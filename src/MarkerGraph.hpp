@@ -1,0 +1,469 @@
+#ifndef DINARA_MARKER_GRAPH_HPP
+#define DINARA_MARKER_GRAPH_HPP
+
+#include "MarkerInterval.hpp"
+#include "MemoryMappedVectorOfVectors.hpp"
+#include "MultithreadedObject.hpp"
+#include "dinaraTypes.hpp"
+#include "Uint.hpp"
+
+#include "cstdint.hpp"
+#include "memory.hpp"
+
+namespace dinara {
+
+    class Base;
+    class CompressedCoverageData;
+    class CompressedMarker;
+    class MarkerGraph;
+    class Reads;
+
+    extern template class MultithreadedObject<MarkerGraph>;
+}
+
+
+
+class dinara::MarkerGraph : public MultithreadedObject<MarkerGraph> {
+public:
+
+    using VertexId = MarkerGraphVertexId;
+    using EdgeId = MarkerGraphEdgeId;
+    static const VertexId invalidVertexId;
+    static const EdgeId invalidEdgeId;
+
+    // To save memory, store vertex ids using 5 bytes.
+    // This allows for up to 2^40 = 1 Ti markers (both strands).
+    // A human size run with 40x coverage and 10% markers
+    // has around 25 G markers (both strands).
+    using CompressedVertexId = Uint40;
+    static const CompressedVertexId invalidCompressedVertexId;
+
+    MarkerGraph();
+
+    // The marker ids of the markers corresponding to
+    // each vertex of the global marker graph.
+    // Indexed by VertexId.
+    // For a given vertex, the marker ids are sorted.
+    // Stored as a shared pointer to permit easy replacement of the vertices.
+    shared_ptr< MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId> > verticesPointer;
+    void constructVertices()
+    {
+        verticesPointer = make_shared<MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId> >();
+    }
+    void destructVertices() {
+        verticesPointer = 0;
+    }
+
+
+
+    // Vertices access functions.
+    // Return the number of vertices.
+    MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId>& vertices()
+    {
+        return *verticesPointer;
+    }
+    const MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId>& vertices() const
+    {
+        return *verticesPointer;
+    }
+    uint64_t vertexCount() const {
+        return verticesPointer->size();
+    }
+    // Return the number of markers for a given vertex.
+    uint64_t vertexCoverage(VertexId vertexId) const
+    {
+        return verticesPointer->size(vertexId);
+    }
+    // Return the marker ids for a given vertex.
+    span<MarkerId> getVertexMarkerIds(VertexId vertexId) {
+        return vertices()[vertexId];
+    }
+    span<const MarkerId> getVertexMarkerIds(VertexId vertexId) const {
+        return vertices()[vertexId];
+    }
+
+    // Find out if a vertex has more than one marker on the same oriented read.
+    bool vertexHasDuplicateOrientedReadIds(
+        VertexId,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers) const;
+
+    // Find out if a vertex has more than one marker on the same read.
+    bool vertexHasDuplicateReadIds(
+        VertexId,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers) const;
+
+    void remove();
+
+    // The global marker graph vertex corresponding to each marker.
+    // Indexed by MarkerId.
+    // For markers that don't correspond to a marker graph vertex,
+    // this stores invalidCompressedVertexId.
+    MemoryMapped::Vector<CompressedVertexId> vertexTable;
+
+
+
+    // This renumbers the vertex table to make sure that
+    // vertices are numbered contiguously starting at 0.
+    // This must be called after the vertexTable is changed,
+    // as in Assembler::cleanupDuplicateMarkers.
+    // After this is called, all other data structures
+    // are inconsistent and need to be recreated.
+    // The second version can be called if the maximum vertex id
+    // present in the vertex table is already known, and is faster.
+    // Returns the maximmum vertex id after renumbering.
+    VertexId renumberVertexTable(size_t threadCount);
+    VertexId renumberVertexTable(size_t threadCount, VertexId maxVertexId);
+private:
+    void renumberVertexTableThreadFunction1(size_t threadId);
+    void renumberVertexTableThreadFunction2(size_t threadId);
+    class RenumberVertexTableData {
+    public:
+        // Set to true for VertexId values represented in the starting vertexTable.
+        MemoryMapped::Vector<bool> isPresent;
+
+        // The new VertexId corresponding to each old VertexId.
+        MemoryMapped::Vector<VertexId> newVertexId;
+    };
+    RenumberVertexTableData renumberVertexTableData;
+
+
+
+    // Find the maximum valid VertexId in the vertex table.
+    VertexId findMaxVertexTableEntry(size_t threadCount);
+    void findMaxVertexTableEntryThreadFunction(size_t threadId);
+    class FindMaxVertexTableEntryData {
+    public:
+        // The maximum VertexId found by each thread.
+        vector<VertexId> threadMaxVertexId;
+    };
+    FindMaxVertexTableEntryData findMaxVertexTableEntryData;
+public:
+
+
+    // Recreate the vertices from the vertexTable.
+    // This assumes that valid VertexId's in the vertex table
+    // are numbered contiguously starting at 0 (call renumberVertexTable to ensure that).
+    void createVerticesFromVertexTable(size_t threadCount, VertexId maxVertexId);
+private:
+    void createVerticesFromVertexTableThreadFunction1(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction2(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction3(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction4(size_t threadId);
+    class CreateVerticesFromVertexTableData {
+    public:
+        // Like the vertices, but the second template argument is VertexId
+        // instead of CompressedVertexId. This is necessariy to be able to
+        // work on it in multilthreaded code efficiently.
+        MemoryMapped::VectorOfVectors<MarkerId, VertexId> vertices;
+    };
+    CreateVerticesFromVertexTableData createVerticesFromVertexTableData;
+public:
+
+    // The disjoint sets histogram in a MemoryMapped::Vector.
+    // This is used when flagging primary marker graph edges for Mode 3 assembly.
+    // This stored pairs(coverage, frequency).
+    // Only pairs where the frequency is not zero are stored.
+    MemoryMapped::Vector< pair<uint64_t, uint64_t> > disjointSetsHistogram;
+
+    // Remove marker graph vertices and update vertices and vertexTable.
+    // After this is called, the only
+    // two MarkerGraph field filled in are vertices and vertexTable.
+    // Everything else has to be recreated.
+    void removeVertices(
+        const MemoryMapped::Vector<VertexId>& verticesToBeKept,
+        uint64_t pageSize,
+        uint64_t threadCount);
+private:
+    class RemoveVerticesData {
+    public:
+        const MemoryMapped::Vector<VertexId>* verticesToBeKept;
+        shared_ptr<MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId> > newVerticesPointer;
+    };
+    RemoveVerticesData removeVerticesData;
+    void removeVerticesThreadFunction1(size_t threadId);
+    void removeVerticesThreadFunction2(size_t threadId);
+    void removeVerticesThreadFunction3(size_t threadId);
+public:
+
+
+    // Find the common KmerId for all the markers of a marker graph vertex.
+    KmerId getVertexKmerId(
+        MarkerGraphVertexId vertexId,
+        uint64_t k,
+        const Reads&,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers
+        ) const;
+
+
+
+    // The reverse complement of each vertex.
+    // Indexed by VertexId.
+    MemoryMapped::Vector<VertexId> reverseComplementVertex;
+
+    // The edges of the marker graph.
+    class Edge {
+    public:
+        Uint40 source;  // The source vertex (index into globalMarkerGraphVertices).
+        Uint40 target;  // The target vertex (index into globalMarkerGraphVertices).
+
+        // Flags used to mark the edge as removed from the marker graph.
+        bool wasRemoved() const
+        {
+            return
+                wasRemovedByTransitiveReduction ||
+                wasPruned ||
+                isLowCoverageCrossEdge ||
+                isSuperBubbleEdge ||
+                wasRemovedWhileSplittingSecondaryEdges
+                ;
+        }
+
+        // Flag that is set if the edge was removed during
+        // approximate transitive reduction by flagWeakMarkerGraphEdges.
+        uint8_t wasRemovedByTransitiveReduction : 1;
+
+        // Set if this edge was removed during pruning.
+        uint8_t wasPruned : 1;
+
+        // Set if this edge belongs to a bubble/superbubble that was removed.
+        uint8_t isSuperBubbleEdge : 1;
+
+        // Flag set if this edge corresponds to a low coverage cross edge
+        // of the assembly graph.
+        uint8_t isLowCoverageCrossEdge: 1;
+
+        // Flag set if this edge was assembled.
+        // If set, edgeConsensusOverlappingBaseCount and edgeConsensus
+        // for this edge are set.
+        uint8_t wasAssembled : 1;
+
+        // Flag for secondary edges in assembly mode 1.
+        uint8_t isSecondary;
+
+        // This is set for secondary edges that are created and later split.
+        // Assembly mode 2 only.
+        uint8_t wasRemovedWhileSplittingSecondaryEdges : 1;
+
+        uint8_t unused : 1;
+
+        void clearFlags()
+        {
+            wasRemovedByTransitiveReduction = 0;
+            wasPruned = 0;
+            isSuperBubbleEdge = 0;
+            isLowCoverageCrossEdge = 0;
+            wasAssembled = 0;
+            isSecondary = 0;
+            wasRemovedWhileSplittingSecondaryEdges = 0;
+            unused = 0;
+        }
+        Edge() :
+            source(MarkerGraph::invalidCompressedVertexId),
+            target(MarkerGraph::invalidCompressedVertexId)
+        {
+            clearFlags();
+        }
+
+        void writeFlags(ostream&) const;
+    };
+    MemoryMapped::Vector<Edge> edges;
+    const Edge* findEdge(Uint40 source, Uint40 target) const;
+    EdgeId findEdgeId(Uint40 source, Uint40 target) const;
+
+    // The MarkerIntervals for each of the above edges.
+    MemoryMapped::VectorOfVectors<MarkerInterval, uint64_t> edgeMarkerIntervals;
+
+    // The edges that each vertex is the source of.
+    // Contains indexes into the above edges vector.
+    MemoryMapped::VectorOfVectors<Uint40, uint64_t> edgesBySource;
+
+    // The edges that each vertex is the target of.
+    // Contains indexes into the above edges vector.
+    MemoryMapped::VectorOfVectors<Uint40, uint64_t> edgesByTarget;
+
+    // Compute in-degree or out-degree of a vertex,
+    // counting only edges that were not removed.
+    uint64_t inDegree(VertexId) const;
+    uint64_t outDegree(VertexId) const;
+    EdgeId getFirstNonRemovedOutEdge(VertexId) const;
+    EdgeId getFirstNonRemovedInEdge(VertexId) const;
+
+    // Find the edge that contains a given MarkerInterval.
+    EdgeId locateMarkerInterval(
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+       const MarkerInterval&) const;
+
+    // Apply an ordinal offset in the specified direction to a given MarkerInterval
+    // and find the edge that contains the offset MarkerInterval.
+    // This assumes that we have the complete marker graph.
+    EdgeId locateMarkerIntervalWithOffset(
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        MarkerInterval,
+        uint32_t ordinalOffset,
+        uint64_t direction // 0=forward, 1=backward.
+        ) const;
+
+    // Find out if two edges are adjacent, using only the MarkerIntervals for the two edges.
+    // This is used for Mode 3 assembly, when the MarkerGraph is only partially constructed.
+    bool areAdjacentEdges(EdgeId, EdgeId) const;
+
+    // Find out if an edge has duplicate oriented reads
+    // in its MarkerIntervals.
+    bool edgeHasDuplicateOrientedReadIds(EdgeId) const;
+
+    // The reverse complement of each edge.
+    // Indexed by EdgeId.
+    MemoryMapped::Vector<EdgeId> reverseComplementEdge;
+
+    // Return total coverage of an edge.
+    uint64_t edgeCoverage(EdgeId edgeId) const
+    {
+        return edgeMarkerIntervals.size(edgeId);
+    }
+
+    // Return coverage for each strand for an edge.
+    array<uint64_t, 2> edgeStrandCoverage(EdgeId edgeId) const
+    {
+        array<uint64_t, 2> coverage = {0, 0};
+        for(const MarkerInterval& markerInterval: edgeMarkerIntervals[edgeId]) {
+            ++coverage[markerInterval.orientedReadId.getStrand()];
+        }
+        return coverage;
+    }
+
+    // The consensus repeat counts of each vertex of the marker graph.
+    // There are assemblerInfo->k entries for each vertex.
+    // The first entry for a vertex is at index vertexId*assemblerInfo->k.
+    MemoryMapped::Vector<uint8_t> vertexRepeatCounts;
+
+    // Consensus sequence and repeat counts for each marker graph edge.
+    // This excludes the sequence of flanking markers and their repeat counts.
+    // Indexed by the marker graph edge id.
+    // - For edges that were marked as removed,
+    //   edgeConsensusOverlappingBaseCount is 0 and edgeConsensus is empty.
+    // - For edges that were not marked as removed:
+    //   * If the consensus sequence has one or more intervening bases
+    //     between the flanking markers,
+    //     edgeConsensusOverlappingBaseCount is 0 and edgeConsensus
+    //     stores those intervening bases with their repeat count consensus.
+    //   * Otherwise, edgeConsensus is empty and
+    //     edgeConsensusOverlappingBaseCount stores the number of
+    //     overlapping bases (for the consensus sequence)
+    //     between the two flanking markers. This can be zero
+    //     if the consensus sequence has the flanking markers
+    //     exactly adjacent.
+    MemoryMapped::VectorOfVectors<pair<Base, uint8_t>, uint64_t> edgeConsensus;
+    MemoryMapped::Vector<uint8_t> edgeConsensusOverlappingBaseCount;
+
+
+    // Details of vertex coverage.
+    // These are not stored by default.
+    // They can be used to calibrate the Bayesian model for repeat counts
+    // and for some types of analyses.
+    // Indeed by VertexId. For each vertex, contains pairs (position, CompressedCoverageData),
+    // ordered by position.
+    // Note that the bases at a given position are all identical by construction.
+    MemoryMapped::VectorOfVectors<pair<uint32_t, CompressedCoverageData>, uint64_t>
+        vertexCoverageData;
+
+    // Details of edge coverage.
+    // These are not stored by default.
+    // They can be used to calibrate the Bayesian model for repeat counts
+    // and for some types of analyses.
+    // Indeed by EdgeId. For each edge, contains pairs (position, CompressedCoverageData),
+    // ordered by position.
+    MemoryMapped::VectorOfVectors<pair<uint32_t, CompressedCoverageData>, uint64_t>
+        edgeCoverageData;
+
+
+
+    // Edge sequence for each edge, for Mode 3 assembly.
+    // There are several difference compared to the consensus sequences stored above,
+    // which are not used in Mode 3 assembly:
+    // - Mode 3 assembly assumes we are not using RLE, so we don't need to store repeat counts.
+    // - Mode 3 assembly uses createMarkerGraphedgesStrict, which guarantees that
+    //   all marker interval on a marker graph edge have exactly the same sequence.
+    //   This dramatically simplifies edge sequence assembly because we can just
+    //   obtain the sequence from the first marker interval, and multiple sequence
+    //   alignment is not nedeed.
+    // - For Mode 3 assembly we assume that marker ength k is even, and
+    //   the stored edge sequence includes the last k/2 bases from the marker
+    //   of the source vertex and the first k/2 bases from the marker of
+    //   the target vertex. As a result, every edge has at least one base of sequence,
+    //   even when adjacent markers overlap. And the sequence of a path can
+    //   be obtained by just concatenating the edge sequences.
+    MemoryMapped::VectorOfVectors<Base, uint64_t> edgeSequence;
+
+#if 0
+    // ALL MARKER GRAPH EDGES ARE NOW PRIMARY IN MODE 3 ASSEMBLY.
+    // Flag primary edges (only used for Mode 3 assembly).
+    void flagPrimaryEdges(
+        uint64_t minPrimaryCoverage,
+        uint64_t maxPrimaryCoverage,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        uint64_t threadCount);
+private:
+    void flagPrimaryEdgesThreadFunction(uint64_t threadId);
+public:
+    bool isPrimaryEdge(
+        EdgeId,
+        uint64_t minPrimaryCoverage,
+        uint64_t maxPrimaryCoverage,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers) const;
+private:
+    class FlagPrimaryEdgesData {
+    public:
+        uint64_t minPrimaryCoverage;
+        uint64_t maxPrimaryCoverage;
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>* markersPointer;
+    };
+    FlagPrimaryEdgesData flagPrimaryEdgesData;
+#endif
+
+
+
+#if 0
+    // PRIMARY JOURNEYS ARE NOW COMPUTED LOCALLY BY CLASS Mode3Assembler.
+    // The primary journey of an oriented read is the sequence of primary
+    // marker graph edges encountered by the oriented read.
+    // Indexed by OrientedReadId::getValue().
+    // Only used for mode 3 assembly.
+public:
+    class PrimaryJourneyEntry {
+    public:
+        array<uint32_t, 2> ordinals;
+        EdgeId edgeId;
+        bool operator<(const PrimaryJourneyEntry& that) const {
+            return ordinals[0] < that.ordinals[0];
+        }
+    };
+    MemoryMapped::VectorOfVectors<PrimaryJourneyEntry, uint64_t> primaryJourneys;
+    void createPrimaryJourneys(uint64_t orientedReadCount, uint64_t threadCount);
+    void writePrimaryJourneys();
+private:
+    void createPrimaryJourneysThreadFunction1(uint64_t threadId);
+    void createPrimaryJourneysThreadFunction2(uint64_t threadId);
+    void createPrimaryJourneysThreadFunction12(uint64_t pass);
+    void createPrimaryJourneysThreadFunction3(uint64_t threadId);
+
+public:
+
+    // Starting from a primary marker graph edge, follow the primary journeys
+    // of all oriented reads on the edge, moving forward.
+    // Find the set of MarkerGraphEdgeIds that were encountered in this way,
+    // and for each the number of times it was encountered.
+    void followPrimaryJourneysForward(
+        MarkerGraphEdgeId,
+        vector<MarkerGraphEdgeId>&,
+        vector<uint64_t>& count
+        ) const;
+    // Same, but moving backward.
+    void followPrimaryJourneysBackward(
+        MarkerGraphEdgeId,
+        vector<MarkerGraphEdgeId>&,
+        vector<uint64_t>& count
+        ) const;
+#endif
+};
+
+#endif

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <link rel=stylesheet href=style.css />
+    <link rel=icon href=CZI-new-logo.png />
+</head>
+
+<body>
+    <main>
+        <div class="goto-index"><a href="index.html">Table of contents</a></div>
+        <h1>Python API</h1>
+
+        <p>
+            On Ubuntu 16.04 and Ubuntu 18.04, a Dinara build
+            includes a shared library <code>dinara-build/dinara-install/dinara.so</code>
+            which behaves as a Python module. Python code can <code>import dinara</code>
+            to use the functionality provided by the module.
+            To create documentation for the Python API, see directions in
+            <code>dinara/docs/PythonApi/README</code>.
+
+            For the Python interpreter to find the module you must either:
+        <ul>
+            <li>Make sure the Python script that contains <code>import dinara</code> is in the same directory
+                that contains <code>dinara.so</code> (<code>dinara-build/dinara-install/bin</code>).
+                All Python scripts provided with Dinara are copied
+                to that location during the build process.
+
+            <li>Or, set environment variable <code>PYTHONPATH</code>
+                to the name of the directory where <code>dinara.so</code> is located.
+        </ul>
+
+        <div class="goto-index"><a href="index.html">Table of contents</a></div>
+    </main>
+</body>
+
+</html>
