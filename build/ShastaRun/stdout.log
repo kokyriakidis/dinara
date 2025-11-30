@@ -1,0 +1,120 @@
+2025-Nov-28 00:13:19.031818 Assembly begins.
+Command line:
+./shasta-install/bin/shasta --config Nanopore-Sep2020 --input ../tests/TinyTest.fasta --Align.useWfa 
+For options in use for this assembly, see shasta.conf in the assembly directory.
+This run uses options "--memoryBacking 4K --memoryMode anonymous".
+This could result in longer run time.
+For faster assembly, use "--memoryBacking 2M --memoryMode filesystem"
+(root privilege via sudo required).
+Therefore the results of this run should not be used
+for the purpose of benchmarking assembly time.
+However the memory options don't affect assembly results in any way.
+This assembly will use 20 threads.
+Setting up consensus caller Bayesian:guppy-3.6.0-a
+Using predefined Bayesian consensus caller guppy-3.6.0-a
+Bayesian consensus caller configuration name is guppy_360_hg002_chr1 with pseudocounts 1
+Discarded read statistics for file /home/kokyriakidis/Downloads/variantClustering/shasta/tests/TinyTest.fasta:
+    Discarded 0 reads containing invalid bases for a total 0 valid bases.
+    Discarded 0 reads shorter than 10000 bases for a total 0 bases.
+    Discarded 0 reads containing repeat counts 256 or more for a total 0 bases.
+Discarded read statistics for all input files:
+    Discarded 0 reads containing invalid bases for a total 0 valid bases.
+    Discarded 0 short reads for a total 0 bases.
+    Discarded 0 reads containing repeat counts 256 or more for a total 0 bases.
+Read statistics for reads that will be used in this assembly:
+    Total number of reads is 20.
+    Total number of raw bases is 891443.
+    Average read length is 44572.2 bases.
+    N50 for read length is 81086 bases.
+Found 0 reads with duplicate names.
+Discarded from the assembly 0 reads with duplicate names.
+Created 124196 markers.
+Flagged 0 reads as palindromic out of 20 total.
+Palindromic fraction is 0
+LowHash0 algorithm will use 2^16 = 65536 buckets. 
+Alignment candidates after lowhash iteration 0: high frequency 26, total 141, capacity 141.
+Alignment candidates after lowhash iteration 1: high frequency 103, total 195, capacity 281.
+Alignment candidates after lowhash iteration 2: high frequency 133, total 221, capacity 303.
+Alignment candidates after lowhash iteration 3: high frequency 161, total 237, capacity 326.
+Alignment candidates after lowhash iteration 4: high frequency 169, total 237, capacity 326.
+Alignment candidates after lowhash iteration 5: high frequency 172, total 237, capacity 326.
+Alignment candidates after lowhash iteration 6: high frequency 173, total 237, capacity 326.
+Alignment candidates after lowhash iteration 7: high frequency 176, total 237, capacity 326.
+Alignment candidates after lowhash iteration 8: high frequency 177, total 238, capacity 326.
+Alignment candidates after lowhash iteration 9: high frequency 182, total 238, capacity 326.
+Found 182 alignment candidates.
+Average number of alignment candidates per oriented read is 9.1.
+Number of alignment candidates before suppression is 182
+Suppressed 0 alignment candidates.
+Number of alignment candidates after suppression is 182
+Loading alignment candidates from /home/kokyriakidis/Downloads/blend/bin/output.paf
+Loaded 0 alignment candidates from /home/kokyriakidis/Downloads/blend/bin/output.paf
+2025-Nov-28 00:13:19.394588 Alignment computation begins.
+2025-Nov-28 00:13:19.395625 Alignment computation completed.
+Found and stored 0 good alignments.
+Automatically selected alignment criteria:
+	minAlignedFraction:	1.005
+	minAlignedMarkerCount:		3005
+	maxDrift:		101
+	maxSkip:		101
+	maxTrim:		101
+Keeping 0 alignments of 0
+Of 40 vertices in the read graph, 0 are within distance 6 of their reverse complement.
+Found 0 strand jump regions.
+Marked 0 read graph edges out of 0 total as cross-strand.
+Flagged 0 reads as chimeric out of 20 total.
+Chimera rate is 0
+Unable to automatically select MarkerGraph.minCoverage. No significant cutoff found in disjoint sets size distribution. Observed peak has percent total area of 0
+minPercentArea is 0.08
+See DisjointSetsHistogram.csv.Using MarkerGraph.minCoverage = 5
+Kept 0 disjoint sets with coverage in the requested range.
+Found 0 disjoint sets with more than one marker on a single oriented read or with less than 0 supporting oriented reads on each strand.
+Found 0 edges for 0 vertices.
+The marker graph has 0 vertices and 0 edges.
+Maximum edge coverage is 0
+Flagged as weak 0 edges with coverage 1 and marker skip greater than 100
+Transitive reduction removed 0 marker graph edges out of 0 total.
+The marker graph has 0 vertices and 0 strong edges.
+Pruned 0 edges at prune iteration 0.
+Pruned 0 edges at prune iteration 1.
+Pruned 0 edges at prune iteration 2.
+Pruned 0 edges at prune iteration 3.
+Pruned 0 edges at prune iteration 4.
+Pruned 0 edges at prune iteration 5.
+The original marker graph had 0 vertices and 0 edges.
+The number of surviving edges is 0.
+Begin simplifyMarkerGraph iteration 0 with maxLength = 10
+Before iteration 0 part 1, the assembly graph has 0 vertices and 0 edges.
+Before iteration 0 part 2, the assembly graph has 0 vertices and 0 edges.
+Begin simplifyMarkerGraph iteration 1 with maxLength = 100
+Before iteration 1 part 1, the assembly graph has 0 vertices and 0 edges.
+Before iteration 1 part 2, the assembly graph has 0 vertices and 0 edges.
+Begin simplifyMarkerGraph iteration 2 with maxLength = 1000
+Before iteration 2 part 1, the assembly graph has 0 vertices and 0 edges.
+Before iteration 2 part 2, the assembly graph has 0 vertices and 0 edges.
+Begin simplifyMarkerGraph iteration 3 with maxLength = 10000
+Before iteration 3 part 1, the assembly graph has 0 vertices and 0 edges.
+Before iteration 3 part 2, the assembly graph has 0 vertices and 0 edges.
+Begin simplifyMarkerGraph iteration 4 with maxLength = 100000
+Before iteration 4 part 1, the assembly graph has 0 vertices and 0 edges.
+Before iteration 4 part 2, the assembly graph has 0 vertices and 0 edges.
+Removed 0 low coverage cross edges of the assembly graph and 0 corresponding marker graph edges.
+Before detangling, the assembly graph has 0 vertices and 0 edges.
+Found 0 tangles.
+The detangled assembly graph has 0 vertices.
+The detangled assembly graph has 0 edges.
+Removed 0 low coverage cross edges of the assembly graph and 0 corresponding marker graph edges.
+Using 20 threads.
+Assembly begins for 0 edges of the assembly graph.
+Assembled a total 0 bases for 0 assembly graph edges of which 0 were assembled.
+The assembly graph has 0 vertices and 0 edges of which 0 were assembled.
+Total length of assembled sequence is 0
+This run used options "--memoryBacking 4K --memoryMode anonymous".
+This could result in longer run time.
+For faster assembly, use "--memoryBacking 2M --memoryMode filesystem"
+(root privilege via sudo required).
+Therefore the results of this run should not be used
+for the purpose of benchmarking assembly time.
+However the memory options don't affect assembly results in any way.
+Shasta development build. This is not a released version.
+2025-Nov-28 00:13:19.432071 Assembly ends.

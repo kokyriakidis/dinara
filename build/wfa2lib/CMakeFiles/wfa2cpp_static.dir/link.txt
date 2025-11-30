@@ -1,0 +1,2 @@
+/usr/bin/ar qc libwfa2cpp.a CMakeFiles/wfa2cpp_static.dir/bindings/cpp/WFAligner.cpp.o
+/usr/bin/ranlib libwfa2cpp.a

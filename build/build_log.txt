@@ -1,0 +1,80 @@
+[  1%] Building CXX object staticLibrary/CMakeFiles/shastaStaticLibrary.dir/__/src/AssemblerVariantClustering.cpp.o
+[  1%] Building CXX object dynamicLibrary/CMakeFiles/shastaDynamicLibrary.dir/__/src/AssemblerVariantClustering.cpp.o
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp: In member function ‘void shasta::Assembler::linkVariantClustersThreadFunction(uint64_t)’:
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:209:17: error: ‘assemblerOptions’ was not declared in this scope; did you mean ‘assemblerInfo’?
+  209 |             if (assemblerOptions) {
+      |                 ^~~~~~~~~~~~~~~~
+      |                 assemblerInfo
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:328:121: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  328 |                                 Base base0Rc = getReads().getOrientedReadBase(currentOrientedReadId0Rc, readLength0 - 1 - positionInRead0);
+      |                                                                                                         ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:329:121: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  329 |                                 Base base1Rc = getReads().getOrientedReadBase(currentOrientedReadId1Rc, readLength1 - 1 - positionInRead1);
+      |                                                                                                         ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp: In member function ‘void shasta::Assembler::performGlobalVariantClustering(uint64_t, uint64_t, std::size_t)’:
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:486:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  486 |             const uint32_t rcPosition = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp: In member function ‘void shasta::Assembler::linkVariantClustersThreadFunction(uint64_t)’:
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:209:17: error: ‘assemblerOptions’ was not declared in this scope; did you mean ‘assemblerInfo’?
+  209 |             if (assemblerOptions) {
+      |                 ^~~~~~~~~~~~~~~~
+      |                 assemblerInfo
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:328:121: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  328 |                                 Base base0Rc = getReads().getOrientedReadBase(currentOrientedReadId0Rc, readLength0 - 1 - positionInRead0);
+      |                                                                                                         ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:329:121: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  329 |                                 Base base1Rc = getReads().getOrientedReadBase(currentOrientedReadId1Rc, readLength1 - 1 - positionInRead1);
+      |                                                                                                         ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp: In member function ‘void shasta::Assembler::performGlobalVariantClustering(uint64_t, uint64_t, std::size_t)’:
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:486:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  486 |             const uint32_t rcPosition = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:846:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  846 |             const uint32_t positionRc = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:875:62: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  875 |                 const uint32_t positionJRc = readLengthJ - 1 - pairJ.second;
+      |                                              ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:897:22: warning: unused variable ‘tVerify’ [-Wunused-variable]
+  897 |         const double tVerify = seconds(tVerifyEnd - tVerifyStart);
+      |                      ^~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:940:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  940 |             const uint32_t positionRc = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:957:22: warning: unused variable ‘tVerifyExistence’ [-Wunused-variable]
+  957 |         const double tVerifyExistence = seconds(tVerifyExistenceEnd - tVerifyExistenceStart);
+      |                      ^~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:846:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  846 |             const uint32_t positionRc = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:875:62: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  875 |                 const uint32_t positionJRc = readLengthJ - 1 - pairJ.second;
+      |                                              ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:897:22: warning: unused variable ‘tVerify’ [-Wunused-variable]
+  897 |         const double tVerify = seconds(tVerifyEnd - tVerifyStart);
+      |                      ^~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:940:56: warning: conversion from ‘long unsigned int’ to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  940 |             const uint32_t positionRc = readLength - 1 - position;
+      |                                         ~~~~~~~~~~~~~~~^~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:957:22: warning: unused variable ‘tVerifyExistence’ [-Wunused-variable]
+  957 |         const double tVerifyExistence = seconds(tVerifyExistenceEnd - tVerifyExistenceStart);
+      |                      ^~~~~~~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:372:14: warning: unused parameter ‘minCoverage’ [-Wunused-parameter]
+  372 |     uint64_t minCoverage,
+      |     ~~~~~~~~~^~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:373:14: warning: unused parameter ‘maxCoverage’ [-Wunused-parameter]
+  373 |     uint64_t maxCoverage,
+      |     ~~~~~~~~~^~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:372:14: warning: unused parameter ‘minCoverage’ [-Wunused-parameter]
+  372 |     uint64_t minCoverage,
+      |     ~~~~~~~~~^~~~~~~~~~~
+/home/kokyriakidis/Downloads/variantClustering/shasta/src/AssemblerVariantClustering.cpp:373:14: warning: unused parameter ‘maxCoverage’ [-Wunused-parameter]
+  373 |     uint64_t maxCoverage,
+      |     ~~~~~~~~~^~~~~~~~~~~
+make[2]: *** [dynamicLibrary/CMakeFiles/shastaDynamicLibrary.dir/build.make:706: dynamicLibrary/CMakeFiles/shastaDynamicLibrary.dir/__/src/AssemblerVariantClustering.cpp.o] Error 1
+make[1]: *** [CMakeFiles/Makefile2:186: dynamicLibrary/CMakeFiles/shastaDynamicLibrary.dir/all] Error 2
+make[1]: *** Waiting for unfinished jobs....
+make[2]: *** [staticLibrary/CMakeFiles/shastaStaticLibrary.dir/build.make:706: staticLibrary/CMakeFiles/shastaStaticLibrary.dir/__/src/AssemblerVariantClustering.cpp.o] Error 1
+make[1]: *** [CMakeFiles/Makefile2:134: staticLibrary/CMakeFiles/shastaStaticLibrary.dir/all] Error 2
+make: *** [Makefile:136: all] Error 2

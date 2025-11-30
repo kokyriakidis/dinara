@@ -1,0 +1,53 @@
+#ifndef DINARA_MARKER_FINDER_HPP
+#define DINARA_MARKER_FINDER_HPP
+
+#include "Marker.hpp"
+#include "MultithreadedObject.hpp"
+#include "Reads.hpp"
+
+namespace dinara {
+    class MarkerFinder;
+    class LongBaseSequences;
+    class KmerChecker;
+
+    namespace MemoryMapped {
+        template<class T> class Vector;
+        template<class Int, class T> class VectorOfVectors;
+    }
+
+    extern template class MultithreadedObject<MarkerFinder>;
+}
+
+
+
+class dinara::MarkerFinder :
+    public MultithreadedObject<MarkerFinder>{
+public:
+
+    // The constructor does all the work.
+    MarkerFinder(
+        size_t k,
+        const KmerChecker&,
+        const Reads& reads,
+        MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        size_t threadCount);
+
+private:
+
+    // The arguments passed to the constructor.
+    size_t k;
+    const KmerChecker& kmerChecker;
+    const Reads& reads;
+    MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers;
+    size_t threadCount;
+
+    void threadFunction(size_t threadId);
+
+    // In pass 1, we count the number of markers for each
+    // read and call reads->incrementCountMultithreaded.
+    // In pass 2, we store the markers.
+    size_t pass;
+
+};
+
+#endif
