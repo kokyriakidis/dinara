@@ -25,17 +25,17 @@ namespace dinara {
 # Using these options require root access.
 
 # For detailed information on all available options see here:
-# https://paolodinara.github.io/dinara/CommandLineOptions.html
+# https://kokyriakidis.github.io/dinara/CommandLineOptions.html
 
 # For information on running a small assembly for which 
 # performance is not essential see here:
-# https://paolodinara.github.io/dinara/QuickStart.html
+# https://kokyriakidis.github.io/dinara/QuickStart.html
 
 # For more information on running an assembly see here:
-# https://paolodinara.github.io/dinara/Running.html
+# https://kokyriakidis.github.io/dinara/Running.html
 
 # For information on optimizing assembly performance see here:
-# https://paolodinara.github.io/dinara/Performance.html
+# https://kokyriakidis.github.io/dinara/Performance.html
 
 
 
@@ -77,17 +77,17 @@ consensusCaller = Bayesian:guppy-3.0.5-a
 # Using these options require root access.
 
 # For detailed information on all available options see here:
-# https://paolodinara.github.io/dinara/CommandLineOptions.html
+# https://kokyriakidis.github.io/dinara/CommandLineOptions.html
 
 # For information on running a small assembly for which 
 # performance is not essential see here:
-# https://paolodinara.github.io/dinara/QuickStart.html
+# https://kokyriakidis.github.io/dinara/QuickStart.html
 
 # For more information on running an assembly see here:
-# https://paolodinara.github.io/dinara/Running.html
+# https://kokyriakidis.github.io/dinara/Running.html
 
 # For information on optimizing assembly performance see here:
-# https://paolodinara.github.io/dinara/Performance.html
+# https://kokyriakidis.github.io/dinara/Performance.html
 
 
 
@@ -143,17 +143,17 @@ consensusCaller = Bayesian:guppy-3.0.5-a
 # Using these options requires root access.
 
 # For detailed information on all available options see here:
-# https://paolodinara.github.io/dinara/CommandLineOptions.html
+# https://kokyriakidis.github.io/dinara/CommandLineOptions.html
 
 # For information on running a small assembly for which 
 # performance is not essential see here:
-# https://paolodinara.github.io/dinara/QuickStart.html
+# https://kokyriakidis.github.io/dinara/QuickStart.html
 
 # For more information on running an assembly see here:
-# https://paolodinara.github.io/dinara/Running.html
+# https://kokyriakidis.github.io/dinara/Running.html
 
 # For information on optimizing assembly performance see here:
-# https://paolodinara.github.io/dinara/Performance.html
+# https://kokyriakidis.github.io/dinara/Performance.html
 
 
 
@@ -233,17 +233,17 @@ detangleMethod = 2
 # Using these options requires root access.
 
 # For detailed information on all available options see here:
-# https://paolodinara.github.io/dinara/CommandLineOptions.html
+# https://kokyriakidis.github.io/dinara/CommandLineOptions.html
 
 # For information on running a small assembly for which 
 # performance is not essential see here:
-# https://paolodinara.github.io/dinara/QuickStart.html
+# https://kokyriakidis.github.io/dinara/QuickStart.html
 
 # For more information on running an assembly see here:
-# https://paolodinara.github.io/dinara/Running.html
+# https://kokyriakidis.github.io/dinara/Running.html
 
 # For information on optimizing assembly performance see here:
-# https://paolodinara.github.io/dinara/Performance.html
+# https://kokyriakidis.github.io/dinara/Performance.html
 
 
 
@@ -370,17 +370,17 @@ iterative = True
 # Using these options requires root access.
 
 # For detailed information on all available options see here:
-# https://paolodinara.github.io/dinara/CommandLineOptions.html
+# https://kokyriakidis.github.io/dinara/CommandLineOptions.html
 
 # For information on running a small assembly for which 
 # performance is not essential see here:
-# https://paolodinara.github.io/dinara/QuickStart.html
+# https://kokyriakidis.github.io/dinara/QuickStart.html
 
 # For more information on running an assembly see here:
-# https://paolodinara.github.io/dinara/Running.html
+# https://kokyriakidis.github.io/dinara/Running.html
 
 # For information on optimizing assembly performance see here:
-# https://paolodinara.github.io/dinara/Performance.html
+# https://kokyriakidis.github.io/dinara/Performance.html
 
 
 
@@ -449,7 +449,7 @@ detangleMethod = 2
 # for providing access to the reads in advance of publication. 
 
 # Also see Dinara issue #200 for some discussion
-# https://github.com/paolodinara/dinara/issues/200
+# https://github.com/kokyriakidis/dinara/issues/200
 
 
 

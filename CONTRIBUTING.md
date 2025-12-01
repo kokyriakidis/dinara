@@ -27,7 +27,7 @@ by the standard libraries, you can also use the Boost libraries.
 
 #### Contributing ideas, computational experiments, comments, or criticism
 * Please use the GitHub
-[Issues](https://github.com/paolodinara/dinara/issues)
+[Issues](https://github.com/kokyriakidis/dinara/issues)
 section of the GitHub repository as appropriate.
 
 #### Contributing documentation

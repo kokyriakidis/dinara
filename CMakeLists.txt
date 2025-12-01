@@ -27,35 +27,20 @@ message(STATUS "CMAKE_SYSTEM_NAME is " ${CMAKE_SYSTEM_NAME})
 
 
 
+# # Decide what we want to build.
+# option(BUILD_STATIC_LIBRARY "Build the static library." ON)
+# option(BUILD_STATIC_EXECUTABLE "Build the static executable." ON)
+# option(BUILD_DYNAMIC_LIBRARY "Build the shared library." ON)
+# option(BUILD_DYNAMIC_EXECUTABLE "Build the dynamic executable." OFF)
+
 # Decide what we want to build.
-option(BUILD_STATIC_LIBRARY "Build the static library." ON)
-option(BUILD_STATIC_EXECUTABLE "Build the static executable." ON)
-option(BUILD_DYNAMIC_LIBRARY "Build the shared library." ON)
-option(BUILD_DYNAMIC_EXECUTABLE "Build the dynamic executable." OFF)
-
-
-
-# To build the static executable, we also need the static library.
-if(BUILD_STATIC_EXECUTABLE AND NOT BUILD_STATIC_LIBRARY)
-    set(BUILD_STATIC_LIBRARY ON)
-    message(STATUS "Turned on BUILD_STATIC_LIBRARY because it is needed for BUILD_STATIC_EXECUTABLE.")
-endif(BUILD_STATIC_EXECUTABLE AND NOT BUILD_STATIC_LIBRARY)
-
-
-
-# To build the dynamic executable, we also need the dynamic library.
-if(BUILD_DYNAMIC_EXECUTABLE AND NOT BUILD_DYNAMIC_LIBRARY)
-    set(BUILD_DYNAMIC_LIBRARY ON)
-    message(STATUS "Turned on BUILD_DYNAMIC_LIBRARY because it is needed for BUILD_DYNAMIC_EXECUTABLE.")
-endif(BUILD_DYNAMIC_EXECUTABLE AND NOT BUILD_DYNAMIC_LIBRARY)
-
+option(BUILD_EXECUTABLE "Build the executable." ON)
+option(BUILD_PYTHON_MODULE "Build the Python module." ON)
 
 
 # Write out what we will actually build.
-message(STATUS "BUILD_STATIC_LIBRARY is " ${BUILD_STATIC_LIBRARY})
-message(STATUS "BUILD_STATIC_EXECUTABLE is " ${BUILD_STATIC_EXECUTABLE})
-message(STATUS "BUILD_DYNAMIC_LIBRARY is " ${BUILD_DYNAMIC_LIBRARY})
-message(STATUS "BUILD_DYNAMIC_EXECUTABLE is " ${BUILD_DYNAMIC_EXECUTABLE})
+message(STATUS "BUILD_EXECUTABLE is " ${BUILD_EXECUTABLE})
+message(STATUS "BUILD_PYTHON_MODULE is " ${BUILD_PYTHON_MODULE})
 
 
 
@@ -70,41 +55,14 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
-
-# The BUILD_ID can be specified to identify the build
-# This is normally used only when building a new GitHub release,
-# in which case we use the following option when running Cmake:
-# -DBUILD_ID="Dinara Release X.Y.Z"
-# BUILD_ID should not contain a comma, otherwise the C preprocessor does not handle it correctly.
-if(NOT DEFINED BUILD_ID)
-    set(BUILD_ID "Dinara development build. This is not a released version.")
-endif(NOT DEFINED BUILD_ID)
-message(STATUS "BUILD_ID is: " ${BUILD_ID})
-
-
-# Option to request a build with long markers.
-option(DINARA_LONG_MARKERS "Make a build with DINARA_LONG_MARKERS set." OFF)
-message(STATUS "DINARA_LONG_MARKERS is " ${DINARA_LONG_MARKERS})
-
-
-
 # Add the subdirectories we need.
-if(BUILD_STATIC_LIBRARY)
-    add_subdirectory(staticLibrary)
-endif(BUILD_STATIC_LIBRARY)
+if(BUILD_EXECUTABLE)
+    add_subdirectory(Executable)
+endif(BUILD_EXECUTABLE)
 
-if(BUILD_STATIC_EXECUTABLE)
-    add_subdirectory(staticExecutable)
-endif(BUILD_STATIC_EXECUTABLE)
-
-if(BUILD_DYNAMIC_LIBRARY)
-    add_subdirectory(dynamicLibrary)
-endif(BUILD_DYNAMIC_LIBRARY)
-
-if(BUILD_DYNAMIC_EXECUTABLE)
-    add_subdirectory(dynamicExecutable)
-endif(BUILD_DYNAMIC_EXECUTABLE)
-
+if(BUILD_PYTHON_MODULE)
+    add_subdirectory(PythonModule)
+endif(BUILD_PYTHON_MODULE)
 
 
 # Install to the dinara-install directory.
@@ -115,14 +73,9 @@ file(GLOB SCRIPTS scripts/*.py scripts/*.sh)
 install(PROGRAMS ${SCRIPTS} DESTINATION dinara-install/bin)
 
 # Install the configuration files.
-install(DIRECTORY conf DESTINATION dinara-install USE_SOURCE_PERMISSIONS)
+install(DIRECTORY conf DESTINATION dinara-install)
 
 # Install the docs directory.
 install(DIRECTORY docs DESTINATION dinara-install)
-
-# The targets built in each subdirectory are
-# installed by the cmake file of each subdirectory.
-
-
 
 
