@@ -1,12 +1,12 @@
 LICENSE NOTICES
 
-The paolodinara/dinara repository was forked from
+The kokyriakidis/dinara repository was forked from
 the chanzuckerberg/dinara repository on 10/4/2022.
 They both use an MIT license, but with different
 copyright owners - see below for details.
 
 Contents:
-* Licensing notice for GitHub repository paolodinara/dinara.
+* Licensing notice for GitHub repository kokyriakidis/dinara.
 * Licensing notice for GitHub repository chanzuckerberg/dinara.
 * Licensing notice for GitHub repository aappleby/smhasher
 * Licensing notice for GitHub repository wjakob/dset
@@ -21,10 +21,10 @@ https://chanzuckerberg.github.io/dinara/Acknowledgments.html
 
 -------------------------------------------------------------------------------
 
-LICENSING NOTICE FOR GITHUB REPOSITORY paolodinara/dinara
+LICENSING NOTICE FOR GITHUB REPOSITORY kokyriakidis/dinara
 
 This notice applies to all code changes made on 10/4/2022 or later.
-These code changes were committed to the paolodinara/dinara repository.
+These code changes were committed to the kokyriakidis/dinara repository.
 
 MIT License
 

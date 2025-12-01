@@ -17,70 +17,8 @@
 #include "Tee.hpp"
 #include "timestamp.hpp"
 #include "platformDependent.hpp"
-#include "SimpleBayesianConsensusCaller.hpp"
 
-// Standard library.
-#include <filesystem>
 
-namespace dinara {
-    namespace main {
-
-        void main(int argumentCount, const char** arguments);
-
-        void assemble(
-            Assembler&,
-            const AssemblerOptions&,
-            vector<string> inputNames,
-            const vector<string>& anchorFileNames);
-
-        void mode0Assembly(
-            Assembler&,
-            const AssemblerOptions&,
-            uint32_t threadCount);
-        void mode2Assembly(
-            Assembler&,
-            const AssemblerOptions&,
-            uint32_t threadCount);
-        void mode3Assembly(
-            Assembler&,
-            const AssemblerOptions&,
-            uint32_t threadCount);
-
-        void setupRunDirectory(
-            const string& memoryMode,
-            const string& memoryBacking,
-            size_t& pageSize,
-            string& dataDirectory
-            );
-
-        void setupHugePages();
-        void segmentFaultHandler(int);
-
-        // Functions that implement --command keywords
-        void assemble(const AssemblerOptions&, int argumentCount, const char** arguments);
-        void saveBinaryData(const AssemblerOptions&);
-        void cleanupBinaryData(const AssemblerOptions&);
-        void createBashCompletionScript(const AssemblerOptions&);
-        void listCommands();
-        void listConfigurations();
-        void listConfiguration(const AssemblerOptions&);
-        void explore(const AssemblerOptions&);
-
-        const std::set<string> commands = {
-            "assemble",
-            "cleanupBinaryData",
-            "createBashCompletionScript",
-            "explore",
-            "listCommands",
-            "listConfiguration",
-            "listConfigurations",
-            "saveBinaryData"};
-
-    }
-
-    Tee tee;
-    ofstream dinaraLog;
-}
 using namespace dinara;
 
 // Boost libraries.
@@ -92,12 +30,64 @@ using namespace dinara;
 #include <stdlib.h>
 #include <unistd.h>
 
-
 // Standard library.
 #include "chrono.hpp"
+#include <filesystem>
 #include "iostream.hpp"
 #include "iterator.hpp"
 #include "stdexcept.hpp"
+
+
+
+namespace dinara {
+    namespace main {
+
+        void main(int argumentCount, const char** arguments);
+
+        void setupRunDirectory(
+            const string& memoryMode,
+            const string& memoryBacking,
+            size_t& pageSize,
+            string& dataDirectory
+            );
+
+        void setupHugePages();
+        void segmentFaultHandler(int);
+        void setupSegmentFaultHandler();
+
+        // Functions that implement --command keywords
+        void assemble(const AssemblerOptions&, int argumentCount, const char** arguments);
+        void saveBinaryData(const AssemblerOptions&);
+        void cleanupBinaryData(const AssemblerOptions&);
+        void explore(const AssemblerOptions&);
+        void listCommands();
+
+        const std::set<string> commands = {
+            "assemble",
+            "saveBinaryData",
+            "cleanupBinaryData",
+            "explore",
+            "listCommands"};
+
+
+
+        void assemble(
+            Assembler&,
+            const AssemblerOptions&,
+            vector<string> inputNames);
+
+        void mode3Assembly(
+            Assembler&,
+            const AssemblerOptions&,
+            uint32_t threadCount);
+
+    }
+
+    // This is used to duplicate cout output to stdout.log.
+    Tee tee;
+    ofstream dinaraLog;
+}
+
 
 
 
@@ -135,18 +125,23 @@ void dinara::main::segmentFaultHandler(int)
 {
     char message[] = "\nA segment fault occurred. Please report it by filing an "
         "issue on the Dinara repository and attaching the entire log output. "
-        "To file an issue, point your browser to https://github.com/paolodinara/dinara/issues\n";
+        "To file an issue, point your browser to https://github.com/kokyriakidis/dinara/issues\n";
     ::write(fileno(stderr), message, sizeof(message));
     ::_exit(1);
 }
 
-
-void dinara::main::main(int argumentCount, const char** arguments)
+void dinara::main::setupSegmentFaultHandler()
 {
     struct sigaction action;
     ::memset(&action, 0, sizeof(action));
     action.sa_handler = &segmentFaultHandler;
     sigaction(SIGSEGV, &action, 0);
+}
+
+
+void dinara::main::main(int argumentCount, const char** arguments)
+{
+    setupSegmentFaultHandler();
 
     // Parse command line options and the configuration file, if one was specified.
     AssemblerOptions assemblerOptions(argumentCount, arguments);
@@ -159,8 +154,6 @@ void dinara::main::main(int argumentCount, const char** arguments)
         listCommands();
         throw runtime_error(message);
     }
-
-
 
     // Execute the requested command.
     if(assemblerOptions.commandLineOnlyOptions.command == "assemble") {
@@ -175,17 +168,8 @@ void dinara::main::main(int argumentCount, const char** arguments)
     } else if(assemblerOptions.commandLineOnlyOptions.command == "explore") {
         explore(assemblerOptions);
         return;
-    } else if(assemblerOptions.commandLineOnlyOptions.command == "createBashCompletionScript") {
-        createBashCompletionScript(assemblerOptions);
-        return;
     } else if(assemblerOptions.commandLineOnlyOptions.command == "listCommands") {
         listCommands();
-        return;
-    } else if(assemblerOptions.commandLineOnlyOptions.command == "listConfigurations") {
-        listConfigurations();
-        return;
-    } else if(assemblerOptions.commandLineOnlyOptions.command == "listConfiguration") {
-        listConfiguration(assemblerOptions);
         return;
     }
 
@@ -207,69 +191,18 @@ void dinara::main::assemble(
 
     // Various checks for option validity.
 
-    if(assemblerOptions.commandLineOnlyOptions.configName.empty()) {
-        cout <<
-            "Option \"--config\" is missing and is now required to "
-            "run an assembly.\n"
-            "It must specify either a configuration file\n"
-            "or one of the following built-in configurations:\n";
-        for(const auto& p: configurationTable) {
-            cout << p.first << endl;
-        }
-        throw runtime_error(
-            "Option \"--config\" is missing "
-            "and is now required to run an assembly.");
-    }
-
-    // Check --Kmers.k.
     if(assemblerOptions.kmersOptions.k > 62 or assemblerOptions.kmersOptions.k < 6) {
-        throw runtime_error("Invalid value specified for --Kmers.k. "
-            "Must be between 6 and 62");
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and 62.");
     }
-    // For assembly modes other than 0, k must be even.
-    if((assemblerOptions.assemblyOptions.mode != 0) and
-        ((assemblerOptions.kmersOptions.k % 2) == 1)) {
-        throw runtime_error("Invalid value specified for --Kmers.k. "
-            "Must be even for assembly modes other than 0.");
 
+    if((assemblerOptions.kmersOptions.k % 2) == 1) {
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be even.");
     }
 
     // Check that we have at least one input file.
     if(assemblerOptions.commandLineOnlyOptions.inputFileNames.empty()) {
-        cout << assemblerOptions.allOptionsDescription << endl;
         throw runtime_error("Specify at least one input file "
-            "using command line option \"--input\".");
-    }
-
-    // Check assemblerOptions.minHashOptions.version.
-    if( assemblerOptions.minHashOptions.version!=0) {
-        throw runtime_error("Invalid value " +
-            to_string(assemblerOptions.minHashOptions.version) +
-            " specified for --MinHash.version. Must be 0.");
-    }
-
-    // Check assemblerOptions.minHashOptions minimum/maximum bucket size.
-    const bool dynamicMinHashBucketRange =
-        (assemblerOptions.minHashOptions.minBucketSize == 0) and
-        (assemblerOptions.minHashOptions.maxBucketSize == 0);
-    if((not dynamicMinHashBucketRange) and (assemblerOptions.minHashOptions.maxBucketSize <=
-        assemblerOptions.minHashOptions.minBucketSize)) {
-        throw runtime_error("Invalid MinHash min/max bucket sizes specified. "
-            "The following values were specified:"
-            " minimum bucket size " +
-            to_string(assemblerOptions.minHashOptions.minBucketSize) +
-            ", maximum bucket size " +
-            to_string(assemblerOptions.minHashOptions.maxBucketSize) + "."
-            );
-    }
-
-    // If coverage data was requested, memoryMode should be filesystem,
-    // otherwise the coverage data cannot be accessed.
-    if(assemblerOptions.assemblyOptions.storeCoverageData) {
-        if(assemblerOptions.commandLineOnlyOptions.memoryMode != "filesystem") {
-            throw runtime_error("To obtain usable coverage data, "
-                "you must use --memoryMode filesystem.");
-        }
+            "using command line option --input.");
     }
 
     if( assemblerOptions.alignOptions.alignMethod <  0 or
@@ -277,33 +210,6 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions.alignMethod >  6) {
         throw runtime_error("Align method " + to_string(assemblerOptions.alignOptions.alignMethod) +
             " is not valid. Valid options are 0 through 6 except 2.");
-    }
-
-    if((assemblerOptions.readGraphOptions.creationMethod > 5) or
-       (assemblerOptions.readGraphOptions.creationMethod == 1)) {
-        throw runtime_error("--ReadGraph.creationMethod " +
-            to_string(assemblerOptions.readGraphOptions.creationMethod) +
-            " is not valid. Valid values are 0 through 5 except 1.");
-    }
-
-    // Check assemblerOptions.assemblyOptions.detangleMethod.
-    if( assemblerOptions.assemblyOptions.detangleMethod!=0 and
-        assemblerOptions.assemblyOptions.detangleMethod!=1 and
-        assemblerOptions.assemblyOptions.detangleMethod!=2) {
-        throw runtime_error("Invalid value " +
-            to_string(assemblerOptions.assemblyOptions.detangleMethod) +
-            " specified for --AssemblyOptions.detangleMethod. Must be 0, 1, or 2.");
-    }
-
-    // Check readGraphOptions.strandSeparationMethod.
-    if(assemblerOptions.assemblyOptions.mode == 2 and
-        assemblerOptions.readGraphOptions.strandSeparationMethod != 2) {
-        throw runtime_error("--Assembly.mode 2 requires --ReadGraph.strandSeparationMethod 2.");
-    }
-
-    if(assemblerOptions.readGraphOptions.creationMethod == 4 and
-        assemblerOptions.readGraphOptions.strandSeparationMethod != 0) {
-        throw runtime_error("--ReadGraph.creationMethod 4 requires --ReadGraph.strandSeparationMethod 0.");
     }
 
     // Find absolute paths of the input files.
@@ -318,42 +224,15 @@ void dinara::main::assemble(
         }
         inputFileAbsolutePaths.push_back(filesystem::getAbsolutePath(inputFileName));
     }
-    vector<string> anchorFileAbsolutePaths;
-    if(
-        (assemblerOptions.assemblyOptions.mode == 3) and
-        (assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod == "FromJson")) {
-        for(const string& anchorFileName: assemblerOptions.commandLineOnlyOptions.anchorFileNames) {
-            if(!std::filesystem::exists(anchorFileName)) {
-                throw runtime_error("Anchor file not found: " + anchorFileName);
-            }
-            if(!std::filesystem::is_regular_file(anchorFileName)) {
-                throw runtime_error("Anchor file is not a regular file: " + anchorFileName);
-            }
-            anchorFileAbsolutePaths.push_back(filesystem::getAbsolutePath(anchorFileName));
-        }
-    }
 
-
-
-    // Create the assembly directory. If it exists and is not empty then stop.
+    // Create the assembly directory. If it exists, stop.
     bool exists = std::filesystem::exists(assemblerOptions.commandLineOnlyOptions.assemblyDirectory);
-    bool isDir = std::filesystem::is_directory(assemblerOptions.commandLineOnlyOptions.assemblyDirectory);
     if (exists) {
-        if (!isDir) {
-            throw runtime_error(
-                assemblerOptions.commandLineOnlyOptions.assemblyDirectory +
-                " already exists and is not a directory.\n"
-                "Use --assemblyDirectory to specify a different assembly directory."
-            );
-        }
-        bool isEmpty = filesystem::directoryContents(assemblerOptions.commandLineOnlyOptions.assemblyDirectory).empty();
-        if (!isEmpty) {
-            throw runtime_error(
-                "Assembly directory " +
-                assemblerOptions.commandLineOnlyOptions.assemblyDirectory +
-                " exists and is not empty.\n"
-                "Empty it for reuse or use --assemblyDirectory to specify a different assembly directory.");
-        }
+        throw runtime_error(
+            assemblerOptions.commandLineOnlyOptions.assemblyDirectory +
+            " already exists. Remove it first \n"
+            "or use --assemblyDirectory to specify a different assembly directory."
+        );
     } else {
         DINARA_ASSERT(std::filesystem::create_directory(assemblerOptions.commandLineOnlyOptions.assemblyDirectory));
     }
@@ -378,8 +257,6 @@ void dinara::main::assemble(
     }
     cout << endl;
 
-
-
     // Set up the run directory as required by the memoryMode and memoryBacking options.
     size_t pageSize = 0;
     string dataDirectory;
@@ -389,8 +266,6 @@ void dinara::main::assemble(
         pageSize,
         dataDirectory);
 
-
-
     // Write out the option in effect to dinara.conf.
     {
         ofstream configurationFile("dinara.conf");
@@ -398,46 +273,16 @@ void dinara::main::assemble(
     }
     cout << "For options in use for this assembly, see dinara.conf in the assembly directory." << endl;
 
-    // Initial disclaimer message.
-    if(assemblerOptions.commandLineOnlyOptions.memoryBacking != "2M" &&
-        assemblerOptions.commandLineOnlyOptions.memoryMode != "filesystem") {
-        cout << "This run uses options \"--memoryBacking " << assemblerOptions.commandLineOnlyOptions.memoryBacking <<
-            " --memoryMode " << assemblerOptions.commandLineOnlyOptions.memoryMode << "\".\n"
-            "This could result in longer run time.\n"
-            "For faster assembly, use \"--memoryBacking 2M --memoryMode filesystem\"\n"
-            "(root privilege via sudo required).\n"
-            "Therefore the results of this run should not be used\n"
-            "for the purpose of benchmarking assembly time.\n"
-            "However the memory options don't affect assembly results in any way." << endl;
-    }
-
     // Create the Assembler.
     Assembler assembler(dataDirectory, true, assemblerOptions.readsOptions.representation, pageSize);
     assembler.assemblerInfo->readGraphCreationMethod = assemblerOptions.readGraphOptions.creationMethod;
     assembler.assemblerInfo->assemblyMode = assemblerOptions.assemblyOptions.mode;
 
-
     // Run the assembly.
-    assemble(assembler, assemblerOptions, inputFileAbsolutePaths, anchorFileAbsolutePaths);
+    assemble(assembler, assemblerOptions, inputFileAbsolutePaths);
 
-    // Final disclaimer message.
-    if(assemblerOptions.commandLineOnlyOptions.memoryBacking != "2M" &&
-        assemblerOptions.commandLineOnlyOptions.memoryMode != "filesystem") {
-        cout << "This run used options \"--memoryBacking " << assemblerOptions.commandLineOnlyOptions.memoryBacking <<
-            " --memoryMode " << assemblerOptions.commandLineOnlyOptions.memoryMode << "\".\n"
-            "This could result in longer run time.\n"
-            "For faster assembly, use \"--memoryBacking 2M --memoryMode filesystem\"\n"
-            "(root privilege via sudo required).\n"
-            "Therefore the results of this run should not be used\n"
-            "for the purpose of benchmarking assembly time.\n"
-            "However the memory options don't affect assembly results in any way." << endl;
-    }
-
-    // Write out the build id again.
-    cout << buildId() << endl;
-
-    performanceLog << timestamp << "Assembly ends." << endl;
     cout << timestamp << "Assembly ends." << endl;
+    performanceLog << timestamp << "Assembly ends." << endl;
 }
 
 
@@ -474,8 +319,12 @@ void dinara::main::setupRunDirectory(
             // and may result in a password prompting depending on sudo set up.
             // Root privilege is not required if 2M pages have already
             // been set up as required.
+#ifdef __APPLE__
+            throw runtime_error("Option --memoryBacking 2M is not supported on macOS.");
+#else
             setupHugePages();
             pageSize = 2 * 1024 * 1024;
+#endif
 
         } else {
             throw runtime_error("Invalid value specified for --memoryBacking: " + memoryBacking +
@@ -498,6 +347,9 @@ void dinara::main::setupRunDirectory(
             // (filesystem in memory backed by 4K pages).
             // This requires root privilege, which is obtained using sudo
             // and may result in a password prompting depending on sudo set up.
+#ifdef __APPLE__
+            throw runtime_error("Option --memoryMode filesystem --memoryBacking 4K is not supported on macOS.");
+#else
             DINARA_ASSERT(std::filesystem::create_directory("Data"));
             dataDirectory = "Data/";
             pageSize = 4096;
@@ -507,6 +359,7 @@ void dinara::main::setupRunDirectory(
                 throw runtime_error("Error " + to_string(errorCode) + ": " + strerror(errorCode) +
                     " running command: " + command);
             }
+#endif
 
         } else if(memoryBacking == "2M") {
 
@@ -514,6 +367,9 @@ void dinara::main::setupRunDirectory(
             // (filesystem in memory backed by 2M pages).
             // This requires root privilege, which is obtained using sudo
             // and may result in a password prompting depending on sudo set up.
+#ifdef __APPLE__
+            throw runtime_error("Option --memoryMode filesystem --memoryBacking 2M is not supported on macOS.");
+#else
             setupHugePages();
             DINARA_ASSERT(std::filesystem::create_directory("Data"));
             dataDirectory = "Data/";
@@ -529,6 +385,7 @@ void dinara::main::setupRunDirectory(
                 throw runtime_error("Error " + to_string(errorCode) + ": " + strerror(errorCode) +
                     " running command: " + command);
             }
+#endif
 
         } else {
             throw runtime_error("Invalid value specified for --memoryBacking: " + memoryBacking +
@@ -551,8 +408,7 @@ void dinara::main::setupRunDirectory(
 void dinara::main::assemble(
     Assembler& assembler,
     const AssemblerOptions& assemblerOptions,
-    vector<string> inputFileNames,
-    const vector<string>& anchorFileNames)
+    vector<string> inputFileNames)
 {
     const auto steadyClock0 = std::chrono::steady_clock::now();
     const auto userClock0 = boost::chrono::process_user_cpu_clock::now();
@@ -644,17 +500,18 @@ void dinara::main::assemble(
     assembler.findMarkers(threadCount);
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
-    // If mode 3 assembly and Assembly.mode3.anchorCreationMethod is not
-    // FromMarkerGraphEdges, use the alignment free code path and return.
-    if(
-        (assemblerOptions.assemblyOptions.mode == 3) and
-        (assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromMarkerGraphEdges")) {
-        assembler.alignmentFreeAssembly(
-            assemblerOptions.assemblyOptions.mode3Options,
-            anchorFileNames,
-            threadCount);
-        return;
-    }
+    // // If mode 3 assembly and Assembly.mode3.anchorCreationMethod is not
+    // // FromMarkerGraphEdges, use the alignment free code path and return.
+    // if(
+    //     (assemblerOptions.assemblyOptions.mode == 3) and
+    //     (assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromMarkerGraphEdges")) {
+    //     const vector<string> emptyAnchorFiles;
+    //     assembler.alignmentFreeAssembly(
+    //         assemblerOptions.assemblyOptions.mode3Options,
+    //         emptyAnchorFiles,
+    //         threadCount);
+    //     return;
+    // }
 
     // If using alignment method 6, count marker k-mers.
     if(assemblerOptions.alignOptions.alignMethod == 6) {
@@ -817,22 +674,7 @@ void dinara::main::assemble(
 
 
     // Do the rest of the assembly using the selected assembly mode.
-    switch(assemblerOptions.assemblyOptions.mode) {
-    case 0:
-        mode0Assembly(assembler, assemblerOptions, threadCount);
-        break;
-    case 2:
-        mode2Assembly(assembler, assemblerOptions, threadCount);
-        break;
-    case 3:
-        mode3Assembly(assembler, assemblerOptions, threadCount);
-        break;
-    default:
-        throw runtime_error("Invalid value specified for --Assembly.mode. "
-            "Valid values are 0 (haploid assembly) and 2 (phased diploid assembly), but " +
-            to_string(assemblerOptions.assemblyOptions.mode) +
-            " was specified.");
-    }
+    mode3Assembly(assembler, assemblerOptions, threadCount);
 
 
     // Store elapsed time for assembly.
@@ -885,269 +727,6 @@ void dinara::main::assemble(
         int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
 }
-
-
-
-void dinara::main::mode0Assembly(
-    Assembler& assembler,
-    const AssemblerOptions& assemblerOptions,
-    uint32_t threadCount)
-{
-
-    // Iterative assembly, if requested (experimental).
-    if(assemblerOptions.assemblyOptions.iterative) {
-        for(uint64_t iteration=0;
-            iteration<assemblerOptions.assemblyOptions.iterativeIterationCount;
-            iteration++) {
-            cout << timestamp << "Iterative assembly iteration " << iteration << " begins." << endl;
-
-            // Do an assembly with the current read graph, without marker graph
-            // simplification or detangling.
-            assembler.createMarkerGraphVertices(
-                assemblerOptions.markerGraphOptions.minCoverage,
-                assemblerOptions.markerGraphOptions.maxCoverage,
-                assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-                assemblerOptions.markerGraphOptions.allowDuplicateMarkers,
-                assemblerOptions.markerGraphOptions.peakFinderMinAreaFraction,
-                assemblerOptions.markerGraphOptions.peakFinderAreaStartIndex,
-                threadCount);
-            assembler.findMarkerGraphReverseComplementVertices(threadCount);
-            assembler.createMarkerGraphEdges(threadCount);
-            assembler.findMarkerGraphReverseComplementEdges(threadCount);
-            assembler.transitiveReduction(
-                assemblerOptions.markerGraphOptions.lowCoverageThreshold,
-                assemblerOptions.markerGraphOptions.highCoverageThreshold,
-                assemblerOptions.markerGraphOptions.maxDistance,
-                assemblerOptions.markerGraphOptions.edgeMarkerSkipThreshold);
-            assembler.pruneMarkerGraphStrongSubgraph(
-                assemblerOptions.markerGraphOptions.pruneIterationCount);
-            assembler.createAssemblyGraphEdges();
-            assembler.createAssemblyGraphVertices();
-
-            // Recreate the read graph using pseudo-paths from this assembly.
-            assembler.createReadGraphUsingPseudoPaths(
-                assemblerOptions.assemblyOptions.iterativePseudoPathAlignMatchScore,
-                assemblerOptions.assemblyOptions.iterativePseudoPathAlignMismatchScore,
-                assemblerOptions.assemblyOptions.iterativePseudoPathAlignGapScore,
-                assemblerOptions.assemblyOptions.iterativeMismatchSquareFactor,
-                assemblerOptions.assemblyOptions.iterativeMinScore,
-                assemblerOptions.assemblyOptions.iterativeMaxAlignmentCount,
-                threadCount);
-            for(uint64_t bridgeRemovalIteration=0;
-                bridgeRemovalIteration<assemblerOptions.assemblyOptions.iterativeBridgeRemovalIterationCount;
-                bridgeRemovalIteration++) {
-                assembler.removeReadGraphBridges(
-                    assemblerOptions.assemblyOptions.iterativeBridgeRemovalMaxDistance);
-            }
-
-            // Remove the marker graph and assembly graph we created in the process.
-            assembler.markerGraph.remove();
-            assembler.assemblyGraphPointer.reset();
-
-        }
-
-        // Now we have a new read graph with some amount of separation
-        // between copies of long repeats and/or haplotypes.
-        // The rest of the assembly continues normally.
-    }
-
-
-
-    // Create marker graph vertices.
-    // This uses a disjoint sets data structure to merge markers
-    // that are aligned based on an alignment present in the read graph.
-    assembler.createMarkerGraphVertices(
-        assemblerOptions.markerGraphOptions.minCoverage,
-        assemblerOptions.markerGraphOptions.maxCoverage,
-        assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-        assemblerOptions.markerGraphOptions.allowDuplicateMarkers,
-        assemblerOptions.markerGraphOptions.peakFinderMinAreaFraction,
-        assemblerOptions.markerGraphOptions.peakFinderAreaStartIndex,
-        threadCount);
-
-    // Find the reverse complement of each marker graph vertex.
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-    // Clean up of duplicate markers, if requested and necessary.
-    if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
-        assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
-        assembler.cleanupDuplicateMarkers(
-            threadCount,
-            assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
-            assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-            assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
-            false, false);
-    }
-
-    // Create edges of the marker graph.
-    assembler.createMarkerGraphEdges(threadCount);
-    assembler.findMarkerGraphReverseComplementEdges(threadCount);
-
-    // Approximate transitive reduction.
-    assembler.transitiveReduction(
-        assemblerOptions.markerGraphOptions.lowCoverageThreshold,
-        assemblerOptions.markerGraphOptions.highCoverageThreshold,
-        assemblerOptions.markerGraphOptions.maxDistance,
-        assemblerOptions.markerGraphOptions.edgeMarkerSkipThreshold);
-
-    // Prune the marker graph.
-    assembler.pruneMarkerGraphStrongSubgraph(
-        assemblerOptions.markerGraphOptions.pruneIterationCount);
-
-    // Compute marker graph coverage histogram.
-    assembler.computeMarkerGraphCoverageHistogram();
-
-    // Simplify the marker graph to remove bubbles and superbubbles.
-    // The maxLength parameter controls the maximum number of markers
-    // for a branch to be collapsed during each iteration.
-    assembler.simplifyMarkerGraph(assemblerOptions.markerGraphOptions.simplifyMaxLengthVector, false);
-
-    // Create the assembly graph.
-    assembler.createAssemblyGraphEdges();
-    assembler.createAssemblyGraphVertices();
-
-    // Remove low-coverage cross-edges from the assembly graph and
-    // the corresponding marker graph edges.
-    if(assemblerOptions.markerGraphOptions.crossEdgeCoverageThreshold > 0.) {
-        assembler.removeLowCoverageCrossEdges(
-            uint32_t(assemblerOptions.markerGraphOptions.crossEdgeCoverageThreshold));
-        assembler.assemblyGraphPointer->remove();
-        assembler.createAssemblyGraphEdges();
-        assembler.createAssemblyGraphVertices();
-    }
-
-    // Prune the assembly graph, if requested.
-    if(assemblerOptions.assemblyOptions.pruneLength > 0) {
-        assembler.pruneAssemblyGraph(assemblerOptions.assemblyOptions.pruneLength);
-    }
-
-    // Detangle, if requested.
-    if(assemblerOptions.assemblyOptions.detangleMethod == 1) {
-        assembler.detangle();
-    } else if(assemblerOptions.assemblyOptions.detangleMethod == 2) {
-        assembler.detangle2(
-            assemblerOptions.assemblyOptions.detangleDiagonalReadCountMin,
-            assemblerOptions.assemblyOptions.detangleOffDiagonalReadCountMax,
-            assemblerOptions.assemblyOptions.detangleOffDiagonalRatio
-            );
-    }
-
-    // If any detangling was done, remove low-coverage cross-edges again.
-    if(assemblerOptions.assemblyOptions.detangleMethod != 0 and
-        assemblerOptions.markerGraphOptions.crossEdgeCoverageThreshold > 0.) {
-        assembler.removeLowCoverageCrossEdges(
-            uint32_t(assemblerOptions.markerGraphOptions.crossEdgeCoverageThreshold));
-        assembler.assemblyGraphPointer->remove();
-        assembler.createAssemblyGraphEdges();
-        assembler.createAssemblyGraphVertices();
-    }
-
-    // Compute optimal repeat counts for each vertex of the marker graph.
-    if(assemblerOptions.readsOptions.representation == 1) {
-        assembler.assembleMarkerGraphVertices(threadCount);
-    }
-
-    // If coverage data was requested, compute and store coverage data for the vertices.
-    if(assemblerOptions.assemblyOptions.storeCoverageData or
-        assemblerOptions.assemblyOptions.storeCoverageDataCsvLengthThreshold>0) {
-        assembler.computeMarkerGraphVerticesCoverageData(threadCount);
-    }
-
-    // Compute consensus sequence for marker graph edges to be used for assembly.
-    assembler.assembleMarkerGraphEdges(
-        threadCount,
-        assemblerOptions.assemblyOptions.markerGraphEdgeLengthThresholdForConsensus,
-        assemblerOptions.assemblyOptions.storeCoverageData or
-        assemblerOptions.assemblyOptions.storeCoverageDataCsvLengthThreshold>0,
-        false
-        );
-
-    // Use the assembly graph for global assembly.
-    assembler.assemble(
-        threadCount,
-        assemblerOptions.assemblyOptions.storeCoverageDataCsvLengthThreshold);
-    // assembler.findAssemblyGraphBubbles();
-    assembler.computeAssemblyStatistics();
-    assembler.writeGfa1("Assembly.gfa");
-    assembler.writeGfa1BothStrands("Assembly-BothStrands.gfa");
-    assembler.writeGfa1BothStrandsNoSequence("Assembly-BothStrands-NoSequence.gfa");
-    assembler.writeFasta("Assembly.fasta");
-
-    // If requested, write out the oriented reads that were used to assemble
-    // each assembled segment.
-    if(assemblerOptions.assemblyOptions.writeReadsByAssembledSegment) {
-        cout << timestamp << " Writing the oriented reads that were used to assemble each segment." << endl;
-        assembler.gatherOrientedReadsByAssemblyGraphEdge(threadCount);
-        assembler.writeOrientedReadsByAssemblyGraphEdge();
-    }
-}
-
-
-
-void dinara::main::mode2Assembly(
-    Assembler& assembler,
-    const AssemblerOptions& assemblerOptions,
-    uint32_t threadCount)
-{
-    // Create marker graph vertices.
-    assembler.createMarkerGraphVertices(
-        assemblerOptions.markerGraphOptions.minCoverage,
-        assemblerOptions.markerGraphOptions.maxCoverage,
-        assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-        assemblerOptions.markerGraphOptions.allowDuplicateMarkers,
-        assemblerOptions.markerGraphOptions.peakFinderMinAreaFraction,
-        assemblerOptions.markerGraphOptions.peakFinderAreaStartIndex,
-        threadCount);
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-    // Create marker graph edges.
-    // For assembly mode 1 we use createMarkerGraphEdgesStrict
-    // with minimum edge coverage (total and per strand).
-    assembler.createMarkerGraphEdgesStrict(
-        assemblerOptions.markerGraphOptions.minEdgeCoverage,
-        assemblerOptions.markerGraphOptions.minEdgeCoveragePerStrand, threadCount);
-    assembler.findMarkerGraphReverseComplementEdges(threadCount);
-
-    // Coverage histograms for vertices and edges of the marker graph.
-    assembler.computeMarkerGraphCoverageHistogram();
-
-    // To recover contiguity, add secondary edges.
-    assembler.createMarkerGraphSecondaryEdges(
-        uint32_t(assemblerOptions.markerGraphOptions.secondaryEdgesMaxSkip),
-        threadCount);
-    assembler.splitMarkerGraphSecondaryEdges(
-        assemblerOptions.markerGraphOptions.secondaryEdgesSplitErrorRateThreshold,
-        assemblerOptions.markerGraphOptions.secondaryEdgesSplitMinCoverage,
-        threadCount);
-
-    // Coverage histograms for vertices and edges of the marker graph.
-    assembler.computeMarkerGraphCoverageHistogram();
-
-    // Compute optimal repeat counts for each vertex of the marker graph.
-    if(assemblerOptions.readsOptions.representation == 1) {
-        assembler.assembleMarkerGraphVertices(threadCount);
-    }
-
-    // Compute consensus sequence for all marker graph edges.
-    assembler.assembleMarkerGraphEdges(
-        threadCount,
-        assemblerOptions.assemblyOptions.markerGraphEdgeLengthThresholdForConsensus,
-        assemblerOptions.assemblyOptions.storeCoverageData or
-        assemblerOptions.assemblyOptions.storeCoverageDataCsvLengthThreshold>0,
-        true
-        );
-
-    // Create the mode 2 assembly graph.
-    assembler.createAssemblyGraph2(
-        assemblerOptions.assemblyOptions.pruneLength,
-        assemblerOptions.assemblyOptions.mode2Options,
-        threadCount, false);
-
-
-}
-
-
-
 
 
 
@@ -1465,66 +1044,6 @@ void dinara::main::explore(
 
 
 
-// This creates a bash completion script for the Dinara executable,
-// which makes it easier to type long option names.
-// To use it:
-// dinara --command createBashCompletionScript; source dinaraCompletion.sh
-// Then, press TAB once or twice while editing a Dinara command line
-// to get the Bash shell to suggest or fill in possibilities.
-// You can put the "source" command in your .bashrc or other
-// appropriate location.
-// THIS IS AN INITIAL CUT AND LACKS MANY DESIRABLE FEATURES,
-// LIKE FOR EXAMPLE COMPLETION OF FILE NAMES (AFTER --input),
-// AND THE ABILITY TO COMPLETE KEYWORDS ONLY AFTER THE OPTION THEY
-// SHOULD BE PRECEDED BY.
-// IF SOMEBODY WITH A GOOD UNDERSTANDING OF BASH COMPLETION SEES THIS,
-// PLEASE MAKE IT BETTER AND SUBMIT A PULL REQUEST!
-void dinara::main::createBashCompletionScript(const AssemblerOptions& assemblerOptions)
-{
-    const string fileName = "dinaraCompletion.sh";
-    ofstream file(fileName);
-
-    file << "#!/bin/bash\n";
-    file << "complete -o default -W \"\\\n";
-
-    // Options.
-    for(const auto& option: assemblerOptions.allOptionsDescription.options()) {
-        file << "--" << option->long_name() << " \\\n";
-    }
-
-    // Commands.
-    for(const auto& command: commands) {
-        file << command << " \\\n";
-    }
-
-    // Built-in configurations.
-    for(const auto& p: configurationTable) {
-        file << p.first << " \\\n";
-    }
-
-    // Bayesian models.
-    for(const string& name: SimpleBayesianConsensusCaller::builtIns) {
-        file << name << " \\\n";
-    }
-
-    // Other keywords. This should be modified to only accept them after the appropriate option.
-    file << "filesystem anonymous \\\n";
-    file << "disk 4K 2M \\\n";
-    file << "user local unrestricted \\\n";
-    file << "Bayesian Modal Median \\\n";
-
-    // Finish the "complete" command.
-    file << "\" dinara\n";
-
-    cout << "Created dinaraCompletion.sh. "
-        "In the bash shell, use the following command to "
-        "get shell command completion when invoking Dinara:\n"
-        "source dinaraCompletion.sh\n"
-        "This makes it easier to type when running Dinara." << endl;
-
-}
-
-
 
 void dinara::main::listCommands()
 {
@@ -1533,45 +1052,3 @@ void dinara::main::listCommands()
         cout << command << endl;
     }
 }
-
-
-
-void dinara::main::listConfigurations()
-{
-    cout << "Valid Dinara built-in configurations, in chronological order, are:\n" << endl;
-    for(const auto& p: configurationTable) {
-        cout << p.first << endl;
-    }
-    cout <<
-        "\nUse \"dinara --command listConfiguration --config configurationName\" "
-        "to list the details of one of the above configurations.\n\n"
-        "When running an assembly, you can use option \"--config\" "
-        "to specify any of the above configuration names, "
-        "or the name of a configuration file. "
-        "See dinara/conf for examples of configuration files. "
-        "Each of the above configurations has a corresponding "
-        "configuration file in dinara/conf." << endl;
-}
-
-
-
-void dinara::main::listConfiguration(const AssemblerOptions& options)
-{
-    const string& configName = options.commandLineOnlyOptions.configName;
-
-    if(configName.empty()) {
-        throw runtime_error("Specify --config with a valid configuration name.");
-    }
-
-    const string* configuration = getConfiguration(configName);
-    if(configuration == 0) {
-        const string message = configName + " is not a valid configuration name.";
-        cout << message << endl;
-        listConfigurations();
-        throw runtime_error(configName);
-    }
-
-    cout << *configuration << flush;
-}
-
-
