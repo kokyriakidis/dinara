@@ -19,7 +19,11 @@
 // Linux.
 #include <fcntl.h>
 #include <sys/mman.h>
+
+#ifdef __linux__
 #include <linux/mman.h>
+#endif
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
