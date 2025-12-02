@@ -24,6 +24,10 @@
 #include <linux/mman.h>
 #endif
 
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0
+#endif
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
