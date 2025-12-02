@@ -804,170 +804,170 @@ void Assembler::performGlobalVariantClustering(
 
 
 
-    {
-        // Verify reverse complement consistency
-        const auto tVerifyStart = steady_clock::now();
-        performanceLog << timestamp << "Verifying reverse complement consistency" << endl;
-        cout << "\nVerifying reverse complement consistency..." << endl;
+    // {
+    //     // Verify reverse complement consistency
+    //     const auto tVerifyStart = steady_clock::now();
+    //     performanceLog << timestamp << "Verifying reverse complement consistency" << endl;
+    //     cout << "\nVerifying reverse complement consistency..." << endl;
 
-        // Build reverse complement index map: (readId, strand, position) -> index
-        std::map<pair<ReadId, pair<Strand, uint32_t>>, uint64_t> pairToIndex;
-        for (uint64_t i = 0; i < variantClusteringPositionPairs.size(); i++) {
-            const auto& p = variantClusteringPositionPairs[i];
-            pairToIndex[{p.first.getReadId(), {p.first.getStrand(), p.second}}] = i;
-        }
+    //     // Build reverse complement index map: (readId, strand, position) -> index
+    //     std::map<pair<ReadId, pair<Strand, uint32_t>>, uint64_t> pairToIndex;
+    //     for (uint64_t i = 0; i < variantClusteringPositionPairs.size(); i++) {
+    //         const auto& p = variantClusteringPositionPairs[i];
+    //         pairToIndex[{p.first.getReadId(), {p.first.getStrand(), p.second}}] = i;
+    //     }
 
-        uint64_t inconsistencies = 0;
-        uint64_t checkedPairs = 0;
-        // const uint64_t sampleSize = std::min(variantClusteringPositionPairs.size(), uint64_t(10000));
-        const uint64_t sampleSize = variantClusteringPositionPairs.size();
+    //     uint64_t inconsistencies = 0;
+    //     uint64_t checkedPairs = 0;
+    //     // const uint64_t sampleSize = std::min(variantClusteringPositionPairs.size(), uint64_t(10000));
+    //     const uint64_t sampleSize = variantClusteringPositionPairs.size();
 
-        // Sample check: verify that if (readId, 0, pos) is linked with others,
-        // then (readId, 1, readLength-1-pos) is linked with corresponding RC pairs
-        for (uint64_t i = 0; i < sampleSize; i++) {
-            const auto& pair = variantClusteringPositionPairs[i];
-            const ReadId readId = pair.first.getReadId();
-            const Strand strand = pair.first.getStrand();
-            const uint32_t position = pair.second;
+    //     // Sample check: verify that if (readId, 0, pos) is linked with others,
+    //     // then (readId, 1, readLength-1-pos) is linked with corresponding RC pairs
+    //     for (uint64_t i = 0; i < sampleSize; i++) {
+    //         const auto& pair = variantClusteringPositionPairs[i];
+    //         const ReadId readId = pair.first.getReadId();
+    //         const Strand strand = pair.first.getStrand();
+    //         const uint32_t position = pair.second;
             
-            // Only check strand 0 pairs
-            if (strand != 0) continue;
+    //         // Only check strand 0 pairs
+    //         if (strand != 0) continue;
             
-            checkedPairs++;
+    //         checkedPairs++;
             
-            // Find reverse complement pair
-            const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
-            const uint32_t positionRc = readLength - 1 - position;
-            const auto rcKey = make_pair(readId, make_pair(Strand(1), positionRc));
+    //         // Find reverse complement pair
+    //         const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
+    //         const uint32_t positionRc = readLength - 1 - position;
+    //         const auto rcKey = make_pair(readId, make_pair(Strand(1), positionRc));
             
-            auto rcIt = pairToIndex.find(rcKey);
-            if (rcIt == pairToIndex.end()) {
-                continue; // RC pair was filtered out, skip
-            }
+    //         auto rcIt = pairToIndex.find(rcKey);
+    //         if (rcIt == pairToIndex.end()) {
+    //             continue; // RC pair was filtered out, skip
+    //         }
             
-            const uint64_t rcIndex = rcIt->second;
-            const uint64_t setId0 = variantClusteringDisjointSets->find(i);
-            const uint64_t setId0Rc = variantClusteringDisjointSets->find(rcIndex);
+    //         const uint64_t rcIndex = rcIt->second;
+    //         const uint64_t setId0 = variantClusteringDisjointSets->find(i);
+    //         const uint64_t setId0Rc = variantClusteringDisjointSets->find(rcIndex);
             
-            // Find all pairs in the same set as i
-            std::vector<uint64_t> linkedPairs;
-            for (uint64_t j = 0; j < variantClusteringPositionPairs.size(); j++) {
-                if (variantClusteringDisjointSets->find(j) == setId0) {
-                    linkedPairs.push_back(j);
-                }
-            }
+    //         // Find all pairs in the same set as i
+    //         std::vector<uint64_t> linkedPairs;
+    //         for (uint64_t j = 0; j < variantClusteringPositionPairs.size(); j++) {
+    //             if (variantClusteringDisjointSets->find(j) == setId0) {
+    //                 linkedPairs.push_back(j);
+    //             }
+    //         }
             
-            // For each linked pair j (strand 0), check if rc(j) is linked with rc(i)
-            for (uint64_t j : linkedPairs) {
-                if (i == j) continue;
+    //         // For each linked pair j (strand 0), check if rc(j) is linked with rc(i)
+    //         for (uint64_t j : linkedPairs) {
+    //             if (i == j) continue;
                 
-                const auto& pairJ = variantClusteringPositionPairs[j];
-                if (pairJ.first.getStrand() != 0) continue; // Only check strand 0 pairs
+    //             const auto& pairJ = variantClusteringPositionPairs[j];
+    //             if (pairJ.first.getStrand() != 0) continue; // Only check strand 0 pairs
                 
-                const ReadId readIdJ = pairJ.first.getReadId();
-                const uint64_t readLengthJ = getReads().getReadRawSequenceLength(readIdJ);
-                const uint32_t positionJRc = readLengthJ - 1 - pairJ.second;
-                const auto rcJKey = make_pair(readIdJ, make_pair(Strand(1), positionJRc));
+    //             const ReadId readIdJ = pairJ.first.getReadId();
+    //             const uint64_t readLengthJ = getReads().getReadRawSequenceLength(readIdJ);
+    //             const uint32_t positionJRc = readLengthJ - 1 - pairJ.second;
+    //             const auto rcJKey = make_pair(readIdJ, make_pair(Strand(1), positionJRc));
                 
-                auto rcJIt = pairToIndex.find(rcJKey);
-                if (rcJIt == pairToIndex.end()) continue;
+    //             auto rcJIt = pairToIndex.find(rcJKey);
+    //             if (rcJIt == pairToIndex.end()) continue;
                 
-                const uint64_t rcJIndex = rcJIt->second;
-                const uint64_t setIdJRc = variantClusteringDisjointSets->find(rcJIndex);
+    //             const uint64_t rcJIndex = rcJIt->second;
+    //             const uint64_t setIdJRc = variantClusteringDisjointSets->find(rcJIndex);
                 
-                // Check consistency: rc(i) and rc(j) should be in the same set
-                if (setIdJRc != setId0Rc) {
-                    inconsistencies++;
-                    if (inconsistencies <= 5) {
-                        cout << "INCONSISTENCY: " << pair.first << ":" << position 
-                            << " linked with " << pairJ.first << ":" << pairJ.second
-                            << ", but RC pairs are NOT linked" << endl;
-                    }
-                }
-            }
-        }
+    //             // Check consistency: rc(i) and rc(j) should be in the same set
+    //             if (setIdJRc != setId0Rc) {
+    //                 inconsistencies++;
+    //                 if (inconsistencies <= 5) {
+    //                     cout << "INCONSISTENCY: " << pair.first << ":" << position 
+    //                         << " linked with " << pairJ.first << ":" << pairJ.second
+    //                         << ", but RC pairs are NOT linked" << endl;
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        const auto tVerifyEnd = steady_clock::now();
-        const double tVerify = seconds(tVerifyEnd - tVerifyStart);
+    //     const auto tVerifyEnd = steady_clock::now();
+    //     const double tVerify = seconds(tVerifyEnd - tVerifyStart);
 
-        cout << "Verification: checked " << checkedPairs << " pairs, found " 
-            << inconsistencies << " inconsistencies" << endl;
-        if (inconsistencies == 0) {
-            cout << "✓ Reverse complement consistency verified!" << endl;
-        } else {
-            cout << "✗ WARNING: Found inconsistencies - check Phase 2 linking logic!" << endl;
-        }
-        performanceLog << timestamp << "Verification: " << checkedPairs << " pairs checked, " 
-                    << inconsistencies << " inconsistencies" << endl;
-    }
+    //     cout << "Verification: checked " << checkedPairs << " pairs, found " 
+    //         << inconsistencies << " inconsistencies" << endl;
+    //     if (inconsistencies == 0) {
+    //         cout << "✓ Reverse complement consistency verified!" << endl;
+    //     } else {
+    //         cout << "✗ WARNING: Found inconsistencies - check Phase 2 linking logic!" << endl;
+    //     }
+    //     performanceLog << timestamp << "Verification: " << checkedPairs << " pairs checked, " 
+    //                 << inconsistencies << " inconsistencies" << endl;
+    // }
     
-    // Verify reverse complement pair EXISTENCE (not just linkage)
-    {
-        const auto tVerifyExistenceStart = steady_clock::now();
-        performanceLog << timestamp << "Verifying reverse complement pair existence" << endl;
-        cout << "\nVerifying reverse complement pair existence..." << endl;
+    // // Verify reverse complement pair EXISTENCE (not just linkage)
+    // {
+    //     const auto tVerifyExistenceStart = steady_clock::now();
+    //     performanceLog << timestamp << "Verifying reverse complement pair existence" << endl;
+    //     cout << "\nVerifying reverse complement pair existence..." << endl;
         
-        // Check if every forward pair has a corresponding RC pair
-        uint64_t missingRcPairs = 0;
-        uint64_t strand0Count = 0;
-        uint64_t strand1Count = 0;
+    //     // Check if every forward pair has a corresponding RC pair
+    //     uint64_t missingRcPairs = 0;
+    //     uint64_t strand0Count = 0;
+    //     uint64_t strand1Count = 0;
         
-        // Build a set of all pairs for fast lookup
-        std::set<pair<OrientedReadId, uint32_t>> pairSet;
-        for (const auto& p : variantClusteringPositionPairs) {
-            pairSet.insert(p);
-            if (p.first.getStrand() == 0) {
-                strand0Count++;
-            } else {
-                strand1Count++;
-            }
-        }
+    //     // Build a set of all pairs for fast lookup
+    //     std::set<pair<OrientedReadId, uint32_t>> pairSet;
+    //     for (const auto& p : variantClusteringPositionPairs) {
+    //         pairSet.insert(p);
+    //         if (p.first.getStrand() == 0) {
+    //             strand0Count++;
+    //         } else {
+    //             strand1Count++;
+    //         }
+    //     }
         
-        // Check each pair to see if its RC counterpart exists
-        for (const auto& pair : variantClusteringPositionPairs) {
-            const ReadId readId = pair.first.getReadId();
-            const Strand strand = pair.first.getStrand();
-            const uint32_t position = pair.second;
+    //     // Check each pair to see if its RC counterpart exists
+    //     for (const auto& pair : variantClusteringPositionPairs) {
+    //         const ReadId readId = pair.first.getReadId();
+    //         const Strand strand = pair.first.getStrand();
+    //         const uint32_t position = pair.second;
             
-            // Calculate RC pair
-            const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
-            const uint32_t positionRc = readLength - 1 - position;
-            const Strand strandRc = 1 - strand;
-            OrientedReadId orientedReadIdRc(readId, strandRc);
-            const auto rcPair = make_pair(orientedReadIdRc, positionRc);
+    //         // Calculate RC pair
+    //         const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
+    //         const uint32_t positionRc = readLength - 1 - position;
+    //         const Strand strandRc = 1 - strand;
+    //         OrientedReadId orientedReadIdRc(readId, strandRc);
+    //         const auto rcPair = make_pair(orientedReadIdRc, positionRc);
             
-            // Check if RC pair exists
-            if (pairSet.find(rcPair) == pairSet.end()) {
-                missingRcPairs++;
-                if (missingRcPairs <= 5) {
-                    cout << "MISSING RC PAIR: " << pair.first << ":" << position 
-                         << " exists, but RC pair " << orientedReadIdRc << ":" << positionRc
-                         << " does NOT exist" << endl;
-                }
-            }
-        }
+    //         // Check if RC pair exists
+    //         if (pairSet.find(rcPair) == pairSet.end()) {
+    //             missingRcPairs++;
+    //             if (missingRcPairs <= 5) {
+    //                 cout << "MISSING RC PAIR: " << pair.first << ":" << position 
+    //                      << " exists, but RC pair " << orientedReadIdRc << ":" << positionRc
+    //                      << " does NOT exist" << endl;
+    //             }
+    //         }
+    //     }
         
-        const auto tVerifyExistenceEnd = steady_clock::now();
-        const double tVerifyExistence = seconds(tVerifyExistenceEnd - tVerifyExistenceStart);
+    //     const auto tVerifyExistenceEnd = steady_clock::now();
+    //     const double tVerifyExistence = seconds(tVerifyExistenceEnd - tVerifyExistenceStart);
         
-        cout << "Pair existence check:" << endl;
-        cout << "  Total pairs: " << variantClusteringPositionPairs.size() << endl;
-        cout << "  Strand 0 pairs: " << strand0Count << endl;
-        cout << "  Strand 1 pairs: " << strand1Count << endl;
-        cout << "  Missing RC pairs: " << missingRcPairs << endl;
+    //     cout << "Pair existence check:" << endl;
+    //     cout << "  Total pairs: " << variantClusteringPositionPairs.size() << endl;
+    //     cout << "  Strand 0 pairs: " << strand0Count << endl;
+    //     cout << "  Strand 1 pairs: " << strand1Count << endl;
+    //     cout << "  Missing RC pairs: " << missingRcPairs << endl;
         
-        if (missingRcPairs == 0) {
-            cout << "✓ All pairs have their reverse complement counterparts!" << endl;
-        } else {
-            cout << "✗ WARNING: " << missingRcPairs << " pairs are missing their RC counterparts!" << endl;
-            cout << "  This explains why DINARA_ASSERT(found0 && found1 && found0Rc && found1Rc) fails." << endl;
-            cout << "  Phase 1 filtering created an asymmetry between forward and RC strands." << endl;
-        }
+    //     if (missingRcPairs == 0) {
+    //         cout << "✓ All pairs have their reverse complement counterparts!" << endl;
+    //     } else {
+    //         cout << "✗ WARNING: " << missingRcPairs << " pairs are missing their RC counterparts!" << endl;
+    //         cout << "  This explains why DINARA_ASSERT(found0 && found1 && found0Rc && found1Rc) fails." << endl;
+    //         cout << "  Phase 1 filtering created an asymmetry between forward and RC strands." << endl;
+    //     }
         
-        performanceLog << timestamp << "RC existence verification: " 
-                      << missingRcPairs << " missing RC pairs out of " 
-                      << variantClusteringPositionPairs.size() << " total pairs" << endl;
-    }
+    //     performanceLog << timestamp << "RC existence verification: " 
+    //                   << missingRcPairs << " missing RC pairs out of " 
+    //                   << variantClusteringPositionPairs.size() << " total pairs" << endl;
+    // }
 
 
 
