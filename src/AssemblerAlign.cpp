@@ -22,6 +22,8 @@ using namespace dinara;
 #include <filesystem>
 #include "iterator.hpp"
 #include "tuple.hpp"
+#include <fstream>
+#include <sstream>
 
 
 
@@ -220,6 +222,62 @@ void Assembler::computeAlignments(
 {
 
     const auto tBegin = steady_clock::now();
+
+    // Check if a PAF file exists at the hardcoded location.
+    const string pafFilePath = "/home/kokyriakidis/Downloads/blend/bin/output.paf";
+    if (std::filesystem::exists(pafFilePath)) {
+        cout << timestamp << "Loading alignment candidates from " << pafFilePath << endl;
+        alignmentCandidates.candidates.clear();
+        std::ifstream pafFile(pafFilePath);
+        string line;
+        while (std::getline(pafFile, line)) {
+            std::stringstream ss(line);
+            string qName, tName, strandStr;
+            uint64_t qLen, qStart, qEnd, tLen, tStart, tEnd, mapQ, alignLen;
+            
+            // PAF columns:
+            // 1: Query name
+            // 2: Query length
+            // 3: Query start
+            // 4: Query end
+            // 5: Strand (+/-)
+            // 6: Target name
+            // 7: Target length
+            // 8: Target start
+            // 9: Target end
+            // 10: Number of residue matches
+            // 11: Alignment block length
+            
+            if (!(ss >> qName >> qLen >> qStart >> qEnd >> strandStr >> tName >> tLen >> tStart >> tEnd >> mapQ >> alignLen)) {
+                continue; 
+            }
+
+            if (alignLen < 1000) {
+                continue;
+            }
+
+            try {
+                ReadId readId0 = reads->getReadId(qName);
+                ReadId readId1 = reads->getReadId(tName);
+
+                if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) {
+                    continue;
+                }
+                if (readId0 == readId1) continue; 
+
+                bool isSameStrand = (strandStr == "+");
+                
+                if (readId0 > readId1) {
+                    swap(readId0, readId1);
+                }
+                
+                alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
+            } catch (...) {
+                continue;
+            }
+        }
+        cout << timestamp << "Loaded " << alignmentCandidates.candidates.size() << " candidates from PAF." << endl;
+    }
     performanceLog << timestamp << "Begin computing alignments for ";
     performanceLog << alignmentCandidates.candidates.size() << " alignment candidates." << endl;
 

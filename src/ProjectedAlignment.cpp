@@ -9,6 +9,7 @@
 using namespace dinara;
 
 #include "algorithm.hpp"
+#include <iostream>
 
 
 
@@ -246,36 +247,116 @@ void ProjectedAlignmentSegment::computeAlignment(
         editDistance = 0;
         alignment.resize(sequence0.size());
         fill(alignment.begin(), alignment.end(), make_pair(true, true));
+        mismatchCount = 0;
 
     } else {
-        editDistance =  -seqanAlign(
-            sequence0.begin(), sequence0.end(),
-            sequence1.begin(), sequence1.end(),
-            matchScore,
-            mismatchScore,
-            gapScore,
-            false,
-            false,
-            alignment);
-    }
+        // Convert sequences to ASCII for A*PA2
+        // Use thread_local buffers to avoid allocation
+        static thread_local vector<uint8_t> asciiSequence0;
+        static thread_local vector<uint8_t> asciiSequence1;
+        asciiSequence0.clear();
+        asciiSequence1.clear();
+        asciiSequence0.reserve(sequence0.size());
+        asciiSequence1.reserve(sequence1.size());
 
-    // Compute the number of mismatches in the alignment.
-    mismatchCount = 0;
-    uint64_t position0 = 0;
-    uint64_t position1 = 0;
-    for(const pair<bool, bool>& p: alignment) {
-        if(p.first and p.second and (sequence0[position0] != sequence1[position1])) {
-            ++mismatchCount;
+        static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
+
+        // Fast conversion using lookup table
+        for(uint8_t b : sequence0) {
+            asciiSequence0.push_back(b < 4 ? baseToAscii[b] : 'N');
         }
-        if(p.first) {
-            ++position0;
+        for(uint8_t b : sequence1) {
+            asciiSequence1.push_back(b < 4 ? baseToAscii[b] : 'N');
         }
-        if(p.second) {
-            ++position1;
+
+        char* cigar = nullptr;
+        size_t cigarLen = 0;
+        int64_t cost = astarpa2_simple(
+            asciiSequence0.data(), asciiSequence0.size(),
+            asciiSequence1.data(), asciiSequence1.size(),
+            (unsigned char**)&cigar, &cigarLen);
+        
+        // Convert cost to edit distance (A*PA2 cost is usually edit distance if using defaults)
+        // But here we just use the returned cost.
+        editDistance = cost;
+
+        // Parse CIGAR directly from char*
+        alignment.clear();
+        
+        // Optimization: Pre-calculate total alignment length to avoid reallocations
+        size_t totalAlignmentLength = 0;
+        size_t currentVal = 0;
+        for(size_t i=0; i<cigarLen; i++) {
+            char c = cigar[i];
+            if(isdigit(c)) {
+                currentVal = currentVal * 10 + (c - '0');
+            } else {
+                if(currentVal == 0) currentVal = 1;
+                // All supported operations (M, =, X, I, D, S, N) contribute to alignment vector length
+                // H (hard clip) does not.
+                if (c != 'H') {
+                    totalAlignmentLength += currentVal;
+                }
+                currentVal = 0;
+            }
         }
+        
+        alignment.resize(totalAlignmentLength);
+
+        // Fill the alignment vector AND compute mismatchCount
+        size_t currentIndex = 0;
+        currentVal = 0;
+        uint64_t position0 = 0;
+        uint64_t position1 = 0;
+        mismatchCount = 0;
+
+        for(size_t i=0; i<cigarLen; i++) {
+            char c = cigar[i];
+            if(isdigit(c)) {
+                currentVal = currentVal * 10 + (c - '0');
+            } else {
+                if(currentVal == 0) currentVal = 1;
+                
+                pair<bool, bool> op;
+                if(c == 'M' || c == '=' || c == 'X') {
+                    op = {true, true};
+                } else if(c == 'I') {
+                    op = {false, true};
+                } else if(c == 'D') {
+                    op = {true, false};
+                } else {
+                    op = {true, true}; // Default
+                }
+
+                if (c == 'M' || c == '=' || c == 'X' || c == 'I' || c == 'D') {
+                    // Fill alignment
+                    std::fill(alignment.begin() + currentIndex, alignment.begin() + currentIndex + currentVal, op);
+                    currentIndex += currentVal;
+
+                    // Update mismatchCount and positions
+                    if (op.first && op.second) { // M, =, X
+                        for(size_t k=0; k<currentVal; ++k) {
+                            if (sequence0[position0 + k] != sequence1[position1 + k]) {
+                                mismatchCount++;
+                            }
+                        }
+                        position0 += currentVal;
+                        position1 += currentVal;
+                    } else if (op.first) { // D
+                        position0 += currentVal;
+                    } else if (op.second) { // I
+                        position1 += currentVal;
+                    }
+                }
+                currentVal = 0;
+            }
+        }
+        
+        astarpa_free_cigar((unsigned char*)cigar);
+
+        DINARA_ASSERT(position0 == sequence0.size());
+        DINARA_ASSERT(position1 == sequence1.size());
     }
-    DINARA_ASSERT(position0 == sequence0.size());
-    DINARA_ASSERT(position1 == sequence1.size());
 
 }
 
@@ -293,36 +374,116 @@ void ProjectedAlignmentSegment::computeRleAlignment(
         rleEditDistance = 0;
         rleAlignment.resize(sequence0.size());
         fill(rleAlignment.begin(), rleAlignment.end(), make_pair(true, true));
+        mismatchCountRle = 0;
 
     } else {
-        rleEditDistance =  -seqanAlign(
-            sequence0.begin(), sequence0.end(),
-            sequence1.begin(), sequence1.end(),
-            matchScore,
-            mismatchScore,
-            gapScore,
-            false,
-            false,
-            rleAlignment);
-    }
+        // Convert sequences to ASCII for A*PA2
+        // Use thread_local buffers to avoid allocation
+        static thread_local vector<uint8_t> asciiSequence0;
+        static thread_local vector<uint8_t> asciiSequence1;
+        asciiSequence0.clear();
+        asciiSequence1.clear();
+        asciiSequence0.reserve(sequence0.size());
+        asciiSequence1.reserve(sequence1.size());
 
-    // Compute the number of mismatches in the RLE alignment.
-    mismatchCountRle = 0;
-    uint64_t position0 = 0;
-    uint64_t position1 = 0;
-    for(const pair<bool, bool>& p: rleAlignment) {
-        if(p.first and p.second and (sequence0[position0] != sequence1[position1])) {
-            ++mismatchCountRle;
+        static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
+
+        // Fast conversion using lookup table
+        for(uint8_t b : sequence0) {
+            asciiSequence0.push_back(b < 4 ? baseToAscii[b] : 'N');
         }
-        if(p.first) {
-            ++position0;
+        for(uint8_t b : sequence1) {
+            asciiSequence1.push_back(b < 4 ? baseToAscii[b] : 'N');
         }
-        if(p.second) {
-            ++position1;
+
+        char* cigar = nullptr;
+        size_t cigarLen = 0;
+        int64_t cost = astarpa2_simple(
+            asciiSequence0.data(), asciiSequence0.size(),
+            asciiSequence1.data(), asciiSequence1.size(),
+            (unsigned char**)&cigar, &cigarLen);
+        
+        // Convert cost to edit distance (A*PA2 cost is usually edit distance if using defaults)
+        // But here we just use the returned cost.
+        rleEditDistance = cost;
+
+        // Parse CIGAR directly from char*
+        rleAlignment.clear();
+        
+        // Optimization: Pre-calculate total alignment length to avoid reallocations
+        size_t totalAlignmentLength = 0;
+        size_t currentVal = 0;
+        for(size_t i=0; i<cigarLen; i++) {
+            char c = cigar[i];
+            if(isdigit(c)) {
+                currentVal = currentVal * 10 + (c - '0');
+            } else {
+                if(currentVal == 0) currentVal = 1;
+                // All supported operations (M, =, X, I, D, S, N) contribute to alignment vector length
+                // H (hard clip) does not.
+                if (c != 'H') {
+                    totalAlignmentLength += currentVal;
+                }
+                currentVal = 0;
+            }
         }
+        
+        rleAlignment.resize(totalAlignmentLength);
+
+        // Fill the alignment vector AND compute mismatchCountRle
+        size_t currentIndex = 0;
+        currentVal = 0;
+        uint64_t position0 = 0;
+        uint64_t position1 = 0;
+        mismatchCountRle = 0;
+
+        for(size_t i=0; i<cigarLen; i++) {
+            char c = cigar[i];
+            if(isdigit(c)) {
+                currentVal = currentVal * 10 + (c - '0');
+            } else {
+                if(currentVal == 0) currentVal = 1;
+                
+                pair<bool, bool> op;
+                if(c == 'M' || c == '=' || c == 'X') {
+                    op = {true, true};
+                } else if(c == 'I') {
+                    op = {false, true};
+                } else if(c == 'D') {
+                    op = {true, false};
+                } else {
+                    op = {true, true}; // Default
+                }
+
+                if (c == 'M' || c == '=' || c == 'X' || c == 'I' || c == 'D') {
+                    // Fill alignment
+                    std::fill(rleAlignment.begin() + currentIndex, rleAlignment.begin() + currentIndex + currentVal, op);
+                    currentIndex += currentVal;
+
+                    // Update mismatchCountRle and positions
+                    if (op.first && op.second) { // M, =, X
+                        for(size_t k=0; k<currentVal; ++k) {
+                            if (sequence0[position0 + k] != sequence1[position1 + k]) {
+                                mismatchCountRle++;
+                            }
+                        }
+                        position0 += currentVal;
+                        position1 += currentVal;
+                    } else if (op.first) { // D
+                        position0 += currentVal;
+                    } else if (op.second) { // I
+                        position1 += currentVal;
+                    }
+                }
+                currentVal = 0;
+            }
+        }
+        
+        astarpa_free_cigar((unsigned char*)cigar);
+
+        DINARA_ASSERT(position0 == sequence0.size());
+        DINARA_ASSERT(position1 == sequence1.size());
     }
-    DINARA_ASSERT(position0 == sequence0.size());
-    DINARA_ASSERT(position1 == sequence1.size());
 
 }
 
