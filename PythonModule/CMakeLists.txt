@@ -46,7 +46,7 @@ file(GLOB SOURCES ../src/*.cpp)
 include(FetchContent)
 FetchContent_Declare(
     seqan
-    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.4.0.tar.gz
+    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.5.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_GetProperties(seqan)
@@ -69,6 +69,7 @@ endif()
 
 # Define our library.
 add_library(dinaraPythonModule SHARED ${SOURCES})
+add_dependencies(dinaraPythonModule astarpa_lib)
 
 # Make sure the library is named dinara.so.
 set_target_properties(dinaraPythonModule PROPERTIES OUTPUT_NAME "dinara")

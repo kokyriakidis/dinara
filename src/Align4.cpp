@@ -13,7 +13,6 @@ using namespace Align4;
 
 // Seqan.
 #include <seqan/align.h>
-namespace seqan = seqan2;
 
 // Boost libraries.
 #include <boost/pending/disjoint_sets.hpp>
