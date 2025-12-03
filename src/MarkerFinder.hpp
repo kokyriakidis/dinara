@@ -41,7 +41,7 @@ private:
     MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers;
     size_t threadCount;
 
-    void threadFunction(uint64_t threadId);
+    void threadFunction(size_t threadId);
 
     // In pass 1, we count the number of markers for each
     // read and call reads->incrementCountMultithreaded.

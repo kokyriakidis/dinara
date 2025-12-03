@@ -11,9 +11,7 @@ using namespace dinara;
 #include <numeric>
 
 #include "MultithreadedObject.tpp"
-namespace dinara {
-    template class MultithreadedObject<LowHash0>;
-}
+template class MultithreadedObject<LowHash0>;
 
 
 // Class LowHash0 uses the LowHash0 algorithm to find candidate pairs
@@ -357,7 +355,7 @@ void LowHash0::pass2ThreadFunction(uint64_t)
 
 
 // Pass 3: inspect the buckets to find candidates.
-void LowHash0::pass3ThreadFunction(uint64_t threadId)
+void LowHash0::pass3ThreadFunction(size_t threadId)
 {
 
     // The alignment candidates found at this iteration for a single read.
@@ -554,7 +552,7 @@ void LowHash0::computeBucketHistogram(vector<uint64_t>& bucketHistogram)
 
 
 }
-void LowHash0::computeBucketHistogramThreadFunction(uint64_t threadId)
+void LowHash0::computeBucketHistogramThreadFunction(size_t threadId)
 {
     vector<uint64_t>& histogram = threadBucketHistogram[threadId];
     histogram.clear();

@@ -21,18 +21,7 @@
 // Linux.
 #include <fcntl.h>
 #include <sys/mman.h>
-
-#ifdef __linux__
 #include <linux/mman.h>
-#endif
-
-#ifndef MAP_HUGETLB
-#define MAP_HUGETLB 0
-#endif
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB 0
-#endif
-
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -770,11 +759,7 @@ template<class T> inline void dinara::MemoryMapped::Vector<T>::remove()
 template<class T> inline bool dinara::MemoryMapped::Vector<T>::save(const string& fileName) const
 {
     // Try to open it with O_DIRECT to avoid polluting the cache.
-#ifdef __linux__
     int fileDescriptor = ::open(fileName.c_str(), O_CREAT | O_RDWR | O_DIRECT, S_IRWXU);
-#else
-    int fileDescriptor = -1;
-#endif
 
     // If that did not work, try without O_DIRECT.
     if(fileDescriptor == -1) {
@@ -796,7 +781,7 @@ template<class T> inline bool dinara::MemoryMapped::Vector<T>::save(const string
             return false;
         }
         pointer += bytesWritten;
-        bytesToWrite -= static_cast<size_t>(bytesWritten);
+        bytesToWrite -= bytesWritten;
     }
 
     ::close(fileDescriptor);
@@ -950,12 +935,9 @@ template<class T> inline void
             // Remap it.
             // We can only use remap for Linux, and for 4K pages.
             bool useMremap = false;
-#ifdef __linux__
-            useMremap = (pageSize == 4096);
-#endif
             void* pointer = 0;
+            useMremap = (pageSize == 4096);
             if(useMremap) {
-#ifdef __linux__
                 pointer = ::mremap(header, header->fileSize, headerOnStack.fileSize, MREMAP_MAYMOVE);
                 if(pointer == reinterpret_cast<void*>(-1LL)) {
                     if(errno == ENOMEM) {
@@ -968,7 +950,6 @@ template<class T> inline void
                             + " during mremap call for MemoryMapped::Vector: " + string(strerror(errno)));
                     }
                 }
-#endif
             } else {
 
                 // We cannot use mremap. We have to create a new mapping
@@ -1093,12 +1074,9 @@ template<class T> inline
     // Remap it.
     // We can only use remap for Linux, and for 4K pages.
     bool useMremap = false;
-#ifdef __linux__
     useMremap = (pageSize == 4096);
-#endif
     void* pointer = 0;
     if(useMremap) {
-#ifdef __linux__
         pointer = ::mremap(header, header->fileSize, headerOnStack.fileSize, MREMAP_MAYMOVE);
         if(pointer == reinterpret_cast<void*>(-1LL)) {
             if(errno == ENOMEM) {
@@ -1111,7 +1089,6 @@ template<class T> inline
                     + " during mremap call for MemoryMapped::Vector: " + string(strerror(errno)));
             }
         }
-#endif
     } else {
 
         // We cannot use mremap. We have to create a new mapping

@@ -12,9 +12,7 @@ using namespace dinara;
 #include <limits>
 
 #include "MultithreadedObject.tpp"
-namespace dinara {
-    template class MultithreadedObject<MarkerFinder>;
-}
+template class MultithreadedObject<MarkerFinder>;
 
 MarkerFinder::MarkerFinder(
     size_t k,

@@ -833,7 +833,7 @@ void Assembler::splitMarkerGraphSecondaryEdges(
 
 
 
-void Assembler::splitMarkerGraphSecondaryEdgesThreadFunction(uint64_t threadId)
+void Assembler::splitMarkerGraphSecondaryEdgesThreadFunction(size_t threadId)
 {
 
     auto& data = splitMarkerGraphSecondaryEdgesData;

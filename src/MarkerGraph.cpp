@@ -11,9 +11,7 @@ using namespace dinara;
 #include "fstream.hpp"
 
 #include "MultithreadedObject.tpp"
-namespace dinara {
-    template class MultithreadedObject<MarkerGraph>;
-}
+template class MultithreadedObject<MarkerGraph>;
 
 
 const MarkerGraph::VertexId MarkerGraph::invalidVertexId = std::numeric_limits<VertexId>::max();
@@ -466,7 +464,7 @@ MarkerGraph::VertexId MarkerGraph::findMaxVertexTableEntry(size_t threadCount)
 
 
 
-void MarkerGraph::findMaxVertexTableEntryThreadFunction(uint64_t threadId)
+void MarkerGraph::findMaxVertexTableEntryThreadFunction(size_t threadId)
 {
     VertexId maxVertexId = 0;
 

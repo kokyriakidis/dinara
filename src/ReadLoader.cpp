@@ -13,9 +13,7 @@ using namespace dinara;
 #include "tuple.hpp"
 
 #include "MultithreadedObject.tpp"
-namespace dinara {
-    template class MultithreadedObject<ReadLoader>;
-}
+template class MultithreadedObject<ReadLoader>;
 
 // Load reads from a fastq or fasta file.
 ReadLoader::ReadLoader(
@@ -116,7 +114,7 @@ void ReadLoader::processFastaFile()
 
 // Each thread processes the reads whose initial ">" character
 // is in the file block assigned to the read.
-void ReadLoader::processFastaFileThreadFunction(uint64_t threadId)
+void ReadLoader::processFastaFileThreadFunction(size_t threadId)
 {
     const char* bufferPointer = &buffer[0];
     const uint64_t bufferSize = buffer.size();
@@ -346,7 +344,7 @@ void ReadLoader::processFastqFile()
 
 
 
-void ReadLoader::processFastqFileThreadFunction(uint64_t threadId)
+void ReadLoader::processFastqFileThreadFunction(size_t threadId)
 {
 
     // Allocate and access the data structures where this thread will store the
@@ -557,11 +555,9 @@ bool ReadLoader::readFile(bool useODirect)
 
     // Set up flags to open the file.
     int flags = O_RDONLY;
-#ifdef __linux__
     if(useODirect) {
         flags |= O_DIRECT;
     }
-#endif
 
     // Open the input file.
     const int fileDescriptor = ::open(fileName.c_str(), flags);
@@ -610,7 +606,7 @@ void ReadLoader::findLineEnds()
     }
     threadLineEnds.clear();
 }
-void ReadLoader::findLineEndsThreadFunction(uint64_t threadId)
+void ReadLoader::findLineEndsThreadFunction(size_t threadId)
 {
     // Access the vector where this thread will store the line ends it finds.
     vector<uint64_t>& thisThreadLineEnds = threadLineEnds[threadId];
@@ -668,7 +664,7 @@ void ReadLoader::allocatePerThreadDataStructures()
 }
 
 
-void ReadLoader::allocatePerThreadDataStructures(uint64_t threadId)
+void ReadLoader::allocatePerThreadDataStructures(size_t threadId)
 {
     threadReadNames[threadId] = make_unique< MemoryMapped::VectorOfVectors<char, uint64_t> >();
     threadReadNames[threadId]->createNew(

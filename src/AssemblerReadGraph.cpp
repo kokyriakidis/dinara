@@ -464,7 +464,7 @@ void Assembler::flagChimericReads(size_t maxDistance, size_t threadCount)
 
 
 
-void Assembler::flagChimericReadsThreadFunction(uint64_t threadId)
+void Assembler::flagChimericReadsThreadFunction(size_t threadId)
 {
     const size_t maxDistance = flagChimericReadsData.maxDistance;
 
@@ -1988,7 +1988,7 @@ void Assembler::flagInconsistentAlignmentsThreadFunction1(uint64_t)
 // In the triple loop, we exclude vertices corresponding to chimeric reads
 // and edges marked as cross-strand edges.
 
-void Assembler::flagInconsistentAlignmentsThreadFunction2(uint64_t threadId)
+void Assembler::flagInconsistentAlignmentsThreadFunction2(size_t threadId)
 {
     using vertex_descriptor = LocalReadGraph::vertex_descriptor;
     using edge_descriptor = LocalReadGraph::edge_descriptor;

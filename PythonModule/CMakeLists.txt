@@ -6,12 +6,7 @@ project(dinaraPythonModule)
 add_definitions(-std=c++23)
 
 # Compilation warnings.
-# Compilation warnings.
-if(APPLE)
-    add_definitions(-w)
-else()
-    add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
-endif()
+add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
 
 # Optimization and debug options.
 if(BUILD_DEBUG)
@@ -42,34 +37,15 @@ add_definitions(-DDINARA_PYTHON_API)
 # Sources files.
 file(GLOB SOURCES ../src/*.cpp)
 
-# Fetch SeqAn 2.4.0
-include(FetchContent)
-FetchContent_Declare(
-    seqan
-    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.5.0.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_GetProperties(seqan)
-if(NOT seqan_POPULATED)
-    FetchContent_Populate(seqan)
-endif()
-
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ${seqan_SOURCE_DIR}/include)
+include_directories(../src)
 
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
-if(APPLE)
-    # Add Homebrew paths for Apple Silicon and Intel Macs
-    include_directories(/opt/homebrew/include /usr/local/include)
-    link_directories(/opt/homebrew/lib /usr/local/lib)
-endif()
-
 # Define our library.
 add_library(dinaraPythonModule SHARED ${SOURCES})
-add_dependencies(dinaraPythonModule astarpa_lib)
 
 # Make sure the library is named dinara.so.
 set_target_properties(dinaraPythonModule PROPERTIES OUTPUT_NAME "dinara")
@@ -80,22 +56,18 @@ set_target_properties(dinaraPythonModule PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 
 # Include directories and libraries for Python3 and pybind11.
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-include_directories(${Python3_INCLUDE_DIRS})
-
-# Find pybind11
-execute_process(COMMAND "${Python3_EXECUTABLE}" -m pybind11 --includes OUTPUT_VARIABLE DINARA_PYTHON_INCLUDES)
+execute_process(COMMAND /usr/bin/python3-config --embed --libs OUTPUT_VARIABLE DINARA_PYTHON_LIBRARIES)
+execute_process(COMMAND python3 -m pybind11 --includes OUTPUT_VARIABLE DINARA_PYTHON_INCLUDES)
 add_definitions(${DINARA_PYTHON_INCLUDES})
+string(STRIP ${DINARA_PYTHON_LIBRARIES} DINARA_PYTHON_LIBRARIES)
+SET(CMAKE_LINKER_FLAGS  "${CMAKE_LINKER_FLAGS} ${DINARA_PYTHON_LIBRARIES}")
 
 
-
-# Add astarpa-c include directory
-include_directories(${ASTARPA_DIR}/astarpa-c)
 
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule 
-    atomic png boost_program_options boost_serialization pthread z m lapack blas Python3::Module ${ASTARPA_LIB})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)

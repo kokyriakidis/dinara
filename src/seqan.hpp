@@ -9,7 +9,6 @@
 
 // Seqan.
 #include <seqan/align.h>
-namespace seqan2 = seqan;
 
 // Standard library.
 #include "utility.hpp"

@@ -5,12 +5,7 @@ project(dinaraExecutable)
 add_definitions(-std=c++23)
 
 # Compilation warnings.
-# Compilation warnings.
-if(APPLE)
-    add_definitions(-w)
-else()
-    add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
-endif()
+add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
 
 # Optimization and debug options.
 if(BUILD_DEBUG)
@@ -38,30 +33,25 @@ endif(BUILD_NATIVE)
 # Source files
 file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
 
-# Fetch SeqAn 2.4.0
-include(FetchContent)
-FetchContent_Declare(
-    seqan
-    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.5.0.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_GetProperties(seqan)
-if(NOT seqan_POPULATED)
-    FetchContent_Populate(seqan)
-endif()
-
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../external/astar-pairwise-aligner/astarpa-c ${seqan_SOURCE_DIR}/include)
+include_directories(../src ../external/astar-pairwise-aligner/astarpa-c)
 
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
-if(APPLE)
-    # Add Homebrew paths for Apple Silicon and Intel Macs
-    include_directories(/opt/homebrew/include /usr/local/include)
-    link_directories(/opt/homebrew/lib /usr/local/lib)
-endif()
+# Build astarpa-c using cargo
+set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
+set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
+
+add_custom_command(
+    OUTPUT ${ASTARPA_LIB}
+    COMMAND cargo build --release --offline
+    WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
+    COMMENT "Building astarpa-c library..."
+)
+
+add_custom_target(astarpa_lib DEPENDS ${ASTARPA_LIB})
 
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})

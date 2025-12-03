@@ -163,18 +163,16 @@ private:
     vector<MarkerPair> activeMarkerPairs;
     void gatherActiveMarkerPairs();
 
-    using Graph = boost::adjacency_list<
-        boost::vecS, boost::vecS, boost::bidirectionalS,
-        boost::no_property, boost::no_property, boost::no_property,
-        boost::vecS>;
-
     // Use the active marker pairs to compute the alignment.
-    vector<Graph::vertex_descriptor> longestPath;
+    vector<uint64_t> longestPath;
     void computeAlignment(
         const array<span<Align6Marker>, 2>& orientedReadMarkers,
         Alignment& alignment,
         AlignmentInfo& alignmentInfo);
-
+    using Graph = boost::adjacency_list<
+        boost::vecS, boost::vecS, boost::bidirectionalS,
+        boost::no_property, boost::no_property, boost::no_property,
+        boost::vecS>;
     Graph graph;
     void computeAlignment1(
         const array<span<Align6Marker>, 2>& orientedReadMarkers,

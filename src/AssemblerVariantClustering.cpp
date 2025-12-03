@@ -197,7 +197,7 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
             // Get oriented read IDs from alignment data
             OrientedReadId currentOrientedReadId0(alignmentData.readIds[0], 0);
             OrientedReadId currentOrientedReadId1(alignmentData.readIds[1], alignmentData.isSameStrand ? 0 : 1);
-            // AlignmentInfo alignmentInfo = alignmentData.info;
+            AlignmentInfo alignmentInfo = alignmentData.info;
 
             // Decompress alignment
             Alignment alignment;
@@ -319,8 +319,8 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
                                 rcLinks++;
 
                                 // Find the base these position pairs represent in the reverse strand reads
-                                Base base0Rc = getReads().getOrientedReadBase(currentOrientedReadId0Rc, uint32_t(readLength0 - 1 - positionInRead0));
-                                Base base1Rc = getReads().getOrientedReadBase(currentOrientedReadId1Rc, uint32_t(readLength1 - 1 - positionInRead1));
+                                Base base0Rc = getReads().getOrientedReadBase(currentOrientedReadId0Rc, readLength0 - 1 - positionInRead0);
+                                Base base1Rc = getReads().getOrientedReadBase(currentOrientedReadId1Rc, readLength1 - 1 - positionInRead1);
                                 variantClusteringPositionPairAlleles[id0Rc] = base0Rc.value;
                                 variantClusteringPositionPairAlleles[id1Rc] = base1Rc.value;
 
@@ -363,8 +363,8 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
 
 // Main function to create variant clusters
 void Assembler::performGlobalVariantClustering(
-    uint64_t /* minCoverage */,
-    uint64_t /* maxCoverage */,
+    uint64_t minCoverage,
+    uint64_t maxCoverage,
     size_t threadCount)
 {
     performanceLog << timestamp << "Starting Global Variant Clustering" << endl;
@@ -477,7 +477,7 @@ void Assembler::performGlobalVariantClustering(
             const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
 
             const Strand rcStrand = Strand(1 - strand);
-            const uint32_t rcPosition = uint32_t(readLength - 1 - position);
+            const uint32_t rcPosition = readLength - 1 - position;
             const OrientedReadId rcId(readId, rcStrand);
             const auto rcPair = std::make_pair(rcId, rcPosition);
 

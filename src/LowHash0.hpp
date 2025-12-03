@@ -172,7 +172,7 @@ private:
 
     // Compute a histogram of the number of entries in each histogram.
     void computeBucketHistogram(vector<uint64_t>& bucketHistogram);
-    void computeBucketHistogramThreadFunction(uint64_t threadId);
+    void computeBucketHistogramThreadFunction(size_t threadId);
     vector< vector<uint64_t> > threadBucketHistogram;
     ofstream histogramCsv;
 
@@ -184,13 +184,13 @@ private:
 
     // Pass1: compute the low hashes for each oriented read
     // and prepare the buckets for filling.
-    void pass1ThreadFunction(uint64_t threadId);
+    void pass1ThreadFunction(size_t threadId);
 
     // Pass 2: fill the buckets.
-    void pass2ThreadFunction(uint64_t threadId);
+    void pass2ThreadFunction(size_t threadId);
 
     // Pass 3: inspect the buckets to find candidates.
-    void pass3ThreadFunction(uint64_t threadId);
+    void pass3ThreadFunction(size_t threadId);
 
 };
 
