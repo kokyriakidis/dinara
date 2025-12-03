@@ -17,7 +17,9 @@ using namespace mode3;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<Mode3Assembler>;
+namespace dinara {
+    template class MultithreadedObject<Mode3Assembler>;
+}
 
 
 
