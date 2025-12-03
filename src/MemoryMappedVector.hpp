@@ -950,9 +950,12 @@ template<class T> inline void
             // Remap it.
             // We can only use remap for Linux, and for 4K pages.
             bool useMremap = false;
-            void* pointer = 0;
+#ifdef __linux__
             useMremap = (pageSize == 4096);
+#endif
+            void* pointer = 0;
             if(useMremap) {
+#ifdef __linux__
                 pointer = ::mremap(header, header->fileSize, headerOnStack.fileSize, MREMAP_MAYMOVE);
                 if(pointer == reinterpret_cast<void*>(-1LL)) {
                     if(errno == ENOMEM) {
@@ -965,6 +968,7 @@ template<class T> inline void
                             + " during mremap call for MemoryMapped::Vector: " + string(strerror(errno)));
                     }
                 }
+#endif
             } else {
 
                 // We cannot use mremap. We have to create a new mapping
@@ -1089,9 +1093,12 @@ template<class T> inline
     // Remap it.
     // We can only use remap for Linux, and for 4K pages.
     bool useMremap = false;
+#ifdef __linux__
     useMremap = (pageSize == 4096);
+#endif
     void* pointer = 0;
     if(useMremap) {
+#ifdef __linux__
         pointer = ::mremap(header, header->fileSize, headerOnStack.fileSize, MREMAP_MAYMOVE);
         if(pointer == reinterpret_cast<void*>(-1LL)) {
             if(errno == ENOMEM) {
@@ -1104,6 +1111,7 @@ template<class T> inline
                     + " during mremap call for MemoryMapped::Vector: " + string(strerror(errno)));
             }
         }
+#endif
     } else {
 
         // We cannot use mremap. We have to create a new mapping
