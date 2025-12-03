@@ -8,6 +8,7 @@ an Alignment in marker space to base space.
 ******************************************************************/
 
 #include "array.hpp"
+#include "Base.hpp"
 #include "cstdint.hpp"
 #include "invalid.hpp"
 #include "iosfwd.hpp"
@@ -22,7 +23,7 @@ namespace dinara {
 
     class Alignment;
     class Assembler;
-    class Base;
+    // class Base; // Included via Base.hpp
     class CompressedMarker;
     class LongBaseSequenceView;
     class OrientedReadId;
