@@ -677,14 +677,14 @@ void Assembler::createMarkerGraphVerticesThreadFunction3(uint64_t)
 
 void Assembler::createMarkerGraphVerticesThreadFunction4(uint64_t)
 {
-    createMarkerGraphVerticesThreadFunctionHelper(4);
+    createMarkerGraphVerticesThreadFunction45(4);
 }
 
 
 
 void Assembler::createMarkerGraphVerticesThreadFunction5(uint64_t)
 {
-    createMarkerGraphVerticesThreadFunctionHelper(5);
+    createMarkerGraphVerticesThreadFunction45(5);
 }
 
 
@@ -762,7 +762,7 @@ void Assembler::createMarkerGraphVerticesThreadFunction7(uint64_t)
 
 
 
-void Assembler::createMarkerGraphVerticesThreadFunctionHelper(int value)
+void Assembler::createMarkerGraphVerticesThreadFunction45(int value)
 {
     DINARA_ASSERT(value==4 || value==5);
     const auto& disjointSetTable = createMarkerGraphVerticesData.disjointSetTable;
@@ -907,7 +907,7 @@ void Assembler::checkMarkerGraphVertices(
 
 
 #if 0
-void Assembler::createMarkerGraphVerticesThreadFunction3(uint64_t threadId)
+void Assembler::createMarkerGraphVerticesThreadFunction3(size_t threadId)
 {
     MarkerGraph::VertexId* workArea =
         createMarkerGraphVerticesData.workArea.begin();
@@ -923,7 +923,7 @@ void Assembler::createMarkerGraphVerticesThreadFunction3(uint64_t threadId)
 
 
 
-void Assembler::createMarkerGraphVerticesThreadFunction4(uint64_t threadId)
+void Assembler::createMarkerGraphVerticesThreadFunction4(size_t threadId)
 {
     MarkerGraph::VertexId* workArea =
         createMarkerGraphVerticesData.workArea.begin();
@@ -4395,7 +4395,7 @@ void Assembler::computeMarkerGraphVerticesCoverageData(size_t threadCount)
 
 
 
-void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(uint64_t threadId)
+void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(size_t threadId)
 {
 
     // Allocate space for the results computed by this thread.
@@ -4615,7 +4615,7 @@ void Assembler::accessMarkerGraphCoverageData()
 
 
 
-void Assembler::assembleMarkerGraphEdgesThreadFunction(uint64_t threadId)
+void Assembler::assembleMarkerGraphEdgesThreadFunction(size_t threadId)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
     const uint32_t markerGraphEdgeLengthThresholdForConsensus = assembleMarkerGraphEdgesData.markerGraphEdgeLengthThresholdForConsensus;

@@ -183,7 +183,7 @@ private:
         double epsilon,
         size_t threadCount,
         bool allowRandomHypothesis);
-    void createEdgesThreadFunction(uint64_t threadId);
+    void createEdgesThreadFunction(size_t threadId);
     class CreateEdgesData {
     public:
         uint64_t minConcordantReadCount;

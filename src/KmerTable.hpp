@@ -110,7 +110,7 @@ public:
 
 private:
     const Reads& reads;
-    void computeKmerFrequency(uint64_t threadId);
+    void computeKmerFrequency(size_t threadId);
 };
 
 
@@ -150,7 +150,7 @@ private:
     // Indexed by KmerId.
     MemoryMapped::Vector<ReadId> overenrichedReadCount;
 
-    void threadFunction(uint64_t threadId);
+    void threadFunction(size_t threadId);
 };
 
 
@@ -200,7 +200,7 @@ public:
 public:
     const Reads& reads;
 
-    void threadFunction(uint64_t threadId);
+    void threadFunction(size_t threadId);
 
     // The number of times each k-mer appears in an oriented read.
     // Indexed by KmerId.

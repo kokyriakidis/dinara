@@ -114,8 +114,8 @@ public:
     VertexId renumberVertexTable(size_t threadCount);
     VertexId renumberVertexTable(size_t threadCount, VertexId maxVertexId);
 private:
-    void renumberVertexTableThreadFunction1(uint64_t threadId);
-    void renumberVertexTableThreadFunction2(uint64_t threadId);
+    void renumberVertexTableThreadFunction1(size_t threadId);
+    void renumberVertexTableThreadFunction2(size_t threadId);
     class RenumberVertexTableData {
     public:
         // Set to true for VertexId values represented in the starting vertexTable.
@@ -130,7 +130,7 @@ private:
 
     // Find the maximum valid VertexId in the vertex table.
     VertexId findMaxVertexTableEntry(size_t threadCount);
-    void findMaxVertexTableEntryThreadFunction(uint64_t threadId);
+    void findMaxVertexTableEntryThreadFunction(size_t threadId);
     class FindMaxVertexTableEntryData {
     public:
         // The maximum VertexId found by each thread.
@@ -145,10 +145,10 @@ public:
     // are numbered contiguously starting at 0 (call renumberVertexTable to ensure that).
     void createVerticesFromVertexTable(size_t threadCount, VertexId maxVertexId);
 private:
-    void createVerticesFromVertexTableThreadFunction1(uint64_t threadId);
-    void createVerticesFromVertexTableThreadFunction2(uint64_t threadId);
-    void createVerticesFromVertexTableThreadFunction3(uint64_t threadId);
-    void createVerticesFromVertexTableThreadFunction4(uint64_t threadId);
+    void createVerticesFromVertexTableThreadFunction1(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction2(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction3(size_t threadId);
+    void createVerticesFromVertexTableThreadFunction4(size_t threadId);
     class CreateVerticesFromVertexTableData {
     public:
         // Like the vertices, but the second template argument is VertexId
@@ -180,9 +180,9 @@ private:
         shared_ptr<MemoryMapped::VectorOfVectors<MarkerId, CompressedVertexId> > newVerticesPointer;
     };
     RemoveVerticesData removeVerticesData;
-    void removeVerticesThreadFunction1(uint64_t threadId);
-    void removeVerticesThreadFunction2(uint64_t threadId);
-    void removeVerticesThreadFunction3(uint64_t threadId);
+    void removeVerticesThreadFunction1(size_t threadId);
+    void removeVerticesThreadFunction2(size_t threadId);
+    void removeVerticesThreadFunction3(size_t threadId);
 public:
 
 

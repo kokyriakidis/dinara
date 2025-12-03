@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC   -march=native -D_FILE_OFFSET_BITS=64 -O3 -DNDEBUG -shared -Wl,-soname,libwfa2cpp.so.0 -o libwfa2cpp.so.0 CMakeFiles/wfa2cpp.dir/bindings/cpp/WFAligner.cpp.o  -Wl,-rpath,/home/kokyriakidis/Downloads/variantClustering/shasta/build/wfa2lib libwfa2.so.0 

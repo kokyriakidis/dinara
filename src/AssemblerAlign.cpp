@@ -374,36 +374,34 @@ void Assembler::computeAlignments(
 
 
 
-    if (assemblerInfo->readGraphCreationMethod == 5) {
-        // Aggregate timing statistics from all threads
-        double totalProjectedAlignmentTime = 0.0;
-        double totalCollectionTime = 0.0;
-        for (size_t i = 0; i < threadCount; i++) {
-            totalProjectedAlignmentTime += data.threadProjectedAlignmentTime[i];
-            totalCollectionTime += data.threadCollectionTime[i];
-        }
-        
-        // Estimate wall-clock time by dividing summed thread time by thread count
-        const double estimatedProjectedWallTime = totalProjectedAlignmentTime / double(threadCount);
-        const double estimatedCollectionWallTime = totalCollectionTime / double(threadCount);
-        
-        // Store these times for the variant clustering summary
-        variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
-        variantClusteringCollectionTime = estimatedCollectionWallTime;
-        
-        cout << "\nVariant clustering collection timing (estimated wall-clock):" << endl;
-        cout << "  Projected alignment: ~" << estimatedProjectedWallTime << " s" << endl;
-        cout << "  Position pair collection: ~" << estimatedCollectionWallTime << " s" << endl;
-        performanceLog << timestamp << "Projected alignment (estimated wall-clock): " << estimatedProjectedWallTime << " s" << endl;
-        performanceLog << timestamp << "Collection (estimated wall-clock): " << estimatedCollectionWallTime << " s" << endl;
-        
-        // Store position pairs collected by each thread
-        performanceLog << timestamp << "Storing position pairs for variant clustering." << endl;
-        cout << timestamp << "Storing position pairs for variant clustering." << endl;
-        storeVariantClusteringPositionPairs(threadCount, data);
-        performanceLog << timestamp << "Done storing position pairs for variant clustering." << endl;
-        cout << timestamp << "Done storing position pairs for variant clustering." << endl;
+    // Aggregate timing statistics from all threads
+    double totalProjectedAlignmentTime = 0.0;
+    double totalCollectionTime = 0.0;
+    for (size_t i = 0; i < threadCount; i++) {
+        totalProjectedAlignmentTime += data.threadProjectedAlignmentTime[i];
+        totalCollectionTime += data.threadCollectionTime[i];
     }
+    
+    // Estimate wall-clock time by dividing summed thread time by thread count
+    const double estimatedProjectedWallTime = totalProjectedAlignmentTime / threadCount;
+    const double estimatedCollectionWallTime = totalCollectionTime / threadCount;
+    
+    // Store these times for the variant clustering summary
+    variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
+    variantClusteringCollectionTime = estimatedCollectionWallTime;
+    
+    cout << "\nVariant clustering collection timing (estimated wall-clock):" << endl;
+    cout << "  Projected alignment: ~" << estimatedProjectedWallTime << " s" << endl;
+    cout << "  Position pair collection: ~" << estimatedCollectionWallTime << " s" << endl;
+    performanceLog << timestamp << "Projected alignment (estimated wall-clock): " << estimatedProjectedWallTime << " s" << endl;
+    performanceLog << timestamp << "Collection (estimated wall-clock): " << estimatedCollectionWallTime << " s" << endl;
+    
+    // Store position pairs collected by each thread
+    performanceLog << timestamp << "Storing position pairs for variant clustering." << endl;
+    cout << timestamp << "Storing position pairs for variant clustering." << endl;
+    storeVariantClusteringPositionPairs(threadCount, data);
+    performanceLog << timestamp << "Done storing position pairs for variant clustering." << endl;
+    cout << timestamp << "Done storing position pairs for variant clustering." << endl;
 
 
 
@@ -432,7 +430,7 @@ void Assembler::computeAlignments(
 
 
 
-void Assembler::computeAlignmentsThreadFunction(uint64_t threadId)
+void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 {
 
     array<OrientedReadId, 2> orientedReadIds;

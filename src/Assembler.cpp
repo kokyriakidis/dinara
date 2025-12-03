@@ -11,9 +11,7 @@
 using namespace dinara;
 
 #include "MultithreadedObject.tpp"
-namespace dinara {
-    template class MultithreadedObject<Assembler>;
-}
+template class MultithreadedObject<Assembler>;
 
 
 // Constructor to be called one to create a new run.

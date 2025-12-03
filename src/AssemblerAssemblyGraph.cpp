@@ -24,11 +24,7 @@ using namespace mode0;
 #include <unordered_map>
 
 // This is needed for mallopt.
-#ifdef __APPLE__
-#include <stdlib.h>
-#else
 #include <malloc.h>
-#endif
 
 
 
@@ -753,9 +749,7 @@ void Assembler::assemble(
     }
 
     // Attempt to reduce memory fragmentation.
-#ifdef __linux__
     mallopt(M_MMAP_THRESHOLD, 16*1024);
-#endif
 
     // Do all the assemblies.
     cout << "Assembly begins for " << assemblyGraph.edgeLists.size() <<
@@ -826,7 +820,7 @@ void Assembler::assemble(
 
 
 
-void Assembler::assembleThreadFunction(uint64_t threadId)
+void Assembler::assembleThreadFunction(size_t threadId)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
 

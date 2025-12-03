@@ -488,7 +488,7 @@ public:
     void computeMarkerKmerIds(uint64_t threadCount);
     void cleanupMarkerKmerIds();
 private:
-    void computeMarkerKmerIdsThreadFunction(uint64_t threadId);
+    void computeMarkerKmerIdsThreadFunction(size_t threadId);
 
 
     // Pairs (KmerId, ordinal), sorted by KmerId, for each oriented read.
@@ -499,9 +499,9 @@ public:
     void computeSortedMarkers(uint64_t threadCount);
     bool accessSortedMarkers();
 private:
-    void computeSortedMarkersThreadFunction(uint64_t threadId);
-    // void computeSortedMarkersThreadFunction1(uint64_t threadId);
-    // void computeSortedMarkersThreadFunction2(uint64_t threadId);
+    void computeSortedMarkersThreadFunction(size_t threadId);
+    // void computeSortedMarkersThreadFunction1(size_t threadId);
+    // void computeSortedMarkersThreadFunction2(size_t threadId);
 
 
 
@@ -537,7 +537,7 @@ public:
     void computeAlign6Markers(uint64_t threadCount);
     void accessAlign6Markers();
 private:
-    void computeAlign6MarkersThreadFunction(uint64_t threadId);
+    void computeAlign6MarkersThreadFunction(size_t threadId);
 
 
 
@@ -624,7 +624,7 @@ public:
         uint32_t deltaThreshold,
         size_t threadCount);
 private:
-    void flagPalindromicReadsThreadFunction(uint64_t threadId);
+    void flagPalindromicReadsThreadFunction(size_t threadId);
     class FlagPalindromicReadsData {
     public:
         uint32_t maxSkip;
@@ -653,7 +653,7 @@ private:
         MemoryMapped::Vector<bool> suppress; // For each alignment candidate.
     };
     SuppressAlignmentCandidatesData suppressAlignmentCandidatesData;
-    void suppressAlignmentCandidatesThreadFunction(uint64_t threadId);
+    void suppressAlignmentCandidatesThreadFunction(size_t threadId);
 
 
 
@@ -976,7 +976,7 @@ private:
 
 
     // Private functions and data used by computeAlignments.
-    void computeAlignmentsThreadFunction(uint64_t threadId);
+    void computeAlignmentsThreadFunction(size_t threadId);
     class ComputeAlignmentsData {
     public:
 
@@ -1160,8 +1160,8 @@ public:
         uint64_t leastSquareMaxDistance,
         size_t threadCount);
 private:
-    void flagInconsistentAlignmentsThreadFunction1(uint64_t threadId);
-    void flagInconsistentAlignmentsThreadFunction2(uint64_t threadId);
+    void flagInconsistentAlignmentsThreadFunction1(size_t threadId);
+    void flagInconsistentAlignmentsThreadFunction2(size_t threadId);
     class FlagInconsistentAlignmentsData {
     public:
 
@@ -1226,7 +1226,7 @@ public:
 #if 0
     // Functions and data for the version that uses mini-assemblies.
 private:
-    void createReadGraph2ThreadFunction(uint64_t threadId);
+    void createReadGraph2ThreadFunction(size_t threadId);
     void createReadGraph2LowLevel(ReadId);
     class CreateReadGraph2Data {
     public:
@@ -1241,7 +1241,7 @@ public:
     // Approximate strand separation in the read graph.
     void flagCrossStrandReadGraphEdges1(int maxDistance, size_t threadCount);
 private:
-    void flagCrossStrandReadGraphEdges1ThreadFunction(uint64_t threadId);
+    void flagCrossStrandReadGraphEdges1ThreadFunction(size_t threadId);
     class FlagCrossStrandReadGraphEdges1Data {
     public:
         size_t maxDistance;
@@ -1274,7 +1274,7 @@ private:
         size_t maxDistance;
     };
     FlagChimericReadsData flagChimericReadsData;
-    void flagChimericReadsThreadFunction(uint64_t threadId);
+    void flagChimericReadsThreadFunction(size_t threadId);
 
 
     // Create a local subgraph of the global read graph,
@@ -1337,15 +1337,15 @@ public:
 
     // Private functions and data used by createMarkerGraphVertices.
 private:
-    void createMarkerGraphVerticesThreadFunction1(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction2(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction21(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction3(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction4(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction5(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunctionHelper(int);
-    void createMarkerGraphVerticesThreadFunction6(uint64_t threadId);
-    void createMarkerGraphVerticesThreadFunction7(uint64_t threadId);
+    void createMarkerGraphVerticesThreadFunction1(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction2(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction21(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction3(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction4(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction5(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction45(int);
+    void createMarkerGraphVerticesThreadFunction6(size_t threadId);
+    void createMarkerGraphVerticesThreadFunction7(size_t threadId);
     void createMarkerGraphVerticesDebug1(uint64_t stage);
     class CreateMarkerGraphVerticesData {
     public:
@@ -1403,8 +1403,8 @@ public:
     void removeMarkerGraphVertices();
     void accessDisjointSetsHistogram();
 private:
-    void findMarkerGraphReverseComplementVerticesThreadFunction1(uint64_t threadId);
-    void findMarkerGraphReverseComplementVerticesThreadFunction2(uint64_t threadId);
+    void findMarkerGraphReverseComplementVerticesThreadFunction1(size_t threadId);
+    void findMarkerGraphReverseComplementVerticesThreadFunction2(size_t threadId);
 
 
 
@@ -1435,7 +1435,7 @@ public:
         bool pattern1CreateNewVertices,
         bool pattern2CreateNewVertices);
 private:
-    void cleanupDuplicateMarkersThreadFunction(uint64_t threadId);
+    void cleanupDuplicateMarkersThreadFunction(size_t threadId);
     void cleanupDuplicateMarkersPattern1(
         MarkerGraph::VertexId,
         uint64_t minCoverage,
@@ -1486,10 +1486,10 @@ public:
     void checkMarkerGraphEdgesIsOpen() const;
     void accessMarkerGraphConsensus();
 private:
-    void createMarkerGraphEdgesThreadFunction0(uint64_t threadId);
-    void createMarkerGraphEdgesThreadFunction1(uint64_t threadId);
-    void createMarkerGraphEdgesThreadFunction2(uint64_t threadId);
-    void createMarkerGraphEdgesThreadFunction12(uint64_t threadId, size_t pass);
+    void createMarkerGraphEdgesThreadFunction0(size_t threadId);
+    void createMarkerGraphEdgesThreadFunction1(size_t threadId);
+    void createMarkerGraphEdgesThreadFunction2(size_t threadId);
+    void createMarkerGraphEdgesThreadFunction12(size_t threadId, size_t pass);
     void createMarkerGraphEdgesBySourceAndTarget(size_t threadCount);
     class CreateMarkerGraphEdgesData {
     public:
@@ -1670,7 +1670,7 @@ public:
         double errorRateThreshold,
         uint64_t minCoverage,
         size_t threadCount);
-    void splitMarkerGraphSecondaryEdgesThreadFunction(uint64_t threadId);
+    void splitMarkerGraphSecondaryEdgesThreadFunction(size_t threadId);
     class SplitMarkerGraphSecondaryEdgesData {
     public:
         double errorRateThreshold;
@@ -1709,8 +1709,8 @@ public:
     void findMarkerGraphReverseComplementEdges(size_t threadCount);
     void accessMarkerGraphReverseComplementEdge();
 private:
-    void findMarkerGraphReverseComplementEdgesThreadFunction1(uint64_t threadId);
-    void findMarkerGraphReverseComplementEdgesThreadFunction2(uint64_t threadId);
+    void findMarkerGraphReverseComplementEdgesThreadFunction1(size_t threadId);
+    void findMarkerGraphReverseComplementEdgesThreadFunction2(size_t threadId);
 
 
     // Check that the marker graph is strand symmetric.
@@ -1719,8 +1719,8 @@ private:
 public:
     void checkMarkerGraphIsStrandSymmetric(size_t threadCount = 0);
 private:
-    void checkMarkerGraphIsStrandSymmetricThreadFunction1(uint64_t threadId);
-    void checkMarkerGraphIsStrandSymmetricThreadFunction2(uint64_t threadId);
+    void checkMarkerGraphIsStrandSymmetricThreadFunction1(size_t threadId);
+    void checkMarkerGraphIsStrandSymmetricThreadFunction2(size_t threadId);
 
 
 
@@ -2047,7 +2047,7 @@ public:
     void assembleMarkerGraphVertices(size_t threadCount);
     void accessMarkerGraphVertexRepeatCounts();
 private:
-    void assembleMarkerGraphVerticesThreadFunction(uint64_t threadId);
+    void assembleMarkerGraphVerticesThreadFunction(size_t threadId);
 public:
 
 
@@ -2056,7 +2056,7 @@ public:
     // This is only called if Assembly.storeCoverageData in dinara.conf is True.
     void computeMarkerGraphVerticesCoverageData(size_t threadCount);
 private:
-    void computeMarkerGraphVerticesCoverageDataThreadFunction(uint64_t threadId);
+    void computeMarkerGraphVerticesCoverageDataThreadFunction(size_t threadId);
     class ComputeMarkerGraphVerticesCoverageDataData {
     public:
 
@@ -2173,7 +2173,7 @@ public:
         bool assembleAllEdges
         );
 private:
-    void assembleMarkerGraphEdgesThreadFunction(uint64_t threadId);
+    void assembleMarkerGraphEdgesThreadFunction(size_t threadId);
     class AssembleMarkerGraphEdgesData {
     public:
 
@@ -2257,7 +2257,7 @@ private:
         void free();
     };
     AssembleData assembleData;
-    void assembleThreadFunction(uint64_t threadId);
+    void assembleThreadFunction(size_t threadId);
 
 
 
@@ -2471,7 +2471,7 @@ public:
     // This can be slow for large assemblies,
     // and therefore the computation is multithreaded.
     void computeAllAlignments(const vector<string>&, ostream&);
-    void computeAllAlignmentsThreadFunction(uint64_t threadId);
+    void computeAllAlignmentsThreadFunction(size_t threadId);
     class ComputeAllAlignmentsData {
     public:
         OrientedReadId orientedReadId0;

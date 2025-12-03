@@ -8,14 +8,13 @@ an Alignment in marker space to base space.
 ******************************************************************/
 
 #include "array.hpp"
-#include "Base.hpp"
 #include "cstdint.hpp"
 #include "invalid.hpp"
 #include "iosfwd.hpp"
 #include "span.hpp"
 #include "utility.hpp"
 #include "vector.hpp"
-#include "astarpa.h"
+#include "../external/astar-pairwise-aligner/astarpa-c/astarpa.h"
 
 namespace dinara {
     class ProjectedAlignment;
@@ -23,7 +22,7 @@ namespace dinara {
 
     class Alignment;
     class Assembler;
-    // class Base; // Included via Base.hpp
+    class Base;
     class CompressedMarker;
     class LongBaseSequenceView;
     class OrientedReadId;

@@ -55,18 +55,6 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
-# Build astarpa-c using cargo
-set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
-set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
-
-# Use a custom target that runs every time. 
-# Cargo handles incremental builds, so this is fast if nothing changed.
-add_custom_target(astarpa_lib
-    COMMAND cargo +nightly build --release
-    WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
-    COMMENT "Checking astarpa-c build..."
-)
-
 # Add the subdirectories we need.
 if(BUILD_EXECUTABLE)
     add_subdirectory(Executable)
