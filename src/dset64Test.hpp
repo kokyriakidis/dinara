@@ -43,7 +43,7 @@ private:
     );
 
     DisjointSets* disjointSetsPointer;
-    void threadFunction(size_t threadId);
+    void threadFunction(uint64_t threadId);
 };
 
 #endif

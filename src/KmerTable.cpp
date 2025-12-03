@@ -64,7 +64,7 @@ KmerTable0::KmerTable0(
 
 
     // Prepare to generate uniformly distributed numbers between 0 and 1.
-    std::mt19937 randomSource(seed);
+    std::mt19937 randomSource(static_cast<std::mt19937::result_type>(seed));
     std::uniform_real_distribution<> uniformDistribution;
 
     // Pick each k-mer and its reverse complement with probability p.
@@ -164,7 +164,7 @@ KmerTable1::KmerTable1(
 
     const Reads& reads,
 
-    size_t threadCount,
+    uint64_t threadCount,
 
     const MappedMemoryOwner& mappedMemoryOwner) :
 
@@ -348,7 +348,7 @@ KmerTable1::KmerTable1(
 
 
 
-void KmerTable1::computeKmerFrequency(size_t threadId)
+void KmerTable1::computeKmerFrequency(uint64_t threadId)
 {
     // Create a frequency vector for this thread.
     MemoryMapped::Vector<uint64_t> frequency;
@@ -552,7 +552,7 @@ KmerTable2::KmerTable2(
         overenrichedReadCount.begin(),
         overenrichedReadCount.end(), 0);
     setupLoadBalancing(reads.readCount(), 100);
-    runThreads(&KmerTable2::threadFunction, threadCount);
+    runThreads(static_cast<void (KmerTable2::*)(uint64_t)>(&KmerTable2::threadFunction), threadCount);
 
 
 
@@ -690,7 +690,7 @@ KmerTable2::KmerTable2(
 
 
 
-void KmerTable2::threadFunction(size_t threadId)
+void KmerTable2::threadFunction(uint64_t threadId)
 {
     // Initialize globalFrequency for this thread.
     MemoryMapped::Vector<uint64_t> threadGlobalFrequency;
@@ -862,7 +862,7 @@ KmerTable4::KmerTable4(
 
     // Compute the minimumDistance vector.
     setupLoadBalancing(reads.readCount(), 100);
-    runThreads(&KmerTable4::threadFunction, threadCount);
+    runThreads(static_cast<void (KmerTable4::*)(uint64_t)>(&KmerTable4::threadFunction), threadCount);
 
 
 
@@ -1032,7 +1032,7 @@ KmerTable4::KmerTable4(
 
 
 
-void KmerTable4::threadFunction(size_t threadId)
+void KmerTable4::threadFunction(uint64_t threadId)
 {
     // Initialize globalFrequency for this thread.
     // Having all threads accumulate atomically on the global frequency vector is too slow.

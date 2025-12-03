@@ -50,7 +50,7 @@ void HttpServer::explore(uint16_t port, bool localOnly, bool sameUserOnly)
     tcp::acceptor acceptor(service);
     tcp::endpoint endpoint = (
         localOnly ?
-        tcp::endpoint(ip::address::from_string("::ffff:127.0.0.1"), port) :
+        tcp::endpoint(ip::make_address("::ffff:127.0.0.1"), port) :
         tcp::endpoint(tcp::v6(), port)
     );
     acceptor.open(endpoint.protocol());
@@ -124,7 +124,7 @@ void HttpServer::explore(uint16_t port, bool localOnly, bool sameUserOnly)
           tcp::iostream s;
           tcp::endpoint remoteEndpoint;
           boost::system::error_code errorCode;
-          acceptor.accept(*s.rdbuf(), remoteEndpoint, errorCode);
+          acceptor.accept(s, remoteEndpoint, errorCode);
           if(errorCode) {
               // If interrupted with Ctrl-C, we get here.
               cout << "\nError code from accept: " << errorCode.message() << endl;

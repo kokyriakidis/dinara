@@ -46,7 +46,7 @@ public:
     // Return the histogram position with the maximum frequency.
     size_t bestValue() const
     {
-        return std::max_element(begin(), end()) - begin();
+        return static_cast<size_t>(std::max_element(begin(), end()) - begin());
     }
 
     // Return the best frequency stored in the histogram.

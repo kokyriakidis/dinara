@@ -164,7 +164,7 @@ private:
     void gatherActiveMarkerPairs();
 
     // Use the active marker pairs to compute the alignment.
-    vector<uint64_t> longestPath;
+    vector<Graph::vertex_descriptor> longestPath;
     void computeAlignment(
         const array<span<Align6Marker>, 2>& orientedReadMarkers,
         Alignment& alignment,
