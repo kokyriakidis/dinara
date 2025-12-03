@@ -57,7 +57,7 @@ set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
 
 add_custom_command(
     OUTPUT ${ASTARPA_LIB}
-    COMMAND cargo build --release --offline
+    COMMAND cargo build --release
     WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
     COMMENT "Building astarpa-c library..."
 )
