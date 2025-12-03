@@ -36,7 +36,11 @@ void dinara::mappedCopy(
 
     // Let the system know that we will be accessing this file sequentially.
     // This improves performance in some cases.
+#ifdef __APPLE__
+    // posix_fadvise is not available on macOS
+#else
     posix_fadvise(inputFileDescriptor, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
     // Open the output file.
     const int outputFileDescriptor = ::open(outputPath.c_str(),

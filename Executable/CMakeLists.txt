@@ -38,9 +38,17 @@ endif(BUILD_NATIVE)
 # Source files
 file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
 
+# Fetch SeqAn 2.4.0
+include(FetchContent)
+FetchContent_Declare(
+    seqan
+    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.4.0.tar.gz
+)
+FetchContent_MakeAvailable(seqan)
+
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../external/astar-pairwise-aligner/astarpa-c)
+include_directories(../src ../external/astar-pairwise-aligner/astarpa-c ${seqan_SOURCE_DIR}/include)
 
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
@@ -52,7 +60,7 @@ if(APPLE)
 endif()
 
 # Build astarpa-c using cargo
-set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
+set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/../external/astar-pairwise-aligner)
 set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
 
 add_custom_command(
