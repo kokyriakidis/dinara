@@ -27,7 +27,7 @@
 #endif
 
 #ifndef MAP_HUGETLB
-#define MAP_HUGETLB 0s
+#define MAP_HUGETLB 0
 #endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB 0
@@ -770,7 +770,11 @@ template<class T> inline void dinara::MemoryMapped::Vector<T>::remove()
 template<class T> inline bool dinara::MemoryMapped::Vector<T>::save(const string& fileName) const
 {
     // Try to open it with O_DIRECT to avoid polluting the cache.
+#ifdef __linux__
     int fileDescriptor = ::open(fileName.c_str(), O_CREAT | O_RDWR | O_DIRECT, S_IRWXU);
+#else
+    int fileDescriptor = -1;
+#endif
 
     // If that did not work, try without O_DIRECT.
     if(fileDescriptor == -1) {
@@ -792,7 +796,7 @@ template<class T> inline bool dinara::MemoryMapped::Vector<T>::save(const string
             return false;
         }
         pointer += bytesWritten;
-        bytesToWrite -= bytesWritten;
+        bytesToWrite -= static_cast<size_t>(bytesWritten);
     }
 
     ::close(fileDescriptor);

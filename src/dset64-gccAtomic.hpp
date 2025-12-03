@@ -2,6 +2,7 @@
 #define __DSET64_GCC_ATOMIC_HPP
 
 #include <cstdint>
+#include <utility> // For std::swap
 #include <stdexcept>
 
 /**
