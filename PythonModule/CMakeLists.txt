@@ -88,17 +88,6 @@ add_definitions(${DINARA_PYTHON_INCLUDES})
 
 
 
-# Build astarpa-c using cargo
-set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/../external/astar-pairwise-aligner)
-set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
-
-add_custom_command(
-    OUTPUT ${ASTARPA_LIB}
-    COMMAND cargo build --release
-    WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
-    COMMENT "Building astarpa-c library"
-)
-
 # Add astarpa-c include directory
 include_directories(${ASTARPA_DIR}/astarpa-c)
 
