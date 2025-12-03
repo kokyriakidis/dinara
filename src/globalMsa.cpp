@@ -53,7 +53,7 @@ void dinara::globalMsa(
     // Compute the maximum length of the input sequences.
     uint64_t maxLength = 0;
     for(const auto& p: sequences) {
-        maxLength = max(maxLength, p.first.size());
+        maxLength = max(maxLength, uint64_t(p.first.size()));
     }
 
     // If short enough, use spoa.

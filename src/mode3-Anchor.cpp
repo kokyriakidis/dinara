@@ -13,7 +13,9 @@ using namespace mode3;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<Anchors>;
+namespace dinara {
+    template class MultithreadedObject<Anchors>;
+}
 
 
 
