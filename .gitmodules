@@ -1,0 +1,3 @@
+[submodule "external/astar-pairwise-aligner"]
+	path = external/astar-pairwise-aligner
+	url = https://github.com/RagnarGrootKoerkamp/astar-pairwise-aligner

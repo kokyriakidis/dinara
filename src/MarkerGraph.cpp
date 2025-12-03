@@ -466,7 +466,7 @@ MarkerGraph::VertexId MarkerGraph::findMaxVertexTableEntry(size_t threadCount)
 
 
 
-void MarkerGraph::findMaxVertexTableEntryThreadFunction(size_t threadId)
+void MarkerGraph::findMaxVertexTableEntryThreadFunction(uint64_t threadId)
 {
     VertexId maxVertexId = 0;
 

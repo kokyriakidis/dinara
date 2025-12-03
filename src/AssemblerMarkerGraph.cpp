@@ -4395,7 +4395,7 @@ void Assembler::computeMarkerGraphVerticesCoverageData(size_t threadCount)
 
 
 
-void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(size_t threadId)
+void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(uint64_t threadId)
 {
 
     // Allocate space for the results computed by this thread.
@@ -4615,7 +4615,7 @@ void Assembler::accessMarkerGraphCoverageData()
 
 
 
-void Assembler::assembleMarkerGraphEdgesThreadFunction(size_t threadId)
+void Assembler::assembleMarkerGraphEdgesThreadFunction(uint64_t threadId)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
     const uint32_t markerGraphEdgeLengthThresholdForConsensus = assembleMarkerGraphEdgesData.markerGraphEdgeLengthThresholdForConsensus;

@@ -121,10 +121,11 @@ void HttpServer::explore(uint16_t port, bool localOnly, bool sameUserOnly)
 
     // Endless loop over incoming connections.
     while(true) {
-          tcp::iostream s;
+          tcp::socket socket(service);
           tcp::endpoint remoteEndpoint;
           boost::system::error_code errorCode;
-          acceptor.accept(s, remoteEndpoint, errorCode);
+          acceptor.accept(socket, remoteEndpoint, errorCode);
+          tcp::iostream s(std::move(socket));
           if(errorCode) {
               // If interrupted with Ctrl-C, we get here.
               cout << "\nError code from accept: " << errorCode.message() << endl;
