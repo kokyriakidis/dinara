@@ -2940,7 +2940,7 @@ void Assembler::assessAlignments(
 }
 
 
-void Assembler::computeAllAlignmentsThreadFunction(size_t threadId)
+void Assembler::computeAllAlignmentsThreadFunction(uint64_t threadId)
 {
     // Get the first oriented read.
     const OrientedReadId orientedReadId0 = computeAllAlignmentsData.orientedReadId0;

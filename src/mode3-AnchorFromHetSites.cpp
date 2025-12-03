@@ -220,7 +220,7 @@ namespace {
         const double minFraction = 0.8)  // Default 80%
     {
         const uint8_t requiredBit = (1 << cacheIndex);
-        const size_t minReadsRequired = static_cast<size_t>(std::ceil(readKmersCache.size() * minFraction));
+        const size_t minReadsRequired = static_cast<size_t>(std::ceil(double(readKmersCache.size()) * minFraction));
         
         // Count kmers that appear at this position
         std::map<KmerId, std::vector<size_t>> kmerToReadIndices;
@@ -256,7 +256,7 @@ namespace {
         std::vector<MarkerKmers::MarkerInfo>& markerInfos,
         const double minFraction = 0.8)  // Default 80%
     {
-        const size_t minReadsRequired = static_cast<size_t>(std::ceil(readKmersCache.size() * minFraction));
+        const size_t minReadsRequired = static_cast<size_t>(std::ceil(double(readKmersCache.size()) * minFraction));
         
         // Map: KmerId -> [(readIdx, cacheIdx), ...]
         std::map<KmerId, std::vector<std::pair<size_t, size_t>>> kmerToReads;
@@ -688,7 +688,7 @@ void Anchors::constructFromHetSitesThreadFunction(uint64_t threadId)
                 if(anchorMarkerInfos.size() < alleleMemberIds.size()) {
                     debugOut << "Note: Found common kmer for " << anchorMarkerInfos.size() 
                         << " out of " << alleleMemberIds.size() << " reads (" 
-                        << (100.0 * anchorMarkerInfos.size() / alleleMemberIds.size()) 
+                        << (100.0 * double(anchorMarkerInfos.size()) / double(alleleMemberIds.size())) 
                         << "%) in allele " << int(allele) << " of cluster " << clusterIdx << endl;
                 }
                 

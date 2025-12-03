@@ -677,14 +677,14 @@ void Assembler::createMarkerGraphVerticesThreadFunction3(uint64_t)
 
 void Assembler::createMarkerGraphVerticesThreadFunction4(uint64_t)
 {
-    createMarkerGraphVerticesThreadFunction45(4);
+    createMarkerGraphVerticesThreadFunctionHelper(4);
 }
 
 
 
 void Assembler::createMarkerGraphVerticesThreadFunction5(uint64_t)
 {
-    createMarkerGraphVerticesThreadFunction45(5);
+    createMarkerGraphVerticesThreadFunctionHelper(5);
 }
 
 
@@ -762,7 +762,7 @@ void Assembler::createMarkerGraphVerticesThreadFunction7(uint64_t)
 
 
 
-void Assembler::createMarkerGraphVerticesThreadFunction45(int value)
+void Assembler::createMarkerGraphVerticesThreadFunctionHelper(int value)
 {
     DINARA_ASSERT(value==4 || value==5);
     const auto& disjointSetTable = createMarkerGraphVerticesData.disjointSetTable;
@@ -907,7 +907,7 @@ void Assembler::checkMarkerGraphVertices(
 
 
 #if 0
-void Assembler::createMarkerGraphVerticesThreadFunction3(size_t threadId)
+void Assembler::createMarkerGraphVerticesThreadFunction3(uint64_t threadId)
 {
     MarkerGraph::VertexId* workArea =
         createMarkerGraphVerticesData.workArea.begin();
@@ -923,7 +923,7 @@ void Assembler::createMarkerGraphVerticesThreadFunction3(size_t threadId)
 
 
 
-void Assembler::createMarkerGraphVerticesThreadFunction4(size_t threadId)
+void Assembler::createMarkerGraphVerticesThreadFunction4(uint64_t threadId)
 {
     MarkerGraph::VertexId* workArea =
         createMarkerGraphVerticesData.workArea.begin();

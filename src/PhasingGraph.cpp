@@ -18,7 +18,9 @@ using namespace dinara;
 #include "tuple.hpp"
 
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<PhasingGraph>;
+namespace dinara {
+    template class MultithreadedObject<PhasingGraph>;
+}
 
 
 void PhasingGraphEdge::runBayesianModel(double epsilon, bool allowRandomHypothesis)

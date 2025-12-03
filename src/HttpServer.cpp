@@ -10,7 +10,7 @@ using namespace dinara;
 // Boost libraries.
 #include <boost/algorithm/string.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/v6_only.hpp>
 #include <boost/tokenizer.hpp>
@@ -46,7 +46,7 @@ void HttpServer::explore(uint16_t port, bool localOnly, bool sameUserOnly)
     }
 
     // Create the acceptor, making sure to accept both ipv4 and ipv6 ip addresses.
-    io_service service;
+    io_context service;
     tcp::acceptor acceptor(service);
     tcp::endpoint endpoint = (
         localOnly ?

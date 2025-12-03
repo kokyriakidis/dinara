@@ -423,7 +423,7 @@ bool dinara::globalMsaSpoa(
     if(sequences.size() > 1) {
         uint64_t maxLength = 0;
         for(const auto& sequence: sequences) {
-            maxLength = max(maxLength, sequence.first.size());
+            maxLength = max(maxLength, uint64_t(sequence.first.size()));
         }
         if(maxLength > maximumMsaLength) {
             return false;

@@ -7,11 +7,14 @@
 #include "performanceLog.hpp"
 #include "ReadId.hpp"
 #include "Reads.hpp"
+#include <bit>
 using namespace dinara;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<KmerCounter>;
+namespace dinara {
+    template class MultithreadedObject<KmerCounter>;
+}
 
 
 

@@ -76,8 +76,8 @@ template<class T> void dinara::MultithreadedObject<T>::startThreads(
 // for all threads to finish.
 template<class T> void dinara::MultithreadedObject<T>::runThreadFunction(
     T& t,
-    ThreadFunction f,
-    size_t threadId)
+    typename MultithreadedObject<T>::ThreadFunction f,
+    uint64_t threadId)
 {
     try {
         (t.*f)(threadId);

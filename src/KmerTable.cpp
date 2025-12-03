@@ -12,9 +12,11 @@ using namespace dinara;
 
 // Explicit template instantiations.
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<KmerTable1>;
-template class MultithreadedObject<KmerTable2>;
-template class MultithreadedObject<KmerTable4>;
+namespace dinara {
+    template class MultithreadedObject<KmerTable1>;
+    template class MultithreadedObject<KmerTable2>;
+    template class MultithreadedObject<KmerTable4>;
+}
 
 
 
