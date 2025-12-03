@@ -4,8 +4,6 @@
 #include "seqan.hpp"
 using namespace dinara;
 
-namespace seqan = seqan2;
-
 // Version that uses banded alignments.
 void Assembler::alignOrientedReads5(
     OrientedReadId orientedReadId0,

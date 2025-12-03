@@ -42,7 +42,7 @@ file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
 include(FetchContent)
 FetchContent_Declare(
     seqan
-    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.4.0.tar.gz
+    URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.5.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_GetProperties(seqan)

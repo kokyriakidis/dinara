@@ -59,14 +59,13 @@ message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
 set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
 
-add_custom_command(
-    OUTPUT ${ASTARPA_LIB}
-    COMMAND cargo build --release
+# Use a custom target that runs every time. 
+# Cargo handles incremental builds, so this is fast if nothing changed.
+add_custom_target(astarpa_lib
+    COMMAND cargo +nightly build --release
     WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
-    COMMENT "Building astarpa-c library..."
+    COMMENT "Checking astarpa-c build..."
 )
-
-add_custom_target(astarpa_lib DEPENDS ${ASTARPA_LIB})
 
 # Add the subdirectories we need.
 if(BUILD_EXECUTABLE)
