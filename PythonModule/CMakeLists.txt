@@ -70,10 +70,24 @@ SET(CMAKE_LINKER_FLAGS  "${CMAKE_LINKER_FLAGS} ${DINARA_PYTHON_LIBRARIES}")
 
 
 
+# Build astarpa-c using cargo
+set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
+set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
+
+add_custom_command(
+    OUTPUT ${ASTARPA_LIB}
+    COMMAND cargo build --release
+    WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
+    COMMENT "Building astarpa-c library"
+)
+
+# Add astarpa-c include directory
+include_directories(${ASTARPA_DIR}/astarpa-c)
+
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule 
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)
