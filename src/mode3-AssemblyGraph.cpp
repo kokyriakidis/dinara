@@ -7134,7 +7134,7 @@ void AssemblyGraph::optimizeChain(
         const uint64_t j0First = (k < i0) ? (i0 - k) : 0;
         const uint64_t j0Last = i0;
         const uint64_t j1First = i1;
-        const uint64_t j1Last = min(i1 + k, chain.size() - 1);
+        const uint64_t j1Last = min(i1 + k, uint64_t(chain.size() - 1));
         for(uint64_t j0=j0First; j0<=j0Last; j0++) {
             for(uint64_t j1=j1First; j1<=j1Last; j1++) {
                 if(j0==i0 and j1 == i1) {

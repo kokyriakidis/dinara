@@ -24,7 +24,11 @@ using namespace mode0;
 #include <unordered_map>
 
 // This is needed for mallopt.
+#ifdef __APPLE__
+#include <stdlib.h>
+#else
 #include <malloc.h>
+#endif
 
 
 
