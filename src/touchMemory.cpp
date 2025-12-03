@@ -15,7 +15,7 @@ size_t dinara::touchMemory(
     const char* cEnd = static_cast<const char*>(end);
     size_t sum = 0ULL;
     for(const char* p=cBegin; p<cEnd; p+=pageSize) {
-        sum += *p;
+        sum += static_cast<uint8_t>(*p);
     }
     return sum;
 }

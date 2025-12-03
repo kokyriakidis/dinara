@@ -1,6 +1,6 @@
 // Dinara.
 
-#include "bits/stdint-uintn.h"
+#include <cstdint>
 #include "mode3-AssemblyGraph.hpp"
 #include "mode3-PhasingTable.hpp"
 #include "MarkerInterval.hpp"
