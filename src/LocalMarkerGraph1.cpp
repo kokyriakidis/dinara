@@ -440,7 +440,7 @@ void LocalMarkerGraph1::writeHtml1(
         const vertex_descriptor v1 = target(e, graph);
         const MarkerGraphEdgeId edgeId = graph[e].edgeId;
         const uint64_t sequenceLength = markerGraph.edgeSequence[edgeId].size();
-        const uint64_t auxiliaryVertexCount = max(1UL, uint64_t(edgeResolution * double(sequenceLength)));
+        const uint64_t auxiliaryVertexCount = max(uint64_t(1), uint64_t(edgeResolution * double(sequenceLength)));
         const double edgeLength = double(sequenceLength) / double(auxiliaryVertexCount + 1);
         auxiliaryVertices.clear();
         for(uint64_t i=0; i<auxiliaryVertexCount; i++) {
