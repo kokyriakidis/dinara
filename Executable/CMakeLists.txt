@@ -43,8 +43,12 @@ include(FetchContent)
 FetchContent_Declare(
     seqan
     URL https://github.com/seqan/seqan/archive/refs/tags/seqan-v2.4.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
-FetchContent_MakeAvailable(seqan)
+FetchContent_GetProperties(seqan)
+if(NOT seqan_POPULATED)
+    FetchContent_Populate(seqan)
+endif()
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
