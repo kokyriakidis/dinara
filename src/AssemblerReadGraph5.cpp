@@ -411,7 +411,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t /* threadId */)
                         if (supportPhase0 > 0 && supportPhase1 > 0) {
                             if(LCG[j] + 1 > LCG[i]) {
                                 LCG[i] = LCG[j] + 1; // Longest compatible group length
-                                parent[i] = j; // Parent node in the DP chain
+                                parent[i] = int(j); // Parent node in the DP chain
                             }
                         }
                     }

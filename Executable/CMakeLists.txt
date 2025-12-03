@@ -5,7 +5,12 @@ project(dinaraExecutable)
 add_definitions(-std=c++23)
 
 # Compilation warnings.
-add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
+# Compilation warnings.
+if(APPLE)
+    add_definitions(-w)
+else()
+    add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
+endif()
 
 # Optimization and debug options.
 if(BUILD_DEBUG)
