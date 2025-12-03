@@ -40,6 +40,12 @@ include_directories(../src ../external/astar-pairwise-aligner/astarpa-c)
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
+if(APPLE)
+    # Add Homebrew paths for Apple Silicon and Intel Macs
+    include_directories(/opt/homebrew/include /usr/local/include)
+    link_directories(/opt/homebrew/lib /usr/local/lib)
+endif()
+
 # Build astarpa-c using cargo
 set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
 set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)

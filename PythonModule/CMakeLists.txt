@@ -44,6 +44,12 @@ include_directories(../src)
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
+if(APPLE)
+    # Add Homebrew paths for Apple Silicon and Intel Macs
+    include_directories(/opt/homebrew/include /usr/local/include)
+    link_directories(/opt/homebrew/lib /usr/local/lib)
+endif()
+
 # Define our library.
 add_library(dinaraPythonModule SHARED ${SOURCES})
 

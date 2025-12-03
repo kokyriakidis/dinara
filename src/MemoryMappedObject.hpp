@@ -27,6 +27,9 @@
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0
 #endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB 0
+#endif
 
 #include <sys/stat.h>
 #include <sys/types.h>
