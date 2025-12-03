@@ -1,5 +1,6 @@
 
 
+#include <cstdint>
 #include "touchMemory.hpp"
 using namespace dinara;
 
