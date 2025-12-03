@@ -5,10 +5,13 @@
 using namespace dinara;
 
 #include "fstream.hpp"
+#include <bit>
 
 // Expplicit instantiationn.
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<MarkerKmers>;
+namespace dinara {
+    template class MultithreadedObject<MarkerKmers>;
+}
 
 
 

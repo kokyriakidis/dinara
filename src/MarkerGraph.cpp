@@ -11,7 +11,9 @@ using namespace dinara;
 #include "fstream.hpp"
 
 #include "MultithreadedObject.tpp"
-template class MultithreadedObject<MarkerGraph>;
+namespace dinara {
+    template class MultithreadedObject<MarkerGraph>;
+}
 
 
 const MarkerGraph::VertexId MarkerGraph::invalidVertexId = std::numeric_limits<VertexId>::max();

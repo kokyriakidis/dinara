@@ -74,7 +74,7 @@ public:
     // takes as input an integer thread id.
     // The function is called in parallel for all integer
     // thread ids in [0, threadCount-1].
-    using ThreadFunction = void (T::*)(size_t threadId);
+    using ThreadFunction = void (T::*)(uint64_t threadId);
 
     // Start the threads and wait for them to complete.
     void runThreads(
@@ -95,7 +95,7 @@ private:
     T& t;
 
     // The function run by each thread.
-    static void runThreadFunction(T& t, ThreadFunction f, size_t threadId);
+    static void runThreadFunction(T& t, ThreadFunction f, uint64_t threadId);
 };
 
 
