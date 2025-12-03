@@ -108,7 +108,7 @@ private:
     vector< unique_ptr<LongBaseSequences> > threadReads;
     vector< unique_ptr<MemoryMapped::VectorOfVectors<uint8_t, uint64_t> > > threadReadRepeatCounts;
     void allocatePerThreadDataStructures();
-    void allocatePerThreadDataStructures(size_t threadId);
+    void allocatePerThreadDataStructures(uint64_t threadId);
 
     // Store the reads computed by each thread and free
     // the per-thread data structures.
@@ -116,18 +116,18 @@ private:
 
     // Functions used for fasta files.
     void processFastaFile();
-    void processFastaFileThreadFunction(size_t threadId);
+    void processFastaFileThreadFunction(uint64_t threadId);
     // Function that returns true if a read begins
     // at this position in Fasta format.
     bool fastaReadBeginsHere(uint64_t offset) const;
 
     // Functions used for fastq files.
     void processFastqFile();
-    void processFastqFileThreadFunction(size_t threadId);
+    void processFastqFileThreadFunction(uint64_t threadId);
 
     // Find all line ends in the file.
     void findLineEnds();
-    void findLineEndsThreadFunction(size_t threadId);
+    void findLineEndsThreadFunction(uint64_t threadId);
     vector< vector<uint64_t> > threadLineEnds;
     vector<uint64_t> lineEnds;
 

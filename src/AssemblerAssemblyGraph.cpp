@@ -820,7 +820,7 @@ void Assembler::assemble(
 
 
 
-void Assembler::assembleThreadFunction(size_t threadId)
+void Assembler::assembleThreadFunction(uint64_t threadId)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
 

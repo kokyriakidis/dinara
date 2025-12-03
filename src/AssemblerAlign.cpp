@@ -384,8 +384,8 @@ void Assembler::computeAlignments(
         }
         
         // Estimate wall-clock time by dividing summed thread time by thread count
-        const double estimatedProjectedWallTime = totalProjectedAlignmentTime / threadCount;
-        const double estimatedCollectionWallTime = totalCollectionTime / threadCount;
+        const double estimatedProjectedWallTime = totalProjectedAlignmentTime / double(threadCount);
+        const double estimatedCollectionWallTime = totalCollectionTime / double(threadCount);
         
         // Store these times for the variant clustering summary
         variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
@@ -432,7 +432,7 @@ void Assembler::computeAlignments(
 
 
 
-void Assembler::computeAlignmentsThreadFunction(size_t threadId)
+void Assembler::computeAlignmentsThreadFunction(uint64_t threadId)
 {
 
     array<OrientedReadId, 2> orientedReadIds;

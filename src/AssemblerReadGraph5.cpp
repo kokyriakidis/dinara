@@ -66,7 +66,7 @@ void Assembler::createReadGraph5()
     // A cluster is valid if it has at least 2 alleles with coverage >= minAlleleCoverage.
     cout << timestamp << "Running global cluster validity checks." << endl;
     const uint32_t threadCount = std::thread::hardware_concurrency();
-    const uint64_t minAlleleCoverage = 5;
+    // const uint64_t minAlleleCoverage = 5;
     setupLoadBalancing(clusterCount, 1);
     runThreads(&Assembler::computeClusterValidityThreadFunction, threadCount);
     cout << timestamp << "Global cluster validity checks completed." << endl;
@@ -160,7 +160,7 @@ void Assembler::createReadGraph5()
 
 // Global Cluster Validity Check Function to check if a cluster is valid.
 // A cluster is valid if it has at least 2 alleles with coverage >= minAlleleCoverage.
-void Assembler::computeClusterValidityThreadFunction(uint64_t threadId) {
+void Assembler::computeClusterValidityThreadFunction(uint64_t /* threadId */) {
     uint64_t currentMinAlleleCoverage = this->minAlleleCoverage;
     // Loop over a batch of cluster IDs assigned to this thread
     uint64_t clusterIdBegin, clusterIdEnd;
@@ -193,7 +193,7 @@ void Assembler::computeClusterValidityThreadFunction(uint64_t threadId) {
 }
 
 
-void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
+void Assembler::createReadGraph5ThreadFunction(uint64_t /* threadId */)
 {
     // Access data
     const auto& positionPairs = variantClusteringPositionPairs;
@@ -202,7 +202,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
 
     uint64_t readIdBegin, readIdEnd;
     while (getNextBatch(readIdBegin, readIdEnd)) {
-        for (ReadId readId = readIdBegin; readId < readIdEnd; readId++) {
+        for (ReadId readId = ReadId(readIdBegin); readId < ReadId(readIdEnd); readId++) {
             
             // Only process strand 0
             // The process is symmetric for the two strands.
@@ -356,8 +356,8 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             vector<int> LCG(N, 1);
             vector<int> parent(N, -1);
 
-            for(int i = 0; i < N; i++) {
-                for(int j = 0; j < i; j++) {
+            for(size_t i = 0; i < N; i++) {
+                for(size_t j = 0; j < i; j++) {
                     // Don't link two virtual nodes coming from the SAME physical cluster.
                     // This is to avoid linking multiallelic sites coming from the same physical cluster.
                     // We force the DP chain to pick at most one virtual node per physical genomic site, 
@@ -428,7 +428,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             vector<pair<int, int>> sortedLCGIndices; // (Length, Index)
             vector<pair<int, int>> isolatedSitesIndices;
 
-            for(int i = 0; i < N; i++) {
+            for(size_t i = 0; i < N; i++) {
                 if (LCG[i] > 1) {
                     sortedLCGIndices.push_back({LCG[i], i});
                 } else {
@@ -586,7 +586,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                 for(OrientedReadId::Int otherOrientedReadIdValue : finalHapOrientedReadIds) {
                     if(otherOrientedReadIdValue != currentOrientedReadId0.getValue()) {
                         // Try to add edge with totalWeight
-                        auto result = boost::add_edge(currentOrientedReadId0.getValue(), otherOrientedReadIdValue, totalWeight, *globalHaplotypeGraph);
+                        boost::add_edge(currentOrientedReadId0.getValue(), otherOrientedReadIdValue, totalWeight, *globalHaplotypeGraph);
                     }
                 }
             }
@@ -597,7 +597,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
 }
 
 
-void Assembler::refineClustersThreadFunction(uint64_t threadId) {
+void Assembler::refineClustersThreadFunction(uint64_t /* threadId */) {
     const uint64_t currentMinAlleleCoverage = this->minAlleleCoverage;
     const auto& graph = *globalHaplotypeGraph;
     

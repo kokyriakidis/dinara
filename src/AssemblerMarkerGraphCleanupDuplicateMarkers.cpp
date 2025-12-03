@@ -161,7 +161,7 @@ void Assembler::cleanupDuplicateMarkers(
 
 
 
-void Assembler::cleanupDuplicateMarkersThreadFunction(size_t threadId)
+void Assembler::cleanupDuplicateMarkersThreadFunction(uint64_t threadId)
 {
     const bool debug = true;
     ofstream out;
