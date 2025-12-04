@@ -411,13 +411,6 @@ void dinara::main::assemble(
     }
     cout << "This assembly will use " << threadCount << " threads." << endl;
 
-    // // Set up the consensus caller.
-    // if(assembler.getReads().representation == 1) {
-    //     cout << "Setting up consensus caller " <<
-    //         assemblerOptions.assemblyOptions.consensusCaller << endl;
-    // }
-    // assembler.setupConsensusCaller(assemblerOptions.assemblyOptions.consensusCaller);
-
     // If --saveBinaryData was requested,
     // create the directory where binary data will be saved.
     if (assemblerOptions.commandLineOnlyOptions.saveBinaryData) {
@@ -478,7 +471,7 @@ void dinara::main::assemble(
     performanceLog << "Read loading took " << seconds(t1-t0) << "s." << endl;
 
     // Find duplicate reads and handle them according to the setting
-    // of --Reads.handleDuplicates.
+    // of --Reads.handleDuplicates. The default option is "useOneCopy".
     assembler.findDuplicateReads(assemblerOptions.readsOptions.handleDuplicates);
 
     // Initialize the KmerChecker, which has the information needed
@@ -488,19 +481,6 @@ void dinara::main::assemble(
     // Find the markers in the reads.
     assembler.findMarkers(threadCount);
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
-
-    // // If mode 3 assembly and Assembly.mode3.anchorCreationMethod is not
-    // // FromMarkerGraphEdges, use the alignment free code path and return.
-    // if(
-    //     (assemblerOptions.assemblyOptions.mode == 3) and
-    //     (assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromMarkerGraphEdges")) {
-    //     const vector<string> emptyAnchorFiles;
-    //     assembler.alignmentFreeAssembly(
-    //         assemblerOptions.assemblyOptions.mode3Options,
-    //         emptyAnchorFiles,
-    //         threadCount);
-    //     return;
-    // }
 
     // If using alignment method 6, count marker k-mers.
     if(assemblerOptions.alignOptions.alignMethod == 6) {
@@ -551,14 +531,6 @@ void dinara::main::assemble(
     }
 
 
-    // // Suppress alignment candidates where reads are close on the same channel.
-    // if(assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold > 0) {
-    //     assembler.suppressAlignmentCandidates(
-    //         assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold,
-    //         threadCount);
-    // }
-
-
     // For http server and debugging/development purposes, generate an exhaustive table of candidates
     assembler.computeCandidateTable();
 
@@ -586,82 +558,6 @@ void dinara::main::assemble(
 
     // Create the read graph.
     assembler.createReadGraph5();
-
-    // // Create the read graph.
-    // if(assemblerOptions.readGraphOptions.creationMethod != 2 ) {
-    //     if(assemblerOptions.readGraphOptions.creationMethod == 0) {
-    //         assembler.createReadGraph(
-    //             assemblerOptions.readGraphOptions.maxAlignmentCount,
-    //             assemblerOptions.readGraphOptions.preferAlignedFraction);
-    //     } else if(assemblerOptions.readGraphOptions.creationMethod == 3) {
-    //         assembler.createReadGraph3(
-    //             assemblerOptions.readGraphOptions.maxAlignmentCount);
-    //     } else if(assemblerOptions.readGraphOptions.creationMethod == 4) {
-    //         assembler.createReadGraph4withStrandSeparation(
-    //         assemblerOptions.readGraphOptions.maxAlignmentCount,
-    //         assemblerOptions.readGraphOptions.epsilon,
-    //         assemblerOptions.readGraphOptions.delta,
-    //         assemblerOptions.readGraphOptions.WThreshold,
-    //         assemblerOptions.readGraphOptions.WThresholdForBreaks
-    //         );
-    //     }  else if(assemblerOptions.readGraphOptions.creationMethod == 5) {
-    //         assembler.createReadGraph5();
-    //     }
-
-    //     // Actual alignment criteria are as specified in the command line options
-    //     // and/or configuration.
-    //     assembler.assemblerInfo->actualMinAlignedFraction = assemblerOptions.alignOptions.minAlignedFraction;
-    //     assembler.assemblerInfo->actualMinAlignedMarkerCount = assemblerOptions.alignOptions.minAlignedMarkerCount;
-    //     assembler.assemblerInfo->actualMaxDrift = assemblerOptions.alignOptions.maxDrift;
-    //     assembler.assemblerInfo->actualMaxSkip = assemblerOptions.alignOptions.maxSkip;
-    //     assembler.assemblerInfo->actualMaxTrim = assemblerOptions.alignOptions.maxTrim;
-
-
-    // } else if(assemblerOptions.readGraphOptions.creationMethod == 2) {
-    //     assembler.createReadGraph2(
-    //         assemblerOptions.readGraphOptions.maxAlignmentCount,
-    //         assemblerOptions.readGraphOptions.markerCountPercentile,
-    //         assemblerOptions.readGraphOptions.alignedFractionPercentile,
-    //         assemblerOptions.readGraphOptions.maxSkipPercentile,
-    //         assemblerOptions.readGraphOptions.maxDriftPercentile,
-    //         assemblerOptions.readGraphOptions.maxTrimPercentile);
-    // } else {
-    //     throw runtime_error("Invalid value for --ReadGraph.creationMethod.");
-    // }
-
-    // // Limited strand separation.
-    // // If strict strand separation is requested, it is done later,
-    // // after chimera detection.
-    // if(assemblerOptions.readGraphOptions.strandSeparationMethod == 1) {
-    //     assembler.flagCrossStrandReadGraphEdges1(
-    //         assemblerOptions.readGraphOptions.crossStrandMaxDistance,
-    //         threadCount);
-    // }
-
-    // // Flag chimeric reads.
-    // assembler.flagChimericReads(assemblerOptions.readGraphOptions.maxChimericReadDistance, threadCount);
-
-    // // Flag inconsistent alignments, if requested.
-    // if(assemblerOptions.readGraphOptions.flagInconsistentAlignments) {
-    //     assembler.flagInconsistentAlignments(
-    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsTriangleErrorThreshold,
-    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareErrorThreshold,
-    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareMaxDistance,
-    //         threadCount);
-    // }
-
-    // // Strict strand separation.
-    // if(assemblerOptions.readGraphOptions.strandSeparationMethod == 2) {
-    //     assembler.flagCrossStrandReadGraphEdges2();
-    // }
-
-    // // Compute connected components of the read graph.
-    // // These are currently not used.
-    // // For strand separation method 2 this was already done
-    // // in flagCrossStrandReadGraphEdges2.
-    // if(assemblerOptions.readGraphOptions.strandSeparationMethod != 2) {
-    //     assembler.computeReadGraphConnectedComponents();
-    // }
 
 
     // Mode 3 assembly requires reads in raw representation (not RLE).
