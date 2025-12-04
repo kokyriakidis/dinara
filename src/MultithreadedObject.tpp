@@ -22,7 +22,7 @@ template<class T> dinara::MultithreadedObject<T>::MultithreadedObject(T& t) :
 
 template<class T> void dinara::MultithreadedObject<T>::runThreads(
     ThreadFunction f,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     startThreads(f, threadCount);
     waitForThreads();
@@ -32,7 +32,7 @@ template<class T> void dinara::MultithreadedObject<T>::runThreads(
 
 template<class T> void dinara::MultithreadedObject<T>::startThreads(
     ThreadFunction f,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     DINARA_ASSERT(threadCount > 0);
 

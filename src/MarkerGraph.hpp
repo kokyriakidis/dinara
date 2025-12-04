@@ -112,8 +112,8 @@ public:
     // The second version can be called if the maximum vertex id
     // present in the vertex table is already known, and is faster.
     // Returns the maximmum vertex id after renumbering.
-    VertexId renumberVertexTable(size_t threadCount);
-    VertexId renumberVertexTable(size_t threadCount, VertexId maxVertexId);
+    VertexId renumberVertexTable(uint64_t threadCount);
+    VertexId renumberVertexTable(uint64_t threadCount, VertexId maxVertexId);
 private:
     void renumberVertexTableThreadFunction1(size_t threadId);
     void renumberVertexTableThreadFunction2(size_t threadId);
@@ -130,7 +130,7 @@ private:
 
 
     // Find the maximum valid VertexId in the vertex table.
-    VertexId findMaxVertexTableEntry(size_t threadCount);
+    VertexId findMaxVertexTableEntry(uint64_t threadCount);
     void findMaxVertexTableEntryThreadFunction(size_t threadId);
     class FindMaxVertexTableEntryData {
     public:
@@ -144,7 +144,7 @@ public:
     // Recreate the vertices from the vertexTable.
     // This assumes that valid VertexId's in the vertex table
     // are numbered contiguously starting at 0 (call renumberVertexTable to ensure that).
-    void createVerticesFromVertexTable(size_t threadCount, VertexId maxVertexId);
+    void createVerticesFromVertexTable(uint64_t threadCount, VertexId maxVertexId);
 private:
     void createVerticesFromVertexTableThreadFunction1(size_t threadId);
     void createVerticesFromVertexTableThreadFunction2(size_t threadId);

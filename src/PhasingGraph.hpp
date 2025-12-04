@@ -152,7 +152,7 @@ public:
         uint64_t maxDiscordantReadCount,
         double minLogP,
         double epsilon,
-        size_t threadCount,
+        uint64_t threadCount,
         bool allowRandomHypothesis);
 
     // Find the optimal spanning tree using logFisher as the edge weight.
@@ -181,7 +181,7 @@ private:
         uint64_t maxDiscordantReadCount,
         double minLogP,
         double epsilon,
-        size_t threadCount,
+        uint64_t threadCount,
         bool allowRandomHypothesis);
     void createEdgesThreadFunction(size_t threadId);
     class CreateEdgesData {

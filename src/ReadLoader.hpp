@@ -30,7 +30,7 @@ public:
         uint64_t representation, // 0 = raw sequence, 1 = RLE sequence
         uint64_t minReadLength,
         bool noCache,
-        size_t threadCount,
+        uint64_t threadCount,
         const string& dataNamePrefix,
         size_t pageSize,
         Reads& reads);
@@ -75,7 +75,7 @@ private:
     // The number of threads to be used for processing.
     // Reading is done single-threaded as there is usually no benefit
     // frm multithreaded reading.
-    size_t threadCount;
+    uint64_t threadCount;
     void adjustThreadCount();
 
     // Information that we can use to create temporary

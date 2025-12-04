@@ -55,7 +55,7 @@ public:
     void run(
         uint64_t n,
         uint64_t batchSize,
-        size_t threadCount
+        uint64_t threadCount
         )
     {
         setupLoadBalancing(n, batchSize);

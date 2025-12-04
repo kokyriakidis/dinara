@@ -11,7 +11,7 @@ using namespace dinara;
 void Assembler::createAssemblyGraph2(
     uint64_t pruneLength,
     const Mode2AssemblyOptions& mode2Options,
-    size_t threadCount,
+    uint64_t threadCount,
     bool debug
     )
 {

@@ -57,7 +57,7 @@ PhasingGraph::PhasingGraph(
     uint64_t maxDiscordantReadCount,
     double minLogP,
     double epsilon,
-    size_t threadCount,
+    uint64_t threadCount,
     bool allowRandomHypothesis) :
     MultithreadedObject<PhasingGraph>(*this)
 {
@@ -180,7 +180,7 @@ void PhasingGraph::createEdges(
     uint64_t maxDiscordantReadCount,
     double minLogP,
     double epsilon,
-    size_t threadCount,
+    uint64_t threadCount,
     bool allowRandomHypothesis)
 {
     performanceLog << timestamp << "AssemblyGraph2::PhasingGraph::createEdges begins." << endl;

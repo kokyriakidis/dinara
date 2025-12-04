@@ -250,7 +250,7 @@ public:
         const string& fileName,
         uint64_t minReadLength,
         bool noCache,
-        size_t threadCount);
+        uint64_t threadCount);
 
     // Create a histogram of read lengths.
     void histogramReadLength(const string& fileName);
@@ -258,7 +258,7 @@ public:
 
     // Functions related to markers.
     // See the beginning of Marker.hpp for more information.
-    void findMarkers(size_t threadCount);
+    void findMarkers(uint64_t threadCount);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -296,7 +296,7 @@ public:
 
         // Number of threads. If zero, a number of threads equal to
         // the number of virtual processors is used.
-        size_t threadCount
+        uint64_t threadCount
     );
     void accessAlignmentData();
     void accessAlignmentDataReadWrite();
@@ -333,7 +333,7 @@ public:
 
         // Number of threads. If zero, a number of threads equal to
         // the number of virtual processors is used.
-        size_t threadCount
+        uint64_t threadCount
     );
 
 
@@ -621,7 +621,7 @@ public:
         double alignedFractionThreshold,
         double nearDiagonalFractionThreshold,
         uint32_t deltaThreshold,
-        size_t threadCount);
+        uint64_t threadCount);
 private:
     void flagPalindromicReadsThreadFunction(size_t threadId);
     class FlagPalindromicReadsData {
@@ -644,7 +644,7 @@ private:
     // Remove all alignment candidates for which suppressAlignment
     // returns false.
 public:
-    void suppressAlignmentCandidates(uint64_t delta, size_t threadCount);
+    void suppressAlignmentCandidates(uint64_t delta, uint64_t threadCount);
 private:
     class SuppressAlignmentCandidatesData {
     public:
@@ -680,7 +680,7 @@ public:
         size_t minBucketSize,           // The minimum size for a bucket to be used.
         size_t maxBucketSize,           // The maximum size for a bucket to be used.
         size_t minFrequency,            // Minimum number of lowHash hits for a pair to become a candidate.
-        size_t threadCount
+        uint64_t threadCount
     );
     void markAlignmentCandidatesAllPairs();
     void accessAlignmentCandidates();
@@ -1096,7 +1096,7 @@ public:
         MemoryMapped::Vector< pair<OrientedReadId, uint32_t> >& positionPairs);
 
     void storeVariantClusteringPositionPairs(
-        size_t threadCount,
+        uint64_t threadCount,
         ComputeAlignmentsData& data);
 
     // Data structures for variant clustering compatibility check.
@@ -1108,7 +1108,7 @@ public:
     void performGlobalVariantClustering(
         uint64_t minCoverage,
         uint64_t maxCoverage,
-        size_t threadCount = 0);
+        uint64_t threadCount = 0);
 
     MemoryMapped::Vector<__uint128_t> variantClusteringDisjointSetTable;
     MemoryMapped::Vector<uint8_t> variantClusteringPositionPairAlleles;
@@ -1158,7 +1158,7 @@ public:
         uint64_t triangleErrorThreshold,
         uint64_t leastSquareErrorThreshold,
         uint64_t leastSquareMaxDistance,
-        size_t threadCount);
+        uint64_t threadCount);
 private:
     void flagInconsistentAlignmentsThreadFunction1(size_t threadId);
     void flagInconsistentAlignmentsThreadFunction2(size_t threadId);
@@ -1191,7 +1191,7 @@ public:
         double mismatchSquareFactor,
         double minScore,
         uint64_t maxAlignmentCount,
-        size_t threadCount);
+        uint64_t threadCount);
     class CreateReadGraphsingPseudoPathsAlignmentData {
     public:
         uint64_t alignedMarkerCount = 0;
@@ -1239,7 +1239,7 @@ public:
 
 
     // Approximate strand separation in the read graph.
-    void flagCrossStrandReadGraphEdges1(int maxDistance, size_t threadCount);
+    void flagCrossStrandReadGraphEdges1(int maxDistance, uint64_t threadCount);
 private:
     void flagCrossStrandReadGraphEdges1ThreadFunction(size_t threadId);
     class FlagCrossStrandReadGraphEdges1Data {
@@ -1267,7 +1267,7 @@ public:
 
 public:
     // Use the read graph to flag chimeric reads.
-    void flagChimericReads(size_t maxDistance, size_t threadCount);
+    void flagChimericReads(size_t maxDistance, uint64_t threadCount);
 private:
     class FlagChimericReadsData {
     public:
@@ -1397,7 +1397,7 @@ public:
     }
 
     // Find the reverse complement of each marker graph vertex.
-    void findMarkerGraphReverseComplementVertices(size_t threadCount);
+    void findMarkerGraphReverseComplementVertices(uint64_t threadCount);
     void accessMarkerGraphVertices(bool readWriteAccess = false);
     void accessMarkerGraphReverseComplementVertex(bool readWriteAccess = false);
     void removeMarkerGraphVertices();
@@ -1480,7 +1480,7 @@ private:
 
     // Create marker graph edges.
 public:
-    void createMarkerGraphEdges(size_t threadCount);
+    void createMarkerGraphEdges(uint64_t threadCount);
     void accessMarkerGraphEdges(bool accessEdgesReadWrite, bool accessConnectivityReadWrite = false);
     void accessMarkerGraphEdgeMarkerIntervals();
     void checkMarkerGraphEdgesIsOpen() const;
@@ -1490,7 +1490,7 @@ private:
     void createMarkerGraphEdgesThreadFunction1(size_t threadId);
     void createMarkerGraphEdgesThreadFunction2(size_t threadId);
     void createMarkerGraphEdgesThreadFunction12(size_t threadId, size_t pass);
-    void createMarkerGraphEdgesBySourceAndTarget(size_t threadCount);
+    void createMarkerGraphEdgesBySourceAndTarget(uint64_t threadCount);
     class CreateMarkerGraphEdgesData {
     public:
         vector< shared_ptr< MemoryMapped::Vector<MarkerGraph::Edge> > > threadEdges;
@@ -1518,7 +1518,7 @@ public:
     void createMarkerGraphEdgesStrict(
         uint64_t minEdgeCoverage,
         uint64_t minEdgeCoveragePerStrand,
-        size_t threadCount);
+        uint64_t threadCount);
 private:
     void createMarkerGraphEdgesStrictPass1(size_t threadId);
     void createMarkerGraphEdgesStrictPass2(size_t threadId);
@@ -1644,12 +1644,12 @@ public:
     // sufficient to restore contiguity.
     void createMarkerGraphSecondaryEdges(
         uint32_t secondaryEdgeMaxSkip,
-        size_t threadCount);
+        uint64_t threadCount);
 private:
     void createMarkerGraphSecondaryEdges(
         uint32_t secondaryEdgeMaxSkip,
         bool aggressive,
-        size_t threadCount);
+        uint64_t threadCount);
 public:
 
 
@@ -1669,7 +1669,7 @@ public:
     void splitMarkerGraphSecondaryEdges(
         double errorRateThreshold,
         uint64_t minCoverage,
-        size_t threadCount);
+        uint64_t threadCount);
     void splitMarkerGraphSecondaryEdgesThreadFunction(size_t threadId);
     class SplitMarkerGraphSecondaryEdgesData {
     public:
@@ -1706,7 +1706,7 @@ public:
 
     // Find the reverse complement of each marker graph edge.
 public:
-    void findMarkerGraphReverseComplementEdges(size_t threadCount);
+    void findMarkerGraphReverseComplementEdges(uint64_t threadCount);
     void accessMarkerGraphReverseComplementEdge();
 private:
     void findMarkerGraphReverseComplementEdgesThreadFunction1(size_t threadId);
@@ -1717,7 +1717,7 @@ private:
     // This can only be called after both findMarkerGraphReverseComplementVertices
     // and findMarkerGraphReverseComplementEdges have been called.
 public:
-    void checkMarkerGraphIsStrandSymmetric(size_t threadCount = 0);
+    void checkMarkerGraphIsStrandSymmetric(uint64_t threadCount = 0);
 private:
     void checkMarkerGraphIsStrandSymmetricThreadFunction1(size_t threadId);
     void checkMarkerGraphIsStrandSymmetricThreadFunction2(size_t threadId);
@@ -2022,7 +2022,7 @@ public:
 
     // Gather and write out all reads that contributed to
     // each assembly graph edge.
-    void gatherOrientedReadsByAssemblyGraphEdge(size_t threadCount);
+    void gatherOrientedReadsByAssemblyGraphEdge(uint64_t threadCount);
     void writeOrientedReadsByAssemblyGraphEdge();
 private:
     void gatherOrientedReadsByAssemblyGraphEdgePass1(size_t threadId);
@@ -2044,7 +2044,7 @@ public:
 
 
     // Compute consensus repeat counts for each vertex of the marker graph.
-    void assembleMarkerGraphVertices(size_t threadCount);
+    void assembleMarkerGraphVertices(uint64_t threadCount);
     void accessMarkerGraphVertexRepeatCounts();
 private:
     void assembleMarkerGraphVerticesThreadFunction(size_t threadId);
@@ -2054,7 +2054,7 @@ public:
 
     // Optional computation of coverage data for marker graph vertices.
     // This is only called if Assembly.storeCoverageData in dinara.conf is True.
-    void computeMarkerGraphVerticesCoverageData(size_t threadCount);
+    void computeMarkerGraphVerticesCoverageData(uint64_t threadCount);
 private:
     void computeMarkerGraphVerticesCoverageDataThreadFunction(size_t threadId);
     class ComputeMarkerGraphVerticesCoverageDataData {
@@ -2161,7 +2161,7 @@ public:
 
     // Assemble consensus sequence and repeat counts for each marker graph edge.
     void assembleMarkerGraphEdges(
-        size_t threadCount,
+        uint64_t threadCount,
 
         // This controls when we give up trying to compute consensus for long edges.
         uint32_t markerGraphEdgeLengthThresholdForConsensus,
@@ -2239,7 +2239,7 @@ public:
 
     // Assemble sequence for all edges of the assembly graph.
     void assemble(
-        size_t threadCount,
+        uint64_t threadCount,
         uint32_t storeCoverageDataCsvLengthThreshold);
     void accessAssemblyGraphSequences();
     void computeAssemblyStatistics();
@@ -2253,7 +2253,7 @@ private:
         vector< vector<AssemblyGraphEdgeId> > edges;
         vector< shared_ptr<LongBaseSequences> > sequences;
         vector< shared_ptr<MemoryMapped::VectorOfVectors<uint8_t, uint64_t> > > repeatCounts;
-        void allocate(size_t threadCount);
+        void allocate(uint64_t threadCount);
         void free();
     };
     AssembleData assembleData;
@@ -2588,7 +2588,7 @@ public:
     void createAssemblyGraph2(
         uint64_t pruneLength,
         const Mode2AssemblyOptions&,
-        size_t threadCount,
+        uint64_t threadCount,
         bool debug);
 
 

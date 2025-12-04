@@ -18,7 +18,7 @@ void Assembler::findAlignmentCandidatesLowHash0(
     size_t minBucketSize,           // The minimum size for a bucket to be used.
     size_t maxBucketSize,           // The maximum size for a bucket to be used.
     size_t minFrequency,            // Minimum number of minHash hits for a pair to become a candidate.
-    size_t threadCount)
+    uint64_t threadCount)
 {
 
     // Check that we have what we need.

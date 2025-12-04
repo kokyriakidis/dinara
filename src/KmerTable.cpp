@@ -162,7 +162,7 @@ KmerTable1::KmerTable1(
 
     const Reads& reads,
 
-    size_t threadCount,
+    uint64_t threadCount,
 
     const MappedMemoryOwner& mappedMemoryOwner) :
 

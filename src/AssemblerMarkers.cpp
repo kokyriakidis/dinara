@@ -15,7 +15,7 @@ using namespace dinara;
 #include "fstream.hpp"
 
 
-void Assembler::findMarkers(size_t threadCount)
+void Assembler::findMarkers(uint64_t threadCount)
 {
     reads->checkReadsAreOpen();
     DINARA_ASSERT(kmerChecker);

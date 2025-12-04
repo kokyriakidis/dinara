@@ -22,7 +22,7 @@ void Assembler::createReadGraphUsingPseudoPaths(
     double mismatchSquareFactor,
     double minScore,
     uint64_t maxAlignmentCount,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     using SegmentId = AssemblyGraphEdgeId;
     const bool debug = false;

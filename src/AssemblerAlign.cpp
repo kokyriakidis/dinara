@@ -277,7 +277,7 @@ void Assembler::computeAlignments(
 
     // Number of threads. If zero, a number of threads equal to
     // the number of virtual processors is used.
-    size_t threadCount
+    uint64_t threadCount
 )
 {
 
@@ -896,7 +896,7 @@ void Assembler::flagPalindromicReads(
     double alignedFractionThreshold,
     double nearDiagonalFractionThreshold,
     uint32_t deltaThreshold,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "Finding palindromic reads." << endl;
 
@@ -1343,7 +1343,7 @@ bool Assembler::suppressAlignment(
 // returns false.
 void Assembler::suppressAlignmentCandidates(
     uint64_t delta,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "Suppressing alignment candidates." << endl;
 

@@ -136,7 +136,6 @@ void dinara::main::main(int argumentCount, const char** arguments)
 
     // Parse command line options and the configuration file, if one was specified.
     AssemblerOptions assemblerOptions(argumentCount, arguments);
-    cout << buildId() << endl;
 
     // Check that we have a valid command.
     auto it = commands.find(assemblerOptions.commandLineOnlyOptions.command);
@@ -406,7 +405,7 @@ void dinara::main::assemble(
     const auto systemClock0 = boost::chrono::process_system_cpu_clock::now();
 
     // Adjust the number of threads, if necessary.
-    uint32_t threadCount = assemblerOptions.commandLineOnlyOptions.threadCount;
+    uint64_t threadCount = assemblerOptions.commandLineOnlyOptions.threadCount;
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
@@ -419,10 +418,9 @@ void dinara::main::assemble(
     // }
     // assembler.setupConsensusCaller(assemblerOptions.assemblyOptions.consensusCaller);
 
-    // If --saveBinaryData was requested and Mode assembly is 3,
+    // If --saveBinaryData was requested,
     // create the directory where binary data will be saved.
-    if( assemblerOptions.commandLineOnlyOptions.saveBinaryData and
-        assemblerOptions.assemblyOptions.mode == 3) {
+    if (assemblerOptions.commandLineOnlyOptions.saveBinaryData) {
         assembler.createSaveBinaryDataDirectory(assemblerOptions.commandLineOnlyOptions.memoryMode);
     }
 
