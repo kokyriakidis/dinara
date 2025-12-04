@@ -259,7 +259,7 @@ public:
         uint64_t pruneLength,
         const Mode2AssemblyOptions&,
         AssemblyGraph2Statistics&,
-        size_t threadCount,
+        uint64_t threadCount,
         bool debug
         );
 
@@ -629,7 +629,7 @@ private:
         uint64_t maxSuperbubbleChunkPathCount,
         uint64_t pruneLength,
         uint64_t componentSizeThreshold,
-        size_t threadCount);
+        uint64_t threadCount);
 
     // Hierarchical phasing using the PhasingGraph.
     void hierarchicalPhase(
@@ -637,7 +637,7 @@ private:
         uint64_t maxDiscordantReadCount,
         double minLogP,
         double epsilon,
-        size_t threadCount);
+        uint64_t threadCount);
 
     // Renumber component to make them contiguous starting at 0.
     void renumberComponents();

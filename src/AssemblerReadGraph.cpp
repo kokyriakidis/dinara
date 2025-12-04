@@ -417,7 +417,7 @@ bool Assembler::createLocalReadGraph(
 // If not all the vertices at maximum distance are
 // in the same component, the read corresponding to v0
 // is flagged as chimeric.
-void Assembler::flagChimericReads(size_t maxDistance, size_t threadCount)
+void Assembler::flagChimericReads(size_t maxDistance, uint64_t threadCount)
 {
     performanceLog << timestamp << "Begin flagging chimeric reads." << endl;
 
@@ -836,7 +836,7 @@ void Assembler::writeLocalReadGraphReads(
 
 
 // Limited strand separation in the read graph.
-void Assembler::flagCrossStrandReadGraphEdges1(int maxDistance, size_t threadCount)
+void Assembler::flagCrossStrandReadGraphEdges1(int maxDistance, uint64_t threadCount)
 {
     const bool debug = false;
 
@@ -1890,7 +1890,7 @@ void Assembler::flagInconsistentAlignments(
     uint64_t triangleErrorThreshold,
     uint64_t leastSquareErrorThreshold,
     uint64_t leastSquareMaxDistance,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     // Check that we have what we need.
     DINARA_ASSERT(alignmentData.isOpenWithWriteAccess);

@@ -62,7 +62,7 @@ void Assembler::createMarkerGraphVertices(
 
     // Number of threads. If zero, a number of threads equal to
     // the number of virtual processors is used.
-    size_t threadCount
+    uint64_t threadCount
 )
 {
 
@@ -1148,7 +1148,7 @@ void Assembler::getMarkerIntervals(
 
 
 // Find the reverse complement of each marker graph vertex.
-void Assembler::findMarkerGraphReverseComplementVertices(size_t threadCount)
+void Assembler::findMarkerGraphReverseComplementVertices(uint64_t threadCount)
 {
     performanceLog << timestamp << "Begin findMarkerGraphReverseComplementVertices."
         << endl;
@@ -1263,7 +1263,7 @@ void Assembler::accessDisjointSetsHistogram()
 
 
 // Find the reverse complement of each marker graph edge.
-void Assembler::findMarkerGraphReverseComplementEdges(size_t threadCount)
+void Assembler::findMarkerGraphReverseComplementEdges(uint64_t threadCount)
 {
     performanceLog << timestamp << "Begin findMarkerGraphReverseComplementEdges." << endl;
 
@@ -1425,7 +1425,7 @@ void Assembler::accessMarkerGraphReverseComplementEdge()
 // and findMarkerGraphReverseComplementEdges have been called,
 // as it requires markerGraph.reverseComplementVertex
 // and markerGraph.reverseComplementEdge.
-void Assembler::checkMarkerGraphIsStrandSymmetric(size_t threadCount)
+void Assembler::checkMarkerGraphIsStrandSymmetric(uint64_t threadCount)
 {
     // cout << timestamp << "Begin checkMarkerGraphIsStrandSymmetric." << endl;
 
@@ -1951,7 +1951,7 @@ bool Assembler::extractLocalMarkerGraph(
 
 
 // Compute edges of the global marker graph.
-void Assembler::createMarkerGraphEdges(size_t threadCount)
+void Assembler::createMarkerGraphEdges(uint64_t threadCount)
 {
     performanceLog << timestamp << "createMarkerGraphEdges begins." << endl;
 
@@ -2012,7 +2012,7 @@ void Assembler::createMarkerGraphEdges(size_t threadCount)
 
 
 
-void Assembler::createMarkerGraphEdgesBySourceAndTarget(size_t threadCount)
+void Assembler::createMarkerGraphEdgesBySourceAndTarget(uint64_t threadCount)
 {
     markerGraph.edgesBySource.createNew(
         largeDataName("GlobalMarkerGraphEdgesBySource"),
@@ -4256,7 +4256,7 @@ void Assembler::simplifyMarkerGraphIterationPart2(
 
 
 // Compute consensus repeat counts for each vertex of the marker graph.
-void Assembler::assembleMarkerGraphVertices(size_t threadCount)
+void Assembler::assembleMarkerGraphVertices(uint64_t threadCount)
 {
     performanceLog << timestamp << "assembleMarkerGraphVertices begins." << endl;
 
@@ -4327,7 +4327,7 @@ void Assembler::accessMarkerGraphVertexRepeatCounts()
 
 // Optional computation of coverage data for marker graph vertices.
 // This is only called if Assembly.storeCoverageData in dinara.conf is True.
-void Assembler::computeMarkerGraphVerticesCoverageData(size_t threadCount)
+void Assembler::computeMarkerGraphVerticesCoverageData(uint64_t threadCount)
 {
     performanceLog << timestamp<< "computeMarkerGraphVerticesCoverageData begins." << endl;
 
@@ -4488,7 +4488,7 @@ void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(size_t thre
 
 // Assemble consensus sequence and repeat counts for each marker graph edge.
 void Assembler::assembleMarkerGraphEdges(
-    size_t threadCount,
+    uint64_t threadCount,
 
     // This controls when we give up trying to compute consensus for long edges.
     uint32_t markerGraphEdgeLengthThresholdForConsensus,

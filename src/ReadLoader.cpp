@@ -21,7 +21,7 @@ ReadLoader::ReadLoader(
     uint64_t representation, // 0 = raw sequence, 1 = RLE sequence
     uint64_t minReadLength,
     bool noCache,
-    size_t threadCount,
+    uint64_t threadCount,
     const string& dataNamePrefix,
     size_t pageSize,
     Reads& reads):

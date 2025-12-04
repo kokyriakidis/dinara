@@ -79,12 +79,12 @@ public:
     // Start the threads and wait for them to complete.
     void runThreads(
         ThreadFunction,
-        size_t threadCount);
+        uint64_t threadCount);
 
     // Start the threads without waiting for them to complete.
     void startThreads(
         ThreadFunction,
-        size_t threadCount);
+        uint64_t threadCount);
 
 protected:
 

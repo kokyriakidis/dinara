@@ -32,7 +32,7 @@ namespace seqan = seqan2;
 void Assembler::createMarkerGraphEdgesStrict(
     uint64_t minEdgeCoverage,
     uint64_t minEdgeCoveragePerStrand,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "createMarkerGraphEdgesStrict begins." << endl;
 
@@ -429,7 +429,7 @@ void Assembler::writeParallelMarkerGraphEdges() const
 //   namespace dinara::MemoryMapped.
 void Assembler::createMarkerGraphSecondaryEdges(
     uint32_t secondaryEdgeMaxSkip,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     createMarkerGraphSecondaryEdges(secondaryEdgeMaxSkip, false, threadCount);
     createMarkerGraphSecondaryEdges(secondaryEdgeMaxSkip, true, threadCount);
@@ -437,7 +437,7 @@ void Assembler::createMarkerGraphSecondaryEdges(
 void Assembler::createMarkerGraphSecondaryEdges(
     uint32_t secondaryEdgeMaxSkip,
     bool aggressive,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     using VertexId = MarkerGraph::VertexId;
 
@@ -766,7 +766,7 @@ vector< vector<uint64_t> > Assembler::clusterMarkerGraphEdgeOrientedReads(
 void Assembler::splitMarkerGraphSecondaryEdges(
     double errorRateThreshold,
     uint64_t minCoverage,
-    size_t threadCount)
+    uint64_t threadCount)
 {
 
     // Adjust the numbers of threads, if necessary.

@@ -112,7 +112,7 @@ void Assembler::checkVariantClusteringPositionPairsIsOpen() const
 
 
 void Assembler::storeVariantClusteringPositionPairs(
-    size_t threadCount,
+    uint64_t threadCount,
     ComputeAlignmentsData& data)
 {
     const auto tStoreStart = steady_clock::now();
@@ -365,7 +365,7 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
 void Assembler::performGlobalVariantClustering(
     uint64_t minCoverage,
     uint64_t maxCoverage,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "Starting Global Variant Clustering" << endl;
     cout << timestamp << "Starting Global Variant Clustering" << endl;

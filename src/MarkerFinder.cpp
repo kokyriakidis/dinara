@@ -19,7 +19,7 @@ MarkerFinder::MarkerFinder(
     const KmerChecker& kmerChecker,
     const Reads& reads,
     MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
-    size_t threadCountArgument) :
+    uint64_t threadCountArgument) :
     MultithreadedObject(*this),
     k(k),
     kmerChecker(kmerChecker),

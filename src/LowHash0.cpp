@@ -32,7 +32,7 @@ LowHash0::LowHash0(
     size_t minBucketSize,           // The minimum size for a bucket to be used.
     size_t maxBucketSize,           // The maximum size for a bucket to be used.
     size_t minFrequency,            // Minimum number of minHash hits for a pair to be considered a candidate.
-    size_t threadCountArgument,
+    uint64_t threadCountArgument,
     const Reads& reads,
     const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& kmerIds,
     MemoryMapped::Vector<OrientedReadPair>& candidateAlignments,

@@ -52,7 +52,7 @@ AssemblyGraph2::AssemblyGraph2(
     uint64_t pruneLength,
     const Mode2AssemblyOptions& mode2Options,
     AssemblyGraph2Statistics& statistics,
-    size_t threadCount,
+    uint64_t threadCount,
     bool debug
     ) :
     MultithreadedObject<AssemblyGraph2>(*this),
@@ -4268,7 +4268,7 @@ void AssemblyGraph2::removeBadBubblesIterative(
     uint64_t maxSuperbubbleChunkPathCount,
     uint64_t pruneLength,
     uint64_t componentSizeThreshold,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "AssemblyGraph2::removeBadBubblesIterative begins." << endl;
 
@@ -4428,7 +4428,7 @@ void AssemblyGraph2::hierarchicalPhase(
     uint64_t maxDiscordantReadCount,
     double minLogP,
     double epsilon,
-    size_t threadCount)
+    uint64_t threadCount)
 {
     performanceLog << timestamp << "AssemblyGraph2::hierarchicalPhase begins." << endl;
 

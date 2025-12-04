@@ -308,7 +308,7 @@ void MarkerGraph::removeVerticesThreadFunction3(uint64_t)
 // as in Assembler::cleanupDuplicateMarkers.
 // After this is called, all other data structures
 // are inconsistent and need to be recreated.
-MarkerGraph::VertexId MarkerGraph::renumberVertexTable(size_t threadCount)
+MarkerGraph::VertexId MarkerGraph::renumberVertexTable(uint64_t threadCount)
 {
     // Sanity check.
     DINARA_ASSERT(threadCount > 0);
@@ -327,7 +327,7 @@ MarkerGraph::VertexId MarkerGraph::renumberVertexTable(size_t threadCount)
 
 // This second version can be called if the maximum vertex id
 // present in the vertex table is already known, and is faster.
-MarkerGraph::VertexId MarkerGraph::renumberVertexTable(size_t threadCount, VertexId maxVertexId)
+MarkerGraph::VertexId MarkerGraph::renumberVertexTable(uint64_t threadCount, VertexId maxVertexId)
 {
     const bool debug = false;
 
@@ -438,7 +438,7 @@ void MarkerGraph::renumberVertexTableThreadFunction2(uint64_t)
 
 
 
-MarkerGraph::VertexId MarkerGraph::findMaxVertexTableEntry(size_t threadCount)
+MarkerGraph::VertexId MarkerGraph::findMaxVertexTableEntry(uint64_t threadCount)
 {
     // Sanity checks.
     DINARA_ASSERT(threadCount > 0);
@@ -490,7 +490,7 @@ void MarkerGraph::findMaxVertexTableEntryThreadFunction(size_t threadId)
 // Recreate the vertices from the vertexTable.
 // This assumes that valid VertexId's in the vertex table
 // are numbered contiguously starting at 0 (call renumberVertexTable to ensure that).
-void MarkerGraph::createVerticesFromVertexTable(size_t threadCount, VertexId maxVertexId)
+void MarkerGraph::createVerticesFromVertexTable(uint64_t threadCount, VertexId maxVertexId)
 {
     DINARA_ASSERT(vertexTable.isOpen);
     const string vertexTableName = vertexTable.fileName;

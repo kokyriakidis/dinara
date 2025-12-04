@@ -16,7 +16,7 @@ void Assembler::addReads(
     const string& fileName,
     uint64_t minReadLength,
     bool noCache,
-    const size_t threadCount)
+    uint64_t threadCount)
 {
     reads->checkReadsAreOpen();
     reads->checkReadNamesAreOpen();

@@ -716,7 +716,7 @@ void Assembler::writeAssemblyGraph(const string& fileName) const
 
 // Assemble sequence for all edges of the assembly graph.
 void Assembler::assemble(
-    size_t threadCount,
+    uint64_t threadCount,
     uint32_t storeCoverageDataCsvLengthThreshold)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
@@ -893,7 +893,7 @@ void Assembler::assembleThreadFunction(size_t threadId)
 
 
 
-void Assembler::AssembleData::allocate(size_t threadCount)
+void Assembler::AssembleData::allocate(uint64_t threadCount)
 {
     edges.resize(threadCount);
     sequences.resize(threadCount);
@@ -1894,7 +1894,7 @@ void Assembler::colorGfaBySimilarityToSegment(
 
 // Gather all oriented reads used to assembly each edge of the
 // assembly graph.
-void Assembler::gatherOrientedReadsByAssemblyGraphEdge(size_t threadCount)
+void Assembler::gatherOrientedReadsByAssemblyGraphEdge(uint64_t threadCount)
 {
     AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
 

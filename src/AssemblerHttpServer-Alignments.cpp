@@ -2190,7 +2190,7 @@ void Assembler::computeAllAlignments(
 
     // Compute the alignments in parallel.
     computeAllAlignmentsData.orientedReadId0 = orientedReadId0;
-    const size_t threadCount =std::thread::hardware_concurrency();
+    uint64_t threadCount =std::thread::hardware_concurrency();
     computeAllAlignmentsData.threadAlignments.resize(threadCount);
     const size_t batchSize = 1;
     setupLoadBalancing(reads->readCount(), batchSize);
@@ -2771,7 +2771,7 @@ void Assembler::assessAlignments(
     vector<pair<OrientedReadId, AlignmentInfo> > allAlignmentInfo;
     vector<pair<OrientedReadId, AlignmentInfo> > allStoredAlignmentInfo;
 
-    const size_t threadCount = std::thread::hardware_concurrency();
+    uint64_t threadCount = std::thread::hardware_concurrency();
 
     html << "<br>";
     html << "<p>Computing alignments using " << threadCount << " threads";
