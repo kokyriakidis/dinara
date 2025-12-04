@@ -72,11 +72,6 @@ namespace dinara {
             const AssemblerOptions&,
             vector<string> inputNames);
 
-        void mode3Assembly(
-            Assembler&,
-            const AssemblerOptions&,
-            uint32_t threadCount);
-
     }
 
     // This is used to duplicate cout output to stdout.log.
@@ -668,9 +663,39 @@ void dinara::main::assemble(
     }
 
 
+    // Mode 3 assembly requires reads in raw representation (not RLE).
+    DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
 
-    // Do the rest of the assembly using the selected assembly mode.
-    mode3Assembly(assembler, assemblerOptions, threadCount);
+    // The marker length must be even.
+    DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
+
+    // Declare anchors pointer here to avoid scope issues
+    shared_ptr<mode3::Anchors> anchors;
+
+    cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
+    anchors = make_shared<mode3::Anchors>(
+        MappedMemoryOwner(assembler),
+        assembler.getReads(),
+        assembler.assemblerInfo->k,
+        assembler.markers,
+        assembler.variantClusteringClusterRepresentatives,
+        *assembler.variantClusteringDisjointSets,
+        assembler.variantClusteringPositionPairs,
+        assembler.variantClusteringPositionPairAlleles,
+        assembler.variantClusteringPositionPairContexts,
+        assembler.variantClusteringValidClustersCompatible,
+        assembler.variantClusteringMemberStatus,
+        /*minClusterCoverage*/ 6,
+        /*minAlleleCoverage*/ 5,
+        /*minCommonKmerFraction*/ 0.8,
+        threadCount);
+    
+
+    // Compute oriented read journeys.
+    anchors->computeJourneys(threadCount);
+
+    // Run Mode 3 assembly.
+    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
 
     // Store elapsed time for assembly.
@@ -722,113 +747,6 @@ void dinara::main::assemble(
     performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
         int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
-}
-
-
-
-void dinara::main::mode3Assembly(
-    Assembler& assembler,
-    const AssemblerOptions& assemblerOptions,
-    uint32_t threadCount)
-{
-    // Mode 3 assembly requires reads in raw representation (not RLE).
-    DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
-
-    // The marker length must be even.
-    DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
-
-    // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::Anchors> anchors;
-
-    if (assemblerOptions.readGraphOptions.creationMethod != 5) {
-
-        // Create marker graph vertices.
-        // To create a complete marker graph, generate all vertices
-        // regardless of coverage, and allow duplicate markers on vertices.
-        assembler.createMarkerGraphVertices(
-            1,                                              // minVertexCoverage
-            std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-            0,                                              // minVertexCoveragePerStrand
-            true,                                           // allowDuplicateMarkers
-            std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-            invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-            threadCount);
-
-        // If the coverage range for primary marker graph edges (anchors) is not
-        // specified, use the disjoint sets histogram to compute reasonable values.
-        uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
-        uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
-        if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
-            tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
-            cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
-                ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-            minPrimaryCoverage = uint64_t(std::round(
-                double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
-            maxPrimaryCoverage = uint64_t(std::round(
-                double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
-            cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
-                ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-        } else {
-            cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
-                ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-        }
-
-        // Construct the mode3::Anchors from marker graph.
-        anchors = make_shared<mode3::Anchors>(
-            MappedMemoryOwner(assembler),
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            assembler.markers,
-            assembler.markerGraph,
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount);
-
-        // We no longer need the MarkerGraph vertices.
-        // We can remove them here, unless --MarkerGraph.alwaysSave is in effect,
-        // in which case we also need to complete creation of the marker graph
-        // (at a substantial additional memory cost).
-        if(assemblerOptions.markerGraphOptions.alwaysSave) {
-            assembler.findMarkerGraphReverseComplementVertices(threadCount);
-            assembler.createMarkerGraphEdgesStrict(
-                minPrimaryCoverage,
-                0, threadCount);
-            assembler.findMarkerGraphReverseComplementEdges(threadCount);
-        } else {
-            // This is the standard path.
-            assembler.markerGraph.vertices().remove();
-            assembler.markerGraph.vertexTable.remove();
-        }
-    
-    } else if (assemblerOptions.readGraphOptions.creationMethod == 5) {
-
-        cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
-        anchors = make_shared<mode3::Anchors>(
-            MappedMemoryOwner(assembler),
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            assembler.markers,
-            assembler.variantClusteringClusterRepresentatives,
-            *assembler.variantClusteringDisjointSets,
-            assembler.variantClusteringPositionPairs,
-            assembler.variantClusteringPositionPairAlleles,
-            assembler.variantClusteringPositionPairContexts,
-            assembler.variantClusteringValidClustersCompatible,
-            assembler.variantClusteringMemberStatus,
-            /*minClusterCoverage*/ 6,
-            /*minAlleleCoverage*/ 5,
-            /*minCommonKmerFraction*/ 0.8,
-            threadCount);
-    
-    }
-
-    
-
-    // Compute oriented read journeys.
-    anchors->computeJourneys(threadCount);
-
-    // Run Mode 3 assembly.
-    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 }
 
 
