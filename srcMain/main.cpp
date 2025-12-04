@@ -412,12 +412,12 @@ void dinara::main::assemble(
     }
     cout << "This assembly will use " << threadCount << " threads." << endl;
 
-    // Set up the consensus caller.
-    if(assembler.getReads().representation == 1) {
-        cout << "Setting up consensus caller " <<
-            assemblerOptions.assemblyOptions.consensusCaller << endl;
-    }
-    assembler.setupConsensusCaller(assemblerOptions.assemblyOptions.consensusCaller);
+    // // Set up the consensus caller.
+    // if(assembler.getReads().representation == 1) {
+    //     cout << "Setting up consensus caller " <<
+    //         assemblerOptions.assemblyOptions.consensusCaller << endl;
+    // }
+    // assembler.setupConsensusCaller(assemblerOptions.assemblyOptions.consensusCaller);
 
     // If --saveBinaryData was requested and Mode assembly is 3,
     // create the directory where binary data will be saved.
@@ -528,7 +528,9 @@ void dinara::main::assemble(
     }
 
     // Find alignment candidates.
-    if(assemblerOptions.minHashOptions.allPairs) {
+    if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
+        assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
+    } else if(assemblerOptions.minHashOptions.allPairs) {
         assembler.markAlignmentCandidatesAllPairs();
     } else {
         DINARA_ASSERT(assemblerOptions.minHashOptions.version == 0); // Already checked for that.
@@ -551,12 +553,12 @@ void dinara::main::assemble(
     }
 
 
-    // Suppress alignment candidates where reads are close on the same channel.
-    if(assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold > 0) {
-        assembler.suppressAlignmentCandidates(
-            assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold,
-            threadCount);
-    }
+    // // Suppress alignment candidates where reads are close on the same channel.
+    // if(assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold > 0) {
+    //     assembler.suppressAlignmentCandidates(
+    //         assemblerOptions.alignOptions.sameChannelReadAlignmentSuppressDeltaThreshold,
+    //         threadCount);
+    // }
 
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates
@@ -564,19 +566,17 @@ void dinara::main::assemble(
 
 
     // Compute alignments.
-    const bool computeProjectedAlignmentMetrics = ((assemblerOptions.readGraphOptions.creationMethod == 4) || (assemblerOptions.readGraphOptions.creationMethod == 5));
+    const bool computeProjectedAlignmentMetrics = true;
     assembler.computeAlignments(
         assemblerOptions.alignOptions,
         computeProjectedAlignmentMetrics,
         threadCount);
 
     
-    if (assemblerOptions.readGraphOptions.creationMethod == 5) {
-        assembler.performGlobalVariantClustering(
-            assemblerOptions.markerGraphOptions.minCoverage,
-            assemblerOptions.markerGraphOptions.maxCoverage,
-            threadCount);
-    }
+    assembler.performGlobalVariantClustering(
+        assemblerOptions.markerGraphOptions.minCoverage,
+        assemblerOptions.markerGraphOptions.maxCoverage,
+        threadCount);
 
 
     // Marker KmerIds are freed here.
@@ -587,80 +587,83 @@ void dinara::main::assemble(
 
 
     // Create the read graph.
-    if(assemblerOptions.readGraphOptions.creationMethod != 2 ) {
-        if(assemblerOptions.readGraphOptions.creationMethod == 0) {
-            assembler.createReadGraph(
-                assemblerOptions.readGraphOptions.maxAlignmentCount,
-                assemblerOptions.readGraphOptions.preferAlignedFraction);
-        } else if(assemblerOptions.readGraphOptions.creationMethod == 3) {
-            assembler.createReadGraph3(
-                assemblerOptions.readGraphOptions.maxAlignmentCount);
-        } else if(assemblerOptions.readGraphOptions.creationMethod == 4) {
-            assembler.createReadGraph4withStrandSeparation(
-            assemblerOptions.readGraphOptions.maxAlignmentCount,
-            assemblerOptions.readGraphOptions.epsilon,
-            assemblerOptions.readGraphOptions.delta,
-            assemblerOptions.readGraphOptions.WThreshold,
-            assemblerOptions.readGraphOptions.WThresholdForBreaks
-            );
-        }  else if(assemblerOptions.readGraphOptions.creationMethod == 5) {
-            assembler.createReadGraph5();
-        }
+    assembler.createReadGraph5();
 
-        // Actual alignment criteria are as specified in the command line options
-        // and/or configuration.
-        assembler.assemblerInfo->actualMinAlignedFraction = assemblerOptions.alignOptions.minAlignedFraction;
-        assembler.assemblerInfo->actualMinAlignedMarkerCount = assemblerOptions.alignOptions.minAlignedMarkerCount;
-        assembler.assemblerInfo->actualMaxDrift = assemblerOptions.alignOptions.maxDrift;
-        assembler.assemblerInfo->actualMaxSkip = assemblerOptions.alignOptions.maxSkip;
-        assembler.assemblerInfo->actualMaxTrim = assemblerOptions.alignOptions.maxTrim;
+    // // Create the read graph.
+    // if(assemblerOptions.readGraphOptions.creationMethod != 2 ) {
+    //     if(assemblerOptions.readGraphOptions.creationMethod == 0) {
+    //         assembler.createReadGraph(
+    //             assemblerOptions.readGraphOptions.maxAlignmentCount,
+    //             assemblerOptions.readGraphOptions.preferAlignedFraction);
+    //     } else if(assemblerOptions.readGraphOptions.creationMethod == 3) {
+    //         assembler.createReadGraph3(
+    //             assemblerOptions.readGraphOptions.maxAlignmentCount);
+    //     } else if(assemblerOptions.readGraphOptions.creationMethod == 4) {
+    //         assembler.createReadGraph4withStrandSeparation(
+    //         assemblerOptions.readGraphOptions.maxAlignmentCount,
+    //         assemblerOptions.readGraphOptions.epsilon,
+    //         assemblerOptions.readGraphOptions.delta,
+    //         assemblerOptions.readGraphOptions.WThreshold,
+    //         assemblerOptions.readGraphOptions.WThresholdForBreaks
+    //         );
+    //     }  else if(assemblerOptions.readGraphOptions.creationMethod == 5) {
+    //         assembler.createReadGraph5();
+    //     }
+
+    //     // Actual alignment criteria are as specified in the command line options
+    //     // and/or configuration.
+    //     assembler.assemblerInfo->actualMinAlignedFraction = assemblerOptions.alignOptions.minAlignedFraction;
+    //     assembler.assemblerInfo->actualMinAlignedMarkerCount = assemblerOptions.alignOptions.minAlignedMarkerCount;
+    //     assembler.assemblerInfo->actualMaxDrift = assemblerOptions.alignOptions.maxDrift;
+    //     assembler.assemblerInfo->actualMaxSkip = assemblerOptions.alignOptions.maxSkip;
+    //     assembler.assemblerInfo->actualMaxTrim = assemblerOptions.alignOptions.maxTrim;
 
 
-    } else if(assemblerOptions.readGraphOptions.creationMethod == 2) {
-        assembler.createReadGraph2(
-            assemblerOptions.readGraphOptions.maxAlignmentCount,
-            assemblerOptions.readGraphOptions.markerCountPercentile,
-            assemblerOptions.readGraphOptions.alignedFractionPercentile,
-            assemblerOptions.readGraphOptions.maxSkipPercentile,
-            assemblerOptions.readGraphOptions.maxDriftPercentile,
-            assemblerOptions.readGraphOptions.maxTrimPercentile);
-    } else {
-        throw runtime_error("Invalid value for --ReadGraph.creationMethod.");
-    }
+    // } else if(assemblerOptions.readGraphOptions.creationMethod == 2) {
+    //     assembler.createReadGraph2(
+    //         assemblerOptions.readGraphOptions.maxAlignmentCount,
+    //         assemblerOptions.readGraphOptions.markerCountPercentile,
+    //         assemblerOptions.readGraphOptions.alignedFractionPercentile,
+    //         assemblerOptions.readGraphOptions.maxSkipPercentile,
+    //         assemblerOptions.readGraphOptions.maxDriftPercentile,
+    //         assemblerOptions.readGraphOptions.maxTrimPercentile);
+    // } else {
+    //     throw runtime_error("Invalid value for --ReadGraph.creationMethod.");
+    // }
 
-    // Limited strand separation.
-    // If strict strand separation is requested, it is done later,
-    // after chimera detection.
-    if(assemblerOptions.readGraphOptions.strandSeparationMethod == 1) {
-        assembler.flagCrossStrandReadGraphEdges1(
-            assemblerOptions.readGraphOptions.crossStrandMaxDistance,
-            threadCount);
-    }
+    // // Limited strand separation.
+    // // If strict strand separation is requested, it is done later,
+    // // after chimera detection.
+    // if(assemblerOptions.readGraphOptions.strandSeparationMethod == 1) {
+    //     assembler.flagCrossStrandReadGraphEdges1(
+    //         assemblerOptions.readGraphOptions.crossStrandMaxDistance,
+    //         threadCount);
+    // }
 
-    // Flag chimeric reads.
-    assembler.flagChimericReads(assemblerOptions.readGraphOptions.maxChimericReadDistance, threadCount);
+    // // Flag chimeric reads.
+    // assembler.flagChimericReads(assemblerOptions.readGraphOptions.maxChimericReadDistance, threadCount);
 
-    // Flag inconsistent alignments, if requested.
-    if(assemblerOptions.readGraphOptions.flagInconsistentAlignments) {
-        assembler.flagInconsistentAlignments(
-            assemblerOptions.readGraphOptions.flagInconsistentAlignmentsTriangleErrorThreshold,
-            assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareErrorThreshold,
-            assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareMaxDistance,
-            threadCount);
-    }
+    // // Flag inconsistent alignments, if requested.
+    // if(assemblerOptions.readGraphOptions.flagInconsistentAlignments) {
+    //     assembler.flagInconsistentAlignments(
+    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsTriangleErrorThreshold,
+    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareErrorThreshold,
+    //         assemblerOptions.readGraphOptions.flagInconsistentAlignmentsLeastSquareMaxDistance,
+    //         threadCount);
+    // }
 
-    // Strict strand separation.
-    if(assemblerOptions.readGraphOptions.strandSeparationMethod == 2) {
-        assembler.flagCrossStrandReadGraphEdges2();
-    }
+    // // Strict strand separation.
+    // if(assemblerOptions.readGraphOptions.strandSeparationMethod == 2) {
+    //     assembler.flagCrossStrandReadGraphEdges2();
+    // }
 
-    // Compute connected components of the read graph.
-    // These are currently not used.
-    // For strand separation method 2 this was already done
-    // in flagCrossStrandReadGraphEdges2.
-    if(assemblerOptions.readGraphOptions.strandSeparationMethod != 2) {
-        assembler.computeReadGraphConnectedComponents();
-    }
+    // // Compute connected components of the read graph.
+    // // These are currently not used.
+    // // For strand separation method 2 this was already done
+    // // in flagCrossStrandReadGraphEdges2.
+    // if(assemblerOptions.readGraphOptions.strandSeparationMethod != 2) {
+    //     assembler.computeReadGraphConnectedComponents();
+    // }
 
 
     // Mode 3 assembly requires reads in raw representation (not RLE).
