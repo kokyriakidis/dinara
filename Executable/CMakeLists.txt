@@ -35,27 +35,19 @@ file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../external/astar-pairwise-aligner/astarpa-c)
+include_directories(../src)
 
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
-# Build astarpa-c using cargo
-set(ASTARPA_DIR ${CMAKE_SOURCE_DIR}/external/astar-pairwise-aligner)
-set(ASTARPA_LIB ${ASTARPA_DIR}/target/release/libastarpa_c.a)
-
-add_custom_command(
-    OUTPUT ${ASTARPA_LIB}
-    COMMAND cargo build --release --offline
-    WORKING_DIRECTORY ${ASTARPA_DIR}/astarpa-c
-    COMMENT "Building astarpa-c library..."
-)
-
-add_custom_target(astarpa_lib DEPENDS ${ASTARPA_LIB})
+# Find astarpa-c library
+find_library(ASTARPA_LIB astarpa_c)
+if(NOT ASTARPA_LIB)
+    message(FATAL_ERROR "astarpa_c library not found. Please install it.")
+endif()
 
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})
-add_dependencies(dinaraExecutable astarpa_lib)
 set_target_properties(dinaraExecutable PROPERTIES OUTPUT_NAME "dinara")
 
 # Request a static executable (Linux only).

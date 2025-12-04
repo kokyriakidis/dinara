@@ -64,10 +64,16 @@ SET(CMAKE_LINKER_FLAGS  "${CMAKE_LINKER_FLAGS} ${DINARA_PYTHON_LIBRARIES}")
 
 
 
+# Find astarpa-c library
+find_library(ASTARPA_LIB astarpa_c)
+if(NOT ASTARPA_LIB)
+    message(FATAL_ERROR "astarpa_c library not found. Please install it.")
+endif()
+
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule 
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)
