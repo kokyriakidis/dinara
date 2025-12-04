@@ -163,8 +163,9 @@ def installAstarpa():
     else:
         print("cbindgen already installed.")
 
-    if os.path.exists("/usr/local/include/astarpa.h"):
-        print("astarpa header found in /usr/local/include/astarpa.h. Skipping installation.")
+    installPath = "/usr/include/astarpa"
+    if os.path.exists(installPath + "/astarpa.h"):
+        print("astarpa header found in %s/astarpa.h. Skipping installation." % installPath)
         return
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
@@ -190,8 +191,10 @@ def installAstarpa():
         
         # Install
         print("Installing astarpa to /usr/local...")
-        runCommand("cp astarpa.h /usr/local/include/")
-        runCommand("cp ../target/release/libastarpa_c.a /usr/local/lib/")
+        if not os.path.exists(installPath):
+            runCommand("sudo mkdir -p " + installPath)
+        runCommand("sudo cp astarpa.h " + installPath)
+        runCommand("sudo cp ../target/release/libastarpa_c.a /usr/local/lib/")
         
         os.chdir(oldDirectory)
 
@@ -201,8 +204,48 @@ installSeqan()
 installPybind11() 
 installSpoa()
 installAstarpa()
+
+def installSimdMinimizers():
+    installPath = "/usr/include/simd-minimizers"
+    if os.path.exists(installPath + "/simd_minimizers.h"):
+        print("simd-minimizers-c header found in %s/simd_minimizers.h. Skipping installation." % installPath)
+        return
+
+    print("Installing simd-minimizers-c...")
+    
+    cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
+    
+    # Ensure Rust is installed (installAstarpa might have done it, but check to be safe)
+    if not os.path.exists(cargoPath):
+        print("Rust not found. Installing Rust...")
+        runCommand("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
+        
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building simd-minimizers-c library using temporary directory", temporaryDirectory)
+        
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+        
+        # Clone repo
+        runCommand("git clone https://github.com/kokyriakidis/simd-minimizers-c.git")
+        os.chdir("simd-minimizers-c")
+        
+        # Build
+        # We use target-cpu=native for best performance as requested
+        runCommand("RUSTFLAGS='-C target-cpu=native' " + cargoPath + " build --release")
+        
+        # Install
+        print("Installing simd-minimizers-c to /usr/local...")
+        if not os.path.exists(installPath):
+            runCommand("sudo mkdir -p " + installPath)
+        runCommand("sudo cp simd_minimizers.h " + installPath)
+        runCommand("sudo cp target/release/libsimd_minimizers_c.so /usr/local/lib/")
+        
+        os.chdir(oldDirectory)
+
+installSimdMinimizers()
   
 # Make sure the newly created libraries are immediately visible to the loader.
-runCommand("ldconfig")
+runCommand("sudo ldconfig")
 
 print("Installation of Dinara prerequisies completed successfully.")
