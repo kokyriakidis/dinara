@@ -6,10 +6,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "AssemblerOptions.hpp"
-#include "AssemblyGraph.hpp"
 #include "buildId.hpp"
-#include "ConfigurationTable.hpp"
-#include "Coverage.hpp"
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
 #include "performanceLog.hpp"
@@ -34,7 +31,6 @@ using namespace dinara;
 #include "chrono.hpp"
 #include <filesystem>
 #include "iostream.hpp"
-#include "iterator.hpp"
 #include "stdexcept.hpp"
 
 

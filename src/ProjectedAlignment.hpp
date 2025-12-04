@@ -14,7 +14,7 @@ an Alignment in marker space to base space.
 #include "span.hpp"
 #include "utility.hpp"
 #include "vector.hpp"
-#include "../external/astar-pairwise-aligner/astarpa-c/astarpa.h"
+#include <astarpa.h>
 
 namespace dinara {
     class ProjectedAlignment;

@@ -8,7 +8,6 @@
 #include "AssemblerOptions.hpp"
 #include "AssemblyGraph2Statistics.hpp"
 #include "HttpServer.hpp"
-#include "invalid.hpp"
 #include "Kmer.hpp"
 #include "KmerDistributionInfo.hpp"
 #include "MappedMemoryOwner.hpp"

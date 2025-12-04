@@ -49,9 +49,10 @@ def installSeqan():
     installPath = "/usr/include/seqan"
     
     # First check that this path does not exist.
+    # First check that this path does not exist.
     if os.path.exists(installPath):
-        raise Exception("The seqan install path %s already exists. "
-            "Remove it first (using apt remove if it was installed using apt)." % installPath)
+        print("The seqan install path %s already exists. Skipping installation." % installPath)
+        return
         
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building seqan library using temporary directory", temporaryDirectory)
@@ -89,6 +90,10 @@ def installSpoa():
     # without the static version.
     # So we have to build it from source.
     
+    if os.path.exists("/usr/local/include/spoa/spoa.hpp"):
+        print("spoa header found in /usr/local/include/spoa/spoa.hpp. Skipping installation.")
+        return
+
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building spoa library using temporary directory", temporaryDirectory)
         
@@ -135,10 +140,67 @@ def installSpoa():
         os.chdir(oldDirectory)
 
 
+def installAstarpa():
+    print("Checking for Rust installation...")
+    installPackage("curl")
+    
+    cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
+    rustupPath = os.path.expanduser("~/.cargo/bin/rustup")
+    cbindgenPath = os.path.expanduser("~/.cargo/bin/cbindgen")
+    
+    if not os.path.exists(cargoPath):
+        print("Rust not found. Installing Rust...")
+        runCommand("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
+    
+    # Switch to nightly as recommended by astarpa docs
+    print("Switching to nightly toolchain...")
+    runCommand(rustupPath + " install nightly")
+    runCommand(rustupPath + " default nightly")
+
+    if not os.path.exists(cbindgenPath):
+        print("Installing cbindgen...")
+        runCommand(cargoPath + " install cbindgen")
+    else:
+        print("cbindgen already installed.")
+
+    if os.path.exists("/usr/local/include/astarpa.h"):
+        print("astarpa header found in /usr/local/include/astarpa.h. Skipping installation.")
+        return
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building astarpa library using temporary directory", temporaryDirectory)
+        
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+        
+        # Clone repo
+        runCommand("git clone https://github.com/RagnarGrootKoerkamp/astar-pairwise-aligner.git")
+        os.chdir("astar-pairwise-aligner/astarpa-c")
+        
+        # Patch for recent nightly Rust (unsafe attributes)
+        print("Patching astarpa-c for nightly Rust compatibility...")
+        runCommand("sed -i 's/#\\[no_mangle\\]/#\\[unsafe(no_mangle)\\]/g' src/lib.rs")
+        runCommand("sed -i '1i #![allow(unsafe_op_in_unsafe_fn)]' src/lib.rs")
+
+        # Build
+        runCommand(cargoPath + " build --release")
+        
+        # Generate header
+        runCommand(cbindgenPath + " --lang c --cpp-compat --crate astarpa-c -o astarpa.h")
+        
+        # Install
+        print("Installing astarpa to /usr/local...")
+        runCommand("cp astarpa.h /usr/local/include/")
+        runCommand("cp ../target/release/libastarpa_c.a /usr/local/lib/")
+        
+        os.chdir(oldDirectory)
+
+
 installAptPackages() 
 installSeqan()
 installPybind11() 
 installSpoa()
+installAstarpa()
   
 # Make sure the newly created libraries are immediately visible to the loader.
 runCommand("ldconfig")
