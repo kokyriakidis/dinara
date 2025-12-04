@@ -687,6 +687,7 @@ public:
     void accessAlignmentCandidateTable();
     vector<OrientedReadPair> getAlignmentCandidates() const;
     void computeCandidateTable();
+    void importAlignmentCandidatesFromPaf(const string& pafFilePath);
 
 private:
     void checkAlignmentCandidatesAreOpen() const;

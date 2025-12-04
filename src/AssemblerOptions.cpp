@@ -255,6 +255,13 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         "candidate graph. Experimental."
         )
 
+        ("overlapsFromPafFile",
+        value<string>(&commandLineOnlyOptions.overlapsFromPafFile),
+        "The name of a PAF file containing overlaps between reads. "
+        "If specified, alignment candidates are loaded from this file "
+        "instead of being computed using LowHash."
+        )
+
         ("saveBinaryData",
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->
         default_value(false),

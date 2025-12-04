@@ -103,6 +103,7 @@ public:
     string exploreAccess;
     uint16_t port;
     string alignmentsPafFile;
+    string overlapsFromPafFile;
     bool saveBinaryData;
 };
 
