@@ -9,11 +9,12 @@
 
 #include "cstdint.hpp"
 #include "memory.hpp"
+#include "Coverage.hpp"
 
 namespace dinara {
 
     class Base;
-    class CompressedCoverageData;
+
     class CompressedMarker;
     class MarkerGraph;
     class Reads;
