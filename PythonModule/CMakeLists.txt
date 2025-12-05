@@ -70,10 +70,22 @@ if(NOT ASTARPA_LIB)
     message(FATAL_ERROR "astarpa_c library not found. Please install it.")
 endif()
 
+# Find poasta-c library
+find_library(POASTA_LIB poasta_c)
+if(NOT POASTA_LIB)
+    message(FATAL_ERROR "poasta_c library not found. Please install it.")
+endif()
+
+# Find simd-minimizers-c library
+find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c)
+if(NOT SIMD_MINIMIZERS_LIB)
+    message(FATAL_ERROR "simd_minimizers_c library not found. Please install it.")
+endif()
+
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule 
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)
