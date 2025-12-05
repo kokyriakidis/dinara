@@ -205,6 +205,43 @@ installPybind11()
 installSpoa()
 installAstarpa()
 
+def installPoasta():
+    installPath = "/usr/include/poasta"
+    if os.path.exists(installPath + "/poasta.h"):
+        print("poasta-c header found in %s/poasta.h. Skipping installation." % installPath)
+        return
+
+    print("Installing poasta-c...")
+    
+    cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
+    
+    if not os.path.exists(cargoPath):
+        print("Rust not found. Installing Rust...")
+        runCommand("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
+        
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building poasta-c library using temporary directory", temporaryDirectory)
+        
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+        
+        # Clone repo
+        runCommand("git clone https://github.com/kokyriakidis/poasta-c.git")
+        os.chdir("poasta-c")
+        
+        # Build
+        runCommand("RUSTFLAGS='-C target-cpu=native' " + cargoPath + " build --release")
+        
+        # Install
+        print("Installing poasta-c to /usr/local...")
+        if not os.path.exists(installPath):
+            runCommand("sudo mkdir -p " + installPath)
+        runCommand("sudo cp poasta.h " + installPath)
+        runCommand("sudo cp target/release/libpoasta_c.so /usr/local/lib/")
+        runCommand("sudo cp target/release/libpoasta_c.a /usr/local/lib/")
+        
+        os.chdir(oldDirectory)
+
 def installSimdMinimizers():
     installPath = "/usr/include/simd-minimizers"
     if os.path.exists(installPath + "/simd_minimizers.h"):
@@ -240,10 +277,12 @@ def installSimdMinimizers():
             runCommand("sudo mkdir -p " + installPath)
         runCommand("sudo cp simd_minimizers.h " + installPath)
         runCommand("sudo cp target/release/libsimd_minimizers_c.so /usr/local/lib/")
+        runCommand("sudo cp target/release/libsimd_minimizers_c.a /usr/local/lib/")
         
         os.chdir(oldDirectory)
 
 installSimdMinimizers()
+installPoasta()
   
 # Make sure the newly created libraries are immediately visible to the loader.
 runCommand("sudo ldconfig")
