@@ -1,2 +1,14 @@
 build/
 external/
+
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+*.so
+*.a
+
+# Install directory
+dinara-install/

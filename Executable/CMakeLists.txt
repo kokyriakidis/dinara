@@ -46,6 +46,18 @@ if(NOT ASTARPA_LIB)
     message(FATAL_ERROR "astarpa_c library not found. Please install it.")
 endif()
 
+# Find poasta-c library
+find_library(POASTA_LIB poasta_c)
+if(NOT POASTA_LIB)
+    message(FATAL_ERROR "poasta_c library not found. Please install it.")
+endif()
+
+# Find simd-minimizers-c library
+find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c)
+if(NOT SIMD_MINIMIZERS_LIB)
+    message(FATAL_ERROR "simd_minimizers_c library not found. Please install it.")
+endif()
+
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})
 set_target_properties(dinaraExecutable PROPERTIES OUTPUT_NAME "dinara")
@@ -61,24 +73,24 @@ if(APPLE)
         dinaraExecutable
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
-        ${ASTARPA_LIB})
+        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
 else()
     # For arcane reasons, statically linking with the pthread
     # library on Linux requires "--whole-archive".
-    if(X86_64)
+        if(X86_64)
         target_link_libraries(
             dinaraExecutable
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB})
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB})
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
     endif(X86_64) 
 endif()
   
