@@ -259,6 +259,7 @@ public:
     // Functions related to markers.
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
+    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 

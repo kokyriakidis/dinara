@@ -395,6 +395,22 @@ void AssemblerOptions::addConfigurableOptions()
         "The directory containing the hash table with marker k-mer global frequencies. "
         "Only used for Dinara development.")
 
+        ("Kmers.useSimdMinimizers",
+        value<bool>(&kmersOptions.useSimdMinimizers)->
+        default_value(false),
+        "If set to true, use SIMD-accelerated minimizers for marker generation instead of "
+        "the default k-mer based method. Requires Kmers.minimizerK and Kmers.minimizerW.")
+
+        ("Kmers.minimizerK",
+        value<int>(&kmersOptions.minimizerK)->
+        default_value(32),
+        "K-mer size for SIMD minimizer-based marker generation. Only used if Kmers.useSimdMinimizers is set.")
+
+        ("Kmers.minimizerW",
+        value<int>(&kmersOptions.minimizerW)->
+        default_value(32),
+        "Window size for SIMD minimizer-based marker generation. Only used if Kmers.useSimdMinimizers is set.")
+
         ("MinHash.version",
         value<int>(&minHashOptions.version)->
         default_value(0),
@@ -1325,6 +1341,9 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
+    s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
+    s << "minimizerK = " << minimizerK << "\n";
+    s << "minimizerW = " << minimizerW << "\n";
 }
 
 

@@ -289,7 +289,7 @@ void Assembler::computeAlignments(
 
     // Check that we have what we need.
     reads->checkReadsAreOpen();
-    DINARA_ASSERT(kmerChecker);
+    // Note: kmerChecker is not required when using SIMD minimizers for marker generation.
     checkMarkersAreOpen();
     checkAlignmentCandidatesAreOpen();
 

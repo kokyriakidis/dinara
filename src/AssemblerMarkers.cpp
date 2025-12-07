@@ -11,8 +11,15 @@
 #include "timestamp.hpp"
 using namespace dinara;
 
+// SIMD minimizers library.
+#include <simd-minimizers/simd_minimizers.h>
+
 // Standard library.
 #include "fstream.hpp"
+#include <algorithm>
+#include <chrono>
+#include <sstream>
+#include <vector>
 
 
 void Assembler::findMarkers(uint64_t threadCount)
@@ -28,6 +35,123 @@ void Assembler::findMarkers(uint64_t threadCount)
         markers,
         threadCount);
 
+}
+
+
+
+// Find markers using SIMD-accelerated minimizers.
+// This uses the simd-minimizers-c library to compute canonical minimizers
+// for each read, and stores the minimizer positions as markers.
+void Assembler::findMarkersSimdMinimizers(uint64_t /* threadCount */, int k, int w)
+{
+    reads->checkReadsAreOpen();
+
+    performanceLog << timestamp << "Finding markers using SIMD minimizers (k=" << k << ", w=" << w << ") in "
+        << reads->readCount() << " reads." << endl;
+    const auto tBegin = std::chrono::steady_clock::now();
+
+    // Store k in assemblerInfo for later use.
+    assemblerInfo->k = k;
+
+    // Create the markers data structure.
+    markers.createNew(largeDataName("Markers"), largeDataPageSize);
+
+    // Create the SIMD sketcher for computing minimizers.
+    SimdSketcher* sketcher = simd_sketcher_new(static_cast<uint8_t>(k), static_cast<uint8_t>(w));
+
+    // We need to process reads in two passes:
+    // Pass 1: Count markers for each oriented read.
+    // Pass 2: Store markers.
+
+    const ReadId readCount = reads->readCount();
+
+    // Helper lambda to get sorted, unique minimizer positions for a read.
+    auto getSortedUniquePositions = [&](ReadId readId) -> std::vector<uint32_t> {
+        const LongBaseSequenceView read = reads->getRead(readId);
+        
+        if(read.baseCount < uint64_t(k)) {
+            return {};
+        }
+
+        // Convert read to string for simd-minimizers.
+        string readSequence;
+        readSequence.reserve(read.baseCount);
+        for(uint64_t i = 0; i < read.baseCount; i++) {
+            readSequence.push_back(read[i].character());
+        }
+
+        // Compute minimizer positions using simd-minimizers.
+        MinimizerList minimizerPositions = canonical_minimizer_positions(
+            sketcher,
+            readSequence.c_str(),
+            readSequence.size());
+
+        // Copy to vector, sort, and remove duplicates.
+        std::vector<uint32_t> positions(minimizerPositions.data, 
+                                         minimizerPositions.data + minimizerPositions.len);
+        std::sort(positions.begin(), positions.end());
+        positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+
+        // Free the minimizer list.
+        free_minimizer_list(minimizerPositions);
+
+        return positions;
+    };
+
+    // Pass 1: Count markers for each read.
+    markers.beginPass1(2 * readCount);
+
+    for(ReadId readId = 0; readId < readCount; readId++) {
+        const std::vector<uint32_t> positions = getSortedUniquePositions(readId);
+        
+        // Each read has the same number of markers on both strands.
+        markers.incrementCount(OrientedReadId(readId, 0).getValue(), positions.size());
+        markers.incrementCount(OrientedReadId(readId, 1).getValue(), positions.size());
+    }
+
+    markers.beginPass2();
+
+    // Pass 2: Store markers.
+    for(ReadId readId = 0; readId < readCount; readId++) {
+        const LongBaseSequenceView read = reads->getRead(readId);
+        const std::vector<uint32_t> positions = getSortedUniquePositions(readId);
+
+        if(positions.empty()) {
+            continue;
+        }
+
+        // Get pointers for storing markers.
+        CompressedMarker* markerPointerStrand0 = markers.begin(OrientedReadId(readId, 0).getValue());
+        CompressedMarker* markerPointerStrand1 = markers.end(OrientedReadId(readId, 1).getValue()) - 1;
+
+        // Store markers for both strands.
+        for(const uint32_t position : positions) {
+            // Strand 0: position as-is.
+            markerPointerStrand0->position = position;
+            ++markerPointerStrand0;
+
+            // Strand 1: reverse complement position.
+            markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
+            --markerPointerStrand1;
+        }
+
+        // Verify correct number of markers were stored (like original MarkerFinder).
+        DINARA_ASSERT(markerPointerStrand0 == markers.end(OrientedReadId(readId, 0).getValue()));
+        DINARA_ASSERT(markerPointerStrand1 == markers.begin(OrientedReadId(readId, 1).getValue()) - 1);
+    }
+
+    markers.endPass2(false);
+
+    // Free the sketcher.
+    simd_sketcher_free(sketcher);
+
+    markers.unreserve();
+
+    // Final message.
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
+    performanceLog << timestamp << "Finding markers using SIMD minimizers completed in " << tTotal << " s." << endl;
+    cout << "Created " << markers.totalSize() << " markers using SIMD minimizers." << endl;
 }
 
 
