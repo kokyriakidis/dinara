@@ -474,12 +474,22 @@ void dinara::main::assemble(
     // of --Reads.handleDuplicates. The default option is "useOneCopy".
     assembler.findDuplicateReads(assemblerOptions.readsOptions.handleDuplicates);
 
-    // Initialize the KmerChecker, which has the information needed
-    // to decide if a k-mer is a marker.
-    assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
+    // Find markers using either SIMD minimizers or the default k-mer based method.
+    if(assemblerOptions.kmersOptions.useSimdMinimizers) {
+        // Use SIMD-accelerated minimizers for marker generation.
+        assembler.findMarkersSimdMinimizers(
+            threadCount,
+            assemblerOptions.kmersOptions.minimizerK,
+            assemblerOptions.kmersOptions.minimizerW);
+    } else {
+        // Use the default k-mer based method.
+        // Initialize the KmerChecker, which has the information needed
+        // to decide if a k-mer is a marker.
+        assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
 
-    // Find the markers in the reads.
-    assembler.findMarkers(threadCount);
+        // Find the markers in the reads.
+        assembler.findMarkers(threadCount);
+    }
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
     // If using alignment method 6, count marker k-mers.

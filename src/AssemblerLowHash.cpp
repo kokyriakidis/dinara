@@ -22,7 +22,8 @@ void Assembler::findAlignmentCandidatesLowHash0(
 {
 
     // Check that we have what we need.
-    DINARA_ASSERT(kmerChecker);
+    // Note: kmerChecker is not required here - we only use markerKmerIds,
+    // which can be computed without kmerChecker (e.g., when using SIMD minimizers).
     checkMarkersAreOpen();
     const ReadId readCount = ReadId(markers.size() / 2);
     DINARA_ASSERT(readCount > 0);

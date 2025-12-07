@@ -162,6 +162,12 @@ public:
     uint64_t distanceThreshold;
     string file;
     string globalFrequencyOverrideDirectory;
+
+    // Options for SIMD minimizer-based marker generation.
+    bool useSimdMinimizers;
+    int minimizerK;
+    int minimizerW;
+
     void write(ostream&) const;
 };
 
