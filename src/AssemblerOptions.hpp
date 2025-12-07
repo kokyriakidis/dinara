@@ -268,12 +268,15 @@ public:
     uint64_t flagInconsistentAlignmentsTriangleErrorThreshold;
     uint64_t flagInconsistentAlignmentsLeastSquareErrorThreshold;
     uint64_t flagInconsistentAlignmentsLeastSquareMaxDistance;
-    void write(ostream& ) const;
     // New readGraph4withStrandSeparation options
     double epsilon;
     double delta;
     double WThreshold;
     double WThresholdForBreaks;
+    
+    // Cluster graph options.
+    uint64_t clusterGraphMinEdgeCoverage;
+    void write(ostream& ) const;
 };
 
 

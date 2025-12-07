@@ -7,6 +7,7 @@
 #include "Assembler.hpp"
 #include "AssemblerOptions.hpp"
 #include "buildId.hpp"
+#include "ClusterGraph.hpp"
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
 #include "performanceLog.hpp"
@@ -568,6 +569,12 @@ void dinara::main::assemble(
 
     // Create the read graph.
     assembler.createReadGraph5();
+
+    // Create the cluster graph for visualization and exploration.
+    // This graph shows connections between valid clusters based on read paths.
+    // We save the full graph (minEdgeCoverage=0) to include all edges;
+    // filtering is done at exploration time in the HTTP server.
+    assembler.createClusterGraph(0);
 
 
     // Mode 3 assembly requires reads in raw representation (not RLE).
