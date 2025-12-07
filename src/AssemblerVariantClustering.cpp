@@ -110,6 +110,48 @@ void Assembler::checkVariantClusteringPositionPairsIsOpen() const
 }
 
 
+void Assembler::accessVariantClusteringData()
+{
+    // Access position pairs
+    variantClusteringPositionPairs.accessExistingReadOnly(
+        largeDataName("VariantClusteringPositionPairs"));
+    cout << "Accessed " << variantClusteringPositionPairs.size() 
+         << " position pairs for variant clustering." << endl;
+
+    // Access members by representative index
+    variantClusteringMembersByRepIdx.accessExistingReadOnly(
+        largeDataName("VariantClusteringMembersByRepIdx"));
+    cout << "Accessed variant clustering members by representative index with " 
+         << variantClusteringMembersByRepIdx.size() << " clusters." << endl;
+
+    // Access valid clusters
+    variantClusteringValidClusters.accessExistingReadOnly(
+        largeDataName("VariantClusteringValidClusters"));
+    cout << "Accessed " << variantClusteringValidClusters.size() 
+         << " variant clustering validity flags." << endl;
+
+    // Access position pair alleles (optional, may not be present in older runs)
+    try {
+        variantClusteringPositionPairAlleles.accessExistingReadOnly(
+            largeDataName("VariantClusteringPositionPairAlleles"));
+        cout << "Accessed " << variantClusteringPositionPairAlleles.size() 
+             << " variant clustering position pair alleles." << endl;
+    } catch(const exception& e) {
+        cout << "Variant clustering position pair alleles not available." << endl;
+    }
+
+    // Access member status (optional, may not be present in older runs)
+    // Status 0 = Good/Keep, Status 1 = Stray/Filter
+    try {
+        variantClusteringMemberStatus.accessExistingReadOnly(
+            largeDataName("VariantClusteringMemberStatus"));
+        cout << "Accessed " << variantClusteringMemberStatus.size() 
+             << " variant clustering member status entries." << endl;
+    } catch(const exception& e) {
+        cout << "Variant clustering member status not available (using all members)." << endl;
+    }
+}
+
 
 void Assembler::storeVariantClusteringPositionPairs(
     uint64_t threadCount,

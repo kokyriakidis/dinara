@@ -257,6 +257,7 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreClusterGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowingAssemblyGraph);
@@ -545,6 +546,10 @@ void Assembler::writeNavigation(ostream& html) const
             {"Local anchor graph", "exploreLocalAnchorGraph"},
             });
 
+        writeNavigation(html, "Cluster graph", {
+            {"Explore cluster graph", "exploreClusterGraph"},
+            });
+
         writeNavigation(html, "Assembly", {
             {"Local assembly", "exploreLocalAssembly"},
             {"Local assembly graph", "exploreMode3AssemblyGraph"},
@@ -829,6 +834,14 @@ void Assembler::accessAllSoft()
             cout << "The mode 3 assembler is not accessible." << endl;
             allDataAreAvailable = false;
         }
+    }
+
+    // Variant clustering data (for ClusterGraph).
+    try {
+        accessVariantClusteringData();
+    } catch(const exception& e) {
+        cout << "Variant clustering data is not accessible." << endl;
+        // Don't set allDataAreAvailable = false since this is optional
     }
 
 

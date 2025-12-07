@@ -47,6 +47,7 @@ namespace dinara {
     class AssemblerOptions;
     class AssembledSegment;
     class AssemblyGraph2;
+    class ClusterGraph;
     class CompressedAssemblyGraph;
     class ConsensusCaller;
     class Histogram2;
@@ -1091,6 +1092,9 @@ public:
     void accessVariantClusteringPositionPairsReadWrite();
     void checkVariantClusteringPositionPairsIsOpen() const;
 
+    // Access functions for variant clustering data (for explore mode)
+    void accessVariantClusteringData();
+
     void collectVariantClusteringPositionPairs(
         const ProjectedAlignment& projectedAlignment,
         const array<OrientedReadId, 2>& orientedReadIds,
@@ -1149,8 +1153,21 @@ public:
 
     void linkVariantClustersThreadFunction(uint64_t threadId);  // Phase 2: Link pairs with disjoint sets
 
-
-
+    // ClusterGraph: A graph where vertices are valid clusters and edges
+    // represent connectivity between clusters based on read paths.
+    std::shared_ptr<ClusterGraph> clusterGraph;
+    
+    // Create the ClusterGraph from variant clustering data and save it.
+    void createClusterGraph(uint64_t minEdgeCoverage = 0);
+    
+    // Load the ClusterGraph from binary file.
+    void loadClusterGraph();
+    
+    // Access the ClusterGraph (load if not exists).
+    ClusterGraph& getClusterGraph();
+    
+    // HTTP server function to explore the cluster graph.
+    void exploreClusterGraph(const vector<string>& request, ostream& html);
 
 
     // Triangle and least square analysis of the read graph

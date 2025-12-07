@@ -745,6 +745,12 @@ void AssemblerOptions::addConfigurableOptions()
         "Logarithm of probability ratio used for the Bayesian ranking of alignments to detect breaks in the read graph. "
         "(only used when --ReadGraph.creationMethod is 4).")
 
+        ("ReadGraph.clusterGraphMinEdgeCoverage",
+        value<uint64_t>(&readGraphOptions.clusterGraphMinEdgeCoverage)->
+        default_value(6),
+        "Minimum edge coverage for the cluster graph. "
+        "Edges with coverage below this threshold are not created.")
+
         ("MarkerGraph.minCoverage",
         value<int>(&markerGraphOptions.minCoverage)->
         default_value(10),
@@ -1441,6 +1447,7 @@ void ReadGraphOptions::write(ostream& s) const
     s << "delta = " << delta << "\n";
     s << "WThreshold = " << WThreshold << "\n";
     s << "WThresholdForBreaks = " << WThresholdForBreaks << "\n";
+    s << "clusterGraphMinEdgeCoverage = " << clusterGraphMinEdgeCoverage << "\n";
 }
 
 
