@@ -70,7 +70,7 @@ public:
     double edgeThickness = 1.0;
     bool edgeLabels = false;
     std::string edgeColoring = "byCoverage";  // "black", "byCoverage"
-    double arrowSize = 0.5;
+    double arrowSize = 0.3;  // Arrowhead size multiplier (smaller = smaller arrows)
     
     // Thresholds for coloring by coverage.
     uint64_t lowCoverage = 1;
@@ -132,10 +132,19 @@ public:
     
     // True if this edge connects a cluster to its reverse-complement partner.
     bool isRcPairEdge = false;
+    
+    // Haplotype support score: sum of HaplotypeGraph edge weights for reads
+    // supporting this edge. Higher = more confident these clusters are on same haplotype.
+    uint64_t haplotypeScore = 0;
+
+    // The reads that support this edge. 
+    // Used for "read following" to resolve forks locally.
+    std::vector<ReadId> readIds;
 
     ClusterGraphEdge() = default;
-    ClusterGraphEdge(uint64_t coverage, int64_t averageOffset) :
-        coverage(coverage), averageOffset(averageOffset), isRcPairEdge(false) {}
+    ClusterGraphEdge(uint64_t coverage, int64_t averageOffset, bool isRcPairEdge) : 
+        coverage(coverage), averageOffset(averageOffset), 
+        isRcPairEdge(isRcPairEdge), haplotypeScore(0) {}
     
     // Constructor for RC pair edges.
     static ClusterGraphEdge createRcPairEdge() {
@@ -208,7 +217,9 @@ public:
         vertex_descriptor v0,
         vertex_descriptor v1,
         uint64_t coverage,
-        int64_t averageOffset);
+        int64_t averageOffset,
+        uint64_t haplotypeScore,
+        const std::vector<ReadId>& readIds);
 
     // Write the graph in Graphviz format.
     void writeGraphviz(
@@ -231,6 +242,31 @@ public:
 
     // Remove edges with coverage below threshold.
     void removeWeakEdges(uint64_t minCoverage);
+
+    // Remove edges with average haplotype support score below threshold.
+    // Average score = total haplotype score / coverage.
+    void removeLowHaplotypeSupportEdges(double minAverageHaplotypeScore);
+
+    // Remove edges that do not have a corresponding Reverse Complement edge.
+    // If u->v exists, we require RC(v)->RC(u) to exist.
+    void pruneAsymmetricEdges();
+
+    // Prune outgoing edges that are much weaker than the best outgoing edge.
+    // For each vertex, finds the max haplotypeScore among outgoing edges.
+    // Removes edges with score < maxScore * relativeThreshold.
+    void pruneConflictingEdges(double relativeThreshold = 0.1);
+
+    // Simplify the graph by removing transitive edges.
+    // If A->B->C exists, remove A->C.
+    // This helps in visualizing linear structures.
+    void transitiveReduction();
+
+    // Resolve forks using local read following (readIds on edges).
+    void resolveForks();
+
+    // Update edge coverages to be the number of shared reads between source and target clusters.
+    // This counts ALL shared reads, not just consecutive ones.
+    void updateEdgeCoverages(const Assembler& assembler);
 
     // Get graph statistics.
     uint64_t vertexCount() const { return num_vertices(*this); }

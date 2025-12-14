@@ -215,6 +215,8 @@ public:
     uint32_t mismatchCountRle = invalid<uint32_t>;
     float errorRate = invalid<float>;
     uint32_t mismatchCount = invalid<uint32_t>;
+    float errorRateGaps = invalid<float>;
+    uint32_t gapCount = invalid<uint32_t>;
 
     void clearFlags()
     {
