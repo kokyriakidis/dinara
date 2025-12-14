@@ -88,6 +88,9 @@ public:
 
     // The number of mismatches in the raw alignment.
     uint64_t mismatchCount = invalid<uint64_t>;
+    
+    // The number of deletions in the raw alignment.
+    uint64_t deletionCount = invalid<uint64_t>;
 
 
     void writeAlignmentHtml(ostream&) const;
@@ -174,9 +177,13 @@ public:
 
     // The number of mismatches in the raw alignment.
     uint64_t mismatchCount;
+    
+    // The number of deletions in the raw alignment.
+    uint64_t totalDeletionCount;
 
     void computeStatistics();
     double errorRate() const;
+    double errorRateGaps() const;
     double errorRateRle() const;
     double Q() const;
     double QRle() const;

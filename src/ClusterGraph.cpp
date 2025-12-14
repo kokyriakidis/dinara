@@ -36,10 +36,11 @@ ClusterGraph::ClusterGraph(
     const Assembler& assembler,
     uint64_t minEdgeCoverage)
 {
-    // Collect all valid cluster IDs.
-    const uint64_t clusterCount = assembler.variantClusteringValidClusters.size();
+    // Collect all compatible cluster IDs (stricter filtering than just valid).
+    // These clusters passed: allele coverage, strand bias, homopolymer, AND compatibility checks.
+    const uint64_t clusterCount = assembler.variantClusteringValidClustersCompatible.size();
     for(uint64_t clusterId = 0; clusterId < clusterCount; clusterId++) {
-        if(assembler.variantClusteringValidClusters[clusterId]) {
+        if(assembler.variantClusteringValidClustersCompatible[clusterId]) {
             clusterIds.push_back(clusterId);
         }
     }
@@ -219,6 +220,7 @@ void ClusterGraph::save(const std::string& fileName) const
         out.write(reinterpret_cast<const char*>(&edge.coverage), sizeof(edge.coverage));
         out.write(reinterpret_cast<const char*>(&edge.averageOffset), sizeof(edge.averageOffset));
         out.write(reinterpret_cast<const char*>(&edge.isRcPairEdge), sizeof(edge.isRcPairEdge));
+        out.write(reinterpret_cast<const char*>(&edge.haplotypeScore), sizeof(edge.haplotypeScore));
     }
 }
 
@@ -272,6 +274,7 @@ void ClusterGraph::load(const std::string& fileName)
         in.read(reinterpret_cast<char*>(&edge.coverage), sizeof(edge.coverage));
         in.read(reinterpret_cast<char*>(&edge.averageOffset), sizeof(edge.averageOffset));
         in.read(reinterpret_cast<char*>(&edge.isRcPairEdge), sizeof(edge.isRcPairEdge));
+        in.read(reinterpret_cast<char*>(&edge.haplotypeScore), sizeof(edge.haplotypeScore));
         
         auto itSource = clusterIdToVertex.find(sourceClusterId);
         auto itTarget = clusterIdToVertex.find(targetClusterId);
@@ -406,9 +409,15 @@ void ClusterGraph::buildEdgesFromReads(
     const Assembler& assembler,
     uint64_t minEdgeCoverage)
 {
-    // Build a map from (sourceClusterId, targetClusterId) -> (coverage, sumOffset).
+    // Build a map from (sourceClusterId, targetClusterId) -> (coverage, sumOffset, haplotypeScore).
     // Directed: source has lower position on read, target has higher position.
-    std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, int64_t>> edgeMap;
+    struct EdgeData {
+        uint64_t coverage = 0;
+        int64_t sumOffset = 0;
+        uint64_t haplotypeScore = 0;
+        std::vector<ReadId> readIds;
+    };
+    std::map<std::pair<uint64_t, uint64_t>, EdgeData> edgeMap;
 
     const auto& positionPairs = assembler.variantClusteringPositionPairs;
     
@@ -426,6 +435,24 @@ void ClusterGraph::buildEdgesFromReads(
         }
     }
 
+    // Pre-compute max outgoing edge weight in HaplotypeGraph for each oriented read.
+    // This represents the "haplotype quality" of each read.
+    const uint64_t orientedReadCount = 2 * assembler.getReads().readCount();
+    std::vector<uint32_t> readHaplotypeQuality(orientedReadCount, 0);
+    
+    if(assembler.globalHaplotypeGraph) {
+        const auto& hapGraph = *assembler.globalHaplotypeGraph;
+        for(uint64_t orientedReadIdValue = 0; orientedReadIdValue < orientedReadCount; orientedReadIdValue++) {
+            uint32_t maxWeight = 0;
+            auto outEdges = boost::out_edges(orientedReadIdValue, hapGraph);
+            for(auto eit = outEdges.first; eit != outEdges.second; ++eit) {
+                uint32_t weight = boost::get(boost::edge_weight, hapGraph, *eit);
+                maxWeight = std::max(maxWeight, weight);
+            }
+            readHaplotypeQuality[orientedReadIdValue] = maxWeight;
+        }
+    }
+
     // Iterate over all reads.
     const uint64_t readCount = assembler.getReads().readCount();
     
@@ -433,6 +460,7 @@ void ClusterGraph::buildEdgesFromReads(
         // Process both strands.
         for(Strand strand = 0; strand < 2; strand++) {
             OrientedReadId orientedReadId(readId, strand);
+            const uint32_t thisReadHapQuality = readHaplotypeQuality[orientedReadId.getValue()];
             
             // Find position pairs for this read.
             auto it = std::lower_bound(
@@ -449,6 +477,18 @@ void ClusterGraph::buildEdgesFromReads(
             
             while(it != positionPairs.end() && it->first == orientedReadId) {
                 uint64_t index = it - positionPairs.begin();
+
+                // Check for stray reads (status 1) if status information is available.
+                // Status 1 means the read was identified as inconsistent with the cluster's haplotype
+                // during refined clustering using the global haplotype graph.
+                if(assembler.variantClusteringMemberStatus.isOpen && 
+                   index < assembler.variantClusteringMemberStatus.size()) {
+                    if(assembler.variantClusteringMemberStatus[index] == 1) {
+                         ++it;
+                         continue; // Skip stray reads
+                    }
+                }
+
                 uint64_t clusterId = positionPairToClusterId[index];
                 
                 // Only include clusters that are in this graph.
@@ -487,27 +527,29 @@ void ClusterGraph::buildEdgesFromReads(
                 auto key = std::make_pair(sourceClusterId, targetClusterId);
                 
                 auto& edgeData = edgeMap[key];
-                edgeData.first++;  // coverage
-                edgeData.second += offset;  // sum of offsets (always positive since sorted by position)
+                edgeData.coverage++;
+                edgeData.sumOffset += offset;
+                edgeData.haplotypeScore += thisReadHapQuality;  // Sum of read haplotype qualities
+                edgeData.readIds.push_back(readId);
             }
         }
     }
 
     // Create edges from the map.
     for(const auto& [key, data] : edgeMap) {
-        const uint64_t coverage = data.first;
+        const uint64_t coverage = data.coverage;
         if(coverage < minEdgeCoverage) {
             continue;
         }
         
-        const int64_t averageOffset = data.second / int64_t(coverage);
+        const int64_t averageOffset = data.sumOffset / int64_t(coverage);
         
         // key.first = source cluster, key.second = target cluster
         auto itSource = clusterIdToVertex.find(key.first);
         auto itTarget = clusterIdToVertex.find(key.second);
         
         if(itSource != clusterIdToVertex.end() && itTarget != clusterIdToVertex.end()) {
-            addEdge(itSource->second, itTarget->second, coverage, averageOffset);
+            addEdge(itSource->second, itTarget->second, coverage, averageOffset, data.haplotypeScore, data.readIds);
         }
     }
 }
@@ -518,9 +560,13 @@ void ClusterGraph::addEdge(
     vertex_descriptor v0,
     vertex_descriptor v1,
     uint64_t coverage,
-    int64_t averageOffset)
+    int64_t averageOffset,
+    uint64_t haplotypeScore,
+    const std::vector<ReadId>& readIds)
 {
-    ClusterGraphEdge edge(coverage, averageOffset);
+    ClusterGraphEdge edge(coverage, averageOffset, false);
+    edge.haplotypeScore = haplotypeScore;
+    edge.readIds = readIds;
     boost::add_edge(v0, v1, edge, *this);
 }
 
@@ -674,6 +720,387 @@ void ClusterGraph::removeWeakEdges(uint64_t minCoverage)
     // Remove them.
     for(const auto& e : edgesToRemove) {
         boost::remove_edge(e, graph);
+    }
+}
+
+
+
+// Remove edges with average haplotype support score below threshold.
+void ClusterGraph::removeLowHaplotypeSupportEdges(double minAverageHaplotypeScore)
+{
+    ClusterGraph& graph = *this;
+    
+    // Collect edges to remove.
+    std::vector<edge_descriptor> edgesToRemove;
+    BGL_FORALL_EDGES(e, graph, ClusterGraph) {
+        // Never remove RC pair edges.
+        if(graph[e].isRcPairEdge) {
+            continue;
+        }
+        
+        // Calculate average score.
+        double averageScore = 0.0;
+        if (graph[e].coverage > 0) {
+            averageScore = static_cast<double>(graph[e].haplotypeScore) / static_cast<double>(graph[e].coverage);
+        }
+
+        if(averageScore < minAverageHaplotypeScore) {
+            edgesToRemove.push_back(e);
+        }
+    }
+    
+    // Remove them.
+    for(const auto& e : edgesToRemove) {
+        boost::remove_edge(e, graph);
+    }
+}
+
+
+
+
+
+
+
+// Remove edges that do not have a corresponding Reverse Complement edge.
+void ClusterGraph::pruneAsymmetricEdges()
+{
+    ClusterGraph& graph = *this;
+    std::vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_EDGES(e, graph, ClusterGraph) {
+        // Only consider forward edges (RC pair edges are structural)
+        if (graph[e].isRcPairEdge) {
+            continue;
+        }
+
+        vertex_descriptor u = source(e, graph);
+        vertex_descriptor v = target(e, graph);
+
+        const ClusterGraphVertex& vU = graph[u];
+        const ClusterGraphVertex& vV = graph[v];
+
+        // If either vertex lacks an RC partner, the edge cannot be symmetric.
+        // (Unless it's a self-loop on a palindrome? But Clusters are usually strand-specific in this context)
+        if (!vU.hasRcPartner() || !vV.hasRcPartner()) {
+            edgesToRemove.push_back(e);
+            continue;
+        }
+
+        // Find RC vertices
+        // Edge u -> v implies we expect RC(v) -> RC(u)
+        uint64_t clusterIdU_rc = vU.rcPartnerClusterId;
+        uint64_t clusterIdV_rc = vV.rcPartnerClusterId;
+
+        auto itU_rc = clusterIdToVertex.find(clusterIdU_rc);
+        auto itV_rc = clusterIdToVertex.find(clusterIdV_rc);
+
+        if (itU_rc == clusterIdToVertex.end() || itV_rc == clusterIdToVertex.end()) {
+             // Should verify consistency, but if we can't find vertices, remove edge.
+             edgesToRemove.push_back(e);
+             continue;
+        }
+
+        vertex_descriptor u_rc = itU_rc->second;
+        vertex_descriptor v_rc = itV_rc->second;
+
+        // Check for existence of edge v_rc -> u_rc
+        bool symmetricEdgeExists = false;
+        // boost::edge(u, v, g) returns pair<edge_descriptor, bool>
+        // But we need to check if ANY edge exists (ClusterGraph allows parallel edges? 
+        // Based on definition, it's adjacency_list with listS, listS, bidirectionalS.
+        // boost::edge returns the first one found if parallel edges exist, but we just need existence.
+        
+        auto result = boost::edge(v_rc, u_rc, graph);
+        if (result.second) {
+            symmetricEdgeExists = true;
+        }
+
+        if (!symmetricEdgeExists) {
+            edgesToRemove.push_back(e);
+        }
+    }
+
+    // Remove the asymmetric edges
+    for(const auto& e : edgesToRemove) {
+        boost::remove_edge(e, graph);
+    }
+}
+
+
+
+
+
+
+
+// Prune outgoing edges that are much weaker than the best outgoing edge.
+void ClusterGraph::pruneConflictingEdges(double relativeThreshold)
+{
+    ClusterGraph& graph = *this;
+    std::vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_VERTICES(v, graph, ClusterGraph) {
+        if(boost::out_degree(v, graph) <= 1) {
+            continue;
+        }
+
+        // Find max haplotype score among outgoing edges.
+        uint64_t maxScore = 0;
+        BGL_FORALL_OUTEDGES(v, e, graph, ClusterGraph) {
+            if(graph[e].isRcPairEdge) continue; // Ignore RC pair edges
+            if(graph[e].haplotypeScore > maxScore) {
+                maxScore = graph[e].haplotypeScore;
+            }
+        }
+
+        // Mark edges to remove.
+        BGL_FORALL_OUTEDGES(v, e, graph, ClusterGraph) {
+            if(graph[e].isRcPairEdge) continue;
+
+            double threshold = static_cast<double>(maxScore) * relativeThreshold;
+            if(static_cast<double>(graph[e].haplotypeScore) < threshold) {
+                edgesToRemove.push_back(e);
+            }
+        }
+    }
+
+    // Remove the failing edges.
+    for(const auto& e : edgesToRemove) {
+        boost::remove_edge(e, graph);
+    }
+}
+
+
+
+    // Remove the failing edges.
+
+
+
+
+// Simplify the graph by removing transitive edges.
+// If A->B->C exists, remove A->C, BUT only if A->C is not significantly stronger (higher coverage).
+// Standard transitive reduction for directed acyclic graphs (DAGs).
+// Simplify the graph by resolving triangles (transitive reduction variants).
+// A triangle consists of u->v ("Direct") and u->w->v ("Indirect").
+// We identify the "Weakest Link" in the triangle and remove it.
+// 1. If Direct is weakest (or tied): Remove Direct (Standard Transitive Reduction).
+// 2. If Indirect path has a strictly weaker edge: Remove that edge.
+//    This effectively prunes "clustered errors" (weak bubbles) while keeping the strong single hop.
+void ClusterGraph::transitiveReduction()
+{
+    ClusterGraph& graph = *this;
+    std::vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_VERTICES(u, graph, ClusterGraph) {
+        // Collect immediate neighbors of u.
+        std::map<vertex_descriptor, edge_descriptor> directEdges;
+        BGL_FORALL_OUTEDGES(u, e, graph, ClusterGraph) {
+            if(graph[e].isRcPairEdge) continue;
+            directEdges[target(e, graph)] = e;
+        }
+
+        // For each neighbor w (intermediate node), check its neighbors v.
+        for(const auto& [w, edgeUW] : directEdges) {
+            BGL_FORALL_OUTEDGES(w, e2, graph, ClusterGraph) {
+                if(graph[e2].isRcPairEdge) continue;
+                
+                vertex_descriptor v = target(e2, graph);
+                edge_descriptor edgeWV = e2;
+
+                // Check if we have a triangle: u->v exists.
+                if(directEdges.find(v) != directEdges.end()) {
+                    edge_descriptor edgeUV = directEdges[v];
+
+                    // Identified Triangle: u->v (Direct), u->w->v (Indirect) elements: edgeUW, edgeWV.
+                    uint64_t covUV = graph[edgeUV].coverage;
+                    uint64_t covUW = graph[edgeUW].coverage;
+                    uint64_t covWV = graph[edgeWV].coverage;
+
+                    // Find the weakest link.
+                    // Logic: "Always keep the longer path (single hop)" [Direct Edge] if it is strong.
+                    // Implementation: Remove the Minimum Coverage edge.
+                    // Tie-breaking: Prefer removing Direct Edge (Standard TR) to be safe/canonical,
+                    // unless Direct Edge is strictly stronger.
+
+                    uint64_t minCov = std::min({covUV, covUW, covWV});
+
+                    if(covUV == minCov) {
+                        // Direct edge is weakest (or tied). Prune it.
+                        // This removes "skip" edges if they aren't dominant.
+                        edgesToRemove.push_back(edgeUV);
+                    } else {
+                        // Indirect path has the weakest link.
+                        // Prune the specific backbone edge that is weak.
+                        // This handles "clustered errors" / weak bubbles.
+                        if(covUW == minCov) {
+                            edgesToRemove.push_back(edgeUW);
+                        } else {
+                            edgesToRemove.push_back(edgeWV);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort and unique to avoid double removal attempts (though boost handles invalid iterators poorly, better safe)
+    std::sort(edgesToRemove.begin(), edgesToRemove.end());
+    edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()), edgesToRemove.end());
+
+    // Remove the transitive edges.
+    for(const auto& e : edgesToRemove) {
+        // Double check edge still exists (in case of duplicates pointing to same edge object)
+        // With EdgeList=listS (implied), descriptors are stable.
+        boost::remove_edge(e, graph);
+    }
+}
+
+
+// Resolve forks using local read following.
+// Refined Logic (Relative Best Support):
+// For each incoming edge w->u, we identify the "best" outgoing successor v_best (max shared reads).
+// We keep an outgoing edge u->v only if it is "comparable" to the best successor for at least one incoming stream.
+// Criteria: Support(v) >= 0.7 * Support(v_best) AND TransitionProb > 0.1.
+// This preserves strong heterozygous forks (50/50) but pops weak bubbles and removes noise.
+void ClusterGraph::resolveForks()
+{
+    ClusterGraph& graph = *this;
+    std::vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_VERTICES(u, graph, ClusterGraph) {
+        if(boost::out_degree(u, graph) <= 1) continue;
+
+        std::vector<edge_descriptor> inEdges;
+        BGL_FORALL_INEDGES(u, e, graph, ClusterGraph) {
+            if(!graph[e].isRcPairEdge) inEdges.push_back(e);
+        }
+        
+        std::vector<edge_descriptor> outEdges;
+        BGL_FORALL_OUTEDGES(u, e, graph, ClusterGraph) {
+            if(!graph[e].isRcPairEdge) outEdges.push_back(e);
+        }
+
+        if(inEdges.empty() || outEdges.empty()) continue;
+
+        std::set<edge_descriptor> supportedOutEdges;
+        std::map<edge_descriptor, uint64_t> validatedCoverage;
+
+        for(auto e_in : inEdges) {
+            const auto& readsIn = graph[e_in].readIds;
+            if(readsIn.empty()) continue;
+            
+            std::vector<ReadId> sortedReadsIn = readsIn;
+            std::sort(sortedReadsIn.begin(), sortedReadsIn.end());
+            uint64_t flowIn = sortedReadsIn.size();
+
+            // First pass: Find max support for this incoming edge
+            uint64_t maxFlowThrough = 0;
+            std::map<edge_descriptor, uint64_t> flowCounts;
+
+            for(auto e_out : outEdges) {
+                const auto& readsOut = graph[e_out].readIds;
+                std::vector<ReadId> sortedReadsOut = readsOut;
+                std::sort(sortedReadsOut.begin(), sortedReadsOut.end());
+
+                std::vector<ReadId> intersection;
+                std::set_intersection(sortedReadsIn.begin(), sortedReadsIn.end(),
+                                      sortedReadsOut.begin(), sortedReadsOut.end(),
+                                      std::back_inserter(intersection));
+                
+                uint64_t flow = intersection.size();
+                flowCounts[e_out] = flow;
+                if(flow > maxFlowThrough) maxFlowThrough = flow;
+            }
+            
+            if(maxFlowThrough == 0) continue;
+
+            // Second pass: Mark supported edges
+            for(auto e_out : outEdges) {
+                uint64_t flow = flowCounts[e_out];
+                
+                // Relative Threshold: Must be at least 70% of the best path.
+                // Absolute Threshold: Must handle at least 10% of the incoming flow (noise filtering).
+                double transitionProb = (double)flow / (double)flowIn;
+                
+                if(flow >= 0.7 * maxFlowThrough && transitionProb > 0.1) {
+                    supportedOutEdges.insert(e_out);
+                    validatedCoverage[e_out] += flow;
+                }
+            }
+        }
+
+        // Decision:
+        for(auto e_out : outEdges) {
+            bool isSupported = (supportedOutEdges.find(e_out) != supportedOutEdges.end());
+            
+            if(!isSupported) {
+                 // Pruning logic for unsupported edges.
+                 // If an edge has significant coverage but failed the vote, it means
+                 // its reads are disjoint from the incoming flow -> phantom edge or wrong path.
+                 
+                 // Caveat: What if the edge consists entirely of NEW reads (starts)?
+                 // If graph[e_out].coverage is 50, and validatedCoverage is 0, then 50 reads started here.
+                 // In a "Cluster" graph, usually we don't have many new starts in the middle of a complex tangle.
+                 // But let's be safe: If validatedCoverage explains < 30% of the edge and it wasn't picked as a successor, kill it.
+                 
+                 if(graph[e_out].coverage < 10 || validatedCoverage[e_out] < 0.3 * graph[e_out].coverage) {
+                     edgesToRemove.push_back(e_out);
+                 }
+            }
+        }
+    }
+
+    // Remove edges.
+    for(const auto& e : edgesToRemove) {
+        boost::remove_edge(e, graph);
+    }
+}
+
+
+// Update edge coverages to be the number of shared reads between source and target clusters.
+void ClusterGraph::updateEdgeCoverages(const Assembler& assembler)
+{
+    ClusterGraph& graph = *this;
+
+    // 1. Pre-compute sorted ReadIds for each vertex (cluster).
+    std::map<vertex_descriptor, std::vector<ReadId>> vertexReads;
+    
+    const auto& membersByRepIdx = assembler.variantClusteringMembersByRepIdx;
+    const auto& positionPairs = assembler.variantClusteringPositionPairs;
+
+    BGL_FORALL_VERTICES(v, graph, ClusterGraph) {
+        uint64_t clusterId = graph[v].clusterId;
+        if(clusterId >= membersByRepIdx.size()) continue;
+
+        std::vector<ReadId> reads;
+        for(uint64_t memberIdx : membersByRepIdx[clusterId]) {
+            if(memberIdx < positionPairs.size()) {
+                reads.push_back(positionPairs[memberIdx].first.getReadId());
+            }
+        }
+        std::sort(reads.begin(), reads.end());
+        reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+        
+        vertexReads[v] = std::move(reads);
+    }
+
+    // 2. Update all edges.
+    BGL_FORALL_EDGES(e, graph, ClusterGraph) {
+        if(graph[e].isRcPairEdge) continue;
+
+        vertex_descriptor u = source(e, graph);
+        vertex_descriptor v = target(e, graph);
+
+        const auto& readsU = vertexReads[u];
+        const auto& readsV = vertexReads[v];
+
+        std::vector<ReadId> sharedReads;
+        std::set_intersection(readsU.begin(), readsU.end(),
+                              readsV.begin(), readsV.end(),
+                              std::back_inserter(sharedReads));
+        
+        // Update Edge Properties
+        graph[e].coverage = sharedReads.size();
+        graph[e].readIds = sharedReads; // Update read list to include ALL shared reads
     }
 }
 
@@ -1010,6 +1437,44 @@ void ClusterGraph::writeEdges(
     
     const double scalingFactor = 0.002;  // sfdp scaling factor
     
+    // Arrow marker size - scaled by options.arrowSize
+    // Default arrowSize=0.5 gives reasonable arrows, increase for bigger arrows
+    // Increased base size from 4.0 to 12.0 to ensure visibility.
+    const double markerSize = 12.0 * options.arrowSize;  // markerWidth/Height
+    const double refX = 0.9 * markerSize;  // Reference point X
+    const double refY = 0.5 * markerSize;  // Reference point Y (center)
+    const double pathSize = markerSize;    // Path scale
+    
+    // Define arrow markers in defs section.
+    // Explicitly set fill colors to ensure they render even if context-fill ambiguous.
+    html << "\n<defs>";
+    
+    // Forward arrow (strand 0): blue
+    html << "\n<marker id='arrowForward' markerWidth='" << markerSize 
+         << "' markerHeight='" << markerSize 
+         << "' refX='" << refX << "' refY='" << refY 
+         << "' orient='auto' markerUnits='strokeWidth'>"
+         << "<path d='M0,0 L0," << pathSize << " L" << (0.9 * pathSize) << "," << (0.5 * pathSize) << " z' fill='blue'/>"
+         << "</marker>";
+    
+    // Reverse arrow (strand 1 / RC): red
+    html << "\n<marker id='arrowReverse' markerWidth='" << markerSize 
+         << "' markerHeight='" << markerSize 
+         << "' refX='" << refX << "' refY='" << refY 
+         << "' orient='auto' markerUnits='strokeWidth'>"
+         << "<path d='M0,0 L0," << pathSize << " L" << (0.9 * pathSize) << "," << (0.5 * pathSize) << " z' fill='red'/>"
+         << "</marker>";
+    
+    // Generic arrow for coverage coloring (inherits stroke color).
+    html << "\n<marker id='arrowGeneric' markerWidth='" << markerSize 
+         << "' markerHeight='" << markerSize 
+         << "' refX='" << refX << "' refY='" << refY 
+         << "' orient='auto' markerUnits='strokeWidth'>"
+         << "<path d='M0,0 L0," << pathSize << " L" << (0.9 * pathSize) << "," << (0.5 * pathSize) << " z' fill='context-stroke'/>"
+         << "</marker>";
+    
+    html << "\n</defs>";
+    
     // Draw edges.
     html << "\n<g id='edges'>";
     
@@ -1030,12 +1495,11 @@ void ClusterGraph::writeEdges(
         
         // Handle RC pair edges differently.
         if(edge.isRcPairEdge) {
-            // RC pair edges: dashed magenta lines.
+            // RC pair edges: solid magenta lines (no direction).
             double thickness = scalingFactor * options.edgeThickness * 2.0;  // Fixed thickness
             html << "\n<line x1='" << x0 << "' y1='" << y0 
                  << "' x2='" << x1 << "' y2='" << y1 
-                 << "' stroke='magenta' stroke-width='" << thickness 
-                 << "' stroke-dasharray='" << (thickness * 3) << "," << (thickness * 2) << "'>"
+                 << "' stroke='magenta' stroke-width='" << thickness << "'>"
                  << "<title>RC Pair Edge</title>"
                  << "</line>";
             continue;
@@ -1044,8 +1508,13 @@ void ClusterGraph::writeEdges(
         // Compute thickness for normal edges.
         double thickness = scalingFactor * options.edgeThickness * std::sqrt(double(edge.coverage));
         
-        // Choose color.
-        std::string color = "black";
+        // Determine if this is a forward (strand 0) or reverse (strand 1) edge
+        // based on offset sign. Positive offset = forward direction.
+        const bool isForward = (edge.averageOffset >= 0);
+        
+        // Choose color based on direction.
+        std::string color;
+        std::string markerId;
         if(options.edgeColoring == "byCoverage") {
             double fraction = 0.0;
             if(options.highCoverage > options.lowCoverage) {
@@ -1058,62 +1527,22 @@ void ClusterGraph::writeEdges(
             char colorBuf[10];
             snprintf(colorBuf, sizeof(colorBuf), "#%02x%02x00", r, g);
             color = colorBuf;
+            markerId = "arrowGeneric";
+        } else {
+            // Color by direction: blue for forward, red for reverse.
+            color = isForward ? "blue" : "red";
+            markerId = isForward ? "arrowForward" : "arrowReverse";
         }
         
+        // Draw edge as a line with arrow marker at the end.
         html << "\n<line x1='" << x0 << "' y1='" << y0 
              << "' x2='" << x1 << "' y2='" << y1 
-             << "' stroke='" << color << "' stroke-width='" << thickness << "'>"
+             << "' stroke='" << color << "' stroke-width='" << thickness 
+             << "' marker-end='url(#" << markerId << ")'>"
              << "<title>Coverage " << edge.coverage 
-             << ", offset " << edge.averageOffset << "</title>"
+             << ", offset " << edge.averageOffset 
+             << " (" << (isForward ? "forward" : "reverse") << ")</title>"
              << "</line>";
-    }
-    
-    html << "\n</g>";
-    
-    // Draw arrows (skip RC pair edges).
-    html << "\n<g id='arrows'>";
-    
-    BGL_FORALL_EDGES(e, graph, ClusterGraph) {
-        const ClusterGraphEdge& edge = graph[e];
-        
-        // No arrows for RC pair edges.
-        if(edge.isRcPairEdge) continue;
-        
-        const vertex_descriptor v0 = source(e, graph);
-        const vertex_descriptor v1 = target(e, graph);
-        
-        const auto it0 = layout.find(v0);
-        const auto it1 = layout.find(v1);
-        if(it0 == layout.end() || it1 == layout.end()) continue;
-        
-        const double x0 = it0->second[0];
-        const double y0 = it0->second[1];
-        const double x1 = it1->second[0];
-        const double y1 = it1->second[1];
-        
-        std::string color = "black";
-        if(options.edgeColoring == "byCoverage") {
-            double fraction = 0.0;
-            if(options.highCoverage > options.lowCoverage) {
-                fraction = double(edge.coverage - options.lowCoverage) / 
-                           double(options.highCoverage - options.lowCoverage);
-                fraction = std::max(0.0, std::min(1.0, fraction));
-            }
-            uint8_t r = static_cast<uint8_t>(255 * (1.0 - fraction));
-            uint8_t g = static_cast<uint8_t>(255 * fraction);
-            char colorBuf[10];
-            snprintf(colorBuf, sizeof(colorBuf), "#%02x%02x00", r, g);
-            color = colorBuf;
-        }
-        
-        // Arrow at 70% of the way to target.
-        const double relativeArrowLength = 0.3;
-        const double x2 = (1. - relativeArrowLength) * x1 + relativeArrowLength * x0;
-        const double y2 = (1. - relativeArrowLength) * y1 + relativeArrowLength * y0;
-        
-        html << "\n<line x1='" << x1 << "' y1='" << y1 
-             << "' x2='" << x2 << "' y2='" << y2 
-             << "' stroke='" << color << "' stroke-width='" << (0.2 * scalingFactor * options.arrowSize * double(edge.coverage)) << "' />";
     }
     
     html << "\n</g>";
@@ -1238,6 +1667,88 @@ void ClusterGraph::writeSvgControls(std::ostream& html) const
     </script>
     )stringDelimiter";
 
+    // Multi-selection controls.
+    html << R"stringDelimiter(
+        <tr><td colspan=2 style='padding-top:10px;'>
+        <b>Multi-Selection</b> (click clusters to add)
+        <tr><td colspan=2>
+        <textarea id='selectedClusters' rows=2 cols=30 placeholder='Click clusters to select...'></textarea>
+        <tr><td colspan=2>
+        <button onClick='clearSelection()'>Clear</button>
+        <button onClick='exploreSelected()'>Explore Selected</button>
+        <button onClick='analyzeSelected()'>Analyze Together</button>
+    <script>
+    var selectedClusterIds = new Set();
+    
+    // Handle cluster clicks for multi-selection
+    document.addEventListener('DOMContentLoaded', function() {
+        var vertexGroup = document.getElementById('vertices');
+        if(vertexGroup) {
+            var vertices = vertexGroup.getElementsByTagName('circle');
+            for(var i=0; i<vertices.length; i++) {
+                vertices[i].addEventListener('click', function(e) {
+                    // Shift+click for multi-select
+                    if(e.shiftKey) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        var clusterId = this.id.substring(1); // Remove 'C' prefix
+                        toggleClusterSelection(clusterId, this);
+                        return false;
+                    }
+                });
+            }
+        }
+    });
+    
+    function toggleClusterSelection(clusterId, element) {
+        if(selectedClusterIds.has(clusterId)) {
+            selectedClusterIds.delete(clusterId);
+            element.style.stroke = '';
+            element.style.strokeWidth = '';
+        } else {
+            selectedClusterIds.add(clusterId);
+            element.style.stroke = 'blue';
+            element.style.strokeWidth = '3';
+        }
+        updateSelectionTextarea();
+    }
+    
+    function updateSelectionTextarea() {
+        var textarea = document.getElementById('selectedClusters');
+        textarea.value = Array.from(selectedClusterIds).join(', ');
+    }
+    
+    function clearSelection() {
+        selectedClusterIds.clear();
+        var vertexGroup = document.getElementById('vertices');
+        var vertices = vertexGroup.getElementsByTagName('circle');
+        for(var i=0; i<vertices.length; i++) {
+            vertices[i].style.stroke = '';
+            vertices[i].style.strokeWidth = '';
+        }
+        updateSelectionTextarea();
+    }
+    
+    function exploreSelected() {
+        var ids = document.getElementById('selectedClusters').value;
+        if(!ids.trim()) {
+            alert('No clusters selected. Shift+click to select clusters.');
+            return;
+        }
+        window.location = 'exploreClusterGraph?clusterIds=' + encodeURIComponent(ids);
+    }
+    
+    function analyzeSelected() {
+        var ids = document.getElementById('selectedClusters').value;
+        if(!ids.trim()) {
+            alert('No clusters selected. Shift+click to select clusters.');
+            return;
+        }
+        window.location = 'exploreVariantClusters?clusterIds=' + encodeURIComponent(ids);
+    }
+    </script>
+    )stringDelimiter";
+
     html << "</table>";
 
     // Scroll down to the svg.
@@ -1248,8 +1759,9 @@ void ClusterGraph::writeSvgControls(std::ostream& html) const
         "</script>";
 
     html <<
-        "<p>Use Ctrl+Click to pan."
-        "<p>Use Ctrl-Wheel or the above buttons to zoom.";
+        "<p><b>Navigation:</b> Ctrl+Click to pan, Ctrl-Wheel to zoom."
+        "<p><b>Single cluster:</b> Click a cluster to view its reads and alleles."
+        "<p><b>Multiple clusters:</b> Shift+Click to select, then 'Analyze Together' to compare.";
 }
 
 

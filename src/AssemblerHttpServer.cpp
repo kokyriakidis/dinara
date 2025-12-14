@@ -258,6 +258,8 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreClusterGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantCluster);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantClusters);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowingAssemblyGraph);

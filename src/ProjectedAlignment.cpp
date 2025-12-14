@@ -101,6 +101,8 @@ void ProjectedAlignment::constructAll()
         mismatchCountRle += segment.mismatchCountRle;
     }
 
+
+
     computeStatistics();
 }
 
@@ -177,6 +179,7 @@ void ProjectedAlignment::constructQuickRaw()
     totalLength = {0, 0};
     totalEditDistance = 0;
     mismatchCount = 0;
+    totalDeletionCount = 0;
 
     // Loop over pairs of consecutive aligned markers (A, B).
     for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
@@ -211,6 +214,7 @@ void ProjectedAlignment::constructQuickRaw()
         // Accumulate statistics
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
+        totalDeletionCount += segment.deletionCount;
 
         // Store the segment.
         segments.push_back(segment);
@@ -236,9 +240,9 @@ ProjectedAlignmentSegment::ProjectedAlignmentSegment(
 
 
 void ProjectedAlignmentSegment::computeAlignment(
-    int64_t matchScore,
-    int64_t mismatchScore,
-    int64_t gapScore)
+    int64_t /* matchScore */,
+    int64_t /* mismatchScore */,
+    int64_t /* gapScore */)
 {
     const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(sequences[0]);
     const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(sequences[1]);
@@ -248,6 +252,7 @@ void ProjectedAlignmentSegment::computeAlignment(
         alignment.resize(sequence0.size());
         fill(alignment.begin(), alignment.end(), make_pair(true, true));
         mismatchCount = 0;
+        deletionCount = 0;
 
     } else {
         // Convert sequences to ASCII for A*PA2
@@ -309,6 +314,7 @@ void ProjectedAlignmentSegment::computeAlignment(
         uint64_t position0 = 0;
         uint64_t position1 = 0;
         mismatchCount = 0;
+        deletionCount = 0;
 
         for(size_t i=0; i<cigarLen; i++) {
             char c = cigar[i];
@@ -344,6 +350,7 @@ void ProjectedAlignmentSegment::computeAlignment(
                         position1 += currentVal;
                     } else if (op.first) { // D
                         position0 += currentVal;
+                        deletionCount += currentVal;
                     } else if (op.second) { // I
                         position1 += currentVal;
                     }
@@ -363,9 +370,9 @@ void ProjectedAlignmentSegment::computeAlignment(
 
 
 void ProjectedAlignmentSegment::computeRleAlignment(
-    int64_t matchScore,
-    int64_t mismatchScore,
-    int64_t gapScore)
+    int64_t /* matchScore */,
+    int64_t /* mismatchScore */,
+    int64_t /* gapScore */)
 {
     const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(rleSequences[0]);
     const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(rleSequences[1]);
@@ -748,6 +755,7 @@ void ProjectedAlignment::computeStatistics()
     for(const ProjectedAlignmentSegment& segment: segments) {
         totalEditDistance += segment.editDistance;
         totalEditDistanceRle += segment.rleEditDistance;
+        totalDeletionCount += segment.deletionCount;
     }
 }
 
@@ -756,6 +764,13 @@ void ProjectedAlignment::computeStatistics()
 double ProjectedAlignment::errorRate() const
 {
     return double(totalEditDistance) / double(totalLength[0] + totalLength[1]);
+}
+
+
+
+double ProjectedAlignment::errorRateGaps() const
+{
+    return double(totalDeletionCount) / double(totalLength[0] + totalLength[1]);
 }
 
 

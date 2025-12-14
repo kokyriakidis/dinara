@@ -999,6 +999,9 @@ private:
         // Timing accumulators for variant clustering (per thread, in seconds)
         vector<double> threadProjectedAlignmentTime;  // Time spent in ProjectedAlignment construction
         vector<double> threadCollectionTime;          // Time spent in collectVariantClusteringPositionPairs
+        vector<uint64_t> threadFilteredByErrorRate; 
+        vector<uint64_t> threadFilteredByErrorRateGap; 
+        vector<uint64_t> threadFilteredByGapCount;
     };
     ComputeAlignmentsData computeAlignmentsData;
 
@@ -1168,6 +1171,12 @@ public:
     
     // HTTP server function to explore the cluster graph.
     void exploreClusterGraph(const vector<string>& request, ostream& html);
+    
+    // HTTP server function to explore a single variant cluster (shows reads and alleles).
+    void exploreVariantCluster(const vector<string>& request, ostream& html);
+    
+    // HTTP server function to explore multiple variant clusters together.
+    void exploreVariantClusters(const vector<string>& request, ostream& html);
 
 
     // Triangle and least square analysis of the read graph

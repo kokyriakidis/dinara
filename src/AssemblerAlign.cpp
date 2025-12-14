@@ -340,6 +340,9 @@ void Assembler::computeAlignments(
         data.threadVariantClusteringPositionPairs.resize(threadCount);
         data.threadProjectedAlignmentTime.resize(threadCount, 0.0);
         data.threadCollectionTime.resize(threadCount, 0.0);
+        data.threadFilteredByErrorRate.resize(threadCount, 0);
+        data.threadFilteredByErrorRateGap.resize(threadCount, 0);
+        data.threadFilteredByGapCount.resize(threadCount, 0);
     }
     
     performanceLog << timestamp << "Alignment computation begins." << endl;
@@ -391,8 +394,22 @@ void Assembler::computeAlignments(
     // Estimate wall-clock time by dividing summed thread time by thread count
     const double estimatedProjectedWallTime = totalProjectedAlignmentTime / threadCount;
     const double estimatedCollectionWallTime = totalCollectionTime / threadCount;
-    
-    // Store these times for the variant clustering summary
+
+    if (assemblerInfo->readGraphCreationMethod == 5) {
+        uint64_t totalFilteredByErrorRate = 0;
+        uint64_t totalFilteredByErrorRateGap = 0;
+        uint64_t totalFilteredByGapCount = 0;
+        for (size_t i = 0; i < threadCount; i++) {
+            totalFilteredByErrorRate += data.threadFilteredByErrorRate[i];
+            totalFilteredByErrorRateGap += data.threadFilteredByErrorRateGap[i];
+            totalFilteredByGapCount += data.threadFilteredByGapCount[i];
+        }
+        cout << "Time spent in projected alignment construction (all threads): " << totalProjectedAlignmentTime << " s" << endl;
+        cout << "Time spent collecting variant clustering position pairs (all threads): " << totalCollectionTime << " s" << endl;
+        cout << "Alignments filtered by error rate (> 0.07): " << totalFilteredByErrorRate << endl;
+        cout << "Alignments filtered by gap error rate (> 0.006): " << totalFilteredByErrorRateGap << endl;
+        cout << "Alignments filtered by gap count (> 64): " << totalFilteredByGapCount << endl;
+    }
     variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
     variantClusteringCollectionTime = estimatedCollectionWallTime;
     
@@ -671,16 +688,29 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 
                 alignmentInfo.errorRate = float(projectedAlignment.errorRate());
                 alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
+                alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
+                alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
 
                 if (assemblerInfo->readGraphCreationMethod == 5) {
                     data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
 
                     // Skip alignments with error rate greater than 0.07.
                     if (alignmentInfo.errorRate > 0.07) {
+                        data.threadFilteredByErrorRate[threadId]++;
                         continue;
                     }
 
-                    // Collect position pairs for variant clustering
+                    // Skip alignments with gap error rate greater than 0.006.
+                    if (alignmentInfo.errorRateGaps > 0.006) {
+                        data.threadFilteredByErrorRateGap[threadId]++;
+                        continue;
+                    }
+
+                    // Skip alignments with gap count greater than 64.
+                    if (alignmentInfo.gapCount > 64) {
+                        data.threadFilteredByGapCount[threadId]++;
+                        continue;
+                    }// Collect position pairs for variant clustering
                     // Only collect those with SNP differences (No indels)
                     const auto tCollectStart = steady_clock::now();
                     collectVariantClusteringPositionPairs(
