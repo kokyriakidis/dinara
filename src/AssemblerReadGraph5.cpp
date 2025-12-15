@@ -9,6 +9,7 @@
 #include <numeric>
 #include <algorithm>
 #include <vector>
+#include <cstdint>
 
 using namespace dinara;
 
@@ -382,56 +383,42 @@ void Assembler::createReadGraph5()
     // Parallelize filtering for efficiency
     #pragma omp parallel for reduction(+:keptAlignmentCount)
     for(uint64_t alignmentId=0; alignmentId<alignmentCount; alignmentId++) {
-         const auto& ad = alignmentData[alignmentId];
-         
-         bool veto = false;
+        const auto& ad = alignmentData[alignmentId];
+        
+        // Helper lambda to check if a read is phased and voting for the other
+        auto checkPhasing = [&](ReadId sourceRead, ReadId targetRead, bool sameStrand) -> std::pair<bool, bool> {
+            OrientedReadId::Int u = OrientedReadId(sourceRead, 0).getValue();
+            if (u >= numVertices || boost::out_degree(u, graph) == 0) return {false, false}; // Not Phased
+            
+            // Is Phased, check for edge
+            OrientedReadId::Int v_target = OrientedReadId(targetRead, sameStrand ? 0 : 1).getValue();
+            auto outEdges = boost::out_edges(u, graph);
+            for(auto it = outEdges.first; it != outEdges.second; ++it) {
+                if (boost::target(*it, graph) == v_target) return {true, true}; // Phased & Found
+            }
+            return {true, false}; // Phased & Not Found
+        };
 
-         // Check Veto from Read 0 Perspective
-         // We only check Strand 0 because we only populated out-edges for Strand 0 in createReadGraph5ThreadFunction.
-         OrientedReadId::Int u1 = OrientedReadId(ad.readIds[0], 0).getValue();
-         if (u1 < numVertices && boost::out_degree(u1, graph) > 0) {
-             // Read 0 is phased. It MUST have an edge to Read 1 with correct orientation.
-             OrientedReadId::Int v_target = OrientedReadId(ad.readIds[1], ad.isSameStrand ? 0 : 1).getValue();
-             
-             bool found = false;
-             auto outEdges = boost::out_edges(u1, graph);
-             for(auto it = outEdges.first; it != outEdges.second; ++it) {
-                 if (boost::target(*it, graph) == v_target) {
-                     found = true;
-                     break;
-                 }
-             }
-             if (!found) veto = true;
-         }
+        // Check Read 0 -> Read 1
+        std::pair<bool, bool> r0 = checkPhasing(ad.readIds[0], ad.readIds[1], ad.isSameStrand);
+        // Check Read 1 -> Read 0
+        std::pair<bool, bool> r1 = checkPhasing(ad.readIds[1], ad.readIds[0], ad.isSameStrand);
 
-         // Check Veto from Read 1 Perspective (if not already vetoed)
-         if (!veto) {
-             OrientedReadId::Int u2 = OrientedReadId(ad.readIds[1], 0).getValue();
-             if (u2 < numVertices && boost::out_degree(u2, graph) > 0) {
-                 // Read 1 is phased. It MUST have an edge to Read 0 with correct orientation.
-                 // If ad.isSameStrand: R1(0) -> R0(0)
-                 // If !ad.isSameStrand: R1(0) -> R0(1)
-                 OrientedReadId::Int v_target = OrientedReadId(ad.readIds[0], ad.isSameStrand ? 0 : 1).getValue();
-                 
-                 bool found = false;
-                 auto outEdges = boost::out_edges(u2, graph);
-                 for(auto it = outEdges.first; it != outEdges.second; ++it) {
-                     if (boost::target(*it, graph) == v_target) {
-                         found = true;
-                         break;
-                     }
-                 }
-                 if (!found) veto = true;
-             }
-         }
+        bool keep = true;
+        
+        // If either is phased, we require at least one confirmation
+        if (r0.first || r1.first) {
+            keep = (r0.second || r1.second);
+        }
+        // Else (neither phased) -> Keep (default)
 
-         if (!veto) {
-             alignmentData[alignmentId].info.isInReadGraph = 1;
-             keptAlignmentCount++;
-         } else {
-             keepAlignment[alignmentId] = false;
-             alignmentData[alignmentId].info.isInReadGraph = 0;
-         }
+        if (keep) {
+            alignmentData[alignmentId].info.isInReadGraph = 1;
+            keptAlignmentCount++;
+        } else {
+            keepAlignment[alignmentId] = false;
+            alignmentData[alignmentId].info.isInReadGraph = 0;
+        }
     }
 
     cout << timestamp << "Kept " << keptAlignmentCount << " / " << alignmentCount << " alignments after haplotype filtering." << endl;
@@ -697,83 +684,48 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             // The position pairs are sorted by read id and strand.
             auto it = std::lower_bound(positionPairs.begin(), positionPairs.end(), make_pair(currentOrientedReadId0, 0u));
             
-            struct ClusterOnRead {
-                uint64_t clusterId;
-                uint32_t position;
-                uint64_t indexInPositionPairs;
-            };
-            vector<ClusterOnRead> clusters;
-
-            // Find clusters that involve this read on strand 0.
-            while(it != positionPairs.end() && it->first == currentOrientedReadId0) {
-                uint64_t index = it - positionPairs.begin();
-                uint64_t clusterId = disjointSets.find(index);
-                clusters.push_back({clusterId, it->second, index});
-                ++it;
-            }
-
-            // If no clusters that involve this read on strand 0, skip it
-            if (clusters.empty()) {
-                continue;
-            }
-
-            vector<ClusterOnRead> filteredClusters;
-            for(const auto& cluster : clusters) {
-                // O(1) Lookup
-                if (variantClusteringValidClusters[cluster.clusterId]) {
-                    filteredClusters.push_back(cluster);
-                }
-            }
-            
-            // If no valid clusters after filtering, skip this read
-            if (filteredClusters.empty()) {
-                continue;
-            }
-            
-            // Use filtered clusters for the rest of the analysis
-            clusters = std::move(filteredClusters);
-
-
-
-
-            // --------------------------------------------------------------
-            // Compatibility Check with Multi-Allelic Splitting
-            // --------------------------------------------------------------
-
-            // Check if we have any clusters to process
-            if (clusters.empty()) {
-                continue;
-            }
-
-            // --- Step 1: Generate Virtual Clusters (Nodes for DP) ---
+            // --- Step 1: Generate Virtual Clusters & Populate Reads (Nodes for DP) ---
             // A physical cluster with alleles {Target, A, B} becomes 
             // two virtual clusters: (Target vs A) and (Target vs B).
-            
+            // Each VirtualCluster now self-contains its evidence (reads).
+
+            struct ReadPhase {
+                OrientedReadId::Int orientedReadIdValue; // Using the raw integer value
+                bool isPhase1; // false=Target, true=Alt
+            };
+
             struct VirtualCluster {
                 uint64_t clusterId;
                 uint8_t targetAllele;
                 uint8_t altAllele;
-                // ID in the original 'clusters' vector to retrieve members
-                uint32_t originalIndex; 
+                std::vector<ReadPhase> reads; // Evidence
+                
+                // Haplotype Assignment (Step 5) Fields
+                uint32_t position = 0;
+                uint32_t occ_0 = 0; 
+                uint32_t occ_1 = 0;
+                int32_t score = 0; // 0=Unconfirmed, 1=Confirmed Het, -1=Invalidated
+                bool is_filtered = false;
             };
             vector<VirtualCluster> dpNodes;
-            dpNodes.reserve(clusters.size() * 2); // Heuristic reserve
-
+            
             const uint64_t currentMinAlleleCoverage = this->minAlleleCoverage; 
 
-            for(uint32_t i=0; i<clusters.size(); i++) {
-                const auto& cluster = clusters[i];
+            // Find clusters that involve this read on strand 0.
+            while(it != positionPairs.end() && it->first == currentOrientedReadId0) {
+                uint64_t indexInPositionPairs = it - positionPairs.begin();
+                uint64_t clusterId = disjointSets.find(indexInPositionPairs);
                 
                 // Identify Target Allele (The allele supported by the current read we are phasing)
                 uint8_t targetAllele = 255;
-                if (cluster.indexInPositionPairs < variantClusteringPositionPairAlleles.size()) {
-                    targetAllele = variantClusteringPositionPairAlleles[cluster.indexInPositionPairs];
+                if (indexInPositionPairs < variantClusteringPositionPairAlleles.size()) {
+                    targetAllele = variantClusteringPositionPairAlleles[indexInPositionPairs];
                 }
                 DINARA_ASSERT(targetAllele < 5); // Invalid target allele
 
                 // Count alleles in this cluster
                 // ALSO count Strand-0 (Forward) occurrences for bias checking.
-                const auto& members = membersByRepIdx[cluster.clusterId];
+                const auto& members = membersByRepIdx[clusterId];
                 std::array<uint32_t, 5> alleleCounts = {0};       // Total
                 std::array<uint32_t, 5> alleleStrand0Counts = {0}; // Forward (Strand 0)
                 
@@ -789,530 +741,583 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                     }
                 }
 
-                // Check Strand Bias for the Reference Allele
-                // If the Reference allele is strand biased, we filter this physical cluster entirely.
-                if (isStrandBiased(alleleCounts[targetAllele], alleleStrand0Counts[targetAllele])) {
-                    continue;
-                }
-
-                // Check if the Reference Allele has sufficient coverage
-                if (alleleCounts[targetAllele] < currentMinAlleleCoverage) {
-                    continue;
-                }
-
-                // Create a Virtual Cluster for each significant ALT allele
-                // It is guaranteed that there is at least one significant ALT allele.
-                // The point is to split multiallelic clusters into binary het clusters.
-                for(uint8_t a=0; a<5; a++) {
-                    if (a == targetAllele) continue;
-                    if (alleleCounts[a] >= currentMinAlleleCoverage) {
-                        dpNodes.push_back({cluster.clusterId, targetAllele, a, i});
-                    }
-                }
-            }
-
-            const size_t N = dpNodes.size();
-            if (N == 0) continue;
-
-            // --- Step 2: Build Read Phase Vectors for each DP Node ---
-            // nodeReads[i] contains list of {ReadId, isPhase1} for dpNodes[i]
-            // Phase 0 = Matches Target. Phase 1 = Matches Alt. 
-
-            struct ReadPhase {
-                OrientedReadId::Int orientedReadIdValue; // Using the raw integer value
-                bool isPhase1; // false=Target, true=Alt
-            };
-            vector<vector<ReadPhase>> nodeReads(N);
-
-            for(size_t i=0; i<N; i++) {
-                const auto& node = dpNodes[i];
-                const auto& members = membersByRepIdx[node.clusterId];
-                nodeReads[i].reserve(members.size());
-
-                for(uint64_t memberIdx : members) {
-                    const auto& pp = positionPairs[memberIdx];
-                    
-                    OrientedReadId orientedReadId = pp.first;
-                    
-                    // Skip target oriented read itself (given that the clusters involve this read on strand 0).
-                    if(orientedReadId == currentOrientedReadId0) continue;
-
-                    if(memberIdx < variantClusteringPositionPairAlleles.size()) {
-                        uint8_t a = variantClusteringPositionPairAlleles[memberIdx];
+                // Check Strand Bias & Coverage for the Reference Allele
+                // If the Reference allele fails, we cannot use it as a pivot.
+                if (!isStrandBiased(alleleCounts[targetAllele], alleleStrand0Counts[targetAllele])) {
+                     // Check if the Reference Allele has sufficient coverage
+                    if (alleleCounts[targetAllele] >= currentMinAlleleCoverage) {
                         
-                        if (a == node.targetAllele) {
-                            nodeReads[i].push_back({orientedReadId.getValue(), false}); 
-                        } else if (a == node.altAllele) {
-                            nodeReads[i].push_back({orientedReadId.getValue(), true});  
+                        // Identify valid Alt alleles
+                        std::vector<uint8_t> validAlts;
+                        for(uint8_t a=0; a<5; a++) {
+                            if (a == targetAllele) continue;
+
+                            // Check Alt Coverage
+                            if (alleleCounts[a] < currentMinAlleleCoverage) continue;
+
+                            // // Check Alt Strand Bias
+                            // if (isStrandBiased(alleleCounts[a], alleleStrand0Counts[a])) continue;
+
+                            validAlts.push_back(a);
+                        }
+
+                        if (!validAlts.empty()) {
+                            // Create Virtual Clusters
+                            size_t startIdx = dpNodes.size();
+                            for (uint8_t alt : validAlts) {
+                                VirtualCluster vc;
+                                vc.clusterId = clusterId;
+                                vc.targetAllele = targetAllele;
+                                vc.altAllele = alt;
+                                vc.reads.reserve(members.size()); // Upper bound
+                                dpNodes.push_back(std::move(vc));
+                            }
+
+                            // POPULATE READS for these new virtual clusters
+                            // We iterate members once and distribute to relevant VCs
+                            for(uint64_t memberIdx : members) {
+                                const auto& pp = positionPairs[memberIdx];
+                                OrientedReadId orientedReadId = pp.first;
+                                
+                                // Skip target oriented read itself
+                                if(orientedReadId == currentOrientedReadId0) continue;
+
+                                if(memberIdx < variantClusteringPositionPairAlleles.size()) {
+                                    uint8_t a = variantClusteringPositionPairAlleles[memberIdx];
+                                    
+                                    if (a == targetAllele) {
+                                        // Supported Target: Add (Phase 0) to ALL VCs derived from this physical cluster
+                                        for(size_t k=0; k<validAlts.size(); k++) {
+                                            dpNodes[startIdx + k].reads.push_back({orientedReadId.getValue(), false});
+                                        }
+                                    } else {
+                                        // Supported Alt: Check if it matches one of our valid Alts
+                                        for(size_t k=0; k<validAlts.size(); k++) {
+                                            if (a == validAlts[k]) {
+                                                dpNodes[startIdx + k].reads.push_back({orientedReadId.getValue(), true});
+                                                break; // Found the matching alt VC
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // SORT READS for these new virtual clusters
+                            for(size_t k=0; k<validAlts.size(); k++) {
+                                auto& reads = dpNodes[startIdx + k].reads;
+                                std::sort(reads.begin(), reads.end(), 
+                                    [](const ReadPhase& a, const ReadPhase& b) { 
+                                        return a.orientedReadIdValue < b.orientedReadIdValue; 
+                                    });
+                            }
                         }
                     }
                 }
-                
-                // Sort by OrientedReadId value for fast intersection
-                std::sort(nodeReads[i].begin(), nodeReads[i].end(), 
-                    [](const ReadPhase& a, const ReadPhase& b) { 
-                        return a.orientedReadIdValue < b.orientedReadIdValue; 
-                    });
+
+                ++it;
             }
 
-            // --- Step 3: DP for Longest Compatible Group (LCG) ---
-            vector<int> LCG(N, 1);
-            vector<int> parent(N, -1);
+            // Get the number of Virtual Clusters (DP nodes)
+            const size_t N = dpNodes.size();
 
+            // If no DP nodes, skip this read
+            if (N == 0) continue;
+
+            // --- Step 2: Strict DP for Phasing Consistency (gen_rphase_dp) ---
+            // Replaces previous LCG logic with strict "comput_sc_rphase" consistency check.
+            
+            // DP definition:
+            // dp[i] = max score of a consistent chain ending at node i
+            // parent[i] = predecessor node index
+            // Initialize with 1 because every node is a valid chain of length 1 by itself.
+            std::vector<int64_t> dpScore(N, 1); 
+            std::vector<int> parent(N, -1);
+
+            // DP Loop
             for(int i = 0; i < N; i++) {
-                for(int j = 0; j < i; j++) {
-                    // Don't link two virtual nodes coming from the SAME physical cluster.
-                    // This is to avoid linking multiallelic sites coming from the same physical cluster.
-                    // We force the DP chain to pick at most one virtual node per physical genomic site, 
-                    // ensuring we don't double-count the same site or create invalid paths.
-                    // This enforces the constraint: "One genomic location = One node in the path."
+                int64_t currentMaxScore = 1; // Base score (chain of length 1)
+                int bestPredecessorIndex = -1;
+
+                // Optimization: Iterate backwards to find closest predecessor first.
+                for(int j = i - 1; j >= 0; j--) {
+                    // Optimization: If the best possible score from j doesn't improve our current max, skip.
+                    // Since we iterate backwards, we likely found a good/closest predecessor early.
+                    if (dpScore[j] + 1 <= currentMaxScore) continue;
+
+                    // 1. Physical Cluster constraint
+                    // Only allow chains between different clusters (don't chain multiallelic clusters).
                     if (dpNodes[i].clusterId == dpNodes[j].clusterId) continue;
 
-                    // Check compatibility(i, j)
-                    // Compatible if NO read conflicts.
-                    // Conflict: Read r present in both, but has Phase 0 in one and Phase 1 in other.
-                    
-                    bool compatible = true;
-                    const auto& orientedReadsI = nodeReads[i];
-                    const auto& orientedReadsJ = nodeReads[j];
-                    
-                    auto itI = orientedReadsI.begin();
-                    auto itJ = orientedReadsJ.begin();
-                    
-                    int supportPhase0 = 0; // Reads linking Target -> Target
-                    int supportPhase1 = 0; // Reads linking Alt -> Alt
+                    // 2. Strict Consistency Check (comput_sc_rphase)
+                    // Check if the reads support the same phase.
+                    const auto& readsI = dpNodes[i].reads;
+                    const auto& readsJ = dpNodes[j].reads;
 
-                    // Linear intersection scan to compare sorted sets.
-                    while(itI != orientedReadsI.end() && itJ != orientedReadsJ.end()) {
+                    int supportTarget = 0; // Support matching Ref-Ref
+                    int supportAlt = 0; // Support matching Alt-Alt
+                    bool inconsistent = false;
+
+                    // Sorted intersection
+                    auto itI = readsI.begin();
+                    auto itJ = readsJ.begin();
+                    auto endI = readsI.end();
+                    auto endJ = readsJ.end();
+
+                    // We compare dpNodes[i].reads and dpNodes[j].reads.
+                    // Since they are sorted, we use a single linear pass (like merging two sorted lists).
+                    // Conflict: If any orientedReadId is shared but has different phases (Ref vs Alt), we flag inconsistent = true and abort.
+                    // Support: If phases match, we count support for Ref (supportTarget) and Alt (supportAlt).
+                    while(itI != endI && itJ != endJ) {
                         if(itI->orientedReadIdValue < itJ->orientedReadIdValue) {
                             ++itI;
                         } else if(itJ->orientedReadIdValue < itI->orientedReadIdValue) {
                             ++itJ;
                         } else {
-                            // Same OrientedRead covers both.
-                            if(itI->isPhase1 != itJ->isPhase1) {
-                                // CONFLICT found! (Phase 0 -> 1 or 1 -> 0).
-                                compatible = false; 
-                                break; 
+                            // Shared Read
+                            if (itI->isPhase1 != itJ->isPhase1) {
+                                // Conflict! (One says Ref, one says Alt)
+                                inconsistent = true;
+                                break;
                             } else {
-                                // Consistent!
-                                if (itI->isPhase1 == false) supportPhase0++;
-                                else supportPhase1++;
+                                // Consistent
+                                if (itI->isPhase1 == false) supportTarget++;
+                                else supportAlt++;
                             }
                             ++itI;
                             ++itJ;
                         }
                     }
 
-                    // COMPATIBILITY CRITERIA:
-                    // 1. Must be compatible (no conflicts)
-                    // 2. Must have ACTIVE support (shared reads)
-                    
-                    if (compatible) {
-                        // "Strong Linkage" (Support for BOTH alleles)
-                        // This ensures we are tracking two real haplotypes, not just linking noise.
-                        if (supportPhase0 > 0 && supportPhase1 > 0) {
-                            if(LCG[j] + 1 > LCG[i]) {
-                                LCG[i] = LCG[j] + 1; // Longest compatible group length
-                                parent[i] = j; // Parent node in the DP chain
-                            }
+                    if (inconsistent) continue; // Score = INT64_MIN -> skip
+
+                    // Check for positive evidence (Strict Requirement)
+                    // Ensure that we have at least one read supporting the Reference haplotype (supportTarget) 
+                    // AND at least one read supporting the Alternative haplotype (supportAlt) connecting these two sites.
+                    // Just because two sites don't conflict (e.g., no reads jumping from Ref to Alt) doesn't mean 
+                    // they are truly linked. They might just be far apart with no shared reads, or only one haplotype might be covered.
+                    // This eliminates "hollow" chains where one haplotype is actually missing or unsupported.
+                    if (supportTarget > 0 && supportAlt > 0) {
+                        // Consistent and Linked!
+                        int64_t candidateScore = 1 + dpScore[j];
+                        // Maximization: We check if this new path coming from $j$ is longer than 
+                        // any best path we found from other predecessors so far (currentMaxScore).
+                        // If it is longer, we update currentMaxScore (new best score) and record bestPredecessorIndex (best predecessor) 
+                        // to reconstruct the path later.
+                        if (candidateScore > currentMaxScore) {
+                            currentMaxScore = candidateScore;
+                            bestPredecessorIndex = j;
                         }
                     }
                 }
+                dpScore[i] = currentMaxScore;
+                parent[i] = bestPredecessorIndex;
             }
 
-            // --- Step 4: Traceback and Chain Identification (Multi-Chain) ---
-            // This is the core of the DP algorithm.
-            // It identifies the longest compatible group of virtual nodes.
-            // It also identifies isolated sites that are supported by a sufficiently high number of reads.
-            // It then marks the clusters as valid and collects the reads that support the Target and Alt alleles.
- 
+            // --- Step 3: Traceback & Selection ---
+            // Extract chains starting from best scores.
+            
+            std::vector<int> sortedNodeIndices(N);
+            std::iota(sortedNodeIndices.begin(), sortedNodeIndices.end(), 0);
+            std::sort(sortedNodeIndices.begin(), sortedNodeIndices.end(), [&](int a, int b) {
+                return dpScore[a] > dpScore[b]; // Descending score
+            });
+
             vector<bool> isAssigned(N, false);
-            vector<pair<int, int>> sortedLCGIndices; // (Length, Index)
-            vector<pair<int, int>> isolatedSitesIndices;
-
-            for(int i = 0; i < N; i++) {
-                if (LCG[i] > 1) {
-                    sortedLCGIndices.push_back({LCG[i], i});
-                } else {
-                    isolatedSitesIndices.push_back({LCG[i], i});
-                }
-            }
-
-            // Sort chains by length descending
-            std::sort(sortedLCGIndices.rbegin(), sortedLCGIndices.rend());
             vector<vector<int>> validChains;
 
-            const uint64_t minMultiChainCoverage = 6; // Stricter threshold for multi-chain sites
-            
-            // 1. Process Multi-Node Chains
-            for (const auto& p : sortedLCGIndices) {
-                int endNode = p.second;
-                if (!isAssigned[endNode]) {
-                    vector<int> chain;
-                    int curr = endNode;
-                    while (curr != -1 && !isAssigned[curr]) {
-                        // Calculate target allele support
-                        uint64_t targetAlleleSupport = 0;
-                        for (const auto& rp : nodeReads[curr]) {
-                            if (!rp.isPhase1) targetAlleleSupport++;
-                        }
-
-                        // Filter by Target Allele Support
-                        if (targetAlleleSupport >= minMultiChainCoverage) {
-                            chain.push_back(curr);
-                        }
-                        isAssigned[curr] = true;
-                        curr = parent[curr];
-                    }
-                    
-                    // No need to reverse if we just iterate, but for correctness:
-                    // Check if it is empty chain
-                    if (chain.size() > 0) {
-                        std::reverse(chain.begin(), chain.end());
-                        validChains.push_back(chain);
-                    }
-                }
-            }
-
-            // -------------------------------------------------------------------------
-            // Filter Helper for Isolated Sites in Homopolymer Regions
-            // -------------------------------------------------------------------------
+            // Filter Helper Definition: Checks if the site is dominated by homopolymer errors.
+            // Returns true if valid coverage (non-HP reads) is too low for either allele.
             auto isHomopolymerDominated = [&](const VirtualCluster& node) -> bool {
+                int64_t validCoverageTarget = 0;
+                int64_t validCoverageAlt = 0;
+                
                 const auto& members = membersByRepIdx[node.clusterId];
-                
-                int64_t n0 = 0;
-                int64_t n1 = 0;
-
-                // 1. Initial counts
-                for(uint64_t memberIdx : members) {
-                     if(memberIdx < variantClusteringPositionPairAlleles.size()) {
-                        uint8_t a = variantClusteringPositionPairAlleles[memberIdx];
-                        if (a == node.targetAllele) n0++;
-                        else if (a == node.altAllele) n1++;
-                     }
-                }
-                
-                int64_t occ_0 = n0;
-                int64_t occ_1 = n1;
-
-                // 2. Remove votes from reads in homopolymer regions
-                // We access the reads object once outside loop if possible, but inside lambda we need 'this'.
                 const auto& reads = this->getReads();
 
                 for(uint64_t memberIdx : members) {
-                    if(memberIdx < variantClusteringPositionPairAlleles.size()) {
-                        const auto& pp = positionPairs[memberIdx];
-                        ReadId rId = pp.first.getReadId();
-                                                
-                        uint32_t pos = pp.second; 
+                    if(memberIdx >= variantClusteringPositionPairAlleles.size()) continue;
 
-                        // Retrieve the raw sequence (LongBaseSequenceView)
-                        dinara::LongBaseSequenceView readSequence = reads.getRead(rId);
+                    uint8_t a = variantClusteringPositionPairAlleles[memberIdx];
+                    bool isTarget = (a == node.targetAllele);
+                    bool isAlt = (a == node.altAllele);
 
-                        // Check if this read is in a homopolymer region at this site
-                        // Note: readSequence is always Strand 0 (Forward).
-                        // If the read is on Strand 1 (Reverse), the position 'pos' is relative to the RC read.
-                        // We need to convert 'pos' to the corresponding coordinate on Strand 0.
-                        uint64_t checkPos = pos;
-                        if (pp.first.getStrand() == 1) {
-                            uint64_t readLen = readSequence.baseCount;
-                            DINARA_ASSERT(pos < readLen);
-                            checkPos = readLen - 1 - pos;
-                        }
-                        
-                        // "Keep the default values for the other parameters"
-                        if (isSiteInHomopolymerRegion(checkPos, readSequence)) {
-                            uint8_t a = variantClusteringPositionPairAlleles[memberIdx];
-                            if (a == node.targetAllele) {
-                                occ_0--;
-                            } else if (a == node.altAllele) {
-                                occ_1--;
-                            }
-                        }
+                    if (!isTarget && !isAlt) continue; // Skip noise/irrelevant alleles
+
+                    // Check Homopolymer Status
+                    const auto& pp = positionPairs[memberIdx];
+                    ReadId rId = pp.first.getReadId();
+                    uint32_t pos = pp.second; 
+                    
+                    dinara::LongBaseSequenceView readSequence = reads.getRead(rId);
+                    uint64_t checkPos = pos;
+                    if (pp.first.getStrand() == 1) checkPos = readSequence.baseCount - 1 - pos;
+                    
+                    if (isSiteInHomopolymerRegion(checkPos, readSequence)) {
+                        continue; // Ignored (HP region)
                     }
+
+                    if (isTarget) validCoverageTarget++;
+                    else validCoverageAlt++;
                 }
-
-                // 3. Check thresholds
-                if (occ_0 < 2 || occ_1 < 2 || !(occ_0 >= currentMinAlleleCoverage && occ_1 >= currentMinAlleleCoverage)) return true;
-
-                return false;
+                
+                // Check thresholds (Min 3 non-HP reads for both)
+                if (validCoverageTarget < 3 || validCoverageAlt < 3) return true; 
+                return false; 
             };
 
-            // 2. Process Isolated Sites
-            // An isolated site is considered informative only if the reference read allele 
-            // is supported by a sufficiently high number of reads AND is not HP-dominated.
-            const uint64_t minIsolatedCoverage = 14; // Stricter threshold for isolated sites
-            
-            for (const auto& p : isolatedSitesIndices) {
-                int nodeIdx = p.second;
-                if (!isAssigned[nodeIdx]) {
-                    // Check support for this specific Virtual Cluster
-                    
-                    // Count reads supporting the reference read allele (Target Allele / Phase 0)
-                    uint64_t targetAlleleSupport = 0;
-                    for (const auto& rp : nodeReads[nodeIdx]) {
-                        if (!rp.isPhase1) { // isPhase1=false means Target Allele
-                            targetAlleleSupport++;
+            for (int idx : sortedNodeIndices) {
+                if (isAssigned[idx]) continue;
+
+                // Traceback to reconstruct the chain
+                std::vector<int> chain;
+                int curr = idx;
+                while (curr != -1 && !isAssigned[curr]) {
+                    isAssigned[curr] = true;
+                    chain.push_back(curr);
+                    curr = parent[curr];
+                }
+                if (chain.empty()) continue;
+
+                // Chain is [End, ..., Start]. Reverse to [Start, ..., End]
+                std::reverse(chain.begin(), chain.end());
+
+                // Evaluate Chain Quality
+                if (chain.size() > 1) {
+                    // MULTI-NODE CHAIN:
+                    // Only keep sites that meet coverage requirements within the chain
+                    std::vector<int> filteredChain;
+                    for(int nodeIdx : chain) {
+                        // Check Target Support coverage.
+                        // We use the pre-filtered reads vector for efficiency.
+                        int supportTarget = 0;
+                        for(const auto& rp : dpNodes[nodeIdx].reads) if(!rp.isPhase1) supportTarget++;
+                        
+                        if (supportTarget >= minMultiNodeChainSupport) {
+                            filteredChain.push_back(nodeIdx);
                         }
                     }
+                    if (!filteredChain.empty()) validChains.push_back(filteredChain);
 
-                    if (targetAlleleSupport >= minIsolatedCoverage) {
-                        // Check Homopolymer Filter
+                } else {
+                    // ISOLATED SITE:
+                    int nodeIdx = chain[0];
+                    int supportTarget = 0;
+                    for(const auto& rp : dpNodes[nodeIdx].reads) if(!rp.isPhase1) supportTarget++;
+                    
+                    if (supportTarget >= minIsolatedSiteSupport) {
+                        // Strict Homopolymer Check for isolated sites
                         if (!isHomopolymerDominated(dpNodes[nodeIdx])) {
                             validChains.push_back({nodeIdx});
-                            isAssigned[nodeIdx] = true;
                         }
                     }
                 }
             }
 
-            // --- Step 5: Haplotype Assignment (Naive HiFi) ---
 
-            // Data structures for the algorithm
-            struct SiteStat {
-                uint32_t dpNodeIdx;
-                uint32_t position;
-                uint32_t occ_0; // Target allele count
-                uint32_t occ_1; // Alt allele count
-                uint32_t score; // 0=Unconfirmed, 1=Confirmed Het
-                bool is_filtered;
-            };
+            // --- Step 5: Haplotype Assignment (Naive HiFi) ---
             
+            // Data structures
+            // 'SiteStat' is now merged into 'VirtualCluster' (dpNodes)
+            // We only need Read structures locally.
+
             struct ReadSiteInfo {
-                uint32_t siteIndex; // Index in 'sites' vector
-                bool isPhase1;      // false=Target, true=Alt
+                uint32_t dpNodeIdx; // Index in 'dpNodes'
+                bool isPhase1;      // false=Ref/Match, true=Alt/Mismatch
             };
 
             struct ReadStat {
                 OrientedReadId::Int orientedReadIdValue;
                 std::vector<ReadSiteInfo> coveredSites;
-                uint32_t informative_score; // 'o' in user algo
+                uint32_t informative_score; // 'o'
                 uint8_t is_trans;           // 0=Unknown, 1=CIS, 2=TRANS
+                bool strong;
             };
 
             // 1. Data Preparation
-            // Collect unique sites from all valid chains
-            std::vector<SiteStat> sites;
             std::vector<ReadStat> readStats;
-            std::unordered_map<OrientedReadId::Int, size_t> readMap; // ReadValue -> Index in readStats
+            std::unordered_map<OrientedReadId::Int, size_t> readMap;
 
-            // We need to flatten the chains into a list of unique sites
+            // Collect unique sites
             std::set<int> usedNodeIndices;
             for (const auto& chain : validChains) {
-                for (int nodeIdx : chain) {
-                    usedNodeIndices.insert(nodeIdx);
-                }
+                for (int nodeIdx : chain) usedNodeIndices.insert(nodeIdx);
             }
-            
+
             // Mark Compatible Clusters
             for (int nodeIdx : usedNodeIndices) {
-                 uint64_t originalClusterId = dpNodes[nodeIdx].clusterId;
+                uint64_t cId = dpNodes[nodeIdx].clusterId;
+                __sync_bool_compare_and_swap(&variantClusteringValidClustersCompatible[cId], 0, 1);
 
-                // Mark compatible atomically
-                __sync_bool_compare_and_swap(&variantClusteringValidClustersCompatible[originalClusterId], 0, 1);
-
-                // Mark RC cluster
-                {
-                    const auto& members = membersByRepIdx[originalClusterId];
-                    if (!members.empty()) {
-                        uint64_t memberIdx = members[0];
-                        const auto& pp = positionPairs[memberIdx];
-                        ReadId readId = pp.first.getReadId();
-                        Strand strand = pp.first.getStrand();
-                        uint32_t position = pp.second;
-                        
-                        Strand rcStrand = 1 - strand;
-                        OrientedReadId rcOrientedReadId(readId, rcStrand);
-                        uint64_t readLength = getReads().getReadRawSequenceLength(readId);
-                        uint32_t rcPosition = uint32_t(readLength - 1 - position);
-                        
-                        auto searchKey = std::make_pair(rcOrientedReadId, rcPosition);
-                        auto itRc = std::lower_bound(positionPairs.begin(), positionPairs.end(), searchKey);
-                        if (itRc != positionPairs.end() && *itRc == searchKey) {
-                            uint64_t rcMemberIdx = itRc - positionPairs.begin();
-                            uint64_t rcClusterId = disjointSets.find(rcMemberIdx);
-                            if (rcClusterId != originalClusterId) {
-                                __sync_bool_compare_and_swap(&variantClusteringValidClustersCompatible[rcClusterId], 0, 1);
-                            }
-                        }
+                // Mark RC
+                if (!membersByRepIdx[cId].empty()) {
+                    const auto& pp = positionPairs[membersByRepIdx[cId][0]];
+                    ReadId readId = pp.first.getReadId();
+                    Strand strand = pp.first.getStrand();
+                    uint32_t position = pp.second;
+                    Strand rcStrand = 1 - strand;
+                    OrientedReadId rcId(readId, rcStrand);
+                    uint32_t rcPos = uint32_t(getReads().getReadRawSequenceLength(readId) - 1 - position);
+                    auto searchKey = std::make_pair(rcId, rcPos);
+                    auto itRc = std::lower_bound(positionPairs.begin(), positionPairs.end(), searchKey);
+                    if (itRc != positionPairs.end() && *itRc == searchKey) {
+                        uint64_t rcCId = disjointSets.find(itRc - positionPairs.begin());
+                        if (rcCId != cId) __sync_bool_compare_and_swap(&variantClusteringValidClustersCompatible[rcCId], 0, 1);
                     }
                 }
             }
 
-            // Build Sites and Reads
+            // Init Sites (in dpNodes) & Reads
             for (int nodeIdx : usedNodeIndices) {
-                // Get Position
-                uint32_t pos = 0;
+                // Initialize VirtualCluster fields
+                dpNodes[nodeIdx].occ_0 = 0;
+                dpNodes[nodeIdx].occ_1 = 0;
+                dpNodes[nodeIdx].score = 0;
+                dpNodes[nodeIdx].is_filtered = false;
+                
                 uint64_t cId = dpNodes[nodeIdx].clusterId;
                 if (!membersByRepIdx[cId].empty()) {
-                    pos = positionPairs[membersByRepIdx[cId][0]].second;
+                    dpNodes[nodeIdx].position = positionPairs[membersByRepIdx[cId][0]].second;
+                } else {
+                    dpNodes[nodeIdx].position = 0; 
                 }
 
-                // Initial Counts (Target=0, Alt=0 - will fill from reads)
-                SiteStat s = {(uint32_t)nodeIdx, pos, 0, 0, 0, false};
-                
-                uint32_t currentSiteIdx = (uint32_t)sites.size();
-                sites.push_back(s);
-
-                // Process Reads in this Node
-                for (const auto& rp : nodeReads[nodeIdx]) {
-                    // Find or Create ReadStat
+                // Process Reads
+                for (const auto& rp : dpNodes[nodeIdx].reads) {
                     if (readMap.find(rp.orientedReadIdValue) == readMap.end()) {
                         size_t idx = readStats.size();
-                        readStats.push_back({rp.orientedReadIdValue, {}, 0, 0});
+                        readStats.push_back(ReadStat{rp.orientedReadIdValue, {}, 0, 1, false}); // Default is_trans=1 (CIS)
                         readMap[rp.orientedReadIdValue] = idx;
                     }
                     size_t rIdx = readMap[rp.orientedReadIdValue];
+                    readStats[rIdx].coveredSites.push_back(ReadSiteInfo{(uint32_t)nodeIdx, rp.isPhase1});
                     
-                    // Add site info to read
-                    readStats[rIdx].coveredSites.push_back({currentSiteIdx, rp.isPhase1});
-
-                    // Update Site Counts (temporarily, will refine later)
-                    if (!rp.isPhase1) sites.back().occ_0++;
-                    else sites.back().occ_1++;
+                    if (!rp.isPhase1) dpNodes[nodeIdx].occ_0++;
+                    else dpNodes[nodeIdx].occ_1++;
                 }
             }
 
-            // 2.1 Adjacent Site Filter
-            // Sort sites by position
-            // Note: 'sites' vector order corresponds to indices in ReadSiteInfo. 
-            // If we sort 'sites', we break those indices.
-            // Instead of sorting 'sites' and breaking indices, let's create a sorted view or just iterate carefully.
-            // Actually, sorting sites by position is needed for the 1bp check. 
-            // We can check 1bp diff by comparing all pairs O(N^2) or sorting. N is small (chain nodes).
-            // Let's sort an index vector.
-            std::vector<uint32_t> sitesByPos(sites.size());
-            std::iota(sitesByPos.begin(), sitesByPos.end(), 0);
-            std::sort(sitesByPos.begin(), sitesByPos.end(), [&](uint32_t a, uint32_t b) {
-                return sites[a].position < sites[b].position;
+            // 2.1 Filter Adjacent SNPs (Hifiasm "Block-based" Logic)
+            // Goal: Remove ANY site that is exactly 1bp away from another site.
+            // Why Block-Based? 
+            // - We may have multiple nodes at the same position (multi-allelic sites or duplicates).
+            // - These nodes form a "block" [l, k) in the sorted list.
+            // - We must check if the ENTIRE block is adjacent to the *previous* unique position or *next* unique position.
+            // - If adjacency is found, ALL nodes in the block are filtered out.
+
+            std::vector<int> sortedNodeIndicesByPos(usedNodeIndices.begin(), usedNodeIndices.end());
+            std::sort(sortedNodeIndicesByPos.begin(), sortedNodeIndicesByPos.end(), [&](int a, int b){
+                return dpNodes[a].position < dpNodes[b].position;
             });
 
-            for (size_t i = 0; i < sites.size(); ++i) {
-                // Check neighbors in sorted list
-                uint32_t siteIdx = sitesByPos[i];
-                uint32_t myPos = sites[siteIdx].position;
-                
-                // Check Prev
-                if (i > 0) {
-                    uint32_t prevIdx = sitesByPos[i-1];
-                    if (sites[prevIdx].position + 1 == myPos) {
-                        sites[siteIdx].is_filtered = true;
+            size_t n = sortedNodeIndicesByPos.size();
+            size_t l = 0; // Start index of current block
+            for (size_t k = 1; k <= n; ++k) {
+                // Determine if we reached the end of a block of identical positions:
+                // k == n: End of list
+                // pos[k] != pos[l]: New unique position found
+                if (k == n || dpNodes[sortedNodeIndicesByPos[k]].position != dpNodes[sortedNodeIndicesByPos[l]].position) {
+                    bool filterBlock = false;
+                    uint32_t currentPos = dpNodes[sortedNodeIndicesByPos[l]].position;
+
+                    // 1. Check Previous Block Adjacency
+                    // If this isn't the first block (l > 0), look at the last element of the PREVIOUS block (l-1)
+                    if (l > 0) {
+                        uint32_t prevPos = dpNodes[sortedNodeIndicesByPos[l-1]].position;
+                        if (currentPos == prevPos + 1) {
+                            filterBlock = true; // Block is 1bp after previous block
+                        }
                     }
-                }
-                // Check Next
-                if (i + 1 < sites.size()) {
-                    uint32_t nextIdx = sitesByPos[i+1];
-                    if (sites[nextIdx].position == myPos + 1) {
-                         sites[siteIdx].is_filtered = true;
+
+                    // 2. Check Next Block Adjacency
+                    // If this isn't the last block (k < n), look at the first element of the NEXT block (k)
+                    if (k < n) {
+                        uint32_t nextPos = dpNodes[sortedNodeIndicesByPos[k]].position;
+                        if (currentPos + 1 == nextPos) {
+                            filterBlock = true; // Block is 1bp before next block
+                        }
                     }
+
+                    // 3. Apply Filter
+                    // If either neighbor was exactly 1bp away, invalidate EVERY node in this current block.
+                    if (filterBlock) {
+                        for (size_t i = l; i < k; ++i) {
+                            dpNodes[sortedNodeIndicesByPos[i]].is_filtered = true;
+                        }
+                    }
+
+                    // Advance start pointer 'l' to 'k' (start of the next block)
+                    l = k;
                 }
             }
 
-            // 2.2 Count Informative Sites Per Read
+            // 2.2 Calculate Informative Scores (Hifiasm "o" metric)
+            // Goal: Score each read based on how many "strong" mismatches it provides.
+            // This score ('o') is used to process the most informative reads first.
             for (auto& r : readStats) {
                 r.informative_score = 0;
                 for (const auto& info : r.coveredSites) {
-                     SiteStat& s = sites[info.siteIndex];
-                     
-                     if (s.is_filtered) continue;
-                     
-                     // Must be mismatch (Phase 1 / Alt) to be "informative" for TRANS detection?
-                     // User code: "if (hh_tp(hap->list[i]) != 1) continue; // Must be mismatch"
-                     // Wait, hh_tp != 1 means Mismatch? Or Match?
-                     // In user code: 
-                     //   Line 8973: if (overlap_list->list[ii].is_match == 1) overlap_list->list[ii].is_match = 2; (Mark TRANS)
-                     //   Inside loop: if (hh_tp == 1) s->score=1 (MISMATCH pos)
-                     // So hh_tp=1 is Mismatch/Alt.
-                     // User 2.2 says: "if (hh_tp != 1) continue; // Must be mismatch"
-                     // So yes, we only count Mismatches (Alt alleles) as "informative" for *identifying* trans overlaps?
-                     // But later: "Only overlaps with o > 0 are added".
-                     // Let's follow user: info.isPhase1 == true (Alt)
-                     if (!info.isPhase1) continue; 
+                    VirtualCluster& s = dpNodes[info.dpNodeIdx];
+                    if (s.is_filtered) continue;
+                    
+                    // Criteria 1: Must be a Mismatch (Phase 1 / Alt)
+                    // Matches (Reference allele) do not help distinguish the *other* haplotype in this logic.
+                    if (!info.isPhase1) continue; 
 
-                     // Coverage check
-                     if (s.occ_0 < 2 || s.occ_1 < 2) continue;
-
-                     // Strand bias check (Skip for now, or assume handled upstream)
-                     
-                     // "if (s->occ_0 >= 3 && s->occ_1 >= 3) o++"
-                     if (s.occ_0 >= 3 && s.occ_1 >= 3) {
-                         r.informative_score++;
-                     }
+                    // Criteria 2: Site must have minimum coverage (occ >= 2)
+                    // If a site is poorly covered on either allele, it's too noisy to trust.
+                    if (s.occ_0 < 2 || s.occ_1 < 2) continue;
+                    
+                    // Criteria 3: High-Quality / "Strong" Site (occ >= 3)
+                    // We only increment the informative score if the site coverage is robust (>= 3).
+                    // This creates the 'o' score used for sorting.
+                    if (s.occ_0 >= 3 && s.occ_1 >= 3) {
+                        r.informative_score++;
+                    }
                 }
             }
 
-            // 2.3 Sort Reads (Overlaps)
-            // Sort by informative_score descending
+            // 2.3 Sort reads by their informative_score in descending order.
+            // Reads with higher informative_score will be processed first.
+            // We want to process the reads with the strongest evidence of being "Other Haplotype" (TRANS) first. 
+            // Identifying these correctly clarifies the picture for ambiguous reads later.
             std::vector<uint32_t> readIndices(readStats.size());
             std::iota(readIndices.begin(), readIndices.end(), 0);
             std::sort(readIndices.begin(), readIndices.end(), [&](uint32_t a, uint32_t b) {
                 return readStats[a].informative_score > readStats[b].informative_score;
             });
 
-            // 2.4 First Loop: Assign Trans and Update Coverage
+            // 2.4 First Loop: Greedy TRANS Assignment & Coverage Update
+            // Goals:
+            // 1. Identify definitive TRANS (Other Haplotype) reads based on their score.
+            // 2. "Lock in" the sites they mismatch as Confirmed Heterozygous (score=1).
+            // 3. Remove their support from Reference alleles (since we know they aren't Reference).
             for (uint32_t rIdx : readIndices) {
                 ReadStat& r = readStats[rIdx];
                 
-                // If informative score > 0 (from 2.2 logic: overlap has mismatch at strong site)
-                // "Only overlaps with o > 0 are added to processing queue" implied filter?
-                // Or just proceed. User says "For each overlap...".
-                // User code: "if (overlap_list->list[ii].is_match == 1) is_match = 2"
-                // This implies ALL reads in this sorted list are candidates for TRANS if they have mismatches?
-                // Actually, the sorting key `o` is based on mismatches. If `o > 0`, it has mismatches at strong sites.
-                // So likely these are the ones we assume are TRANS first?
-                // Wait, "2.4 ... For each overlap (most informative first): ... mark as TRANS"
-                // It seems it aggressively marks them as TRANS if they have mismatches?
-                // Let's implement the loop actions.
-                
-                // Check if it's candidate for TRANS
-                // The user logic seems to assume we are processing a list of potential *TRANS* overlaps?
-                // "Only overlaps with o > 0 (at least one mismatch at informative site) are added to the processing queue."
-                // So if informative_score == 0, we skip this logic (it remains default/CIS or UNKNOWN).
-                if (r.informative_score == 0) continue;
-
-                // Mark as TRANS
-                r.is_trans = 2; // TRANS
-
+                // Hifiasm Logic: We re-calculate 'o' with CURRENT site counts.
+                // Site counts change as we process reads, so a read that looked informative initially 
+                // might lose that status if its supporting sites get "downgraded" to not informative.
+                // We verify if the read *still* has strong support after previous decrements.
+                int o = 0;
                 for (const auto& info : r.coveredSites) {
-                    SiteStat& s = sites[info.siteIndex];
+                    VirtualCluster& s = dpNodes[info.dpNodeIdx];
+                    if (s.is_filtered) continue;
+                    if (!info.isPhase1) continue; // Only count Mismatches
+                    if (s.occ_0 < 2 || s.occ_1 < 2) continue; // Weak sites ignored
+                    if (s.occ_0 >= 3 && s.occ_1 >= 3) o++;    // Strong mismatch count
+                }
+
+                // If read has no strong mismatches anymore, skip it (leave as potential CIS/Ambiguous).
+                if (o == 0) continue;
+
+                // Action 1: Mark as TRANS (Other Haplotype)
+                r.is_trans = 2; // 2 = Definitely TRANS
+
+                // Action 2: Update Sites based on this read's assignment
+                for (const auto& info : r.coveredSites) {
+                    VirtualCluster& s = dpNodes[info.dpNodeIdx];
                     if (s.is_filtered) continue;
 
-                    if (info.isPhase1) { // Mismatch / Alt
-                        // "MISMATCH position -> mark site as confirmed het"
+                    if (info.isPhase1) { 
+                        // Mismatch -> This TRANS read confirms this site is a real Difference.
+                        // Mark site as "Confirmed Heterozygous" (Anchor).
                         s.score = 1; 
-                    } else { // Match / Target
-                        // "MATCH position -> remove this overlap's ref vote"
+                    } else { 
+                        // Match -> This TRANS read happens to match Reference here (homozygosity/noise).
+                        // Since this read is TRANS, its vote for Reference is invalid.
+                        // Decrement occ_0 to remove this false support.
                         if (s.occ_0 > 0) s.occ_0--;
                     }
                 }
             }
 
-            // 2.7 Second Loop: Catch-Up Assignment
-            // "For overlaps not yet assigned" -> i.e. informative_score == 0 or not visited?
-            // "or overlaps not yet assigned, check against confirmed het sites"
+            // 2.5 Second Loop: "Catch-up" Pass
+            // Goal: Rescue ambiguous reads using the anchors established in the First Pass.
+            // Why? Some reads might not have had enough strong sites to be called TRANS initially ('informative' count too low).
+            // However, if they conflict with a site that is NOW "Confirmed Heterozygous" (score=1), 
+            // that is strong evidence they belong to the other haplotype.
+            // Logic: "If you clash with a trusted anchor, you are TRANS."
             for (uint32_t rIdx : readIndices) {
                 ReadStat& r = readStats[rIdx];
                 
-                // If already TRANS, skip
+                // Skip reads already definitively assigned as TRANS
                 if (r.is_trans == 2) continue;
 
                 int o = 0;
                 for (const auto& info : r.coveredSites) {
-                    SiteStat& s = sites[info.siteIndex];
-                    // "if (hh_tp != 1) continue" -> Mismatch only
-                    if (!info.isPhase1) continue;
+                    VirtualCluster& s = dpNodes[info.dpNodeIdx];
+                    if (s.is_filtered) continue;
+                    if (!info.isPhase1) continue; // Mismatch only
+                    if (s.occ_0 < 2 || s.occ_1 < 2) continue; // Min coverage check
                     
-                    // "if (s->occ_0 < 2 || s->occ_1 < 2) continue" -> Updated counts!
-                    if (s.occ_0 < 2 || s.occ_1 < 2) continue;
-                    
-                    // "if (s->score == 1) o++" -> Confirmed het
+                    // Critical Check: Does this mismatch happen at a CONFIRMED Anchor?
+                    // s.score was set to 1 in the First Pass.
                     if (s.score == 1) o++;
                 }
 
-                // Mark as TRANS if mismatch at confirmed het site
+                // If at least one Confirmed Mismatch exists -> Mark as TRANS
                 if (o > 0) {
-                    r.is_trans = 2;
+                    r.is_trans = 2; 
+                }
+            }
+
+            // 2.6 Reset/Invalidate Contradictory Sites in CIS Reads
+            // Goal: Clean up sites that show contradictory evidence in the reads we believe are CIS.
+            // Logic:
+            // - At this point, any read with is_trans != 2 is tentatively considered "CIS" (In-Phase).
+            // - If a CIS read has a Mismatch (Phase 1) at a site, that is a contradiction.
+            //   (A CIS read should technically Match indices, not Mismatch).
+            // - Instead of discarding the read, we blame the site: strict logic says this site is unreliable.
+            // - Action: Invalidate the site (score = -1) so it cannot determine future assignments.
+            for (auto& r : readStats) {
+                if (r.is_trans == 1) { // Currently considered CIS
+                    for (const auto& info : r.coveredSites) {
+                        if (info.isPhase1) { // Mismatch at this site
+                            // Contradiction found -> Invalidate site
+                            dpNodes[info.dpNodeIdx].score = -1; 
+                        }
+                    }
+                }
+            }
+
+            // 2.7 Final Assignment & Strong Marking
+            // Goal: Finalize TRANS/CIS status and identify "Strong" (high-confidence) reads.
+            // Why? Even after previous loops, some CIS reads might still technically conflict 
+            // with sites that are definitely Heterozygous anchors. We need a final safety check.
+            for (auto& r : readStats) {
+                if (r.is_trans == 2) {
+                    // TRANS reads are already confirmed strong by definition (they drove the assignment).
+                    r.strong = true;
+                }
+                else if (r.is_trans == 1) { // Tentative CIS
+                    // Safety Check: Does this CIS read actually Mismatch a trusted Anchor?
+                    // Anchor definition here: score=1 (Confirmed Het) AND robust coverage (>=2) on both alleles.
+                    for (const auto& info : r.coveredSites) {
+                        VirtualCluster& s = dpNodes[info.dpNodeIdx];
+                        if (s.is_filtered) continue;
+                        
+                        if (s.score == 1 && s.occ_0 >= 2 && s.occ_1 >= 2) {
+                            if (info.isPhase1) { // Mismatch!
+                                // It contradicts a trusted anchor -> It MUST be TRANS.
+                                r.is_trans = 2;
+                                r.strong = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Final "Strong" Check for surviving CIS reads:
+                    // A CIS read is only "Strong" if it explicitly MATCHES at least one trusted anchor.
+                    // (i.e., it's not just "not conflicting", it's positively confirmed).
+                    if (r.is_trans == 1) {
+                        for (const auto& info : r.coveredSites) {
+                            VirtualCluster& s = dpNodes[info.dpNodeIdx];
+                            if (s.score == 1 && s.occ_0 >= 2 && s.occ_1 >= 2) {
+                                // Implicit: Since we passed the loop above, we know info.isPhase0 (Match).
+                                r.strong = true;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1323,12 +1328,18 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             // Add Target Read itself (always in phase)
             finalHapOrientedReadIds.push_back(currentOrientedReadId0.getValue());
 
+            // 2.8 Output Generation (Strict Mode - Experimental)
+            // User Request: Discard "Weak CIS" reads. 
+            // Only keep reads that are definitively assigned to this haplotype (is_trans != 2) AND have strong confirmation.
+            
             for (const auto& r : readStats) {
                 if (r.is_trans != 2) {
-                    // In-Phase (CIS)
-                     finalHapOrientedReadIds.push_back(r.orientedReadIdValue);
+                    // Only keep if marked STRONG (Confirmed CIS)
+                    // This discards "ambiguous" reads that didn't conflict but also didn't match an anchor.
+                    if (r.strong) {
+                        finalHapOrientedReadIds.push_back(r.orientedReadIdValue);
+                    }
                 } 
-                // else Out-Of-Phase (TRANS) - dropped from final haplotype helper
             }
 
             // Sort & Unique
@@ -1336,7 +1347,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             finalHapOrientedReadIds.erase(std::unique(finalHapOrientedReadIds.begin(), finalHapOrientedReadIds.end()), finalHapOrientedReadIds.end());
 
             // Print finalHapOrientedReadIds with one orientedReadId per line if readId is 0 (debug)
-            if(currentOrientedReadId0.getReadId() == 87 and currentOrientedReadId0.getStrand() == 0) {
+            if(currentOrientedReadId0.getReadId() == 8820 and currentOrientedReadId0.getStrand() == 0) {
                 cout << "Final Haplotype Oriented Reads: " << endl;
                 for(OrientedReadId::Int orientedReadIdValue : finalHapOrientedReadIds) {
                     cout << OrientedReadId::fromValue(orientedReadIdValue).getString() << endl;

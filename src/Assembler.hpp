@@ -394,6 +394,11 @@ public:
     {
         return assemblerInfo->markerGraphMinCoverageUsed;
     }
+    
+    // Filtering parameters for phased chains (passed from ReadGraphOptions)
+    int minMultiNodeChainSupport = 6;
+    int minIsolatedSiteSupport = 6;
+
 private:
 
 

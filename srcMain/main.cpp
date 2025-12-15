@@ -268,6 +268,8 @@ void dinara::main::assemble(
     Assembler assembler(dataDirectory, true, assemblerOptions.readsOptions.representation, pageSize);
     assembler.assemblerInfo->readGraphCreationMethod = assemblerOptions.readGraphOptions.creationMethod;
     assembler.assemblerInfo->assemblyMode = assemblerOptions.assemblyOptions.mode;
+    assembler.minMultiNodeChainSupport = assemblerOptions.readGraphOptions.minMultiNodeChainSupport;
+    assembler.minIsolatedSiteSupport = assemblerOptions.readGraphOptions.minIsolatedSiteSupport;
 
     // Run the assembly.
     assemble(assembler, assemblerOptions, inputFileAbsolutePaths);

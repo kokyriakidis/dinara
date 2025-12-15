@@ -276,6 +276,11 @@ public:
     
     // Cluster graph options.
     uint64_t clusterGraphMinEdgeCoverage;
+    
+    // Filtering options for phased chains/sites
+    int minMultiNodeChainSupport;
+    int minIsolatedSiteSupport;
+
     void write(ostream& ) const;
 };
 

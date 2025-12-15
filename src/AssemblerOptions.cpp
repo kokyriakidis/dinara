@@ -751,6 +751,16 @@ void AssemblerOptions::addConfigurableOptions()
         "Minimum edge coverage for the cluster graph. "
         "Edges with coverage below this threshold are not created.")
 
+        ("ReadGraph.minMultiNodeChainSupport",
+        value<int>(&readGraphOptions.minMultiNodeChainSupport)->
+        default_value(6),
+        "Minimum support (Target coverage) for a multi-node phased chain to be kept.")
+
+        ("ReadGraph.minIsolatedSiteSupport",
+        value<int>(&readGraphOptions.minIsolatedSiteSupport)->
+        default_value(6),
+        "Minimum support (Target coverage) for an isolated phased site to be kept.")
+
         ("MarkerGraph.minCoverage",
         value<int>(&markerGraphOptions.minCoverage)->
         default_value(10),
@@ -1448,6 +1458,8 @@ void ReadGraphOptions::write(ostream& s) const
     s << "WThreshold = " << WThreshold << "\n";
     s << "WThresholdForBreaks = " << WThresholdForBreaks << "\n";
     s << "clusterGraphMinEdgeCoverage = " << clusterGraphMinEdgeCoverage << "\n";
+    s << "minMultiNodeChainSupport = " << minMultiNodeChainSupport << "\n";
+    s << "minIsolatedSiteSupport = " << minIsolatedSiteSupport << "\n";
 }
 
 
