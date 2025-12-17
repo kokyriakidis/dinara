@@ -747,6 +747,10 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                      // Check if the Reference Allele has sufficient coverage
                     if (alleleCounts[targetAllele] >= currentMinAlleleCoverage) {
                         
+                        // 4. Identify Valid Chains (Graph Nodes)
+                        std::vector<std::vector<int>> validChains;
+                        std::vector<int> validChainsDumpster; // Captured sites that failed filters
+                        std::vector<bool> visited(dpNodes.size(), false);
                         // Identify valid Alt alleles
                         std::vector<uint8_t> validAlts;
                         for(uint8_t a=0; a<5; a++) {
@@ -924,6 +928,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
 
             vector<bool> isAssigned(N, false);
             vector<vector<int>> validChains;
+            vector<int> validChainsDumpster; // Captured sites that failed filters
 
             // Filter Helper Definition: Checks if the site is dominated by homopolymer errors.
             // Returns true if valid coverage (non-HP reads) is too low for either allele.
@@ -994,6 +999,9 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                         
                         if (supportTarget >= minMultiNodeChainSupport) {
                             filteredChain.push_back(nodeIdx);
+                        } else {
+                            // DUMPSTER: Low support sites in chains
+                            validChainsDumpster.push_back(nodeIdx);
                         }
                     }
                     if (!filteredChain.empty()) validChains.push_back(filteredChain);
@@ -1008,7 +1016,13 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                         // Strict Homopolymer Check for isolated sites
                         if (!isHomopolymerDominated(dpNodes[nodeIdx])) {
                             validChains.push_back({nodeIdx});
+                        } else {
+                            // DUMPSTER: Homopolymer failure
+                            validChainsDumpster.push_back(nodeIdx); 
                         }
+                    } else {
+                        // DUMPSTER: Low support isolated
+                        validChainsDumpster.push_back(nodeIdx);
                     }
                 }
             }
@@ -1328,18 +1342,96 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             // Add Target Read itself (always in phase)
             finalHapOrientedReadIds.push_back(currentOrientedReadId0.getValue());
 
-            // 2.8 Output Generation (Strict Mode - Experimental)
-            // User Request: Discard "Weak CIS" reads. 
-            // Only keep reads that are definitively assigned to this haplotype (is_trans != 2) AND have strong confirmation.
+            // 2.7.5 Dumpster Diving Validation
+            // Goal: Rescue evidence from sites that were discarded during chain filtering (validChainsDumpster).
+            // Logic: Same consensus check. If a "Dumpster" site is effectively validated by Strong TRANS reads,
+            // we can use it to flip Weak CIS reads even though the site itself was considered low quality/noisy.
             
+            size_t dumpsterFlippedCount = 0;
+            
+            // We need to initialize the "Dumpster" sites first (calculate position, occ, etc.)
+            // Note: These sites were NOT in usedNodeIndices, so they have raw data.
+            for (int dNodeIdx : validChainsDumpster) {
+                // Calculation matches Init Sites loop (lines ~1069)
+                dpNodes[dNodeIdx].occ_0 = 0;
+                dpNodes[dNodeIdx].occ_1 = 0;
+                // dpNodes[dNodeIdx].reads is already populated
+                for (const auto& rp : dpNodes[dNodeIdx].reads) {
+                     if (!rp.isPhase1) dpNodes[dNodeIdx].occ_0++;
+                     else dpNodes[dNodeIdx].occ_1++;
+                }
+                // No need to map position or extensive filtering for this heuristic
+            }
+
+            for (auto& r : readStats) {
+                if (r.is_trans == 1 && !r.strong) { // Weak CIS
+                    // We need to check if this read covers any Dumpster sites.
+                    // This is inefficient (O(Reads * DumpsterSites)), but correct for testing.
+                    // Ideally, we would have added Dumpster sites to r.coveredSites, but that would pollute the main logic.
+                    // Instead, we iterate the Dumpster list and check if 'r' is present in the site's read list.
+                    
+                    for (int dNodeIdx : validChainsDumpster) {
+                        VirtualCluster& s = dpNodes[dNodeIdx];
+                        // Basic quality check for the dumpster site itself (e.g. at least SOME coverage)
+                        if (s.occ_0 < 2 || s.occ_1 < 2) continue; 
+
+                        // Does 'r' mismatch here?
+                        bool rMismatchesHere = false;
+                        for (const auto& rp : s.reads) {
+                            if (rp.orientedReadIdValue == r.orientedReadIdValue && rp.isPhase1) {
+                                rMismatchesHere = true;
+                        break;
+                            }
+                        }
+                        if (!rMismatchesHere) continue;
+
+                        // Validate this site using OTHER reads
+                        bool supportedByStrongTrans = false;
+                        bool conflictWithStrongReads = false;
+
+                        for (const auto& otherRp : s.reads) {
+                            if (otherRp.orientedReadIdValue == r.orientedReadIdValue) continue; // Skip self
+                            if (readMap.find(otherRp.orientedReadIdValue) == readMap.end()) continue;
+                            
+                            size_t otherIdx = readMap[otherRp.orientedReadIdValue];
+                            ReadStat& otherR = readStats[otherIdx];
+
+                            // Check Strong TRANS opinions
+                            if (otherR.is_trans == 2 && otherR.strong) {
+                                if (otherRp.isPhase1) supportedByStrongTrans = true; // Confirms TRANS
+                                else {
+                                    conflictWithStrongReads = true; // Contradiction: Strong TRANS matches Ref
+                                    break;
+                                }
+                            }
+                            // Check Strong CIS opinions
+                            else if (otherR.is_trans == 1 && otherR.strong) {
+                                if (otherRp.isPhase1) {
+                                    conflictWithStrongReads = true; // Contradiction: Strong CIS matches Alt
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (supportedByStrongTrans && !conflictWithStrongReads) {
+                            r.is_trans = 2; // Flip to TRANS
+                            dumpsterFlippedCount++;
+                            break; // One valid site is enough
+                        }
+                    }
+                }
+            }
+            if (dumpsterFlippedCount > 0) {
+                 std::cout << "Dumpster Diving Validation: Flipped " << dumpsterFlippedCount << " Weak CIS reads to TRANS." << std::endl;
+            }
+
+            // 2.8 Output Generation
             for (const auto& r : readStats) {
                 if (r.is_trans != 2) {
-                    // Only keep if marked STRONG (Confirmed CIS)
-                    // This discards "ambiguous" reads that didn't conflict but also didn't match an anchor.
-                    if (r.strong) {
-                        finalHapOrientedReadIds.push_back(r.orientedReadIdValue);
-                    }
+                    // In-Phase (CIS) - Includes both Strong CIS and surviving Weak CIS
+                    finalHapOrientedReadIds.push_back(r.orientedReadIdValue);
                 } 
+                // else Out-Of-Phase (TRANS) - dropped from final haplotype helper
             }
 
             // Sort & Unique
