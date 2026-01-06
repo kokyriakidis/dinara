@@ -24,6 +24,7 @@ using namespace dinara;
 #include "tuple.hpp"
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 
 
@@ -266,6 +267,25 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             continue;
         }
     }
+
+    // Sort and remove duplicates.
+    // This handles cases where the PAF file contains multiple entries for the same pair
+    // (e.g. A->B and B->A, or multiple segments).
+    std::sort(alignmentCandidates.candidates.begin(), alignmentCandidates.candidates.end(),
+        [](const OrientedReadPair& a, const OrientedReadPair& b) {
+            return tie(a.readIds[0], a.readIds[1], a.isSameStrand) <
+                   tie(b.readIds[0], b.readIds[1], b.isSameStrand);
+        });
+    
+    auto it = std::unique(alignmentCandidates.candidates.begin(), alignmentCandidates.candidates.end(),
+        [](const OrientedReadPair& a, const OrientedReadPair& b) {
+            return a.readIds[0] == b.readIds[0] &&
+                   a.readIds[1] == b.readIds[1] &&
+                   a.isSameStrand == b.isSameStrand;
+        });
+    
+    alignmentCandidates.candidates.resize(it - alignmentCandidates.candidates.begin());
+
     alignmentCandidates.unreserve();
     cout << timestamp << "Loaded " << alignmentCandidates.candidates.size() << " candidates from PAF." << endl;
 }
@@ -677,6 +697,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // If getting here, this is a good alignment.
 
             // Compute projected alignment metrics, if requested.
+            bool hasLargeIndel = false;
             if(computeProjectedAlignmentMetrics) {
                 const auto tProjStart = steady_clock::now();
                 const ProjectedAlignment projectedAlignment(
@@ -690,27 +711,35 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
                 alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
                 alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
+                hasLargeIndel = projectedAlignment.hasLargeIndel;
 
                 if (assemblerInfo->readGraphCreationMethod == 5) {
                     data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
 
-                    // Skip alignments with error rate greater than 0.07.
-                    if (alignmentInfo.errorRate > 0.07) {
+                    const uint64_t ql = projectedAlignment.totalLength[0];
+                    const uint64_t tl = projectedAlignment.totalLength[1];
+                    
+                    const double errorRateThreshold = 0.07;
+                    const uint64_t totalErrors = uint64_t(projectedAlignment.mismatchCount) + uint64_t(projectedAlignment.totalDeletionCount);
+                    if ((totalErrors > (ql * errorRateThreshold)) || (totalErrors > (tl * errorRateThreshold))) {
                         data.threadFilteredByErrorRate[threadId]++;
                         continue;
                     }
 
-                    // Skip alignments with gap error rate greater than 0.006.
-                    if (alignmentInfo.errorRateGaps > 0.006) {
-                        data.threadFilteredByErrorRateGap[threadId]++;
+                    // const double gapRateThreshold = 0.006;
+                    // const uint64_t totalGapCount = uint64_t(projectedAlignment.totalDeletionCount);
+                    // if ((totalGapCount > (ql * gapRateThreshold)) || (totalGapCount > (tl * gapRateThreshold))) {
+                    //     data.threadFilteredByErrorRateGap[threadId]++;
+                    //     continue;
+                    // }
+
+                    // Skip alignments with any single indel >= 64 bases.
+                    if (projectedAlignment.maxIndelSize > 64) {
+                        data.threadFilteredByGapCount[threadId]++;
                         continue;
                     }
 
-                    // Skip alignments with gap count greater than 64.
-                    if (alignmentInfo.gapCount > 64) {
-                        data.threadFilteredByGapCount[threadId]++;
-                        continue;
-                    }// Collect position pairs for variant clustering
+                    // Collect position pairs for variant clustering
                     // Only collect those with SNP differences (No indels)
                     const auto tCollectStart = steady_clock::now();
                     collectVariantClusteringPositionPairs(
@@ -726,7 +755,32 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             }
 
             // cout << orientedReadIds[0] << " " << orientedReadIds[1] << " good." << endl;
-            threadAlignmentData.push_back(AlignmentData(candidate, alignmentInfo));
+            AlignmentData ad(candidate, alignmentInfo);
+            
+            // Calculate coordinates efficiently using direct marker access
+            if (alignmentInfo.markerCount > 0) {
+                const auto markers0 = markers[orientedReadIds[0].getValue()];
+                ad.qs = markers0[alignmentInfo.data[0].firstOrdinal].position;
+                ad.qe = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
+
+                const auto markers1 = markers[orientedReadIds[1].getValue()];
+                ad.ts = markers1[alignmentInfo.data[1].firstOrdinal].position;
+                ad.te = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
+            } else {
+                ad.qs = ad.qe = ad.ts = ad.te = 0;
+            }
+
+            // Check for large indels (>= 6 bases)
+            ad.hasLargeIndel = false;
+            if (assemblerInfo->readGraphCreationMethod == 5) {
+                ad.hasLargeIndel = hasLargeIndel;
+            }
+
+            ad.cisTransStatus = CisTransStatus::Unknown;
+            ad.coversHetSite = false;
+            ad.isDeleted = false;
+
+            threadAlignmentData.push_back(ad);
 
             // Store the alignment in compressed form.
             dinara::compress(alignment, compressedAlignment);

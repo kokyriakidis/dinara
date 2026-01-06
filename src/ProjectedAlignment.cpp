@@ -180,6 +180,8 @@ void ProjectedAlignment::constructQuickRaw()
     totalEditDistance = 0;
     mismatchCount = 0;
     totalDeletionCount = 0;
+    hasLargeIndel = false;
+    maxIndelSize = 0;
 
     // Loop over pairs of consecutive aligned markers (A, B).
     for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
@@ -215,6 +217,8 @@ void ProjectedAlignment::constructQuickRaw()
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
         totalDeletionCount += segment.deletionCount;
+        if (segment.hasLargeIndel) hasLargeIndel = true;
+        if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
 
         // Store the segment.
         segments.push_back(segment);
@@ -315,6 +319,8 @@ void ProjectedAlignmentSegment::computeAlignment(
         uint64_t position1 = 0;
         mismatchCount = 0;
         deletionCount = 0;
+        hasLargeIndel = false;
+        maxIndelSize = 0;
 
         for(size_t i=0; i<cigarLen; i++) {
             char c = cigar[i];
@@ -351,8 +357,13 @@ void ProjectedAlignmentSegment::computeAlignment(
                     } else if (op.first) { // D
                         position0 += currentVal;
                         deletionCount += currentVal;
+                        if(currentVal >= 6) hasLargeIndel = true;
+                        if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     } else if (op.second) { // I
                         position1 += currentVal;
+                        deletionCount += currentVal;
+                        if(currentVal >= 6) hasLargeIndel = true;
+                        if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     }
                 }
                 currentVal = 0;
@@ -752,10 +763,15 @@ void ProjectedAlignment::computeStatistics()
     // Compute total edit distances.
     totalEditDistance = 0;
     totalEditDistanceRle = 0;
+    hasLargeIndel = false;
+    maxIndelSize = 0;
     for(const ProjectedAlignmentSegment& segment: segments) {
         totalEditDistance += segment.editDistance;
         totalEditDistanceRle += segment.rleEditDistance;
         totalDeletionCount += segment.deletionCount;
+        mismatchCount += segment.mismatchCount;
+        if (segment.hasLargeIndel) hasLargeIndel = true;
+        if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
     }
 }
 

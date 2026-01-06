@@ -390,13 +390,18 @@ void Assembler::createReadGraph5()
             OrientedReadId::Int u = OrientedReadId(sourceRead, 0).getValue();
             if (u >= numVertices || boost::out_degree(u, graph) == 0) return {false, false}; // Not Phased
             
-            // Is Phased, check for edge
+            // Is Phased, check for edge with Weight 1 (CIS)
             OrientedReadId::Int v_target = OrientedReadId(targetRead, sameStrand ? 0 : 1).getValue();
             auto outEdges = boost::out_edges(u, graph);
             for(auto it = outEdges.first; it != outEdges.second; ++it) {
-                if (boost::target(*it, graph) == v_target) return {true, true}; // Phased & Found
+                // We check if the target matches AND the weight is 1 (CIS).
+                // Edges with weight 2 (trans) must NOT count for keeping the alignment.
+                if (boost::target(*it, graph) == v_target) {
+                    uint32_t w = boost::get(boost::edge_weight, graph, *it);
+                    if (w == 1) return {true, true}; // Phased & Found (CIS)
+                }
             }
-            return {true, false}; // Phased & Not Found
+            return {true, false}; // Phased & Not Found (or Found TRANS only, which counts as Not Found for keeping)
         };
 
         // Check Read 0 -> Read 1
@@ -406,8 +411,9 @@ void Assembler::createReadGraph5()
 
         bool keep = true;
         
-        // If either is phased, we require at least one confirmation
-        if (r0.first || r1.first) {
+        // If BOTH are phased, we require at least one confirmation.
+        // If one is unphased (no het sites), we keep the overlap.
+        if (r0.first && r1.first) {
             keep = (r0.second || r1.second);
         }
         // Else (neither phased) -> Keep (default)
@@ -1426,15 +1432,28 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             }
 
             // 2.8 Output Generation
+            vector<std::pair<OrientedReadId::Int, int>> finalGraphEdges; // Pair<ReadVal, Weight>
+            
             for (const auto& r : readStats) {
                 if (r.is_trans != 2) {
                     // In-Phase (CIS) - Includes both Strong CIS and surviving Weak CIS
+                    finalGraphEdges.push_back({r.orientedReadIdValue, 1}); // Weight 1 for CIS
                     finalHapOrientedReadIds.push_back(r.orientedReadIdValue);
                 } 
-                // else Out-Of-Phase (TRANS) - dropped from final haplotype helper
+                else if (r.is_trans == 2) {
+                    // Out-Of-Phase (TRANS)
+                    finalGraphEdges.push_back({r.orientedReadIdValue, 2}); // Weight 2 for TRANS
+                    // Do NOT add to finalHapOrientedReadIds (helper set usually implies Same Haplotype)
+                }
             }
+            finalGraphEdges.push_back({currentOrientedReadId0.getValue(), 1}); // Self is CIS (Weight 1)
 
-            // Sort & Unique
+            // Sort & Unique (using Read ID as primary key, but we need weight consistency)
+            // Just sorting by ID is enough if we trust uniqueness logic.
+            std::sort(finalGraphEdges.begin(), finalGraphEdges.end());
+            finalGraphEdges.erase(std::unique(finalGraphEdges.begin(), finalGraphEdges.end()), finalGraphEdges.end());
+
+            // Also maintain the CIS-only list for debug printing if needed
             std::sort(finalHapOrientedReadIds.begin(), finalHapOrientedReadIds.end());
             finalHapOrientedReadIds.erase(std::unique(finalHapOrientedReadIds.begin(), finalHapOrientedReadIds.end()), finalHapOrientedReadIds.end());
 
@@ -1458,10 +1477,14 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
 
             {
                 std::lock_guard<std::mutex> lock(haplotypeGraphMutex);
-                for(OrientedReadId::Int otherOrientedReadIdValue : finalHapOrientedReadIds) {
-                    if(otherOrientedReadIdValue != currentOrientedReadId0.getValue()) {
-                        // Try to add edge with totalWeight
-                        auto result = boost::add_edge(currentOrientedReadId0.getValue(), otherOrientedReadIdValue, totalWeight, *globalHaplotypeGraph);
+                for(const auto& edge : finalGraphEdges) {
+                    OrientedReadId::Int otherVal = edge.first;
+                    int weightType = edge.second; // 1=CIS, 2=TRANS
+                    
+                    if(otherVal != currentOrientedReadId0.getValue()) {
+                        // Add edge with weight = weightType (1 or 2)
+                        // Note: totalWeight (chain size) is ignored as per user instruction to use specific codes.
+                        boost::add_edge(currentOrientedReadId0.getValue(), otherVal, weightType, *globalHaplotypeGraph);
                     }
                 }
             }

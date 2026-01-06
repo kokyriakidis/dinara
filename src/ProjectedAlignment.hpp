@@ -92,6 +92,12 @@ public:
     // The number of deletions in the raw alignment.
     uint64_t deletionCount = invalid<uint64_t>;
 
+    // Flag for large indel (>= 6 bases)
+    bool hasLargeIndel = false;
+
+    // Largest indel size
+    uint32_t maxIndelSize = 0;
+
 
     void writeAlignmentHtml(ostream&) const;
     void writeRleAlignmentHtml(ostream&) const;
@@ -180,6 +186,12 @@ public:
     
     // The number of deletions in the raw alignment.
     uint64_t totalDeletionCount;
+
+    // Flag for large indel (>= 6 bases)
+    bool hasLargeIndel = false;
+
+    // Largest indel size
+    uint32_t maxIndelSize = 0;
 
     void computeStatistics();
     double errorRate() const;
