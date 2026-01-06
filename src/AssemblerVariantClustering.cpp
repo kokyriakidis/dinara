@@ -447,7 +447,7 @@ void Assembler::performGlobalVariantClustering(
     std::sort(variantClusteringPositionPairs.begin(), variantClusteringPositionPairs.end());
 
     // Count occurrences of genomic positions (strand-agnostic) and filter
-    const uint64_t minOccurrences = 3;
+    const uint64_t minOccurrences = 2;
     const uint64_t totalOccurrences = variantClusteringPositionPairs.size();
 
     MemoryMapped::Vector<std::pair<OrientedReadId, uint32_t>> variantClusteringFilteredPositionPairs;

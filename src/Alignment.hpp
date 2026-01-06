@@ -26,6 +26,13 @@ namespace dinara {
         int32_t ordinalOffset
     );
 
+    // Classification of the overlap
+    enum class CisTransStatus : uint8_t {
+        Unknown = 0,
+        Cis = 1,
+        Trans = 2
+    };
+
     class CompressedMarker;
 
     namespace MemoryMapped {
@@ -454,6 +461,20 @@ public:
 
     // The AlignmentInfo computed with the first read on strand 0.
     AlignmentInfo info;
+
+    // Classification of the overlap
+    CisTransStatus cisTransStatus = CisTransStatus::Unknown;
+
+    // Flags
+    bool coversHetSite = false;
+    bool isDeleted = false;
+    bool hasLargeIndel = false;
+
+    // Explicit Coordinates (likely in bases, derived from markers or passed from PAF)
+    uint32_t qs = 0; // Query Start
+    uint32_t qe = 0; // Query End
+    uint32_t ts = 0; // Target Start
+    uint32_t te = 0; // Target End
 
     AlignmentData() {}
     AlignmentData(
