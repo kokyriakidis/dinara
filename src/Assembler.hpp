@@ -813,7 +813,22 @@ private:
 
 
 
-    // Member functions that use alignment algorithm 4.
+    // Chimeric Read Detection
+public:
+    void detectChimericReads(uint64_t threadCount);
+private:
+    void detectChimericReadsThreadFunction(size_t threadId);
+
+    // Data for chimeric detection (if needed across threads)
+    class ChimericDetectionData {
+    public:
+         // Thread-local or shared data
+    };
+    ChimericDetectionData chimericDetectionData;
+    
+    // Store reads identified as chimeric
+    MemoryMapped::Vector<bool> isChimericRead;
+
 public:
 
     // Python-callable version.

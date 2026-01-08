@@ -429,6 +429,24 @@ void Assembler::createReadGraph5()
 
     cout << timestamp << "Kept " << keptAlignmentCount << " / " << alignmentCount << " alignments after haplotype filtering." << endl;
 
+    // Detect Chimeric Reads
+    detectChimericReads(threadCount);
+
+    // Remove overlaps for chimeric reads
+    uint64_t chimericFilteredCount = 0;
+    #pragma omp parallel for reduction(+:chimericFilteredCount)
+    for(uint64_t alignmentId=0; alignmentId<alignmentCount; alignmentId++) {
+        if (!keepAlignment[alignmentId]) continue; // Already filtered
+
+        const auto& ad = alignmentData[alignmentId];
+        if (isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
+             keepAlignment[alignmentId] = false;
+             alignmentData[alignmentId].info.isInReadGraph = 0;
+             chimericFilteredCount++;
+        }
+    }
+    cout << timestamp << "Removed " << chimericFilteredCount << " alignments due to chimeric reads." << endl;
+
     // Create the read graph using FILTERED alignments.
     createReadGraphUsingSelectedAlignments(keepAlignment);
 }
