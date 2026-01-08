@@ -760,12 +760,32 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Calculate coordinates efficiently using direct marker access
             if (alignmentInfo.markerCount > 0) {
                 const auto markers0 = markers[orientedReadIds[0].getValue()];
-                ad.qs = markers0[alignmentInfo.data[0].firstOrdinal].position;
-                ad.qe = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
+                uint32_t qs_marker = markers0[alignmentInfo.data[0].firstOrdinal].position;
+                uint32_t qe_marker = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
 
                 const auto markers1 = markers[orientedReadIds[1].getValue()];
-                ad.ts = markers1[alignmentInfo.data[1].firstOrdinal].position;
-                ad.te = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
+                uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
+                uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
+
+                // --- Extend Coordinates to Read Tips ---
+                // We assume the alignment extends as far as possible in both directions.
+                const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
+                const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
+
+                // Left Extension: Extend backwards until one read hits 0
+                uint32_t leftExt = std::min(qs_marker, ts_marker);
+                ad.qs = qs_marker - leftExt;
+                ad.ts = ts_marker - leftExt;
+
+                // Right Extension: Extend forwards until one read hits its end
+                // Available info: len0, len1.
+                uint32_t rightExt = std::min(
+                    (uint32_t)len0 - qe_marker, 
+                    (uint32_t)len1 - te_marker
+                );
+                ad.qe = qe_marker + rightExt;
+                ad.te = te_marker + rightExt;
+
             } else {
                 ad.qs = ad.qe = ad.ts = ad.te = 0;
             }
