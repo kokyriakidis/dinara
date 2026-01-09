@@ -117,6 +117,8 @@ public:
     double alignedFractionThreshold;
     double nearDiagonalFractionThreshold;
     int deltaThreshold;
+    int minAlignedMarkerCount;
+    int maxUncoveredBases;
     void write(ostream&) const;
 };
 

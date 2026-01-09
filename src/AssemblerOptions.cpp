@@ -348,10 +348,20 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(0.1, "0.1"),
         "Used for palindromic read detection.")
 
-        ("Reads.palindromicReads.deltaThreshold",
-         value<int>(&readsOptions.palindromicReads.deltaThreshold)->
-         default_value(100),
-         "Used for palindromic read detection.")
+         ("Reads.palindromicReads.deltaThreshold",
+          value<int>(&readsOptions.palindromicReads.deltaThreshold)->
+          default_value(100),
+          "Used for palindromic read detection.")
+
+         ("Reads.palindromicReads.minAlignedMarkerCount",
+          value<int>(&readsOptions.palindromicReads.minAlignedMarkerCount)->
+          default_value(32),
+          "Minimum number of aligned markers to consider a read palindromic.")
+
+         ("Reads.palindromicReads.maxUncoveredBases",
+          value<int>(&readsOptions.palindromicReads.maxUncoveredBases)->
+          default_value(500),
+          "Maximum number of unaligned bases (start + end) to consider a read palindromic.")
 
          ("Kmers.generationMethod",
          value<int>(&kmersOptions.generationMethod)->
@@ -1329,6 +1339,8 @@ void PalindromicReadOptions::write(ostream& s) const
     s << "palindromicReads.alignedFractionThreshold = " << alignedFractionThreshold << "\n";
     s << "palindromicReads.nearDiagonalFractionThreshold = " << nearDiagonalFractionThreshold << "\n";
     s << "palindromicReads.deltaThreshold = " << deltaThreshold << "\n";
+    s << "palindromicReads.minAlignedMarkerCount = " << minAlignedMarkerCount << "\n";
+    s << "palindromicReads.maxUncoveredBases = " << maxUncoveredBases << "\n";
 }
 
 

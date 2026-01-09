@@ -505,18 +505,22 @@ void dinara::main::assemble(
     // These will be kept until we are done computing alignments.
     assembler.computeMarkerKmerIds(threadCount);
 
-    // // Flag palindromic reads.
-    // // These will be excluded from further processing.
-    // if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
-    //     assembler.flagPalindromicReads(
-    //         assemblerOptions.readsOptions.palindromicReads.maxSkip,
-    //         assemblerOptions.readsOptions.palindromicReads.maxDrift,
-    //         assemblerOptions.readsOptions.palindromicReads.maxMarkerFrequency,
-    //         assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
-    //         assemblerOptions.readsOptions.palindromicReads.nearDiagonalFractionThreshold,
-    //         assemblerOptions.readsOptions.palindromicReads.deltaThreshold,
-    //         threadCount);
-    // }
+    // Flag palindromic reads.
+    // These will be excluded from further processing.
+    // Flag palindromic reads.
+    // These will be excluded from further processing.
+    if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
+        assembler.palindromicMinAlignedMarkerCount = assemblerOptions.readsOptions.palindromicReads.minAlignedMarkerCount;
+        assembler.palindromicMaxUncoveredBases = assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases;
+        assembler.flagPalindromicReads(
+            assemblerOptions.readsOptions.palindromicReads.maxSkip,
+            assemblerOptions.readsOptions.palindromicReads.maxDrift,
+            assemblerOptions.readsOptions.palindromicReads.maxMarkerFrequency,
+            assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
+            assemblerOptions.readsOptions.palindromicReads.nearDiagonalFractionThreshold,
+            assemblerOptions.readsOptions.palindromicReads.deltaThreshold,
+            threadCount);
+    }
 
     // Find alignment candidates.
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
