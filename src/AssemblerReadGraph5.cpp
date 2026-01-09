@@ -413,14 +413,17 @@ void Assembler::createReadGraph5()
 
         bool keep = true;
         
-        // If it passed Best Hit filter, apply Phasing filter.
-        
         // If BOTH are phased, we require at least one confirmation.
         // If one is unphased (no het sites), we keep the overlap.
         if (r0.first && r1.first) {
             keep = (r0.second || r1.second);
         }
         // Else (neither phased) -> Keep (default)
+
+        // Filter out alignments involving palindromic reads
+        if (reads->getFlags(ad.readIds[0]).isPalindromic || reads->getFlags(ad.readIds[1]).isPalindromic) {
+            keep = false;
+        }
 
         if (keep) {
             alignmentData[alignmentId].info.isInReadGraph = 1;
@@ -433,24 +436,55 @@ void Assembler::createReadGraph5()
 
     cout << timestamp << "Kept " << keptAlignmentCount << " / " << alignmentCount << " alignments after haplotype filtering." << endl;
 
-    // Detect Chimeric Reads
+    // --- Old Chimeric Detection (Kept per user request) ---
     detectChimericReads(threadCount);
     rescueChimericReads(threadCount);
 
-    // Remove overlaps for chimeric reads
-    uint64_t chimericFilteredCount = 0;
-    #pragma omp parallel for reduction(+:chimericFilteredCount)
+    // --- New Filtering Pipeline (Mirrors ma_hit_sub -> detect_chimeric -> ma_hit_cut -> ma_hit_flt) ---
+    cout << timestamp << "Running read graph filtering pipeline..." << endl;
+
+    // 1. ma_hit_sub: Filter local segments (coverage > 3)
+    // Mirrors: ma_hit_sub(min_dp, src, n_read, readLen, mini_overlap_length, cov);
+    // We use minCoverage = 3 as standard default.
+    filterLocalSegments(3, threadCount);
+
+    // 2. detect_chimeric_reads: Identify and filter chimeric reads using anchor logic
+    // Mirrors: detect_chimeric_reads(src, n_read, readLen, *cov, asm_opt.max_ov_diff_final*2.0, ul, UL_COV_THRES);
+    // shiftRate = 0.05 (approx max_ov_diff_final * 2), ulThres = 0 (unlimited)
+    detectChimericReadsFromAnchors(0.05, 0, threadCount);
+
+    // 3. ma_hit_cut: Clip alignments to valid regions
+    // Mirrors: ma_hit_cut(src, n_read, readLen, mini_overlap_length, cov);
+    // minOverlapLength = 0 (or a small value like 100 bp if desired)
+    applyCoverageCuts(0, threadCount);
+
+    // 4. ma_hit_flt: Filter hanging overlaps (dovetail check)
+    // Mirrors: ma_hit_flt(src, n_read, *cov, max_hang_length, mini_overlap_length);
+    // maxHang = 1000, maxHangRate = 0.8, minOverlap = 0
+    filterHangingOverlaps(1000, 0.8, 0, threadCount);
+
+    // 5. ma_hit_contained_advance: Remove contained reads
+    // Mirrors: ma_hit_contained_advance(...);
+    // Uses the same maxHang (1000) and minOverlap (0).
+    removeContainedReads(1000, 0.8, 0, threadCount);
+
+    // Sync keepAlignment status with isDeleted flags
+    // The functions above mark alignments as `isDeleted`. We need to respect that.
+    uint64_t filteredCount = 0;
+    #pragma omp parallel for reduction(+:filteredCount)
     for(uint64_t alignmentId=0; alignmentId<alignmentCount; alignmentId++) {
-        if (!keepAlignment[alignmentId]) continue; // Already filtered
+        if (!keepAlignment[alignmentId]) continue; 
 
         const auto& ad = alignmentData[alignmentId];
+        // If marked deleted by any stage of the pipeline, drop it.
+        // Also check if read is chimeric (though detectChimericReadsFromAnchors handles deleting edges, safe to double check).
         if (ad.isDeleted || isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
              keepAlignment[alignmentId] = false;
              alignmentData[alignmentId].info.isInReadGraph = 0;
-             chimericFilteredCount++;
+             filteredCount++;
         }
     }
-    cout << timestamp << "Removed " << chimericFilteredCount << " alignments due to chimeric reads." << endl;
+    cout << timestamp << "Pipeline removed " << filteredCount << " additional alignments." << endl;
 
     // Create the read graph using FILTERED alignments.
     createReadGraphUsingSelectedAlignments(keepAlignment);
@@ -1404,6 +1438,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             
             size_t dumpsterFlippedCount = 0;
             
+            /* 
             // We need to initialize the "Dumpster" sites first (calculate position, occ, etc.)
             // Note: These sites were NOT in usedNodeIndices, so they have raw data.
             for (int dNodeIdx : validChainsDumpster) {
@@ -1479,6 +1514,7 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
             if (dumpsterFlippedCount > 0) {
                  std::cout << "Dumpster Diving Validation: Flipped " << dumpsterFlippedCount << " Weak CIS reads to TRANS." << std::endl;
             }
+            */
 
             // 2.8 Output Generation
             vector<std::pair<OrientedReadId::Int, int>> finalGraphEdges; // Pair<ReadVal, Weight>
