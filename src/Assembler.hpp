@@ -651,6 +651,56 @@ private:
     void filterBestHitAlignmentsThreadFunction(size_t threadId);
     std::atomic<uint64_t> removedBestHitCount;
 
+    // Filter local segments (coverage based)
+    void filterLocalSegmentsThreadFunction(size_t threadId);
+    void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
+    
+    // Structure for local segment filtering results
+    struct ReadSegmentStatus {
+        uint32_t start = 0;
+        uint32_t end = 0;
+        bool isDeleted = false;
+    };
+
+    // Store valid intervals and status for each read.
+    std::vector<ReadSegmentStatus> validReadIntervals;
+
+    // Temporary storage for filtering parameter, accessible by thread function.
+    uint64_t localSegmentMinCoverage = 0;
+
+    // Chimeric read detection (From Anchors / Miniasm style)
+    void detectChimericReadsFromAnchorsThreadFunction(size_t threadId);
+    void detectChimericReadsFromAnchors(double shiftRate, uint64_t ulThres, uint64_t threadCount);
+    
+    // Config for anchor detection
+    double chimericShiftRate = 0.06;
+    uint64_t chimericUlThres = 2;
+
+    // Apply coverage cuts (ma_hit_cut equivalent)
+    // Clips alignments to valid regions and removes short overlaps.
+    void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
+    void applyCoverageCutsToAlignmentsThreadFunction(size_t threadId);
+    void applyCoverageCutsCleanupThreadFunction(size_t threadId);
+    uint64_t coverageCutMinOverlap = 0;
+
+    // Filter hanging overlaps (ma_hit_flt equivalent)
+    // Filters overlaps based on excessive overhangs (dovetail rule).
+    void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void filterHangingOverlapsThreadFunction(size_t threadId);
+    uint64_t hangingFilterMaxHang = 1000;
+    double hangingFilterMaxHangRate = 0.8;
+    uint64_t hangingFilterMinOverlap = 0;
+
+
+    // Remove contained reads (ma_hit_contained_advance equivalent)
+    // Identifies reads fully contained in others and removes them.
+    void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void removeContainedReadsThreadFunction(size_t threadId);
+    
+    // Mapping from contained read to its container (parent).
+    // Initialized to invalidReadId.
+    MemoryMapped::Vector<ReadId> containmentParent;
+
 
     // Check if an alignment between two reads should be suppressed,
     // bases on the setting of command line option
