@@ -15,6 +15,8 @@
 #include <array>
 #include <unordered_set>
 #include <algorithm>
+#include <numeric>
+#include <vector>
 
 
 using namespace dinara;
@@ -239,6 +241,9 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
         // Process alignments directly
         for (uint64_t alignmentId = alignmentIdBegin; alignmentId < alignmentIdEnd; alignmentId++) {
             
+            // Skip deleted alignments (e.g. redundant alignments from Best Hit Filtering)
+            if (alignmentDataRef[alignmentId].isDeleted) continue;
+
             const AlignmentData& alignmentData = alignmentDataRef[alignmentId];
             
             // Get oriented read IDs from alignment data
@@ -412,6 +417,21 @@ void Assembler::performGlobalVariantClustering(
     const auto tCheckEnd = steady_clock::now();
     const double tCheck = seconds(tCheckEnd - tCheckStart);
     
+    // --- Best Hit Alignment Filtering (hifiasm-style) ---
+    // Efficiently implemented using alignmentTable iteration (reads -> overlaps).
+    
+    cout << timestamp << "Filtering alignments to keep Best Hit per read pair (Variant Clustering Phase)." << endl;
+    
+    // Reset counter
+    removedBestHitCount = 0;
+    
+    // Run threads
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100); // Batch size heuristic
+    runThreads(&Assembler::filterBestHitAlignmentsThreadFunction, threadCount);
+
+    cout << timestamp << "Removed " << removedBestHitCount << " redundant alignments (marked isDeleted)." << endl;
+
     // Access position pairs that were collected during alignment computation
     // Note: Finding and storage of position pairs happened during computeAlignments (timed separately)
     const auto tAccessStart = steady_clock::now();
@@ -447,7 +467,7 @@ void Assembler::performGlobalVariantClustering(
     std::sort(variantClusteringPositionPairs.begin(), variantClusteringPositionPairs.end());
 
     // Count occurrences of genomic positions (strand-agnostic) and filter
-    const uint64_t minOccurrences = 3;
+    const uint64_t minOccurrences = 2;
     const uint64_t totalOccurrences = variantClusteringPositionPairs.size();
 
     MemoryMapped::Vector<std::pair<OrientedReadId, uint32_t>> variantClusteringFilteredPositionPairs;
@@ -1042,4 +1062,107 @@ void Assembler::performGlobalVariantClustering(
     cout << "============================================\n" << endl;
     
     performanceLog << timestamp << "createVariantClusters ends" << endl;
+}
+
+
+
+void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
+{
+    uint64_t begin, end;
+    uint64_t localRemovedCount = 0;
+
+    // We use a small vector to avoid repeated allocations, clearing it each iteration.
+    std::vector<std::pair<ReadId, uint32_t>> candidates;
+    
+    // Default batch size from setupLoadBalancing
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); r0++) {
+            
+            candidates.clear();
+
+            // Helper to collect alignments for an oriented version of r0
+            // Since we are inside a member function, we can't easily use a local lambda 
+            // capturing 'candidates' efficiently if we want to keep it simple, 
+            // but we can just inline the logic or use a simple lambda.
+            auto collectCandidates = [&](OrientedReadId orientedR0) {
+                const auto& table = alignmentTable[orientedR0.getValue()];
+                for (uint32_t alignmentId : table) {
+                    const auto& ad = alignmentData[alignmentId];
+                    ReadId rA = ad.readIds[0];
+                    ReadId rB = ad.readIds[1];
+                    ReadId target = (rA == r0) ? rB : rA;
+                    
+                    // Mark self-overlaps as deleted immediately
+                    if (rA == rB) {
+                         alignmentData[alignmentId].isDeleted = true;
+                         localRemovedCount++; // It's thread-local, safe to increment here? 
+                         // Wait, alignmentData is shared. Writing bool is atomic-ish but let's be safe.
+                         // Multiple threads might confuse this count? 
+                         // Actually, only r0 thread processes r0. So safe.
+                         continue;
+                    }
+                    
+                    // Enforce canonical ordering: only process if r0 < target.
+                    if (r0 > target) continue;
+                    
+                    candidates.push_back({target, alignmentId});
+                }
+            };
+            
+            collectCandidates(OrientedReadId(r0, 0));
+            collectCandidates(OrientedReadId(r0, 1));
+            
+            if (candidates.empty()) continue;
+            
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            
+            size_t n = candidates.size();
+            for(size_t i = 0; i < n; ) {
+                ReadId currentTarget = candidates[i].first;
+                uint32_t bestAlignmentId = candidates[i].second;
+                size_t j = i + 1;
+                
+                while(j < n && candidates[j].first == currentTarget) {
+                     uint32_t currAlignmentId = candidates[j].second;
+                     
+                     const auto& validInfo = alignmentData[currAlignmentId].info;
+                     const auto& bestInfo = alignmentData[bestAlignmentId].info;
+                        
+                     bool isBetter = false;
+                     // Prefer valid mismatch counts
+                     if (validInfo.mismatchCount != invalid<uint32_t> && bestInfo.mismatchCount == invalid<uint32_t>) {
+                         isBetter = true;
+                     } else if (validInfo.mismatchCount != invalid<uint32_t> && bestInfo.mismatchCount != invalid<uint32_t>) {
+                         if (validInfo.mismatchCount < bestInfo.mismatchCount) {
+                             isBetter = true;
+                         } else if (validInfo.mismatchCount == bestInfo.mismatchCount) {
+                             if (validInfo.markerCount > bestInfo.markerCount) {
+                                 isBetter = true;
+                             }
+                         }
+                     } else { 
+                         // Fallback to length.
+                         if (bestInfo.mismatchCount == invalid<uint32_t> && validInfo.mismatchCount == invalid<uint32_t>) {
+                              if (validInfo.markerCount > bestInfo.markerCount) {
+                                 isBetter = true;
+                              }
+                         }
+                     }
+                     
+                     if (isBetter) {
+                         alignmentData[bestAlignmentId].isDeleted = true;
+                         localRemovedCount++;
+                         bestAlignmentId = currAlignmentId; 
+                     } else {
+                         alignmentData[currAlignmentId].isDeleted = true;
+                         localRemovedCount++;
+                     }
+                     j++;
+                }
+                i = j;
+            }
+        }
+    }
+    removedBestHitCount += localRemovedCount;
 }

@@ -250,6 +250,8 @@ void Assembler::createReadGraph5()
         throw runtime_error("Variant clustering disjoint sets not available.");
     }
 
+
+
     // 1. Build membersByRepIdx (Cluster -> PositionPairs map)
     // We use the 2-pass approach for MemoryMapped::VectorOfVectors to be memory efficient
     // and avoid creating a huge temporary vector<vector> in RAM.
@@ -411,6 +413,8 @@ void Assembler::createReadGraph5()
 
         bool keep = true;
         
+        // If it passed Best Hit filter, apply Phasing filter.
+        
         // If BOTH are phased, we require at least one confirmation.
         // If one is unphased (no het sites), we keep the overlap.
         if (r0.first && r1.first) {
@@ -431,6 +435,7 @@ void Assembler::createReadGraph5()
 
     // Detect Chimeric Reads
     detectChimericReads(threadCount);
+    rescueChimericReads(threadCount);
 
     // Remove overlaps for chimeric reads
     uint64_t chimericFilteredCount = 0;
@@ -439,7 +444,7 @@ void Assembler::createReadGraph5()
         if (!keepAlignment[alignmentId]) continue; // Already filtered
 
         const auto& ad = alignmentData[alignmentId];
-        if (isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
+        if (ad.isDeleted || isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
              keepAlignment[alignmentId] = false;
              alignmentData[alignmentId].info.isInReadGraph = 0;
              chimericFilteredCount++;
@@ -498,20 +503,46 @@ void Assembler::computeClusterValidityThreadFunction(uint64_t threadId) {
             std::array<std::pair<OrientedReadId, uint32_t>, 10> homopolymerCheckPositions;
             uint64_t homopolymerCheckCount = 0;
 
-            // Single pass through all members
+            // Single pass through all members - WITH DEDUPLICATION (Best Hit Policy)
+            // To prevent double counting from multiple alignments (e.g. both strands),
+            // we ensure each ReadId contributes at most once.
+            // Since we can't easily access alignment score here, we take the "first" one encountered
+            // (which is arbitrary but prevents bias inflation).
+            
+            // Fixed-size optimization: Use small vector for seen ReadIds to avoid set overhead
+            // Most clusters have < 100 coverage.
+            std::vector<ReadId> seenReads;
+            seenReads.reserve(members.size());
+
             for (uint64_t memberIdx : members) {
                 const auto& pp = variantClusteringPositionPairs[memberIdx];
                 const OrientedReadId orientedReadId = pp.first;
+                
+                // Deduplication check
+                bool seen = false;
+                for(ReadId r : seenReads) {
+                    if (r == orientedReadId.getReadId()) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) continue; // Skip duplicate contribution from same read
+                seenReads.push_back(orientedReadId.getReadId());
+
                 const uint32_t position = pp.second;
                 
                 const uint8_t allele = variantClusteringPositionPairAlleles[memberIdx];
                 if (allele < 5) {
-                    alleleCounts[allele]++;
-                    // Track strand counts per allele
-                    if (orientedReadId.getStrand() == 0) {
-                        strand0Counts[allele]++;
-                    } else {
-                        strand1Counts[allele]++;
+                    // Check for palindromic reads and skip them for coverage counting
+                    // This "reduces the coverage" as requested for checking potential het sites.
+                    if (!reads->getFlags(orientedReadId.getReadId()).isPalindromic) {
+                        alleleCounts[allele]++;
+                        // Track strand counts per allele
+                        if (orientedReadId.getStrand() == 0) {
+                            strand0Counts[allele]++;
+                        } else {
+                            strand1Counts[allele]++;
+                        }
                     }
                 }
                 

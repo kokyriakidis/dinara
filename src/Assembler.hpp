@@ -620,6 +620,9 @@ public:
 
 
 
+    int palindromicMinAlignedMarkerCount = 32;
+    int palindromicMaxUncoveredBases = 500;
+
     // Flag palindromic reads.
     void flagPalindromicReads(
         uint32_t maxSkip,
@@ -639,8 +642,14 @@ private:
         double alignedFractionThreshold;
         double nearDiagonalFractionThreshold;
         uint32_t deltaThreshold;
+        int minAlignedMarkerCount;
+        int maxUncoveredBases;
     };
     FlagPalindromicReadsData flagPalindromicReadsData;
+
+    // Filter optimal alignments (Best Hit)
+    void filterBestHitAlignmentsThreadFunction(size_t threadId);
+    std::atomic<uint64_t> removedBestHitCount;
 
 
     // Check if an alignment between two reads should be suppressed,
@@ -816,8 +825,10 @@ private:
     // Chimeric Read Detection
 public:
     void detectChimericReads(uint64_t threadCount);
+    void rescueChimericReads(uint64_t threadCount);
 private:
     void detectChimericReadsThreadFunction(size_t threadId);
+    void rescueChimericReadsThreadFunction(size_t threadId);
 
     // Data for chimeric detection (if needed across threads)
     class ChimericDetectionData {

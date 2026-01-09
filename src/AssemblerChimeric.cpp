@@ -209,4 +209,192 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
     }
 }
 
+// ----------------------------------------------------------------------------
+// Chimeric Read Rescue (Symmetry Restoration)
+// ----------------------------------------------------------------------------
+// Mirrors hifiasm's `try_rescue_overlaps`.
+// Logic:
+// 1. Iterate over reads flagged as Chimeric.
+// 2. Collect "Safe Neighbors" (Non-chimeric, Valid Alignment).
+// 3. STRICT CHECK: Do these neighbors support the SAME region?
+//    - Hifiasm performs a sweep-line on the neighbors' overlaps.
+//    - It finds the maximum pileup depth (max_dp).
+// 4. If max_dp >= 4 (RescueThreshold), un-flag the read.
+
+void Assembler::rescueChimericReads(uint64_t threadCount)
+{
+    cout << timestamp << "Rescuing chimeric reads..." << endl;
+    
+    // We need to know who is chimeric to check neighbors. 
+    setupLoadBalancing(reads->readCount(), 1);
+    runThreads(&Assembler::rescueChimericReadsThreadFunction, threadCount);
+
+    // Recount
+    uint64_t chimericCount = 0;
+    for(size_t i=0; i<isChimericRead.size(); i++) {
+        if(isChimericRead[i]) chimericCount++;
+    }
+    cout << timestamp << "Chimeric reads after rescue: " << chimericCount << "." << endl;
+}
+
+void Assembler::rescueChimericReadsThreadFunction(size_t /* threadId */)
+{
+    const uint32_t rescueThreshold = 4; // Hifiasm default
+    
+    uint64_t readIdBegin, readIdEnd;
+    while(getNextBatch(readIdBegin, readIdEnd)) {
+        for(ReadId readId = ReadId(readIdBegin); readId < ReadId(readIdEnd); readId++) {
+            
+            // Only process if currently flagged as Chimeric
+            if (!isChimericRead[readId]) continue;
+            
+            OrientedReadId orientedReadId(readId, 0);
+            
+            // Check neighbors in alignment table
+            if (orientedReadId.getValue() >= alignmentTable.size()) continue;
+            
+            vector<pair<uint32_t, int>> events;
+            
+            const size_t n = alignmentTable.size(orientedReadId.getValue());
+            
+            for(size_t i=0; i<n; i++) {
+                const uint64_t alignmentId = alignmentTable[orientedReadId.getValue()][i];
+                const AlignmentData& ad = alignmentData[alignmentId];
+                
+                // Identify the neighbor
+                ReadId neighborId;
+                uint32_t qs, qe; // Coordinates on CURRENT read (readId)
+                
+                if (ad.readIds[0] == readId) {
+                    neighborId = ad.readIds[1];
+                    qs = ad.qs; qe = ad.qe;
+                } else {
+                    neighborId = ad.readIds[0];
+                    qs = ad.ts; qe = ad.te;
+                }
+                
+                // 1. Is Neighbor Chimeric?
+                if (isChimericRead[neighborId]) continue;
+                
+                // 2. Is Alignment Valid?
+                bool isValid = (ad.cisTransStatus == CisTransStatus::Cis);
+                if (ad.cisTransStatus == CisTransStatus::Unknown && ad.info.isInReadGraph) {
+                    isValid = true;
+                }
+                
+                if (isValid) {
+                    // Add Interval [qs, qe) to sweep line events
+                    // Use Type 1=Start, 2=End to ensure Start < End at same position (Start processed first) - Matches Hifiasm
+                    if (qs < qe) {
+                        events.push_back({qs, 1});
+                        events.push_back({qe, 2});
+                    }
+                }
+            }
+            
+            // 3. Sweep Line to check Consensus Depth (max_dp)
+            // We need at least 'rescueThreshold' reads agreeing on the SAME region.
+            if (events.size() / 2 >= rescueThreshold) {
+                // Sort events:
+                // Hifiasm sorts `qs<<1` (Start, LSB=0) and `qe<<1|1` (End, LSB=1).
+                // This means at the same coordinate, START (even) comes before END (odd).
+                // We use TYPE_START=1, TYPE_END=2.
+                // pair compare: first(pos) then second(type).
+                // So {pos, 1} < {pos, 2}. Matches Hifiasm.
+                std::sort(events.begin(), events.end());
+                
+                int max_dp = 0;
+                int dp = 0;
+                uint32_t start = 0;
+                uint32_t max_interval_s = 0;
+                uint32_t max_interval_e = 0;
+                int old_dp = 0;
+
+                for(const auto& ev : events) {
+                    old_dp = dp;
+                    
+                    if (ev.second == 1) { // Start
+                        dp++;
+                    } else { // End
+                        dp--;
+                    }
+                    
+                    // Logic mirroring Hifiasm's max_interval tracking
+                    if (old_dp < dp) { // Increasing (Start processed)
+                        // "if(dp >= max_dp) { start = b.a[j]>>1; max_dp = dp; }"
+                        if (dp >= max_dp) {
+                            start = ev.first;
+                            max_dp = dp;
+                        }
+                    } else if (old_dp > dp) { // Decreasing (End processed)
+                        // "if(old_dp == max_dp) { max_interval.s = start; max_interval.e = b.a[j]>>1; }"
+                        if (old_dp == max_dp) {
+                            max_interval_s = start;
+                            max_interval_e = ev.first;
+                        }
+                    }
+                }
+                
+                // Hifiasm rescues if max_dp >= threshold.
+                // It then filters edges to only those spanning max_interval.
+                // "if(qs <= max_interval.s && qe >= max_interval.e)"
+                
+                if (max_dp >= (int)rescueThreshold) {
+                    // Rescue!
+                    isChimericRead[readId] = false;
+                    
+                    // Second Pass: Filter edges (Enforce Consensus)
+                    // Hifiasm effectively drops edges that don't support the consensus.
+                    // We mark them as deleted.
+                    
+                    for(size_t i=0; i<n; i++) {
+                        const uint64_t alignmentId = alignmentTable[orientedReadId.getValue()][i];
+                        // We need access to writable AlignmentData
+                        AlignmentData& ad = alignmentData[alignmentId];
+                        
+                        // Identify neighbor & coordinates again
+                        ReadId neighborId;
+                        uint32_t qs, qe;
+                        if (ad.readIds[0] == readId) {
+                            neighborId = ad.readIds[1];
+                            qs = ad.qs; qe = ad.qe;
+                        } else {
+                            neighborId = ad.readIds[0];
+                            qs = ad.ts; qe = ad.te;
+                        }
+                        
+                         // Same validity checks as pass 1
+                        if (isChimericRead[neighborId]) continue; // Chimeric neighbors likely shouldn't constrain us, but Hifiasm ignores them in "evidence".
+                        // Wait, Hifiasm only loops over "evi" (the collected valid neighbors) for filtering.
+                        // So we should only filter the *valid* edges? 
+                        // If an edge was skipped in pass 1 (e.g. invalid status), it remains whatever it was.
+                        // But if we rescue the read, we keep "all" edges unless we delete them.
+                        // So we MUST process all edges and delete those that fail the check?
+                        // Hifiasm loop: "for (j = 0; j < evi.n; j++)" -> It only adds valid edges to paf. 
+                        // The implicit implication is that edges NOT in evi are NOT added (remain deleted).
+                        // So yes, we should probably delete *everything* that doesn't pass.
+                        
+                        bool isValidType = (ad.cisTransStatus == CisTransStatus::Cis);
+                        if (ad.cisTransStatus == CisTransStatus::Unknown && ad.info.isInReadGraph) isValidType = true;
+                        
+                        // Strict filter:
+                        // 1. Must be Valid Type
+                        // 2. Must span max_interval
+                        bool keep = false;
+                        if (isValidType) {
+                            if (qs <= max_interval_s && qe >= max_interval_e) {
+                                keep = true;
+                            }
+                        }
+                        
+                        if (!keep) {
+                            ad.isDeleted = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 

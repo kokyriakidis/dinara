@@ -254,6 +254,10 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) {
                 continue;
             }
+            if (reads->getFlags(readId0).isPalindromic || reads->getFlags(readId1).isPalindromic) {
+                // TODO: handle palindromic reads.
+                // continue;
+            }
             if (readId0 == readId1) continue; 
 
             bool isSameStrand = (strandStr == "+");
@@ -1062,7 +1066,15 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
     const double alignedFractionThreshold = flagPalindromicReadsData.alignedFractionThreshold;
     const double nearDiagonalFractionThreshold = flagPalindromicReadsData.nearDiagonalFractionThreshold;
     const uint32_t deltaThreshold = flagPalindromicReadsData.deltaThreshold;
+    const int maxUncoveredBases = flagPalindromicReadsData.maxUncoveredBases;
 
+    // Default values for alignOrientedReads5 (LowHash), matching AssemblerOptions defaults
+    const int matchScore = 6;
+    const int mismatchScore = -1;
+    const int gapScore = -1;
+    const double align5DriftRateTolerance = 0.05;
+    const uint64_t align5MinBandExtend = 10;
+    ofstream nullStream;
 
     // Loop over all batches assigned to this thread.
     uint64_t begin, end;
@@ -1073,20 +1085,48 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
         // Loop over all reads in this batch.
         for(ReadId readId=ReadId(begin); readId!=ReadId(end); readId++) {
 
-            // Get markers sorted by KmerId for this read and its reverse complement.
-            for(Strand strand=0; strand<2; strand++) {
-                getMarkersSortedByKmerId(OrientedReadId(readId, strand), markersSortedByKmerId[strand]);
+            alignOrientedReads5(OrientedReadId(readId, 0), OrientedReadId(readId, 1),
+                        matchScore, mismatchScore, gapScore,
+                        align5DriftRateTolerance, align5MinBandExtend,
+                        alignment, alignmentInfo,
+                        nullStream);
+
+            // Calculate Metrics
+            const uint32_t alignedMarkerCount = alignmentInfo.markerCount;
+            const uint32_t totalMarkerCount = uint32_t(markers[OrientedReadId(readId, 0).getValue()].size());
+            const double alignedFraction = alignmentInfo.alignedFraction(0);
+            const uint32_t alignmentRange = alignmentInfo.range(0);
+
+            // Metric 1: Extended Span (for full-length palindromes with gaps/adapters)
+            bool isSpanPass = false;
+            uint64_t unaligned = 0; // Declare outside to be visible for debug
+
+            // We require *some* markers to calculate span, but low count is acceptable for 'gappy' alignments.
+            if (alignedMarkerCount > 30) { 
+
+                uint64_t readLength = reads->getReadRawSequenceLength(readId);
+                
+                uint64_t unaligned = (readLength > alignmentRange) ? (readLength - alignmentRange) : 0;
+                 
+
+                if (unaligned <= maxUncoveredBases) {
+                    isSpanPass = true;
+                }
             }
 
-            // Compute a marker alignment of this read versus its reverse complement.
-            alignOrientedReads(markersSortedByKmerId, maxSkip, maxDrift, maxMarkerFrequency, false,
-                graph, alignment, alignmentInfo);
+            // Metric 2: Aligned Fraction (Legacy/Density Check)
+            // If the span is good, we don't care about the fraction (handles large gaps).
+            bool isEnoughMarkers = isSpanPass || (alignedFraction >= alignedFractionThreshold);
 
-            // If the alignment has too few markers, skip it.
-            const size_t alignedMarkerCount = alignment.ordinals.size();
-            const size_t totalMarkerCount = markersSortedByKmerId[0].size();
-            const double alignedFraction = double(alignedMarkerCount)/double(totalMarkerCount);
-            if(alignedFraction < alignedFractionThreshold) {
+            if(!isEnoughMarkers) {
+                // Debug Logging for targeted read if it FAILs
+                if (readId == 1180) {
+                    {
+                        cout << "DEBUG Palindrome 1180 FAILED: alignedMarkerCount=" << alignedMarkerCount 
+                            << " alignedFraction=" << alignedFraction
+                            << " unalignedBases=" << unaligned << endl;
+                    }
+                }
                 continue;
             }
 
@@ -1103,6 +1143,11 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
             }
             const double nearDiagonalFraction = double(nearDiagonalMarkerCount)/double(totalMarkerCount);
             if(nearDiagonalFraction < nearDiagonalFractionThreshold) {
+                if (readId == 1180) {
+                    {
+                        cout << "DEBUG Palindrome 1180 FAILED: nearDiagonalFraction=" << nearDiagonalFraction << endl;
+                    }
+                }
                 continue;
             }
 
