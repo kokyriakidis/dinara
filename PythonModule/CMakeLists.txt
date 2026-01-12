@@ -82,10 +82,16 @@ if(NOT SIMD_MINIMIZERS_LIB)
     message(FATAL_ERROR "simd_minimizers_c library not found. Please install it.")
 endif()
 
+# Find shasta2 library
+find_library(SHASTA2_LIB shasta2)
+if(NOT SHASTA2_LIB)
+    message(FATAL_ERROR "shasta2 library not found. Please install it.")
+endif()
+
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule 
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)
