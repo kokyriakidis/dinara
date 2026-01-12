@@ -40,6 +40,11 @@ include_directories(../src)
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
+# On Linux, we build a static executable, so we must find static libraries (.a).
+if(NOT APPLE)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+endif()
+
 # Find astarpa-c library
 find_library(ASTARPA_LIB astarpa_c)
 if(NOT ASTARPA_LIB)
@@ -58,6 +63,18 @@ if(NOT SIMD_MINIMIZERS_LIB)
     message(FATAL_ERROR "simd_minimizers_c library not found. Please install it.")
 endif()
 
+# Find abpoa library
+find_library(ABPOA_LIB abpoa)
+if(NOT ABPOA_LIB)
+    message(FATAL_ERROR "abpoa library not found. Please install it.")
+endif()
+
+# Find shasta2 library
+find_library(SHASTA2_LIB shasta2)
+if(NOT SHASTA2_LIB)
+    message(FATAL_ERROR "shasta2 library not found. Please install it.")
+endif()
+
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})
 set_target_properties(dinaraExecutable PROPERTIES OUTPUT_NAME "dinara")
@@ -73,7 +90,7 @@ if(APPLE)
         dinaraExecutable
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
-        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
+        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB})
 else()
     # For arcane reasons, statically linking with the pthread
     # library on Linux requires "--whole-archive".
@@ -83,14 +100,14 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} z m)
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} z m)
     endif(X86_64) 
 endif()
   

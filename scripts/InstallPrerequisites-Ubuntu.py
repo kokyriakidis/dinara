@@ -110,6 +110,7 @@ def installAptPackages():
     "graphviz",
     "gnuplot",
     "python3-dev", 
+    "libsimde-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
 
@@ -375,13 +376,164 @@ installSpoa()
 # Setup Rust toolchain with pinned nightly version (must be done before Rust libraries)
 setupRustToolchain()
 
+def installAbpoa():
+    print("Installing abPOA (Shared Library)...")
+    
+    if os.path.exists("/usr/local/lib/libabpoa.so"):
+        print("libabpoa.so found in /usr/local/lib. Skipping installation.")
+        return
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building abPOA using temporary directory", temporaryDirectory)
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+        
+        runCommand("git clone https://github.com/yangao07/abPOA.git")
+        os.chdir("abPOA")
+
+        # Patch Makefile as requested by user
+        # 1. Comment out SIMDE flags
+        runCommand("sed -i 's/^EXTRA_FLAGS += -DUSE_SIMDE/# EXTRA_FLAGS += -DUSE_SIMDE/' Makefile")
+        
+        # 2. Add -fpic -shared to CFLAGS
+        # We append it to the definition of CFLAGS
+        runCommand("sed -i 's/^CFLAGS =/CFLAGS += -fpic -shared /' Makefile")
+
+        # 3. Change library name to .so and build command
+        # Replace .a with .so
+        runCommand("sed -i 's/libabpoa.a/libabpoa.so/g' Makefile")
+        # Replace ar command with compiler for shared lib
+        runCommand("sed -i 's/ar -csru/$(CC) -shared -o/g' Makefile")
+
+        runCommand("make")
+
+        # Install
+        print("Installing abPOA to /usr/local...")
+        if os.path.exists("lib/libabpoa.so"):
+            runCommand("sudo cp lib/libabpoa.so /usr/local/lib/")
+            # Also copy headers
+            if not os.path.exists("/usr/include/abpoa"):
+                runCommand("sudo mkdir -p /usr/include/abpoa")
+            # Usually abpoa.h is in include/. Copying content of include/*
+            runCommand("sudo cp include/*.h /usr/include/abpoa/")
+            # Also copy to /usr/include/abpoa.h for compatibility if needed?
+            # shasta code might use <abpoa.h> or <abpoa/abpoa.h>
+            runCommand("sudo cp include/abpoa.h /usr/include/")
+        else:
+            raise Exception("Build failed: lib/libabpoa.so not found")
+
+        os.chdir(oldDirectory)
+
+
 # Check that any existing Rust libraries were built with the same toolchain
 checkRustLibrariesConsistency()
 
-# Install all Rust libraries (all use the same toolchain to avoid symbol conflicts)
+def installShasta2():
+    print("Installing shasta2 and dependencies (abPOA)...")
+    
+    installPath = "/usr/include/shasta2"
+    libPath = "/usr/local/lib/libshasta2.so"
+    staticLibPath = "/usr/local/lib/libshasta2.a"
+    abpoaLibPath = "/usr/local/lib/libabpoa.so"
+    abpoaStaticLibPath = "/usr/local/lib/libabpoa.a"
+    
+    # Check if already installed (all components)
+    if os.path.exists(installPath + "/src") and os.path.exists(libPath) and os.path.exists(abpoaLibPath) and os.path.exists(staticLibPath) and os.path.exists(abpoaStaticLibPath):
+        print("shasta2 and abpoa (shared & static) found. Skipping installation.")
+        return
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building shasta2 using temporary directory", temporaryDirectory)
+        
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+        
+        # Clone repo
+        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
+        
+        # Cleanup existing build directory to prevent BuildAbpoa.py failure
+        home = os.path.expanduser("~")
+        shastaBuildDir = home + "/.shasta2Build"
+        if os.path.exists(shastaBuildDir):
+             print("Cleaning up existing shasta2 build directory: " + shastaBuildDir)
+             shutil.rmtree(shastaBuildDir)
+
+        # Install dependencies (This builds abPOA in ~/.shasta2Build/abpoa)
+        # It handles the -fPIC shared library build for us!
+        runCommand("python3 shasta2/scripts/InstallBuildPrerequisites.py")
+
+        # Copy abPOA headers and library from shasta2 build
+        home = os.path.expanduser("~")
+        abpoaBuildDir = home + "/.shasta2Build/abpoa"
+        
+        # Install abPOA Shared
+        if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.so"):
+            print("Installing abPOA shared from shasta2 build...")
+            runCommand("sudo cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.so " + abpoaLibPath)
+        else:
+            print("Warning: libabpoa.so not found in shasta2 build directory.")
+
+        # Install abPOA Static
+        if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.a"):
+            print("Installing abPOA static from shasta2 build...")
+            runCommand("sudo cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.a " + abpoaStaticLibPath)
+        else:
+            print("Warning: libabpoa.a not found in shasta2 build directory.")
+
+        # Install Headers
+        if not os.path.exists("/usr/include/abpoa"):
+            runCommand("sudo mkdir -p /usr/include/abpoa")
+        runCommand("sudo cp " + abpoaBuildDir + "/abPOA/include/*.h /usr/include/abpoa/")
+        # Also copy abpoa.h to /usr/include/abpoa.h for compatibility
+        runCommand("sudo cp " + abpoaBuildDir + "/abPOA/include/abpoa.h /usr/include/")
+        
+        os.chdir("shasta2")
+        
+        # PATCH: Add static library target to PythonModule/CMakeLists.txt
+        # We append code to define 'shasta2Static' which excludes main.cpp and PythonModule.cpp
+        patchContent = """
+# Static library for Dinara
+file(GLOB SOURCES_STATIC ../src/*.cpp)
+list(REMOVE_ITEM SOURCES_STATIC ${CMAKE_CURRENT_SOURCE_DIR}/../src/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/PythonModule.cpp)
+add_library(shasta2Static STATIC ${SOURCES_STATIC})
+set_target_properties(shasta2Static PROPERTIES OUTPUT_NAME "shasta2")
+"""
+        with open("PythonModule/CMakeLists.txt", "a") as f:
+            f.write(patchContent)
+
+        os.mkdir("build")
+        os.chdir("build")
+        
+        # Build shasta2 library (Python Module + Static Lib)
+        runCommand("cmake .. -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON")
+        runCommand("make -j")
+        
+        # Install shasta2 library (Shared)
+        print("Installing shasta2 shared to /usr/local...")
+        runCommand("sudo cp PythonModule/shasta2.so " + libPath)
+
+        # Install shasta2 library (Static)
+        print("Installing shasta2 static to /usr/local...")
+        if os.path.exists("PythonModule/libshasta2.a"):
+            runCommand("sudo cp PythonModule/libshasta2.a " + staticLibPath)
+        else:
+            print("Warning: libshasta2.a not found (static build failed?)")
+        
+        # Install shasta2 headers
+        if not os.path.exists(installPath):
+            runCommand("sudo mkdir -p " + installPath)
+        runCommand("sudo cp -r ../src " + installPath)
+        
+        os.chdir(oldDirectory)
+
+
+# Install all Rust libraries
 installAstarpa()
 installPoasta()
 installSimdMinimizers()
+
+# Install shasta2 (and abpoa via shasta2 scripts)
+installShasta2()
   
 # Make sure the newly created libraries are immediately visible to the loader.
 runCommand("sudo ldconfig")
