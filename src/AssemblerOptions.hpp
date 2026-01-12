@@ -80,6 +80,7 @@ namespace dinara {
     class PalindromicReadOptions;
     class ReadsOptions;
     class ReadGraphOptions;
+    class VariantClusteringOptions;
 
     // Function to convert a bool to True or False for better
     // compatibility with Python scripts.
@@ -321,6 +322,14 @@ public:
     void parseSimplifyMaxLength();
     void write(ostream&) const;
 };
+// Options for variant clustering.
+class dinara::VariantClusteringOptions {
+public:
+    uint64_t minOccurrences;
+    uint64_t minSeparation;
+    void write(ostream&) const;
+};
+
 
 
 
@@ -533,6 +542,7 @@ public:
     MinHashOptions minHashOptions;
     AlignOptions alignOptions;
     ReadGraphOptions readGraphOptions;
+    VariantClusteringOptions variantClusteringOptions;
     MarkerGraphOptions markerGraphOptions;
     AssemblyOptions assemblyOptions;
 

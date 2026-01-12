@@ -270,6 +270,8 @@ void dinara::main::assemble(
     assembler.assemblerInfo->assemblyMode = assemblerOptions.assemblyOptions.mode;
     assembler.minMultiNodeChainSupport = assemblerOptions.readGraphOptions.minMultiNodeChainSupport;
     assembler.minIsolatedSiteSupport = assemblerOptions.readGraphOptions.minIsolatedSiteSupport;
+    assembler.assemblerInfo->variantClusteringMinOccurrences = assemblerOptions.variantClusteringOptions.minOccurrences;
+    assembler.assemblerInfo->variantClusteringMinSeparation = assemblerOptions.variantClusteringOptions.minSeparation;
 
     // Run the assembly.
     assemble(assembler, assemblerOptions, inputFileAbsolutePaths);
@@ -507,8 +509,6 @@ void dinara::main::assemble(
 
     // Flag palindromic reads.
     // These will be excluded from further processing.
-    // Flag palindromic reads.
-    // These will be excluded from further processing.
     if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
         assembler.palindromicMinAlignedMarkerCount = assemblerOptions.readsOptions.palindromicReads.minAlignedMarkerCount;
         assembler.palindromicMaxUncoveredBases = assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases;
@@ -592,23 +592,67 @@ void dinara::main::assemble(
     // Declare anchors pointer here to avoid scope issues
     shared_ptr<mode3::Anchors> anchors;
 
-    cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
-    anchors = make_shared<mode3::Anchors>(
-        MappedMemoryOwner(assembler),
-        assembler.getReads(),
-        assembler.assemblerInfo->k,
-        assembler.markers,
-        assembler.variantClusteringClusterRepresentatives,
-        *assembler.variantClusteringDisjointSets,
-        assembler.variantClusteringPositionPairs,
-        assembler.variantClusteringPositionPairAlleles,
-        assembler.variantClusteringPositionPairContexts,
-        assembler.variantClusteringValidClustersCompatible,
-        assembler.variantClusteringMemberStatus,
-        /*minClusterCoverage*/ 6,
-        /*minAlleleCoverage*/ 5,
-        /*minCommonKmerFraction*/ 0.8,
+    // cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
+    // anchors = make_shared<mode3::Anchors>(
+    //     MappedMemoryOwner(assembler),
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     assembler.markers,
+    //     assembler.variantClusteringClusterRepresentatives,
+    //     *assembler.variantClusteringDisjointSets,
+    //     assembler.variantClusteringPositionPairs,
+    //     assembler.variantClusteringPositionPairAlleles,
+    //     assembler.variantClusteringPositionPairContexts,
+    //     assembler.variantClusteringValidClustersCompatible,
+    //     assembler.variantClusteringMemberStatus,
+    //     /*minClusterCoverage*/ 6,
+    //     /*minAlleleCoverage*/ 5,
+    //     /*minCommonKmerFraction*/ 0.8,
+    //     threadCount);
+
+
+    // Create marker graph vertices.
+    // To create a complete marker graph, generate all vertices
+    // regardless of coverage, and allow duplicate markers on vertices.
+    assembler.createMarkerGraphVertices(
+        1,                                              // minVertexCoverage
+        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+        0,                                              // minVertexCoveragePerStrand
+        true,                                           // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);
+
+    // If the coverage range for primary marker graph edges (anchors) is not
+    // specified, use the disjoint sets histogram to compute reasonable values.
+    uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
+    uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
+    if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
+        tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
+        cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+        minPrimaryCoverage = uint64_t(std::round(
+            double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
+        maxPrimaryCoverage = uint64_t(std::round(
+            double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
+        cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    } else {
+        cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    }
+
+    // Construct the mode3::Anchors from marker graph.
+    anchors =
+        make_shared<mode3::Anchors>(
+            MappedMemoryOwner(assembler),
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            assembler.markers,
+            assembler.markerGraph,
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount);
     
 
     // Compute oriented read journeys.

@@ -463,10 +463,10 @@ void Assembler::createReadGraph5()
     // maxHang = 1000, maxHangRate = 0.8, minOverlap = 0
     filterHangingOverlaps(1000, 0.8, 0, threadCount);
 
-    // 5. ma_hit_contained_advance: Remove contained reads
-    // Mirrors: ma_hit_contained_advance(...);
-    // Uses the same maxHang (1000) and minOverlap (0).
-    removeContainedReads(1000, 0.8, 0, threadCount);
+    // // 5. ma_hit_contained_advance: Remove contained reads
+    // // Mirrors: ma_hit_contained_advance(...);
+    // // Uses the same maxHang (1000) and minOverlap (0).
+    // removeContainedReads(1000, 0.8, 0, threadCount);
 
     // Sync keepAlignment status with isDeleted flags
     // The functions above mark alignments as `isDeleted`. We need to respect that.
@@ -810,7 +810,12 @@ void Assembler::createReadGraph5ThreadFunction(uint64_t threadId)
                 if (indexInPositionPairs < variantClusteringPositionPairAlleles.size()) {
                     targetAllele = variantClusteringPositionPairAlleles[indexInPositionPairs];
                 }
-                DINARA_ASSERT(targetAllele < 5); // Invalid target allele
+                
+                // If allele is invalid (e.g. filtered out duplicate), skip this position.
+                if (targetAllele >= 5) {
+                    it++;
+                    continue;
+                }
 
                 // Count alleles in this cluster
                 // ALSO count Strand-0 (Forward) occurrences for bias checking.

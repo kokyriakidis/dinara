@@ -633,8 +633,8 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
                 // Why: Coverage naturally drops to zero at the tips of any read. We don't want to flag a read as chimeric just 
                 // because it has low coverage at the very start or end. We only care about "holes" that appear deep inside the read body.
                 // "if (s0 > 0) s0 += cut_len" -> If start is NOT at tip, shrink it (internal gap potential).
-                // "if (e0 < len) e0 -= cut_len" -> If end is NOT at tip, shrink it.
-                // If it IS at tip, keep it at tip (to provide coverage there).
+                    // --- SHRINK LOGIC (Hifiasm-style: Preserve Tips) ---
+                // We shrink the valid coverage interval by flank (256bp), but only if the alignment doesn't touch the read end.
                 
                 int32_t flank = 256; 
                 int32_t s = int32_t(start);
@@ -648,6 +648,7 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
                     events.push_back({e, -1});
                 }
             }
+
             
             // --- SWEEP LOGIC ---
             // We sweep from 0 to readLen.
@@ -1295,12 +1296,6 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
     }
 
     // Temporary storage for parameters
-    this->hangingFilterMaxHang = maxHang; // Reuse these members or add new ones? 
-    // Let's assume we can reuse hangingFilter vars for simplicity or just capture them if we could.
-    // Thread function needs access. I'll rely on the existing members used for filterHanging logic
-    // or just assume hardcoded for now to avoid header churn, 
-    // OR BETTER: use the arguments passed to functions if I modify the thread func to take args? No, it takes only threadId.
-    // I will use 'hangingFilterMaxHang' etc as proxies since the user request passed similar args.
     this->hangingFilterMaxHang = maxHang;
     this->hangingFilterMaxHangRate = maxHangRate;
     this->hangingFilterMinOverlap = minOverlapLength;
@@ -1308,33 +1303,43 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
     setupLoadBalancing(alignmentData.size(), 1000); // Iterate over alignments
     runThreads(&Assembler::removeContainedReadsThreadFunction, threadCount);
     
-    // Transitive Reduction of Containment Tree
-    // If A in B and B in C -> A in C.
-    // Run essentially sequentially or parallel with care.
-    cout << timestamp << "Transitive reduction of containment..." << endl;
-    
-    // Simple path compression
-    // For each read i, if parent[i] != invalid, find root.
-    // Since graph is DAG (containment implies length < parent length usually), no cycles expected ideally.
-    // But with fuzziness, cycles possible (A in B in A). Need loop detection.
+    // Transitive Reduction of Containment Tree & Cleanup
+    cout << timestamp << "Transitive reduction and containment cleanup..." << endl;
     
     uint64_t containedCount = 0;
+    
+    // 1. Path Compression for containment parent
     for(size_t i=0; i<containmentParent.size(); i++) {
         if (containmentParent[i] != invalidReadId) {
-            containedCount++;
-            // Resolve parent
+            
             ReadId p = containmentParent[i];
+            
+            // Check for containment cycles or long chains
+            // (A contains B, B contains C -> A contains C)
+            // Limit depth to avoid infinite loops if cycle exists
             int depth = 0;
-            while(p != invalidReadId && containmentParent[p] != invalidReadId && depth < 50) {
+            while(p != invalidReadId && containmentParent[p] != invalidReadId && depth < 100) {
                  p = containmentParent[p];
                  depth++;
             }
-            containmentParent[i] = p; // Point to ultimate parent
+            // If cycle (depth hit max), maybe break link or pick one? 
+            // For now, assign ultimate parent.
+            containmentParent[i] = p; 
             
             // Mark as deleted in global flags
+            // This corresponds to 'coverage_cut[i].del = 1'
             validReadIntervals[i].isDeleted = true;
+            containedCount++;
         }
     }
+    
+    // 2. Remove all alignments involving contained reads (Cleanup)
+    // The snippet does `delete_all_edges` immediately.
+    // We do it in a pass or rely on graph construction to respect `isDeleted`.
+    // Let's enforce it in validReadIntervals which is checked by ReadGraph5.
+    // Also, we can launch a thread pass to mark AlignmentData::isDeleted if strictly needed for other steps.
+    // For now, setting validReadIntervals::isDeleted is sufficient as ReadGraph5 checks it.
+    
     cout << timestamp << "Identified " << containedCount << " contained reads." << endl;
 }
 
@@ -1363,13 +1368,79 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
             // Let's guess based on usage elsewhere: `ad.readIds[0]`.
             
             AlignmentData& ad = alignmentData[i];
+
+            ReadId r0 = ad.readIds[0];
+            ReadId r1 = ad.readIds[1];
+
+            // Get raw lengths
+            uint64_t len0 = getReads().getReadRawSequenceLength(r0);
+            uint64_t len1 = getReads().getReadRawSequenceLength(r1);
+            
+            // Unaligned tails for R0
+            int64_t tail0_L = (int64_t)ad.qs;
+            int64_t tail0_R = (int64_t)len0 - (int64_t)ad.qe;
+             
+            // Unaligned tails for R1
+            int64_t tail1_L = (int64_t)ad.ts;
+            int64_t tail1_R = (int64_t)len1 - (int64_t)ad.te;
+
+            // int64_t leftUnaligned0 = ad.info.leftTrim(0);
+            // int64_t rightUnaligned0 = ad.info.rightTrim(0);
+            // int64_t leftUnaligned1 = ad.info.leftTrim(1);
+            // int64_t rightUnaligned1 = ad.info.rightTrim(1);
+
+            int64_t leftUnaligned0 = tail0_L;
+            int64_t rightUnaligned0 = tail0_R;
+            int64_t leftUnaligned1 = tail1_L;
+            int64_t rightUnaligned1 = tail1_R;
+
+            if (r0 == 8894 || r1 == 8894) {
+                cout << "Alignment " << i << ": " << r0 << " " << r1 << endl;
+                cout << "Tail 0: " << tail0_L << " " << tail0_R << endl;
+                cout << "Tail 1: " << tail1_L << " " << tail1_R << endl;
+                cout << "Left Unaligned 0: " << leftUnaligned0 << " " << leftUnaligned1 << endl;
+                cout << "Right Unaligned 0: " << rightUnaligned0 << " " << rightUnaligned1 << endl;
+            }
+
+            if ((leftUnaligned0 <= leftUnaligned1) && (rightUnaligned0 <= rightUnaligned1)) {
+                containmentParent[r0] = r1;
+                validReadIntervals[r0].isDeleted = true;
+                ad.isDeleted = true;
+                
+                // Aggressively remove all other alignments involving contained read r0
+                for(uint32_t strand=0; strand<2; strand++) {
+                    OrientedReadId oid(r0, strand);
+                    for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
+                        alignmentData[otherAlignId].isDeleted = true;
+                    }
+                }
+                
+                continue;
+            } else if ((leftUnaligned1 <= leftUnaligned0) && (rightUnaligned1 <= rightUnaligned0)) {
+                containmentParent[r1] = r0;
+                validReadIntervals[r1].isDeleted = true;
+                ad.isDeleted = true;
+
+                // Aggressively remove all other alignments involving contained read r1
+                for(uint32_t strand=0; strand<2; strand++) {
+                    OrientedReadId oid(r1, strand);
+                    for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
+                        alignmentData[otherAlignId].isDeleted = true;
+                    }
+                }
+                
+                continue;
+            }
+
+
+
+
             
             if (!ad.info.isInReadGraph) continue;
             
             if (ad.isDeleted) continue;
             
-            ReadId r0 = ad.readIds[0];
-            ReadId r1 = ad.readIds[1];
+            
             
             // Ignore if already deleted/chimeric
             if (validReadIntervals[r0].isDeleted || validReadIntervals[r1].isDeleted) continue;
@@ -1378,81 +1449,47 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
             const auto& status0 = validReadIntervals[r0];
             const auto& status1 = validReadIntervals[r1];
             
-            // Valid segment lengths
-            uint32_t vl0 = status0.end - status0.start;
-            uint32_t vl1 = status1.end - status1.start;
+            // Containment Logic:
+            // Check if one read is "enclosed" in the other.
+            // Enclosed = The read is fully covered by the alignment (i.e. has no significant overhangs).
+            // User Request: "check if one is contained in the other! we cant have both of them contained!"
             
-            // Alignment coordinates in BASES.
-            // We need to convert from AlignmentInfo (markers) to bases.
-            // Or assume AlignmentData has cached it?
-            // Previous code used `ad.readIntervals`. If that doesn't exist, we must compute.
-            // Helper: `info.baseRange(...)`? 
             
-            // Let's compute approx range from markers * k?
-            // Or assume full read if not available?
-            // Actually validReadIntervals are in bases (from filterLocalSegments).
-            
-            // To get overlap range in bases:
-            // Approximate with marker range * stride? 
-            // Assembler::getReads().getReadRawSequenceLength(r0);
-            
-            // NOTE: The previous compilation failed on readIntervals.
-            // I will implement a safe fallback using marker counts or just full read for now if exact overlap is tricky.
-            // BUT containment REQUIRES exact overlap coords.
-            
-            // Let's look at `applyCoverageCuts`. It uses `ad.info`.
-            // Does it compute overlap?
-            
-            // Re-implement checkContainment using marker counts?
-            // Or use `info.range(0)` and `info.range(1)`.
-            // Range (in markers) * k is approx bases.
-            
-            uint32_t mk0 = ad.info.range(0);
-            uint32_t mk1 = ad.info.range(1);
-            
-            // Convert to approx bases. This is heuristic anyway.
-            uint32_t os = ad.info.leftTrim(0) * assemblerInfo->k; 
-            uint32_t oe = (ad.info.leftTrim(0) + mk0) * assemblerInfo->k;
-            
-            // For Read 1, handle reverse complement? 
-            // info is normalized? 
-            // AlignmentInfo stores data for both reads.
-            
-            uint32_t rs = ad.info.leftTrim(1) * assemblerInfo->k;
-            uint32_t re = (ad.info.leftTrim(1) + mk1) * assemblerInfo->k;
 
-            // IsReverse?
-            // `ad` doesn't seem to have `isReverseComplement` flag directly exposed in the snippet.
-            // AlignmentData stores `readIds` and `info`.
-            // `readIds[1]` might encode strand?. No, usually `OrientedReadId`.
-            // `ad.readIds` are `ReadId`.
             
-            // Assume "Same Channel" vs "Cross Channel" or simpler:
-            // The alignment is between Oriented Reads.
-            // But `AlignmentData` usually stores canonical (r0 < r1).
-            // `info` describes the alignment.
+            // int64_t tol = (int64_t)this->hangingFilterMaxHang;
             
-            // Check containment using these approx coords.
-            // Note: `checkContainment` expects bases. k-mer scaling is approx.
             
-            int c = checkContainment(
-                status0.start, status0.end, vl0,
-                status1.start, status1.end, vl1,
-                os, oe, rs, re,
-                false, // Todo: check strand from AlignmentInfo or Ad
-                hangingFilterMaxHang,
-                hangingFilterMaxHangRate,
-                hangingFilterMinOverlap
-            );
+            // Determine Candidate based on length (Shorter read can be contained in Longer read)
+            // Tie-break with ID for determinism.
+            bool checkR0 = false;
             
-            if (c == 1) { // R0 contained in R1
-                containmentParent[r0] = r1;
-                validReadIntervals[r0].isDeleted = true;
-                ad.isDeleted = true; 
-            } else if (c == 2) { // R1 contained in R0
-                containmentParent[r1] = r0;
-                validReadIntervals[r1].isDeleted = true;
-                ad.isDeleted = true;
+            if (len0 < len1) {
+                checkR0 = true;
+            } else if (len1 < len0) {
+                checkR0 = false;
+            } else {
+                // Equal lengths: Tie-break
+                if (r0 > r1) checkR0 = true;
+                else checkR0 = false;
+            }
+            
+            if (checkR0) {
+                 // Check if R0 is contained in R1.
+                 // logic: R0 is "inside" R1 if R0's tails are smaller than R1's tails (on the corresponding sides).
+                 // relative check: tail0 <= tail1 (+ tolerance)
+                 if ((tail0_L <= tail1_L) && (tail0_R <= tail1_R)) {
+                     containmentParent[r0] = r1;
+                     validReadIntervals[r0].isDeleted = true;
+                     ad.isDeleted = true;
+                 }
+            } else {
+                 // Check if R1 is contained in R0.
+                 if ((tail1_L <= tail0_L) && (tail1_R <= tail0_R)) {
+                     containmentParent[r1] = r0;
+                     validReadIntervals[r1].isDeleted = true;
+                     ad.isDeleted = true;
+                 }
             }
         }
     }

@@ -140,6 +140,10 @@ public:
     // Read graph creation method.
     uint64_t readGraphCreationMethod;
 
+    // Variant Clustering options
+    uint64_t variantClusteringMinOccurrences;
+    uint64_t variantClusteringMinSeparation;
+
 
     // Statistics on the number of reads discarded on input.
     // These are incremented during each call to addReadsFromFasta.

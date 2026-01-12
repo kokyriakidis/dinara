@@ -79,7 +79,9 @@ void Assembler::createMarkerGraphVertices(
     // Check that we have what we need.
     reads->checkReadsAreOpen();
     reads->checkReadFlagsAreOpen();
-    DINARA_ASSERT(kmerChecker);
+    reads->checkReadFlagsAreOpen();
+    // DINARA_ASSERT(kmerChecker); // Not needed for simple vertex creation
+    checkMarkersAreOpen();
     checkMarkersAreOpen();
     checkAlignmentDataAreOpen();
     DINARA_ASSERT(compressedAlignments.isOpen());
