@@ -25,6 +25,7 @@ using namespace dinara;
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <thread>
 
 
 
@@ -209,18 +210,34 @@ void Assembler::alignOverlappingOrientedReads(
 
 
 
-// Compute an alignment for each alignment candidate.
-// Store the alignments the satisfy our criteria.
+// Minimal struct to store overlap info for transitive inference
+struct PafOverlap {
+    ReadId otherId;
+    bool sameStrand;
+    uint32_t start;
+    uint32_t end;
+};
+
 void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
 {
     if (!std::filesystem::exists(pafFilePath)) {
         throw runtime_error("PAF file not found: " + pafFilePath);
     }
 
-    cout << timestamp << "Loading alignment candidates from " << pafFilePath << endl;
+    cout << timestamp << "Loading alignment candidates from " << pafFilePath << " with transitive expansion..." << endl;
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
+    
+    // Store overlaps per read for geometric checking: overlaps[readId] -> list of intervals
+    vector<vector<PafOverlap>> overlaps(reads->readCount());
+    
+    // Vectors to store direct candidates for later sorting
+    // We'll create thread-local storage for parsing if needed, but parsing is usually I/O bound.
+    // Let's do single-threaded parse, but it's fast.
+    
     std::ifstream pafFile(pafFilePath);
     string line;
+    uint64_t lineCount = 0;
+    
     while (std::getline(pafFile, line)) {
         std::stringstream ss(line);
         string qName, tName, strandStr;
@@ -243,7 +260,7 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             continue; 
         }
 
-        if (alignLen < 1000) {
+        if (alignLen < 200) {
             continue;
         }
 
@@ -251,30 +268,116 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             ReadId readId0 = reads->getReadId(qName);
             ReadId readId1 = reads->getReadId(tName);
 
-            if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) {
-                continue;
-            }
-            if (reads->getFlags(readId0).isPalindromic || reads->getFlags(readId1).isPalindromic) {
-                // TODO: handle palindromic reads.
-                // continue;
-            }
+            if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) continue;
+            // Ignore palindromic for now
+            if (reads->getFlags(readId0).isPalindromic || reads->getFlags(readId1).isPalindromic) continue;
             if (readId0 == readId1) continue; 
 
             bool isSameStrand = (strandStr == "+");
             
-            if (readId0 > readId1) {
-                swap(readId0, readId1);
-            }
+            // Store for transitive inference (Geometric Graph)
+            // Q aligns to T.
+            // On Q, the interval is [qStart, qEnd].
+            // On T, the interval is [tStart, tEnd].
             
+            // Add neighbor T to Q
+            overlaps[readId0].push_back({readId1, isSameStrand, (uint32_t)qStart, (uint32_t)qEnd});
+            // Add neighbor Q to T
+            overlaps[readId1].push_back({readId0, isSameStrand, (uint32_t)tStart, (uint32_t)tEnd});
+            
+            // Store direct candidate
+            if (readId0 > readId1) swap(readId0, readId1);
             alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
+            
+            lineCount++;
+            
         } catch (...) {
             continue;
         }
     }
+    cout << timestamp << "Parsed " << lineCount << " PAF lines." << endl;
+
+    // Transitive Expansion with Geometric Filter
+    cout << timestamp << "Generating transitive candidates (Distance 2 with overlap check)..." << endl;
+    
+    uint64_t threadCount = std::thread::hardware_concurrency();
+    vector<vector<OrientedReadPair>> threadNewCandidates(threadCount);
+    
+    const uint64_t batchSize = 200;
+    setupLoadBalancing(reads->readCount(), batchSize);
+
+    vector<std::thread> threads;
+    for (size_t t = 0; t < threadCount; t++) {
+        threads.emplace_back([&, t]() {
+            uint64_t start, end;
+            while (getNextBatch(start, end)) {
+                for (uint64_t r = start; r < end; r++) {
+                    auto& neighbors = overlaps[r]; // Mutable reference, safe as r is exclusive to thread
+                    if (neighbors.size() < 2) continue; 
+                    
+                    // OPTIMIZATION: Sort by start position to enable sliding window
+                    std::sort(neighbors.begin(), neighbors.end(), 
+                        [](const PafOverlap& a, const PafOverlap& b) {
+                            return a.start < b.start;
+                        });
+                    
+                    // Check overlapping pairs using sliding window
+                    for (size_t i = 0; i < neighbors.size(); i++) {
+                        const auto& n1 = neighbors[i];
+                        
+                        // We need overlap > 200.
+                        // Implies: min(n1.end, n2.end) - max(n1.start, n2.start) > 200
+                        // Since sorted by start, n2.start >= n1.start.
+                        // So max(starts) = n2.start.
+                        // Overlap = min(n1.end, n2.end) - n2.start > 200
+                        // We need min(n1.end, n2.end) > n2.start + 200
+                        // Necessary condition: n1.end > n2.start + 200  (since min(...) <= n1.end)
+                        // So if n2.start >= n1.end - 200, we can stop, as n2.start will only increase.
+                        
+                        uint32_t limit = (n1.end > 200) ? n1.end - 200 : 0;
+
+                        for (size_t j = i + 1; j < neighbors.size(); j++) {
+                            const auto& n2 = neighbors[j];
+                            
+                            // Optimization: Early exit
+                            if (n2.start >= limit) break; 
+                            
+                            // Check if distinct neighbors
+                            if (n1.otherId == n2.otherId) continue;
+                            
+                            // Strict overlap calculation
+                            uint32_t overlapStart = n2.start; // Since sorted
+                            uint32_t overlapEnd = std::min(n1.end, n2.end);
+                            
+                            if (overlapEnd > overlapStart + 200) {
+                                // Overlap exists! Transitive candidate identified.
+                                bool impliedSame = (n1.sameStrand == n2.sameStrand);
+                                
+                                ReadId rA = n1.otherId;
+                                ReadId rC = n2.otherId;
+                                if (rA > rC) swap(rA, rC);
+                                
+                                threadNewCandidates[t].push_back(OrientedReadPair(rA, rC, impliedSame));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    // Merge new candidates
+    for (const auto& vec : threadNewCandidates) {
+        for (const auto& c : vec) {
+            alignmentCandidates.candidates.push_back(c);
+        }
+    }
 
     // Sort and remove duplicates.
-    // This handles cases where the PAF file contains multiple entries for the same pair
-    // (e.g. A->B and B->A, or multiple segments).
     std::sort(alignmentCandidates.candidates.begin(), alignmentCandidates.candidates.end(),
         [](const OrientedReadPair& a, const OrientedReadPair& b) {
             return tie(a.readIds[0], a.readIds[1], a.isSameStrand) <
@@ -291,8 +394,9 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
     alignmentCandidates.candidates.resize(it - alignmentCandidates.candidates.begin());
 
     alignmentCandidates.unreserve();
-    cout << timestamp << "Loaded " << alignmentCandidates.candidates.size() << " candidates from PAF." << endl;
+    cout << timestamp << "Total unique candidates (Direct + Transitive): " << alignmentCandidates.candidates.size() << endl;
 }
+
 
 void Assembler::computeAlignments(
 
@@ -693,118 +797,104 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 }
             }
 
-            // Skip containing alignments, if so requested.
-            if(suppressContainments and alignmentInfo.isContaining(uint32_t(maxTrim))) {
+            // If getting here, this is a good alignment.
+
+            // Compute projected alignment metrics.
+            bool hasLargeIndel = false;
+            const auto tProjStart = steady_clock::now();
+            const ProjectedAlignment projectedAlignment(
+                *this,
+                orientedReadIds,
+                alignment,
+                ProjectedAlignment::Method::QuickRaw);
+            const auto tProjEnd = steady_clock::now();
+            
+            alignmentInfo.errorRate = float(projectedAlignment.errorRate());
+            alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
+            alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
+            alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
+            
+
+            data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
+
+            const uint64_t ql = projectedAlignment.totalLength[0];
+            const uint64_t tl = projectedAlignment.totalLength[1];
+            
+            const double errorRateThreshold = 0.07;
+            const uint64_t totalErrors = uint64_t(projectedAlignment.mismatchCount) + uint64_t(projectedAlignment.totalDeletionCount);
+            if ((totalErrors > (ql * errorRateThreshold)) || (totalErrors > (tl * errorRateThreshold))) {
+                data.threadFilteredByErrorRate[threadId]++;
                 continue;
             }
 
-            // If getting here, this is a good alignment.
+            // const double gapRateThreshold = 0.006;
+            // const uint64_t totalGapCount = uint64_t(projectedAlignment.totalDeletionCount);
+            // if ((totalGapCount > (ql * gapRateThreshold)) || (totalGapCount > (tl * gapRateThreshold))) {
+            //     data.threadFilteredByErrorRateGap[threadId]++;
+            //     continue;
+            // }
 
-            // Compute projected alignment metrics, if requested.
-            bool hasLargeIndel = false;
-            if(computeProjectedAlignmentMetrics) {
-                const auto tProjStart = steady_clock::now();
-                const ProjectedAlignment projectedAlignment(
-                    *this,
-                    orientedReadIds,
-                    alignment,
-                    ProjectedAlignment::Method::QuickRaw);
-                const auto tProjEnd = steady_clock::now();
-                
-                alignmentInfo.errorRate = float(projectedAlignment.errorRate());
-                alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
-                alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
-                alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
-                hasLargeIndel = projectedAlignment.hasLargeIndel;
-
-                if (assemblerInfo->readGraphCreationMethod == 5) {
-                    data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
-
-                    const uint64_t ql = projectedAlignment.totalLength[0];
-                    const uint64_t tl = projectedAlignment.totalLength[1];
-                    
-                    const double errorRateThreshold = 0.07;
-                    const uint64_t totalErrors = uint64_t(projectedAlignment.mismatchCount) + uint64_t(projectedAlignment.totalDeletionCount);
-                    if ((totalErrors > (ql * errorRateThreshold)) || (totalErrors > (tl * errorRateThreshold))) {
-                        data.threadFilteredByErrorRate[threadId]++;
-                        continue;
-                    }
-
-                    // const double gapRateThreshold = 0.006;
-                    // const uint64_t totalGapCount = uint64_t(projectedAlignment.totalDeletionCount);
-                    // if ((totalGapCount > (ql * gapRateThreshold)) || (totalGapCount > (tl * gapRateThreshold))) {
-                    //     data.threadFilteredByErrorRateGap[threadId]++;
-                    //     continue;
-                    // }
-
-                    // Skip alignments with any single indel >= 64 bases.
-                    if (projectedAlignment.maxIndelSize > 64) {
-                        data.threadFilteredByGapCount[threadId]++;
-                        continue;
-                    }
-
-                    // Collect position pairs for variant clustering
-                    // Only collect those with SNP differences (No indels)
-                    const auto tCollectStart = steady_clock::now();
-                    collectVariantClusteringPositionPairs(
-                        projectedAlignment,
-                        orientedReadIds,
-                        *data.threadVariantClusteringPositionPairs[threadId]
-                    );
-                    const auto tCollectEnd = steady_clock::now();
-                    data.threadCollectionTime[threadId] += seconds(tCollectEnd - tCollectStart);
-                }
-
-                
+            // Skip alignments with any single indel >= 64 bases.
+            if (projectedAlignment.maxIndelSize > 64) {
+                data.threadFilteredByGapCount[threadId]++;
+                continue;
             }
+
+            // Collect position pairs for variant clustering
+            // Only collect those with SNP differences (No indels)
+            const auto tCollectStart = steady_clock::now();
+            collectVariantClusteringPositionPairs(
+                projectedAlignment,
+                orientedReadIds,
+                *data.threadVariantClusteringPositionPairs[threadId]
+            );
+            const auto tCollectEnd = steady_clock::now();
+            data.threadCollectionTime[threadId] += seconds(tCollectEnd - tCollectStart);
 
             // cout << orientedReadIds[0] << " " << orientedReadIds[1] << " good." << endl;
-            AlignmentData ad(candidate, alignmentInfo);
+            AlignmentData thisAlignmentData(candidate, alignmentInfo);
             
             // Calculate coordinates efficiently using direct marker access
-            if (alignmentInfo.markerCount > 0) {
-                const auto markers0 = markers[orientedReadIds[0].getValue()];
-                uint32_t qs_marker = markers0[alignmentInfo.data[0].firstOrdinal].position;
-                uint32_t qe_marker = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
+            const auto markers0 = markers[orientedReadIds[0].getValue()];
+            uint32_t qs_marker = markers0[alignmentInfo.data[0].firstOrdinal].position;
+            uint32_t qe_marker = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
 
-                const auto markers1 = markers[orientedReadIds[1].getValue()];
-                uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
-                uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
+            const auto markers1 = markers[orientedReadIds[1].getValue()];
+            uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
+            uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
 
-                // --- Extend Coordinates to Read Tips ---
-                // We assume the alignment extends as far as possible in both directions.
-                const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
-                const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
+            // --- Extend Coordinates to Read Tips ---
+            // We assume the alignment extends as far as possible in both directions.
+            const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
+            const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
 
-                // Left Extension: Extend backwards until one read hits 0
-                uint32_t leftExt = std::min(qs_marker, ts_marker);
-                ad.qs = qs_marker - leftExt;
-                ad.ts = ts_marker - leftExt;
+            // Left Extension: Extend backwards until one read hits 0
+            uint32_t leftExt = std::min(qs_marker, ts_marker);
+            thisAlignmentData.qs = qs_marker - leftExt;
+            thisAlignmentData.ts = ts_marker - leftExt;
 
-                // Right Extension: Extend forwards until one read hits its end
-                // Available info: len0, len1.
-                uint32_t rightExt = std::min(
-                    (uint32_t)len0 - qe_marker, 
-                    (uint32_t)len1 - te_marker
-                );
-                ad.qe = qe_marker + rightExt;
-                ad.te = te_marker + rightExt;
-
-            } else {
-                ad.qs = ad.qe = ad.ts = ad.te = 0;
-            }
+            // Right Extension: Extend forwards until one read hits its end
+            // Available info: len0, len1.
+            uint32_t rightExt = std::min(
+                (uint32_t)len0 - qe_marker, 
+                (uint32_t)len1 - te_marker
+            );
+            thisAlignmentData.qe = qe_marker + rightExt;
+            thisAlignmentData.te = te_marker + rightExt;
 
             // Check for large indels (>= 6 bases)
-            ad.hasLargeIndel = false;
-            if (assemblerInfo->readGraphCreationMethod == 5) {
-                ad.hasLargeIndel = hasLargeIndel;
-            }
+            thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
 
-            ad.cisTransStatus = CisTransStatus::Unknown;
-            ad.coversHetSite = false;
-            ad.isDeleted = false;
+            // Cis/Trans Status
+            thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
+            
+            // Alignment covers an informative het site
+            thisAlignmentData.coversHetSite = false;
+            
+            // Alignment is deleted/filtered
+            thisAlignmentData.isDeleted = false;
 
-            threadAlignmentData.push_back(ad);
+            threadAlignmentData.push_back(thisAlignmentData);
 
             // Store the alignment in compressed form.
             dinara::compress(alignment, compressedAlignment);
@@ -1469,6 +1559,7 @@ bool Assembler::suppressAlignment(
         return false;
     }
     // cout << read0 << " " << read1 << endl;
+
 
 
 

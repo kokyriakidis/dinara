@@ -771,6 +771,16 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(6),
         "Minimum support (Target coverage) for an isolated phased site to be kept.")
 
+        ("VariantClustering.minOccurrences",
+        value<uint64_t>(&variantClusteringOptions.minOccurrences)->
+        default_value(2),
+        "Minimum occurrences of a position pair to be collected for variant clustering.")
+
+        ("VariantClustering.minSeparation",
+        value<uint64_t>(&variantClusteringOptions.minSeparation)->
+        default_value(0),
+        "Minimum separation (bp) for well-separated filter.")
+
         ("MarkerGraph.minCoverage",
         value<int>(&markerGraphOptions.minCoverage)->
         default_value(10),

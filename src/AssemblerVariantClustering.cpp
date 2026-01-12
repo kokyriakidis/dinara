@@ -62,16 +62,16 @@ void Assembler::collectVariantClusteringPositionPairs(
 
                     // Canonicalize to Strand 0 for Read 0
                     if (currentOrientedReadId0.getStrand() == 1) {
-                         const uint64_t readLength0 = getReads().getReadRawSequenceLength(currentOrientedReadId0.getReadId());
-                         positionInRead0 = readLength0 - 1 - positionInRead0;
+                        const uint64_t readLength0 = getReads().getReadRawSequenceLength(currentOrientedReadId0.getReadId());
+                        positionInRead0 = readLength0 - 1 - positionInRead0;
                     }
                     OrientedReadId canonicalOrientedReadId0(currentOrientedReadId0.getReadId(), 0);
                     positionPairs.push_back(make_pair(canonicalOrientedReadId0, uint32_t(positionInRead0)));
 
                     // Canonicalize to Strand 0 for Read 1
                     if (currentOrientedReadId1.getStrand() == 1) {
-                         const uint64_t readLength1 = getReads().getReadRawSequenceLength(currentOrientedReadId1.getReadId());
-                         positionInRead1 = readLength1 - 1 - positionInRead1;
+                        const uint64_t readLength1 = getReads().getReadRawSequenceLength(currentOrientedReadId1.getReadId());
+                        positionInRead1 = readLength1 - 1 - positionInRead1;
                     }
                     OrientedReadId canonicalOrientedReadId1(currentOrientedReadId1.getReadId(), 0);
                     positionPairs.push_back(make_pair(canonicalOrientedReadId1, uint32_t(positionInRead1)));
@@ -88,7 +88,8 @@ void Assembler::collectVariantClusteringPositionPairs(
                 // Only read 1 has a base (read 0 has a gap)
                 position1++;
             }
-            // else: both have gaps (shouldn't happen in a valid alignment, but handle gracefully)
+            // else: both have gaps (shouldn't happen in a valid alignment)
+            DINARA_ASSERT(hasBase0 or hasBase1);
         }
     }
 }
@@ -385,6 +386,7 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
                         position1++;
                     }
                     // else: both have gaps (shouldn't happen in a valid alignment, but handle gracefully)
+                    DINARA_ASSERT(hasBase0 || hasBase1);
                 }
             }
         }
@@ -466,51 +468,43 @@ void Assembler::performGlobalVariantClustering(
     // Sort using std::sort (works because MemoryMapped::Vector::begin/end return T*)
     std::sort(variantClusteringPositionPairs.begin(), variantClusteringPositionPairs.end());
 
-    // Count occurrences of genomic positions (strand-agnostic) and filter
-    const uint64_t minOccurrences = 2;
+    // Count occurrences of genomic positions (strand-agnostic) and filter IN-PLACE
+    const uint64_t minOccurrences = assemblerInfo->variantClusteringMinOccurrences;
     const uint64_t totalOccurrences = variantClusteringPositionPairs.size();
 
-    MemoryMapped::Vector<std::pair<OrientedReadId, uint32_t>> variantClusteringFilteredPositionPairs;
-    variantClusteringFilteredPositionPairs.createNew(
-        largeDataName("tmp-VariantClusteringFilteredPositionPairs"),
-        largeDataPageSize);
-    variantClusteringFilteredPositionPairs.reserve(variantClusteringPositionPairs.size());
-
-    if (!variantClusteringPositionPairs.empty()) {
+    if (totalOccurrences > 0) {
+        uint64_t writeIndex = 0;
         uint64_t count = 1;
         auto current = variantClusteringPositionPairs[0];
-    
+
         for (uint64_t i = 1; i < totalOccurrences; ++i) {
             if (variantClusteringPositionPairs[i] == current) {
                 ++count;
             } else {
                 if (count >= minOccurrences) {
-                    variantClusteringFilteredPositionPairs.push_back(current);
+                    variantClusteringPositionPairs[writeIndex++] = current;
                 }
                 current = variantClusteringPositionPairs[i];
                 count = 1;
             }
         }
+        // Handle the last group
         if (count >= minOccurrences) {
-            variantClusteringFilteredPositionPairs.push_back(current);
+            variantClusteringPositionPairs[writeIndex++] = current;
         }
-    }
 
-    // Replace the memory-mapped vector with filtered results
-    variantClusteringPositionPairs.clear();
-    variantClusteringPositionPairs.reserve(variantClusteringFilteredPositionPairs.size());
-    for (const auto& pair : variantClusteringFilteredPositionPairs) {
-        variantClusteringPositionPairs.push_back(pair);
+        // Resize to the filtered count
+        variantClusteringPositionPairs.resize(writeIndex);
+    } else {
+        variantClusteringPositionPairs.resize(0);
     }
-    variantClusteringPositionPairs.unreserve();
 
     const auto tOccurrenceEnd = steady_clock::now();
     const double tOccurrence = seconds(tOccurrenceEnd - tOccurrenceStart);
 
     cout << "After filtering (min occurrences=" << minOccurrences << "): " 
-         << variantClusteringFilteredPositionPairs.size() << " position pairs (from " << totalOccurrences << " total occurrences)" << endl;
-    cout << "  Filtered out " << totalOccurrences - variantClusteringFilteredPositionPairs.size() << " position pairs with < " << minOccurrences << " occurrences" << endl;
-    
+         << variantClusteringPositionPairs.size() << " position pairs (from " << totalOccurrences << " total occurrences)" << endl;
+    cout << "  Filtered out " << totalOccurrences - variantClusteringPositionPairs.size() << " position pairs with < " << minOccurrences << " occurrences" << endl;
 
     // XXX
     // --- END OF: MINIMUM OCCURRENCES FILTER
@@ -536,47 +530,43 @@ void Assembler::performGlobalVariantClustering(
     const auto tSeparationStart = steady_clock::now();
 
     // Remember how many survived the occurrence filter.
-    const uint64_t filteredCountBeforeSeparation = variantClusteringFilteredPositionPairs.size();
+    const uint64_t filteredCountBeforeSeparation = variantClusteringPositionPairs.size();
 
     // --- Filter out clusters of nearby SNPs (well-separated filter) ---
-    const uint64_t minSeparation = 0;
+    const uint64_t minSeparation = assemblerInfo->variantClusteringMinSeparation;
 
-    MemoryMapped::Vector<pair<OrientedReadId, uint32_t>> wellSeparatedPositionPairs;
-    wellSeparatedPositionPairs.createNew(
-        largeDataName("tmp-VariantClusteringWellSeparatedPositionPairs"),
-        largeDataPageSize);
-    wellSeparatedPositionPairs.reserve(variantClusteringFilteredPositionPairs.size());
-
-    if (!variantClusteringFilteredPositionPairs.empty()) {
+    if (filteredCountBeforeSeparation > 0) {
+        uint64_t writeIndex = 0;
         ReadId currentReadId = invalid<ReadId>;
         uint32_t lastPosition = 0;
 
-        for (const auto& pair : variantClusteringFilteredPositionPairs) {
+        for (uint64_t i = 0; i < filteredCountBeforeSeparation; ++i) {
+            const auto& pair = variantClusteringPositionPairs[i];
             const OrientedReadId orientedReadId = pair.first;
             const ReadId readId = orientedReadId.getReadId();
             const uint32_t position = pair.second;
 
             if (readId != currentReadId) {
                 // First position for this new read
-                wellSeparatedPositionPairs.push_back(pair);
+                variantClusteringPositionPairs[writeIndex++] = pair;
                 currentReadId = readId;
                 lastPosition = position;
             } else {
                 // Same read as previous pair, check separation
                 // Since input is sorted, position >= lastPosition
                 if (position - lastPosition >= minSeparation) {
-                    wellSeparatedPositionPairs.push_back(pair);
+                    variantClusteringPositionPairs[writeIndex++] = pair;
                     lastPosition = position;
                 }
             }
         }
+        variantClusteringPositionPairs.resize(writeIndex);
     }
 
+    const auto tSeparationEnd = steady_clock::now();
+    const double tSeparation = seconds(tSeparationEnd - tSeparationStart);
 
-
-
-
-    const uint64_t wellSeparatedCount = wellSeparatedPositionPairs.size();
+    const uint64_t wellSeparatedCount = variantClusteringPositionPairs.size();
     const uint64_t wellSeparatedFilteredOut = filteredCountBeforeSeparation - wellSeparatedCount;
 
     std::cout << "After well-separated filter (min separation="
@@ -586,14 +576,15 @@ void Assembler::performGlobalVariantClustering(
                 << " position pairs within " << minSeparation
                 << "bp of adjacent positions" << std::endl;
                 
-    // Replace the memory-mapped vector with filtered results
-    // We expand each kept Strand 0 position to include its Strand 1 reverse complement.
-    variantClusteringPositionPairs.clear();
-    variantClusteringPositionPairs.reserve(2 * wellSeparatedPositionPairs.size());
-    for (const auto& pair : wellSeparatedPositionPairs) {
-        
-        // Push Strand 0
-        variantClusteringPositionPairs.push_back(pair);
+    // Expand each kept Strand 0 position to include its Strand 1 reverse complement.
+    // We do this by resizing and filling the second half.
+    const uint64_t s0Count = variantClusteringPositionPairs.size();
+    
+    // Resize to hold both strands
+    variantClusteringPositionPairs.resize(2 * s0Count);
+    
+    for (uint64_t i = 0; i < s0Count; ++i) {
+        const auto& pair = variantClusteringPositionPairs[i];
         
         // Push Strand 1
         const OrientedReadId orientedReadId = pair.first;
@@ -606,16 +597,8 @@ void Assembler::performGlobalVariantClustering(
         const uint32_t rcPosition = uint32_t(readLength - 1 - position);
         const OrientedReadId rcOrientedReadId(readId, 1);
         
-        variantClusteringPositionPairs.push_back(make_pair(rcOrientedReadId, rcPosition));
-    }
-    variantClusteringPositionPairs.unreserve();
-
-    const auto tSeparationEnd = steady_clock::now();
-    const double tSeparation = seconds(tSeparationEnd - tSeparationStart);
-
-    
-    // DEBUG: check removed
-    {
+        // Store at the second half
+        variantClusteringPositionPairs[s0Count + i] = make_pair(rcOrientedReadId, rcPosition);
     }
 
     cout << "  Occurrence filter time: " << tOccurrence << " s" << endl;
@@ -728,177 +711,6 @@ void Assembler::performGlobalVariantClustering(
                   << totalMismatchesSkipped << " skipped, "
                   << totalForwardLinks << " forward links, "
                   << totalRcLinks << " RC links" << endl;
-    
-
-
-
-    // {
-    //     // Verify reverse complement consistency
-    //     const auto tVerifyStart = steady_clock::now();
-    //     performanceLog << timestamp << "Verifying reverse complement consistency" << endl;
-    //     cout << "\nVerifying reverse complement consistency..." << endl;
-
-    //     // Build reverse complement index map: (readId, strand, position) -> index
-    //     std::map<pair<ReadId, pair<Strand, uint32_t>>, uint64_t> pairToIndex;
-    //     for (uint64_t i = 0; i < variantClusteringPositionPairs.size(); i++) {
-    //         const auto& p = variantClusteringPositionPairs[i];
-    //         pairToIndex[{p.first.getReadId(), {p.first.getStrand(), p.second}}] = i;
-    //     }
-
-    //     uint64_t inconsistencies = 0;
-    //     uint64_t checkedPairs = 0;
-    //     // const uint64_t sampleSize = std::min(variantClusteringPositionPairs.size(), uint64_t(10000));
-    //     const uint64_t sampleSize = variantClusteringPositionPairs.size();
-
-    //     // Sample check: verify that if (readId, 0, pos) is linked with others,
-    //     // then (readId, 1, readLength-1-pos) is linked with corresponding RC pairs
-    //     for (uint64_t i = 0; i < sampleSize; i++) {
-    //         const auto& pair = variantClusteringPositionPairs[i];
-    //         const ReadId readId = pair.first.getReadId();
-    //         const Strand strand = pair.first.getStrand();
-    //         const uint32_t position = pair.second;
-            
-    //         // Only check strand 0 pairs
-    //         if (strand != 0) continue;
-            
-    //         checkedPairs++;
-            
-    //         // Find reverse complement pair
-    //         const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
-    //         const uint32_t positionRc = readLength - 1 - position;
-    //         const auto rcKey = make_pair(readId, make_pair(Strand(1), positionRc));
-            
-    //         auto rcIt = pairToIndex.find(rcKey);
-    //         if (rcIt == pairToIndex.end()) {
-    //             continue; // RC pair was filtered out, skip
-    //         }
-            
-    //         const uint64_t rcIndex = rcIt->second;
-    //         const uint64_t setId0 = variantClusteringDisjointSets->find(i);
-    //         const uint64_t setId0Rc = variantClusteringDisjointSets->find(rcIndex);
-            
-    //         // Find all pairs in the same set as i
-    //         std::vector<uint64_t> linkedPairs;
-    //         for (uint64_t j = 0; j < variantClusteringPositionPairs.size(); j++) {
-    //             if (variantClusteringDisjointSets->find(j) == setId0) {
-    //                 linkedPairs.push_back(j);
-    //             }
-    //         }
-            
-    //         // For each linked pair j (strand 0), check if rc(j) is linked with rc(i)
-    //         for (uint64_t j : linkedPairs) {
-    //             if (i == j) continue;
-                
-    //             const auto& pairJ = variantClusteringPositionPairs[j];
-    //             if (pairJ.first.getStrand() != 0) continue; // Only check strand 0 pairs
-                
-    //             const ReadId readIdJ = pairJ.first.getReadId();
-    //             const uint64_t readLengthJ = getReads().getReadRawSequenceLength(readIdJ);
-    //             const uint32_t positionJRc = readLengthJ - 1 - pairJ.second;
-    //             const auto rcJKey = make_pair(readIdJ, make_pair(Strand(1), positionJRc));
-                
-    //             auto rcJIt = pairToIndex.find(rcJKey);
-    //             if (rcJIt == pairToIndex.end()) continue;
-                
-    //             const uint64_t rcJIndex = rcJIt->second;
-    //             const uint64_t setIdJRc = variantClusteringDisjointSets->find(rcJIndex);
-                
-    //             // Check consistency: rc(i) and rc(j) should be in the same set
-    //             if (setIdJRc != setId0Rc) {
-    //                 inconsistencies++;
-    //                 if (inconsistencies <= 5) {
-    //                     cout << "INCONSISTENCY: " << pair.first << ":" << position 
-    //                         << " linked with " << pairJ.first << ":" << pairJ.second
-    //                         << ", but RC pairs are NOT linked" << endl;
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     const auto tVerifyEnd = steady_clock::now();
-    //     const double tVerify = seconds(tVerifyEnd - tVerifyStart);
-
-    //     cout << "Verification: checked " << checkedPairs << " pairs, found " 
-    //         << inconsistencies << " inconsistencies" << endl;
-    //     if (inconsistencies == 0) {
-    //         cout << "✓ Reverse complement consistency verified!" << endl;
-    //     } else {
-    //         cout << "✗ WARNING: Found inconsistencies - check Phase 2 linking logic!" << endl;
-    //     }
-    //     performanceLog << timestamp << "Verification: " << checkedPairs << " pairs checked, " 
-    //                 << inconsistencies << " inconsistencies" << endl;
-    // }
-    
-    // // Verify reverse complement pair EXISTENCE (not just linkage)
-    // {
-    //     const auto tVerifyExistenceStart = steady_clock::now();
-    //     performanceLog << timestamp << "Verifying reverse complement pair existence" << endl;
-    //     cout << "\nVerifying reverse complement pair existence..." << endl;
-        
-    //     // Check if every forward pair has a corresponding RC pair
-    //     uint64_t missingRcPairs = 0;
-    //     uint64_t strand0Count = 0;
-    //     uint64_t strand1Count = 0;
-        
-    //     // Build a set of all pairs for fast lookup
-    //     std::set<pair<OrientedReadId, uint32_t>> pairSet;
-    //     for (const auto& p : variantClusteringPositionPairs) {
-    //         pairSet.insert(p);
-    //         if (p.first.getStrand() == 0) {
-    //             strand0Count++;
-    //         } else {
-    //             strand1Count++;
-    //         }
-    //     }
-        
-    //     // Check each pair to see if its RC counterpart exists
-    //     for (const auto& pair : variantClusteringPositionPairs) {
-    //         const ReadId readId = pair.first.getReadId();
-    //         const Strand strand = pair.first.getStrand();
-    //         const uint32_t position = pair.second;
-            
-    //         // Calculate RC pair
-    //         const uint64_t readLength = getReads().getReadRawSequenceLength(readId);
-    //         const uint32_t positionRc = readLength - 1 - position;
-    //         const Strand strandRc = 1 - strand;
-    //         OrientedReadId orientedReadIdRc(readId, strandRc);
-    //         const auto rcPair = make_pair(orientedReadIdRc, positionRc);
-            
-    //         // Check if RC pair exists
-    //         if (pairSet.find(rcPair) == pairSet.end()) {
-    //             missingRcPairs++;
-    //             if (missingRcPairs <= 5) {
-    //                 cout << "MISSING RC PAIR: " << pair.first << ":" << position 
-    //                      << " exists, but RC pair " << orientedReadIdRc << ":" << positionRc
-    //                      << " does NOT exist" << endl;
-    //             }
-    //         }
-    //     }
-        
-    //     const auto tVerifyExistenceEnd = steady_clock::now();
-    //     const double tVerifyExistence = seconds(tVerifyExistenceEnd - tVerifyExistenceStart);
-        
-    //     cout << "Pair existence check:" << endl;
-    //     cout << "  Total pairs: " << variantClusteringPositionPairs.size() << endl;
-    //     cout << "  Strand 0 pairs: " << strand0Count << endl;
-    //     cout << "  Strand 1 pairs: " << strand1Count << endl;
-    //     cout << "  Missing RC pairs: " << missingRcPairs << endl;
-        
-    //     if (missingRcPairs == 0) {
-    //         cout << "✓ All pairs have their reverse complement counterparts!" << endl;
-    //     } else {
-    //         cout << "✗ WARNING: " << missingRcPairs << " pairs are missing their RC counterparts!" << endl;
-    //         cout << "  This explains why DINARA_ASSERT(found0 && found1 && found0Rc && found1Rc) fails." << endl;
-    //         cout << "  Phase 1 filtering created an asymmetry between forward and RC strands." << endl;
-    //     }
-        
-    //     performanceLog << timestamp << "RC existence verification: " 
-    //                   << missingRcPairs << " missing RC pairs out of " 
-    //                   << variantClusteringPositionPairs.size() << " total pairs" << endl;
-    // }
-
-
-
 
     
     // Identify cluster representatives
@@ -908,14 +720,130 @@ void Assembler::performGlobalVariantClustering(
     
     // Store cluster representatives in Assembler member so they persist for mode3Assembly
     variantClusteringClusterRepresentatives.clear();
+
+    // To efficiently validate clusters, we first group all element IDs by their cluster representative.
+    // We use a flat vector of (RepID, ElementID) pairs and sort it to avoid map overhead.
+    cout << "Grouping clusters for validation..." << endl;
+    vector<pair<uint64_t, uint64_t>> elementsByCluster;
+    elementsByCluster.reserve(disjointSetCount);
     for (uint64_t id = 0; id < disjointSetCount; id++) {
-        if (variantClusteringDisjointSets->find(id) == id) {
-            variantClusteringClusterRepresentatives.push_back(id);
+        elementsByCluster.push_back({variantClusteringDisjointSets->find(id), id});
+    }
+    std::sort(elementsByCluster.begin(), elementsByCluster.end());
+
+    uint64_t discardedClusters = 0;
+    uint64_t keptClusters = 0;
+    uint64_t removedReads = 0;
+
+    // Pre-allocate buffer for duplicate detection to avoid re-allocation per cluster
+    std::vector<pair<ReadId, uint64_t>> readOccurrences;
+    readOccurrences.reserve(256); // Reasonable expected coverage
+
+    // Iterate through groups of elements belonging to the same cluster
+    uint64_t totalElements = elementsByCluster.size();
+    uint64_t i = 0;
+    while (i < totalElements) {
+        uint64_t repId = elementsByCluster[i].first;
+        uint64_t start = i;
+        
+        // Find end of current cluster
+        while (i < totalElements && elementsByCluster[i].first == repId) {
+            i++;
+        }
+        uint64_t end = i; // [start, end)
+        
+        uint64_t clusterSize = end - start;
+        bool keepCluster = true;
+
+        /*  
+        if (clusterSize > 1) {
+        
+            // 1. Identify reads that appear multiple times in this cluster.
+            // We want to remove ALL occurrences of ambiguous reads.
+            
+            // Gather (ReadId, ElementIndex) for all members
+            readOccurrences.clear();
+            if (readOccurrences.capacity() < clusterSize) {
+            readOccurrences.reserve(clusterSize);
+            }
+
+            for(uint64_t k = start; k < end; k++) {
+                uint64_t elementId = elementsByCluster[k].second;
+                ReadId r = variantClusteringPositionPairs[elementId].first.getReadId();
+                readOccurrences.push_back({r, elementId});
+            }
+            
+            // Sort by ReadId to find duplicates
+            std::sort(readOccurrences.begin(), readOccurrences.end());
+            
+            uint64_t validMemberCount = 0;
+            uint64_t r = 0;
+            while(r < clusterSize) {
+                ReadId currentRead = readOccurrences[r].first;
+                uint64_t rStart = r;
+                while(r < clusterSize && readOccurrences[r].first == currentRead) {
+                    r++;
+                }
+                uint64_t rEnd = r;
+                uint64_t count = rEnd - rStart;
+                
+                if (count > 1) {
+                    // This read appears multiple times. Mark all occurrences as invalid (255).
+                    for(uint64_t k = rStart; k < rEnd; k++) {
+                        uint64_t elementId = readOccurrences[k].second;
+                        if (elementId < variantClusteringPositionPairAlleles.size()) {
+                        variantClusteringPositionPairAlleles[elementId] = 255;
+                        removedReads++;
+                        }
+                    }
+                } else {
+                    validMemberCount++;
+                }
+            }
+
+            if (validMemberCount == 0) {
+                keepCluster = false;
+            }
+        
+        }
+        */
+
+        // STRICT FILTER: Discard entire cluster if any ambiguity exists (Total Position Pairs != Total Unique Reads)
+        if (clusterSize > 1) {
+            readOccurrences.clear();
+            if (readOccurrences.capacity() < clusterSize) {
+                readOccurrences.reserve(clusterSize);
+            }
+            for(uint64_t k = start; k < end; k++) {
+                uint64_t elementId = elementsByCluster[k].second;
+                ReadId r = variantClusteringPositionPairs[elementId].first.getReadId();
+                readOccurrences.push_back({r, elementId});
+            }
+            
+            // Sort by ReadId
+            std::sort(readOccurrences.begin(), readOccurrences.end());
+            
+            // Check for duplicates
+            for(size_t k = 1; k < readOccurrences.size(); k++) {
+                if (readOccurrences[k].first == readOccurrences[k-1].first) {
+                    keepCluster = false;
+                    break;
+                }
+            }
+        }
+        
+        
+        if (keepCluster) {
+            variantClusteringClusterRepresentatives.push_back(repId);
+            keptClusters++;
+        } else {
+            discardedClusters++;
         }
     }
     
-    cout << "Found " << variantClusteringClusterRepresentatives.size() << " clusters from " 
-         << disjointSetCount << " unique position pairs" << endl;
+    cout << "Found " << variantClusteringClusterRepresentatives.size() << " valid clusters." << endl;
+    cout << "Discarded " << discardedClusters << " empty clusters." << endl;
+    cout << "Removed " << removedReads << " ambiguous read references (duplicates within clusters)." << endl;
 
     const auto tIdentifyClustersEnd = steady_clock::now();
     const double tIdentifyClusters = seconds(tIdentifyClustersEnd - tIdentifyClustersStart);
@@ -1094,12 +1022,9 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
                     
                     // Mark self-overlaps as deleted immediately
                     if (rA == rB) {
-                         alignmentData[alignmentId].isDeleted = true;
-                         localRemovedCount++; // It's thread-local, safe to increment here? 
-                         // Wait, alignmentData is shared. Writing bool is atomic-ish but let's be safe.
-                         // Multiple threads might confuse this count? 
-                         // Actually, only r0 thread processes r0. So safe.
-                         continue;
+                        alignmentData[alignmentId].isDeleted = true;
+                        localRemovedCount++;
+                        continue;
                     }
                     
                     // Enforce canonical ordering: only process if r0 < target.
@@ -1116,6 +1041,9 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
             
             std::sort(candidates.begin(), candidates.end());
             candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+            uint64_t validOverlapLengthOnR0;
+            uint64_t bestOverlapLengthOnR0;
             
             size_t n = candidates.size();
             for(size_t i = 0; i < n; ) {
@@ -1124,41 +1052,75 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
                 size_t j = i + 1;
                 
                 while(j < n && candidates[j].first == currentTarget) {
-                     uint32_t currAlignmentId = candidates[j].second;
-                     
-                     const auto& validInfo = alignmentData[currAlignmentId].info;
-                     const auto& bestInfo = alignmentData[bestAlignmentId].info;
+                    uint32_t currAlignmentId = candidates[j].second;
+                    const auto& validAd = alignmentData[currAlignmentId];
+                    const auto& bestAd = alignmentData[bestAlignmentId];
+                    const auto& validInfo = validAd.info;
+                    const auto& bestInfo = bestAd.info;
+                    
+                    bool isBetter = false;
+
+                    // Helper to check validity
+                    bool validHasMetrics = (validInfo.mismatchCount != invalid<uint32_t>) && (validInfo.gapCount != invalid<uint32_t>);
+                    bool bestHasMetrics = (bestInfo.mismatchCount != invalid<uint32_t>) && (bestInfo.gapCount != invalid<uint32_t>);
+
+                    if (validHasMetrics && !bestHasMetrics) {
+                        isBetter = true;
+                    } else if (validHasMetrics && bestHasMetrics) {
+                        uint64_t validErrors = (uint64_t)validInfo.mismatchCount + (uint64_t)validInfo.gapCount;
+                        uint64_t bestErrors = (uint64_t)bestInfo.mismatchCount + (uint64_t)bestInfo.gapCount;
                         
-                     bool isBetter = false;
-                     // Prefer valid mismatch counts
-                     if (validInfo.mismatchCount != invalid<uint32_t> && bestInfo.mismatchCount == invalid<uint32_t>) {
-                         isBetter = true;
-                     } else if (validInfo.mismatchCount != invalid<uint32_t> && bestInfo.mismatchCount != invalid<uint32_t>) {
-                         if (validInfo.mismatchCount < bestInfo.mismatchCount) {
-                             isBetter = true;
-                         } else if (validInfo.mismatchCount == bestInfo.mismatchCount) {
-                             if (validInfo.markerCount > bestInfo.markerCount) {
-                                 isBetter = true;
-                             }
-                         }
-                     } else { 
-                         // Fallback to length.
-                         if (bestInfo.mismatchCount == invalid<uint32_t> && validInfo.mismatchCount == invalid<uint32_t>) {
-                              if (validInfo.markerCount > bestInfo.markerCount) {
-                                 isBetter = true;
-                              }
-                         }
-                     }
-                     
-                     if (isBetter) {
-                         alignmentData[bestAlignmentId].isDeleted = true;
-                         localRemovedCount++;
-                         bestAlignmentId = currAlignmentId; 
-                     } else {
-                         alignmentData[currAlignmentId].isDeleted = true;
-                         localRemovedCount++;
-                     }
-                     j++;
+                        // Calculate overlap length on r0 efficiently using stored coordinates
+                        // This avoids expensive marker lookups and works because qs/qe/ts/te are populated during alignment import.
+                        uint64_t validOverlapLengthOnR0;
+                        if (validAd.readIds[0] == r0) {
+                            validOverlapLengthOnR0 = (uint64_t)validAd.qe - (uint64_t)validAd.qs;
+                        } else {
+                            validOverlapLengthOnR0 = (uint64_t)validAd.te - (uint64_t)validAd.ts;
+                        }
+
+                        uint64_t bestOverlapLengthOnR0;
+                        if (bestAd.readIds[0] == r0) {
+                            bestOverlapLengthOnR0 = (uint64_t)bestAd.qe - (uint64_t)bestAd.qs;
+                        } else {
+                            bestOverlapLengthOnR0 = (uint64_t)bestAd.te - (uint64_t)bestAd.ts;
+                        }
+
+                        // Protect against division by zero
+                        DINARA_ASSERT(validOverlapLengthOnR0 > 0);
+                        DINARA_ASSERT(bestOverlapLengthOnR0 > 0);
+
+                        double validErrorRate = (double)validErrors / (double)validOverlapLengthOnR0;
+                        double bestErrorRate = (double)bestErrors / (double)bestOverlapLengthOnR0;
+                        
+                        if (validErrorRate < bestErrorRate) {
+                            isBetter = true;
+                        } else if (validErrorRate > bestErrorRate) {    
+                            isBetter = false;
+                        } else {
+                            // Tie-breaker
+                            if (validInfo.markerCount > bestInfo.markerCount) {
+                                isBetter = true;
+                            }
+                        }
+                    } else { 
+                        // Fallback to length if no metrics available
+                        if (!validHasMetrics && !bestHasMetrics) {
+                            if (validInfo.markerCount > bestInfo.markerCount) {
+                                isBetter = true;
+                            }
+                        }
+                    }
+                    
+                    if (isBetter) {
+                        alignmentData[bestAlignmentId].isDeleted = true;
+                        localRemovedCount++;
+                        bestAlignmentId = currAlignmentId; 
+                    } else {
+                        alignmentData[currAlignmentId].isDeleted = true;
+                        localRemovedCount++;
+                    }
+                    j++;
                 }
                 i = j;
             }
