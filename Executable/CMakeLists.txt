@@ -37,8 +37,14 @@ file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
 include_directories(../src)
 
-# # Additional link directory.
+# Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
+
+# Point to local build directory
+set(DINARA_BUILD_DIR "$ENV{HOME}/.dinaraBuild")
+include_directories(${DINARA_BUILD_DIR}/include)
+link_directories(${DINARA_BUILD_DIR}/lib)
+list(APPEND CMAKE_PREFIX_PATH "${DINARA_BUILD_DIR}")
 
 # On Linux, we build a static executable, so we must find static libraries (.a).
 if(NOT APPLE)
