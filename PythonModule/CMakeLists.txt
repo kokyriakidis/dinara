@@ -44,6 +44,12 @@ include_directories(../src)
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
 
+# Point to local build directory
+set(DINARA_BUILD_DIR "$ENV{HOME}/.dinaraBuild")
+include_directories(${DINARA_BUILD_DIR}/include)
+link_directories(${DINARA_BUILD_DIR}/lib)
+list(APPEND CMAKE_PREFIX_PATH "${DINARA_BUILD_DIR}")
+
 # Define our library.
 add_library(dinaraPythonModule SHARED ${SOURCES})
 

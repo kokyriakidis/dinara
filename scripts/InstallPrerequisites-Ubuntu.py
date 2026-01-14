@@ -5,6 +5,23 @@ import shutil
 import subprocess
 import tempfile
 
+# Define the local build directory
+HOME = os.path.expanduser("~")
+DINARA_BUILD_DIR = os.path.join(HOME, ".dinaraBuild")
+INCLUDE_DIR = os.path.join(DINARA_BUILD_DIR, "include")
+LIB_DIR = os.path.join(DINARA_BUILD_DIR, "lib")
+
+# Clean and recreate the build directory structure
+def initializeBuildDirectory():
+    print(f"Initializing build directory: {DINARA_BUILD_DIR}")
+    if os.path.exists(DINARA_BUILD_DIR):
+        print(f"Removing existing directory: {DINARA_BUILD_DIR}")
+        shutil.rmtree(DINARA_BUILD_DIR)
+    
+    os.makedirs(INCLUDE_DIR, exist_ok=True)
+    os.makedirs(LIB_DIR, exist_ok=True)
+    print("Created include and lib directories.")
+
 def isArm():
     return subprocess.getoutput("uname -p") == "aarch64"
 
@@ -35,9 +52,9 @@ def checkRustLibrariesConsistency():
     times with different Rust versions, which causes linker errors.
     """
     rustLibraries = [
-        ("/usr/local/lib/libastarpa_c.a", "libastarpa_c.a"),
-        ("/usr/local/lib/libpoasta_c.a", "libpoasta_c.a"),
-        ("/usr/local/lib/libsimd_minimizers_c.a", "libsimd_minimizers_c.a"),
+        (os.path.join(LIB_DIR, "libastarpa_c.a"), "libastarpa_c.a"),
+        (os.path.join(LIB_DIR, "libpoasta_c.a"), "libpoasta_c.a"),
+        (os.path.join(LIB_DIR, "libsimd_minimizers_c.a"), "libsimd_minimizers_c.a"),
     ]
     
     # Collect hashes for all existing libraries
@@ -76,8 +93,8 @@ def checkRustLibrariesConsistency():
             "to avoid linker errors (duplicate 'rust_eh_personality' symbols).\n" +
             "\n" +
             "To fix this, remove all existing Rust libraries and reinstall:\n" +
-            "  sudo rm -rf /usr/include/astarpa /usr/include/poasta /usr/include/simd-minimizers\n" +
-            "  sudo rm -f /usr/local/lib/libastarpa_c.a /usr/local/lib/libpoasta_c.* /usr/local/lib/libsimd_minimizers_c.*\n" +
+            "  rm -rf " + INCLUDE_DIR + "/astarpa " + INCLUDE_DIR + "/poasta " + INCLUDE_DIR + "/simd-minimizers\n" +
+            "  rm -f " + LIB_DIR + "/libastarpa_c.a " + LIB_DIR + "/libpoasta_c.* " + LIB_DIR + "/libsimd_minimizers_c.*\n" +
             "  python3 scripts/InstallPrerequisites-Ubuntu.py\n" +
             "="*70
         )
@@ -124,9 +141,8 @@ def installAptPackages():
 def installSeqan():
 
     # The path where the include files will go.
-    installPath = "/usr/include/seqan"
+    installPath = os.path.join(INCLUDE_DIR, "seqan")
     
-    # First check that this path does not exist.
     # First check that this path does not exist.
     if os.path.exists(installPath):
         print("The seqan install path %s already exists. Skipping installation." % installPath)
@@ -168,8 +184,8 @@ def installSpoa():
     # without the static version.
     # So we have to build it from source.
     
-    if os.path.exists("/usr/local/include/spoa/spoa.hpp"):
-        print("spoa header found in /usr/local/include/spoa/spoa.hpp. Skipping installation.")
+    if os.path.exists(os.path.join(INCLUDE_DIR, "spoa/spoa.hpp")):
+        print("spoa header found. Skipping installation.")
         return
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
@@ -196,6 +212,9 @@ def installSpoa():
             # To avoid these additional dependencies, we turn off the dispatcher feature for now.
             # We could turn it back on if we see significant performance degradation in this area.
             spoaBuildFlags = "-DCMAKE_BUILD_TYPE=Release -Dspoa_optimize_for_portability=ON -Dspoa_build_tests=OFF"
+
+        # Add install prefix
+        spoaBuildFlags += " -DCMAKE_INSTALL_PREFIX=" + DINARA_BUILD_DIR
 
         # Build the shared library.
         print("\n******** Building spoa shared library")
@@ -237,6 +256,9 @@ def setupRustToolchain():
         print("Rust not found. Installing Rust...")
         runCommand("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
     
+    # Prepend local cargo bin to PATH so that subprocesses (like cbindgen) find the correct cargo
+    os.environ["PATH"] = os.path.dirname(cargoPath) + os.pathsep + os.environ["PATH"]
+    
     # Update rustup and use latest nightly for consistency across all Rust libraries
     # Nightly is required because astarpa uses unstable Rust features
     print("Updating Rust to latest nightly...")
@@ -258,8 +280,8 @@ def installAstarpa():
     cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
     cbindgenPath = os.path.expanduser("~/.cargo/bin/cbindgen")
 
-    installPath = "/usr/include/astarpa"
-    libPath = "/usr/local/lib/libastarpa_c.a"
+    installPath = os.path.join(INCLUDE_DIR, "astarpa")
+    libPath = os.path.join(LIB_DIR, "libastarpa_c.a")
     
     if os.path.exists(installPath + "/astarpa.h") and os.path.exists(libPath):
         print("astarpa header found in %s/astarpa.h. Skipping installation." % installPath)
@@ -287,11 +309,12 @@ def installAstarpa():
         runCommand(cbindgenPath + " --lang c --cpp-compat --crate astarpa-c -o astarpa.h")
         
         # Install
-        print("Installing astarpa to /usr/local...")
+        # Install
+        print("Installing astarpa to " + DINARA_BUILD_DIR + "...")
         if not os.path.exists(installPath):
-            runCommand("sudo mkdir -p " + installPath)
-        runCommand("sudo cp astarpa.h " + installPath)
-        runCommand("sudo cp ../target/release/libastarpa_c.a /usr/local/lib/")
+            os.makedirs(installPath, exist_ok=True)
+        runCommand("cp astarpa.h " + installPath)
+        runCommand("cp ../target/release/libastarpa_c.a " + LIB_DIR)
         
         os.chdir(oldDirectory)
 
@@ -301,8 +324,8 @@ def installPoasta():
     
     cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
     
-    installPath = "/usr/include/poasta"
-    libPath = "/usr/local/lib/libpoasta_c.a"
+    installPath = os.path.join(INCLUDE_DIR, "poasta")
+    libPath = os.path.join(LIB_DIR, "libpoasta_c.a")
     
     if os.path.exists(installPath + "/poasta.h") and os.path.exists(libPath):
         print("poasta-c header found in %s/poasta.h. Skipping installation." % installPath)
@@ -322,12 +345,13 @@ def installPoasta():
         runCommand("RUSTFLAGS='-C target-cpu=native' " + cargoPath + " build --release")
         
         # Install
-        print("Installing poasta-c to /usr/local...")
+        # Install
+        print("Installing poasta-c to " + DINARA_BUILD_DIR + "...")
         if not os.path.exists(installPath):
-            runCommand("sudo mkdir -p " + installPath)
-        runCommand("sudo cp poasta.h " + installPath)
-        runCommand("sudo cp target/release/libpoasta_c.so /usr/local/lib/")
-        runCommand("sudo cp target/release/libpoasta_c.a /usr/local/lib/")
+            os.makedirs(installPath, exist_ok=True)
+        runCommand("cp poasta.h " + installPath)
+        runCommand("cp target/release/libpoasta_c.so " + LIB_DIR)
+        runCommand("cp target/release/libpoasta_c.a " + LIB_DIR)
         
         os.chdir(oldDirectory)
 
@@ -336,8 +360,8 @@ def installSimdMinimizers():
     
     cargoPath = os.path.expanduser("~/.cargo/bin/cargo")
     
-    installPath = "/usr/include/simd-minimizers"
-    libPath = "/usr/local/lib/libsimd_minimizers_c.a"
+    installPath = os.path.join(INCLUDE_DIR, "simd-minimizers")
+    libPath = os.path.join(LIB_DIR, "libsimd_minimizers_c.a")
     
     if os.path.exists(installPath + "/simd_minimizers.h") and os.path.exists(libPath):
         print("simd-minimizers-c header found in %s/simd_minimizers.h. Skipping installation." % installPath)
@@ -357,15 +381,20 @@ def installSimdMinimizers():
         runCommand("RUSTFLAGS='-C target-cpu=native' " + cargoPath + " build --release")
         
         # Install
-        print("Installing simd-minimizers-c to /usr/local...")
+        # Install
+        print("Installing simd-minimizers-c to " + DINARA_BUILD_DIR + "...")
         if not os.path.exists(installPath):
-            runCommand("sudo mkdir -p " + installPath)
-        runCommand("sudo cp simd_minimizers.h " + installPath)
-        runCommand("sudo cp target/release/libsimd_minimizers_c.so /usr/local/lib/")
-        runCommand("sudo cp target/release/libsimd_minimizers_c.a /usr/local/lib/")
+            os.makedirs(installPath, exist_ok=True)
+        runCommand("cp simd_minimizers.h " + installPath)
+        runCommand("cp target/release/libsimd_minimizers_c.so " + LIB_DIR)
+        runCommand("cp target/release/libsimd_minimizers_c.a " + LIB_DIR)
         
         os.chdir(oldDirectory)
 
+
+
+# Initialize build directory (clean start)
+initializeBuildDirectory()
 
 # Install non-Rust prerequisites first
 installAptPackages() 
@@ -431,11 +460,11 @@ checkRustLibrariesConsistency()
 def installShasta2():
     print("Installing shasta2 and dependencies (abPOA)...")
     
-    installPath = "/usr/include/shasta2"
-    libPath = "/usr/local/lib/libshasta2.so"
-    staticLibPath = "/usr/local/lib/libshasta2.a"
-    abpoaLibPath = "/usr/local/lib/libabpoa.so"
-    abpoaStaticLibPath = "/usr/local/lib/libabpoa.a"
+    installPath = os.path.join(INCLUDE_DIR, "shasta2")
+    libPath = os.path.join(LIB_DIR, "libshasta2.so")
+    staticLibPath = os.path.join(LIB_DIR, "libshasta2.a")
+    abpoaLibPath = os.path.join(LIB_DIR, "libabpoa.so")
+    abpoaStaticLibPath = os.path.join(LIB_DIR, "libabpoa.a")
     
     # Check if already installed (all components)
     if os.path.exists(installPath + "/src") and os.path.exists(libPath) and os.path.exists(abpoaLibPath) and os.path.exists(staticLibPath) and os.path.exists(abpoaStaticLibPath):
@@ -469,60 +498,106 @@ def installShasta2():
         # Install abPOA Shared
         if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.so"):
             print("Installing abPOA shared from shasta2 build...")
-            runCommand("sudo cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.so " + abpoaLibPath)
+            runCommand("cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.so " + abpoaLibPath)
         else:
             print("Warning: libabpoa.so not found in shasta2 build directory.")
 
         # Install abPOA Static
         if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.a"):
             print("Installing abPOA static from shasta2 build...")
-            runCommand("sudo cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.a " + abpoaStaticLibPath)
+            runCommand("cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.a " + abpoaStaticLibPath)
         else:
             print("Warning: libabpoa.a not found in shasta2 build directory.")
 
         # Install Headers
-        if not os.path.exists("/usr/include/abpoa"):
-            runCommand("sudo mkdir -p /usr/include/abpoa")
-        runCommand("sudo cp " + abpoaBuildDir + "/abPOA/include/*.h /usr/include/abpoa/")
-        # Also copy abpoa.h to /usr/include/abpoa.h for compatibility
-        runCommand("sudo cp " + abpoaBuildDir + "/abPOA/include/abpoa.h /usr/include/")
+        abpoaIncludeDir = os.path.join(INCLUDE_DIR, "abpoa")
+        if not os.path.exists(abpoaIncludeDir):
+            os.makedirs(abpoaIncludeDir, exist_ok=True)
+        runCommand("cp " + abpoaBuildDir + "/abPOA/include/*.h " + abpoaIncludeDir)
+        # Also copy abpoa.h to /include/abpoa.h for compatibility
+        runCommand("cp " + abpoaBuildDir + "/abPOA/include/abpoa.h " + INCLUDE_DIR)
         
         os.chdir("shasta2")
         
-        # PATCH: Add static library target to PythonModule/CMakeLists.txt
-        # We append code to define 'shasta2Static' which excludes main.cpp and PythonModule.cpp
-        patchContent = """
-# Static library for Dinara
-file(GLOB SOURCES_STATIC ../src/*.cpp)
-list(REMOVE_ITEM SOURCES_STATIC ${CMAKE_CURRENT_SOURCE_DIR}/../src/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/PythonModule.cpp)
-add_library(shasta2Static STATIC ${SOURCES_STATIC})
-set_target_properties(shasta2Static PROPERTIES OUTPUT_NAME "shasta2")
-"""
-        with open("PythonModule/CMakeLists.txt", "a") as f:
-            f.write(patchContent)
-
-        os.mkdir("build")
-        os.chdir("build")
-        
         # Build shasta2 library (Python Module + Static Lib)
-        runCommand("cmake .. -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON")
+        # The option -DBUILD_STATIC_LIBRARY=ON was added recently to shasta2.
+        if not os.path.exists("build"):
+            os.mkdir("build")
+        os.chdir("build")
+
+        # Use absolute path for install prefix to avoid ambiguity
+        installTmpDir = os.path.abspath("../install_tmp")
+        
+        # Run cmake with install prefix
+        runCommand(f"cmake .. -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON -DBUILD_STATIC_LIBRARY=ON -DCMAKE_INSTALL_PREFIX={installTmpDir}")
         runCommand("make -j")
+        # Run make install to populate install_tmp
+        runCommand("make install")
         
         # Install shasta2 library (Shared)
-        print("Installing shasta2 shared to /usr/local...")
-        runCommand("sudo cp PythonModule/shasta2.so " + libPath)
+        print("Installing shasta2 shared to " + LIB_DIR + "...")
+        # Check standard install location first, then fallback
+        # Shared might be in lib or bin depending on platform/cmake
+        possibleSharedNames = [
+            os.path.join(installTmpDir, "lib/shasta2.so"), 
+            os.path.join(installTmpDir, "bin/shasta2.so"), 
+            os.path.join(installTmpDir, "shasta2-install/bin/shasta2.so"),
+            "shasta2-install/bin/shasta2.so", # Fallback if prefix ignored
+            "PythonModule/shasta2.so", 
+            "src/shasta2.so"
+        ]
+        
+        foundShared = False
+        for name in possibleSharedNames:
+            if os.path.exists(name):
+                 runCommand("cp " + name + " " + libPath)
+                 foundShared = True
+                 break
+                 
+        if not foundShared:
+            print("Warning: shasta2.so not found even after make install.")
 
         # Install shasta2 library (Static)
-        print("Installing shasta2 static to /usr/local...")
-        if os.path.exists("PythonModule/libshasta2.a"):
-            runCommand("sudo cp PythonModule/libshasta2.a " + staticLibPath)
+        print("Installing shasta2 static to " + LIB_DIR + "...")
+        
+        # User confirmed DESTINATION is shasta2-install/bin
+        possibleStaticNames = [
+            os.path.join(installTmpDir, "shasta2-install/bin/shasta2.a"),
+            os.path.join(installTmpDir, "bin/shasta2.a"),
+            os.path.join(installTmpDir, "lib/shasta2.a"),
+            "shasta2-install/bin/shasta2.a", # Fallback if prefix ignored (installed in build)
+            "src/shasta2.a"
+        ]
+        
+        foundStatic = False
+        sourceStaticLib = ""
+        
+        for name in possibleStaticNames:
+             if os.path.exists(name):
+                 sourceStaticLib = name
+                 foundStatic = True
+                 break
+                 
+        if foundStatic:
+            print(f"Found static library at: {sourceStaticLib}")
+            # Rename to libshasta2.a for Dinara
+            runCommand("cp " + sourceStaticLib + " " + os.path.join(LIB_DIR, "libshasta2.a"))
         else:
-            print("Warning: libshasta2.a not found (static build failed?)")
+             print("Error: shasta2.a not found in likely locations. Listing files:")
+             runCommand("find . -name '*.a'")
+             if os.path.exists(installTmpDir):
+                 runCommand(f"find {installTmpDir} -name '*.a'")
+
         
         # Install shasta2 headers
         if not os.path.exists(installPath):
-            runCommand("sudo mkdir -p " + installPath)
-        runCommand("sudo cp -r ../src " + installPath)
+            os.makedirs(installPath, exist_ok=True)
+        # Check install_tmp first, then src
+        tmpInclude = os.path.join(installTmpDir, "include")
+        if os.path.exists(tmpInclude):
+             runCommand(f"cp -r {tmpInclude}/* {installPath}")
+        else:
+             runCommand("cp -r ../src/* " + installPath)
         
         os.chdir(oldDirectory)
 
@@ -536,6 +611,7 @@ installSimdMinimizers()
 installShasta2()
   
 # Make sure the newly created libraries are immediately visible to the loader.
-runCommand("sudo ldconfig")
+# For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable
+# runCommand("sudo ldconfig")
 
 print("Installation of Dinara prerequisites completed successfully.")
