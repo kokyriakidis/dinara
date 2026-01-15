@@ -702,6 +702,26 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Compute the alignment.
             try {
                 if(alignmentMethod == 0) {
+                    // ...
+                }
+                
+                // Direct Chain Propagation Check
+                bool precomputedUsed = false;
+                if(!alignmentCandidatesAlignmentsData.alignments.empty() && 
+                   (alignmentMethod == 5 || alignmentMethod == 6)) { // Only supported for these methods/InvertedIndex
+                    if(i < alignmentCandidatesAlignmentsData.alignments.size()) {
+                        // Use precomputed alignment.
+                        alignment = alignmentCandidatesAlignmentsData.alignments[i];
+                        uint32_t mCount0 = uint32_t(markers[orientedReadIds[0].getValue()].size());
+                        uint32_t mCount1 = uint32_t(markers[orientedReadIds[1].getValue()].size());
+                        alignmentInfo.create(alignment, mCount0, mCount1);
+                        precomputedUsed = true;
+                    }
+                }
+
+                if(precomputedUsed) {
+                    // Skip alignment computation.
+                } else if(alignmentMethod == 0) {
 
                     // Get the markers for the two oriented reads in this candidate.
                     for(size_t j=0; j<2; j++) {
@@ -813,6 +833,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
+            alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount); // Transfer gap events
             
 
             data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);

@@ -36,6 +36,7 @@
 namespace dinara {
 
     class Assembler;
+    class InvertedIndexFinder;
     class AssemblerInfo;
     class Alignment;
     class AlignmentData;
@@ -226,6 +227,7 @@ class dinara::Assembler :
     public MappedMemoryOwner,
     public HttpServer {
 public:
+    friend class InvertedIndexFinder;
 
 
     /***************************************************************************
@@ -440,6 +442,10 @@ private:
     void createKmerChecker(
         const KmersOptions& kmersOptions,
         uint64_t threadCount);
+    void setKmerChecker(shared_ptr<KmerChecker> inputKmerChecker)
+    {
+        kmerChecker = inputKmerChecker;
+    }
     void accessKmerChecker();
 
     // This one should eventually go away, but there are several scripts
@@ -551,6 +557,15 @@ private:
 
 
 
+    // The alignment associated to each alignment candidate.
+    // Computed by findAlignmentCandidatesInvertedIndex (Direct Chain Propagation).
+    // If empty, computed by computeAlignments.
+    class AlignmentCandidatesAlignmentsData {
+    public:
+        MemoryMapped::Vector<Alignment> alignments;
+    };
+    AlignmentCandidatesAlignmentsData alignmentCandidatesAlignmentsData;
+    
     // Low level functions to get marker Kmers/KmerIds of an oriented read.
     // They are obtained from the reads and not from CompressedMarker::kmerId,
     // which will soon go away.
@@ -605,11 +620,21 @@ private:
     MarkerId findReverseComplement(MarkerId) const;
 
     // Counting of marker Kmers.
-    shared_ptr<KmerCounter> kmerCounter;
 public:
+    shared_ptr<KmerCounter> kmerCounter;
+    // Count k-mers in markers.
+    // If the k-mer counts were already computed, this recomputes them.
+    // The previous k-mer counts are lost.
     void countKmers(
         uint64_t threadCount,
-        const string& globalFrequencyOverrideDirectory);
+        const string& globalFrequencyOverrideDirectory
+    );
+    
+    // Optimized variant using markerKmerIds.
+    void countKmersFromMarkerKmerIds(uint64_t threadCount);
+
+    // This creates various histograms of k-mer frequencies:
+    // 1. One line per k-mer. Frequencies of this k-mer in reads and in the marker graph.
     void accessKmerCounts();
 
 
@@ -654,6 +679,9 @@ private:
     // Filter optimal alignments (Best Hit)
     void filterBestHitAlignmentsThreadFunction(size_t threadId);
     std::atomic<uint64_t> removedBestHitCount;
+public:
+    void filterBestHitAlignments(uint64_t threadCount);
+private:
 
     // Filter local segments (coverage based)
     void filterLocalSegmentsThreadFunction(size_t threadId);
@@ -1850,7 +1878,87 @@ private:
 
     // Find the vertex of the global marker graph that contains a given marker.
     // The marker is specified by the ReadId and Strand of the oriented read
-    // it belongs to, plus the ordinal of the marker in the oriented read.
+    // it belongs to, plus the ordinal
+    // The thread function runs on one thread at a time.
+    void findMarkersSimdMinimizersPass1(size_t threadId);
+    void findMarkersSimdMinimizersPass2(size_t threadId);
+    class FindMarkersSimdMinimizersData {
+    public:
+         int k;
+         int w;
+    };
+    FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
+
+public:
+    // Prune existing markers based on KmerCounter frequencies.
+    void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount);
+
+    // Alignment candidates using Inverted Index.
+    void findAlignmentCandidatesInvertedIndex(
+        uint64_t minMarkerCount, 
+        double maxDriftRate,     
+        uint64_t threadCount
+    );
+private:
+    struct InvertedIndexOccurrence {
+        KmerId kmerId;
+        ReadId readId;
+        uint32_t position;
+        bool operator<(const InvertedIndexOccurrence& other) const {
+            return kmerId < other.kmerId;
+        }
+    };
+    
+    // Compact Structure for Query Phase (8 bytes).
+    struct CompactOccurrence {
+        ReadId readId;
+        uint32_t position;
+    };
+    
+
+    
+    class AlignmentCandidatesInvertedIndexData {
+    public:
+         uint64_t minMarkerCount;
+         double maxDriftRate;
+         uint64_t k; // k-mer length for canonicalization
+         
+         // Phase 1: Heavy vector with Keys (for Sort/Group).
+         vector<InvertedIndexOccurrence> occurrences; 
+         
+         // Phase 2: Compact vector for Query (8 bytes/hit).
+         vector<CompactOccurrence> compactOccurrences;
+
+
+
+         // Open Addressing Hash Table (Linear Probing).
+         // Key = KmerId. Value = {Start, Count}.
+         // Stored as a flat vector. size must be Power of 2.
+         struct HashEntry {
+             KmerId key;
+             uint64_t start;
+             uint32_t count;
+             bool empty = true;
+         };
+         vector<HashEntry> hashTable;
+    };
+
+    AlignmentCandidatesInvertedIndexData invertedIndexData;
+
+
+    void applyKmerCountFilterThreadFunctionPass1(size_t threadId);
+    void applyKmerCountFilterThreadFunctionPass2(size_t threadId);
+    class ApplyKmerCountFilterData {
+    public:
+        uint64_t minFreq;
+        uint64_t maxFreq;
+        MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t> oldMarkers;
+        MemoryMapped::VectorOfVectors<KmerId, uint64_t> oldMarkerKmerIds;
+    };
+    ApplyKmerCountFilterData applyKmerCountFilterData;
+
+    // Use a k-mer checker to select markers.
+    // If not used, kmerChecker is empty (null pointer).
     // If the marker is not contained in any vertex, return
     // MarkerGraph::invalidVertexId.
 public:

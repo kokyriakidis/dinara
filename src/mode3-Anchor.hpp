@@ -122,7 +122,7 @@ class dinara::mode3::Anchors :
     public MappedMemoryOwner {
 public:
 
-    // This constructor creates the Anchors from marker graph edges.
+    // This constructor creates the Anchors from marker graph edges or vertices.
     Anchors(
         const MappedMemoryOwner&,
         const Reads& reads,
@@ -131,7 +131,8 @@ public:
         const MarkerGraph&,
         uint64_t minPrimaryCoverage,
         uint64_t maxPrimaryCoverage,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        bool createFromVertices = false);
 
     // This constructor creates the Anchors from marker k-mers.
     Anchors(
@@ -321,6 +322,7 @@ private:
     public:
         uint64_t minPrimaryCoverage;
         uint64_t maxPrimaryCoverage;
+        bool createFromVertices;
 
         const MarkerGraph* markerGraphPointer;
 
@@ -337,6 +339,7 @@ private:
     };
     ConstructFromMarkerGraphData constructFromMarkerGraphData;
     void constructFromMarkerGraphThreadFunction(uint64_t threadId);
+    void constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId);
 
 
     // Data and functions used when constructing the Anchors from marker k-mers.

@@ -319,6 +319,7 @@ void ProjectedAlignmentSegment::computeAlignment(
         uint64_t position1 = 0;
         mismatchCount = 0;
         deletionCount = 0;
+        gapEventCount = 0;
         hasLargeIndel = false;
         maxIndelSize = 0;
 
@@ -357,11 +358,13 @@ void ProjectedAlignmentSegment::computeAlignment(
                     } else if (op.first) { // D
                         position0 += currentVal;
                         deletionCount += currentVal;
+                        gapEventCount++;
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     } else if (op.second) { // I
                         position1 += currentVal;
                         deletionCount += currentVal;
+                        gapEventCount++; // ONE gap event
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     }
@@ -763,12 +766,14 @@ void ProjectedAlignment::computeStatistics()
     // Compute total edit distances.
     totalEditDistance = 0;
     totalEditDistanceRle = 0;
+    totalGapEventCount = 0; // Init
     hasLargeIndel = false;
     maxIndelSize = 0;
     for(const ProjectedAlignmentSegment& segment: segments) {
         totalEditDistance += segment.editDistance;
         totalEditDistanceRle += segment.rleEditDistance;
         totalDeletionCount += segment.deletionCount;
+        totalGapEventCount += segment.gapEventCount; // Sum
         mismatchCount += segment.mismatchCount;
         if (segment.hasLargeIndel) hasLargeIndel = true;
         if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;

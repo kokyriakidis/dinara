@@ -470,6 +470,12 @@ void AssemblerOptions::addConfigurableOptions()
         "The minimum number of times a pair of reads must be found by the MinHash/LowHash algorithm "
         "in order to be considered a candidate alignment.")
 
+        ("MinHash.candidateMethod",
+        value<string>(&minHashOptions.candidateMethod)->
+        default_value("MinHash"),
+        "The method used to identify alignment candidates: "
+        "'MinHash' (default) or 'InvertedIndex' (more efficient, Hifiasm-like).")
+
         ("MinHash.allPairs",
         bool_switch(&minHashOptions.allPairs)->
         default_value(false),

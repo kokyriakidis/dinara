@@ -398,27 +398,8 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
 
 
 // Main function to create variant clusters
-void Assembler::performGlobalVariantClustering(
-    uint64_t minCoverage,
-    uint64_t maxCoverage,
-    uint64_t threadCount)
+void Assembler::filterBestHitAlignments(uint64_t threadCount)
 {
-    performanceLog << timestamp << "Starting Global Variant Clustering" << endl;
-    cout << timestamp << "Starting Global Variant Clustering" << endl;
-    
-    cout << "\n============================================" << endl;
-    cout << "VARIANT CLUSTERING PROFILING" << endl;
-    cout << "============================================\n" << endl;
-    
-    // Check prerequisites
-    const auto tCheckStart = steady_clock::now();
-    reads->checkReadsAreOpen();
-    checkMarkersAreOpen();
-    checkAlignmentDataAreOpen();
-    DINARA_ASSERT(compressedAlignments.isOpen());
-    const auto tCheckEnd = steady_clock::now();
-    const double tCheck = seconds(tCheckEnd - tCheckStart);
-    
     // --- Best Hit Alignment Filtering (hifiasm-style) ---
     // Efficiently implemented using alignmentTable iteration (reads -> overlaps).
     
@@ -433,6 +414,32 @@ void Assembler::performGlobalVariantClustering(
     runThreads(&Assembler::filterBestHitAlignmentsThreadFunction, threadCount);
 
     cout << timestamp << "Removed " << removedBestHitCount << " redundant alignments (marked isDeleted)." << endl;
+}
+
+// Main function to create variant clusters
+void Assembler::performGlobalVariantClustering(
+    uint64_t minCoverage,
+    uint64_t maxCoverage,
+    uint64_t threadCount)
+{
+    performanceLog << timestamp << "Starting Global Variant Clustering" << endl;
+    cout << timestamp << "Starting Global Variant Clustering" << endl;
+    
+    cout << "\n============================================" << endl;
+    cout << "VARIANT CLUSTERING PROFILING" << endl;
+    cout << "============================================\n" << endl;
+
+    
+    // Check prerequisites
+    const auto tCheckStart = steady_clock::now();
+    reads->checkReadsAreOpen();
+    checkMarkersAreOpen();
+    checkAlignmentDataAreOpen();
+    DINARA_ASSERT(compressedAlignments.isOpen());
+    const auto tCheckEnd = steady_clock::now();
+    const double tCheck = seconds(tCheckEnd - tCheckStart);
+    
+
 
     // Access position pairs that were collected during alignment computation
     // Note: Finding and storage of position pairs happened during computeAlignments (timed separately)
@@ -994,7 +1001,7 @@ void Assembler::performGlobalVariantClustering(
 
 
 
-void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
+void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
 {
     uint64_t begin, end;
     uint64_t localRemovedCount = 0;
@@ -1039,89 +1046,120 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t threadId)
             
             if (candidates.empty()) continue;
             
+            // Sort by target
             std::sort(candidates.begin(), candidates.end());
             candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 
-            uint64_t validOverlapLengthOnR0;
-            uint64_t bestOverlapLengthOnR0;
-            
             size_t n = candidates.size();
+
+            // Structure to cache computed score and range for overlap check
+            struct CandidateInfo {
+                uint32_t alignmentId;
+                int64_t score;
+                uint64_t qs;
+                uint64_t qe;
+                ReadId r0; // Store r0 to check which side to use
+            };
+
             for(size_t i = 0; i < n; ) {
                 ReadId currentTarget = candidates[i].first;
-                uint32_t bestAlignmentId = candidates[i].second;
-                size_t j = i + 1;
+                size_t j = i;
+                
+                // Collect all candidates for this target
+                std::vector<CandidateInfo> group;
                 
                 while(j < n && candidates[j].first == currentTarget) {
-                    uint32_t currAlignmentId = candidates[j].second;
-                    const auto& validAd = alignmentData[currAlignmentId];
-                    const auto& bestAd = alignmentData[bestAlignmentId];
-                    const auto& validInfo = validAd.info;
-                    const auto& bestInfo = bestAd.info;
-                    
-                    bool isBetter = false;
+                    uint32_t alignmentId = candidates[j].second;
+                    const auto& ad = alignmentData[alignmentId];
+                    const auto& info = ad.info;
 
-                    // Helper to check validity
-                    bool validHasMetrics = (validInfo.mismatchCount != invalid<uint32_t>) && (validInfo.gapCount != invalid<uint32_t>);
-                    bool bestHasMetrics = (bestInfo.mismatchCount != invalid<uint32_t>) && (bestInfo.gapCount != invalid<uint32_t>);
-
-                    if (validHasMetrics && !bestHasMetrics) {
-                        isBetter = true;
-                    } else if (validHasMetrics && bestHasMetrics) {
-                        uint64_t validErrors = (uint64_t)validInfo.mismatchCount + (uint64_t)validInfo.gapCount;
-                        uint64_t bestErrors = (uint64_t)bestInfo.mismatchCount + (uint64_t)bestInfo.gapCount;
-                        
-                        // Calculate overlap length on r0 efficiently using stored coordinates
-                        // This avoids expensive marker lookups and works because qs/qe/ts/te are populated during alignment import.
-                        uint64_t validOverlapLengthOnR0;
-                        if (validAd.readIds[0] == r0) {
-                            validOverlapLengthOnR0 = (uint64_t)validAd.qe - (uint64_t)validAd.qs;
-                        } else {
-                            validOverlapLengthOnR0 = (uint64_t)validAd.te - (uint64_t)validAd.ts;
-                        }
-
-                        uint64_t bestOverlapLengthOnR0;
-                        if (bestAd.readIds[0] == r0) {
-                            bestOverlapLengthOnR0 = (uint64_t)bestAd.qe - (uint64_t)bestAd.qs;
-                        } else {
-                            bestOverlapLengthOnR0 = (uint64_t)bestAd.te - (uint64_t)bestAd.ts;
-                        }
-
-                        // Protect against division by zero
-                        DINARA_ASSERT(validOverlapLengthOnR0 > 0);
-                        DINARA_ASSERT(bestOverlapLengthOnR0 > 0);
-
-                        double validErrorRate = (double)validErrors / (double)validOverlapLengthOnR0;
-                        double bestErrorRate = (double)bestErrors / (double)bestOverlapLengthOnR0;
-                        
-                        if (validErrorRate < bestErrorRate) {
-                            isBetter = true;
-                        } else if (validErrorRate > bestErrorRate) {    
-                            isBetter = false;
-                        } else {
-                            // Tie-breaker
-                            if (validInfo.markerCount > bestInfo.markerCount) {
-                                isBetter = true;
-                            }
-                        }
-                    } else { 
-                        // Fallback to length if no metrics available
-                        if (!validHasMetrics && !bestHasMetrics) {
-                            if (validInfo.markerCount > bestInfo.markerCount) {
-                                isBetter = true;
-                            }
-                        }
-                    }
-                    
-                    if (isBetter) {
-                        alignmentData[bestAlignmentId].isDeleted = true;
-                        localRemovedCount++;
-                        bestAlignmentId = currAlignmentId; 
+                    // Calculate metrics
+                    uint64_t overlapLenOnR0;
+                    if (ad.readIds[0] == r0) {
+                        overlapLenOnR0 = (uint64_t)ad.qe - (uint64_t)ad.qs;
                     } else {
-                        alignmentData[currAlignmentId].isDeleted = true;
-                        localRemovedCount++;
+                        overlapLenOnR0 = (uint64_t)ad.te - (uint64_t)ad.ts;
                     }
+
+                    int64_t score;
+                    bool hasMetrics = (info.mismatchCount != invalid<uint32_t>) && (info.gapCount != invalid<uint32_t>);
+                    
+                    if (hasMetrics) {
+                        // Hifiasm Affine Score (map-hifi approximation: M=2, X=4, O=4, E=2)
+                        // Score ~= 2*Len - 6*Mis - 4*GapBases - 4*GapEvents
+                        score = 2 * (int64_t)overlapLenOnR0 
+                              - 6 * (int64_t)info.mismatchCount 
+                              - 4 * (int64_t)info.gapCount;
+                        
+                        if (info.gapEventCount != invalid<uint32_t>) {
+                            score -= 4 * (int64_t)info.gapEventCount;
+                        }
+                    } else {
+                        // Fallback: Use Marker Count or Length as proxy
+                        // Make it negative-ish relative to "real" scores if we prefer real metrics
+                        // But if no metrics, we can't do affine. Use raw length * 2.
+                        score = 2 * (int64_t)overlapLenOnR0; 
+                    }
+
+                    // Get Range on r0 for overlap check
+                    uint64_t qs, qe;
+                    if (ad.readIds[0] == r0) {
+                        qs = ad.qs;
+                        qe = ad.qe;
+                    } else {
+                        qs = ad.ts;
+                        qe = ad.te;
+                    }
+
+                    group.push_back({alignmentId, score, qs, qe, r0});
                     j++;
                 }
+
+                // Sort group by score descending
+                std::sort(group.begin(), group.end(), [](const CandidateInfo& a, const CandidateInfo& b) {
+                    return a.score > b.score;
+                });
+
+                // Greedily keep non-overlapping candidates that pass score ratio
+                std::vector<CandidateInfo> kept;
+                int64_t bestScore = group.empty() ? 0 : group[0].score; // First is best due to sort
+
+                for (const auto& cand : group) {
+                    bool drop = false;
+                    
+                    // 1. Score Ratio Filter (Hifiasm -p 0.8)
+                    // We only apply this relative to the BEST chain for this pair.
+                    if (cand.score < bestScore * 0.8) {
+                        drop = true;
+                    } 
+                    else {
+                        // 2. Overlap Filter (Hifiasm -M 0.5)
+                        uint64_t len = cand.qe - cand.qs; 
+                        
+                        for (const auto& existing : kept) {
+                            // Check overlap on r0
+                            uint64_t oStart = std::max(cand.qs, existing.qs);
+                            uint64_t oEnd = std::min(cand.qe, existing.qe);
+                            
+                            if (oEnd > oStart) {
+                                uint64_t oLen = oEnd - oStart;
+                                // Hifiasm Threshold: > 50% of the NEW (shorter/worse) chain
+                                if (oLen > 0.5 * len) {
+                                    drop = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (drop) {
+                        alignmentData[cand.alignmentId].isDeleted = true;
+                        localRemovedCount++;
+                    } else {
+                        kept.push_back(cand);
+                    }
+                }
+
                 i = j;
             }
         }

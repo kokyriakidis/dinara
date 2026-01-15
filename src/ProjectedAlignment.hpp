@@ -92,6 +92,9 @@ public:
     // The number of deletions in the raw alignment.
     uint64_t deletionCount = invalid<uint64_t>;
 
+    // The number of gap events (indels).
+    uint64_t gapEventCount = invalid<uint64_t>;
+
     // Flag for large indel (>= 6 bases)
     bool hasLargeIndel = false;
 
@@ -185,7 +188,10 @@ public:
     uint64_t mismatchCount;
     
     // The number of deletions in the raw alignment.
-    uint64_t totalDeletionCount;
+    uint64_t totalDeletionCount; // Total bases in deletions
+
+    // The number of gap events (indels) in the raw alignment.
+    uint64_t totalGapEventCount;
 
     // Flag for large indel (>= 6 bases)
     bool hasLargeIndel = false;

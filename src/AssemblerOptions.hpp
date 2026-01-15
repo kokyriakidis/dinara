@@ -190,6 +190,7 @@ public:
     int maxBucketSize;
     int minFrequency;
     bool allPairs;
+    string candidateMethod; // "MinHash" or "InvertedIndex".
     void write(ostream&) const;
 };
 
