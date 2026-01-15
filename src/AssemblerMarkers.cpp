@@ -5,6 +5,7 @@
 #include "findMarkerId.hpp"
 #include "KmerCounter.hpp"
 #include "KmerDistributionInfo.hpp"
+#include "KmerChecker.hpp"
 #include "MarkerFinder.hpp"
 #include "MarkerKmers.hpp"
 #include "performanceLog.hpp"
@@ -42,7 +43,61 @@ void Assembler::findMarkers(uint64_t threadCount)
 // Find markers using SIMD-accelerated minimizers.
 // This uses the simd-minimizers-c library to compute canonical minimizers
 // for each read, and stores the minimizer positions as markers.
-void Assembler::findMarkersSimdMinimizers(uint64_t /* threadCount */, int k, int w)
+// Helper to get sorted unique positions and KmerIds.
+static std::vector<std::pair<uint32_t, KmerId>> getSortedUniquePositionsAndIds(
+    ReadId readId,
+    const Reads& reads,
+    int k,
+    SimdSketcher* sketcher,
+    const shared_ptr<KmerChecker>& kmerChecker,
+    string& readSequence // reusable buffer
+) {
+    const LongBaseSequenceView read = reads.getRead(readId);
+    
+    if(read.baseCount < uint64_t(k)) {
+        return {};
+    }
+
+    // Convert read to string for simd-minimizers.
+    readSequence.clear();
+    for(uint64_t i = 0; i < read.baseCount; i++) {
+        readSequence.push_back(read[i].character());
+    }
+
+    // Compute minimizer positions using simd-minimizers.
+    MinimizerList minimizerPositions = canonical_minimizer_positions(
+        sketcher,
+        readSequence.c_str(),
+        readSequence.size());
+
+    // Copy to vector, sort, and remove duplicates based on position.
+    std::vector<uint32_t> positions(minimizerPositions.data, 
+                                     minimizerPositions.data + minimizerPositions.len);
+    
+    // Free the minimizer list immediately.
+    free_minimizer_list(minimizerPositions);
+    
+    // Sort and uniq.
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    
+    std::vector<std::pair<uint32_t, KmerId>> validMarkers;
+    validMarkers.reserve(positions.size());
+
+    for(const uint32_t position : positions) {
+        Kmer kmer;
+        extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+        const KmerId kmerId = kmer.id(uint64_t(k));
+        
+        if(!kmerChecker || kmerChecker->isMarker(kmerId)) {
+            validMarkers.push_back({position, kmerId});
+        }
+    }
+
+    return validMarkers;
+}
+
+void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
 {
     reads->checkReadsAreOpen();
 
@@ -50,108 +105,128 @@ void Assembler::findMarkersSimdMinimizers(uint64_t /* threadCount */, int k, int
         << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
-    // Store k in assemblerInfo for later use.
+    // Store parameters.
     assemblerInfo->k = k;
+    findMarkersSimdMinimizersData.k = k;
+    findMarkersSimdMinimizersData.w = w;
 
     // Create the markers data structure.
     markers.createNew(largeDataName("Markers"), largeDataPageSize);
+    
+    // Create the markerKmerIds data structure.
+    markerKmerIds.createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
 
-    // Create the SIMD sketcher for computing minimizers.
-    SimdSketcher* sketcher = simd_sketcher_new(static_cast<uint8_t>(k), static_cast<uint8_t>(w));
+    // Adjust the numbers of threads, if necessary.
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
 
-    // We need to process reads in two passes:
     // Pass 1: Count markers for each oriented read.
-    // Pass 2: Store markers.
+    const uint64_t readCount = reads->readCount();
+    const uint64_t batchSize = 100; // Adjust batch size as needed.
 
-    const ReadId readCount = reads->readCount();
-
-    // Helper lambda to get sorted, unique minimizer positions for a read.
-    auto getSortedUniquePositions = [&](ReadId readId) -> std::vector<uint32_t> {
-        const LongBaseSequenceView read = reads->getRead(readId);
-        
-        if(read.baseCount < uint64_t(k)) {
-            return {};
-        }
-
-        // Convert read to string for simd-minimizers.
-        string readSequence;
-        readSequence.reserve(read.baseCount);
-        for(uint64_t i = 0; i < read.baseCount; i++) {
-            readSequence.push_back(read[i].character());
-        }
-
-        // Compute minimizer positions using simd-minimizers.
-        MinimizerList minimizerPositions = canonical_minimizer_positions(
-            sketcher,
-            readSequence.c_str(),
-            readSequence.size());
-
-        // Copy to vector, sort, and remove duplicates.
-        std::vector<uint32_t> positions(minimizerPositions.data, 
-                                         minimizerPositions.data + minimizerPositions.len);
-        std::sort(positions.begin(), positions.end());
-        positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-
-        // Free the minimizer list.
-        free_minimizer_list(minimizerPositions);
-
-        return positions;
-    };
-
-    // Pass 1: Count markers for each read.
     markers.beginPass1(2 * readCount);
-
-    for(ReadId readId = 0; readId < readCount; readId++) {
-        const std::vector<uint32_t> positions = getSortedUniquePositions(readId);
-        
-        // Each read has the same number of markers on both strands.
-        markers.incrementCount(OrientedReadId(readId, 0).getValue(), positions.size());
-        markers.incrementCount(OrientedReadId(readId, 1).getValue(), positions.size());
-    }
-
-    markers.beginPass2();
+    markerKmerIds.beginPass1(2 * readCount);
+    setupLoadBalancing(readCount, batchSize);
+    runThreads(&Assembler::findMarkersSimdMinimizersPass1, threadCount);
 
     // Pass 2: Store markers.
-    for(ReadId readId = 0; readId < readCount; readId++) {
-        const LongBaseSequenceView read = reads->getRead(readId);
-        const std::vector<uint32_t> positions = getSortedUniquePositions(readId);
-
-        if(positions.empty()) {
-            continue;
-        }
-
-        // Get pointers for storing markers.
-        CompressedMarker* markerPointerStrand0 = markers.begin(OrientedReadId(readId, 0).getValue());
-        CompressedMarker* markerPointerStrand1 = markers.end(OrientedReadId(readId, 1).getValue()) - 1;
-
-        // Store markers for both strands.
-        for(const uint32_t position : positions) {
-            // Strand 0: position as-is.
-            markerPointerStrand0->position = position;
-            ++markerPointerStrand0;
-
-            // Strand 1: reverse complement position.
-            markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
-            --markerPointerStrand1;
-        }
-
-        // Verify correct number of markers were stored (like original MarkerFinder).
-        DINARA_ASSERT(markerPointerStrand0 == markers.end(OrientedReadId(readId, 0).getValue()));
-        DINARA_ASSERT(markerPointerStrand1 == markers.begin(OrientedReadId(readId, 1).getValue()) - 1);
-    }
-
+    markers.beginPass2();
+    markerKmerIds.beginPass2();
+    setupLoadBalancing(readCount, batchSize);
+    runThreads(&Assembler::findMarkersSimdMinimizersPass2, threadCount);
+    
     markers.endPass2(false);
+    markerKmerIds.endPass2(false);
 
-    // Free the sketcher.
-    simd_sketcher_free(sketcher);
-
-    markers.unreserve();
-
-    // Final message.
+    // Report.
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
     performanceLog << timestamp << "Finding markers using SIMD minimizers completed in " << tTotal << " s." << endl;
     cout << "Created " << markers.totalSize() << " markers using SIMD minimizers." << endl;
+}
+
+void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
+{
+    // Initialize thread-local sketcher and buffer.
+    SimdSketcher* sketcher = simd_sketcher_new(
+        static_cast<uint8_t>(findMarkersSimdMinimizersData.k), 
+        static_cast<uint8_t>(findMarkersSimdMinimizersData.w));
+    string readSequence;
+
+    uint64_t begin, end;
+    while(getNextBatch(begin, end)) {
+        for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
+            const auto markers = getSortedUniquePositionsAndIds(
+                readId, *reads, findMarkersSimdMinimizersData.k, sketcher, kmerChecker, readSequence);
+
+            this->markers.incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
+            this->markers.incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
+            
+            // MarkerKmerIds must match markers counts exactly.
+            markerKmerIds.incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
+            markerKmerIds.incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
+        }
+    }
+    simd_sketcher_free(sketcher);
+}
+
+void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
+{
+    // Initialize thread-local sketcher and buffer.
+    SimdSketcher* sketcher = simd_sketcher_new(
+        static_cast<uint8_t>(findMarkersSimdMinimizersData.k), 
+        static_cast<uint8_t>(findMarkersSimdMinimizersData.w));
+    string readSequence;
+
+    uint64_t begin, end;
+    while(getNextBatch(begin, end)) {
+        for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
+            const LongBaseSequenceView read = reads->getRead(readId); // Need read for baseCount
+            const auto markers = getSortedUniquePositionsAndIds(
+                readId, *reads, findMarkersSimdMinimizersData.k, sketcher, kmerChecker, readSequence);
+
+            if(markers.empty()) continue;
+
+            CompressedMarker* markerPointerStrand0 = this->markers.begin(OrientedReadId(readId, 0).getValue());
+            CompressedMarker* markerPointerStrand1 = this->markers.end(OrientedReadId(readId, 1).getValue()) - 1;
+            
+            KmerId* kmerIdPointerStrand0 = markerKmerIds.begin(OrientedReadId(readId, 0).getValue());
+            KmerId* kmerIdPointerStrand1 = markerKmerIds.end(OrientedReadId(readId, 1).getValue()) - 1;
+
+            for(const auto& val : markers) {
+                uint32_t position = val.first;
+                KmerId kmerId = val.second;
+                
+                // Strand 0
+                markerPointerStrand0->position = position;
+                ++markerPointerStrand0;
+                
+                *kmerIdPointerStrand0 = kmerId;
+                ++kmerIdPointerStrand0;
+
+                // Strand 1: reverse complement position.
+                // KmerId should be the RC of kmerId?
+                // Wait, getSortedUniquePositionsAndIds returns Canonical KmerId if check was canonical?
+                // MarkerKmers usually stores RC KmerId for Strand 1?
+                // Or does it store the canonical ID?
+                // Assembler::computeMarkerKmerIds stores the ID of the kmer *on that strand*.
+                // So for Strand 1, we need RC of kmerId.
+                
+                // Let's compute RC KmerId.
+                Kmer kmer(kmerId, assemblerInfo->k);
+                Kmer rcKmer = kmer.reverseComplement(assemblerInfo->k);
+                KmerId rcKmerId = rcKmer.id(assemblerInfo->k);
+
+                markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - findMarkersSimdMinimizersData.k - position);
+                --markerPointerStrand1;
+                
+                *kmerIdPointerStrand1 = rcKmerId;
+                --kmerIdPointerStrand1;
+            }
+        }
+    }
+    simd_sketcher_free(sketcher);
 }
 
 
@@ -269,6 +344,12 @@ MarkerId Assembler::findReverseComplement(MarkerId markerId) const
 void Assembler::computeMarkerKmerIds(uint64_t threadCount)
 {
     performanceLog << timestamp << "Gathering marker KmerIds." << endl;
+
+    // optimization: if we already have them (from findMarkersSimdMinimizers), don't recompute.
+    if(markerKmerIds.isOpen()) {
+        performanceLog << timestamp << "Marker KmerIds are already present. Skipping computation." << endl;
+        return;
+    }
 
     // Check that we have what we need.
     checkMarkersAreOpen();
@@ -909,3 +990,195 @@ void Assembler::accessMarkerKmers()
         markers);
 }
 
+
+// Count k-mers from pre-calculated Marker KmerIds.
+void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
+{
+    DINARA_ASSERT(markerKmerIds.isOpen());
+    
+    // Create KmerCounter from markerKmerIds.
+    kmerCounter = make_shared<KmerCounter>(
+        assemblerInfo->k,
+        markerKmerIds, 
+        *this, 
+        threadCount);
+    
+    kmerCounter->createHistogram(); 
+
+    ofstream csv("KmerFrequencyHistogram.csv");
+    kmerCounter->writeHistogram(csv);
+    kmerCounter->getHistogramInfo(assemblerInfo->kmerDistributionInfo);
+
+    cout << "Marker k-mer coverage distribution:"
+        " low "   << assemblerInfo->kmerDistributionInfo.coverageLow <<
+        ", peak " << assemblerInfo->kmerDistributionInfo.coveragePeak <<
+        ", high " << assemblerInfo->kmerDistributionInfo.coverageHigh << endl;
+}
+
+// Prune existing markers based on KmerCounter frequencies using markerKmerIds.
+void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount)
+{
+    performanceLog << timestamp << "Filtering markers based on KmerCounter frequency (Fast ID path)." << endl;
+    const auto tBegin = std::chrono::steady_clock::now();
+
+    // Check prerequisites.
+    checkMarkersAreOpen();
+    DINARA_ASSERT(markerKmerIds.isOpen());
+    if(!kmerCounter) {
+        throw runtime_error("KmerCounter is required for marker filtering.");
+    }
+
+    // Move current markers/ids to oldMarkers by renaming files on disk.
+    // VectorOfVectors does not support move assignment, so we use renaming.
+    const string markersName = markers.getName(); 
+    const string markersNameOld = markersName + "-Old";
+    markers.rename(markersNameOld);
+    applyKmerCountFilterData.oldMarkers.accessExistingReadOnly(markersNameOld);
+    markers.close(); // Close the current handle so we can create a new one.
+
+    const string kmerIdsName = markerKmerIds.getName();
+    const string kmerIdsNameOld = kmerIdsName + "-Old";
+    markerKmerIds.rename(kmerIdsNameOld);
+    applyKmerCountFilterData.oldMarkerKmerIds.accessExistingReadOnly(kmerIdsNameOld);
+    markerKmerIds.close(); // Close the current handle so we can create a new one.
+
+    applyKmerCountFilterData.minFreq = minFreq;
+    applyKmerCountFilterData.maxFreq = maxFreq;
+
+    // Create new markers structure (overwriting/creating fresh files).
+    markers.createNew(markersName, largeDataPageSize);
+    markerKmerIds.createNew(kmerIdsName, largeDataPageSize);
+
+    // Adjust threads.
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const uint64_t readCount = reads->readCount();
+    const uint64_t batchSize = 100;
+
+    // Pass 1: Count valid markers.
+    markers.beginPass1(2 * readCount);
+    markerKmerIds.beginPass1(2 * readCount);
+    setupLoadBalancing(readCount, batchSize);
+    runThreads(&Assembler::applyKmerCountFilterThreadFunctionPass1, threadCount);
+
+    // Pass 2: Store valid markers.
+    markers.beginPass2();
+    markerKmerIds.beginPass2();
+    setupLoadBalancing(readCount, batchSize);
+    runThreads(&Assembler::applyKmerCountFilterThreadFunctionPass2, threadCount);
+    
+    markers.endPass2(false);
+    markerKmerIds.endPass2(false);
+
+    // Capture old size before removal.
+    const uint64_t oldTotalSize = applyKmerCountFilterData.oldMarkers.totalSize();
+
+    // Clean up old markers.
+    applyKmerCountFilterData.oldMarkers.remove();
+    applyKmerCountFilterData.oldMarkerKmerIds.remove();
+
+    // Report.
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
+    performanceLog << timestamp << "Marker filtering completed in " << tTotal << " s." << endl;
+    cout << "Filtered markers: kept " << markers.totalSize() << " out of " 
+         << oldTotalSize << "." << endl;
+}
+
+void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
+{
+    const uint64_t k = assemblerInfo->k;
+    
+    uint64_t begin, end;
+    while(getNextBatch(begin, end)) {
+        for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
+            
+            // Get markers for this read from oldMarkers.
+            const OrientedReadId orientedReadId(readId, 0);
+            const auto oldReadMarkers = applyKmerCountFilterData.oldMarkers[orientedReadId.getValue()];
+            const auto oldReadMarkerKmerIds = applyKmerCountFilterData.oldMarkerKmerIds[orientedReadId.getValue()];
+            
+            uint64_t validCount = 0;
+            if(oldReadMarkers.size() > 0) {
+                for(size_t i=0; i<oldReadMarkers.size(); i++) {
+                    // Check frequency using ID (no Read access).
+                    KmerId kmerId = oldReadMarkerKmerIds[i]; // Strand 0 ID.
+                    
+                    // Canonicalize for checking (since KmerCounter tracks canonical).
+                    // Although KmerCounter could be built non-canonical, it's safer to query canonical.
+                    Kmer kmer(kmerId, k);
+                    KmerId rcKmerId = kmer.reverseComplement(k).id(k);
+                    KmerId canonical = std::min(kmerId, rcKmerId);
+
+                    const uint64_t freq = kmerCounter->getFrequency(canonical);
+                    
+                    if(freq >= applyKmerCountFilterData.minFreq && freq <= applyKmerCountFilterData.maxFreq) {
+                        validCount++;
+                    }
+                }
+            }
+
+            markers.incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
+            markers.incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
+            
+            markerKmerIds.incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
+            markerKmerIds.incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
+        }
+    }
+}
+
+void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
+{
+    const uint64_t k = assemblerInfo->k;
+    
+    uint64_t begin, end;
+    while(getNextBatch(begin, end)) {
+        for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
+            
+            const OrientedReadId orientedReadId0(readId, 0);
+            const auto oldReadMarkers = applyKmerCountFilterData.oldMarkers[orientedReadId0.getValue()];
+            const auto oldReadMarkerKmerIds = applyKmerCountFilterData.oldMarkerKmerIds[orientedReadId0.getValue()];
+            
+            if(oldReadMarkers.size() == 0) continue;
+
+            const LongBaseSequenceView read = reads->getRead(readId);
+
+            // Get pointers for storing markers.
+            CompressedMarker* markerPointerStrand0 = markers.begin(orientedReadId0.getValue());
+            CompressedMarker* markerPointerStrand1 = markers.end(OrientedReadId(readId, 1).getValue()) - 1;
+            
+            KmerId* kmerIdPointerStrand0 = markerKmerIds.begin(orientedReadId0.getValue());
+            KmerId* kmerIdPointerStrand1 = markerKmerIds.end(OrientedReadId(readId, 1).getValue()) - 1;
+
+            for(size_t i=0; i<oldReadMarkers.size(); i++) {
+                KmerId kmerId = oldReadMarkerKmerIds[i]; // Strand 0 ID
+                
+                Kmer kmer(kmerId, k);
+                KmerId rcKmerId = kmer.reverseComplement(k).id(k);
+                KmerId canonical = std::min(kmerId, rcKmerId);
+
+                const uint64_t freq = kmerCounter->getFrequency(canonical);
+                
+                if(freq >= applyKmerCountFilterData.minFreq && freq <= applyKmerCountFilterData.maxFreq) {
+                    const uint32_t position = oldReadMarkers[i].position;
+                    
+                    // Strand 0
+                    markerPointerStrand0->position = position;
+                    ++markerPointerStrand0;
+                    
+                    *kmerIdPointerStrand0 = kmerId;
+                    ++kmerIdPointerStrand0;
+
+                    // Strand 1 (Derived from Strand 0 info + read len)
+                    markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
+                    --markerPointerStrand1;
+                    
+                    *kmerIdPointerStrand1 = rcKmerId; // Store correct Strand 1 ID (RC)
+                    --kmerIdPointerStrand1;
+                }
+            }
+        }
+    }
+}

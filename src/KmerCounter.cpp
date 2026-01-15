@@ -388,3 +388,126 @@ void KmerCounter::overrideFrequencies(const KmerCounter& that)
         }
     }
 }
+
+// This constructor creates the KmerIdFrequencies hash table
+// from pre-calculated KmerIds (markerKmerIds).
+KmerCounter::KmerCounter(
+    uint64_t k,
+    const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds,
+    const MappedMemoryOwner& mappedMemoryOwner,
+    uint64_t threadCount
+    ) :
+    MultithreadedObject(*this),
+    MappedMemoryOwner(mappedMemoryOwner),
+    k(k),
+    markerKmerIdsPointer(&markerKmerIds)
+{
+    // Initial message.
+    performanceLog << timestamp << "Markers counting from IDs begins." << endl;
+    const auto tBegin = std::chrono::steady_clock::now();
+
+    // Adjust the numbers of threads, if necessary.
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    // Get the number of reads and sanity check.
+    const uint64_t readCount = markerKmerIds.size() / 2;
+    // We assume markerKmerIds is populated for all reads.
+
+    const uint64_t readBatchSize = 4;
+    const uint64_t bucketBatchSize = 100;
+
+    // Create a temporary hash table to hold the marker KmerIds of all the reads.
+    // (one strand only).
+    const uint64_t kmerCount = markerKmerIds.totalSize() / 2;
+    const uint64_t averageBucketSize = 16;
+    const uint64_t desiredBucketCount = kmerCount / averageBucketSize;
+    const uint64_t bucketCount = std::bit_ceil(desiredBucketCount);
+    hashMask = bucketCount - 1;
+
+    kmerIds.createNew(largeDataName("tmp-KmerCounterKmerIds"), largeDataPageSize);
+
+    // Gather marker KmerIds of all the reads (one strand only).
+    kmerIds.beginPass1(bucketCount);
+    setupLoadBalancing(readCount, readBatchSize);
+    runThreads(&KmerCounter::threadFunction1FromIds, threadCount);
+    kmerIds.beginPass2();
+    setupLoadBalancing(readCount, readBatchSize);
+    runThreads(&KmerCounter::threadFunction2FromIds, threadCount);
+    kmerIds.endPass2(false, true);
+
+    // Now we can create the final hash table to contain in each bucket
+    // pairs(KmerId, frequency).
+    kmerIdFrequencies.createNew(largeDataName("KmerFrequencies"), largeDataPageSize);
+    kmerIdFrequencies.beginPass1(bucketCount);
+    setupLoadBalancing(bucketCount, bucketBatchSize);
+    runThreads(&KmerCounter::threadFunction3, threadCount); // Reuse existing 3/4
+    kmerIdFrequencies.beginPass2();
+    setupLoadBalancing(bucketCount, bucketBatchSize);
+    runThreads(&KmerCounter::threadFunction4, threadCount);
+    kmerIdFrequencies.endPass2(false, true);
+
+    // Remove the temporary hash table.
+    kmerIds.remove();
+
+    // Final message.
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
+    performanceLog << timestamp << "Marker counting from IDs completed in " << tTotal << " s." << endl;
+}
+
+void KmerCounter::threadFunction1FromIds(uint64_t /* threadId */)
+{
+    threadFunction12FromIds(1);
+}
+
+void KmerCounter::threadFunction2FromIds(uint64_t /* threadId */)
+{
+    threadFunction12FromIds(2);
+}
+
+void KmerCounter::threadFunction12FromIds(uint64_t pass)
+{
+    KmerId kmerId;
+    KmerId rcKmerId;
+    KmerId canonicalKmerId;
+
+    const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds = *markerKmerIdsPointer;
+
+    // Loop over all batches of reads assigned to this thread.
+    uint64_t begin, end;
+    while(getNextBatch(begin,  end)) {
+
+        // Loop over all reads assigned to this batch.
+        for(uint64_t readId=begin; readId!=end; readId++) {
+            const OrientedReadId orientedReadId(ReadId(readId), 0);
+
+            // Access the marker KmerIds for this read (Strand 0).
+            const auto readMarkerKmerIds = markerKmerIds[orientedReadId.getValue()];
+
+            // Loop over the markers for this read.
+            for(KmerId id : readMarkerKmerIds) {
+                 kmerId = id;
+
+                 // Compute its reverse complement.
+                 // We need to reconstruct Kmer object to compute RC. 
+                 // This is CPU-only, no memory access.
+                 Kmer kmer(kmerId, k);
+                 rcKmerId = kmer.reverseComplement(k).id(k);
+
+                 canonicalKmerId = min(kmerId, rcKmerId);
+
+                 // Hash it.
+                 const uint64_t hashValue = MurmurHash64A(&canonicalKmerId, sizeof(canonicalKmerId), hashSeed);
+                 const uint64_t bucketId = hashValue & hashMask;
+
+                 if(pass == 1) {
+                     kmerIds.incrementCountMultithreaded(bucketId);
+                 } else {
+                     kmerIds.storeMultithreaded(bucketId, canonicalKmerId);
+                 }
+            }
+        }
+    }
+}

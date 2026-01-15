@@ -258,84 +258,135 @@ Superbubbles::Superbubbles(
 
 
 
-    // Compute dominator trees using as entrance each of the
+    // Compute dominator trees using a Virtual Root.
+    // We add a temporary virtual root and valid edges from it to all
     // vertices with zero in-degree.
-    BGL_FORALL_VERTICES(entrance, assemblyGraph, AssemblyGraph) {
-        if(in_degree(entrance, assemblyGraph) != 0) {
+    const vertex_descriptor virtualRoot = add_vertex(assemblyGraph);
+    indexMap[virtualRoot] = vertexIndex++;
+    
+    // Resize vectors to accommodate the virtual root.
+    dfNum.resize(vertexIndex);
+    parent.resize(vertexIndex);
+    verticesByDFNum.resize(vertexIndex);
+
+    using EdgeDescriptor = AssemblyGraph::edge_descriptor;
+    vector<EdgeDescriptor> virtualEdges;
+    BGL_FORALL_VERTICES(v, assemblyGraph, AssemblyGraph) {
+        if(v == virtualRoot) {
             continue;
         }
-
-        // Compute the dominator tree.
-        fill(dfNum.begin(), dfNum.end(), invalid<uint64_t>);
-        fill(parent.begin(), parent.end(), AssemblyGraph::null_vertex());
-        fill(verticesByDFNum.begin(), verticesByDFNum.end(), AssemblyGraph::null_vertex());
-        std::map<vertex_descriptor, vertex_descriptor> predecessorMap;
-
-        boost::lengauer_tarjan_dominator_tree(
-            assemblyGraph,
-            entrance,
-            boost::make_assoc_property_map(indexMap),
-            boost::make_iterator_property_map(dfNum.begin(), associativeIndexMap),
-            boost::make_iterator_property_map(parent.begin(), associativeIndexMap),
-            verticesByDFNum,
-            boost::make_assoc_property_map(predecessorMap));
-
-        if(debug) {
-            cout << "Forward dominator tree with entrance at " <<
-                anchorIdToString(assemblyGraph[entrance].getAnchorId()) << endl;
-        }
-        for(const auto& p: predecessorMap) {
-            const vertex_descriptor cv0 = p.second;
-            const vertex_descriptor cv1 = p.first;
-            forwardPairs.push_back({cv0, cv1});
-            if(debug) {
-                cout << "F " << anchorIdToString(assemblyGraph[cv0].getAnchorId()) << "->" <<
-                    anchorIdToString(assemblyGraph[cv1].getAnchorId()) << endl;
-            }
+        if(in_degree(v, assemblyGraph) == 0) {
+           virtualEdges.push_back(add_edge(virtualRoot, v, assemblyGraph).first);
         }
     }
 
+    // Compute the dominator tree.
+    fill(dfNum.begin(), dfNum.end(), invalid<uint64_t>);
+    fill(parent.begin(), parent.end(), AssemblyGraph::null_vertex());
+    fill(verticesByDFNum.begin(), verticesByDFNum.end(), AssemblyGraph::null_vertex());
+    std::map<vertex_descriptor, vertex_descriptor> predecessorMap;
+
+    boost::lengauer_tarjan_dominator_tree(
+        assemblyGraph,
+        virtualRoot,
+        boost::make_assoc_property_map(indexMap),
+        boost::make_iterator_property_map(dfNum.begin(), associativeIndexMap),
+        boost::make_iterator_property_map(parent.begin(), associativeIndexMap),
+        verticesByDFNum,
+        boost::make_assoc_property_map(predecessorMap));
+
+    if(debug) {
+        cout << "Forward dominator tree computed with Virtual Root." << endl;
+    }
+    for(const auto& p: predecessorMap) {
+        const vertex_descriptor cv0 = p.second;
+        const vertex_descriptor cv1 = p.first;
+        // Ignore edges involving the virtual root.
+        if(cv0 == virtualRoot || cv1 == virtualRoot) {
+            continue;
+        }
+        forwardPairs.push_back({cv0, cv1});
+        if(debug) {
+            cout << "F " << anchorIdToString(assemblyGraph[cv0].getAnchorId()) << "->" <<
+                anchorIdToString(assemblyGraph[cv1].getAnchorId()) << endl;
+        }
+    }
+
+    // Remove the virtual root and its edges.
+    for(const EdgeDescriptor e: virtualEdges) {
+        remove_edge(e, assemblyGraph);
+    }
+    remove_vertex(virtualRoot, assemblyGraph);
+    indexMap.erase(virtualRoot);
+    vertexIndex--; // Restore vertex count
 
 
-    // Compute dominator trees on the reverse graph using as entrance each of the
-    // vertices with zero in-degree on the reverse graph
-    // (that is, zero out-degree on the AssemblyGraph).
+    
+    // Compute dominator trees on the reverse graph using a Virtual Sink.
+    // In the AssemblyGraph, we add a Virtual Sink and edges from all
+    // vertices with zero out-degree to it.
+    // In the ReverseAssemblyGraph, this becomes a Virtual Source connected TO all sinks.
+    const vertex_descriptor virtualSink = add_vertex(assemblyGraph);
+    indexMap[virtualSink] = vertexIndex++;
+
+    // Resize vectors to accommodate the virtual sink.
+    dfNum.resize(vertexIndex);
+    parent.resize(vertexIndex);
+    verticesByDFNum.resize(vertexIndex);
+
+    virtualEdges.clear();
+    BGL_FORALL_VERTICES(v, assemblyGraph, AssemblyGraph) {
+        if(v == virtualSink) {
+            continue;
+        }
+        if(out_degree(v, assemblyGraph) == 0) {
+           virtualEdges.push_back(add_edge(v, virtualSink, assemblyGraph).first);
+        }
+    }
+
     using ReverseAssemblyGraph = boost::reverse_graph<AssemblyGraph>;
     ReverseAssemblyGraph reverseGraph(assemblyGraph);
-    BGL_FORALL_VERTICES(entrance, reverseGraph, ReverseAssemblyGraph) {
-        if(in_degree(entrance, reverseGraph) != 0) {
+
+    // Compute the dominator tree on reverse graph.
+    fill(dfNum.begin(), dfNum.end(), invalid<uint64_t>);
+    fill(parent.begin(), parent.end(), AssemblyGraph::null_vertex());
+    fill(verticesByDFNum.begin(), verticesByDFNum.end(), AssemblyGraph::null_vertex());
+    predecessorMap.clear();
+
+    boost::lengauer_tarjan_dominator_tree(
+        reverseGraph,
+        virtualSink,
+        boost::make_assoc_property_map(indexMap),
+        boost::make_iterator_property_map(dfNum.begin(), associativeIndexMap),
+        boost::make_iterator_property_map(parent.begin(), associativeIndexMap),
+        verticesByDFNum,
+        boost::make_assoc_property_map(predecessorMap));
+
+    if(debug) {
+        cout << "Backward dominator tree computed with Virtual Sink." << endl;
+    }
+    for(const auto& p: predecessorMap) {
+        const vertex_descriptor cv0 = p.first;
+        const vertex_descriptor cv1 = p.second;
+
+        // Ignore edges involving the virtual sink.
+        if(cv0 == virtualSink || cv1 == virtualSink) {
             continue;
         }
-
-        // Compute the dominator tree.
-        fill(dfNum.begin(), dfNum.end(), invalid<uint64_t>);
-        fill(parent.begin(), parent.end(), AssemblyGraph::null_vertex());
-        fill(verticesByDFNum.begin(), verticesByDFNum.end(), AssemblyGraph::null_vertex());
-        std::map<vertex_descriptor, vertex_descriptor> predecessorMap;
-
-        boost::lengauer_tarjan_dominator_tree(
-            reverseGraph,
-            entrance,
-            boost::make_assoc_property_map(indexMap),
-            boost::make_iterator_property_map(dfNum.begin(), associativeIndexMap),
-            boost::make_iterator_property_map(parent.begin(), associativeIndexMap),
-            verticesByDFNum,
-            boost::make_assoc_property_map(predecessorMap));
-
+        backwardPairs.push_back({cv0, cv1});
         if(debug) {
-            cout << "Backward dominator tree with exit at " <<
-                anchorIdToString(assemblyGraph[entrance].getAnchorId()) << endl;
-        }
-        for(const auto& p: predecessorMap) {
-            const vertex_descriptor cv0 = p.first;
-            const vertex_descriptor cv1 = p.second;
-            backwardPairs.push_back({cv0, cv1});
-            if(debug) {
-                cout << "B " << anchorIdToString(assemblyGraph[cv0].getAnchorId()) << "->" <<
-                    anchorIdToString(assemblyGraph[cv1].getAnchorId()) << endl;
-            }
+            cout << "B " << anchorIdToString(assemblyGraph[cv0].getAnchorId()) << "->" <<
+                anchorIdToString(assemblyGraph[cv1].getAnchorId()) << endl;
         }
     }
+
+    // Remove the virtual sink and its edges.
+    for(const EdgeDescriptor e: virtualEdges) {
+        remove_edge(e, assemblyGraph);
+    }
+    remove_vertex(virtualSink, assemblyGraph);
+    indexMap.erase(virtualSink);
+    vertexIndex--; // Restore vertex count
 
     // Compute strongly connected components.
     std::map<vertex_descriptor, uint64_t> componentMap;

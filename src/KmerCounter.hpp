@@ -36,6 +36,15 @@ public:
         uint64_t threadCount
         );
 
+    // This constructor creates the KmerIdFrequencies hash table
+    // from pre-calculated KmerIds (markerKmerIds).
+    KmerCounter(
+        uint64_t k,
+        const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds,
+        const MappedMemoryOwner& mappedMemoryOwner,
+        uint64_t threadCount
+        );
+
     // This constructor accesses an existing KmerIdFrequencies hash table.
     KmerCounter(
         uint64_t k,
@@ -60,6 +69,7 @@ private:
     uint64_t k;
     Reads const* readsPointer = 0;
     MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t> const* markersPointer = 0;
+    MemoryMapped::VectorOfVectors<KmerId, uint64_t> const* markerKmerIdsPointer = 0; // New member
 
     // Hashing.
     const uint32_t hashSeed = 12771;
@@ -72,13 +82,20 @@ private:
 
     // This is the persistent hash table that contains in each bucket
     // pairs(KmerId, frequency).
+public:
     MemoryMapped::VectorOfVectors<pair<KmerId, uint64_t>, uint64_t> kmerIdFrequencies;
+private:
 
 
     // Passes 1 and 2 gather marker KmerIds in the kmerIds hash table.
     void threadFunction1(uint64_t threadId);
     void threadFunction2(uint64_t threadId);
     void threadFunction12(uint64_t pass);
+
+    // Optimized threading functions that use markerKmerIds.
+    void threadFunction1FromIds(uint64_t threadId);
+    void threadFunction2FromIds(uint64_t threadId);
+    void threadFunction12FromIds(uint64_t pass);
 
     // Passes 3 and 4 gather fill in the KmerIdFrequencies hash table.
     void threadFunction3(uint64_t threadId);

@@ -32,7 +32,19 @@ using namespace dinara;
 #include "chrono.hpp"
 #include <filesystem>
 #include "iostream.hpp"
+
 #include "stdexcept.hpp"
+
+
+// Shasta 2 Integration
+#include "AssemblerShasta2Anchors.hpp"
+#include <thread>
+#include <vector>
+
+// Minimizer filtering
+#include "MinimizerChecker.hpp"
+#include "MarkerKmers.hpp"
+#include "KmerCounter.hpp"
 
 
 
@@ -169,6 +181,7 @@ void dinara::main::main(int argumentCount, const char** arguments)
     DINARA_ASSERT(0);
 
 }
+
 
 
 
@@ -481,11 +494,37 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD minimizers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdMinimizers) {
-        // Use SIMD-accelerated minimizers for marker generation.
+        // Pass 1: Use SIMD-accelerated minimizers for initial marker generation (no filtering).
+        // This generates a superset of the markers we eventually want.
         assembler.findMarkersSimdMinimizers(
             threadCount,
             assemblerOptions.kmersOptions.minimizerK,
             assemblerOptions.kmersOptions.minimizerW);
+
+        // Compute histogram using the pre-calculated KmerIds.
+        // This avoids accessing the Reads data structure (Cache Misses).
+        assembler.countKmersFromMarkerKmerIds(threadCount);
+        
+        // Retrieve peak and set thresholds.
+        const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+        const uint64_t minFreq = 3; 
+        const uint64_t maxFreq = 5 * coveragePeak;
+        const uint64_t distinctKmerCount = assembler.kmerCounter->kmerIdFrequencies.size();
+
+        cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
+        cout << "Filtering minimizers: Peak coverage is " << coveragePeak << "." << endl;
+        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "]." << endl;
+             
+        // Prune the existing markers in-place using the KmerCounter and markerKmerIds.
+        assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount);
+
+        // No need for a second pass of findMarkersSimdMinimizers.
+        // The markers are now filtered.
+
+        // Initialize KmerChecker for HttpServer diagnostics (optional).
+        cout << "Initializing KmerChecker for diagnostics." << endl;
+        assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
+            
     } else {
         // Use the default k-mer based method.
         // Initialize the KmerChecker, which has the information needed
@@ -497,14 +536,11 @@ void dinara::main::assemble(
     }
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
-    // If using alignment method 6, count marker k-mers.
-    if(assemblerOptions.alignOptions.alignMethod == 6) {
-        assembler.countKmers(threadCount, assemblerOptions.kmersOptions.globalFrequencyOverrideDirectory);
-    }
-
     // Gather marker KmerIds for all markers.
     // They are used by LowHash and alignment computation.
     // These will be kept until we are done computing alignments.
+    // Use the existing ones if available (from findMarkersSimdMinimizers),
+    // or compute them now (for legacy findMarkers).
     assembler.computeMarkerKmerIds(threadCount);
 
     // Flag palindromic reads.
@@ -527,8 +563,15 @@ void dinara::main::assemble(
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
     } else if(assemblerOptions.minHashOptions.allPairs) {
         assembler.markAlignmentCandidatesAllPairs();
+    } else if(assemblerOptions.minHashOptions.version == 2 || assemblerOptions.minHashOptions.candidateMethod == "InvertedIndex") {
+        // Inverted Index Method (Hifiasm-like).
+        assembler.findAlignmentCandidatesInvertedIndex(
+            assemblerOptions.alignOptions.minAlignedMarkerCount,
+            assemblerOptions.alignOptions.align6Options.driftRateTolerance,
+            threadCount
+        );
     } else {
-        DINARA_ASSERT(assemblerOptions.minHashOptions.version == 0); // Already checked for that.
+        DINARA_ASSERT(assemblerOptions.minHashOptions.version == 0 || assemblerOptions.minHashOptions.version == 1); 
         assembler.findAlignmentCandidatesLowHash0(
             assemblerOptions.minHashOptions.m,
             assemblerOptions.minHashOptions.hashFraction,
@@ -559,7 +602,9 @@ void dinara::main::assemble(
         computeProjectedAlignmentMetrics,
         threadCount);
 
-    
+    // Filter Best Hit Alignments (Hifiasm Parity)
+    assembler.filterBestHitAlignments(threadCount);
+
     assembler.performGlobalVariantClustering(
         assemblerOptions.markerGraphOptions.minCoverage,
         assemblerOptions.markerGraphOptions.maxCoverage,
@@ -622,6 +667,13 @@ void dinara::main::assemble(
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);
+    
+    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+    // // Create shasta2 anchors equivalent to the marker graph vertices.
+    // // This allows downstream processing using shasta2 tools.
+    // createShasta2Anchors(assembler, threadCount);
 
     // If the coverage range for primary marker graph edges (anchors) is not
     // specified, use the disjoint sets histogram to compute reasonable values.
@@ -642,6 +694,8 @@ void dinara::main::assemble(
             ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
     }
 
+
+
     // Construct the mode3::Anchors from marker graph.
     anchors =
         make_shared<mode3::Anchors>(
@@ -652,7 +706,8 @@ void dinara::main::assemble(
             assembler.markerGraph,
             minPrimaryCoverage,
             maxPrimaryCoverage,
-            threadCount);
+            threadCount,
+            true); // createFromVertices
     
 
     // Compute oriented read journeys.

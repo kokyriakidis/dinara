@@ -223,7 +223,8 @@ public:
     float errorRate = invalid<float>;
     uint32_t mismatchCount = invalid<uint32_t>;
     float errorRateGaps = invalid<float>;
-    uint32_t gapCount = invalid<uint32_t>;
+    uint32_t gapCount = invalid<uint32_t>;      // Total gap BASES
+    uint32_t gapEventCount = invalid<uint32_t>; // Total gap EVENTS
 
     void clearFlags()
     {

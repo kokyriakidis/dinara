@@ -1021,7 +1021,7 @@ void ClusterGraph::resolveForks()
                 // Absolute Threshold: Must handle at least 10% of the incoming flow (noise filtering).
                 double transitionProb = (double)flow / (double)flowIn;
                 
-                if(flow >= 0.7 * maxFlowThrough && transitionProb > 0.1) {
+                if(static_cast<double>(flow) >= 0.7 * static_cast<double>(maxFlowThrough) && transitionProb > 0.1) {
                     supportedOutEdges.insert(e_out);
                     validatedCoverage[e_out] += flow;
                 }
@@ -1042,7 +1042,7 @@ void ClusterGraph::resolveForks()
                  // In a "Cluster" graph, usually we don't have many new starts in the middle of a complex tangle.
                  // But let's be safe: If validatedCoverage explains < 30% of the edge and it wasn't picked as a successor, kill it.
                  
-                 if(graph[e_out].coverage < 10 || validatedCoverage[e_out] < 0.3 * graph[e_out].coverage) {
+                 if(graph[e_out].coverage < 10 || static_cast<double>(validatedCoverage[e_out]) < 0.3 * static_cast<double>(graph[e_out].coverage)) {
                      edgesToRemove.push_back(e_out);
                  }
             }
