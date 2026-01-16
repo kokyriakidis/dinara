@@ -478,7 +478,7 @@ void Assembler::createReadGraph5()
         const auto& ad = alignmentData[alignmentId];
         // If marked deleted by any stage of the pipeline, drop it.
         // Also check if read is chimeric (though detectChimericReadsFromAnchors handles deleting edges, safe to double check).
-        if (ad.isDeleted || isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
+        if (ad.isDeleted() || isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
              keepAlignment[alignmentId] = false;
              alignmentData[alignmentId].info.isInReadGraph = 0;
              filteredCount++;

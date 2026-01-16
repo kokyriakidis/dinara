@@ -468,7 +468,20 @@ public:
 
     // Flags
     bool coversHetSite = false;
-    bool isDeleted = false;
+    
+    // Directional deletion flags for phasing resolution
+    // isDeleted0: phasing decision from readIds[0]'s perspective
+    // isDeleted1: phasing decision from readIds[1]'s perspective
+    // An overlap is only kept if BOTH reads agree (conservative AND)
+    bool isDeleted0 = false;
+    bool isDeleted1 = false;
+    
+    // Helper: returns true if BOTH directions marked as deleted (conservative)
+    bool isDeleted() const { return isDeleted0 && isDeleted1; }
+    
+    // Helper: set both flags (for non-phasing deletion, e.g., filtering)
+    void setDeleted(bool val) { isDeleted0 = isDeleted1 = val; }
+    
     bool hasLargeIndel = false;
 
     // Explicit Coordinates (likely in bases, derived from markers or passed from PAF)

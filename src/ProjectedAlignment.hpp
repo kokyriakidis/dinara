@@ -9,6 +9,7 @@ an Alignment in marker space to base space.
 
 #include "array.hpp"
 #include "cstdint.hpp"
+#include "Base.hpp"
 #include "invalid.hpp"
 #include "iosfwd.hpp"
 #include "span.hpp"
@@ -22,7 +23,6 @@ namespace dinara {
 
     class Alignment;
     class Assembler;
-    class Base;
     class CompressedMarker;
     class LongBaseSequenceView;
     class OrientedReadId;
@@ -140,6 +140,13 @@ public:
     void constructAll();
     void constructQuickRle();
     void constructQuickRaw();
+    
+    // Flag to indicate if the projected alignment touches the ends of the markers.
+    bool touchesMarkerEnds = false;
+
+    // Phasing CIGAR (linear format, Op 0=M, 1=I, 2=D).
+    // Generated during construction to capture all segments, including perfect matches.
+    vector<uint32_t> phasingCigar;
 
     // Marker length and its half.
     uint32_t k;

@@ -108,7 +108,7 @@ void Assembler::filterLocalSegmentsThreadFunction(size_t threadId)
                 const auto& table = alignmentTable[orientedR0.getValue()];
                 for (uint32_t alignmentId : table) {
                     const auto& ad = alignmentData[alignmentId];
-                     if (ad.isDeleted) continue; // Skip deleted
+                     if (ad.isDeleted()) continue; // Skip deleted
 
                     // We use the explicit coordinates provided in AlignmentData (qs, qe, ts, te).
                     // These are assumed to be 0-based coordinates on the Forward strand of the read.
@@ -131,11 +131,12 @@ void Assembler::filterLocalSegmentsThreadFunction(size_t threadId)
                 }
             };
             
-            // We need to check both strands of r0 in the alignment table 
-            // because alignments are stored indexed by the OrientedReadId.
-            // However, the coordinates (qs/qe/ts/te) are physical coordinates on the read.
+            
+            // We only collect from strand 0 to match Hifiasm's sources[i] which is single-direction.
+            // Collecting from both strands would double-count overlaps.
             collectIntervals(OrientedReadId(r0, 0));
-            collectIntervals(OrientedReadId(r0, 1));
+            // Hifiasm parity: Don't collect strand 1 - same alignment is indexed for both oriented reads
+            // collectIntervals(OrientedReadId(r0, 1));
             
             if (intervals.empty()) {
                 // No coverage means no valid segment -> deleted
@@ -241,7 +242,7 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t threadId)
             AlignmentData& ad = alignmentData[i];
             
             // If already deleted, skip.
-            if(ad.isDeleted) continue;
+            if(ad.isDeleted()) continue;
 
             ReadId qn = ad.readIds[0];
             ReadId tn = ad.readIds[1];
@@ -257,7 +258,7 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t threadId)
 
             // "if any of target read and the query read has no enough coverage" -> del
             if (rq.isDeleted || rt.isDeleted) {
-                ad.isDeleted = true;
+                ad.setDeleted(true);
                 continue;
             }
 
@@ -287,16 +288,24 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t threadId)
             ts = std::max(ts, (int32_t)rt.start);
             te = std::min(te, (int32_t)rt.end);
 
+            // Hifiasm parity: Normalize coordinates to 0-based relative to valid region
+            // This matches: qs = (qs - rq.s), qe = (qe - rq.s), etc.
+            int32_t norm_qs = qs - (int32_t)rq.start;
+            int32_t norm_qe = qe - (int32_t)rq.start;
+            int32_t norm_ts = ts - (int32_t)rt.start;
+            int32_t norm_te = te - (int32_t)rt.start;
+
             // Check if valid length remains
             // "if (qe - qs >= mini_overlap_length && te - ts >= mini_overlap_length)"
-            if ((qe - qs >= (int32_t)minLen) && (te - ts >= (int32_t)minLen) && (qe > qs) && (te > ts)) {
-                // Update alignment data
-                ad.qs = (uint32_t)qs;
-                ad.qe = (uint32_t)qe;
-                ad.ts = (uint32_t)ts;
-                ad.te = (uint32_t)te;
+            if ((norm_qe - norm_qs >= (int32_t)minLen) && (norm_te - norm_ts >= (int32_t)minLen) && 
+                (norm_qe > norm_qs) && (norm_te > norm_ts)) {
+                // Update alignment data with normalized coordinates
+                ad.qs = (uint32_t)norm_qs;
+                ad.qe = (uint32_t)norm_qe;
+                ad.ts = (uint32_t)norm_ts;
+                ad.te = (uint32_t)norm_te;
             } else {
-                ad.isDeleted = true;
+                ad.setDeleted(true);
             }
         }
     }
@@ -320,7 +329,7 @@ void Assembler::applyCoverageCutsCleanupThreadFunction(size_t threadId)
             // Check strand 0 (and strand 1 implicitly via edges)
             const auto& table = alignmentTable[OrientedReadId(r, 0).getValue()];
             for(uint32_t alignmentId : table) {
-                if (!alignmentData[alignmentId].isDeleted) {
+                if (!alignmentData[alignmentId].isDeleted()) {
                     hasSurvivingEdge = true;
                     break;
                 }
@@ -329,7 +338,7 @@ void Assembler::applyCoverageCutsCleanupThreadFunction(size_t threadId)
             if (!hasSurvivingEdge) {
                 const auto& table1 = alignmentTable[OrientedReadId(r, 1).getValue()];
                 for(uint32_t alignmentId : table1) {
-                    if (!alignmentData[alignmentId].isDeleted) {
+                    if (!alignmentData[alignmentId].isDeleted()) {
                         hasSurvivingEdge = true;
                         break;
                     }
@@ -382,7 +391,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
         for(uint64_t i=begin; i!=end; i++) {
             AlignmentData& ad = alignmentData[i];
             
-            if(ad.isDeleted) continue;
+            if(ad.isDeleted()) continue;
 
             ReadId qn = ad.readIds[0];
             ReadId tn = ad.readIds[1];
@@ -399,7 +408,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
                 const auto& rq = validReadIntervals[qn];
                 const auto& rt = validReadIntervals[tn];
                 if (rq.isDeleted || rt.isDeleted) {
-                    ad.isDeleted = true;
+                    ad.setDeleted(true);
                     continue;
                 }
                 ql = rq.end - rq.start;
@@ -417,7 +426,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             
             // Re-check length just in case
             if (qe <= qs || te <= ts) {
-                ad.isDeleted = true;
+                ad.setDeleted(true);
                 continue;
             }
 
@@ -493,7 +502,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             // Basically if Bad Shape, we delete.
             
             if (badShape) {
-                ad.isDeleted = true;
+                ad.setDeleted(true);
             }
         }
     }
@@ -879,7 +888,151 @@ void Assembler::rescueChimericReadsThreadFunction(size_t /* threadId */)
                         }
                         
                         if (!keep) {
-                            ad.isDeleted = true;
+                            ad.setDeleted(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Rescue Phased Overlaps (try_rescue_overlaps equivalent)
+// ----------------------------------------------------------------------------
+// Rescues overlaps where isDeleted0 != isDeleted1 (directional phasing conflict)
+// if >= rescueThreshold overlaps from the same direction agree on a region.
+// This recovers edges that were incorrectly phased out from one direction.
+
+void Assembler::rescuePhasedOverlaps(uint64_t rescueThreshold, uint64_t threadCount)
+{
+    cout << timestamp << "Rescuing phased overlaps (threshold=" << rescueThreshold << ")..." << endl;
+    
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+    
+    this->rescuePhasedThreshold = rescueThreshold;
+    
+    setupLoadBalancing(reads->readCount(), 1);
+    runThreads(&Assembler::rescuePhasedOverlapsThreadFunction, threadCount);
+    
+    // Count rescued overlaps
+    uint64_t rescuedCount = 0;
+    for(size_t i = 0; i < alignmentData.size(); i++) {
+        const auto& ad = alignmentData[i];
+        // Count overlaps where both flags are now false (rescued)
+        // that previously had exactly one flag set
+        if (!ad.isDeleted()) {
+            // Simple count of surviving overlaps after rescue
+        }
+    }
+    
+    cout << timestamp << "Phased overlap rescue complete." << endl;
+}
+
+void Assembler::rescuePhasedOverlapsThreadFunction(size_t /* threadId */)
+{
+    const uint64_t rescueThreshold = this->rescuePhasedThreshold;
+    
+    uint64_t readIdBegin, readIdEnd;
+    while(getNextBatch(readIdBegin, readIdEnd)) {
+        for(ReadId readId = ReadId(readIdBegin); readId < ReadId(readIdEnd); readId++) {
+            
+            // Process overlaps from this read's perspective
+            OrientedReadId orientedReadId(readId, 0);
+            
+            if (orientedReadId.getValue() >= alignmentTable.size()) continue;
+            
+            // Collect overlaps where there's a directional conflict
+            // (one direction deleted, other not)
+            std::vector<uint32_t> conflictAlignments;
+            std::vector<std::pair<uint32_t, uint32_t>> conflictIntervals; // qs, qe on readId
+            
+            const size_t n = alignmentTable.size(orientedReadId.getValue());
+            for(size_t i = 0; i < n; i++) {
+                const uint64_t alignmentId = alignmentTable[orientedReadId.getValue()][i];
+                const AlignmentData& ad = alignmentData[alignmentId];
+                
+                // Check for directional conflict: exactly one flag set
+                bool hasConflict = (ad.isDeleted0 != ad.isDeleted1);
+                if (!hasConflict) continue;
+                
+                // For this read's perspective, check which flag corresponds to this read
+                uint32_t qs, qe;
+                bool thisReadDeleted;
+                
+                if (ad.readIds[0] == readId) {
+                    qs = ad.qs;
+                    qe = ad.qe;
+                    thisReadDeleted = ad.isDeleted0; // This read's decision
+                } else {
+                    qs = ad.ts;
+                    qe = ad.te;
+                    thisReadDeleted = ad.isDeleted1; // This read's decision
+                }
+                
+                // We want to rescue overlaps where THIS read said "delete" but other said "keep"
+                // (i.e., thisReadDeleted == true)
+                if (thisReadDeleted) {
+                    conflictAlignments.push_back(alignmentId);
+                    conflictIntervals.push_back({qs, qe});
+                }
+            }
+            
+            // Check if we have enough conflicts to potentially rescue
+            if (conflictAlignments.size() < rescueThreshold) continue;
+            
+            // Sweep line to find max consensus region
+            std::vector<std::pair<uint32_t, int>> events;
+            events.reserve(conflictIntervals.size() * 2);
+            for(const auto& interval : conflictIntervals) {
+                events.push_back({interval.first, 1});  // Start
+                events.push_back({interval.second, -1}); // End
+            }
+            
+            std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
+                if (a.first != b.first) return a.first < b.first;
+                return a.second > b.second; // Start before End at same position
+            });
+            
+            int dp = 0, max_dp = 0;
+            uint32_t start = 0;
+            uint32_t max_interval_s = 0, max_interval_e = 0;
+            
+            for(const auto& ev : events) {
+                int old_dp = dp;
+                dp += ev.second;
+                
+                if (old_dp < dp) { // Start event
+                    if (dp >= max_dp) {
+                        start = ev.first;
+                        max_dp = dp;
+                    }
+                } else if (old_dp > dp) { // End event
+                    if (old_dp == max_dp) {
+                        max_interval_s = start;
+                        max_interval_e = ev.first;
+                    }
+                }
+            }
+            
+            // If consensus depth >= threshold, rescue overlaps spanning the consensus region
+            if ((uint64_t)max_dp >= rescueThreshold) {
+                for(size_t j = 0; j < conflictAlignments.size(); j++) {
+                    uint32_t alignmentId = conflictAlignments[j];
+                    uint32_t qs = conflictIntervals[j].first;
+                    uint32_t qe = conflictIntervals[j].second;
+                    
+                    // Only rescue if this overlap spans the consensus region
+                    if (qs <= max_interval_s && qe >= max_interval_e) {
+                        AlignmentData& ad = alignmentData[alignmentId];
+                        
+                        // Clear the flag for this read's direction
+                        if (ad.readIds[0] == readId) {
+                            ad.isDeleted0 = false;
+                        } else {
+                            ad.isDeleted1 = false;
                         }
                     }
                 }
@@ -945,7 +1098,7 @@ void Assembler::detectChimericReadsFromAnchors(
 //
 // 4.  **Cleaning**: If a read is flagged as chimeric:
 //     - We mark it as validly chimeric (`isChimericRead[id] = true`).
-//     - We conceptually "cut" the read or remove it by marking all its alignments as deleted (`alignmentData[i].isDeleted = true`).
+//     - We conceptually "cut" the read or remove it by marking all its alignments as deleted (`alignmentData[i].setDeleted(true)`).
 
 void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
 {
@@ -1004,7 +1157,7 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
                  const auto& table = alignmentTable[orientedR0.getValue()];
                  for(uint32_t alignmentId : table) {
                      AlignmentData& ad = alignmentData[alignmentId]; 
-                     if(ad.isDeleted) continue;
+                     if(ad.isDeleted()) continue;
                      
                      // Get coordinates on r0
                      uint32_t qs = 0, qe = 0;
@@ -1056,7 +1209,7 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
                  const auto& table = alignmentTable[orientedR0.getValue()];
                  for(uint32_t alignmentId : table) {
                      const AlignmentData& ad = alignmentData[alignmentId];
-                     if(ad.isDeleted) continue;
+                     if(ad.isDeleted()) continue;
                      
                      uint32_t qs = 0, qe = 0;
                      if (ad.readIds[0] == r0) {
@@ -1141,7 +1294,7 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
                          // Race condition if someone reads it.
                          // Standard for this codebase: marking reads is preferred.
                          // But user asked to mirror delete_all_edges.
-                         alignmentData[alignmentId].isDeleted = true;
+                         alignmentData[alignmentId].setDeleted(true);
                      }
                 };
                 deleteEdges(OrientedReadId(r0, 0));
@@ -1405,13 +1558,13 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
             if ((leftUnaligned0 <= leftUnaligned1) && (rightUnaligned0 <= rightUnaligned1)) {
                 containmentParent[r0] = r1;
                 validReadIntervals[r0].isDeleted = true;
-                ad.isDeleted = true;
+                ad.setDeleted(true);
                 
                 // Aggressively remove all other alignments involving contained read r0
                 for(uint32_t strand=0; strand<2; strand++) {
                     OrientedReadId oid(r0, strand);
                     for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
-                        alignmentData[otherAlignId].isDeleted = true;
+                        alignmentData[otherAlignId].setDeleted(true);
                     }
                 }
                 
@@ -1419,13 +1572,13 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
             } else if ((leftUnaligned1 <= leftUnaligned0) && (rightUnaligned1 <= rightUnaligned0)) {
                 containmentParent[r1] = r0;
                 validReadIntervals[r1].isDeleted = true;
-                ad.isDeleted = true;
+                ad.setDeleted(true);
 
                 // Aggressively remove all other alignments involving contained read r1
                 for(uint32_t strand=0; strand<2; strand++) {
                     OrientedReadId oid(r1, strand);
                     for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
-                        alignmentData[otherAlignId].isDeleted = true;
+                        alignmentData[otherAlignId].setDeleted(true);
                     }
                 }
                 
@@ -1438,7 +1591,7 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
             
             if (!ad.info.isInReadGraph) continue;
             
-            if (ad.isDeleted) continue;
+            if (ad.isDeleted()) continue;
             
             
             
@@ -1481,14 +1634,14 @@ void Assembler::removeContainedReadsThreadFunction(size_t threadId)
                  if ((tail0_L <= tail1_L) && (tail0_R <= tail1_R)) {
                      containmentParent[r0] = r1;
                      validReadIntervals[r0].isDeleted = true;
-                     ad.isDeleted = true;
+                     ad.setDeleted(true);
                  }
             } else {
                  // Check if R1 is contained in R0.
                  if ((tail1_L <= tail0_L) && (tail1_R <= tail0_R)) {
                      containmentParent[r1] = r0;
                      validReadIntervals[r1].isDeleted = true;
-                     ad.isDeleted = true;
+                     ad.setDeleted(true);
                  }
             }
         }

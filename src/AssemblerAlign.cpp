@@ -463,6 +463,7 @@ void Assembler::computeAlignments(
     // Compute the alignments.
     data.threadAlignmentData.resize(threadCount);
     data.threadCompressedAlignments.resize(threadCount);
+    data.threadPhasingCigars.resize(threadCount);
 
     if (assemblerInfo->readGraphCreationMethod == 5) {
         data.threadVariantClusteringPositionPairs.resize(threadCount);
@@ -484,6 +485,7 @@ void Assembler::computeAlignments(
     performanceLog << timestamp << "Storing the alignment found by each thread." << endl;
     alignmentData.createNew(largeDataName("AlignmentData"), largeDataPageSize);
     compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
+    phasingCigars.createNew(largeDataName("PhasingCigars"), largeDataPageSize);
     
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         const vector<AlignmentData>& threadAlignmentData = data.threadAlignmentData[threadId];
@@ -500,13 +502,25 @@ void Assembler::computeAlignments(
             );
         }
 
+        // Merge phasing Cigars
+        const auto threadPhasingCigarsPtr = data.threadPhasingCigars[threadId];
+        const auto sizeCigars = threadPhasingCigarsPtr->size();
+        for(size_t i=0; i<sizeCigars; i++) {
+            phasingCigars.appendVector(
+                (*threadPhasingCigarsPtr)[i].begin(),
+                (*threadPhasingCigarsPtr)[i].end()
+            );
+        }
+
         // Clean up thread storage.
         data.threadCompressedAlignments[threadId]->remove();
+        data.threadPhasingCigars[threadId]->remove();
     }
 
     // Release unused allocated memory.
     alignmentData.unreserve();
     compressedAlignments.unreserve();
+    phasingCigars.unreserve();
 
 
 
@@ -667,6 +681,13 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             largeDataName("tmp-ThreadVariantClusteringPositionPairs-" + to_string(threadId)),
             largeDataPageSize);
     }
+
+    shared_ptr< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> > thisThreadPhasingCigarsPointer =
+        make_shared< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> >();
+    data.threadPhasingCigars[threadId] = thisThreadPhasingCigarsPointer;
+    thisThreadPhasingCigarsPointer->createNew(
+        largeDataName("tmp-ThreadPhasingCigars-" + to_string(threadId)),
+        largeDataPageSize);
 
 #if 0
     // A vector to store the time taken to compute each alignment.
@@ -912,8 +933,9 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Alignment covers an informative het site
             thisAlignmentData.coversHetSite = false;
             
-            // Alignment is deleted/filtered
-            thisAlignmentData.isDeleted = false;
+            // Alignment is deleted/filtered (both flags false by default)
+            thisAlignmentData.isDeleted0 = false;
+            thisAlignmentData.isDeleted1 = false;
 
             threadAlignmentData.push_back(thisAlignmentData);
 
@@ -923,6 +945,45 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 compressedAlignment.c_str(),
                 compressedAlignment.c_str() + compressedAlignment.size()
             );
+            
+            // --- Generate and Store Phasing CIGAR ---
+            // Format: standard CIGAR operations (len << 4 | op)
+            // Ops: 0=Match/Mismatch(M), 1=Ins(I), 2=Del(D)
+            // --- Generate and Store Phasing CIGAR ---
+            // Format: standard CIGAR operations (len << 4 | op)
+            // Ops: 0=Match/Mismatch(M), 1=Ins(I), 2=Del(D), 3=Blind(B)
+            
+            // Start with Left Extension (Blind Match) - Op 3
+            // Use thread-local buffer to avoid per-alignment heap allocation
+            thread_local vector<uint32_t> cigar;
+            cigar.clear(); // O(1) - keeps capacity, resets size
+            
+            if (leftExt > 0) {
+                cigar.push_back((leftExt << 4) | 3);
+            }
+            
+            // Append Generated CIGAR from ProjectedAlignment
+            // Note: projectedAlignment.phasingCigar contains M/I/D ops for the aligned region.
+            // We append them directly.
+            const auto& internalCigar = projectedAlignment.phasingCigar;
+            
+            // Check for merge possibility (Last of leftExt vs First of internal)
+            // But leftExt is op 3, internal matches are op 0. They do NOT merge.
+            
+            cigar.insert(cigar.end(), internalCigar.begin(), internalCigar.end());
+            
+            // Right Extension (Blind Match) - Op 3
+            if (rightExt > 0) {
+                 // Check if last was 3 (very unlikely unless alignment was empty)
+                 if (!cigar.empty() && (cigar.back() & 0xF) == 3) {
+                      uint32_t prevLen = cigar.back() >> 4;
+                      cigar.back() = ((prevLen + rightExt) << 4) | 3;
+                 } else {
+                      cigar.push_back((rightExt << 4) | 3);
+                 }
+            }
+            
+            data.threadPhasingCigars[threadId]->appendVector(cigar);
         }
     }
 
@@ -1051,6 +1112,18 @@ void Assembler::checkAlignmentDataAreOpen() const
     }
 }
 
+void Assembler::accessPhasingCigars()
+{
+    phasingCigars.accessExistingReadWrite(largeDataName("PhasingCigars"));
+}
+
+void Assembler::checkPhasingCigarsAreOpen() const
+{
+    if(!phasingCigars.isOpen()) {
+        throw runtime_error("Phasing CIGARs are not accessible.");
+    }
+}
+
 
 
 // Find in the alignment table the alignments involving
@@ -1171,9 +1244,9 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
     array<vector<MarkerWithOrdinal>, 2> markersSortedByKmerId;
 
     // Make local copies of the parameters.
-    const uint32_t maxSkip = flagPalindromicReadsData.maxSkip;
-    const uint32_t maxDrift = flagPalindromicReadsData.maxDrift;
-    const uint32_t maxMarkerFrequency = flagPalindromicReadsData.maxMarkerFrequency;
+    // const uint32_t maxSkip = flagPalindromicReadsData.maxSkip;
+    // const uint32_t maxDrift = flagPalindromicReadsData.maxDrift;
+    // const uint32_t maxMarkerFrequency = flagPalindromicReadsData.maxMarkerFrequency;
     const double alignedFractionThreshold = flagPalindromicReadsData.alignedFractionThreshold;
     const double nearDiagonalFractionThreshold = flagPalindromicReadsData.nearDiagonalFractionThreshold;
     const uint32_t deltaThreshold = flagPalindromicReadsData.deltaThreshold;
@@ -1220,7 +1293,7 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
                 uint64_t unaligned = (readLength > alignmentRange) ? (readLength - alignmentRange) : 0;
                  
 
-                if (unaligned <= maxUncoveredBases) {
+                if (int(unaligned) <= maxUncoveredBases) {
                     isSpanPass = true;
                 }
             }

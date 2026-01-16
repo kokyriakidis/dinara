@@ -243,7 +243,7 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
         for (uint64_t alignmentId = alignmentIdBegin; alignmentId < alignmentIdEnd; alignmentId++) {
             
             // Skip deleted alignments (e.g. redundant alignments from Best Hit Filtering)
-            if (alignmentDataRef[alignmentId].isDeleted) continue;
+            if (alignmentDataRef[alignmentId].isDeleted()) continue;
 
             const AlignmentData& alignmentData = alignmentDataRef[alignmentId];
             
@@ -1029,7 +1029,7 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
                     
                     // Mark self-overlaps as deleted immediately
                     if (rA == rB) {
-                        alignmentData[alignmentId].isDeleted = true;
+                        alignmentData[alignmentId].setDeleted(true);
                         localRemovedCount++;
                         continue;
                     }
@@ -1153,7 +1153,7 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
                     }
 
                     if (drop) {
-                        alignmentData[cand.alignmentId].isDeleted = true;
+                        alignmentData[cand.alignmentId].setDeleted(true);
                         localRemovedCount++;
                     } else {
                         kept.push_back(cand);

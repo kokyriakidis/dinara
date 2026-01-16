@@ -605,166 +605,180 @@ void dinara::main::assemble(
     // Filter Best Hit Alignments (Hifiasm Parity)
     assembler.filterBestHitAlignments(threadCount);
 
-    assembler.performGlobalVariantClustering(
-        assemblerOptions.markerGraphOptions.minCoverage,
-        assemblerOptions.markerGraphOptions.maxCoverage,
-        threadCount);
+    // // Build canonical per-Read overlap index (Hifiasm-style storage)
+    // assembler.buildCanonicalOverlapIndex();
+    
+    // // Phasing using canonical storage (sets is_match/strong flags)
+    // assembler.performPhasingCanonical(threadCount);
+
+    // // // Filter by Haplotype Phasing (ONT DP) - legacy path
+    // // assembler.performPhasing(threadCount);
+
+    // // // Variant clustering (not needed for canonical path)
+    // // assembler.performGlobalVariantClustering(
+    // //     assemblerOptions.markerGraphOptions.minCoverage,
+    // //     assemblerOptions.markerGraphOptions.maxCoverage,
+    // //     threadCount);
 
 
-    // Marker KmerIds are freed here.
-    // For align method 6 this is done earlier.
-    if(assemblerOptions.alignOptions.alignMethod != 6) {
-        assembler.cleanupMarkerKmerIds();
-    }
+    // // Marker KmerIds are freed here.
+    // // For align method 6 this is done earlier.
+    // if(assemblerOptions.alignOptions.alignMethod != 6) {
+    //     assembler.cleanupMarkerKmerIds();
+    // }
 
 
-    // Create the read graph.
-    assembler.createReadGraph5();
+    // // // Create the read graph (legacy paths).
+    // // assembler.createReadGraph5();
+    // // assembler.createReadGraph6();  // Uses AlignmentData with isDeleted0/1
+    
+    // // Create the read graph (new path using OverlapIndex with is_match/del)
+    // assembler.createReadGraph7();
 
-    // Create the cluster graph for visualization and exploration.
-    // This graph shows connections between valid clusters based on read paths.
-    // We save the full graph (minEdgeCoverage=0) to include all edges;
-    // filtering is done at exploration time in the HTTP server.
-    assembler.createClusterGraph(0);
+    // // // Create the cluster graph for visualization and exploration.
+    // // // This graph shows connections between valid clusters based on read paths.
+    // // // We save the full graph (minEdgeCoverage=0) to include all edges;
+    // // // filtering is done at exploration time in the HTTP server.
+    // // assembler.createClusterGraph(0);
 
 
-    // Mode 3 assembly requires reads in raw representation (not RLE).
-    DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
+    // // Mode 3 assembly requires reads in raw representation (not RLE).
+    // DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
 
-    // The marker length must be even.
-    DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
+    // // The marker length must be even.
+    // DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
 
-    // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::Anchors> anchors;
+    // // Declare anchors pointer here to avoid scope issues
+    // shared_ptr<mode3::Anchors> anchors;
 
-    // cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
-    // anchors = make_shared<mode3::Anchors>(
-    //     MappedMemoryOwner(assembler),
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     assembler.markers,
-    //     assembler.variantClusteringClusterRepresentatives,
-    //     *assembler.variantClusteringDisjointSets,
-    //     assembler.variantClusteringPositionPairs,
-    //     assembler.variantClusteringPositionPairAlleles,
-    //     assembler.variantClusteringPositionPairContexts,
-    //     assembler.variantClusteringValidClustersCompatible,
-    //     assembler.variantClusteringMemberStatus,
-    //     /*minClusterCoverage*/ 6,
-    //     /*minAlleleCoverage*/ 5,
-    //     /*minCommonKmerFraction*/ 0.8,
+    // // cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
+    // // anchors = make_shared<mode3::Anchors>(
+    // //     MappedMemoryOwner(assembler),
+    // //     assembler.getReads(),
+    // //     assembler.assemblerInfo->k,
+    // //     assembler.markers,
+    // //     assembler.variantClusteringClusterRepresentatives,
+    // //     *assembler.variantClusteringDisjointSets,
+    // //     assembler.variantClusteringPositionPairs,
+    // //     assembler.variantClusteringPositionPairAlleles,
+    // //     assembler.variantClusteringPositionPairContexts,
+    // //     assembler.variantClusteringValidClustersCompatible,
+    // //     assembler.variantClusteringMemberStatus,
+    // //     /*minClusterCoverage*/ 6,
+    // //     /*minAlleleCoverage*/ 5,
+    // //     /*minCommonKmerFraction*/ 0.8,
+    // //     threadCount);
+
+
+    // // Create marker graph vertices.
+    // // To create a complete marker graph, generate all vertices
+    // // regardless of coverage, and allow duplicate markers on vertices.
+    // assembler.createMarkerGraphVertices(
+    //     1,                                              // minVertexCoverage
+    //     std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+    //     0,                                              // minVertexCoveragePerStrand
+    //     true,                                           // allowDuplicateMarkers
+    //     std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+    //     invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
     //     threadCount);
-
-
-    // Create marker graph vertices.
-    // To create a complete marker graph, generate all vertices
-    // regardless of coverage, and allow duplicate markers on vertices.
-    assembler.createMarkerGraphVertices(
-        1,                                              // minVertexCoverage
-        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-        0,                                              // minVertexCoveragePerStrand
-        true,                                           // allowDuplicateMarkers
-        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-        threadCount);
     
-    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+    // // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+    // assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
-    // // Create shasta2 anchors equivalent to the marker graph vertices.
-    // // This allows downstream processing using shasta2 tools.
-    // createShasta2Anchors(assembler, threadCount);
+    // // // Create shasta2 anchors equivalent to the marker graph vertices.
+    // // // This allows downstream processing using shasta2 tools.
+    // // createShasta2Anchors(assembler, threadCount);
 
-    // If the coverage range for primary marker graph edges (anchors) is not
-    // specified, use the disjoint sets histogram to compute reasonable values.
-    uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
-    uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
-    if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
-        tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
-        cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-        minPrimaryCoverage = uint64_t(std::round(
-            double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
-        maxPrimaryCoverage = uint64_t(std::round(
-            double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
-        cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    } else {
-        cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    }
+    // // If the coverage range for primary marker graph edges (anchors) is not
+    // // specified, use the disjoint sets histogram to compute reasonable values.
+    // uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
+    // uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
+    // if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
+    //     tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
+    //     cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
+    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    //     minPrimaryCoverage = uint64_t(std::round(
+    //         double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
+    //     maxPrimaryCoverage = uint64_t(std::round(
+    //         double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
+    //     cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
+    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    // } else {
+    //     cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
+    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    // }
 
 
 
-    // Construct the mode3::Anchors from marker graph.
-    anchors =
-        make_shared<mode3::Anchors>(
-            MappedMemoryOwner(assembler),
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            assembler.markers,
-            assembler.markerGraph,
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount,
-            true); // createFromVertices
+    // // Construct the mode3::Anchors from marker graph.
+    // anchors =
+    //     make_shared<mode3::Anchors>(
+    //         MappedMemoryOwner(assembler),
+    //         assembler.getReads(),
+    //         assembler.assemblerInfo->k,
+    //         assembler.markers,
+    //         assembler.markerGraph,
+    //         minPrimaryCoverage,
+    //         maxPrimaryCoverage,
+    //         threadCount,
+    //         true); // createFromVertices
     
 
-    // Compute oriented read journeys.
-    anchors->computeJourneys(threadCount);
+    // // Compute oriented read journeys.
+    // anchors->computeJourneys(threadCount);
 
-    // Run Mode 3 assembly.
-    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    // // Run Mode 3 assembly.
+    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
 
-    // Store elapsed time for assembly.
-    const auto steadyClock1 = std::chrono::steady_clock::now();
-    const auto userClock1 = boost::chrono::process_user_cpu_clock::now();
-    const auto systemClock1 = boost::chrono::process_system_cpu_clock::now();
-    const double elapsedTime = 1.e-9 * double((
-        std::chrono::duration_cast<std::chrono::nanoseconds>(steadyClock1 - steadyClock0)).count());
-    const double userTime = 1.e-9 * double((
-        boost::chrono::duration_cast<boost::chrono::nanoseconds>(userClock1 - userClock0)).count());
-    const double systemTime = 1.e-9 * double((
-        boost::chrono::duration_cast<boost::chrono::nanoseconds>(systemClock1 - systemClock0)).count());
-    const double averageCpuUtilization =
-        (userTime + systemTime) / (double(std::thread::hardware_concurrency()) * elapsedTime);
-    assembler.storeAssemblyTime(elapsedTime, averageCpuUtilization);
+    // // Store elapsed time for assembly.
+    // const auto steadyClock1 = std::chrono::steady_clock::now();
+    // const auto userClock1 = boost::chrono::process_user_cpu_clock::now();
+    // const auto systemClock1 = boost::chrono::process_system_cpu_clock::now();
+    // const double elapsedTime = 1.e-9 * double((
+    //     std::chrono::duration_cast<std::chrono::nanoseconds>(steadyClock1 - steadyClock0)).count());
+    // const double userTime = 1.e-9 * double((
+    //     boost::chrono::duration_cast<boost::chrono::nanoseconds>(userClock1 - userClock0)).count());
+    // const double systemTime = 1.e-9 * double((
+    //     boost::chrono::duration_cast<boost::chrono::nanoseconds>(systemClock1 - systemClock0)).count());
+    // const double averageCpuUtilization =
+    //     (userTime + systemTime) / (double(std::thread::hardware_concurrency()) * elapsedTime);
+    // assembler.storeAssemblyTime(elapsedTime, averageCpuUtilization);
 
-    // Store peak memory usage.
-    uint64_t peakMemoryUsage = getPeakMemoryUsage();
-    assembler.storePeakMemoryUsage(peakMemoryUsage);
+    // // Store peak memory usage.
+    // uint64_t peakMemoryUsage = getPeakMemoryUsage();
+    // assembler.storePeakMemoryUsage(peakMemoryUsage);
 
-    // Store other performance information.
-    assembler.assemblerInfo->threadCount = threadCount;
-    assembler.assemblerInfo->virtualCpuCount = std::thread::hardware_concurrency();
-    assembler.assemblerInfo->totalAvailableMemory = getTotalPhysicalMemory();
+    // // Store other performance information.
+    // assembler.assemblerInfo->threadCount = threadCount;
+    // assembler.assemblerInfo->virtualCpuCount = std::thread::hardware_concurrency();
+    // assembler.assemblerInfo->totalAvailableMemory = getTotalPhysicalMemory();
 
-    // Write a summary of read information.
-    assembler.writeReadsSummary();
+    // // Write a summary of read information.
+    // assembler.writeReadsSummary();
 
-    // Write the assembly summary.
-    ofstream html("AssemblySummary.html");
-    assembler.writeAssemblySummary(html);
-    ofstream json("AssemblySummary.json");
-    assembler.writeAssemblySummaryJson(json);
-    ofstream htmlIndex("index.html");
-    assembler.writeAssemblyIndex(htmlIndex);
+    // // Write the assembly summary.
+    // ofstream html("AssemblySummary.html");
+    // assembler.writeAssemblySummary(html);
+    // ofstream json("AssemblySummary.json");
+    // assembler.writeAssemblySummaryJson(json);
+    // ofstream htmlIndex("index.html");
+    // assembler.writeAssemblyIndex(htmlIndex);
 
-    // If --saveBinaryData was requested and Mode assembly is 3,
-    // wait for save binary data threads to finish.
-    if(not assembler.saveBinaryDataDirectory.empty()) {
-        assembler.waitForSaveBinaryDataThreads();
-    }
+    // // If --saveBinaryData was requested and Mode assembly is 3,
+    // // wait for save binary data threads to finish.
+    // if(not assembler.saveBinaryDataDirectory.empty()) {
+    //     assembler.waitForSaveBinaryDataThreads();
+    // }
 
-    performanceLog << timestamp << endl;
-    performanceLog << "Assembly time statistics:\n"
-        "    Elapsed seconds: " << elapsedTime << "\n"
-        "    Elapsed minutes: " << elapsedTime/60. << "\n"
-        "    Elapsed hours:   " << elapsedTime/3600. << "\n";
-    performanceLog << "Average CPU utilization: " << averageCpuUtilization << endl;
-    performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
-        int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
+    // performanceLog << timestamp << endl;
+    // performanceLog << "Assembly time statistics:\n"
+    //     "    Elapsed seconds: " << elapsedTime << "\n"
+    //     "    Elapsed minutes: " << elapsedTime/60. << "\n"
+    //     "    Elapsed hours:   " << elapsedTime/3600. << "\n";
+    // performanceLog << "Average CPU utilization: " << averageCpuUtilization << endl;
+    // performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
+    //     int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
 }
 
