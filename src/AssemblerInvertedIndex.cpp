@@ -215,7 +215,7 @@ private:
                     int32_t bestIdxSame = -1;
                     int32_t bestIdxDiff = -1;
                     
-                    const uint32_t kmerLength = 32; // Assuming 32
+                    const uint32_t kmerLength = (uint32_t)invertedIndexData.k;
                     const double bandwidthPenaltyFactor = 1.0; 
                     const int64_t driftRateInt = (int64_t)(invertedIndexData.maxDriftRate * 1024.0);
                     
@@ -314,7 +314,7 @@ private:
                         }
                     }
 
-// Hifiasm-style Iterative Chaining:
+                    // Hifiasm-style Iterative Chaining:
                     // 1. Identify "peaks" (endpoints) with score >= 0.8 * bestScore.
                     // 2. Sort by score descending.
                     // 3. Greedily keep chains that don't overlap > 50% with accepted chains on Query (Read A).

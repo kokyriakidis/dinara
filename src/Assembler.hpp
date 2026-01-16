@@ -17,6 +17,7 @@
 #include "MemoryMappedObject.hpp"
 #include "MultithreadedObject.hpp"
 #include "ReadGraph.hpp"
+#include "CanonicalOverlap.hpp"
 #include "ReadId.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
@@ -908,9 +909,16 @@ private:
 public:
     void detectChimericReads(uint64_t threadCount);
     void rescueChimericReads(uint64_t threadCount);
+    
+    // Rescue phased overlaps (try_rescue_overlaps equivalent)
+    // Rescues overlaps with directional phasing conflicts if sufficient neighbor support exists.
+    void rescuePhasedOverlaps(uint64_t rescueThreshold, uint64_t threadCount);
+    
 private:
     void detectChimericReadsThreadFunction(size_t threadId);
     void rescueChimericReadsThreadFunction(size_t threadId);
+    void rescuePhasedOverlapsThreadFunction(size_t threadId);
+    uint64_t rescuePhasedThreshold = 4; // Default threshold from Hifiasm
 
     // Data for chimeric detection (if needed across threads)
     class ChimericDetectionData {
@@ -1115,6 +1123,9 @@ private:
         vector<uint64_t> threadFilteredByErrorRate; 
         vector<uint64_t> threadFilteredByErrorRateGap; 
         vector<uint64_t> threadFilteredByGapCount;
+
+        // Thread-local accumulation of Phasing CIGARs
+        vector< std::shared_ptr< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> > > threadPhasingCigars;
     };
     ComputeAlignmentsData computeAlignmentsData;
 
@@ -1190,6 +1201,18 @@ public:
     // This assumes that createReadGraph5 is multithreaded.
     // Simplifications are possible if this is not the case.
     void createReadGraph5();
+    
+    // Read graph creation method 6: Uses CIGAR-based phasing (isDeleted0/isDeleted1 flags)
+    // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
+    void createReadGraph6();
+    
+    // Canonical per-Read overlap storage (Hifiasm parity)
+    OverlapIndex overlapIndex;
+    void buildCanonicalOverlapIndex();  // Convert alignmentData to OverlapIndex
+    
+    // Read graph creation method 7: Uses canonical OverlapIndex with is_match/del flags
+    void createReadGraph7();
+    
     // Temporary or permanent member
     uint64_t minAlleleCoverage = 5; // Threshold from main.cpp
     void computeClusterValidityThreadFunction(uint64_t threadId);
@@ -1466,6 +1489,22 @@ public:
         bool allowChimericReads,
         bool allowCrossStrandEdges,
         bool allowInconsistentAlignmentEdges);
+
+
+
+    // Phasing CIGARs: Stores linear CIGAR for each alignment.
+    MemoryMapped::VectorOfVectors<uint32_t, uint64_t> phasingCigars;
+    void accessPhasingCigars();
+    void checkPhasingCigarsAreOpen() const;
+
+    // Perform Hifiasm-style ONT DP Phasing to filter inconsistent overlaps.
+    void performPhasing(uint64_t threadCount);
+    void performPhasingThreadFunction(uint64_t threadId);
+    
+    // Phasing using canonical OverlapIndex (sets is_match/strong flags)
+    void performPhasingCanonical(uint64_t threadCount);
+    void performPhasingCanonicalThreadFunction(uint64_t threadId);
+
 
 
     // Compute connected components of the read graph.

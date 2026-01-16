@@ -205,8 +205,18 @@ void ProjectedAlignment::constructQuickRaw()
             totalLength[i] += segment.sequences[i].size();
         }
 
-        // If the raw sequences are the same, don't store the segment.
+        // If the raw sequences are the same, don't store the segment but RECORD THE CIGAR.
         if(segment.sequences[0] == segment.sequences[1]) {
+            uint32_t len = segment.sequences[0].size();
+            if (len > 0) {
+                // Merge with previous M if possible
+                if (!phasingCigar.empty() && (phasingCigar.back() & 0xF) == 0) {
+                    uint32_t prevLen = phasingCigar.back() >> 4;
+                    phasingCigar.back() = ((prevLen + len) << 4) | 0;
+                } else {
+                    phasingCigar.push_back((len << 4) | 0);
+                }
+            }
             continue;
         }
 
@@ -222,6 +232,49 @@ void ProjectedAlignment::constructQuickRaw()
 
         // Store the segment.
         segments.push_back(segment);
+
+        // Append CIGAR from the Computed Alignment
+        if(segment.alignment.empty()) continue;
+        
+        uint32_t currentOp = 0; // Default M
+        uint32_t currentLen = 0;
+        
+        for(const auto& step : segment.alignment) {
+            bool adv0 = step.first;
+            bool adv1 = step.second;
+            
+            uint32_t op = 0; // M
+            if (adv0 && adv1) op = 0;      // M
+            else if (!adv0 && adv1) op = 1; // I (in Query)
+            else if (adv0 && !adv1) op = 2; // D (Gap in Query)
+            else continue; 
+            
+            if (currentLen == 0) {
+                currentOp = op;
+                currentLen = 1;
+            } else if (op == currentOp) {
+                currentLen++;
+            } else {
+                // Merge if op is M and previous CIGAR back is M?
+                if (currentOp == 0 && !phasingCigar.empty() && (phasingCigar.back() & 0xF) == 0) {
+                     uint32_t prevLen = phasingCigar.back() >> 4;
+                     phasingCigar.back() = ((prevLen + currentLen) << 4) | 0;
+                     currentLen = 0; // consumed
+                } else {
+                    phasingCigar.push_back((currentLen << 4) | currentOp);
+                }
+                currentOp = op;
+                currentLen = 1;
+            }
+        }
+        if (currentLen > 0) {
+             if (currentOp == 0 && !phasingCigar.empty() && (phasingCigar.back() & 0xF) == 0) {
+                 uint32_t prevLen = phasingCigar.back() >> 4;
+                 phasingCigar.back() = ((prevLen + currentLen) << 4) | 0;
+             } else {
+                 phasingCigar.push_back((currentLen << 4) | currentOp);
+             }
+        }
     }
 }
 
