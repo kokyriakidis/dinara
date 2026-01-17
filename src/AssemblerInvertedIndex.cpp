@@ -222,6 +222,38 @@ private:
                     uint32_t maxChainDiff = 0;
                     int32_t bestIdxSame = -1;
                     int32_t bestIdxDiff = -1;
+                    // Hifiasm Parity: tie-breaking by chainLen for determinism
+                    uint64_t minChainLenSame = UINT64_MAX;
+                    uint64_t minChainLenDiff = UINT64_MAX;
+                    
+                    // Hifiasm Parity: get_chainLen - computes overlap length after coordinate extension
+                    // Used for tie-breaking when scores are equal (prefer shorter chainLen)
+                    const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
+                    const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
+                    auto get_chainLen = [&](uint32_t posA, uint32_t posB) -> uint64_t {
+                        // Extend start: whoever has shorter overhang extends to 0
+                        uint32_t x_beg = posA;
+                        uint32_t y_beg = posB;
+                        if (x_beg <= y_beg) {
+                            y_beg = y_beg - x_beg;
+                            x_beg = 0;
+                        } else {
+                            x_beg = x_beg - y_beg;
+                            y_beg = 0;
+                        }
+                        // Extend end: whoever has shorter remaining extends to read length
+                        uint64_t x_right = readLenA - posA - 1;
+                        uint64_t y_right = readLenB - posB - 1;
+                        uint32_t x_end, y_end;
+                        if (x_right <= y_right) {
+                            x_end = (uint32_t)(readLenA - 1);
+                            y_end = posB + (uint32_t)x_right;
+                        } else {
+                            x_end = posA + (uint32_t)y_right;
+                            y_end = (uint32_t)(readLenB - 1);
+                        }
+                        return x_end - x_beg + 1;
+                    };
                     
                     const uint32_t kmerLength = (uint32_t)invertedIndexData.k;
                     // Hifiasm Parity: bandwidth_penalty = 1 / band_width_threshold
@@ -242,17 +274,73 @@ private:
                     }
 
                     if (canSkipDP && numHits >= invertedIndexData.minMarkerCount) {
-                        // Fast path: all hits form a single valid chain
-                        // Fill DP arrays trivially and skip to result extraction
-                        for (size_t checkK = 0; checkK < numHits; ++checkK) {
-                            dpSame[checkK] = kmerLength * (checkK + 1);
-                            if (checkK > 0) parentSame[checkK] = (int32_t)(checkK - 1);
+                        // Hifiasm Parity: ha_chain_check - compute actual scores with weighting and penalty
+                        // First hit
+                        uint32_t count0 = flatHits[start].weight;
+                        uint32_t score0 = count0 > 1 ? kmerLength / count0 : kmerLength;
+                        if (score0 == 0) score0 = 1;
+                        dpSame[0] = score0;
+                        parentSame[0] = -1;
+                        cumulativeDriftSame[0] = 0;
+                        cumulativeLengthSame[0] = 0;
+                        occSame[0] = 1;
+                        
+                        int32_t tot_indel = 0;
+                        int32_t tot_len = 0;
+                        const int32_t THRESHOLD_MAX_SIZE = 31;  // Hifiasm constant
+                        bool fastPathValid = true;
+                        
+                        for (size_t checkK = 1; checkK < numHits && fastPathValid; ++checkK) {
+                            int32_t dx = (int32_t)flatHits[start + checkK].posA - (int32_t)flatHits[start + checkK - 1].posA;
+                            int32_t dy = (int32_t)flatHits[start + checkK].posB - (int32_t)flatHits[start + checkK - 1].posB;
+                            int32_t dd = std::abs(dx - dy);
+                            tot_indel += dd;
+                            tot_len += dy;
+                            
+                            // Hifiasm Parity: cumulative drift check (line 876)
+                            if (tot_indel > tot_len * invertedIndexData.maxDriftRate) {
+                                fastPathValid = false;
+                                break;
+                            }
+                            
+                            int32_t dg = std::min(dx, dy);
+                            
+                            // Hifiasm Parity: THRESHOLD_MAX_SIZE check (line 878)
+                            if (dd > THRESHOLD_MAX_SIZE && dd > dg * invertedIndexData.maxDriftRate) {
+                                fastPathValid = false;
+                                break;
+                            }
+                            
+                            int32_t baseScore = std::min((uint32_t)dg, kmerLength);
+                            // Hifiasm uses a[i].cnt for fast path (CURRENT hit's count)
+                            uint32_t countK = flatHits[start + checkK].weight;
+                            uint32_t weightedScore = countK > 1 ? baseScore / countK : baseScore;
+                            if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
+                            
+                            double gap_rate = (tot_len > 0) ? ((double)tot_indel / (double)tot_len) : 0.0;
+                            int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
+                            
+                            dpSame[checkK] = dpSame[checkK - 1] + weightedScore - penalty;
+                            parentSame[checkK] = (int32_t)(checkK - 1);
+                            cumulativeDriftSame[checkK] = tot_indel;
+                            cumulativeLengthSame[checkK] = tot_len;
                             occSame[checkK] = (uint32_t)(checkK + 1);
                         }
+                        
+                        if (!fastPathValid) {
+                            // Fast path failed, fall through to full DP
+                            goto full_dp;
+                        }
+                        
+                        // Set best for Same strand
+                        maxChainSame = dpSame[numHits - 1];
+                        bestIdxSame = (int32_t)(numHits - 1);
+                        
                         // Skip full DP, go directly to chain extraction
                         goto skip_dp_same;
                     }
                     
+                    full_dp:  // Label for fallback when fast path fails
                     for(size_t k=0; k<numHits; ++k) {
                         size_t idx = start + k;
                         
@@ -263,8 +351,10 @@ private:
 
                         dpSame[k] = score;
                         dpDiff[k] = score;
-                        cumulativeLengthSame[k] = kmerLength;
-                        cumulativeLengthDiff[k] = kmerLength;
+                        // Hifiasm Parity: self_length starts at 0, not kmerLength!
+                        // dp->self_length[i] = max_self_length (which is 0 initially)
+                        cumulativeLengthSame[k] = 0;
+                        cumulativeLengthDiff[k] = 0;
 
                         // Chain.
                         const size_t MAX_SKIP = 25;
@@ -291,15 +381,16 @@ private:
                                 int32_t distance_min = std::min(deltaA, std::abs(deltaB));
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
-                                // Hifiasm Parity: score = base_score / count
-                                uint32_t weightedScore = count > 1 ? baseScore / count : baseScore;
+                                // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
+                                uint32_t predecessorCount = flatHits[idxJ].weight;
+                                uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
                                 
                                 // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
                                 double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
                                 int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
                                 
-                                if((newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
+                                if(((uint64_t)newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
                                     int32_t candidateScore = (int32_t)dpSame[localJ] + (int32_t)weightedScore - penalty;
                                     if(candidateScore > (int32_t)dpSame[k]) {
                                         dpSame[k] = (uint32_t)std::max(1, candidateScore);
@@ -333,15 +424,16 @@ private:
                                 int32_t distance_min = std::min(deltaA, absDeltaB);
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
-                                // Hifiasm Parity: score = base_score / count
-                                uint32_t weightedScore = count > 1 ? baseScore / count : baseScore;
+                                // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
+                                uint32_t predecessorCount = flatHits[idxJ].weight;
+                                uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
 
                                 // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
                                 double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
                                 int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
 
-                                if((newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
+                                if(((uint64_t)newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
                                     int32_t candidateScore = (int32_t)dpDiff[localJ] + (int32_t)weightedScore - penalty;
                                     if(candidateScore > (int32_t)dpDiff[k]) {
                                         dpDiff[k] = (uint32_t)std::max(1, candidateScore);
@@ -365,13 +457,32 @@ private:
                             }
                         }
                         
+                        // Hifiasm Parity: tie-breaking by chainLen for determinism
+                        // When scores are equal, prefer shorter chainLen
                         if(dpSame[k] > maxChainSame) {
                             maxChainSame = dpSame[k];
                             bestIdxSame = (int32_t)k;
+                            minChainLenSame = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
+                        } else if (dpSame[k] == maxChainSame && bestIdxSame >= 0) {
+                            uint64_t thisChainLen = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
+                            if (thisChainLen < minChainLenSame) {
+                                bestIdxSame = (int32_t)k;
+                                minChainLenSame = thisChainLen;
+                            }
                         }
                         if(dpDiff[k] > maxChainDiff) {
                             maxChainDiff = dpDiff[k];
                             bestIdxDiff = (int32_t)k;
+                            // For diff strand, flip posB to simulate parallel alignment (Hifiasm parity)
+                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
+                            minChainLenDiff = get_chainLen(flatHits[start + k].posA, posB_flipped);
+                        } else if (dpDiff[k] == maxChainDiff && bestIdxDiff >= 0) {
+                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
+                            uint64_t thisChainLen = get_chainLen(flatHits[start + k].posA, posB_flipped);
+                            if (thisChainLen < minChainLenDiff) {
+                                bestIdxDiff = (int32_t)k;
+                                minChainLenDiff = thisChainLen;
+                            }
                         }
                     }
 
@@ -390,10 +501,12 @@ private:
 
                     struct ChainCandidate {
                         uint32_t score;
+                        uint64_t chainLen;  // Hifiasm Parity: for deterministic tie-breaking
                         int32_t endK;
                         bool isDiff; // true if Diff, false if Same
                         bool operator<(const ChainCandidate& other) const {
-                            return score > other.score; // Descending
+                            if (score != other.score) return score > other.score; // Descending by score
+                            return chainLen < other.chainLen; // Tie-break by shorter chainLen
                         }
                     };
                     vector<ChainCandidate> candidates;
@@ -401,18 +514,18 @@ private:
                     // Collect candidates from Same
                     for (size_t k = 0; k < numHits; ++k) {
                         if (dpSame[k] >= threshold) {
-                            // Only add local maxima (peaks) to reduce redundancy? 
-                            // Hifiasm checks if extending improves score.
-                            // Here, we take endpoints. If k extends k-1, k has higher score usually.
-                            // Simple approach: Take all above threshold, sort will prioritize ends.
-                            candidates.push_back({dpSame[k], (int32_t)k, false});
+                            uint64_t cLen = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
+                            candidates.push_back({dpSame[k], cLen, (int32_t)k, false});
                         }
                     }
 
                     // Collect candidates from Diff
                     for (size_t k = 0; k < numHits; ++k) {
                         if (dpDiff[k] >= threshold) {
-                            candidates.push_back({dpDiff[k], (int32_t)k, true});
+                            // For diff strand, flip posB to simulate parallel alignment
+                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
+                            uint64_t cLen = get_chainLen(flatHits[start + k].posA, posB_flipped);
+                            candidates.push_back({dpDiff[k], cLen, (int32_t)k, true});
                         }
                     }
 
