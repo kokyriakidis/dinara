@@ -470,18 +470,33 @@ void AssemblerOptions::addConfigurableOptions()
         "The minimum number of times a pair of reads must be found by the MinHash/LowHash algorithm "
         "in order to be considered a candidate alignment.")
 
-        ("MinHash.candidateMethod",
-        value<string>(&minHashOptions.candidateMethod)->
-        default_value("MinHash"),
-        "The method used to identify alignment candidates: "
-        "'MinHash' (default) or 'InvertedIndex' (more efficient, Hifiasm-like).")
-
         ("MinHash.allPairs",
         bool_switch(&minHashOptions.allPairs)->
         default_value(false),
         "Skip the MinHash algorithm and mark all pairs of reads as alignment"
         "candidates with both orientation. This should only be used for experimentation "
         "on very small runs because it is very time consuming.")
+
+        // =========================================================================
+        // OverlapCandidates options
+        // =========================================================================
+
+        ("OverlapCandidates.method",
+        value<string>(&overlapCandidatesOptions.method)->
+        default_value("InvertedIndex"),
+        "The method used to identify alignment candidates: "
+        "'MinHash' or 'InvertedIndex' (default, more efficient, Hifiasm-like).")
+
+        ("OverlapCandidates.driftRateTolerance",
+        value<double>(&overlapCandidatesOptions.driftRateTolerance)->
+        default_value(0.05),
+        "Drift rate tolerance for overlap chaining. "
+        "Hifiasm uses 0.05 for ONT reads, 0.02 for HiFi reads, 0.001 for final high-quality overlaps.")
+
+        ("OverlapCandidates.minMarkerCount",
+        value<int>(&overlapCandidatesOptions.minMarkerCount)->
+        default_value(4),
+        "Minimum aligned marker count for a candidate overlap to be kept.")
 
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
@@ -1405,6 +1420,15 @@ void MinHashOptions::write(ostream& s) const
     s << "minFrequency = " << minFrequency << "\n";
     s << "allPairs = " <<
         convertBoolToPythonString(allPairs) << "\n";
+}
+
+
+void OverlapCandidatesOptions::write(ostream& s) const
+{
+    s << "[OverlapCandidates]\n";
+    s << "method = " << method << "\n";
+    s << "driftRateTolerance = " << driftRateTolerance << "\n";
+    s << "minMarkerCount = " << minMarkerCount << "\n";
 }
 
 

@@ -77,6 +77,7 @@ namespace dinara {
     class MinHashOptions;
     class Mode2AssemblyOptions;
     class Mode3AssemblyOptions;
+    class OverlapCandidatesOptions;
     class PalindromicReadOptions;
     class ReadsOptions;
     class ReadGraphOptions;
@@ -190,7 +191,18 @@ public:
     int maxBucketSize;
     int minFrequency;
     bool allPairs;
-    string candidateMethod; // "MinHash" or "InvertedIndex".
+    void write(ostream&) const;
+};
+
+
+// Options in the [OverlapCandidates] section of the configuration file.
+// Can also be entered on the command line with option names
+// beginning with "OverlapCandidates.".
+class dinara::OverlapCandidatesOptions {
+public:
+    string method;              // "MinHash" or "InvertedIndex".
+    double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
+    int minMarkerCount;         // Minimum aligned marker count for candidate filtering.
     void write(ostream&) const;
 };
 
@@ -541,6 +553,7 @@ public:
     ReadsOptions readsOptions;
     KmersOptions kmersOptions;
     MinHashOptions minHashOptions;
+    OverlapCandidatesOptions overlapCandidatesOptions;
     AlignOptions alignOptions;
     ReadGraphOptions readGraphOptions;
     VariantClusteringOptions variantClusteringOptions;

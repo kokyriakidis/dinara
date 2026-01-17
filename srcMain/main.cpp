@@ -561,8 +561,8 @@ void dinara::main::assemble(
     } else {
         // Inverted Index Method (Hifiasm-like).
         assembler.findAlignmentCandidatesInvertedIndex(
-            assemblerOptions.alignOptions.minAlignedMarkerCount,
-            assemblerOptions.alignOptions.align6Options.driftRateTolerance,
+            assemblerOptions.overlapCandidatesOptions.minMarkerCount,
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             threadCount
         );
     }

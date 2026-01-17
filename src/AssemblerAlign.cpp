@@ -905,35 +905,67 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
             uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
 
-            // --- Use Marker Coordinates Directly (No Artificial Extension) ---
-            // Hifiasm uses the chain start/end directly, representing the actual aligned region.
-            // Extending to read tips hides overhangs and breaks filtering logic.
-            
-            // Re-define len1 for usage in coordinate conversion
+            // Read lengths for coordinate extension
+            const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
             const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
             
-            thisAlignmentData.qs = qs_marker;
-            uint32_t ts_oriented = ts_marker;
-
-            thisAlignmentData.qe = qe_marker;
-            uint32_t te_oriented = te_marker;
+            // --- Hifiasm Parity: Extend coordinates to read boundaries ---
+            // This matches append_inexact_overlap_region_alloc in Hash_Table.cpp:374-398
+            // The logic extends alignment coordinates so they reach read tips symmetrically.
+            
+            uint32_t qs_ext = qs_marker;
+            uint32_t qe_ext = qe_marker;
+            uint32_t ts_ext = ts_marker;
+            uint32_t te_ext = te_marker;
+            
+            // Extend start: whoever has shorter overhang extends to 0, other adjusts proportionally
+            if (qs_ext <= ts_ext) {
+                ts_ext = ts_ext - qs_ext;  // Reduce ts by qs amount
+                qs_ext = 0;                 // qs goes to 0
+            } else {
+                qs_ext = qs_ext - ts_ext;  // Reduce qs by ts amount
+                ts_ext = 0;                 // ts goes to 0
+            }
+            
+            // Extend end: whoever has shorter remaining distance extends to read length
+            // Hifiasm uses closed coordinates: x_right_length = xLen - x_pos_e - 1
+            // Dinara uses half-open [start, end): equivalent is len0 - qe_ext
+            // But we need to be careful about the semantics:
+            // Hifiasm's x_pos_e is inclusive (last base), Dinara's qe_ext is exclusive (one past last)
+            // So: Hifiasm's "remaining" = xLen - x_pos_e - 1 = positions after x_pos_e
+            // Dinara's "remaining" = len0 - qe_ext = same thing (qe_ext points one past last aligned base)
+            
+            // For closed-to-half-open conversion: closed_end + 1 = half_open_end
+            // So if Hifiasm has x_pos_e as last aligned base, Dinara has qe_ext = x_pos_e + 1
+            // Thus: len0 - qe_ext = len0 - (x_pos_e + 1) = (len0 - 1) - x_pos_e = x_right_length ✓
+            
+            int64_t q_right = (int64_t)len0 - (int64_t)qe_ext;  // Safe signed arithmetic
+            int64_t t_right = (int64_t)len1 - (int64_t)te_ext;
+            
+            if (q_right <= t_right) {
+                qe_ext = (uint32_t)len0;           // qe extends to read end (half-open)
+                te_ext = te_ext + (uint32_t)q_right;  // te extends by same amount
+            } else {
+                te_ext = (uint32_t)len1;           // te extends to read end (half-open)
+                qe_ext = qe_ext + (uint32_t)t_right;  // qe extends by same amount
+            }
+            
+            thisAlignmentData.qs = qs_ext;
+            thisAlignmentData.qe = qe_ext;
             
             // --- Convert target coordinates to FORWARD STRAND (hifiasm convention) ---
             // When isSameStrand=false (reverse), the ts/te are on the reverse-complement strand.
             // We need to flip them to represent positions on the forward strand.
-            // Hifiasm formula (Assembly.cpp:339-344):
-            //   ts = y_readLen - y_pos_e - 1
-            //   te = y_readLen - y_pos_s - 1
-            // Note: Our te is open-ended (exclusive), so we adjust accordingly.
+            // Hifiasm formula (Hash_Table.cpp:403-410):
+            //   x_pos_s = xLen - x_pos_e - 1
+            //   y_pos_s = yLen - y_pos_e - 1
             if (!candidate.isSameStrand) {
                 // Convert from reverse strand coords to forward strand coords
-                // te_fwd = len1 - ts_oriented (since our coords are half-open [start, end))
-                // ts_fwd = len1 - te_oriented
-                thisAlignmentData.ts = (uint32_t)len1 - te_oriented;
-                thisAlignmentData.te = (uint32_t)len1 - ts_oriented;
+                thisAlignmentData.ts = (uint32_t)len1 - te_ext;
+                thisAlignmentData.te = (uint32_t)len1 - ts_ext;
             } else {
-                thisAlignmentData.ts = ts_oriented;
-                thisAlignmentData.te = te_oriented;
+                thisAlignmentData.ts = ts_ext;
+                thisAlignmentData.te = te_ext;
             }
 
             // Check for large indels (>= 6 bases)
