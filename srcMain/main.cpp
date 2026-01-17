@@ -605,11 +605,93 @@ void dinara::main::assemble(
     // Filter Best Hit Alignments (Hifiasm Parity)
     assembler.filterBestHitAlignments(threadCount);
 
+    // =========================================================================
+    // Hifiasm-style Overlap Filtering Pipeline
+    // =========================================================================
+    // These methods mirror hifiasm's pre-graph filtering:
+    //   ma_hit_sub          -> filterLocalSegments
+    //   detect_chimeric_reads -> detectChimericReads  
+    //   ma_hit_cut          -> applyCoverageCuts
+    //   ma_hit_flt          -> filterHangingOverlaps
+    //   ma_hit_contained_advance -> removeContainedReads
+
+    // Parameters matching hifiasm defaults (from CommandLines.cpp)
+    const uint64_t minCoverage = 0;          // min_overlap_coverage (asm_opt.min_overlap_coverage)
+    const uint64_t minOverlapLength = 50;    // min_overlap_Len (asm_opt.min_overlap_Len)
+    const uint64_t maxHangLength = 1000;     // max_hang_Len (asm_opt.max_hang_Len)
+    const double maxHangRate = 0.8;          // max_hang_rate (asm_opt.max_hang_rate)
+
+    // Helper lambda to count deleted alignments
+    auto countDeleted = [&assembler]() -> uint64_t {
+        uint64_t count = 0;
+        for (uint64_t i = 0; i < assembler.alignmentData.size(); i++) {
+            if (assembler.alignmentData[i].isDeleted()) count++;
+        }
+        return count;
+    };
+
+    uint64_t totalAlignments = assembler.alignmentData.size();
+    uint64_t deletedBefore = countDeleted();
+    uint64_t deletedAfter = 0;
+
+
+    cout << timestamp << "=== Hifiasm Filtering Debug ===" << endl;
+    cout << timestamp << "Total alignments: " << totalAlignments << ", already deleted: " << deletedBefore << endl;
+
+    cout << timestamp << "Filtering local segments (ma_hit_sub)..." << endl;
+    assembler.filterLocalSegments(minCoverage, threadCount);
+    deletedAfter = countDeleted();
+    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
+    deletedBefore = deletedAfter;
+
+    cout << timestamp << "Detecting chimeric reads..." << endl;
+    assembler.detectChimericReads(threadCount);
+    deletedAfter = countDeleted();
+    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
+    deletedBefore = deletedAfter;
+
+    cout << timestamp << "Applying coverage cuts (ma_hit_cut)..." << endl;
+    assembler.applyCoverageCuts(minOverlapLength, threadCount);
+    deletedAfter = countDeleted();
+    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
+    deletedBefore = deletedAfter;
+
+    cout << timestamp << "Filtering hanging overlaps (ma_hit_flt)..." << endl;
+    assembler.filterHangingOverlaps(maxHangLength, maxHangRate, minOverlapLength, threadCount);
+    deletedAfter = countDeleted();
+    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
+    deletedBefore = deletedAfter;
+
+    cout << timestamp << "Removing contained reads (ma_hit_contained_advance)..." << endl;
+    assembler.removeContainedReads(maxHangLength, maxHangRate, minOverlapLength, threadCount);
+    deletedAfter = countDeleted();
+    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
+
+    cout << timestamp << "Hifiasm-style filtering complete." << endl;
+    cout << timestamp << "=== Summary: " << deletedAfter << "/" << totalAlignments << " deleted, " 
+         << (totalAlignments - deletedAfter) << " remaining ===" << endl;
+    // =========================================================================
+
+
+
+    // Create read graph from filtered alignments (no phasing)
+    // This now uses alignments after all hifiasm-style filtering
+    assembler.createReadGraphFromFilteredAlignments();
+
+
     // // Build canonical per-Read overlap index (Hifiasm-style storage)
     // assembler.buildCanonicalOverlapIndex();
     
     // // Phasing using canonical storage (sets is_match/strong flags)
     // assembler.performPhasingCanonical(threadCount);
+
+    // // Create the read graph using the usual method (maps OverlapIndex back to alignmentData)
+    // assembler.createReadGraph7();
+
+
+
+
+    
 
     // // // Filter by Haplotype Phasing (ONT DP) - legacy path
     // // assembler.performPhasing(threadCount);
@@ -632,8 +714,7 @@ void dinara::main::assemble(
     // // assembler.createReadGraph5();
     // // assembler.createReadGraph6();  // Uses AlignmentData with isDeleted0/1
     
-    // // Create the read graph (new path using OverlapIndex with is_match/del)
-    // assembler.createReadGraph7();
+    
 
     // // // Create the cluster graph for visualization and exploration.
     // // // This graph shows connections between valid clusters based on read paths.
@@ -642,14 +723,14 @@ void dinara::main::assemble(
     // // assembler.createClusterGraph(0);
 
 
-    // // Mode 3 assembly requires reads in raw representation (not RLE).
-    // DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
+    // Mode 3 assembly requires reads in raw representation (not RLE).
+    DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
 
-    // // The marker length must be even.
-    // DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
+    // The marker length must be even.
+    DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
 
-    // // Declare anchors pointer here to avoid scope issues
-    // shared_ptr<mode3::Anchors> anchors;
+    // Declare anchors pointer here to avoid scope issues
+    shared_ptr<mode3::Anchors> anchors;
 
     // // cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
     // // anchors = make_shared<mode3::Anchors>(
@@ -670,65 +751,63 @@ void dinara::main::assemble(
     // //     threadCount);
 
 
-    // // Create marker graph vertices.
-    // // To create a complete marker graph, generate all vertices
-    // // regardless of coverage, and allow duplicate markers on vertices.
-    // assembler.createMarkerGraphVertices(
-    //     1,                                              // minVertexCoverage
-    //     std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-    //     0,                                              // minVertexCoveragePerStrand
-    //     true,                                           // allowDuplicateMarkers
-    //     std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-    //     invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-    //     threadCount);
+    // Compute the coverage range for primary marker graph edges (anchors).
+    // This is done BEFORE marker graph vertex creation so filtering happens at source.
+    uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
+    uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
+    if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
+        tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
+        cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+        minPrimaryCoverage = uint64_t(std::round(
+            double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
+        maxPrimaryCoverage = uint64_t(std::round(
+            double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
+        cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    } else {
+        cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
+            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    }
+
+    // Create marker graph vertices with coverage filtering.
+    assembler.createMarkerGraphVertices(
+        minPrimaryCoverage,                             // minVertexCoverage (from options)
+        maxPrimaryCoverage,                             // maxVertexCoverage (from options)
+        0,                                              // minVertexCoveragePerStrand
+        true,                                           // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
+        threadCount);
     
-    // // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    // assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-    // // // Create shasta2 anchors equivalent to the marker graph vertices.
-    // // // This allows downstream processing using shasta2 tools.
-    // // createShasta2Anchors(assembler, threadCount);
-
-    // // If the coverage range for primary marker graph edges (anchors) is not
-    // // specified, use the disjoint sets histogram to compute reasonable values.
-    // uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
-    // uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
-    // if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
-    //     tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
-    //     cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
-    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    //     minPrimaryCoverage = uint64_t(std::round(
-    //         double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
-    //     maxPrimaryCoverage = uint64_t(std::round(
-    //         double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
-    //     cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
-    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    // } else {
-    //     cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
-    //         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    // }
+    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-
-    // // Construct the mode3::Anchors from marker graph.
-    // anchors =
-    //     make_shared<mode3::Anchors>(
-    //         MappedMemoryOwner(assembler),
-    //         assembler.getReads(),
-    //         assembler.assemblerInfo->k,
-    //         assembler.markers,
-    //         assembler.markerGraph,
-    //         minPrimaryCoverage,
-    //         maxPrimaryCoverage,
-    //         threadCount,
-    //         true); // createFromVertices
+    // Construct the mode3::Anchors from marker graph (for HTTP server visualization).
+    // This must be done BEFORE createShasta2Anchors.
+    anchors =
+        make_shared<mode3::Anchors>(
+            MappedMemoryOwner(assembler),
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            assembler.markers,
+            assembler.markerGraph,
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount,
+            true); // createFromVertices
     
 
-    // // Compute oriented read journeys.
-    // anchors->computeJourneys(threadCount);
+    // Compute oriented read journeys.
+    anchors->computeJourneys(threadCount);
 
-    // // Run Mode 3 assembly.
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
+    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+    // Create shasta2 anchors equivalent to the marker graph vertices.
+    // This allows downstream processing using shasta2 tools.
+    createShasta2Anchors(assembler, threadCount);
 
 
     // // Store elapsed time for assembly.

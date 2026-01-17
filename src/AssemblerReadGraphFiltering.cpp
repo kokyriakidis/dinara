@@ -417,12 +417,12 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
                 ts0 = rt.start;
             }
 
-            // Calculate effective coordinates relative to valid region
-            // Ensure non-negative (clipping should have handled this, but be safe)
-            uint32_t qs = (ad.qs >= qs0) ? (ad.qs - qs0) : 0;
-            uint32_t qe = (ad.qe >= qs0) ? (ad.qe - qs0) : 0;
-            uint32_t ts = (ad.ts >= ts0) ? (ad.ts - ts0) : 0;
-            uint32_t te = (ad.te >= ts0) ? (ad.te - ts0) : 0;
+            // IMPORTANT: After applyCoverageCuts, coordinates are already normalized (0-based relative to valid region)
+            // So we use them directly without subtracting vr.start again
+            uint32_t qs = ad.qs;
+            uint32_t qe = ad.qe;
+            uint32_t ts = ad.ts;
+            uint32_t te = ad.te;
             
             // Re-check length just in case
             if (qe <= qs || te <= ts) {
@@ -484,22 +484,28 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
                  }
             }
             
-            // 4. Containment Classification (Optional preservation)
-            // miniasm keeps QCONT/TCONT even if "badShape"?
-            // ma_hit_flt: "if (r >= 0 || r == MA_HT_QCONT || r == MA_HT_TCONT)" -> Keep.
-            // Where r is result of ma_hit2arc.
-            // ma_hit2arc logic:
-            //   if (ext checks fail) return MA_HT_INT; (-1)
-            //   else checks containment... 
-            // So if EXT CHECKS FAIL (badShape), it returns INT, which is < 0 and NOT QCONT/TCONT.
-            // So Contained reads are liable to fail Hang Check?
-            // Wait, if contained: qs <= tl5 (because qs=ext5?), etc.
-            // If contained, hangs should be 0 or small?
-            // Actually, if contained, say Query in Target:
-            // qs matches middle of T.
-            // ext5 = min(qs, T_start_hang).
-            // If qs is huge (deep inside), but T_start_hang is huge...
-            // Basically if Bad Shape, we delete.
+            // 4. Containment Classification (Hifiasm ma_hit_flt Parity)
+            // Hifiasm ma_hit_flt: "if (r < 0 || r == MA_HT_QCONT || r == MA_HT_TCONT)" -> Delete.
+            // Contained reads must be deleted here as edges. 
+            // ma_hit2arc checks containment if badShape is false? No, it checks containment explicitly.
+            
+            bool isQCont = false;
+            bool isTCont = false;
+            
+            // Query contained in Target
+            // qs <= tl5 (Left fits) AND (ql - qe) <= tl3 (Right fits)
+            if ((int32_t)qs <= tl5 && ((int32_t)ql - (int32_t)qe) <= tl3) {
+                isQCont = true;
+            }
+            // Target contained in Query
+            // qs >= tl5 (Left extended) AND (ql - qe) >= tl3 (Right extended)
+            if ((int32_t)qs >= tl5 && ((int32_t)ql - (int32_t)qe) >= tl3) {
+                isTCont = true;
+            }
+            
+            if (isQCont || isTCont) {
+                badShape = true;
+            }
             
             if (badShape) {
                 ad.setDeleted(true);
@@ -537,174 +543,126 @@ void Assembler::detectChimericReads(uint64_t threadCount)
     setupLoadBalancing(reads->readCount(), batchSize);
     runThreads(&Assembler::detectChimericReadsThreadFunction, threadCount);
 
-    // Count chimeric reads
+    // Count chimeric reads and mark them as deleted in validReadIntervals
     uint64_t chimericCount = 0;
     for(size_t i=0; i<isChimericRead.size(); i++) {
-        if(isChimericRead[i]) chimericCount++;
+        if(isChimericRead[i]) {
+            chimericCount++;
+            // IMPORTANT: Propagate status to validReadIntervals for downstream filtering
+            if (i < validReadIntervals.size()) {
+                validReadIntervals[i].isDeleted = true;
+            }
+        }
     }
     cout << timestamp << "Detected " << chimericCount << " chimeric reads." << endl;
+    if (chimericCount > 0) {
+        cout << timestamp << "  -> Marked these reads as deleted in validReadIntervals." << endl;
+    }
 }
 
 void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
 {
-    // Loop over batches of reads
-    uint64_t readIdBegin, readIdEnd;
-    while(getNextBatch(readIdBegin, readIdEnd)) {
-        for(ReadId readId = ReadId(readIdBegin); readId < ReadId(readIdEnd); readId++) {
+    // Hifiasm Parity Implementation (detect_chimeric_reads: Overlaps.cpp:2449)
+    
+    // Struct to hold max_left / max_right intervals
+    struct SubRegion { uint32_t s, e; };
+
+    uint64_t start, end;
+    while(getNextBatch(start, end)) {
+        for(ReadId readId = ReadId(start); readId < ReadId(end); readId++) {
             
-            // We only process one orientation (Strand 0) and assume it covers the read.
-            OrientedReadId orientedReadId(readId, 0);
-            const uint64_t readLen = reads->getReadRawSequenceLength(readId);
+            uint64_t rLen = reads->getReadRawSequenceLength(readId);
+            OrientedReadId oid(readId, 0);
+
+            // Access alignments
+            if (oid.getValue() >= alignmentTable.size()) continue;
+            auto alignments = alignmentTable[oid.getValue()];
             
-            // Gather valid intervals (Coverage Events)
-            vector<pair<int32_t, int>> events;
+            SubRegion max_left = { (uint32_t)rLen, 0 };
+            SubRegion max_right = { (uint32_t)rLen, 0 };
             
-            // Access alignments for this read
-            // alignmentTable indexes alignments by OrientedReadId.
-            // CAUTION: Check if alignmentTable covers this ID.
-            if (orientedReadId.getValue() >= alignmentTable.size()) continue;
+            // --- 1. collect_sides ---
+            // "if(qs == 0) update max_left; if(qe == rLen) update max_right"
             
-            // Using range-based iteration if supported, or size/indexing
-            const size_t n = alignmentTable.size(orientedReadId.getValue());
-            for(size_t i=0; i<n; i++) {
-                const uint64_t alignmentId = alignmentTable[orientedReadId.getValue()][i];
+            for (uint32_t alignmentId : alignments) {
                 const AlignmentData& ad = alignmentData[alignmentId];
+                if (ad.isDeleted()) continue;
                 
-                // Only consider "Cis" (kept) alignments. 
-                // If status is Unknown, we fallback to isInReadGraph.
-                bool isCis = (bool)(ad.cisTransStatus == CisTransStatus::Cis);
-                if (ad.cisTransStatus == CisTransStatus::Unknown) {
-                    if (ad.info.isInReadGraph) isCis = true;
-                }
-                if (!isCis) continue;
-                
-                // Determine coordinates on THIS read (readId)
-                // AlignmentData usually stores canonical pair or oriented pair.
-                // We need to deal with the coordinate system properly.
-                // Dinara stores alignment between oriented reads.
-                // The alignment intervals are in `ad.info` usually (markers), 
-                // but we added explicit `qs, qe, ts, te` (bases).
-                
-                uint32_t start = 0;
-                uint32_t end = 0;
-                ReadId otherReadId;
-                
-                if (ad.readIds[0] == readId) {
-                    // Coordinates on Read 0 are usually Forward Strand relative?
-                    // ad.qs and ad.qe are valid for Read 0.
-                    start = ad.qs;
-                    end = ad.qe;
-                    otherReadId = ad.readIds[1];
-                } else if (ad.readIds[1] == readId) {
-                    // Read 1
-                    start = ad.ts;
-                    end = ad.te;
-                    otherReadId = ad.readIds[0];
-                } else {
-                    continue; 
-                }
+                // Get coords on readId
+                uint32_t qs, qe;
+                if (ad.readIds[0] == readId) { qs = ad.qs; qe = ad.qe; }
+                else { qs = ad.ts; qe = ad.te; }
 
-                const uint64_t otherReadLen = reads->getReadRawSequenceLength(otherReadId);
-
-                // --- DUPLICATE FILTER (Hifiasm-style) ---
-                // Filter out full-length overlaps that look like duplicates.
-                // If the overlap is nearly full length for both reads AND lengths are similar (PCR dup).
-                // They support the chimera across the junction artificially.
-                
-                // Length diff
-                uint64_t lenDiff = (readLen > otherReadLen) ? (readLen - otherReadLen) : (otherReadLen - readLen);
-                
-                // Overlap length on this read
-                uint64_t overlapLen = end - start;
-                
-                // Overlap length on other read (approximation using same overlap length, 
-                // or we could use the data fields if we knew orientation). 
-                // Detailed check:
-                // Hifiasm checks: if (diff <= len*0.02 && diff <= otherLen*0.02)
-                // AND overlap covers nearly everything (unaligned part <= len*0.02).
-                
-                const double dupRate = 0.02;
-                if (lenDiff <= uint64_t(double(readLen)*dupRate) && 
-                    lenDiff <= uint64_t(double(otherReadLen)*dupRate)) {
-                    
-                    // Check if it's a full overlap
-                    // Unaligned on this read: readLen - overlapLen
-                    // We check if unaligned part is small.
-                    uint64_t unaligned = readLen - overlapLen;
-                    if (unaligned <= uint64_t(double(readLen)*dupRate)) {
-                        // Likely a duplicate. Skip it.
-                        continue; 
-                    }
+                // Check Left Anchor
+                if (qs == 0) {
+                    if (qs < max_left.s) max_left.s = qs;
+                    if (qe > max_left.e) max_left.e = qe;
                 }
                 
-                // --- SHRINK LOGIC (Hifiasm-style: Preserve Tips) ---
-                // We shrink the valid coverage interval by flank (256bp), but only if the alignment doesn't touch the read end.
-                // Why: Coverage naturally drops to zero at the tips of any read. We don't want to flag a read as chimeric just 
-                // because it has low coverage at the very start or end. We only care about "holes" that appear deep inside the read body.
-                // "if (s0 > 0) s0 += cut_len" -> If start is NOT at tip, shrink it (internal gap potential).
-                    // --- SHRINK LOGIC (Hifiasm-style: Preserve Tips) ---
-                // We shrink the valid coverage interval by flank (256bp), but only if the alignment doesn't touch the read end.
-                
-                int32_t flank = 256; 
-                int32_t s = int32_t(start);
-                int32_t e = int32_t(end);
-                
-                if (s > 0) s += flank;
-                if (e < int32_t(readLen)) e -= flank;
-                
-                if (s < e) {
-                    events.push_back({s, 1});
-                    events.push_back({e, -1});
+                // Check Right Anchor
+                if (qe == (uint32_t)rLen) {
+                    if (qs < max_right.s) max_right.s = qs;
+                    if (qe > max_right.e) max_right.e = qe;
                 }
             }
+            
+            // "if(max_left.s == rLen || max_right.s == rLen) continue;"
+            // Means we didn't find any left anchor or any right anchor.
+            // Hifiasm treats these as "End Nodes" and does not flag them as chimeric.
+            if (max_left.s == (uint32_t)rLen || max_right.s == (uint32_t)rLen) {
+                continue;
+            }
+            
+            // --- 2. collect_contain ---
+            // Extend max_left.e and max_right.s using overlaps contained within them.
+            // Hifiasm: "if(qs < max_left.e && qe > max_left.e && max_left.e - qs > (overlap_rate * (qe -qs)))"
+            float overlap_rate = 0.1f;
+            uint32_t new_left_e = max_left.e;
+            uint32_t new_right_s = max_right.s;
+            
+            for (uint32_t alignmentId : alignments) {
+                const AlignmentData& ad = alignmentData[alignmentId];
+                if (ad.isDeleted()) continue;
+                
+                uint32_t qs, qe;
+                if (ad.readIds[0] == readId) { qs = ad.qs; qe = ad.qe; }
+                else { qs = ad.ts; qe = ad.te; }
 
-            
-            // --- SWEEP LOGIC ---
-            // We sweep from 0 to readLen.
-            // If min coverage < threshold anywhere in [0, readLen), it's chimeric?
-            // Hifiasm tracks min_cov among "regions between events".
-            // AND Hifiasm starts tracking `st=0`.
-            
-            if (events.empty()) {
-                // No valid intervals -> Chimeric
-                isChimericRead[readId] = true;
-            } else {
-                std::sort(events.begin(), events.end());
-                
-                int coverage = 0;
-                const int minCoverageThreshold = 2; 
-                bool foundGap = false;
-                
-                int prevPos = 0; 
-                
-                // Hifiasm Logic: Check ALL intervals [prevPos, pos)
-                for(const auto& ev : events) {
-                    int pos = ev.first;
-                    
-                    if (pos > prevPos) {
-                        // Check coverage in [prevPos, pos)
-                        if (coverage < minCoverageThreshold) {
-                            foundGap = true; 
-                            break;
+                if (qs != 0 && qe != (uint32_t)rLen) {
+                    // Contained overlap extension for Left
+                    if (qs < max_left.e && qe > max_left.e) {
+                         uint32_t len = qe - qs;
+                         if (len > 0 && (max_left.e - qs) > (uint32_t)(overlap_rate * len)) {
+                             if (qe > new_left_e) new_left_e = qe;
+                         }
+                    }
+                    // Contained overlap extension for Right
+                    if (qs < max_right.s && qe > max_right.s) {
+                        uint32_t len = qe - qs;
+                        if (len > 0 && (qe - max_right.s) > (uint32_t)(overlap_rate * len)) {
+                            if (qs < new_right_s) new_right_s = qs;
                         }
                     }
-                    
-                    // Update coverage AFTER checking the interval
-                    coverage += ev.second;
-                    prevPos = pos;
-                }
-                
-                // Check tail [lastEvent, readLen)
-                if (!foundGap && prevPos < int32_t(readLen)) {
-                     if (coverage < minCoverageThreshold) {
-                        foundGap = true;
-                     }
-                }
-                
-                if (foundGap) {
-                    isChimericRead[readId] = true;
                 }
             }
+            max_left.e = new_left_e;
+            max_right.s = new_right_s;
+            
+            // --- 3. Check for Overlap ---
+            // "if (max_left.e > max_right.s && (max_left.e - max_right.s >= rLen * shift_rate)) continue;"
+            // If they overlap sufficiently, it's a good read.
+            // We assume shift_rate=0 for basic check.
+            if (max_left.e > max_right.s) {
+                continue;
+            }
+            
+            // --- 4. Chimeric Flagging ---
+            // If we are here, max_left.e <= max_right.s (Gap Exists or barely touch).
+            // Hifiasm performs expensive "intersection_check" here.
+            // For structural parity, we flag as chimeric if the gap is not bridged.
+            // If the anchors don't meet, and no contained reads bridged them (step 2), then it's chimeric.
+            
+            isChimericRead[readId] = true;
         }
     }
 }
@@ -876,6 +834,8 @@ void Assembler::rescueChimericReadsThreadFunction(size_t /* threadId */)
                         
                         bool isValidType = (ad.cisTransStatus == CisTransStatus::Cis);
                         if (ad.cisTransStatus == CisTransStatus::Unknown && ad.info.isInReadGraph) isValidType = true;
+                        
+
                         
                         // Strict filter:
                         // 1. Must be Valid Type
@@ -1310,137 +1270,83 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
 
 // --- Contained Read Filtering (ma_hit_contained_advance equivalent) ---
 
-// Helper to determine containment status between two reads based on an overlap.
-// Should mimic ma_hit2arc's containment checks.
-// Returns: 
-// 0: No containment
-// 1: Read 0 is contained in Read 1 (QCONT)
-// 2: Read 1 is contained in Read 0 (TCONT)
-static int checkContainment(
-    uint32_t qs, uint32_t qe, uint32_t ql, // Read 0 valid Interval: start, end, len
-    uint32_t ts, uint32_t te, uint32_t tl, // Read 1 valid Interval: start, end, len
-    uint32_t os, uint32_t oe,              // Overlap on Read 0 (raw coords)
-    uint32_t rs, uint32_t re,              // Overlap on Read 1 (raw coords)
-    bool isReverse,                        // relative strand
-    uint32_t maxHang,
-    double maxHangRate,
-    uint32_t minOverlap)
+// Exact hifiasm ma_hit2arc containment check.
+// Parameters match hifiasm naming:
+//   h = alignment (hit)
+//   ql = query length (after coverage cut: sq->e - sq->s)
+//   tl = target length (after coverage cut: st->e - st->s)
+//   max_hang = maximum allowed overhang
+//   int_frac = internal fraction threshold (max_hang_rate)
+//   min_ovlp = minimum overlap length
+// Returns:
+//   0: Normal overlap (dovetail)
+//   1: MA_HT_QCONT - Query contained in Target
+//   2: MA_HT_TCONT - Target contained in Query
+//   -1: MA_HT_INT - Internal match (too much overhang)
+//   -2: MA_HT_SHORT_OVLP - Overlap too short
+static int ma_hit2arc_containment(
+    int32_t qs, int32_t qe, int32_t ql,   // Query: overlap start, end, length
+    int32_t ts, int32_t te, int32_t tl,   // Target: overlap start, end, length  
+    bool isReverse,                       // Is target reverse complemented?
+    int32_t max_hang,                     // Maximum allowed overhang
+    double int_frac,                      // Internal fraction threshold
+    int32_t min_ovlp)                     // Minimum overlap length
 {
-    // Adjust overlap coordinates to be relative to the valid interval
-    // If the overlap is outside the valid interval, it effectively doesn't exist for containment
-    // But typically we assume we're working with valid overlaps.
-    
-    // Calculate overhangs (hang0, hang1)
-    // Conceptually similar to filterHangingOverlaps but specifically for containment.
-    
-    // miniasm ma_hit2arc logic for containment:
-    // It compares the "unmapped" portions.
-    
-    // Left/Right overhangs on Query (Read 0)
-    int32_t q_hang_l = (int32_t)os - (int32_t)qs;
-    int32_t q_hang_r = (int32_t)qe - (int32_t)oe;
-    
-    // Left/Right overhangs on Target (Read 1)
-    // If reverse, Target start corresponds to Query end.
-    int32_t t_hang_l, t_hang_r;
+    // Compute 5' and 3' overhangs on target (relative to query orientation)
+    // tl5 = 5'-end overhang on target (on query strand)
+    // tl3 = 3'-end overhang on target (on query strand)
+    int32_t tl5, tl3;
     if (isReverse) {
-        // Reverse strand: 
-        // Read 0:  [os ----- oe]
-        // Read 1:  [re ----- rs]  (logical direction)
-        // ts is start of valid region on 1, te is end.
-        
-        // Target valid region is [ts, te].
-        // Overlap on target is [rs, re] (where rs < re, usually stored sorted).
-        // Wait, Alignment info usually stores rs, re on the forward strand of Read 1.
-        // If reverse, the 5' end of Read 0 matches the 3' end of Read 1?
-        // Standard PAF/Coords: 
-        // R0: os..oe
-        // R1: rs..re. If Str=1, then R0(os) matches R1(re), R0(oe) matches R1(rs).
-        
-        // Let's compute 'projected' coordinates to align them.
-        // But simpler: just compute overhangs.
-        
-        // Target overhangs (relative to valid interval [ts, te])
-        // The overlap on T is [rs, re].
-        // If Str=1:
-        // Q_Left (os) matches T_Right (re).
-        // Q_Right (oe) matches T_Left (rs).
-        
-        t_hang_l = (int32_t)re - (int32_t)te; // How much T extends beyond the match on the 'right' (which matches Q's left)
-        t_hang_r = (int32_t)ts - (int32_t)rs; // How much T extends beyond match on 'left' (matches Q's right)
-        
-        // Wait, signage.
-        // If T=[0..100], Valid=[10..90]. Overlap=[20..80].
-        // ts=10, te=90. rs=20, re=80.
-        // t_hang_left_of_match = rs - ts = 20-10=10.
-        // t_hang_right_of_match = te - re = 90-80=10.
-        
-        // If Str=1:
-        // match on T is [rs, re].
-        // Q start matches T re. So T's extension "before" the match (relative to Q) is actually bases AFTER re.
-        // So T_hang_corresponding_to_Q_Left = (te - re). (Assuming te > re).
-        // T_hang_corresponding_to_Q_Right = (rs - ts). (Assuming rs > ts).
-        
-        t_hang_l = (int32_t)te - (int32_t)re;
-        t_hang_r = (int32_t)rs - (int32_t)ts;
-        
+        tl5 = tl - te;  // Target's right end becomes 5' relative to query
+        tl3 = ts;       // Target's left end becomes 3' relative to query
     } else {
-        // Forward:
-        // Q Left (os) matches T Left (rs).
-        // Q Right (oe) matches T Right (re).
-        
-        t_hang_l = (int32_t)rs - (int32_t)ts;
-        t_hang_r = (int32_t)te - (int32_t)re;
+        tl5 = ts;       // Target's left end is 5'
+        tl3 = tl - te;  // Target's right end is 3'
+    }
+
+    // ext5 and ext3: the minimum of query and target overhangs on each side
+    int32_t ext5 = (qs < tl5) ? qs : tl5;
+    int32_t ext3 = ((ql - qe) < tl3) ? (ql - qe) : tl3;
+
+    // Check for internal match (too much overhang on both sides)
+    // This rejects overlaps where the alignment doesn't extend to edges
+    if (ext5 > max_hang || ext3 > max_hang) {
+        return -1;  // MA_HT_INT
     }
     
-    // Now we have q_hang_l, q_hang_r, t_hang_l, t_hang_r.
-    // These represent the length of the read *outside* the alignment.
-    // Note: Can be negative if overlap extends beyond valid interval? 
-    // Usually clamped or validInterval constrains it.
-    
-    // Check Query Contained in Target (QCONT)
-    // Q is contained if it has NO significant overhangs compared to T's extension?
-    // No, Q is contained if Q is "inside" T.
-    // This means Q's ends are "covered" by T.
-    // i.e., T extends further than Q in both directions (or effectively so).
-    // Specifically:
-    // overlap almost covers Q (q_hang_l ~ 0, q_hang_r ~ 0).
-    // T has slack on both sides (t_hang_l > 0, t_hang_r > 0) OR T roughly equals Q.
-    
-    // miniasm ma_hit2arc:
-    // int32_t l = 0, r = 0;
-    // if (tl > MAX_HANG) l = 1; // Left overhang significant
-    // if (tr > MAX_HANG) r = 1; // Right overhang significant
-    // And it compares lengths.
-    
-    // Simplified logic:
-    // Q is contained if overlap length is close to Q's length.
-    // (q_hang_l < maxHang && q_hang_r < maxHang).
-    
-    // T is contained if overlap length is close to T's length.
-    // (t_hang_l < maxHang && t_hang_r < maxHang).
-    
-    bool q_covered = (abs(q_hang_l) < (int32_t)maxHang && abs(q_hang_r) < (int32_t)maxHang);
-    bool t_covered = (abs(t_hang_l) < (int32_t)maxHang && abs(t_hang_r) < (int32_t)maxHang);
-    
-    if (q_covered && t_covered) {
-        // Mutual containment (almost identical reads).
-        // Resolve by ID or length to be deterministic.
-        // Keep the longer one, or if equal, keep the larger ID.
-        if (ql < tl) return 1; // Q < T -> Q contained
-        if (tl < ql) return 2; // T < Q -> T contained
-        return (qs > ts) ? 1 : 2; // Tie-break (arbitrary but deterministic)
+    // Check internal fraction constraint
+    int32_t qOverlapLen = qe - qs;
+    int32_t tOverlapLen = te - ts;
+    if (qOverlapLen < (qOverlapLen + ext5 + ext3) * int_frac) {
+        return -1;  // MA_HT_INT
     }
-    
-    if (q_covered) return 1;
-    if (t_covered) return 2;
-    
+    if (tOverlapLen < (tOverlapLen + ext5 + ext3) * int_frac) {
+        return -1;  // MA_HT_INT
+    }
+
+    // Containment checks (exact hifiasm logic from Overlaps.h lines 418-419)
+    // Query contained in Target: query's overhangs are smaller than target's
+    if (qs <= tl5 && (ql - qe) <= tl3) {
+        return 1;  // MA_HT_QCONT
+    }
+    // Target contained in Query: target's overhangs are smaller than query's
+    if (qs >= tl5 && (ql - qe) >= tl3) {
+        return 2;  // MA_HT_TCONT
+    }
+
+    // Check minimum overlap length
+    if (qOverlapLen + ext5 + ext3 < min_ovlp || tOverlapLen + ext5 + ext3 < min_ovlp) {
+        return -2;  // MA_HT_SHORT_OVLP
+    }
+
+    // Normal dovetail overlap
     return 0;
 }
 
+
 void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
-    cout << timestamp << "Removing contained reads..." << endl;
+    cout << timestamp << "Removing contained reads (ma_hit_contained_advance) - Serial Execution for Strict Parity..." << endl;
     
     if (!containmentParent.isOpen) {
         containmentParent.createNew(largeDataName("ContainmentParent"), largeDataPageSize);
@@ -1448,38 +1354,105 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
         std::fill(containmentParent.begin(), containmentParent.end(), ReadId(invalidReadId));
     }
 
-    // Temporary storage for parameters
-    this->hangingFilterMaxHang = maxHang;
-    this->hangingFilterMaxHangRate = maxHangRate;
-    this->hangingFilterMinOverlap = minOverlapLength;
-
-    setupLoadBalancing(alignmentData.size(), 1000); // Iterate over alignments
-    runThreads(&Assembler::removeContainedReadsThreadFunction, threadCount);
-    
-    // Transitive Reduction of Containment Tree & Cleanup
-    cout << timestamp << "Transitive reduction and containment cleanup..." << endl;
-    
     uint64_t containedCount = 0;
     
-    // 1. Path Compression for containment parent
+    // Hifiasm Iterates Reads Serially (Overlaps.cpp:1794)
+    for(ReadId i=0; i<reads->readCount(); i++) {
+        if (validReadIntervals[i].isDeleted) continue;
+        
+        // Iterate alignments for Read i (Strand 0)
+        // Hifiasm iterates sources[i] which contains all overlaps for i.
+        OrientedReadId oid(i, 0);
+        if (oid.getValue() >= alignmentTable.size()) continue;
+        
+        const auto& table = alignmentTable[oid.getValue()];
+        for(uint32_t alignmentId : table) {
+             AlignmentData& ad = alignmentData[alignmentId];
+             
+             // "if(h->del) continue;"
+             if (ad.isDeleted()) continue;
+             
+             // Identify Query (i) and Target (neighbor)
+             ReadId qn = i;
+             ReadId tn;
+             int32_t qs, qe, ts, te;
+             bool isReverse = !ad.isSameStrand;
+             
+             // Determine usage of coordinates based on who is Query
+             // AlignmentData stores [readId0, readId1].
+             // Coordinates are [qs, qe] for r0, [ts, te] for r1.
+             if (ad.readIds[0] == i) {
+                 tn = ad.readIds[1];
+                 qs = (int32_t)ad.qs; qe = (int32_t)ad.qe;
+                 ts = (int32_t)ad.ts; te = (int32_t)ad.te;
+             } else {
+                 tn = ad.readIds[0];
+                 // If i is r1 (Target in AD), then for THIS check, i is Query.
+                 // So we must SWAP the roles of Q and T coordinates from AD perspective.
+                 // "qs" for this check (on Read i) comes from ad.ts/te.
+                 // "ts" for this check (on Read tn) comes from ad.qs/qe.
+                 qs = (int32_t)ad.ts; qe = (int32_t)ad.te;
+                 ts = (int32_t)ad.qs; te = (int32_t)ad.qe;
+             }
+             
+             // "if(sq->del || st->del) continue;"
+             if (validReadIntervals[tn].isDeleted) continue;
+
+             const auto& vrQ = validReadIntervals[qn];
+             const auto& vrT = validReadIntervals[tn];
+             int32_t ql = (int32_t)(vrQ.end - vrQ.start);
+             int32_t tl = (int32_t)(vrT.end - vrT.start);
+             
+             // Call Hifiasm Logic Helper
+             // Note: qs/qe/ts/te are already normalized by applyCoverageCuts (Step 3).
+             // Matches Hifiasm expectation of being relative to valid region.
+             
+             int result = ma_hit2arc_containment(
+                qs, qe, ql,
+                ts, te, tl,
+                isReverse,
+                (int32_t)maxHang,
+                maxHangRate,
+                (int32_t)minOverlapLength
+            );
+            
+            if (result == 1) { // MA_HT_QCONT: Query (i) contained in Target (tn)
+                // "delete_all_edges(qn)" -> Mark read deleted implies all edges invalid
+                // We mark read as deleted immediately.
+                validReadIntervals[qn].isDeleted = true;
+                
+                // "set_R_to_U" -> Record containment
+                containmentParent[qn] = tn;
+                containedCount++;
+                
+                // Break inner loop? Hifiasm does NOT break inner loop immediately?
+                // `delete_all_edges` clears the buffer?
+                // If we delete all edges, checking further overlaps for `i` is pointless?
+                // Hifiasm `delete_all_edges(sources... i)`. It sets `p->del=1` for all overlaps in `sources[i]`.
+                // So yes, we should stop processing `i`.
+                break; 
+                
+            } else if (result == 2) { // MA_HT_TCONT: Target (tn) contained in Query (i)
+                // Mark target deleted
+                validReadIntervals[tn].isDeleted = true;
+                containmentParent[tn] = qn;
+                containedCount++;
+                
+                // Note: We do NOT break here, because Query `i` is still alive and might contain others.
+            }
+        }
+    }
+    
+    // Transitive Reduction of Containment Tree & Cleanup (Parity: transfor_R_to_U)
+    cout << timestamp << "Transitive reduction..." << endl;
     for(size_t i=0; i<containmentParent.size(); i++) {
         if (containmentParent[i] != invalidReadId) {
-            
-            ReadId p = containmentParent[i];
-            
-            // Check for containment cycles or long chains
-            // (A contains B, B contains C -> A contains C)
-            // Limit depth to avoid infinite loops if cycle exists
-            int depth = 0;
-            while(p != invalidReadId && containmentParent[p] != invalidReadId && depth < 100) {
-                 p = containmentParent[p];
-                 depth++;
+            ReadId parent = containmentParent[i];
+            while(containmentParent[parent] != invalidReadId) {
+                parent = containmentParent[parent];
             }
-            // If cycle (depth hit max), maybe break link or pick one? 
-            // For now, assign ultimate parent.
-            containmentParent[i] = p; 
-            
-            // Mark as deleted in global flags
+            containmentParent[i] = parent; // Path compression
+
             // This corresponds to 'coverage_cut[i].del = 1'
             validReadIntervals[i].isDeleted = true;
             containedCount++;
@@ -1496,154 +1469,114 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
     cout << timestamp << "Identified " << containedCount << " contained reads." << endl;
 }
 
-void Assembler::removeContainedReadsThreadFunction(size_t threadId)
+void Assembler::removeContainedReadsThreadFunction(size_t /* threadId */)
 {
-    // Access loadBalancing directly (inherited from MultithreadedObjectBaseClass)
+    // Exact hifiasm ma_hit_contained_advance logic
+    // Iterates over alignments and checks containment using ma_hit2arc logic
+    
     uint64_t start, end;
     while(getNextBatch(start, end)) {
-        for(uint64_t i=start; i<end; i++) {
-            // Check if alignment is active in the graph construction
-            // Since we don't have 'keepAlignment' vector passed here, we check 'isInReadGraph'
-            // and maybe 'isDeleted' if that field exists in AlignmentData or similar.
-            
-            // Note: In ReadGraph5, keepAlignment is local. 
-            // We should rely on `alignmentData[i].info.isInReadGraph` which should be updated?
-            // Actually ReadGraph5 updates keepAlignment locally and then final graph uses it.
-            // But filtering functions modify separate flags (`isDeleted`, `validReadIntervals`).
-            // `applyCoverageCuts` uses `validReadIntervals`.
-            
-            // To be safe, we check if either read is ALREADY deleted by previous steps.
-            
-            // Access alignment data
-            // Assuming AlignmentData is the type, let's see what it contains.
-            // It likely has 'info' of type AlignmentInfo.
-            // AlignmentData might be a struct with: ReadId readIds[2]; AlignmentInfo info; ...
-            // Let's guess based on usage elsewhere: `ad.readIds[0]`.
-            
+        for(uint64_t i = start; i < end; i++) {
             AlignmentData& ad = alignmentData[i];
-
+            
+            // Skip already deleted alignments
+            if (ad.isDeleted()) continue;
+            
             ReadId r0 = ad.readIds[0];
             ReadId r1 = ad.readIds[1];
-
-            // Get raw lengths
-            uint64_t len0 = getReads().getReadRawSequenceLength(r0);
-            uint64_t len1 = getReads().getReadRawSequenceLength(r1);
             
-            // Unaligned tails for R0
-            int64_t tail0_L = (int64_t)ad.qs;
-            int64_t tail0_R = (int64_t)len0 - (int64_t)ad.qe;
-             
-            // Unaligned tails for R1
-            int64_t tail1_L = (int64_t)ad.ts;
-            int64_t tail1_R = (int64_t)len1 - (int64_t)ad.te;
-
-            // int64_t leftUnaligned0 = ad.info.leftTrim(0);
-            // int64_t rightUnaligned0 = ad.info.rightTrim(0);
-            // int64_t leftUnaligned1 = ad.info.leftTrim(1);
-            // int64_t rightUnaligned1 = ad.info.rightTrim(1);
-
-            int64_t leftUnaligned0 = tail0_L;
-            int64_t rightUnaligned0 = tail0_R;
-            int64_t leftUnaligned1 = tail1_L;
-            int64_t rightUnaligned1 = tail1_R;
-
-            if (r0 == 8894 || r1 == 8894) {
-                cout << "Alignment " << i << ": " << r0 << " " << r1 << endl;
-                cout << "Tail 0: " << tail0_L << " " << tail0_R << endl;
-                cout << "Tail 1: " << tail1_L << " " << tail1_R << endl;
-                cout << "Left Unaligned 0: " << leftUnaligned0 << " " << leftUnaligned1 << endl;
-                cout << "Right Unaligned 0: " << rightUnaligned0 << " " << rightUnaligned1 << endl;
+            // Skip if either read is already marked as deleted (coverage_cut[i].del)
+            if (validReadIntervals[r0].isDeleted || validReadIntervals[r1].isDeleted) {
+                continue;
             }
+            
+            // Get valid region lengths (equivalent to sq->e - sq->s in hifiasm)
+            // Uses the valid regions detected by filterLocalSegments (ma_hit_sub equivalent)
+            const auto& vr0 = validReadIntervals[r0];
+            const auto& vr1 = validReadIntervals[r1];
+            int32_t ql = (int32_t)(vr0.end - vr0.start);
+            int32_t tl = (int32_t)(vr1.end - vr1.start);
+            
+            // IMPORTANT: After applyCoverageCuts, coordinates are already normalized (0-based relative to valid region)
+            // So we use them directly without subtracting vr.start again
+            int32_t qs = (int32_t)ad.qs;
+            int32_t qe = (int32_t)ad.qe;
+            int32_t ts = (int32_t)ad.ts;
+            int32_t te = (int32_t)ad.te;
+            bool isReverse = ad.isSameStrand ? false : true;  // ad.isSameStrand means forward, !isSameStrand means reverse
 
-            if ((leftUnaligned0 <= leftUnaligned1) && (rightUnaligned0 <= rightUnaligned1)) {
-                containmentParent[r0] = r1;
-                validReadIntervals[r0].isDeleted = true;
+
+            
+            // Use the exact hifiasm containment check
+            int result = ma_hit2arc_containment(
+                qs, qe, ql,
+                ts, te, tl,
+                isReverse,
+                (int32_t)this->hangingFilterMaxHang,
+                this->hangingFilterMaxHangRate,
+                (int32_t)this->hangingFilterMinOverlap
+            );
+            
+            static std::atomic<int> debugCount(0);
+            if (result == 1 && debugCount < 10) { // QCONT
+                 debugCount++;
+                 // Recalculate overhangs for debug
+                 int32_t tl5, tl3;
+                 if (isReverse) {
+                    tl5 = tl - te;
+                    tl3 = ts;
+                 } else {
+                    tl5 = ts;
+                    tl3 = tl - te;
+                 }
+                 int32_t ext5 = std::min(qs, tl5);
+                 int32_t ext3 = std::min(ql - qe, tl3);
+                 
+                 std::stringstream ss;
+                 ss << "Debug QCONT: R" << r0 << " in R" << r1 
+                    << " qs=" << qs << " qe=" << qe << " ql=" << ql 
+                    << " ts=" << ts << " te=" << te << " tl=" << tl
+                    << " tl5=" << tl5 << " tl3=" << tl3 << " ext5=" << ext5 << " ext3=" << ext3 << endl;
+                 cout << ss.str();
+            }
+            
+            if (result == 1) {
+                // MA_HT_QCONT: Query (r0) is contained in Target (r1)
                 ad.setDeleted(true);
                 
-                // Aggressively remove all other alignments involving contained read r0
-                for(uint32_t strand=0; strand<2; strand++) {
+                // delete_single_edge equivalent: delete the reverse edge from r1 to r0
+                // (This is complex to implement without the full edge structure, 
+                //  but we mark the alignment deleted which is equivalent)
+                
+                // delete_all_edges equivalent: mark all alignments involving r0 as deleted
+                for(uint32_t strand = 0; strand < 2; strand++) {
                     OrientedReadId oid(r0, strand);
                     for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
                         alignmentData[otherAlignId].setDeleted(true);
                     }
                 }
                 
-                continue;
-            } else if ((leftUnaligned1 <= leftUnaligned0) && (rightUnaligned1 <= rightUnaligned0)) {
-                containmentParent[r1] = r0;
-                validReadIntervals[r1].isDeleted = true;
+                // set_R_to_U equivalent: record containment relationship
+                containmentParent[r0] = r1;
+                validReadIntervals[r0].isDeleted = true;
+                
+            } else if (result == 2) {
+                // MA_HT_TCONT: Target (r1) is contained in Query (r0)
                 ad.setDeleted(true);
-
-                // Aggressively remove all other alignments involving contained read r1
-                for(uint32_t strand=0; strand<2; strand++) {
+                
+                // delete_all_edges equivalent: mark all alignments involving r1 as deleted  
+                for(uint32_t strand = 0; strand < 2; strand++) {
                     OrientedReadId oid(r1, strand);
                     for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
                         alignmentData[otherAlignId].setDeleted(true);
                     }
                 }
                 
-                continue;
+                // set_R_to_U equivalent: record containment relationship
+                containmentParent[r1] = r0;
+                validReadIntervals[r1].isDeleted = true;
             }
-
-
-
-
-            
-            if (!ad.info.isInReadGraph) continue;
-            
-            if (ad.isDeleted()) continue;
-            
-            
-            
-            // Ignore if already deleted/chimeric
-            if (validReadIntervals[r0].isDeleted || validReadIntervals[r1].isDeleted) continue;
-            if (isChimericRead[r0] || isChimericRead[r1]) continue;
-
-            const auto& status0 = validReadIntervals[r0];
-            const auto& status1 = validReadIntervals[r1];
-            
-            // Containment Logic:
-            // Check if one read is "enclosed" in the other.
-            // Enclosed = The read is fully covered by the alignment (i.e. has no significant overhangs).
-            // User Request: "check if one is contained in the other! we cant have both of them contained!"
-            
-            
-
-            
-            // int64_t tol = (int64_t)this->hangingFilterMaxHang;
-            
-            
-            // Determine Candidate based on length (Shorter read can be contained in Longer read)
-            // Tie-break with ID for determinism.
-            bool checkR0 = false;
-            
-            if (len0 < len1) {
-                checkR0 = true;
-            } else if (len1 < len0) {
-                checkR0 = false;
-            } else {
-                // Equal lengths: Tie-break
-                if (r0 > r1) checkR0 = true;
-                else checkR0 = false;
-            }
-            
-            if (checkR0) {
-                 // Check if R0 is contained in R1.
-                 // logic: R0 is "inside" R1 if R0's tails are smaller than R1's tails (on the corresponding sides).
-                 // relative check: tail0 <= tail1 (+ tolerance)
-                 if ((tail0_L <= tail1_L) && (tail0_R <= tail1_R)) {
-                     containmentParent[r0] = r1;
-                     validReadIntervals[r0].isDeleted = true;
-                     ad.setDeleted(true);
-                 }
-            } else {
-                 // Check if R1 is contained in R0.
-                 if ((tail1_L <= tail0_L) && (tail1_R <= tail0_R)) {
-                     containmentParent[r1] = r0;
-                     validReadIntervals[r1].isDeleted = true;
-                     ad.setDeleted(true);
-                 }
-            }
+            // result == 0 (normal dovetail), -1 (internal), -2 (short): do nothing
         }
     }
 }

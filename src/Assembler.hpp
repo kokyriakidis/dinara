@@ -682,11 +682,16 @@ private:
     std::atomic<uint64_t> removedBestHitCount;
 public:
     void filterBestHitAlignments(uint64_t threadCount);
-private:
-
-    // Filter local segments (coverage based)
-    void filterLocalSegmentsThreadFunction(size_t threadId);
+public:
+    // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
+    void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
+    void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+
+private:
+    // Filter local segments (coverage based) - thread function
+    void filterLocalSegmentsThreadFunction(size_t threadId);
     
     // Structure for local segment filtering results
     struct ReadSegmentStatus {
@@ -709,25 +714,19 @@ private:
     double chimericShiftRate = 0.06;
     uint64_t chimericUlThres = 2;
 
-    // Apply coverage cuts (ma_hit_cut equivalent)
-    // Clips alignments to valid regions and removes short overlaps.
-    void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
+    // Apply coverage cuts (ma_hit_cut equivalent) - thread functions
     void applyCoverageCutsToAlignmentsThreadFunction(size_t threadId);
     void applyCoverageCutsCleanupThreadFunction(size_t threadId);
     uint64_t coverageCutMinOverlap = 0;
 
-    // Filter hanging overlaps (ma_hit_flt equivalent)
-    // Filters overlaps based on excessive overhangs (dovetail rule).
-    void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    // Filter hanging overlaps (ma_hit_flt equivalent) - thread function
     void filterHangingOverlapsThreadFunction(size_t threadId);
     uint64_t hangingFilterMaxHang = 1000;
     double hangingFilterMaxHangRate = 0.8;
     uint64_t hangingFilterMinOverlap = 0;
 
 
-    // Remove contained reads (ma_hit_contained_advance equivalent)
-    // Identifies reads fully contained in others and removes them.
-    void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    // Remove contained reads (ma_hit_contained_advance equivalent) - thread function
     void removeContainedReadsThreadFunction(size_t threadId);
     
     // Mapping from contained read to its container (parent).
@@ -1212,6 +1211,12 @@ public:
     
     // Read graph creation method 7: Uses canonical OverlapIndex with is_match/del flags
     void createReadGraph7();
+    
+    // Create read graph directly from OverlapIndex (Option A: direct use, no alignmentData mapping)
+    void createReadGraphFromCanonicalOverlaps();
+    
+    // Create read graph from alignments after filterBestHitAlignments (no phasing)
+    void createReadGraphFromFilteredAlignments();
     
     // Temporary or permanent member
     uint64_t minAlleleCoverage = 5; // Threshold from main.cpp

@@ -269,7 +269,46 @@ namespace dinara {
         // This logic remains similar to original plan
         populateAnchors(assembler, *shastaAnchors, threadCount);
         cout << timestamp << "Shasta2 Anchors created." << endl;
-
+        
+        // DEBUG: Print anchor statistics
+        cout << "DEBUG: Anchor count: " << shastaAnchors->size() << endl;
+        cout << "DEBUG: Total AnchorMarkerInfos: " << shastaAnchors->anchorMarkerInfos.totalSize() << endl;
+        
+        // Sample some anchors to verify content
+        if (shastaAnchors->size() > 0) {
+            size_t sampleIdx = 0;
+            auto sampleAnchor = (*shastaAnchors)[sampleIdx];
+            cout << "DEBUG: Anchor " << sampleIdx << " has " << sampleAnchor.size() << " marker infos" << endl;
+            for (size_t j = 0; j < std::min((size_t)3, sampleAnchor.size()); j++) {
+                const auto& ami = sampleAnchor[j];
+                cout << "  MarkerInfo " << j << ": readId=" << ami.orientedReadId.getValue() 
+                     << " ordinal=" << ami.ordinal << endl;
+            }
+        }
+        
+        // DEBUG: Anchor coverage histogram - write to file
+        std::map<uint64_t, uint64_t> coverageHistogram;
+        for (size_t i = 0; i < shastaAnchors->size(); i++) {
+            uint64_t coverage = (*shastaAnchors)[i].size();
+            coverageHistogram[coverage]++;
+        }
+        
+        // Write to file
+        std::ofstream histFile("AnchorCoverageHistogram.csv");
+        histFile << "Coverage,AnchorCount\n";
+        for (const auto& [cov, count] : coverageHistogram) {
+            histFile << cov << "," << count << "\n";
+        }
+        histFile.close();
+        cout << "DEBUG: Anchor coverage histogram written to AnchorCoverageHistogram.csv" << endl;
+        
+        // Also print summary to console
+        cout << "DEBUG: Coverage distribution summary:" << endl;
+        for (const auto& [cov, count] : coverageHistogram) {
+            if (cov <= 10 || count > 100) {
+                cout << "  Coverage " << cov << ": " << count << " anchors" << endl;
+            }
+        }
 
 
         // 4. Downstream Assembly
@@ -283,7 +322,8 @@ namespace dinara {
         options.threadCount = threadCount;
         
         // Map relevant dinara options if necessary, e.g. min/max coverage
-        // options.minAnchorGraphEdgeCoverage = ...
+        // Lower minAnchorGraphEdgeCoverage to allow more edges (default is 6)
+        options.minAnchorGraphEdgeCoverage = 2;
         
         // Create Journeys
         cout << "Creating Journeys..." << endl;
@@ -292,6 +332,22 @@ namespace dinara {
             shastaAnchors,
             threadCount,
             shastaOwner);
+        
+        // DEBUG: Check journey statistics
+        uint64_t nonEmptyJourneys = 0;
+        uint64_t totalJourneyLength = 0;
+        for (uint64_t i = 0; i < 2 * shastaReadsPtr->readCount(); i++) {
+            auto journey = journeys[shasta2::OrientedReadId::fromValue(i)];
+            if (journey.size() > 0) {
+                nonEmptyJourneys++;
+                totalJourneyLength += journey.size();
+            }
+        }
+        cout << "DEBUG: Non-empty journeys: " << nonEmptyJourneys << " / " << 2 * shastaReadsPtr->readCount() << endl;
+        cout << "DEBUG: Total journey length: " << totalJourneyLength << endl;
+        if (nonEmptyJourneys > 0) {
+            cout << "DEBUG: Average journey length: " << (double)totalJourneyLength / nonEmptyJourneys << endl;
+        }
 
         // Create AnchorGraph
         cout << "Creating AnchorGraph..." << endl;
@@ -314,6 +370,10 @@ namespace dinara {
             journeys,
             anchorGraph,
             options);
+
+        // Save AnchorGraph for HTTP server access
+        cout << "Saving AnchorGraph..." << endl;
+        anchorGraph.save("AnchorGraph");
 
         // Simplify and Assemble
         // This method handles the full assembly process including outputting GFA/Fasta.

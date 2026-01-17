@@ -278,3 +278,215 @@ void Assembler::createReadGraph7()
     
     cout << timestamp << "createReadGraph7 completed." << endl;
 }
+
+
+// Create read graph directly from canonical OverlapIndex without mapping to alignmentData.
+// This is Option A: Use overlapIndex directly for graph connectivity.
+// Each canonical overlap (qn < tn) generates 2 edges in the OrientedRead graph.
+void Assembler::createReadGraphFromCanonicalOverlaps()
+{
+    cout << timestamp << "createReadGraphFromCanonicalOverlaps begins." << endl;
+    
+    const uint32_t readCount = reads->readCount();
+    
+    // Count kept overlaps
+    uint64_t keptCount = 0;
+    uint64_t transCount = 0;
+    uint64_t deletedCount = 0;
+    uint64_t palindromicCount = 0;
+    uint64_t chimericCount = 0;
+    
+    // First pass: count edges
+    for (uint32_t qn = 0; qn < readCount; qn++) {
+        for (const auto& ov : overlapIndex.sources[qn]) {
+            if (ov.isTrans()) { transCount++; continue; }
+            if (ov.isDeleted()) { deletedCount++; continue; }
+            if (reads->getFlags(ov.qn).isPalindromic || 
+                reads->getFlags(ov.tn).isPalindromic) { palindromicCount++; continue; }
+            if (isChimericRead.size() > 0 &&
+                (isChimericRead[ov.qn] || isChimericRead[ov.tn])) { chimericCount++; continue; }
+            keptCount++;
+        }
+    }
+    
+    cout << timestamp << "Overlap filtering:" << endl;
+    cout << "  TRANS removed: " << transCount << endl;
+    cout << "  Deleted: " << deletedCount << endl;
+    cout << "  Palindromic: " << palindromicCount << endl;
+    cout << "  Chimeric: " << chimericCount << endl;
+    cout << "  Kept: " << keptCount << endl;
+    
+    // Create read graph edges (2 edges per overlap: forward + RC)
+    readGraph.edges.createNew(largeDataName("ReadGraphEdges"), largeDataPageSize);
+    readGraph.edges.reserve(keptCount * 2);
+    
+    // Second pass: create edges
+    for (uint32_t qn = 0; qn < readCount; qn++) {
+        for (const auto& ov : overlapIndex.sources[qn]) {
+            // Apply same filters
+            if (ov.isTrans()) continue;
+            if (ov.isDeleted()) continue;
+            if (reads->getFlags(ov.qn).isPalindromic || 
+                reads->getFlags(ov.tn).isPalindromic) continue;
+            if (isChimericRead.size() > 0 &&
+                (isChimericRead[ov.qn] || isChimericRead[ov.tn])) continue;
+            
+            // Create edge: (qn-strand0) to (tn-strand based on rev)
+            ReadGraphEdge edge;
+            edge.alignmentId = ov.cigarIdx & 0x3fff'ffff'ffff'ffff;  // Use cigarIdx as reference
+            edge.crossesStrands = 0;
+            edge.hasInconsistentAlignment = 0;
+            edge.orientedReadIds[0] = OrientedReadId(ov.qn, 0);
+            edge.orientedReadIds[1] = OrientedReadId(ov.tn, ov.rev ? 1 : 0);
+            
+            // Ensure canonical ordering for edge (orientedReadIds[0] < orientedReadIds[1])
+            if (edge.orientedReadIds[0] > edge.orientedReadIds[1]) {
+                std::swap(edge.orientedReadIds[0], edge.orientedReadIds[1]);
+            }
+            readGraph.edges.push_back(edge);
+            
+            // Also create the reverse complemented edge
+            edge.orientedReadIds[0].flipStrand();
+            edge.orientedReadIds[1].flipStrand();
+            if (edge.orientedReadIds[0] > edge.orientedReadIds[1]) {
+                std::swap(edge.orientedReadIds[0], edge.orientedReadIds[1]);
+            }
+            readGraph.edges.push_back(edge);
+        }
+    }
+    
+    readGraph.edges.unreserve();
+    
+    // Create read graph connectivity
+    readGraph.connectivity.createNew(largeDataName("ReadGraphConnectivity"), largeDataPageSize);
+    readGraph.connectivity.beginPass1(2 * readCount);
+    for (const ReadGraphEdge& edge : readGraph.edges) {
+        readGraph.connectivity.incrementCount(edge.orientedReadIds[0].getValue());
+        readGraph.connectivity.incrementCount(edge.orientedReadIds[1].getValue());
+    }
+    readGraph.connectivity.beginPass2();
+    for (size_t i = 0; i < readGraph.edges.size(); i++) {
+        const ReadGraphEdge& edge = readGraph.edges[i];
+        readGraph.connectivity.store(edge.orientedReadIds[0].getValue(), uint32_t(i));
+        readGraph.connectivity.store(edge.orientedReadIds[1].getValue(), uint32_t(i));
+    }
+    readGraph.connectivity.endPass2();
+    
+    // Count isolated reads
+    uint64_t isolatedReadCount = 0;
+    uint64_t isolatedReadBaseCount = 0;
+    for (ReadId readId = 0; readId < readCount; readId++) {
+        const OrientedReadId orientedReadId(readId, 0);
+        if (readGraph.connectivity.size(orientedReadId.getValue()) == 0) {
+            isolatedReadCount++;
+            isolatedReadBaseCount += reads->getReadRawSequenceLength(readId);
+        }
+    }
+    assemblerInfo->isolatedReadCount = isolatedReadCount;
+    assemblerInfo->isolatedReadBaseCount = isolatedReadBaseCount;
+    
+    cout << timestamp << "Created read graph with " << readGraph.edges.size() << " edges." << endl;
+    cout << timestamp << "Isolated reads: " << isolatedReadCount << endl;
+    cout << timestamp << "createReadGraphFromCanonicalOverlaps completed." << endl;
+}
+
+
+// Create read graph from all filtered alignments (after filterBestHitAlignments).
+// Simply keeps all alignments where isDeleted() is false.
+void Assembler::createReadGraphFromFilteredAlignments()
+{
+    cout << timestamp << "createReadGraphFromFilteredAlignments begins." << endl;
+    
+    const uint32_t readCount = reads->readCount();
+    const uint64_t alignmentCount = alignmentData.size();
+    
+    // Count kept alignments
+    uint64_t keptCount = 0;
+    uint64_t deletedCount = 0;
+    uint64_t palindromicCount = 0;
+    
+    // First pass: count edges
+    for (uint64_t i = 0; i < alignmentCount; i++) {
+        const auto& ad = alignmentData[i];
+        
+        if (ad.isDeleted()) { deletedCount++; continue; }
+        if (reads->getFlags(ad.readIds[0]).isPalindromic || 
+            reads->getFlags(ad.readIds[1]).isPalindromic) { palindromicCount++; continue; }
+        
+        keptCount++;
+    }
+    
+    cout << timestamp << "Alignment filtering:" << endl;
+    cout << "  Deleted by filterBestHitAlignments: " << deletedCount << endl;
+    cout << "  Palindromic: " << palindromicCount << endl;
+    cout << "  Kept: " << keptCount << " / " << alignmentCount << endl;
+    
+    // Create read graph edges (2 edges per alignment: forward + RC)
+    readGraph.edges.createNew(largeDataName("ReadGraphEdges"), largeDataPageSize);
+    readGraph.edges.reserve(keptCount * 2);
+    
+    // Second pass: create edges
+    for (uint64_t i = 0; i < alignmentCount; i++) {
+        auto& ad = alignmentData[i];
+        
+        // Skip deleted/palindromic
+        if (ad.isDeleted()) continue;
+        if (reads->getFlags(ad.readIds[0]).isPalindromic || 
+            reads->getFlags(ad.readIds[1]).isPalindromic) continue;
+        
+        // Mark this alignment as in read graph
+        ad.info.isInReadGraph = 1;
+        
+        // Create edge: (read0-strand0) to (read1-strand based on isSameStrand)
+        ReadGraphEdge edge;
+        edge.alignmentId = i & 0x3fff'ffff'ffff'ffff;
+        edge.crossesStrands = 0;
+        edge.hasInconsistentAlignment = 0;
+        edge.orientedReadIds[0] = OrientedReadId(ad.readIds[0], 0);
+        edge.orientedReadIds[1] = OrientedReadId(ad.readIds[1], ad.isSameStrand ? 0 : 1);
+        
+        // Ensure canonical ordering
+        DINARA_ASSERT(edge.orientedReadIds[0] < edge.orientedReadIds[1]);
+        readGraph.edges.push_back(edge);
+        
+        // Also create the reverse complemented edge
+        edge.orientedReadIds[0].flipStrand();
+        edge.orientedReadIds[1].flipStrand();
+        DINARA_ASSERT(edge.orientedReadIds[0] < edge.orientedReadIds[1]);
+        readGraph.edges.push_back(edge);
+    }
+    
+    readGraph.edges.unreserve();
+    
+    // Create read graph connectivity
+    readGraph.connectivity.createNew(largeDataName("ReadGraphConnectivity"), largeDataPageSize);
+    readGraph.connectivity.beginPass1(2 * readCount);
+    for (const ReadGraphEdge& edge : readGraph.edges) {
+        readGraph.connectivity.incrementCount(edge.orientedReadIds[0].getValue());
+        readGraph.connectivity.incrementCount(edge.orientedReadIds[1].getValue());
+    }
+    readGraph.connectivity.beginPass2();
+    for (size_t i = 0; i < readGraph.edges.size(); i++) {
+        const ReadGraphEdge& edge = readGraph.edges[i];
+        readGraph.connectivity.store(edge.orientedReadIds[0].getValue(), uint32_t(i));
+        readGraph.connectivity.store(edge.orientedReadIds[1].getValue(), uint32_t(i));
+    }
+    readGraph.connectivity.endPass2();
+    
+    // Count isolated reads
+    uint64_t isolatedReadCount = 0;
+    uint64_t isolatedReadBaseCount = 0;
+    for (ReadId readId = 0; readId < readCount; readId++) {
+        const OrientedReadId orientedReadId(readId, 0);
+        if (readGraph.connectivity.size(orientedReadId.getValue()) == 0) {
+            isolatedReadCount++;
+            isolatedReadBaseCount += reads->getReadRawSequenceLength(readId);
+        }
+    }
+    assemblerInfo->isolatedReadCount = isolatedReadCount;
+    assemblerInfo->isolatedReadBaseCount = isolatedReadBaseCount;
+    
+    cout << timestamp << "Created read graph with " << readGraph.edges.size() << " edges." << endl;
+    cout << timestamp << "Isolated reads: " << isolatedReadCount << endl;
+    cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
+}
