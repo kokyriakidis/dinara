@@ -285,7 +285,8 @@ private:
                                 
                                 int32_t drift = std::abs(deltaB - deltaA);
                                 uint32_t newCumulativeDrift = cumulativeDriftSame[localJ] + drift;
-                                uint32_t newCumulativeLength = cumulativeLengthSame[localJ] + deltaA;
+                                // Hifiasm Parity: use deltaB (distance_self_pos), not deltaA
+                                uint32_t newCumulativeLength = cumulativeLengthSame[localJ] + std::abs(deltaB);
                                 
                                 int32_t distance_min = std::min(deltaA, std::abs(deltaB));
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
@@ -326,7 +327,8 @@ private:
                                 int32_t absDeltaB = -deltaB;
                                 int32_t drift = std::abs(absDeltaB - deltaA);
                                 uint32_t newCumulativeDrift = cumulativeDriftDiff[localJ] + drift;
-                                uint32_t newCumulativeLength = cumulativeLengthDiff[localJ] + deltaA;
+                                // Hifiasm Parity: use absDeltaB (distance_self_pos), not deltaA
+                                uint32_t newCumulativeLength = cumulativeLengthDiff[localJ] + absDeltaB;
                                 
                                 int32_t distance_min = std::min(deltaA, absDeltaB);
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
