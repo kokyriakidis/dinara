@@ -494,7 +494,7 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD minimizers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdMinimizers) {
-        // Pass 1: Use SIMD-accelerated minimizers for initial marker generation (no filtering).
+        // Use SIMD-accelerated minimizers for initial marker generation (no filtering).
         // This generates a superset of the markers we eventually want.
         assembler.findMarkersSimdMinimizers(
             threadCount,
@@ -518,9 +518,6 @@ void dinara::main::assemble(
         // Prune the existing markers in-place using the KmerCounter and markerKmerIds.
         assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount);
 
-        // No need for a second pass of findMarkersSimdMinimizers.
-        // The markers are now filtered.
-
         // Initialize KmerChecker for HttpServer diagnostics (optional).
         cout << "Initializing KmerChecker for diagnostics." << endl;
         assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
@@ -533,63 +530,42 @@ void dinara::main::assemble(
 
         // Find the markers in the reads.
         assembler.findMarkers(threadCount);
+
+        // Compute marker KmerIds (required for LowHash and alignment).
+        // The SIMD path already creates these, but findMarkers does not.
+        assembler.computeMarkerKmerIds(threadCount);
     }
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
-    // Gather marker KmerIds for all markers.
-    // They are used by LowHash and alignment computation.
-    // These will be kept until we are done computing alignments.
-    // Use the existing ones if available (from findMarkersSimdMinimizers),
-    // or compute them now (for legacy findMarkers).
-    assembler.computeMarkerKmerIds(threadCount);
 
-    // Flag palindromic reads.
-    // These will be excluded from further processing.
-    if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
-        assembler.palindromicMinAlignedMarkerCount = assemblerOptions.readsOptions.palindromicReads.minAlignedMarkerCount;
-        assembler.palindromicMaxUncoveredBases = assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases;
-        assembler.flagPalindromicReads(
-            assemblerOptions.readsOptions.palindromicReads.maxSkip,
-            assemblerOptions.readsOptions.palindromicReads.maxDrift,
-            assemblerOptions.readsOptions.palindromicReads.maxMarkerFrequency,
-            assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
-            assemblerOptions.readsOptions.palindromicReads.nearDiagonalFractionThreshold,
-            assemblerOptions.readsOptions.palindromicReads.deltaThreshold,
-            threadCount);
-    }
+
+    // // Flag palindromic reads.
+    // // These will be excluded from further processing.
+    // if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
+    //     assembler.palindromicMinAlignedMarkerCount = assemblerOptions.readsOptions.palindromicReads.minAlignedMarkerCount;
+    //     assembler.palindromicMaxUncoveredBases = assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases;
+    //     assembler.flagPalindromicReads(
+    //         assemblerOptions.readsOptions.palindromicReads.maxSkip,
+    //         assemblerOptions.readsOptions.palindromicReads.maxDrift,
+    //         assemblerOptions.readsOptions.palindromicReads.maxMarkerFrequency,
+    //         assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
+    //         assemblerOptions.readsOptions.palindromicReads.nearDiagonalFractionThreshold,
+    //         assemblerOptions.readsOptions.palindromicReads.deltaThreshold,
+    //         threadCount);
+    // }
+
 
     // Find alignment candidates.
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
-    } else if(assemblerOptions.minHashOptions.allPairs) {
-        assembler.markAlignmentCandidatesAllPairs();
-    } else if(assemblerOptions.minHashOptions.version == 2 || assemblerOptions.minHashOptions.candidateMethod == "InvertedIndex") {
+    } else {
         // Inverted Index Method (Hifiasm-like).
         assembler.findAlignmentCandidatesInvertedIndex(
             assemblerOptions.alignOptions.minAlignedMarkerCount,
             assemblerOptions.alignOptions.align6Options.driftRateTolerance,
             threadCount
         );
-    } else {
-        DINARA_ASSERT(assemblerOptions.minHashOptions.version == 0 || assemblerOptions.minHashOptions.version == 1); 
-        assembler.findAlignmentCandidatesLowHash0(
-            assemblerOptions.minHashOptions.m,
-            assemblerOptions.minHashOptions.hashFraction,
-            assemblerOptions.minHashOptions.minHashIterationCount,
-            assemblerOptions.minHashOptions.alignmentCandidatesPerRead,
-            0,
-            assemblerOptions.minHashOptions.minBucketSize,
-            assemblerOptions.minHashOptions.maxBucketSize,
-            assemblerOptions.minHashOptions.minFrequency,
-            threadCount);
     }
-
-    // For align method 6, marker KmerIds are freed here.
-    // For other align methods this is done later./
-    if(assemblerOptions.alignOptions.alignMethod == 6) {
-        assembler.cleanupMarkerKmerIds();
-    }
-
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates
     assembler.computeCandidateTable();
