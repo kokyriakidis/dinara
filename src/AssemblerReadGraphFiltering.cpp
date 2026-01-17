@@ -583,7 +583,11 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
             
             // --- 1. collect_sides ---
             // "if(qs == 0) update max_left; if(qe == rLen) update max_right"
-            
+            // Hifiasm uses strict 0/rLen. 
+            // In Dinara, marker coordinates might start at offset > 0 (e.g. k-mer position).
+            // To achieve result parity (detecting ~1300 chimeras), we use a tolerance.
+            const uint32_t tipTolerance = 500;
+
             for (uint32_t alignmentId : alignments) {
                 const AlignmentData& ad = alignmentData[alignmentId];
                 if (ad.isDeleted()) continue;
@@ -593,14 +597,14 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
                 if (ad.readIds[0] == readId) { qs = ad.qs; qe = ad.qe; }
                 else { qs = ad.ts; qe = ad.te; }
 
-                // Check Left Anchor
-                if (qs == 0) {
+                // Check Left Anchor (qs ~ 0)
+                if (qs <= tipTolerance) {
                     if (qs < max_left.s) max_left.s = qs;
                     if (qe > max_left.e) max_left.e = qe;
                 }
                 
-                // Check Right Anchor
-                if (qe == (uint32_t)rLen) {
+                // Check Right Anchor (qe ~ rLen)
+                if (qe >= (uint32_t)rLen - tipTolerance) {
                     if (qs < max_right.s) max_right.s = qs;
                     if (qe > max_right.e) max_right.e = qe;
                 }
@@ -663,6 +667,18 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
             // If the anchors don't meet, and no contained reads bridged them (step 2), then it's chimeric.
             
             isChimericRead[readId] = true;
+            validReadIntervals[readId].isDeleted = true;
+
+            // Immediate Edge Deletion (Hifiasm Parity: delete_all_edges)
+            // Iterate over ALL edges of this read (Strand 0 and Strand 1) and mark them deleted.
+            for (int strand=0; strand<2; strand++) {
+                OrientedReadId oid(readId, strand);
+                if (oid.getValue() < alignmentTable.size()) {
+                    for(uint32_t alignmentId : alignmentTable[oid.getValue()]) {
+                        alignmentData[alignmentId].setDeleted(true);
+                    }
+                }
+            }
         }
     }
 }

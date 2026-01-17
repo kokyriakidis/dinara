@@ -208,7 +208,15 @@ private:
                     cumulativeDriftSame.assign(numHits, 0);
                     cumulativeDriftDiff.assign(numHits, 0);
                     cumulativeLengthSame.assign(numHits, 0); 
-                    cumulativeLengthDiff.assign(numHits, 0); 
+                    cumulativeLengthDiff.assign(numHits, 0);
+
+                    // Hifiasm Parity: tmp arrays for chain skip tracking
+                    vector<int32_t> tmpSame(numHits, -1);
+                    vector<int32_t> tmpDiff(numHits, -1);
+
+                    // Hifiasm Parity: occ arrays for chain length counting (dp->occ)
+                    vector<uint32_t> occSame(numHits, 1);
+                    vector<uint32_t> occDiff(numHits, 1); 
 
                     uint32_t maxChainSame = 0;
                     uint32_t maxChainDiff = 0;
@@ -216,8 +224,34 @@ private:
                     int32_t bestIdxDiff = -1;
                     
                     const uint32_t kmerLength = (uint32_t)invertedIndexData.k;
-                    const double bandwidthPenaltyFactor = 1.0; 
+                    // Hifiasm Parity: bandwidth_penalty = 1 / band_width_threshold
+                    const double bandwidthPenalty = 1.0 / invertedIndexData.maxDriftRate;
                     const int64_t driftRateInt = (int64_t)(invertedIndexData.maxDriftRate * 1024.0);
+
+                    // Hifiasm Parity: ha_chain_check fast path
+                    // If all hits are perfectly collinear, skip full DP.
+                    bool canSkipDP = true;
+                    if (numHits > 1) {
+                        for (size_t checkK = 1; checkK < numHits && canSkipDP; ++checkK) {
+                            int32_t dA = (int32_t)flatHits[start + checkK].posA - (int32_t)flatHits[start + checkK - 1].posA;
+                            int32_t dB = (int32_t)flatHits[start + checkK].posB - (int32_t)flatHits[start + checkK - 1].posB;
+                            if (dA <= 0 || dB <= 0 || std::abs(dB - dA) > (int32_t)(invertedIndexData.maxDriftRate * dA)) {
+                                canSkipDP = false;
+                            }
+                        }
+                    }
+
+                    if (canSkipDP && numHits >= invertedIndexData.minMarkerCount) {
+                        // Fast path: all hits form a single valid chain
+                        // Fill DP arrays trivially and skip to result extraction
+                        for (size_t checkK = 0; checkK < numHits; ++checkK) {
+                            dpSame[checkK] = kmerLength * (checkK + 1);
+                            if (checkK > 0) parentSame[checkK] = (int32_t)(checkK - 1);
+                            occSame[checkK] = (uint32_t)(checkK + 1);
+                        }
+                        // Skip full DP, go directly to chain extraction
+                        goto skip_dp_same;
+                    }
                     
                     for(size_t k=0; k<numHits; ++k) {
                         size_t idx = start + k;
@@ -234,8 +268,11 @@ private:
 
                         // Chain.
                         const size_t MAX_SKIP = 25;
-                        size_t n_skip_same = 0;
-                        size_t n_skip_diff = 0;
+                        size_t n_max_skip_same = 0;
+                        size_t n_max_skip_diff = 0;
+                        // Hifiasm Parity: chain skip counters
+                        size_t n_chn_skip_same = 0;
+                        size_t n_chn_skip_diff = 0;
                         
                         for(size_t localJ=k-1; localJ!=SIZE_MAX; --localJ) {
                             size_t idxJ = start + localJ;
@@ -243,7 +280,8 @@ private:
                             int32_t deltaB = (int32_t)flatHits[idx].posB - (int32_t)flatHits[idxJ].posB;
                             
                             if(deltaB > 0) { // Same Strand
-                                if (deltaA == 0) continue; // Ensure strictly increasing posA
+                                // Hifiasm Parity: complete skip condition
+                                if (deltaB == 0 || deltaA <= 0) continue;
                                 
                                 int32_t drift = std::abs(deltaB - deltaA);
                                 uint32_t newCumulativeDrift = cumulativeDriftSame[localJ] + drift;
@@ -252,27 +290,38 @@ private:
                                 int32_t distance_min = std::min(deltaA, std::abs(deltaB));
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
-                                // Apply Hifiasm Weighting: score = base_score / count
+                                // Hifiasm Parity: score = base_score / count
                                 uint32_t weightedScore = count > 1 ? baseScore / count : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
                                 
+                                // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
                                 double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
-                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenaltyFactor / 1024.0);
+                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
                                 
                                 if((newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
                                     int32_t candidateScore = (int32_t)dpSame[localJ] + (int32_t)weightedScore - penalty;
                                     if(candidateScore > (int32_t)dpSame[k]) {
                                         dpSame[k] = (uint32_t)std::max(1, candidateScore);
-                                        parentSame[k] = (int32_t)localJ; // Update Parent
+                                        parentSame[k] = (int32_t)localJ;
                                         cumulativeDriftSame[k] = newCumulativeDrift;
                                         cumulativeLengthSame[k] = newCumulativeLength;
-                                        n_skip_same = 0;
+                                        // Hifiasm Parity: update occ (chain length)
+                                        occSame[k] = occSame[localJ] + 1;
+                                        n_max_skip_same = 0;
+                                        if (n_chn_skip_same > 0) --n_chn_skip_same; // Hifiasm Parity
                                     } else {
-                                        if(++n_skip_same > MAX_SKIP) break;
+                                        if(++n_max_skip_same > MAX_SKIP) break;
+                                        // Hifiasm Parity: chain skip check
+                                        if (tmpSame[localJ] == (int32_t)k) {
+                                            if (++n_chn_skip_same > MAX_SKIP) break;
+                                        }
                                     }
+                                    // Hifiasm Parity: propagate tmp for chain tracking
+                                    if (parentSame[localJ] >= 0) tmpSame[parentSame[localJ]] = (int32_t)k;
                                 }
                             } else if (deltaB < 0) { // Diff Strand
-                                if (deltaA == 0) continue; // Ensure strictly increasing posA
+                                // Hifiasm Parity: complete skip condition
+                                if (deltaA <= 0) continue;
 
                                 int32_t absDeltaB = -deltaB;
                                 int32_t drift = std::abs(absDeltaB - deltaA);
@@ -282,24 +331,34 @@ private:
                                 int32_t distance_min = std::min(deltaA, absDeltaB);
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
-                                // Apply Hifiasm Weighting
+                                // Hifiasm Parity: score = base_score / count
                                 uint32_t weightedScore = count > 1 ? baseScore / count : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
 
+                                // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
                                 double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
-                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenaltyFactor / 1024.0);
+                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
 
                                 if((newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
                                     int32_t candidateScore = (int32_t)dpDiff[localJ] + (int32_t)weightedScore - penalty;
                                     if(candidateScore > (int32_t)dpDiff[k]) {
                                         dpDiff[k] = (uint32_t)std::max(1, candidateScore);
-                                        parentDiff[k] = (int32_t)localJ; // Update Parent
+                                        parentDiff[k] = (int32_t)localJ;
                                         cumulativeDriftDiff[k] = newCumulativeDrift;
                                         cumulativeLengthDiff[k] = newCumulativeLength;
-                                        n_skip_diff = 0;
+                                        // Hifiasm Parity: update occ (chain length)
+                                        occDiff[k] = occDiff[localJ] + 1;
+                                        n_max_skip_diff = 0;
+                                        if (n_chn_skip_diff > 0) --n_chn_skip_diff; // Hifiasm Parity
                                     } else {
-                                        if(++n_skip_diff > MAX_SKIP) break;
+                                        if(++n_max_skip_diff > MAX_SKIP) break;
+                                        // Hifiasm Parity: chain skip check
+                                        if (tmpDiff[localJ] == (int32_t)k) {
+                                            if (++n_chn_skip_diff > MAX_SKIP) break;
+                                        }
                                     }
+                                    // Hifiasm Parity: propagate tmp for chain tracking
+                                    if (parentDiff[localJ] >= 0) tmpDiff[parentDiff[localJ]] = (int32_t)k;
                                 }
                             }
                         }
@@ -313,6 +372,8 @@ private:
                             bestIdxDiff = (int32_t)k;
                         }
                     }
+
+                    skip_dp_same:  // Hifiasm Parity: label for fast path
 
                     // Hifiasm-style Iterative Chaining:
                     // 1. Identify "peaks" (endpoints) with score >= 0.8 * bestScore.
