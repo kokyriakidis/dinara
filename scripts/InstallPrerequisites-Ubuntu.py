@@ -466,10 +466,14 @@ def installShasta2():
     abpoaLibPath = os.path.join(LIB_DIR, "libabpoa.so")
     abpoaStaticLibPath = os.path.join(LIB_DIR, "libabpoa.a")
     
-    # Check if already installed (all components)
-    if os.path.exists(installPath + "/src") and os.path.exists(libPath) and os.path.exists(abpoaLibPath) and os.path.exists(staticLibPath) and os.path.exists(abpoaStaticLibPath):
-        print("shasta2 and abpoa (shared & static) found. Skipping installation.")
-        return
+    # Force rebuild: Remove existing shasta2 files to ensure patch is applied
+    print("Removing existing shasta2 to force rebuild with patch...")
+    if os.path.exists(installPath):
+        shutil.rmtree(installPath)
+    if os.path.exists(libPath):
+        os.remove(libPath)
+    if os.path.exists(staticLibPath):
+        os.remove(staticLibPath)
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building shasta2 using temporary directory", temporaryDirectory)
@@ -518,6 +522,11 @@ def installShasta2():
         runCommand("cp " + abpoaBuildDir + "/abPOA/include/abpoa.h " + INCLUDE_DIR)
         
         os.chdir("shasta2")
+        
+        # Patch shasta2: Disable read following to assemble stage F only
+        # This comments out the findAndConnectAssemblyPaths call in AssemblyGraph::simplifyAndAssemble
+        print("Patching shasta2 to disable read following (stage F only)...")
+        runCommand("sed -i 's/findAndConnectAssemblyPaths(/\\/\\/ findAndConnectAssemblyPaths(/g' src/AssemblyGraph.cpp")
         
         # Build shasta2 library (Python Module + Static Lib)
         # The option -DBUILD_STATIC_LIBRARY=ON was added recently to shasta2.

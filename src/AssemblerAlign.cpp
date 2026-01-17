@@ -905,24 +905,36 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
             uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
 
-            // --- Extend Coordinates to Read Tips ---
-            // We assume the alignment extends as far as possible in both directions.
-            const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
+            // --- Use Marker Coordinates Directly (No Artificial Extension) ---
+            // Hifiasm uses the chain start/end directly, representing the actual aligned region.
+            // Extending to read tips hides overhangs and breaks filtering logic.
+            
+            // Re-define len1 for usage in coordinate conversion
             const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
+            
+            thisAlignmentData.qs = qs_marker;
+            uint32_t ts_oriented = ts_marker;
 
-            // Left Extension: Extend backwards until one read hits 0
-            uint32_t leftExt = std::min(qs_marker, ts_marker);
-            thisAlignmentData.qs = qs_marker - leftExt;
-            thisAlignmentData.ts = ts_marker - leftExt;
-
-            // Right Extension: Extend forwards until one read hits its end
-            // Available info: len0, len1.
-            uint32_t rightExt = std::min(
-                (uint32_t)len0 - qe_marker, 
-                (uint32_t)len1 - te_marker
-            );
-            thisAlignmentData.qe = qe_marker + rightExt;
-            thisAlignmentData.te = te_marker + rightExt;
+            thisAlignmentData.qe = qe_marker;
+            uint32_t te_oriented = te_marker;
+            
+            // --- Convert target coordinates to FORWARD STRAND (hifiasm convention) ---
+            // When isSameStrand=false (reverse), the ts/te are on the reverse-complement strand.
+            // We need to flip them to represent positions on the forward strand.
+            // Hifiasm formula (Assembly.cpp:339-344):
+            //   ts = y_readLen - y_pos_e - 1
+            //   te = y_readLen - y_pos_s - 1
+            // Note: Our te is open-ended (exclusive), so we adjust accordingly.
+            if (!candidate.isSameStrand) {
+                // Convert from reverse strand coords to forward strand coords
+                // te_fwd = len1 - ts_oriented (since our coords are half-open [start, end))
+                // ts_fwd = len1 - te_oriented
+                thisAlignmentData.ts = (uint32_t)len1 - te_oriented;
+                thisAlignmentData.te = (uint32_t)len1 - ts_oriented;
+            } else {
+                thisAlignmentData.ts = ts_oriented;
+                thisAlignmentData.te = te_oriented;
+            }
 
             // Check for large indels (>= 6 bases)
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
@@ -949,45 +961,22 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // --- Generate and Store Phasing CIGAR ---
             // Format: standard CIGAR operations (len << 4 | op)
             // Ops: 0=Match/Mismatch(M), 1=Ins(I), 2=Del(D)
-            // --- Generate and Store Phasing CIGAR ---
-            // Format: standard CIGAR operations (len << 4 | op)
-            // Ops: 0=Match/Mismatch(M), 1=Ins(I), 2=Del(D), 3=Blind(B)
+            // Note: We removed artificial extension, so there is no "Blind" padding (op 3) anymore.
             
-            // Start with Left Extension (Blind Match) - Op 3
             // Use thread-local buffer to avoid per-alignment heap allocation
             thread_local vector<uint32_t> cigar;
             cigar.clear(); // O(1) - keeps capacity, resets size
             
-            if (leftExt > 0) {
-                cigar.push_back((leftExt << 4) | 3);
-            }
-            
-            // Append Generated CIGAR from ProjectedAlignment
-            // Note: projectedAlignment.phasingCigar contains M/I/D ops for the aligned region.
-            // We append them directly.
+            // Only append generated CIGAR from ProjectedAlignment
             const auto& internalCigar = projectedAlignment.phasingCigar;
-            
-            // Check for merge possibility (Last of leftExt vs First of internal)
-            // But leftExt is op 3, internal matches are op 0. They do NOT merge.
-            
             cigar.insert(cigar.end(), internalCigar.begin(), internalCigar.end());
-            
-            // Right Extension (Blind Match) - Op 3
-            if (rightExt > 0) {
-                 // Check if last was 3 (very unlikely unless alignment was empty)
-                 if (!cigar.empty() && (cigar.back() & 0xF) == 3) {
-                      uint32_t prevLen = cigar.back() >> 4;
-                      cigar.back() = ((prevLen + rightExt) << 4) | 3;
-                 } else {
-                      cigar.push_back((rightExt << 4) | 3);
-                 }
-            }
             
             data.threadPhasingCigars[threadId]->appendVector(cigar);
         }
     }
 
     if(alignmentMethod == 4) {
+
         std::lock_guard<std::mutex> lock(mutex);
         cout << "Thread " << threadId << " byte allocator: " <<
             byteAllocator.getMaxAllocatedByteCount() << "/" <<
