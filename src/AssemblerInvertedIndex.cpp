@@ -34,6 +34,17 @@ struct InvertedIndexTempHit {
     }
 };
 
+// Hifiasm parity: Overlap type classification for max_n_chain filtering.
+// Type 0: Left overhang (query starts at position 0)
+// Type 1: Right overhang (query ends at read length)
+// Type 2: Contained (query fully spans read)
+// Type 3: Containing (neither end at boundary)
+static int getOverlapType(uint32_t qs, uint32_t qe, uint32_t queryLen) {
+    if (qs == 0 && qe >= queryLen - 1) return 2;  // Contained
+    else if (qs > 0 && qe < queryLen - 1) return 3;  // Containing
+    else return (qs == 0) ? 0 : 1;  // Left or Right overhang
+}
+
 // Private class to encapsulate parallel logic (Codebase Pattern).
 class InvertedIndexFinder : public MultithreadedObject<InvertedIndexFinder> {
 public:
@@ -44,6 +55,7 @@ public:
         const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData,
         MemoryMapped::Vector<OrientedReadPair>& candidates,
         MemoryMapped::Vector<Alignment>& precomputedAlignments,
+        uint64_t maxChainLimit,
         uint64_t threadCount
     ) : 
         MultithreadedObject(*this),
@@ -53,6 +65,7 @@ public:
         invertedIndexData(invertedIndexData),
         candidates(candidates),
         precomputedAlignments(precomputedAlignments),
+        maxChainLimit(maxChainLimit),
         threadCount(threadCount)
     {
         // 1. Setup Work Areas.
@@ -103,6 +116,7 @@ private:
     const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData;
     MemoryMapped::Vector<OrientedReadPair>& candidates;
     MemoryMapped::Vector<Alignment>& precomputedAlignments;
+    uint64_t maxChainLimit;
     uint64_t threadCount;
 
     vector<vector<OrientedReadPair>> threadCandidates;
@@ -183,6 +197,7 @@ private:
                 std::sort(flatHits.begin(), flatHits.end());
 
                 // 3. DP.
+                const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
                 size_t i = 0;
                 while(i < flatHits.size()) {
                     ReadId readIdB = flatHits[i].partnerReadId;
@@ -198,7 +213,39 @@ private:
                     size_t endGroup = i;
                     size_t numHits = endGroup - start;
                     
-                    if(numHits < invertedIndexData.minMarkerCount) continue;
+                    // Hifiasm Parity: usage of minMarkerCount is replaced by MinScore = K.
+                    // We must allow small hit counts (e.g. 1) if they generate a high score (Unique Marker).
+                    if(numHits == 0) continue;
+
+                    // --- Hifiasm Parity: Gradient Scoring Logic (ha_get_new_candidates) ---
+                    // Calculate dynamic thresholds based on Coverage Peak.
+                    // HA_KMER_GOOD_RATIO = 0.333 (anchor.cpp:11)
+                    uint64_t peak = invertedIndexData.coveragePeak;
+                    uint64_t low_occ = (uint64_t)(peak * 0.333);
+                    if (low_occ < 2) low_occ = 2;
+                    uint64_t high_occ = (uint64_t)(peak * 1.667); // 2.0 - 0.333
+                    if (high_occ < low_occ) high_occ = low_occ + 1; // Safety
+
+                    for(size_t k=0; k<numHits; ++k) {
+                        size_t idx = start + k;
+                        // flatHits.weight currently holds the Global Count (from Index).
+                        uint32_t cnt = flatHits[idx].weight;
+                        
+                        if (cnt > low_occ && cnt < high_occ) {
+                            flatHits[idx].weight = 1; // Good (Unique-ish)
+                        } else if (cnt <= low_occ) {
+                            flatHits[idx].weight = 2; // Low (Rare, slight penalty? Hifiasm logic)
+                        } else {
+                            // High (Repetitive Penalty)
+                            // Hifiasm: cnt = 1 + ((cnt + 2*high - 1) / (2*high))
+                            // Then pow(cnt, 1.1)
+                            // Normal_w divides score by this weight. Higher weight = Lower Score.
+                            uint64_t twoHigh = high_occ * 2;
+                            if (twoHigh == 0) twoHigh = 1; // Safety
+                            uint32_t w = 1 + (uint32_t)((cnt + twoHigh - 1) / twoHigh);
+                            flatHits[idx].weight = (uint32_t)pow((double)w, 1.1);
+                        }
+                    }
 
                     // Init DP.
                     dpSame.assign(numHits, 0); 
@@ -228,7 +275,7 @@ private:
                     
                     // Hifiasm Parity: get_chainLen - computes overlap length after coordinate extension
                     // Used for tie-breaking when scores are equal (prefer shorter chainLen)
-                    const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
+                    // readLenA is hoisted outside loop
                     const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
                     auto get_chainLen = [&](uint32_t posA, uint32_t posB) -> uint64_t {
                         // Extend start: whoever has shorter overhang extends to 0
@@ -273,7 +320,7 @@ private:
                         }
                     }
 
-                    if (canSkipDP && numHits >= invertedIndexData.minMarkerCount) {
+                    if (canSkipDP && numHits > 0) {
                         // Hifiasm Parity: ha_chain_check - compute actual scores with weighting and penalty
                         // First hit
                         uint32_t count0 = flatHits[start].weight;
@@ -298,7 +345,7 @@ private:
                             tot_len += dy;
                             
                             // Hifiasm Parity: cumulative drift check (line 876)
-                            if (tot_indel > tot_len * invertedIndexData.maxDriftRate) {
+                            if (dy <= 0 || tot_indel > tot_len * invertedIndexData.maxDriftRate) {
                                 fastPathValid = false;
                                 break;
                             }
@@ -312,7 +359,7 @@ private:
                             }
                             
                             int32_t baseScore = std::min((uint32_t)dg, kmerLength);
-                            // Hifiasm uses a[i].cnt for fast path (CURRENT hit's count)
+                            // Hifiasm uses a[i].cnt (Local Count)
                             uint32_t countK = flatHits[start + checkK].weight;
                             uint32_t weightedScore = countK > 1 ? baseScore / countK : baseScore;
                             if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
@@ -345,7 +392,8 @@ private:
                         size_t idx = start + k;
                         
                         // Seed.
-                        uint32_t count = flatHits[idx].weight; // We stored count in 'weight' field
+                        // Hifiasm Parity: Local Count
+                        uint32_t count = flatHits[idx].weight;
                         uint32_t score = count > 1 ? kmerLength / count : kmerLength; 
                         if (score == 0) score = 1;
 
@@ -357,6 +405,8 @@ private:
                         cumulativeLengthDiff[k] = 0;
 
                         // Chain.
+                        // Hifiasm Parity: calculate_overlap_region_by_chaining (Hash_Table.cpp:1140) uses 25.
+                        // calculate_ug_chaining uses 50, but we are doing overlap generation.
                         const size_t MAX_SKIP = 25;
                         size_t n_max_skip_same = 0;
                         size_t n_max_skip_diff = 0;
@@ -382,6 +432,7 @@ private:
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
                                 // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
+                                // Use Local Count
                                 uint32_t predecessorCount = flatHits[idxJ].weight;
                                 uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
@@ -425,6 +476,7 @@ private:
                                 uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
                                 
                                 // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
+                                // Use Local Count
                                 uint32_t predecessorCount = flatHits[idxJ].weight;
                                 uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
                                 if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
@@ -493,11 +545,19 @@ private:
                     // 2. Sort by score descending.
                     // 3. Greedily keep chains that don't overlap > 50% with accepted chains on Query (Read A).
 
+                    // --- Hifiasm Parity: Exact Filtering Logic ---
+                    // 1. Chains must have Score >= kmerLength (equivalent to 1 unique marker or ~16 repetitive markers).
+                    // 2. We do NOT filter by minMarkerCount anymore, as Hifiasm accepts single unique markers.
+                    
                     uint32_t bestScore = std::max(maxChainSame, maxChainDiff);
-                    if (bestScore < invertedIndexData.minMarkerCount) continue;
+                    // Hifiasm Parity: chain_cutoff = 2 
+                    // Condition: if (score < 2) drop; => Keeps score >= 2.
+                    if (bestScore < 2) continue; 
 
                     uint32_t threshold = (uint32_t)(bestScore * 0.80);
-                    if (threshold < (uint32_t)invertedIndexData.minMarkerCount) threshold = (uint32_t)invertedIndexData.minMarkerCount;
+                    // Ensure threshold is at least >2 (so 3)
+                    if (threshold <= 2) threshold = 3;
+
 
                     struct ChainCandidate {
                         uint32_t score;
@@ -530,6 +590,58 @@ private:
                     }
 
                     std::sort(candidates.begin(), candidates.end());
+
+                    // --- Hifiasm Parity: max_n_chain filtering per overlap type ---
+                    // If too many candidates, filter by category to keep top N per type.
+                    // This prevents quadratic blowup on repetitive reads.
+                    // Algorithm: (anchor.cpp:508-537)
+                    // 1. Already sorted by score descending
+                    // 2. Count per type, record score threshold at N-th position
+                    // 3. Keep only candidates with score >= threshold for their type
+                    
+                    if (candidates.size() > maxChainLimit && maxChainLimit > 0) {
+                        const uint64_t queryLen = readLenA;
+                        const uint64_t kLen = invertedIndexData.k;
+                        
+                        // Cache overlap type per candidate (avoid double reconstruction)
+                        vector<int> candidateTypes(candidates.size());
+                        
+                        // First pass: Determine type and count per category
+                        int32_t n[4] = {0, 0, 0, 0};
+                        uint32_t s[4] = {0, 0, 0, 0};
+                        
+                        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                            const auto& cand = candidates[ci];
+                            
+                            // Reconstruct chain to get qs_base/qe_base
+                            int32_t first = cand.endK;
+                            const auto& parents = cand.isDiff ? parentDiff : parentSame;
+                            while (parents[first] != -1) first = parents[first];
+                            
+                            uint32_t qs_base = markersA[flatHits[start + first].ordinalA].position;
+                            uint32_t qe_base = markersA[flatHits[start + cand.endK].ordinalA].position + (uint32_t)kLen;
+                            
+                            int w = getOverlapType(qs_base, qe_base, (uint32_t)queryLen);
+                            candidateTypes[ci] = w;
+                            
+                            n[w]++;
+                            if ((uint64_t)n[w] == maxChainLimit) s[w] = cand.score;
+                        }
+                        
+                        // Second pass: Filter using cached types (no reconstruction needed)
+                        if (s[0] > 0 || s[1] > 0 || s[2] > 0 || s[3] > 0) {
+                            vector<ChainCandidate> filteredCandidates;
+                            filteredCandidates.reserve(maxChainLimit * 4);
+                            
+                            for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                                int w = candidateTypes[ci];
+                                if (candidates[ci].score >= s[w]) {
+                                    filteredCandidates.push_back(candidates[ci]);
+                                }
+                            }
+                            candidates = std::move(filteredCandidates);
+                        }
+                    }
 
                     // Accepted chains (Query Interval [qs, qe])
                     struct Interval { uint32_t qs; uint32_t qe; };
@@ -602,6 +714,82 @@ private:
                          }
 
                          if(chainValid) {
+                             // --- Coordinate Extension (Hifiasm Parity) ---
+                             // Compute extended coordinates here to avoid recomputation in AssemblerAlign.cpp
+                             // Logic matches AssemblerAlign.cpp exactly.
+                             {
+                                  // 1. Get Read Lengths (Reuse values)
+                                  const uint64_t len0 = readLenA;
+                                  const uint64_t len1 = readLenB;
+                                  const uint32_t kVal = invertedIndexData.k;
+
+                                  // 2. Get Query Coords (Always Strand 0 / Forward)
+                                  uint32_t qs_marker = markersA[flatHits[start + chainIndices.front()].ordinalA].position;
+                                  uint32_t qe_marker = markersA[flatHits[start + chainIndices.back()].ordinalA].position + kVal;
+                                  
+                                  // 3. Get Target Coords (Strand 0 / Forward)
+                                  uint32_t firstOrdB = alignment.ordinals.front()[1];
+                                  uint32_t lastOrdB = alignment.ordinals.back()[1];
+                                  uint32_t posB_first = markersB[firstOrdB].position;
+                                  uint32_t posB_last = markersB[lastOrdB].position;
+                                  
+                                  uint32_t ts_marker, te_marker;
+                                  
+                                  if (cand.isDiff) {
+                                       // Diff Strand: Work in Reverse Frame to match Hifiasm extension logic.
+                                       uint32_t min_fwd = std::min(posB_first, posB_last);
+                                       uint32_t max_fwd_end = std::max(posB_first, posB_last) + kVal;
+                                       
+                                       // Convert to Reverse Frame (Open)
+                                       ts_marker = (uint32_t)len1 - max_fwd_end;
+                                       te_marker = (uint32_t)len1 - min_fwd;
+                                  } else {
+                                       // Same Strand: Work in Forward Frame
+                                       ts_marker = posB_first;
+                                       te_marker = posB_last + kVal;
+                                  }
+                                  
+                                  // 4. Extension Logic (Hifiasm / AssemblerAlign Parity)
+                                  uint32_t qs_ext = qs_marker;
+                                  uint32_t qe_ext = qe_marker;
+                                  uint32_t ts_ext = ts_marker;
+                                  uint32_t te_ext = te_marker;
+
+                                  // Extend start
+                                  if (qs_ext <= ts_ext) {
+                                      ts_ext = ts_ext - qs_ext;
+                                      qs_ext = 0;
+                                  } else {
+                                      qs_ext = qs_ext - ts_ext;
+                                      ts_ext = 0;
+                                  }
+
+                                  // Extend end
+                                  int64_t q_right = (int64_t)len0 - (int64_t)qe_ext;
+                                  int64_t t_right = (int64_t)len1 - (int64_t)te_ext;
+
+                                  if (q_right <= t_right) {
+                                      qe_ext = (uint32_t)len0;
+                                      te_ext = te_ext + (uint32_t)q_right;
+                                  } else {
+                                      te_ext = (uint32_t)len1;
+                                      qe_ext = qe_ext + (uint32_t)t_right;
+                                  }
+
+                                  // 5. Store Results
+                                  alignment.qs = qs_ext;
+                                  alignment.qe = qe_ext;
+
+                                  if (cand.isDiff) {
+                                      // Convert Target back to Forward Strand (Storage Convention)
+                                      alignment.ts = (uint32_t)len1 - te_ext - 1;
+                                      alignment.te = (uint32_t)len1 - ts_ext - 1;
+                                  } else {
+                                      alignment.ts = ts_ext;
+                                      alignment.te = te_ext;
+                                  }
+                             }
+
                              if (cand.isDiff) {
                                  // Adjust for RC
                                  uint32_t totalMarkersB = (uint32_t)markersB.size();
@@ -644,8 +832,8 @@ using namespace dinara; // For Assembler access below
 // Given std::sort is highly optimized, it is sufficient.
 
 void Assembler::findAlignmentCandidatesInvertedIndex(
-    uint64_t minMarkerCount, 
-    double maxDriftRate,     
+    double maxDriftRate,
+    uint64_t maxChainLimit,
     uint64_t threadCount
 ) {
     if(threadCount == 0) {
@@ -959,8 +1147,8 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     alignmentCandidates.candidates.reserve(size_t(readCount) * 50);
     alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); // Added
 
-    invertedIndexData.minMarkerCount = minMarkerCount;
     invertedIndexData.maxDriftRate = maxDriftRate;
+    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak; // Parity
 
     // Use InvertedIndexFinder pattern.
     InvertedIndexFinder finder(
@@ -970,6 +1158,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         invertedIndexData,
         alignmentCandidates.candidates,
         alignmentCandidatesAlignmentsData.alignments, // Added
+        maxChainLimit,
         threadCount
     );
 

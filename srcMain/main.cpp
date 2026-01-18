@@ -507,7 +507,7 @@ void dinara::main::assemble(
         
         // Retrieve peak and set thresholds.
         const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
-        const uint64_t minFreq = 3; 
+        const uint64_t minFreq = 2;
         const uint64_t maxFreq = 5 * coveragePeak;
         const uint64_t distinctKmerCount = assembler.kmerCounter->kmerIdFrequencies.size();
 
@@ -559,10 +559,14 @@ void dinara::main::assemble(
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
     } else {
+        // Compute maxChainLimit from coverage (Hifiasm parity: max(100, hom_cov * 5))
+        const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+        const uint64_t maxChainLimit = std::max(100UL, coveragePeak * 5);
+        
         // Inverted Index Method (Hifiasm-like).
         assembler.findAlignmentCandidatesInvertedIndex(
-            assemblerOptions.overlapCandidatesOptions.minMarkerCount,
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
             threadCount
         );
     }
