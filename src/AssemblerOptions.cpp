@@ -1396,7 +1396,6 @@ void KmersOptions::write(ostream& s) const
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
-    s << "syncmerK = " << syncmerK << "\n";
     s << "syncmerS = " << syncmerS << "\n";
 }
 
