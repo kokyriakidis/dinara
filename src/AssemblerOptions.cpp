@@ -405,21 +405,16 @@ void AssemblerOptions::addConfigurableOptions()
         "The directory containing the hash table with marker k-mer global frequencies. "
         "Only used for Dinara development.")
 
-        ("Kmers.useSimdMinimizers",
-        value<bool>(&kmersOptions.useSimdMinimizers)->
+        ("Kmers.useSimdClosedSyncmers",
+        value<bool>(&kmersOptions.useSimdClosedSyncmers)->
         default_value(false),
-        "If set to true, use SIMD-accelerated minimizers for marker generation instead of "
-        "the default k-mer based method. Requires Kmers.minimizerK and Kmers.minimizerW.")
+        "If set to true, use SIMD-accelerated closed syncmers for marker generation instead of "
+        "the default k-mer based method. Requires Kmers.syncmerS.")
 
-        ("Kmers.minimizerK",
-        value<int>(&kmersOptions.minimizerK)->
+        ("Kmers.syncmerS",
+        value<int>(&kmersOptions.syncmerS)->
         default_value(32),
-        "K-mer size for SIMD minimizer-based marker generation. Only used if Kmers.useSimdMinimizers is set.")
-
-        ("Kmers.minimizerW",
-        value<int>(&kmersOptions.minimizerW)->
-        default_value(32),
-        "Window size for SIMD minimizer-based marker generation. Only used if Kmers.useSimdMinimizers is set.")
+        "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
 
         ("MinHash.version",
         value<int>(&minHashOptions.version)->
@@ -1400,9 +1395,9 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
-    s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
-    s << "minimizerK = " << minimizerK << "\n";
-    s << "minimizerW = " << minimizerW << "\n";
+    s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
+    s << "syncmerK = " << syncmerK << "\n";
+    s << "syncmerS = " << syncmerS << "\n";
 }
 
 

@@ -492,14 +492,14 @@ void dinara::main::assemble(
     // of --Reads.handleDuplicates. The default option is "useOneCopy".
     assembler.findDuplicateReads(assemblerOptions.readsOptions.handleDuplicates);
 
-    // Find markers using either SIMD minimizers or the default k-mer based method.
-    if(assemblerOptions.kmersOptions.useSimdMinimizers) {
-        // Use SIMD-accelerated minimizers for initial marker generation (no filtering).
+    // Find markers using either SIMD closed syncmers or the default k-mer based method.
+    if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
+        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
         // This generates a superset of the markers we eventually want.
-        assembler.findMarkersSimdMinimizers(
+        assembler.findMarkersSimdClosedSyncmers(
             threadCount,
-            assemblerOptions.kmersOptions.minimizerK,
-            assemblerOptions.kmersOptions.minimizerW);
+            assemblerOptions.kmersOptions.k,
+            assemblerOptions.kmersOptions.syncmerS);
 
         // Compute histogram using the pre-calculated KmerIds.
         // This avoids accessing the Reads data structure (Cache Misses).

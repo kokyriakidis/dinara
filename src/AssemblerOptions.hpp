@@ -167,10 +167,9 @@ public:
     string file;
     string globalFrequencyOverrideDirectory;
 
-    // Options for SIMD minimizer-based marker generation.
-    bool useSimdMinimizers;
-    int minimizerK;
-    int minimizerW;
+    // Options for SIMD closed syncmer-based marker generation.
+    bool useSimdClosedSyncmers;
+    int syncmerS;
 
     void write(ostream&) const;
 };
