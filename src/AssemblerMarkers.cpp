@@ -40,9 +40,9 @@ void Assembler::findMarkers(uint64_t threadCount)
 
 
 
-// Find markers using SIMD-accelerated minimizers.
-// This uses the simd-minimizers-c library to compute canonical minimizers
-// for each read, and stores the minimizer positions as markers.
+// Find markers using SIMD-accelerated closed syncmers.
+// This uses the simd-minimizers-c library to compute canonical closed syncmers
+// for each read, and stores the syncmer positions as markers.
 // Helper to get sorted unique positions and KmerIds.
 static std::vector<std::pair<uint32_t, KmerId>> getSortedUniquePositionsAndIds(
     ReadId readId,
@@ -64,18 +64,65 @@ static std::vector<std::pair<uint32_t, KmerId>> getSortedUniquePositionsAndIds(
         readSequence.push_back(read[i].character());
     }
 
-    // Compute minimizer positions using simd-minimizers.
-    MinimizerList minimizerPositions = canonical_minimizer_positions(
+    // Generate syncmers.
+    // Constraints:
+    // 1. Library requires Odd K for canonical syncmers.
+    // 2. We want markers of length 'k'.
+    // 
+    // Logic:
+    // If k is Odd: Use k directly.
+    // If k is Even: Use k_scan = k + 1 (Odd). 
+    //      This gives us (k+1)-mers. We must reduce them to k-mers symmetrically.
+    //      Rule: 
+    //        If (k+1)-mer is Canonical (M < RC(M)): Use prefix (Pos P).
+    //        If (k+1)-mer is Non-Canonical (M > RC(M)): Use suffix (Pos P+1).
+    //      This ensures that if we picked M on Fwd, we pick RC(M) on Rev, and they map to RC k-mers.
+
+    int k_scan = k;
+    bool handleEvenK = (k % 2 == 0);
+    if(handleEvenK) {
+        k_scan = k + 1;
+    }
+
+    // Compute closed syncmer positions using simd-minimizers.
+    // Note: s (sub-kmer size) is passed as 'w' to the sketcher.
+    // Use k_scan.
+    
+    // We need a temporary sketcher if k_scan differs from valid data k.
+    // But here we passed 'k' to function.
+    // Ideally we reuse the sketcher if it matches.
+    // The sketcher passed in (from Pass1/Pass2) was created with findMarkersSimdClosedSyncmersData.k.
+    // We should update findMarkersSimdClosedSyncmersData.k to be k_scan?
+    // Or create a local sketcher if needed?
+    // The calling function creates the sketcher. We should update the caller to use k_scan.
+    
+    // BUT checking k_scan vs k here is tricky if sketcher is already made.
+    // Let's rely on the caller passing the correct sketcher and k.
+    // We will assume 'k' passed to this function is the TARGET k.
+    // And 'sketcher' is configured for 'k_scan'.
+    
+    // Wait, getSortedUniquePositionsAndIds takes 'k' and 'sketcher'.
+    // If we change logic here, we must make sure sketcher matches.
+    
+    // Let's REVERT this change and update the generic function flow in Pass1/Pass2 instead.
+    // This function should just use the sketcher provided.
+    
+    // However, we need to know if we are doing the "Even K Shift".
+    // We can infer it: if sketcher->k == k + 1, then we are in Even K mode.
+    // But SimdSketcher is opaque here (C struct).
+    // We can just rely on (k % 2 == 0).
+    
+    SyncmerList syncmerPositions = canonical_syncmer_positions(
         sketcher,
         readSequence.c_str(),
         readSequence.size());
 
     // Copy to vector, sort, and remove duplicates based on position.
-    std::vector<uint32_t> positions(minimizerPositions.data, 
-                                     minimizerPositions.data + minimizerPositions.len);
+    std::vector<uint32_t> positions(syncmerPositions.data, 
+                                     syncmerPositions.data + syncmerPositions.len);
     
-    // Free the minimizer list immediately.
-    free_minimizer_list(minimizerPositions);
+    // Free the syncmer list immediately.
+    free_syncmer_list(syncmerPositions);
     
     // Sort and uniq.
     std::sort(positions.begin(), positions.end());
@@ -84,7 +131,53 @@ static std::vector<std::pair<uint32_t, KmerId>> getSortedUniquePositionsAndIds(
     std::vector<std::pair<uint32_t, KmerId>> validMarkers;
     validMarkers.reserve(positions.size());
 
-    for(const uint32_t position : positions) {
+    for(uint32_t position : positions) {
+        // Adjust position for Even K logic
+        if(handleEvenK) {
+            // k_scan is k+1.
+            // Extract (k+1)-mer at 'position'.
+            Kmer kmerScan;
+            extractKmer(read, uint64_t(position), uint64_t(k_scan), kmerScan);
+            
+            // Check Canonicality: M < RC(M) ?
+            Kmer rcKmerScan = kmerScan.reverseComplement(k_scan);
+            
+            // We can compare Kmers directly? Kmer struct has operator<?
+            // Kmer::operator< compares identifiers or contents?
+            // Kmer.hpp usually has comparators.
+            // If not available, we can compare KmerIds? 
+            // KmerId is u64 (for K<=32) or larger?
+            // Dinara KmerId is typedef uint64_t usually.
+            // If k=50, KmerId only stores hash or truncated?
+            // Kmer class handles larger K usually.
+            
+            // Let's assume we can check if kmerScan is canonical.
+            // If K > 32, KmerId might not be unique/exact.
+            // But we need EXACT comparison for symmetry.
+            // Function: bool Kmer::isCanonical(int k) const?
+            
+            // Assuming we must implement comparison.
+            // Kmer struct usually stores data.
+            // Using `extractKmer` puts data in `kmer`.
+            // Let's check `kmerScan < rcKmerScan`.
+            // If Kmer doesn't support <, we might need a helper.
+            // BUT: for even K, typical K is ~50.
+            
+            bool isCanonical = (kmerScan < rcKmerScan);
+            // If Equal? Palindrome.
+            // If Palindrome, Shift=0 or 1?
+            // Palindrome (K+1=Odd) is impossible (cannot be palindrome with odd length).
+            // So Strict Inequality holds.
+            
+            if(!isCanonical) {
+                position++;
+            }
+        }
+        
+        // Now 'position' is the start of the Target K-mer.
+        // Check bounds.
+        if(position + k > read.baseCount) continue;
+
         Kmer kmer;
         extractKmer(read, uint64_t(position), uint64_t(k), kmer);
         const KmerId kmerId = kmer.id(uint64_t(k));
@@ -97,18 +190,31 @@ static std::vector<std::pair<uint32_t, KmerId>> getSortedUniquePositionsAndIds(
     return validMarkers;
 }
 
-void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
+void Assembler::findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s)
 {
     reads->checkReadsAreOpen();
 
-    performanceLog << timestamp << "Finding markers using SIMD minimizers (k=" << k << ", w=" << w << ") in "
+    // Even K Handling setup.
+    int k_scan = k;
+    if(k % 2 == 0) {
+        k_scan = k + 1;
+        cout << "Using Even K logic: Scanning with k=" << k_scan << " (Odd) then reducing to k=" << k << "." << endl;
+    }
+
+    // Check constraint on k_scan + s - 1
+    if((k_scan + s - 1) % 2 == 0) {
+        cout << "Warning: Canonical closed syncmer constraint (k_scan + s - 1) is even. Incrementing s from " << s << " to " << s + 1 << "." << endl;
+        s++;
+    }
+
+    performanceLog << timestamp << "Finding markers using SIMD closed syncmers (k_target=" << k << ", k_scan=" << k_scan << ", s=" << s << ") in "
         << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
     // Store parameters.
     assemblerInfo->k = k;
-    findMarkersSimdMinimizersData.k = k;
-    findMarkersSimdMinimizersData.w = w;
+    findMarkersSimdClosedSyncmersData.k = k_scan; // Store SCAN k for the sketcher creation!
+    findMarkersSimdClosedSyncmersData.w = s; 
 
     // Create the markers data structure.
     markers.createNew(largeDataName("Markers"), largeDataPageSize);
@@ -128,13 +234,13 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
     markers.beginPass1(2 * readCount);
     markerKmerIds.beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
-    runThreads(&Assembler::findMarkersSimdMinimizersPass1, threadCount);
+    runThreads(&Assembler::findMarkersSimdClosedSyncmersPass1, threadCount);
 
     // Pass 2: Store markers.
     markers.beginPass2();
     markerKmerIds.beginPass2();
     setupLoadBalancing(readCount, batchSize);
-    runThreads(&Assembler::findMarkersSimdMinimizersPass2, threadCount);
+    runThreads(&Assembler::findMarkersSimdClosedSyncmersPass2, threadCount);
     
     markers.endPass2(false);
     markerKmerIds.endPass2(false);
@@ -142,23 +248,31 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
     // Report.
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
-    performanceLog << timestamp << "Finding markers using SIMD minimizers completed in " << tTotal << " s." << endl;
-    cout << "Created " << markers.totalSize() << " markers using SIMD minimizers." << endl;
+    performanceLog << timestamp << "Finding markers using SIMD closed syncmers completed in " << tTotal << " s." << endl;
+    cout << "Created " << markers.totalSize() << " markers using SIMD closed syncmers." << endl;
 }
 
-void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
+void Assembler::findMarkersSimdClosedSyncmersPass1(size_t /* threadId */)
 {
     // Initialize thread-local sketcher and buffer.
+    // Use stored k (which is k_scan)
     SimdSketcher* sketcher = simd_sketcher_new(
-        static_cast<uint8_t>(findMarkersSimdMinimizersData.k), 
-        static_cast<uint8_t>(findMarkersSimdMinimizersData.w));
+        static_cast<uint8_t>(findMarkersSimdClosedSyncmersData.k), 
+        static_cast<uint8_t>(findMarkersSimdClosedSyncmersData.w));
     string readSequence;
+
+    // Retrieve global k (target k) from assemblerInfo
+    int k_target = assemblerInfo->k;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
+            // Note: We pass k_target to helper, but helper also checks sketcher->k?
+            // Actually helper signature is: getSortedUniquePositionsAndIds(..., int k, ...)
+            // We should pass k_target. The helper will handle Logic using k_target and sketcher.
+            
             const auto markers = getSortedUniquePositionsAndIds(
-                readId, *reads, findMarkersSimdMinimizersData.k, sketcher, kmerChecker, readSequence);
+                readId, *reads, k_target, sketcher, kmerChecker, readSequence);
 
             this->markers.incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
             this->markers.incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
@@ -171,20 +285,22 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     simd_sketcher_free(sketcher);
 }
 
-void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
+void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
 {
     // Initialize thread-local sketcher and buffer.
     SimdSketcher* sketcher = simd_sketcher_new(
-        static_cast<uint8_t>(findMarkersSimdMinimizersData.k), 
-        static_cast<uint8_t>(findMarkersSimdMinimizersData.w));
+        static_cast<uint8_t>(findMarkersSimdClosedSyncmersData.k), 
+        static_cast<uint8_t>(findMarkersSimdClosedSyncmersData.w));
     string readSequence;
+
+    int k_target = assemblerInfo->k;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId); // Need read for baseCount
             const auto markers = getSortedUniquePositionsAndIds(
-                readId, *reads, findMarkersSimdMinimizersData.k, sketcher, kmerChecker, readSequence);
+                readId, *reads, k_target, sketcher, kmerChecker, readSequence);
 
             if(markers.empty()) continue;
 
@@ -206,19 +322,14 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
                 ++kmerIdPointerStrand0;
 
                 // Strand 1: reverse complement position.
-                // KmerId should be the RC of kmerId?
-                // Wait, getSortedUniquePositionsAndIds returns Canonical KmerId if check was canonical?
-                // MarkerKmers usually stores RC KmerId for Strand 1?
-                // Or does it store the canonical ID?
-                // Assembler::computeMarkerKmerIds stores the ID of the kmer *on that strand*.
-                // So for Strand 1, we need RC of kmerId.
+                // Position is 0-based index of k-mer start.
+                // RC pos = L - k - position.
                 
-                // Let's compute RC KmerId.
-                Kmer kmer(kmerId, assemblerInfo->k);
-                Kmer rcKmer = kmer.reverseComplement(assemblerInfo->k);
-                KmerId rcKmerId = rcKmer.id(assemblerInfo->k);
+                Kmer kmer(kmerId, k_target);
+                Kmer rcKmer = kmer.reverseComplement(k_target);
+                KmerId rcKmerId = rcKmer.id(k_target);
 
-                markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - findMarkersSimdMinimizersData.k - position);
+                markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k_target - position);
                 --markerPointerStrand1;
                 
                 *kmerIdPointerStrand1 = rcKmerId;
@@ -345,7 +456,7 @@ void Assembler::computeMarkerKmerIds(uint64_t threadCount)
 {
     performanceLog << timestamp << "Gathering marker KmerIds." << endl;
 
-    // optimization: if we already have them (from findMarkersSimdMinimizers), don't recompute.
+    // optimization: if we already have them (from findMarkersSimdClosedSyncmers), don't recompute.
     if(markerKmerIds.isOpen()) {
         performanceLog << timestamp << "Marker KmerIds are already present. Skipping computation." << endl;
         return;

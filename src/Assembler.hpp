@@ -267,7 +267,7 @@ public:
     // Functions related to markers.
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
-    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w);
+    void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -1924,14 +1924,14 @@ private:
     // The marker is specified by the ReadId and Strand of the oriented read
     // it belongs to, plus the ordinal
     // The thread function runs on one thread at a time.
-    void findMarkersSimdMinimizersPass1(size_t threadId);
-    void findMarkersSimdMinimizersPass2(size_t threadId);
-    class FindMarkersSimdMinimizersData {
+    void findMarkersSimdClosedSyncmersPass1(size_t threadId);
+    void findMarkersSimdClosedSyncmersPass2(size_t threadId);
+    class FindMarkersSimdClosedSyncmersData {
     public:
          int k;
-         int w;
+         int w; // interpreted as s for syncmers
     };
-    FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
+    FindMarkersSimdClosedSyncmersData findMarkersSimdClosedSyncmersData;
 
 public:
     // Prune existing markers based on KmerCounter frequencies.

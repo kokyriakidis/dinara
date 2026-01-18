@@ -363,9 +363,13 @@ def installSimdMinimizers():
     installPath = os.path.join(INCLUDE_DIR, "simd-minimizers")
     libPath = os.path.join(LIB_DIR, "libsimd_minimizers_c.a")
     
-    if os.path.exists(installPath + "/simd_minimizers.h") and os.path.exists(libPath):
-        print("simd-minimizers-c header found in %s/simd_minimizers.h. Skipping installation." % installPath)
-        return
+    # Force reinstall to get latest version with Syncmers support
+    if os.path.exists(installPath):
+        shutil.rmtree(installPath)
+    if os.path.exists(libPath):
+        os.remove(libPath)
+    if os.path.exists(os.path.join(LIB_DIR, "libsimd_minimizers_c.so")):
+        os.remove(os.path.join(LIB_DIR, "libsimd_minimizers_c.so"))
         
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building simd-minimizers-c library using temporary directory", temporaryDirectory)
