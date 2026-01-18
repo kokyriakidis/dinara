@@ -4,6 +4,8 @@ struct InvertedIndexTempHit {
     ReadId partnerReadId;
     uint32_t posA;
     uint32_t posB;
+    uint32_t ordinalA; // Added for Hifiasm Parity (Local Scoring)
+    uint32_t weight;   // Added for Hifiasm Parity (Local Scoring)
     
     // Sort by PartnerId then PosA.
     bool operator<(const InvertedIndexTempHit& other) const {

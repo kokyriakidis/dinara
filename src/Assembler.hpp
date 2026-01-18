@@ -1939,8 +1939,8 @@ public:
 
     // Alignment candidates using Inverted Index.
     void findAlignmentCandidatesInvertedIndex(
-        uint64_t minMarkerCount, 
-        double maxDriftRate,     
+        double maxDriftRate,
+        uint64_t maxChainLimit,
         uint64_t threadCount
     );
 private:
@@ -1963,9 +1963,9 @@ private:
     
     class AlignmentCandidatesInvertedIndexData {
     public:
-         uint64_t minMarkerCount;
          double maxDriftRate;
          uint64_t k; // k-mer length for canonicalization
+         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
          
          // Phase 1: Heavy vector with Keys (for Sort/Group).
          vector<InvertedIndexOccurrence> occurrences; 

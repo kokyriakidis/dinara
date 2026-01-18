@@ -49,8 +49,17 @@ public:
     // markers in the alignment.
     vector< array<uint32_t, 2> > ordinals;
     
+    // Extended coordinates (computed during chaining for efficiency).
+    // These are pre-computed to avoid duplicate marker lookups.
+    // Format: half-open intervals [start, end)
+    uint32_t qs = 0;  // Query start (extended)
+    uint32_t qe = 0;  // Query end (extended)
+    uint32_t ts = 0;  // Target start (extended, FORWARD strand for both same/diff)
+    uint32_t te = 0;  // Target end (extended, FORWARD strand for both same/diff)
+    
     void clear() {
         ordinals.clear();
+        qs = qe = ts = te = 0;
     }
 
     uint32_t maxSkip() const;
