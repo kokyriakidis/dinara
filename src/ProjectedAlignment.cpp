@@ -184,6 +184,11 @@ void ProjectedAlignment::constructQuickRaw()
     maxIndelSize = 0;
 
     // Loop over pairs of consecutive aligned markers (A, B).
+    // Prepend the initial kHalf match (Left Tail)
+    if (kHalf > 0) {
+        phasingCigar.push_back((kHalf << 4) | 0);
+    }
+
     for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
         const uint64_t iA = iB - 1;
 
@@ -275,6 +280,16 @@ void ProjectedAlignment::constructQuickRaw()
                  phasingCigar.push_back((currentLen << 4) | currentOp);
              }
         }
+    }
+
+    // Append the final kHalf match (Right Tail)
+    if (kHalf > 0) {
+         if (!phasingCigar.empty() && (phasingCigar.back() & 0xF) == 0) {
+             uint32_t prevLen = phasingCigar.back() >> 4;
+             phasingCigar.back() = ((prevLen + kHalf) << 4) | 0;
+         } else {
+             phasingCigar.push_back((kHalf << 4) | 0);
+         }
     }
 }
 

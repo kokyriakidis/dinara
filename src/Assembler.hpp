@@ -17,7 +17,7 @@
 #include "MemoryMappedObject.hpp"
 #include "MultithreadedObject.hpp"
 #include "ReadGraph.hpp"
-#include "CanonicalOverlap.hpp"
+
 #include "ReadId.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
@@ -296,13 +296,18 @@ public:
 
 
 
+    // Compute alignment and return the object (for EC parity)
+    bool computeAlignmentParity(
+        OrientedReadId id0,
+        OrientedReadId id1,
+        Alignment& outAlignment
+    );
+
     // Compute an alignment for each alignment candidate.
     // Store summary information for the ones that are good enough,
     // without storing details of the alignment.
     void computeAlignments(
         const AlignOptions&,
-        bool computeProjectedAlignmentMetrics,
-
         // Number of threads. If zero, a number of threads equal to
         // the number of virtual processors is used.
         uint64_t threadCount
@@ -1104,7 +1109,6 @@ private:
 
         // Not owned.
         const AlignOptions* alignOptions = 0;
-        bool computeProjectedAlignmentMetrics = false;
 
         // The AlignmentInfo found by each thread.
         vector< vector<AlignmentData> > threadAlignmentData;
@@ -1205,15 +1209,12 @@ public:
     // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
     void createReadGraph6();
     
-    // Canonical per-Read overlap storage (Hifiasm parity)
-    OverlapIndex overlapIndex;
-    void buildCanonicalOverlapIndex();  // Convert alignmentData to OverlapIndex
+    // Canonical per-Read overlap storage  // Convert alignmentData to OverlapIndex
     
     // Read graph creation method 7: Uses canonical OverlapIndex with is_match/del flags
     void createReadGraph7();
     
     // Create read graph directly from OverlapIndex (Option A: direct use, no alignmentData mapping)
-    void createReadGraphFromCanonicalOverlaps();
     
     // Create read graph from alignments after filterBestHitAlignments (no phasing)
     void createReadGraphFromFilteredAlignments();
@@ -1502,8 +1503,13 @@ public:
     void accessPhasingCigars();
     void checkPhasingCigarsAreOpen() const;
 
-    // Perform Hifiasm-style ONT DP Phasing to filter inconsistent overlaps.
-    void performPhasing(uint64_t threadCount);
+    // Execute the full Hifiasm EC pipeline (filtering only, no error correction).
+    // Replaces previous ad-hoc filtering.
+    void performHifiasmECParity(uint64_t threadCount);
+    void performHifiasmECFinalFilteringParity(uint64_t threadCount);
+
+    // Old function (to be removed/replaced)
+    void performHifiasmECFiltering(uint64_t threadCount);
     void performPhasingThreadFunction(uint64_t threadId);
     
     // Phasing using canonical OverlapIndex (sets is_match/strong flags)

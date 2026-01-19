@@ -576,19 +576,19 @@ void dinara::main::assemble(
 
 
     // Compute alignments.
-    const bool computeProjectedAlignmentMetrics = true;
     assembler.computeAlignments(
         assemblerOptions.alignOptions,
-        computeProjectedAlignmentMetrics,
         threadCount);
 
     // Filter Best Hit Alignments (Hifiasm Parity)
     assembler.filterBestHitAlignments(threadCount);
 
     // =========================================================================
-    // Hifiasm-style Overlap Filtering Pipeline
+    // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
     // =========================================================================
-    // These methods mirror hifiasm's pre-graph filtering:
+    // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
+    assembler.performHifiasmECParity(threadCount);
+    assembler.performHifiasmECFinalFilteringParity(threadCount);
     //   ma_hit_sub          -> filterLocalSegments
     //   detect_chimeric_reads -> detectChimericReads  
     //   ma_hit_cut          -> applyCoverageCuts

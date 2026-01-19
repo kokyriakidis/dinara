@@ -131,6 +131,38 @@ void Assembler::alignOrientedReads(
 }
 
 
+bool Assembler::computeAlignmentParity(
+    OrientedReadId orientedReadId0,
+    OrientedReadId orientedReadId1,
+    Alignment& alignment
+)
+{
+    // Parity Alignment Reconstruction
+    // Uses actual assembler parameters to reconstruct exact alignment path.
+    reads->checkReadsAreOpen();
+    checkMarkersAreOpen();
+
+    array<vector<MarkerWithOrdinal>, 2> markersSortedByKmerId;
+    getMarkersSortedByKmerId(orientedReadId0, markersSortedByKmerId[0]);
+    getMarkersSortedByKmerId(orientedReadId1, markersSortedByKmerId[1]);
+
+    AlignmentGraph graph;
+    AlignmentInfo alignmentInfo;
+    const bool debug = false;
+    
+    // Use stored alignment parameters
+    size_t maxSkip = assemblerInfo->actualMaxSkip > 0 ? assemblerInfo->actualMaxSkip : 30; // Default fallback
+    size_t maxDrift = assemblerInfo->actualMaxDrift > 0 ? assemblerInfo->actualMaxDrift : 15;
+    uint32_t maxMarkerFrequency = 100; // Standard
+
+    align(
+        markersSortedByKmerId,
+        maxSkip, maxDrift, maxMarkerFrequency, debug, graph, alignment, alignmentInfo);
+        
+    return alignmentInfo.markerCount > 0;
+}
+
+
 
 // Compute marker alignments of an oriented read with all reads
 // for which we have an alignment.
@@ -398,10 +430,10 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
 }
 
 
+// Compute alignments.
 void Assembler::computeAlignments(
 
     const AlignOptions& alignOptions,
-    bool computeProjectedAlignmentMetrics,
 
     // Number of threads. If zero, a number of threads equal to
     // the number of virtual processors is used.
@@ -424,7 +456,6 @@ void Assembler::computeAlignments(
     // Store parameters so they are accessible to the threads.
     auto& data = computeAlignmentsData;
     data.alignOptions = &alignOptions;
-    data.computeProjectedAlignmentMetrics = computeProjectedAlignmentMetrics;
 
     // Adjust the numbers of threads, if necessary.
     if(threadCount == 0) {
@@ -623,7 +654,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
     const bool suppressContainments = data.alignOptions->suppressContainments;
     const double align5DriftRateTolerance = data.alignOptions->align5DriftRateTolerance;
     const uint64_t align5MinBandExtend = data.alignOptions->align5MinBandExtend;
-    const bool computeProjectedAlignmentMetrics = data.computeProjectedAlignmentMetrics;
+    const bool computeProjectedAlignmentMetrics = true;
 
 
     // Align4-specific items.
