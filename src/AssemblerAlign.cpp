@@ -939,22 +939,22 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             //     continue;
             // }
 
-            // Skip alignments with any single indel >= 64 bases.
-            if (projectedAlignment.maxIndelSize > 64) {
-                data.threadFilteredByGapCount[threadId]++;
-                continue;
-            }
+            // // Skip alignments with any single indel >= 64 bases.
+            // if (projectedAlignment.maxIndelSize > 64) {
+            //     data.threadFilteredByGapCount[threadId]++;
+            //     continue;
+            // }
 
-            // Collect position pairs for variant clustering
-            // Only collect those with SNP differences (No indels)
-            const auto tCollectStart = steady_clock::now();
-            collectVariantClusteringPositionPairs(
-                projectedAlignment,
-                orientedReadIds,
-                *data.threadVariantClusteringPositionPairs[threadId]
-            );
-            const auto tCollectEnd = steady_clock::now();
-            data.threadCollectionTime[threadId] += seconds(tCollectEnd - tCollectStart);
+            // // Collect position pairs for variant clustering
+            // // Only collect those with SNP differences (No indels)
+            // const auto tCollectStart = steady_clock::now();
+            // collectVariantClusteringPositionPairs(
+            //     projectedAlignment,
+            //     orientedReadIds,
+            //     *data.threadVariantClusteringPositionPairs[threadId]
+            // );
+            // const auto tCollectEnd = steady_clock::now();
+            // data.threadCollectionTime[threadId] += seconds(tCollectEnd - tCollectStart);
 
             // cout << orientedReadIds[0] << " " << orientedReadIds[1] << " good." << endl;
             AlignmentData thisAlignmentData(candidate, alignmentInfo);
