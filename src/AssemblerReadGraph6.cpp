@@ -15,7 +15,7 @@ void Assembler::createReadGraph6()
 
     // Check required data
     checkAlignmentDataAreOpen();
-    checkPhasingCigarsAreOpen();
+    // checkPhasingCigarsAreOpen(); // Removed: PhasingCigars replaced by AlignedEvidenceStore
 
     const uint64_t threadCount = std::thread::hardware_concurrency();
     const uint64_t totalAlignments = alignmentData.size();
@@ -173,4 +173,45 @@ void Assembler::createReadGraph6()
     createReadGraphUsingSelectedAlignments(keepAlignment);
     
     cout << timestamp << "createReadGraph6 completed." << endl;
+}
+
+void Assembler::createReadGraphFromFilteredAlignments()
+{
+    cout << timestamp << "createReadGraphFromFilteredAlignments begins." << endl;
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+    std::vector<bool> keepAlignment(alignmentCount, true);
+    uint64_t keptCount = 0;
+    uint64_t deletedCount = 0;
+
+    #pragma omp parallel for reduction(+:keptCount, deletedCount)
+    for(uint64_t i = 0; i < alignmentCount; i++) {
+        AlignmentData& ad = alignmentData[i];
+        if (ad.isDeleted()) {
+            keepAlignment[i] = false;
+            ad.info.isInReadGraph = 0; // Ensure consistent state
+            deletedCount++;
+        } else {
+            // Also check if reads are marked deleted globally (e.g. from chimeras/containment)
+            if (validReadIntervals.size() > 0) {
+                 if (validReadIntervals[ad.readIds[0]].isDeleted || 
+                     validReadIntervals[ad.readIds[1]].isDeleted) {
+                     keepAlignment[i] = false;
+                     ad.info.isInReadGraph = 0;
+                     deletedCount++;
+                     continue;
+                 }
+            }
+            
+            ad.info.isInReadGraph = 1;
+            keptCount++;
+        }
+    }
+
+    cout << timestamp << "Filtered out " << deletedCount << " alignments." << endl;
+    cout << timestamp << "Kept " << keptCount << " / " << alignmentCount << " alignments for read graph." << endl;
+
+    createReadGraphUsingSelectedAlignments(keepAlignment);
+    cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
 }

@@ -97,127 +97,16 @@ namespace {
 // Assembler::performPhasing Implementation
 // ----------------------------------------------------------------------------
 
+// Deprecated Legacy Phasing Logic (Replaced by APES/TASSD in AssemblerHifiasmEC.cpp)
 void Assembler::performPhasing(uint64_t threadCount)
 {
-    cout << timestamp << "Phasing alignments to remove inconsistent haplotypes..." << endl;
-    
-    checkPhasingCigarsAreOpen(); 
-
-    setupLoadBalancing(getReads().readCount(), 1000); 
-    runThreads(&Assembler::performPhasingThreadFunction, threadCount);
-
-    cout << timestamp << "Phasing completed." << endl;
+    (void)threadCount;
+    // No-op. Logic moved to performHifiasmECParity.
 }
 
 void Assembler::performPhasingThreadFunction(size_t threadId)
 {
     (void)threadId;
-    std::vector<uint32_t> alignmentIndices;
-    std::vector<PhasingOverlap> collectedOverlaps;
-    PhasingConfig config; 
-    
-    // Hifiasm Parity: For ONT/Low Precision, Hifiasm defaults s_hap_cov to 3.
-    // We retrieve coveragePeak for context but stick to the heuristic constant for now.
-    // If we wanted to be dynamic for HiFi: s_hap_cov could be derived from hom_peak.
-    // But user confirmed: "when is_ont flag is set ... they have a value of 3."
-    
-    if(assemblerInfo->kmerDistributionInfo.coveragePeak != invalid<uint64_t>) {
-         config.hom_cov = assemblerInfo->kmerDistributionInfo.coveragePeak;
-    }
-    config.s_hap_cov = 3; 
-    
-    uint64_t begin, end;
-    while(getNextBatch(begin, end)) {
-        for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
-            OrientedReadId target(readId, 0); // Target is always Strand 0 of ReadId
-            
-            collectedOverlaps.clear();
-            alignmentIndices.clear();
-
-            // Collect alignments from Strand 0
-            const auto table0 = alignmentTable[target.getValue()];
-            for(const auto alnIdx : table0) {
-                const auto& ad = alignmentData[alnIdx];
-                if(ad.isDeleted()) continue; 
-                alignmentIndices.push_back(alnIdx);
-            }
-            
-            // Collect alignments from Strand 1
-            OrientedReadId targetRC(readId, 1);
-            const auto table1 = alignmentTable[targetRC.getValue()];
-            for(const auto alnIdx : table1) {
-                 const auto& ad = alignmentData[alnIdx];
-                 if(ad.isDeleted()) continue;
-                 alignmentIndices.push_back(alnIdx);
-            }
-
-            // Uniquify
-            std::sort(alignmentIndices.begin(), alignmentIndices.end());
-            alignmentIndices.erase(std::unique(alignmentIndices.begin(), alignmentIndices.end()), alignmentIndices.end());
-            
-            // Construct PhasingOverlaps
-            for(auto idx : alignmentIndices) {
-                const auto& ad = alignmentData[idx];
-                const auto cigarSpan = phasingCigars[idx];
-                
-                PhasingOverlap pov;
-                pov.alnIdx = idx;
-                pov.cigar.assign(cigarSpan.begin(), cigarSpan.end());
-                pov.targetReadId = readId;
-
-                // Determine Query ID and Target Range
-                OrientedReadId id0(ad.readIds[0], 0);
-                OrientedReadId id1(ad.readIds[1], ad.isSameStrand?0:1);
-                
-                bool targetIsFirst = (ad.readIds[0] == readId); 
-                // Handle self-overlap ambiguity if needed
-                if(ad.readIds[0] == ad.readIds[1]) targetIsFirst = true;
-
-                if(targetIsFirst) {
-                    pov.queryReadId = id1.getReadId();
-                    pov.queryStrand = id1.getStrand(); // Relative to Target (Strand 0)
-                    pov.targetStart = ad.qs;
-                    pov.targetEnd = ad.qe;
-                    pov.queryStart = ad.ts;
-                    pov.queryEnd = ad.te;
-                } else {
-                    pov.queryReadId = id0.getReadId();
-                    pov.queryStrand = id0.getStrand();
-                    pov.targetStart = ad.ts;
-                    pov.targetEnd = ad.te;
-                    pov.queryStart = ad.qs;
-                    pov.queryEnd = ad.qe;
-                }
-                
-                collectedOverlaps.push_back(std::move(pov));
-            }
-
-            // Filter
-            std::vector<uint32_t> keptIndices = AssemblerPhasing::filterOverlapsByPhasing(
-                *this, readId, collectedOverlaps, config
-            );
-            
-            // Mark deleted with directional flag
-            // keptIndices are indices into collectedOverlaps vector
-            std::vector<bool> keepMask(collectedOverlaps.size(), false);
-            for(auto k : keptIndices) keepMask[k] = true;
-            
-            for(size_t k=0; k<collectedOverlaps.size(); ++k) {
-                if(!keepMask[k]) {
-                    uint32_t globalIdx = collectedOverlaps[k].alnIdx;
-                    const auto& ad = alignmentData[globalIdx];
-                    
-                    // Set the correct directional flag based on which read is being phased
-                    // readIds[0] < readIds[1] is always true (canonical ordering)
-                    if(readId == ad.readIds[0]) {
-                        alignmentData[globalIdx].isDeleted0 = true;
-                    } else {
-                        alignmentData[globalIdx].isDeleted1 = true;
-                    }
-                }
-            }
-        }
-    }
 }
 
 
@@ -295,7 +184,7 @@ std::vector<uint32_t> AssemblerPhasing::refineOverlapsNaive(
     // Evidence Map for fast lookup: OvIdx -> range in evidence vector
     std::vector<std::pair<size_t, size_t>> evRanges(overlaps.size(), {0,0});
     {
-        size_t start = 0;
+        // size_t start = 0;
         for(size_t i=0; i<evidence.size(); ) {
             uint32_t currId = evidence[i].overlapId;
             size_t j = i;
@@ -359,8 +248,8 @@ std::vector<uint32_t> AssemblerPhasing::filterOverlapsBySV(
     const std::vector<PhasingOverlap>& overlaps,
     const std::vector<HaplotypeEvidence>& evidence,
     std::vector<SnpStats>& snpStats,
-    const Assembler& assembler,
-    const PhasingConfig& config)
+    const Assembler& /* assembler */,
+    const PhasingConfig& /* config */)
 {
     if(keptIndices.empty()) return {};
 
@@ -396,7 +285,7 @@ std::vector<uint32_t> AssemblerPhasing::filterOverlapsBySV(
                 
                 uint32_t groupStartT = tPos;
                 uint32_t groupLen = 0; // Total length of indels (size)
-                uint32_t groupSize = 0; // Span on target? No, "err" in Hifiasm is summed op lengths.
+                // uint32_t groupSize = 0;
                 
                 uint32_t spanT = 0;
                 
@@ -473,7 +362,7 @@ std::vector<uint32_t> AssemblerPhasing::filterOverlapsBySV(
     
     for(int k=0; k<nSVs; ++k) {
         // Window optimization
-        uint32_t max_dist = wrappers[k].sv.size * 2 + 100; // heuristic
+        // uint32_t max_dist = wrappers[k].sv.size * 2 + 100;
         
         for(int z=k+1; z<nSVs; ++z) {
             if(wrappers[z].sv.start > wrappers[k].sv.end) break; // Start of z > End of k (approx)
@@ -844,7 +733,7 @@ static int64_t computeLinkScore(
 }
 
 std::vector<uint32_t> AssemblerPhasing::generatePhasingDP(
-    ReadId targetReadId,
+    ReadId /* targetReadId */,
     const std::vector<PhasingOverlap>& overlaps,
     const std::vector<HaplotypeEvidence>& evidence,
     std::vector<SnpStats>& outStats,
@@ -955,7 +844,7 @@ std::vector<uint32_t> AssemblerPhasing::generatePhasingDP(
     std::vector<bool> visited(n, false);
     
     uint64_t cc = (config.hom_cov / 2); 
-    cc = (uint64_t)(cc * 0.70);
+    cc = (uint64_t)((double)cc * 0.70);
     if (cc < 6) cc = 6;
     
     outStats.clear(); // Reset output

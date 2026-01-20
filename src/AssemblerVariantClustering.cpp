@@ -1094,6 +1094,8 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
                         if (info.gapEventCount != invalid<uint32_t>) {
                             score -= 4 * (int64_t)info.gapEventCount;
                         }
+
+
                     } else {
                         // Fallback: Use Marker Count or Length as proxy
                         // Make it negative-ish relative to "real" scores if we prefer real metrics

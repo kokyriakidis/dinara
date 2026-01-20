@@ -19,6 +19,7 @@
 #include "ReadGraph.hpp"
 
 #include "ReadId.hpp"
+#include "AlignedEvidenceStore.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
 #include "mode3-Anchor.hpp"
@@ -312,6 +313,9 @@ public:
         // the number of virtual processors is used.
         uint64_t threadCount
     );
+
+    // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
+    void performPhasing(uint64_t threadCount);
     void accessAlignmentData();
     void accessAlignmentDataReadWrite();
 
@@ -1128,7 +1132,11 @@ private:
         vector<uint64_t> threadFilteredByGapCount;
 
         // Thread-local accumulation of Phasing CIGARs
-        vector< std::shared_ptr< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> > > threadPhasingCigars;
+
+
+        // Thread-local Evidence Stores (APES/TASSD)
+        // One store per thread to avoid locking.
+        vector<AlignedEvidenceStore> threadEvidenceStores;
     };
     ComputeAlignmentsData computeAlignmentsData;
 
@@ -1498,10 +1506,7 @@ public:
 
 
 
-    // Phasing CIGARs: Stores linear CIGAR for each alignment.
-    MemoryMapped::VectorOfVectors<uint32_t, uint64_t> phasingCigars;
-    void accessPhasingCigars();
-    void checkPhasingCigarsAreOpen() const;
+    AlignedEvidenceStore alignedEvidenceStore;
 
     // Execute the full Hifiasm EC pipeline (filtering only, no error correction).
     // Replaces previous ad-hoc filtering.

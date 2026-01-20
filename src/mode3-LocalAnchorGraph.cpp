@@ -6,18 +6,14 @@
 #include "MurmurHash2.hpp"
 #include "platformDependent.hpp"
 #include "runCommandWithTimeout.hpp"
-using namespace dinara;
-using namespace mode3;
-
-// Boost libraries.
-#include <boost/graph/iteration_macros.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_generators.hpp>
-#include <boost/uuid/uuid_io.hpp>
-
 // Standard library.
 #include "fstream.hpp"
+#include <iostream>
 #include <queue>
+
+using namespace std;
+using namespace dinara;
+using namespace mode3;
 
 
 
@@ -606,11 +602,30 @@ void LocalAnchorGraph::writeHtml2(
     const LocalAnchorGraphDisplayOptions& options)
 {
     // Use scientific notation because svg does not accept floating points
+    const LocalAnchorGraph& graph = *this;
+
+    // Use scientific notation because svg does not accept floating points
     // ending with a decimal point.
     html << std::scientific;
 
     computeLayout(options);
+
+    // Debug output
+    cout << "ComputeLayout finished. Layout size: " << layout.size() << " / " << boost::num_vertices(graph) << endl;
+
+    if(layout.empty() && boost::num_vertices(graph) > 0) {
+        // ... (keep existing error handling)
+        cout << "ERROR: Layout is empty!" << endl;
+        html << "<p style='color:red'><strong>Error: Graph layout failed.</strong><br>"
+             << "The layout engine ('" << options.layoutMethod << "') failed to generate vertex positions.<br>"
+             << "Please check if 'sfdp' (Graphviz) is installed and accessible.<br>"
+             << "Also check the server console for any error output from the layout command.</p>";
+        return;
+    }
+
     computeLayoutBoundingBox();
+    cout << "Bounding Box: " << boundingBox.xMin << "," << boundingBox.yMin 
+         << " to " << boundingBox.xMax << "," << boundingBox.yMax << endl;
 
     Box viewportBox = boundingBox;
     viewportBox.extend(0.05);

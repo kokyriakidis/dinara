@@ -59,7 +59,7 @@ void Assembler::filterLocalSegments(
     cout << timestamp << "Local segment filtering complete." << endl;
 }
 
-void Assembler::filterLocalSegmentsThreadFunction(size_t threadId)
+void Assembler::filterLocalSegmentsThreadFunction(size_t /* threadId */)
 {
     // Minimal depth (min_dp in miniasm)
     // We use the passed minCoverage argument.
@@ -232,7 +232,7 @@ void Assembler::applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCoun
     cout << timestamp << "Coverage cuts applied." << endl;
 }
 
-void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t threadId)
+void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t /* threadId */)
 {
     uint64_t begin, end;
     const uint64_t minLen = this->coverageCutMinOverlap;
@@ -311,7 +311,7 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t threadId)
     }
 }
 
-void Assembler::applyCoverageCutsCleanupThreadFunction(size_t threadId)
+void Assembler::applyCoverageCutsCleanupThreadFunction(size_t /* threadId */)
 {
     // Phase 2: Check for orphaned reads.
     // "if(rLen == 0) (*coverage_cut)[i].del = 1;"
@@ -380,7 +380,7 @@ void Assembler::filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint
     cout << timestamp << "Hanging overlaps filtered." << endl;
 }
 
-void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
+void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
 {
     uint64_t begin, end;
     const uint64_t maxHang = this->hangingFilterMaxHang;
@@ -399,11 +399,12 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             // Access valid lengths. If not present (e.g. skipped step), use full read len?
             // ma_hit_flt assumes validReadIntervals populated.
             // If empty, assume full length (fallback).
-            uint32_t ql, tl, qs0, ts0;
+            // uint32_t ql, tl, qs0, ts0; // Unused
+            uint32_t ql, tl;
             if (validReadIntervals.empty()) {
                 ql = (uint32_t)reads->getReadRawSequenceLength(qn);
                 tl = (uint32_t)reads->getReadRawSequenceLength(tn);
-                qs0 = 0; ts0 = 0;
+                // (void)qs0; (void)ts0; // Suppress unused warning
             } else {
                 const auto& rq = validReadIntervals[qn];
                 const auto& rt = validReadIntervals[tn];
@@ -413,8 +414,8 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
                 }
                 ql = rq.end - rq.start;
                 tl = rt.end - rt.start;
-                qs0 = rq.start;
-                ts0 = rt.start;
+                // qs0 = rq.start;
+                // ts0 = rt.start;
             }
 
             // IMPORTANT: After applyCoverageCuts, coordinates are already normalized (0-based relative to valid region)
@@ -636,14 +637,14 @@ void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
                     // Contained overlap extension for Left
                     if (qs < max_left.e && qe > max_left.e) {
                          uint32_t len = qe - qs;
-                         if (len > 0 && (max_left.e - qs) > (uint32_t)(overlap_rate * len)) {
+                         if (len > 0 && (max_left.e - qs) > (uint32_t)(overlap_rate * (float)len)) {
                              if (qe > new_left_e) new_left_e = qe;
                          }
                     }
                     // Contained overlap extension for Right
                     if (qs < max_right.s && qe > max_right.s) {
                         uint32_t len = qe - qs;
-                        if (len > 0 && (qe - max_right.s) > (uint32_t)(overlap_rate * len)) {
+                        if (len > 0 && (qe - max_right.s) > (uint32_t)(overlap_rate * (float)len)) {
                             if (qs < new_right_s) new_right_s = qs;
                         }
                     }
@@ -894,7 +895,7 @@ void Assembler::rescuePhasedOverlaps(uint64_t rescueThreshold, uint64_t threadCo
     runThreads(&Assembler::rescuePhasedOverlapsThreadFunction, threadCount);
     
     // Count rescued overlaps
-    uint64_t rescuedCount = 0;
+    // uint64_t rescuedCount = 0;
     for(size_t i = 0; i < alignmentData.size(); i++) {
         const auto& ad = alignmentData[i];
         // Count overlaps where both flags are now false (rescued)
@@ -951,7 +952,7 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t /* threadId */)
                 // We want to rescue overlaps where THIS read said "delete" but other said "keep"
                 // (i.e., thisReadDeleted == true)
                 if (thisReadDeleted) {
-                    conflictAlignments.push_back(alignmentId);
+                    conflictAlignments.push_back((uint32_t)alignmentId);
                     conflictIntervals.push_back({qs, qe});
                 }
             }
@@ -1076,7 +1077,7 @@ void Assembler::detectChimericReadsFromAnchors(
 //     - We mark it as validly chimeric (`isChimericRead[id] = true`).
 //     - We conceptually "cut" the read or remove it by marking all its alignments as deleted (`alignmentData[i].setDeleted(true)`).
 
-void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
+void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t /* threadId */)
 {
     const double shiftRate = this->chimericShiftRate; // Threshold for overlap between left/right anchors (default ~0.06)
     const double overlapRate = 0.1;                   // Threshold for extending anchors via contained reads
@@ -1248,7 +1249,7 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t threadId)
             // Note: miniasm includes a "Complex Chimera" check here (intersection_check_by_base)
             // for cases where overlaps meet but alignment quality at junction is poor.
             // We omit that for now and rely on structural gap (Simple Chimera).
-            bool isComplexChimera = false; // logic would go here
+            // bool isComplexChimera = false; // logic would go here
             
             // The user logic for 'complex': 
             // if intersection_check_by_base(...) returns true -> delete.
@@ -1360,7 +1361,7 @@ static int ma_hit2arc_containment(
 }
 
 
-void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t /* threadCount */)
 {
     cout << timestamp << "Removing contained reads (ma_hit_contained_advance) - Serial Execution for Strict Parity..." << endl;
     

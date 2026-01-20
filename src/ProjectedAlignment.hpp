@@ -144,9 +144,7 @@ public:
     // Flag to indicate if the projected alignment touches the ends of the markers.
     bool touchesMarkerEnds = false;
 
-    // Phasing CIGAR (linear format, Op 0=M, 1=I, 2=D).
-    // Generated during construction to capture all segments, including perfect matches.
-    vector<uint32_t> phasingCigar;
+
 
     // Marker length and its half.
     uint32_t k;

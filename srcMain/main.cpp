@@ -583,17 +583,17 @@ void dinara::main::assemble(
     // Filter Best Hit Alignments (Hifiasm Parity)
     assembler.filterBestHitAlignments(threadCount);
 
-    // =========================================================================
-    // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
-    // =========================================================================
-    // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
-    assembler.performHifiasmECParity(threadCount);
-    assembler.performHifiasmECFinalFilteringParity(threadCount);
-    //   ma_hit_sub          -> filterLocalSegments
-    //   detect_chimeric_reads -> detectChimericReads  
-    //   ma_hit_cut          -> applyCoverageCuts
-    //   ma_hit_flt          -> filterHangingOverlaps
-    //   ma_hit_contained_advance -> removeContainedReads
+    // // =========================================================================
+    // // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
+    // // =========================================================================
+    // // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
+    // assembler.performHifiasmECParity(threadCount);
+    // assembler.performHifiasmECFinalFilteringParity(threadCount);
+    // //   ma_hit_sub          -> filterLocalSegments
+    // //   detect_chimeric_reads -> detectChimericReads  
+    // //   ma_hit_cut          -> applyCoverageCuts
+    // //   ma_hit_flt          -> filterHangingOverlaps
+    // //   ma_hit_contained_advance -> removeContainedReads
 
     // Parameters matching hifiasm defaults (from CommandLines.cpp)
     const uint64_t minCoverage = 0;          // min_overlap_coverage (asm_opt.min_overlap_coverage)

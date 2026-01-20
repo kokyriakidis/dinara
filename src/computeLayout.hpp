@@ -50,6 +50,7 @@ v x y
 #include "array.hpp"
 #include <filesystem>
 #include "fstream.hpp"
+#include <iostream>
 #include <map>
 #include "utility.hpp"
 #include "vector.hpp"
@@ -148,6 +149,7 @@ template<class Graph> dinara::ComputeLayoutReturnCode dinara::computeLayoutGraph
     // https://www.graphviz.org/doc/info/output.html#d:plain
     const string plainFileName = dotFileName + ".txt";
     const string command = layoutMethod + " -T plain " + dotFileName + " -o " + plainFileName + " " + additionalOptions;
+    std::cout << "Running layout command: " << command << std::endl;
     bool timeoutTriggered = false;
     bool signalOccurred = false;
     int returnCode = 0;
