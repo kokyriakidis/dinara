@@ -180,7 +180,7 @@ void ProjectedAlignment::constructQuickRaw()
     totalEditDistance = 0;
     mismatchCount = 0;
     totalDeletionCount = 0;
-    totalGapEventCount = 0; // Fix: Initialize gap event count
+    totalGapEventCount = 0;
     hasLargeIndel = false;
     maxIndelSize = 0;
 
@@ -222,7 +222,7 @@ void ProjectedAlignment::constructQuickRaw()
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
         totalDeletionCount += segment.deletionCount;
-        totalGapEventCount += segment.gapEventCount; // Fix: Accumulate gap events
+        totalGapEventCount += segment.gapEventCount;
         if (segment.hasLargeIndel) hasLargeIndel = true;
         if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
 

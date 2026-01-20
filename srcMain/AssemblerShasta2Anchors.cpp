@@ -254,6 +254,8 @@ namespace dinara {
         char* argv[] = {name};
         shasta2::Options options(argc, argv);
         options.threadCount = threadCount;
+        options.memoryMode = "filesystem";
+        options.memoryBacking = "disk";
         
         // Options: Anchor creation.
         options.minAnchorCoverage = 10;

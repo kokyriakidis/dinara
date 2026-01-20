@@ -785,59 +785,59 @@ void dinara::main::assemble(
     // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
     assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
-    // Create shasta2 anchors equivalent to the marker graph vertices.
-    // This allows downstream processing using shasta2 tools.
-    createShasta2Anchors(assembler, threadCount);
+    // // Create shasta2 anchors equivalent to the marker graph vertices.
+    // // This allows downstream processing using shasta2 tools.
+    // createShasta2Anchors(assembler, threadCount);
 
 
-    // // Store elapsed time for assembly.
-    // const auto steadyClock1 = std::chrono::steady_clock::now();
-    // const auto userClock1 = boost::chrono::process_user_cpu_clock::now();
-    // const auto systemClock1 = boost::chrono::process_system_cpu_clock::now();
-    // const double elapsedTime = 1.e-9 * double((
-    //     std::chrono::duration_cast<std::chrono::nanoseconds>(steadyClock1 - steadyClock0)).count());
-    // const double userTime = 1.e-9 * double((
-    //     boost::chrono::duration_cast<boost::chrono::nanoseconds>(userClock1 - userClock0)).count());
-    // const double systemTime = 1.e-9 * double((
-    //     boost::chrono::duration_cast<boost::chrono::nanoseconds>(systemClock1 - systemClock0)).count());
-    // const double averageCpuUtilization =
-    //     (userTime + systemTime) / (double(std::thread::hardware_concurrency()) * elapsedTime);
-    // assembler.storeAssemblyTime(elapsedTime, averageCpuUtilization);
+    // Store elapsed time for assembly.
+    const auto steadyClock1 = std::chrono::steady_clock::now();
+    const auto userClock1 = boost::chrono::process_user_cpu_clock::now();
+    const auto systemClock1 = boost::chrono::process_system_cpu_clock::now();
+    const double elapsedTime = 1.e-9 * double((
+        std::chrono::duration_cast<std::chrono::nanoseconds>(steadyClock1 - steadyClock0)).count());
+    const double userTime = 1.e-9 * double((
+        boost::chrono::duration_cast<boost::chrono::nanoseconds>(userClock1 - userClock0)).count());
+    const double systemTime = 1.e-9 * double((
+        boost::chrono::duration_cast<boost::chrono::nanoseconds>(systemClock1 - systemClock0)).count());
+    const double averageCpuUtilization =
+        (userTime + systemTime) / (double(std::thread::hardware_concurrency()) * elapsedTime);
+    assembler.storeAssemblyTime(elapsedTime, averageCpuUtilization);
 
-    // // Store peak memory usage.
-    // uint64_t peakMemoryUsage = getPeakMemoryUsage();
-    // assembler.storePeakMemoryUsage(peakMemoryUsage);
+    // Store peak memory usage.
+    uint64_t peakMemoryUsage = getPeakMemoryUsage();
+    assembler.storePeakMemoryUsage(peakMemoryUsage);
 
-    // // Store other performance information.
-    // assembler.assemblerInfo->threadCount = threadCount;
-    // assembler.assemblerInfo->virtualCpuCount = std::thread::hardware_concurrency();
-    // assembler.assemblerInfo->totalAvailableMemory = getTotalPhysicalMemory();
+    // Store other performance information.
+    assembler.assemblerInfo->threadCount = threadCount;
+    assembler.assemblerInfo->virtualCpuCount = std::thread::hardware_concurrency();
+    assembler.assemblerInfo->totalAvailableMemory = getTotalPhysicalMemory();
 
-    // // Write a summary of read information.
-    // assembler.writeReadsSummary();
+    // Write a summary of read information.
+    assembler.writeReadsSummary();
 
-    // // Write the assembly summary.
-    // ofstream html("AssemblySummary.html");
-    // assembler.writeAssemblySummary(html);
-    // ofstream json("AssemblySummary.json");
-    // assembler.writeAssemblySummaryJson(json);
-    // ofstream htmlIndex("index.html");
-    // assembler.writeAssemblyIndex(htmlIndex);
+    // Write the assembly summary.
+    ofstream html("AssemblySummary.html");
+    assembler.writeAssemblySummary(html);
+    ofstream json("AssemblySummary.json");
+    assembler.writeAssemblySummaryJson(json);
+    ofstream htmlIndex("index.html");
+    assembler.writeAssemblyIndex(htmlIndex);
 
-    // // If --saveBinaryData was requested and Mode assembly is 3,
-    // // wait for save binary data threads to finish.
-    // if(not assembler.saveBinaryDataDirectory.empty()) {
-    //     assembler.waitForSaveBinaryDataThreads();
-    // }
+    // If --saveBinaryData was requested and Mode assembly is 3,
+    // wait for save binary data threads to finish.
+    if(not assembler.saveBinaryDataDirectory.empty()) {
+        assembler.waitForSaveBinaryDataThreads();
+    }
 
-    // performanceLog << timestamp << endl;
-    // performanceLog << "Assembly time statistics:\n"
-    //     "    Elapsed seconds: " << elapsedTime << "\n"
-    //     "    Elapsed minutes: " << elapsedTime/60. << "\n"
-    //     "    Elapsed hours:   " << elapsedTime/3600. << "\n";
-    // performanceLog << "Average CPU utilization: " << averageCpuUtilization << endl;
-    // performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
-    //     int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
+    performanceLog << timestamp << endl;
+    performanceLog << "Assembly time statistics:\n"
+        "    Elapsed seconds: " << elapsedTime << "\n"
+        "    Elapsed minutes: " << elapsedTime/60. << "\n"
+        "    Elapsed hours:   " << elapsedTime/3600. << "\n";
+    performanceLog << "Average CPU utilization: " << averageCpuUtilization << endl;
+    performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
+        int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
 }
 
