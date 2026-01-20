@@ -1512,9 +1512,6 @@ public:
 
     AlignedEvidenceStore alignedEvidenceStore;
 
-    // Execute the full Hifiasm EC pipeline (filtering only, no error correction).
-    // Replaces previous ad-hoc filtering.
-    void performHifiasmECParity(uint64_t threadCount);
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
 
     // Old function (to be removed/replaced)
