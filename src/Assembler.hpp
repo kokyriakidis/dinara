@@ -432,6 +432,10 @@ public:
     // Write a csv file with summary information for each read.
 public:
     void writeReadsSummary();
+    
+    // Hifiasm Error Correction
+    void performHifiasmECParity(uint64_t threadCount);
+
 
     void computeReadIdsSortedByName();
 
