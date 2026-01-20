@@ -542,7 +542,9 @@ def installShasta2():
         installTmpDir = os.path.abspath("../install_tmp")
         
         # Run cmake with install prefix
-        runCommand(f"cmake .. -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON -DBUILD_STATIC_LIBRARY=ON -DCMAKE_INSTALL_PREFIX={installTmpDir}")
+        # We need to explicitly include the paths to our locally built dependencies (poasta, astarpa, etc)
+        cxx_flags = f"-I{INCLUDE_DIR}/poasta -I{INCLUDE_DIR}/astarpa -I{INCLUDE_DIR}/simd-minimizers"
+        runCommand(f"cmake .. -DCMAKE_CXX_FLAGS=\"{cxx_flags}\" -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON -DBUILD_STATIC_LIBRARY=ON -DCMAKE_INSTALL_PREFIX={installTmpDir}")
         runCommand("make -j")
         # Run make install to populate install_tmp
         runCommand("make install")

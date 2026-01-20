@@ -11,6 +11,7 @@
 #include "compressAlignment.hpp"
 #include "performanceLog.hpp"
 #include "ProjectedAlignment.hpp"
+#include "AlignedEvidenceStore.hpp"
 #include "Reads.hpp"
 #include "span.hpp"
 #include "timestamp.hpp"
@@ -494,7 +495,8 @@ void Assembler::computeAlignments(
     // Compute the alignments.
     data.threadAlignmentData.resize(threadCount);
     data.threadCompressedAlignments.resize(threadCount);
-    data.threadPhasingCigars.resize(threadCount);
+
+    data.threadEvidenceStores.resize(threadCount);
 
     if (assemblerInfo->readGraphCreationMethod == 5) {
         data.threadVariantClusteringPositionPairs.resize(threadCount);
@@ -516,11 +518,14 @@ void Assembler::computeAlignments(
     performanceLog << timestamp << "Storing the alignment found by each thread." << endl;
     alignmentData.createNew(largeDataName("AlignmentData"), largeDataPageSize);
     compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
-    phasingCigars.createNew(largeDataName("PhasingCigars"), largeDataPageSize);
+
     
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         const vector<AlignmentData>& threadAlignmentData = data.threadAlignmentData[threadId];
-        for(const AlignmentData& ad: threadAlignmentData) {
+        size_t idShift = alignmentData.size(); // Current global count serves as offset
+        for(const AlignmentData& ad_: threadAlignmentData) {
+            AlignmentData ad = ad_;
+            ad.info.alignmentId += idShift;
             alignmentData.push_back(ad);
         }
 
@@ -533,25 +538,57 @@ void Assembler::computeAlignments(
             );
         }
 
-        // Merge phasing Cigars
-        const auto threadPhasingCigarsPtr = data.threadPhasingCigars[threadId];
-        const auto sizeCigars = threadPhasingCigarsPtr->size();
-        for(size_t i=0; i<sizeCigars; i++) {
-            phasingCigars.appendVector(
-                (*threadPhasingCigarsPtr)[i].begin(),
-                (*threadPhasingCigarsPtr)[i].end()
-            );
+
+
+        // Merge AlignedEvidenceStore (APES/TASSD)
+        AlignedEvidenceStore& localStore = data.threadEvidenceStores[threadId];
+        
+        // Append Indexes (Adjusting offsets)
+        uint64_t globalSnpOffset0 = alignedEvidenceStore.snpStream0.size();
+        uint64_t globalIndelOffset0 = alignedEvidenceStore.indelStream0.size();
+        uint64_t globalSnpOffset1 = alignedEvidenceStore.snpStream1.size();
+        uint64_t globalIndelOffset1 = alignedEvidenceStore.indelStream1.size();
+        
+        alignedEvidenceStore.reserve(
+            alignedEvidenceStore.index.size() + localStore.index.size(),
+            alignedEvidenceStore.snpStream0.size() + localStore.snpStream0.size(),
+            alignedEvidenceStore.indelStream0.size() + localStore.indelStream0.size()
+        );
+        // Reserve Stream1 as well
+        alignedEvidenceStore.snpStream1.reserve(alignedEvidenceStore.snpStream1.size() + localStore.snpStream1.size());
+        alignedEvidenceStore.indelStream1.reserve(alignedEvidenceStore.indelStream1.size() + localStore.indelStream1.size());
+
+        for (auto& entry : localStore.index) {
+            entry.snpOffset0 += globalSnpOffset0;
+            entry.indelOffset0 += globalIndelOffset0;
+            entry.snpOffset1 += globalSnpOffset1;
+            entry.indelOffset1 += globalIndelOffset1;
+            alignedEvidenceStore.index.push_back(entry);
         }
 
-        // Clean up thread storage.
-        data.threadCompressedAlignments[threadId]->remove();
-        data.threadPhasingCigars[threadId]->remove();
+        // Append Streams
+        alignedEvidenceStore.snpStream0.insert(
+            alignedEvidenceStore.snpStream0.end(),
+            localStore.snpStream0.begin(),
+            localStore.snpStream0.end()
+        );
+        alignedEvidenceStore.indelStream0.insert(
+            alignedEvidenceStore.indelStream0.end(),
+            localStore.indelStream0.begin(),
+            localStore.indelStream0.end()
+        );
+        
+        alignedEvidenceStore.snpStream1.insert(alignedEvidenceStore.snpStream1.end(), localStore.snpStream1.begin(), localStore.snpStream1.end());
+        alignedEvidenceStore.indelStream1.insert(alignedEvidenceStore.indelStream1.end(), localStore.indelStream1.begin(), localStore.indelStream1.end());
+
+        // Clear local store to free memory immediately
+        localStore.clear();
     }
 
     // Release unused allocated memory.
     alignmentData.unreserve();
     compressedAlignments.unreserve();
-    phasingCigars.unreserve();
+
 
 
 
@@ -713,12 +750,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             largeDataPageSize);
     }
 
-    shared_ptr< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> > thisThreadPhasingCigarsPointer =
-        make_shared< MemoryMapped::VectorOfVectors<uint32_t, uint64_t> >();
-    data.threadPhasingCigars[threadId] = thisThreadPhasingCigarsPointer;
-    thisThreadPhasingCigarsPointer->createNew(
-        largeDataName("tmp-ThreadPhasingCigars-" + to_string(threadId)),
-        largeDataPageSize);
+
 
 #if 0
     // A vector to store the time taken to compute each alignment.
@@ -1033,20 +1065,285 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 compressedAlignment.c_str() + compressedAlignment.size()
             );
             
-            // --- Generate and Store Phasing CIGAR ---
-            // Format: standard CIGAR operations (len << 4 | op)
-            // Ops: 0=Match/Mismatch(M), 1=Ins(I), 2=Del(D)
-            // Note: We removed artificial extension, so there is no "Blind" padding (op 3) anymore.
-            
-            // Use thread-local buffer to avoid per-alignment heap allocation
-            thread_local vector<uint32_t> cigar;
-            cigar.clear(); // O(1) - keeps capacity, resets size
-            
-            // Only append generated CIGAR from ProjectedAlignment
-            const auto& internalCigar = projectedAlignment.phasingCigar;
-            cigar.insert(cigar.end(), internalCigar.begin(), internalCigar.end());
-            
-            data.threadPhasingCigars[threadId]->appendVector(cigar);
+
+
+            // --- Populate AlignedEvidenceStore (APES/TASSD) ---
+            // The AlignedEvidenceStore uses a dual-stream architecture (Target-View vs Query-View)
+            // to allow O(1) lookups of evidence during phasing without re-projecting.
+            // We populate both streams simultaneously to avoid duplicate computation.
+
+            AlignedEvidenceStore& store = data.threadEvidenceStores[threadId];
+            thisAlignmentData.info.alignmentId = store.beginAlignment(); // Returns ID, implicitly syncs with alignmentData index
+
+            const LongBaseSequenceView qView = reads->getRead(orientedReadIds[0].getReadId());
+            const LongBaseSequenceView tView = reads->getRead(orientedReadIds[1].getReadId());
+            const bool qRev = orientedReadIds[0].getStrand();
+            const bool tRev = orientedReadIds[1].getStrand();
+            const uint64_t qRawLen = qView.baseCount;
+            const uint64_t tRawLen = tView.baseCount;
+
+            // Helper lambdas to access bases in their RAW (Oriented) coordinate system.
+            auto getQ = [&](uint64_t p) { return qRev ? qView[qRawLen - 1 - p].complement() : qView[p]; };
+            auto getT = [&](uint64_t p) { return tRev ? tView[tRawLen - 1 - p].complement() : tView[p]; };
+
+            // =================================================================================
+            // UNIFIED PHASING LOGIC (Forward & Backward Passes)
+            // =================================================================================
+            // We populate streams based on Strand Orientation to ensure Monotonic Canonical Coordinates.
+            // - Forward Reads (!Rev): Populated in Forward Pass (Low->High Oriented).
+            // - Reverse Reads (Rev): Populated in Backward Pass (High->Low Oriented).
+            // This handles all cases: SameStrand (F/F, R/R) and DiffStrand (F/R, R/F).
+
+            const auto& segments = projectedAlignment.segments;
+
+            // --- PASS 1: FORWARD ITERATION (Handles Forward Reads) ---
+            if (!qRev || !tRev) {
+                // Initialize pointers to Alignment Start (Oriented)
+                uint32_t currentQ = thisAlignmentData.qs;
+                uint32_t currentT = thisAlignmentData.ts;
+                
+                uint32_t lastSnpQ = thisAlignmentData.qs;
+                uint32_t lastSnpT = thisAlignmentData.ts;
+
+                if (!segments.empty()) {
+                    // Left Tail Handling
+                    // Implicit match from start to first segment
+                    uint32_t firstQ = segments.front().positionsA[0];
+                    if (firstQ > currentQ) {
+                        uint32_t gapLen = firstQ - currentQ;
+                        uint32_t gapT   = segments.front().positionsA[1] - currentT;
+
+                        if (!qRev) { // Stream 1
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapLen) {
+                                store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
+                                lastSnpQ += 16383; adv += 16383;
+                            }
+                        }
+                        if (!tRev) { // Stream 0
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapT) {
+                                store.addSnp0(16383, getT(lastSnpT + 16383).value);
+                                lastSnpT += 16383; adv += 16383;
+                            }
+                        }
+                    }
+                    // Sync up
+                    currentQ = segments.front().positionsA[0];
+                    currentT = segments.front().positionsA[1];
+
+                    for (const auto& segment : segments) {
+                        // 1. Implicit Gap (between previous segment end and current segment start)
+                        uint32_t gapQ = segment.positionsA[0] - currentQ;
+                        uint32_t gapT = segment.positionsA[1] - currentT;
+
+                        if (!qRev) {
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapQ) {
+                                store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
+                                lastSnpQ += 16383; adv += 16383;
+                            }
+                        }
+                        if (!tRev) {
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapT) {
+                                store.addSnp0(16383, getT(lastSnpT + 16383).value);
+                                lastSnpT += 16383; adv += 16383;
+                            }
+                        }
+
+                        currentQ = segment.positionsA[0];
+                        currentT = segment.positionsA[1];
+
+                        // 2. Steps
+                        for(const auto& step : segment.alignment) {
+                            bool advQ = step.first;
+                            bool advT = step.second;
+                            
+                            if (advQ && advT) { // Match/Mismatch
+                                if (getQ(currentQ) != getT(currentT)) {
+                                    // Mismatch: Store Partner Base
+                                    // Use getQ/getT directly (already returns Aligned/Canonical Bases)
+                                    if (!qRev) { // Stream 1 expects Target Base
+                                        uint32_t d = currentQ - lastSnpQ;
+                                        while(d >= 16383) {
+                                            store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
+                                            lastSnpQ += 16383; d -= 16383;
+                                        }
+                                        store.addSnp1((uint16_t)d, getT(currentT).value);
+                                        lastSnpQ = currentQ;
+                                    }
+                                    if (!tRev) { // Stream 0 expects Query Base
+                                        uint32_t d = currentT - lastSnpT;
+                                        while(d >= 16383) {
+                                            store.addSnp0(16383, getT(lastSnpT + 16383).value);
+                                            lastSnpT += 16383; d -= 16383;
+                                        }
+                                        store.addSnp0((uint16_t)d, getQ(currentQ).value);
+                                        lastSnpT = currentT;
+                                    }
+                                }
+                                currentQ++; currentT++;
+                            } else if (!advQ && advT) { // Gap in Q
+                                if (!qRev) store.addIndel1(currentQ, 1, 0); // Ins in T relative to Q
+                                if (!tRev) store.addIndel0(currentT, 1, 1); // Del in Q relative to T
+                                currentT++;
+                            } else if (advQ && !advT) { // Gap in T
+                                if (!qRev) store.addIndel1(currentQ, 1, 1); // Del in T relative to Q
+                                if (!tRev) store.addIndel0(currentT, 1, 0); // Ins in Q relative to T
+                                currentQ++;
+                            }
+                        }
+                        currentQ = segment.positionsB[0];
+                        currentT = segment.positionsB[1];
+                    }
+                    
+                    // Right Tail Handling
+                    uint32_t endQ = thisAlignmentData.qe;
+                    uint32_t endT = thisAlignmentData.te;
+                    
+                    if (!qRev && endQ > currentQ) {
+                        uint32_t gap = endQ - currentQ;
+                        uint32_t adv = 0;
+                        while(adv + 16383 <= gap) {
+                            store.addSnp1(16383, getQ(lastSnpQ+16383).value);
+                            lastSnpQ += 16383; adv += 16383;
+                        }
+                    }
+                    if (!tRev && endT > currentT) {
+                        uint32_t gap = endT - currentT;
+                        uint32_t adv = 0;
+                        while(adv + 16383 <= gap) {
+                            store.addSnp0(16383, getT(lastSnpT+16383).value);
+                            lastSnpT += 16383; adv += 16383;
+                        }
+                    }
+                }
+            } // End Pass 1
+
+            // --- PASS 2: BACKWARD ITERATION (Handles Reverse Reads) ---
+            if (qRev || tRev) {
+                // Initialize pointers to Oriented High
+                // Query: qs/qe are Oriented. High = qe.
+                // Target: ts/te are Canonical. High = Len - ts.
+                uint32_t currentQ = thisAlignmentData.qe;
+                uint32_t currentT = tRawLen - thisAlignmentData.ts;
+
+                // For Delta Encoding on Reverse Reads:
+                // We iterate Logic High Oriented -> Logic Low Oriented.
+                // This corresponds to Canonical Low -> Canonical High.
+                // Query: Oriented High qe maps to Canonical Low (Len - qe).
+                // Target: Oriented High (Len - ts) maps to Canonical Low ts.
+                uint32_t lastSnpQ = qRawLen - thisAlignmentData.qe;
+                uint32_t lastSnpT = thisAlignmentData.ts;
+
+                if (!segments.empty()) {
+                    // Iterate segments in Reverse
+                    for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
+                        const auto& segment = *it;
+
+                        // 1. Implicit Gap (High Oriented side)
+                        // Gap between current (High) and segment End (High).
+                        // In Canonical space, this is the gap BEFORE the segment (Low->High).
+                        uint32_t gapQ = currentQ - segment.positionsB[0];
+                        uint32_t gapT = currentT - segment.positionsB[1];
+                        
+                        if (qRev) {
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapQ) {
+                                // Dummy at Canonical `lastSnpQ + 16383`.
+                                // To get base, we Map Canonical -> Oriented.
+                                // Oriented = qRawLen - 1 - (lastSnpQ + 16383).
+                                store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ + 16383)).value);
+                                lastSnpQ += 16383; adv += 16383;
+                            }
+                        }
+                        if (tRev) {
+                            uint32_t adv = 0;
+                            while(adv + 16383 <= gapT) {
+                                store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT + 16383)).value);
+                                lastSnpT += 16383; adv += 16383;
+                            }
+                        }
+
+                        currentQ = segment.positionsB[0];
+                        currentT = segment.positionsB[1];
+                        
+                        // 2. Steps (Reverse)
+                        for (auto sIt = segment.alignment.rbegin(); sIt != segment.alignment.rend(); ++sIt) {
+                            bool advQ = sIt->first;
+                            bool advT = sIt->second;
+                            
+                            if (advQ && advT) { // Match/Mismatch
+                                currentQ--; currentT--;
+                                if (getQ(currentQ) != getT(currentT)) {
+                                    // Canonical coords
+                                    uint32_t canQ = qRawLen - 1 - currentQ;
+                                    uint32_t canT = tRawLen - 1 - currentT;
+
+                                    if (qRev) {
+                                        uint32_t d = canQ - lastSnpQ;
+                                        while(d >= 16383) {
+                                            store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ+16383)).value);
+                                            lastSnpQ += 16383; d -= 16383;
+                                        }
+                                        store.addSnp1((uint16_t)d, getT(currentT).value); // Partner Base
+                                        lastSnpQ = canQ;
+                                    }
+                                    if (tRev) {
+                                        uint32_t d = canT - lastSnpT;
+                                        while(d >= 16383) {
+                                            store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT+16383)).value);
+                                            lastSnpT += 16383; d -= 16383;
+                                        }
+                                        store.addSnp0((uint16_t)d, getQ(currentQ).value); // Partner Base
+                                        lastSnpT = canT;
+                                    }
+                                }
+                            } else if (!advQ && advT) { // Gap in Q -> Dec T
+                                currentT--;
+                                // Canonical T: tRawLen - 1 - currentT
+                                if (tRev) store.addIndel0(tRawLen - 1 - currentT, 1, 1); // Del in Q
+                                // Relative to Q? Q didn't move. 
+                                // Canonical Q position is effectively "between" bases (insertion in T).
+                                // Anchor at previous Canonical Q: qRawLen - 1 - currentQ.
+                                if (qRev) store.addIndel1(qRawLen - 1 - currentQ, 1, 0); // Ins in T
+                            } else if (advQ && !advT) { // Gap in T -> Dec Q
+                                currentQ--;
+                                if (qRev) store.addIndel1(qRawLen - 1 - currentQ, 1, 1); // Del in T
+                                if (tRev) store.addIndel0(tRawLen - 1 - currentT, 1, 0); // Ins in Q
+                            }
+                        }
+                        currentQ = segment.positionsA[0];
+                        currentT = segment.positionsA[1];
+                    }
+
+                    // Tail Handling (Low Oriented / High Canonical)
+                    // Corresponds to "Right Tail" of Canonical. 
+                    // Oriented Low Target: tRawLen - 1 - te.
+                    // Oriented Low Query: qRawLen - 1 - qe.
+                    
+                    uint32_t endQ_Oriented = thisAlignmentData.qs;
+                    uint32_t endT_Oriented = tRawLen - thisAlignmentData.te;
+                    
+                    if (qRev && currentQ > endQ_Oriented) {
+                        uint32_t gap = currentQ - endQ_Oriented;
+                        uint32_t adv = 0;
+                        while(adv + 16383 <= gap) {
+                            store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ+16383)).value);
+                            lastSnpQ += 16383; adv += 16383;
+                        }
+                    }
+                    if (tRev && currentT > endT_Oriented) {
+                        uint32_t gap = currentT - endT_Oriented;
+                        uint32_t adv = 0;
+                        while(adv + 16383 <= gap) {
+                            store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT+16383)).value);
+                            lastSnpT += 16383; adv += 16383;
+                        }
+                    }
+                }
+            } // End Pass 2
         }
     }
 
@@ -1176,17 +1473,7 @@ void Assembler::checkAlignmentDataAreOpen() const
     }
 }
 
-void Assembler::accessPhasingCigars()
-{
-    phasingCigars.accessExistingReadWrite(largeDataName("PhasingCigars"));
-}
 
-void Assembler::checkPhasingCigarsAreOpen() const
-{
-    if(!phasingCigars.isOpen()) {
-        throw runtime_error("Phasing CIGARs are not accessible.");
-    }
-}
 
 
 
