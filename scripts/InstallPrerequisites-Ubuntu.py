@@ -385,11 +385,23 @@ def installSimdMinimizers():
         runCommand("RUSTFLAGS='-C target-cpu=native' " + cargoPath + " build --release")
         
         # Install
-        # Install
         print("Installing simd-minimizers-c to " + DINARA_BUILD_DIR + "...")
         if not os.path.exists(installPath):
             os.makedirs(installPath, exist_ok=True)
-        runCommand("cp simd_minimizers.h " + installPath)
+            
+        # Robust header finding
+        if os.path.exists("simd_minimizers.h"):
+             runCommand("cp simd_minimizers.h " + installPath)
+        elif os.path.exists("include/simd_minimizers.h"):
+             runCommand("cp include/simd_minimizers.h " + installPath)
+        else:
+             print("Warning: simd_minimizers.h not found in root/include, searching...")
+             runCommand(f"find . -name 'simd_minimizers.h' -exec cp {{}} {installPath} \\;")
+             
+        # Verify header was installed
+        if not os.path.exists(os.path.join(installPath, "simd_minimizers.h")):
+             raise Exception("Failed to install simd_minimizers.h")
+
         runCommand("cp target/release/libsimd_minimizers_c.so " + LIB_DIR)
         runCommand("cp target/release/libsimd_minimizers_c.a " + LIB_DIR)
         

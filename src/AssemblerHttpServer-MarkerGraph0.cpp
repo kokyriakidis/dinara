@@ -78,7 +78,7 @@ void Assembler::exploreMarkerGraph0(
         uint32_t(assemblerInfo->k),
         assemblerInfo->assemblyMode,
         getReads(),
-        markers,
+        *markers,
         markerGraph,
         markerGraph.vertexTable,
         *consensusCaller);
@@ -876,7 +876,7 @@ void Assembler::exploreMarkerGraphVertex(const vector<string>& request, ostream&
     vector< vector<uint8_t> > repeatCounts(markerCount, vector<uint8_t>(k));
     for(size_t j=0; j<markerCount; j++) {
         const MarkerId markerId = markerIds[j];
-        const CompressedMarker& marker = markers.begin()[markerId];
+        const CompressedMarker& marker = markers->begin()[markerId];
         tie(orientedReadIds[j], ordinals[j]) = findMarkerId(markerId);
 
         // Get the repeat count for this marker at each of the k positions.
@@ -1232,7 +1232,7 @@ void Assembler::exploreMarkerGraphEdge(const vector<string>& request, ostream& h
     for(size_t j=0; j!=markerCount; j++) {
         const MarkerInterval& markerInterval = markerIntervals[j];
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Get the two markers.
         const CompressedMarker& marker0 = orientedReadMarkers[markerInterval.ordinals[0]];
@@ -1697,8 +1697,8 @@ void Assembler::exploreMarkerGraphInducedAlignment(
 
      // Write the alignment matrix to a png file.
      inducedAlignment.writePngImage(
-         uint32_t(markers.size(orientedReadId0.getValue())),
-         uint32_t(markers.size(orientedReadId1.getValue())),
+         uint32_t(markers->size(orientedReadId0.getValue())),
+         uint32_t(markers->size(orientedReadId1.getValue())),
          ordinalType == "compressedOrdinals",
          "Alignment.png");
 
@@ -1814,7 +1814,7 @@ void Assembler::exploreMarkerCoverage(
         "set grid xtics mxtics ytics linestyle 1 linewidth 1 linecolor rgb '#e0e0e0'\n"
         "plot '-' with points pointtype 7 pointsize 0.5 linecolor rgb '#0000ff' notitle\n";
 
-    const uint32_t markerCount = uint32_t(markers.size(orientedReadId.getValue()));
+    const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
     if(lastOrdinal == 0) {
         lastOrdinal = markerCount - 1;
     }
@@ -1879,7 +1879,7 @@ void Assembler::followReadInMarkerGraph(
         return;
     }
     const OrientedReadId orientedReadId0(readId0, strand0);
-    const uint32_t markerCount0 = uint32_t(markers.size(orientedReadId0.getValue()));
+    const uint32_t markerCount0 = uint32_t(markers->size(orientedReadId0.getValue()));
     const uint32_t ordinal0Begin = firstOrdinal;
     const uint32_t ordinal0End = min(markerCount0, lastOrdinal + 1);
 
@@ -1929,7 +1929,7 @@ void Assembler::followReadInMarkerGraph(
         }
         DINARA_ASSERT(alignmentOrientedReadId0 == orientedReadId0);
         const OrientedReadId orientedReadId1 = alignmentOrientedReadId1;
-        const uint32_t markerCount1 = uint32_t(markers.size(orientedReadId1.getValue()));
+        const uint32_t markerCount1 = uint32_t(markers->size(orientedReadId1.getValue()));
         orientedReadIds1.push_back(orientedReadId1);
         isInReadGraph.push_back(ad.info.isInReadGraph);
 
@@ -2142,7 +2142,7 @@ void Assembler::exploreMarkerConnectivity(
     const OrientedReadId orientedReadId(readId, strand);
 
     // Check the ordinal.
-    const uint64_t markerCount = markers.size(orientedReadId.getValue());
+    const uint64_t markerCount = markers->size(orientedReadId.getValue());
     if(ordinal >= markerCount) {
         html << "<p>" << orientedReadId << " has " << markerCount << " markers.";
         return;

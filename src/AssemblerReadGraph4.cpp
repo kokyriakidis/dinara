@@ -1539,8 +1539,8 @@ void Assembler::createReadGraph4withStrandSeparation(
         const OrientedReadId orientedReadId1(readId1, isSameStrand ? 0 : 1);   // On strand 0 or 1.
 
         // Store this pair of edges in our edgeTable.
-        const uint64_t range0 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId0, 0, markers);
-        const uint64_t range1 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId1, 1, markers);
+        const uint64_t range0 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId0, 0, *markers);
+        const uint64_t range1 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId1, 1, *markers);
         const double L = double(range0 + range1)/2.;
         // const uint64_t n = thisAlignmentData.info.mismatchCountRle;
         const double errorRateRle = thisAlignmentData.info.errorRateRle;
@@ -2690,7 +2690,7 @@ void Assembler::createReadGraph4(
         DINARA_ASSERT(mode3Assembler);
         const mode3::Anchors& anchors = mode3Assembler->anchors();
         DINARA_ASSERT(anchors.journeys.isOpen());
-        DINARA_ASSERT(anchors.journeys.size() == markers.size());
+        DINARA_ASSERT(anchors.journeys.size() == markers->size());
         assemblyIsAvailable= true;
     } catch (...) {
     }
@@ -2734,8 +2734,8 @@ void Assembler::createReadGraph4(
             const OrientedReadId orientedReadId0(readId0, 0);   // On strand 0.
             const OrientedReadId orientedReadId1(readId1, isSameStrand ? 0 : 1);   // On strand 0 or 1.
 
-            const uint64_t range0 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId0, 0, markers);
-            const uint64_t range1 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId1, 1, markers);
+            const uint64_t range0 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId0, 0, *markers);
+            const uint64_t range1 = thisAlignmentData.info.baseRange(assemblerInfo->k, orientedReadId1, 1, *markers);
             const double L = double(range0 + range1)/2.;
             const uint64_t n = thisAlignmentData.info.mismatchCountRle;
             const double errorRateRle = double(n)/(2.0*L);;
@@ -2886,8 +2886,8 @@ void Assembler::flagCrossStrandReadGraphEdges4()
         const double q = p.second;
         const AlignmentData& alignment = alignmentData[readGraph.edges[edgeId].alignmentId];
         const uint64_t markerCount = alignment.info.markerCount;
-        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[0], 0, markers);
-        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[1], 1, markers);
+        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[0], 0, *markers);
+        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[1], 1, *markers);
         const double L = double(range0 + range1)/2.;
         const uint64_t n = alignment.info.mismatchCountRle;
         const double errorRateRleNew = double(n)/(2.0*L);;
@@ -3165,8 +3165,8 @@ void Assembler::flagCrossStrandReadGraphEdges5()
         // Q(n) = (1 + δ/2ε)^n * e-δL
         // ε = 1e-4, δ = 5e-4
         // Store this pair of edges in our edgeTable.
-        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, edge.orientedReadIds[0], 0, markers);
-        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, edge.orientedReadIds[1], 1, markers);
+        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, edge.orientedReadIds[0], 0, *markers);
+        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, edge.orientedReadIds[1], 1, *markers);
         const double L = double(range0 + range1)/2.;
         const uint64_t n = alignment.info.mismatchCountRle;     
 
@@ -3189,8 +3189,8 @@ void Assembler::flagCrossStrandReadGraphEdges5()
         const double logQ = p.second;
         const AlignmentData& alignment = alignmentData[readGraph.edges[edgeId].alignmentId];
         const uint64_t markerCount = alignment.info.markerCount;
-        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[0], 0, markers);
-        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[1], 1, markers);
+        const uint64_t range0 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[0], 0, *markers);
+        const uint64_t range1 = alignment.info.baseRange(assemblerInfo->k, readGraph.edges[edgeId].orientedReadIds[1], 1, *markers);
         const double L = double(range0 + range1)/2.;
         const uint64_t n = alignment.info.mismatchCountRle;
         const double errorRateRle = double(n)/(2.0*L);;

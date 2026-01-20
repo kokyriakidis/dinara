@@ -40,7 +40,7 @@ void Assembler::createReadGraph(
     bool preferAlignedFraction)
 {
     // Find the number of reads and oriented reads.
-    const ReadId orientedReadCount = uint32_t(markers.size());
+    const ReadId orientedReadCount = uint32_t(markers->size());
     DINARA_ASSERT((orientedReadCount % 2) == 0);
     const ReadId readCount = orientedReadCount / 2;
 
@@ -315,7 +315,7 @@ bool Assembler::createLocalReadGraph(
         }
 
         // Add the starting vertex.
-        graph.addVertex(start, uint32_t(markers[start.getValue()].size()),
+        graph.addVertex(start, uint32_t((*markers)[start.getValue()].size()),
                         reads->getFlags(start.getReadId()).isChimeric, 0);
 
         // Add each starting vertex to the BFS queue
@@ -380,7 +380,7 @@ bool Assembler::createLocalReadGraph(
             if (distance0 < maxDistance) {
                 if (!graph.vertexExists(orientedReadId1)) {
                     graph.addVertex(orientedReadId1,
-                                    uint32_t(markers[orientedReadId1.getValue()].size()),
+                                    uint32_t((*markers)[orientedReadId1.getValue()].size()),
                                     reads->getFlags(orientedReadId1.getReadId()).isChimeric, distance1);
                     q.push(orientedReadId1);
                 }

@@ -160,7 +160,7 @@ void Assembler::exploreReadRle(
     const auto readStoredSequence = reads->getRead(readId);
     const auto readName = reads->getReadName(readId);
     const auto metaData = reads->getReadMetaData(readId);
-    const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+    const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
     if(!beginPositionIsPresent) {
         beginPosition = 0;
     }
@@ -649,7 +649,7 @@ void Assembler::exploreReadRle(
 
 
         // Markers.
-        if(markers.isOpen() and markerGraph.vertices().isOpen()) {
+        if(markers->isOpen() and markerGraph.vertices().isOpen()) {
             for(uint32_t ordinal=0; ordinal<uint32_t(orientedReadMarkers.size()); ordinal++) {
                 const CompressedMarker& marker = orientedReadMarkers[ordinal];
                 if (marker.position < beginRlePosition || marker.position > endRlePosition-k) {
@@ -949,7 +949,7 @@ void Assembler::exploreReadRaw(
     const OrientedReadId orientedReadId(readId, strand);
     const auto readName = reads->getReadName(readId);
     const auto metaData = reads->getReadMetaData(readId);
-    const span<const CompressedMarker> orientedReadMarkers = markers[orientedReadId.getValue()];
+    const span<const CompressedMarker> orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
     // Adjust the position range, if necessary.
     if(!beginPositionIsPresent) {
@@ -1220,7 +1220,7 @@ void Assembler::exploreReadSequence(const vector<string>& request, ostream& html
     const OrientedReadId orientedReadId(readId, strand);
     const auto readName = reads->getReadName(readId);
     const auto metaData = reads->getReadMetaData(readId);
-    const span<const CompressedMarker> orientedReadMarkers = markers[orientedReadId.getValue()];
+    const span<const CompressedMarker> orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
     // Adjust the position range, if necessary.
     if(!beginPositionIsPresent) {

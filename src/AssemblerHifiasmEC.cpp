@@ -6,6 +6,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <cstring> // For memset
 #include <immintrin.h> // For AVX2
@@ -968,6 +969,7 @@ static void generate_haplotypes_sv(
 // --------------------------------------------------------
 void Assembler::performHifiasmECParity(uint64_t threadCount)
 { 
+    static std::atomic<int> debugInformativeCount{0};
     cout << timestamp << "=== Hifiasm Parity EC Pipeline (Round 1) ===" << endl;
 
     const uint64_t readCount = reads->readCount();
@@ -1032,14 +1034,8 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     }
 
                     if(candidates.empty()) continue;
-
-                    // [DEBUG] Initial Alignments
-                    if (readId == 0) {
-                        cout << "[DEBUG] Initial - Read 0,0 Alignments:" << endl;
-                        for (const auto& cand : candidates) {
-                            cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
-                        }
-                    }
+                    
+                    bool isDebugRead = false;
                     
                     // 1. SNP Detection Phase
                     detectHetSites(*this, *reads, readId, alignmentData, scratch);
@@ -1050,14 +1046,29 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     // 3. Alignment Validation
                     generate_haplotypes_naive_HiFi(*this, scratch);
 
-                    // [DEBUG] After SNV Validation
-                    if (readId == 0) {
-                        cout << "[DEBUG] SNV Phasing - Read 0,0 Keep Set:" << endl;
-                        for (const auto& cand : candidates) {
-                            if (cand.score > 0) {
-                                cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                    // Pick first 2 informative reads for debug tracking
+                    if (debugInformativeCount < 2) {
+                        bool hasSnvChain = false;
+                        for (const auto& s : scratch.snpStats) if (s.score == 1) { hasSnvChain = true; break; }
+                        if (hasSnvChain) {
+                             if (debugInformativeCount.fetch_add(1) < 2) isDebugRead = true;
+                        }
+                    }
+                    
+                    vector<size_t> filteredBySnv;
+                    if (isDebugRead) {
+                        cout << "[DEBUG] Transitions for Informative Read " << readId << ":" << endl;
+                    }
+                    
+                    if (isDebugRead) {
+                        cout << "  - Filtered by SNV Phasing (no valid chain support):" << endl;
+                        for (size_t c = 0; c < candidates.size(); ++c) {
+                            if (candidates[c].score == 0) {
+                                cout << "    * Filtered: " << candidates[c].targetId << ", Strand: " << (candidates[c].isRev ? "R" : "F") << endl;
+                                filteredBySnv.push_back(c);
                             }
                         }
+                        if (filteredBySnv.empty()) cout << "    * (None)" << endl;
                     }
 
                     compactPhasedSites(scratch);
@@ -1066,14 +1077,16 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     detectSVSites(*this, *reads, readId, alignmentData, scratch);
                     generate_haplotypes_sv(*this, scratch);
 
-                    // [DEBUG] After SV Recovery
-                    if (readId == 0) {
-                        cout << "[DEBUG] SV Recovery - Read 0,0 Keep Set:" << endl;
-                        for (const auto& cand : candidates) {
-                            if (cand.score > 0) {
-                                cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                    if (isDebugRead) {
+                        cout << "  - Recovered by SV Detection (backbone support):" << endl;
+                        bool anyRecovered = false;
+                        for (size_t c : filteredBySnv) {
+                            if (candidates[c].score > 0) {
+                                cout << "    * Recovered: " << candidates[c].targetId << ", Strand: " << (candidates[c].isRev ? "R" : "F") << endl;
+                                anyRecovered = true;
                             }
                         }
+                        if (!anyRecovered) cout << "    * (None)" << endl;
                     }
                     
                     // --- Connectivity Heuristic ---
@@ -1097,7 +1110,18 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     }
 
                     // Final Keep Decision & Flag Management
-                    if (readId == 0) cout << "[DEBUG] Final Connectivity - Read 0,0 Keep Set:" << endl;
+                    if (isDebugRead) {
+                        cout << "  - Final Filtered Set (Informative=" << (isInformativeRead?"Yes":"No") << "):" << endl;
+                        bool anyFinalDeletions = false;
+                        for (const auto& cand : candidates) {
+                            bool keep = !isInformativeRead || (cand.score > 0);
+                            if (!keep) {
+                                cout << "    * DELETED: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << endl;
+                                anyFinalDeletions = true;
+                            }
+                        }
+                        if (!anyFinalDeletions) cout << "    * (None)" << endl;
+                    }
 
                     for(size_t c = 0; c < candidates.size(); ++c) {
                         auto& cand = candidates[c];
@@ -1108,9 +1132,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         // 2. If the read IS informative, we only KEEP overlaps that don't conflict (cand.score == 1).
                         bool keep = !isInformativeRead || (cand.score > 0);
 
-                        if (readId == 0 && keep) {
-                            cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
-                        }
+                        if (keep) ad.info.isInReadGraph = 1;
 
                         // Set Directional Deletion Flags (readIds[0] <= readIds[1] invariant)
                         if (readId == ad.readIds[0]) {

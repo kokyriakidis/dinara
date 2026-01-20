@@ -80,7 +80,7 @@ void Assembler::cleanupDuplicateMarkers(
     const bool debug = false;
 
     // Check that we have what we need.
-    DINARA_ASSERT(markers.isOpen());
+    DINARA_ASSERT(markers->isOpen());
     using CompressedVertexId = MarkerGraph::CompressedVertexId;
     MemoryMapped::Vector<CompressedVertexId>& vertexTable = markerGraph.vertexTable;
     DINARA_ASSERT(vertexTable.isOpenWithWriteAccess);

@@ -1114,32 +1114,32 @@ void Assembler::writeAssemblySummaryBody(ostream& html)
         "<h3>Markers</h3>"
         "<table>"
         "<tr><td>Total number of markers on all reads, one strand"
-        "<td class=right>" << markers.totalSize()/2 <<
+        "<td class=right>" << markers->totalSize()/2 <<
         "<tr><td>Total number of markers on all reads, both strands"
-        "<td class=right>" << markers.totalSize();
+        "<td class=right>" << markers->totalSize();
 
     if(assemblerInfo->readRepresentation == 1) {
         html <<
             "<tr><td>Average number of markers per raw base"
-            "<td class=right>" << setprecision(4) << double(markers.totalSize()/2)/double(assemblerInfo->baseCount) <<
+            "<td class=right>" << setprecision(4) << double(markers->totalSize()/2)/double(assemblerInfo->baseCount) <<
             "<tr><td>Average number of markers per run-length encoded base"
-            "<td class=right>" << setprecision(4) << double(markers.totalSize()/2)/double(reads->getRepeatCountsTotalSize()) <<
+            "<td class=right>" << setprecision(4) << double(markers->totalSize()/2)/double(reads->getRepeatCountsTotalSize()) <<
             "<tr><td>Average base offset between markers in raw sequence"
-            "<td class=right>" << setprecision(4) << double(assemblerInfo->baseCount)/double(markers.totalSize()/2) <<
+            "<td class=right>" << setprecision(4) << double(assemblerInfo->baseCount)/double(markers->totalSize()/2) <<
             "<tr><td>Average base offset between markers in run-length encoded sequence"
-            "<td class=right>" << setprecision(4) << double(reads->getRepeatCountsTotalSize())/double(markers.totalSize()/2) <<
+            "<td class=right>" << setprecision(4) << double(reads->getRepeatCountsTotalSize())/double(markers->totalSize()/2) <<
             "<tr><td>Average base gap between markers in run-length encoded sequence"
             "<td class=right>" << setprecision(4) <<
-            double(reads->getRepeatCountsTotalSize())/double(markers.totalSize()/2) - double(assemblerInfo->k);
+            double(reads->getRepeatCountsTotalSize())/double(markers->totalSize()/2) - double(assemblerInfo->k);
     } else {
         html <<
             "<tr><td>Average number of markers per base"
-            "<td class=right>" << setprecision(4) << double(markers.totalSize()/2)/double(assemblerInfo->baseCount) <<
+            "<td class=right>" << setprecision(4) << double(markers->totalSize()/2)/double(assemblerInfo->baseCount) <<
             "<tr><td>Average base offset between markers "
-            "<td class=right>" << setprecision(4) << double(assemblerInfo->baseCount)/double(markers.totalSize()/2) <<
+            "<td class=right>" << setprecision(4) << double(assemblerInfo->baseCount)/double(markers->totalSize()/2) <<
             "<tr><td>Average base gap between markers"
             "<td class=right>" << setprecision(4) <<
-            double(assemblerInfo->baseCount)/double(markers.totalSize()/2) - double(assemblerInfo->k);
+            double(assemblerInfo->baseCount)/double(markers->totalSize()/2) - double(assemblerInfo->k);
     }
     html << "</table>";
 
@@ -1415,32 +1415,32 @@ void Assembler::writeAssemblySummaryJson(ostream& json)
         "  \"Markers\":\n"
         "  {\n"
         "    \"Total number of markers on all reads, one strand\": "
-        << markers.totalSize()/2 << ",\n"
+        << markers->totalSize()/2 << ",\n"
         "    \"Total number of markers on all reads, both strands\": "
-        << markers.totalSize() << ",\n";
+        << markers->totalSize() << ",\n";
 
     if(assemblerInfo->readRepresentation == 1) {
         json <<
             "    \"Average number of markers per raw base\": "
-            << setprecision(4) << double(markers.totalSize()/2)/double(assemblerInfo->baseCount) << ",\n"
+            << setprecision(4) << double(markers->totalSize()/2)/double(assemblerInfo->baseCount) << ",\n"
             "    \"Average number of markers per run-length encoded base\": "
-            << setprecision(4) << double(markers.totalSize()/2)/double(reads->getRepeatCountsTotalSize()) << ",\n"
+            << setprecision(4) << double(markers->totalSize()/2)/double(reads->getRepeatCountsTotalSize()) << ",\n"
             "    \"Average base offset between markers in raw sequence\": "
-            << setprecision(4) << double(assemblerInfo->baseCount)/double(markers.totalSize()/2) << ",\n"
+            << setprecision(4) << double(assemblerInfo->baseCount)/double(markers->totalSize()/2) << ",\n"
             "    \"Average base offset between markers in run-length encoded sequence\": "
-            << setprecision(4) << double(reads->getRepeatCountsTotalSize())/double(markers.totalSize()/2) << ",\n"
+            << setprecision(4) << double(reads->getRepeatCountsTotalSize())/double(markers->totalSize()/2) << ",\n"
             "    \"Average base gap between markers in run-length encoded sequence\": "
             << setprecision(4) <<
-            double(reads->getRepeatCountsTotalSize())/double(markers.totalSize()/2) - double(assemblerInfo->k) << "\n";
+            double(reads->getRepeatCountsTotalSize())/double(markers->totalSize()/2) - double(assemblerInfo->k) << "\n";
     } else {
         json <<
             "    \"Average number of markers per base\": "
-            << setprecision(4) << double(markers.totalSize()/2)/double(assemblerInfo->baseCount) << ",\n"
+            << setprecision(4) << double(markers->totalSize()/2)/double(assemblerInfo->baseCount) << ",\n"
             "    \"Average base offset between markers\": "
-            << setprecision(4) << double(assemblerInfo->baseCount)/double(markers.totalSize()/2) << ",\n"
+            << setprecision(4) << double(assemblerInfo->baseCount)/double(markers->totalSize()/2) << ",\n"
             "    \"Average base gap between markers\": "
             << setprecision(4) <<
-            double(assemblerInfo->baseCount)/double(markers.totalSize()/2) - double(assemblerInfo->k) << "\n";
+            double(assemblerInfo->baseCount)/double(markers->totalSize()/2) - double(assemblerInfo->k) << "\n";
 
     }
 

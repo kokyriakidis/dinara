@@ -11,7 +11,9 @@ using namespace dinara;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<KmerCounter>;
+}
 
 
 

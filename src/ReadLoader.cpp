@@ -13,7 +13,9 @@ using namespace dinara;
 #include "tuple.hpp"
 
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<ReadLoader>;
+}
 
 // Load reads from a fastq or fasta file.
 ReadLoader::ReadLoader(

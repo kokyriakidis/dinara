@@ -30,7 +30,7 @@ void Assembler::analyzeAlignments1(ReadId readId0, Strand strand0) const
     // Create an ordinal table which contains, for each ordinal
     // of orientedReadId0, aligned ordinals for each of the aligned
     // oriented reads.
-    const uint32_t markerCount0 = uint32_t(markers.size(orientedReadId0.getValue()));
+    const uint32_t markerCount0 = uint32_t(markers->size(orientedReadId0.getValue()));
     const uint32_t invalidOrdinal = std::numeric_limits<uint32_t>::max();
     vector< vector<uint32_t> > ordinalTable(
         markerCount0, vector<uint32_t>(alignments.size(), invalidOrdinal));
@@ -249,8 +249,8 @@ void Assembler::getStoredAlignments(
         // Reverse complement, if needed.
         if(alignmentOrientedReadId0.getStrand() != orientedReadId0.getStrand()) {
             alignment.reverseComplement(
-                uint32_t(markers.size(alignmentOrientedReadId0.getValue())),
-                uint32_t(markers.size(alignmentOrientedReadId1.getValue())));
+                uint32_t(markers->size(alignmentOrientedReadId0.getValue())),
+                uint32_t(markers->size(alignmentOrientedReadId1.getValue())));
             alignmentOrientedReadId0.flipStrand();
             alignmentOrientedReadId1.flipStrand();
         }
@@ -339,8 +339,8 @@ void Assembler::getStoredAlignments(
         }
         if(doReverseComplement) {
             alignment.reverseComplement(
-                uint32_t(markers.size(alignmentOrientedReadId0.getValue())),
-                uint32_t(markers.size(alignmentOrientedReadId1.getValue())));
+                uint32_t(markers->size(alignmentOrientedReadId0.getValue())),
+                uint32_t(markers->size(alignmentOrientedReadId1.getValue())));
         }
     }
 }
@@ -355,7 +355,7 @@ void Assembler::findAlignedMarkers(
     vector< pair<OrientedReadId, uint32_t> >& alignedMarkers) const
 {
     alignedMarkers.clear();
-    const uint32_t markerCount0 = uint32_t(markers.size(orientedReadId.getValue()));
+    const uint32_t markerCount0 = uint32_t(markers->size(orientedReadId.getValue()));
 
 
     // Loop over alignment involving this oriented read, as stored in the
@@ -397,7 +397,7 @@ void Assembler::findAlignedMarkers(
         }
         DINARA_ASSERT(alignmentOrientedReadId0 == orientedReadId);
         const OrientedReadId orientedReadId1 = alignmentOrientedReadId1;
-        const uint32_t markerCount1 = uint32_t(markers.size(orientedReadId1.getValue()));
+        const uint32_t markerCount1 = uint32_t(markers->size(orientedReadId1.getValue()));
 
         for(const auto& ordinals: alignment.ordinals) {
             uint32_t ordinal0 = ordinals[0];

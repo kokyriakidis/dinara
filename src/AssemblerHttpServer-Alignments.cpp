@@ -707,7 +707,7 @@ void Assembler::exploreAlignments(
         "<h1>Alignments involving oriented read "
         "<a href='exploreRead?readId=" << readId0  << "&strand=" << strand0 << "'>"
         << OrientedReadId(readId0, strand0) << "</a>"
-        << " (" << markers[orientedReadId0.getValue()].size() << " markers)"
+        << " (" << (*markers)[orientedReadId0.getValue()].size() << " markers)"
         "</h1>";
 
 
@@ -799,7 +799,7 @@ void Assembler::exploreAlignmentCoverage(
     using boost::icl::interval_map;
     interval_map<uint32_t, uint32_t> coverage;
     using boost::icl::interval;
-    const uint32_t markerCount = uint32_t(markers.size(orientedReadId0.getValue()));
+    const uint32_t markerCount = uint32_t(markers->size(orientedReadId0.getValue()));
     coverage.add(make_pair(interval<uint32_t>::right_open(0, markerCount), 1));  // EXTRA 1 TO SIMPLIFY PLOTTING
     for(const auto& p: alignments) {
         const AlignmentInfo& info = p.second;
@@ -857,7 +857,7 @@ void Assembler::displayAlignments(
 {
     const ReadId readId0 = orientedReadId0.getReadId();
     const Strand strand0 = orientedReadId0.getStrand();
-    const uint32_t markerCount0 = uint32_t(markers[orientedReadId0.getValue()].size());
+    const uint32_t markerCount0 = uint32_t((*markers)[orientedReadId0.getValue()].size());
 
 
     // Compute the maximum number of markers that orientedReadId1
@@ -961,7 +961,7 @@ void Assembler::displayAlignments(
         const AlignmentInfo& alignmentInfo = p.second;
         const ReadId readId1 = orientedReadId1.getReadId();
         const ReadId strand1 = orientedReadId1.getStrand();
-        const uint32_t markerCount1 = uint32_t(markers[orientedReadId1.getValue()].size());
+        const uint32_t markerCount1 = uint32_t((*markers)[orientedReadId1.getValue()].size());
 
         const uint32_t leftTrim0 = alignmentInfo.data[0].leftTrim();
         const uint32_t leftTrim1 = alignmentInfo.data[1].leftTrim();
@@ -1418,8 +1418,8 @@ void Assembler::exploreAlignment(
             "<th style='background-color:LavenderBlush' title='Raw position offset'>Raw<br>Offset";
 
         // Access the markers for the two oriented reads.
-        const auto markers0 = markers[orientedReadId0.getValue()];
-        const auto markers1 = markers[orientedReadId1.getValue()];
+        const auto markers0 = (*markers)[orientedReadId0.getValue()];
+        const auto markers1 = (*markers)[orientedReadId1.getValue()];
 
         // Compute the positions of each marker in the two oriented reads.
         const vector<uint32_t> rawPositions0 = reads->getRawPositions(orientedReadId0);
@@ -2236,7 +2236,7 @@ void Assembler::computeAllAlignments(
 
             // If this read has less than the required number of markers, skip.
             const OrientedReadId orientedReadId1(readId1, strand1);
-            if(markers[orientedReadId1.getValue()].size() < minMarkerCount) {
+            if((*markers)[orientedReadId1.getValue()].size() < minMarkerCount) {
                 continue;
             }
 
@@ -2846,8 +2846,8 @@ void Assembler::assessAlignments(
         // Munge the stored alignment data to look like the computed alignment data
         for (auto& a: storedAlignments){
             const auto orientedReadId1 = a.orientedReadId;
-            const auto markerCount0 = uint32_t(markers.size(orientedReadId.getValue()));
-            const auto markerCount1 = uint32_t(markers.size(orientedReadId1.getValue()));
+            const auto markerCount0 = uint32_t(markers->size(orientedReadId.getValue()));
+            const auto markerCount1 = uint32_t(markers->size(orientedReadId1.getValue()));
             const auto info = AlignmentInfo(a.alignment, markerCount0, markerCount1);
             allStoredAlignmentInfo.push_back({orientedReadId, info});
         }
@@ -3031,7 +3031,7 @@ void Assembler::computeAllAlignmentsThreadFunction(size_t threadId)
 
                 // If this read has less than the required number of markers, skip.
                 const OrientedReadId orientedReadId1(readId1, strand1);
-                if(markers[orientedReadId1.getValue()].size() < minMarkerCount) {
+                if((*markers)[orientedReadId1.getValue()].size() < minMarkerCount) {
                     continue;
                 }
 

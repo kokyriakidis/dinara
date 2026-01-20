@@ -145,10 +145,10 @@ void Assembler::createMarkerGraphEdgesStrictPass12(uint64_t, uint64_t pass)
                 const OrientedReadId::Int orientedReadIdValue = orientedReadId.getValue();
 
                 // The first MarkerId for this oriented read.
-                const MarkerId startMarkerId = markers.begin(orientedReadIdValue) - markers.begin();
+                const MarkerId startMarkerId = markers->begin(orientedReadIdValue) - markers->begin();
 
                 // Loop over markers of this oriented read.
-                const span<CompressedMarker>& orientedReadMarkers = markers[orientedReadIdValue];
+                const span<CompressedMarker>& orientedReadMarkers = (*markers)[orientedReadIdValue];
                 const uint32_t invalidOrdinal = std::numeric_limits<uint32_t>::max();
                 uint32_t ordinal0 = invalidOrdinal;
                 MarkerGraph::VertexId vertexId0 = MarkerGraph::invalidVertexId;
@@ -281,13 +281,13 @@ void Assembler::createMarkerGraphEdgesStrictPass3(size_t threadId)
                 for(const CreateMarkerGraphEdgesStrictData::MarkerIntervalInfo& markerIntervalInfo : streak) {
                     CreateMarkerGraphEdgesStrictData::MarkerIntervalInfo3 markerIntervalInfo3;
                     markerIntervalInfo3.markerInterval.orientedReadId = markerIntervalInfo.orientedReadId;
-                    const MarkerId startMarkerId = markers.begin(markerIntervalInfo.orientedReadId.getValue()) - markers.begin();
+                    const MarkerId startMarkerId = markers->begin(markerIntervalInfo.orientedReadId.getValue()) - markers->begin();
                     markerIntervalInfo3.markerInterval.ordinals[0] = markerIntervalInfo.ordinal0;
                     markerIntervalInfo3.markerInterval.ordinals[1] = markerIntervalInfo.ordinal1;
                     const MarkerId markerId0 = startMarkerId + markerIntervalInfo.ordinal0;
                     const MarkerId markerId1 = startMarkerId + markerIntervalInfo.ordinal1;
-                    const uint32_t position0 = uint32_t(markers.begin()[markerId0].position);
-                    const uint32_t position1 = uint32_t(markers.begin()[markerId1].position);
+                    const uint32_t position0 = uint32_t(markers->begin()[markerId0].position);
+                    const uint32_t position1 = uint32_t(markers->begin()[markerId1].position);
                     if(position1 <= position0 + k) {
                         // Store the overlap.
                         markerIntervalInfo3.overlap = (position0 + k) - position1;
@@ -631,7 +631,7 @@ vector< vector<uint64_t> > Assembler::clusterMarkerGraphEdgeOrientedReads(
     vector<TSequence> sequences;
     for(const MarkerInterval& markerInterval: markerIntervals) {
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Get the two markers.
         const CompressedMarker& marker0 = orientedReadMarkers[markerInterval.ordinals[0]];
@@ -970,7 +970,7 @@ void Assembler::assembleMarkerGraphEdgesMode3()
 
         // Get the position interval on the oriented read that corresponds to this
         // marker interval, including k/2 bases on each of the adjacent markers.
-        const span<const CompressedMarker> orientedReadMarkers = markers[orientedReadId.getValue()];
+        const span<const CompressedMarker> orientedReadMarkers = (*markers)[orientedReadId.getValue()];
         const uint64_t positionBegin = orientedReadMarkers[ordinal0].position + kHalf;
         const uint64_t positionEnd = orientedReadMarkers[ordinal1].position + kHalf;
 
@@ -1039,7 +1039,7 @@ bool Assembler::analyzeMarkerGraphEdgePair(
         // We found a common OrientedReadId.
         ++info.common;
         const OrientedReadId orientedReadId = itA->orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Compute the offset in markers.
         DINARA_ASSERT(itA->ordinals[1] == itA->ordinals[0] + 1);
@@ -1097,7 +1097,7 @@ bool Assembler::analyzeMarkerGraphEdgePair(
             // This oriented read only appears in edge A.
             ++onlyACheck;
             const OrientedReadId orientedReadId = itA->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(getReads().getReadRawSequenceLength(orientedReadId.getReadId()));
 
             // Get the positions of edge A in this oriented read.
@@ -1123,7 +1123,7 @@ bool Assembler::analyzeMarkerGraphEdgePair(
             // This oriented read only appears in edge B.
             ++onlyBCheck;
             const OrientedReadId orientedReadId = itB->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(getReads().getReadRawSequenceLength(orientedReadId.getReadId()));
 
             // Get the positions of edge B in this oriented read.

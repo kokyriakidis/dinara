@@ -14,7 +14,9 @@ using namespace dinara;
 #include <random>
 
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<Dset64Test>;
+}
 
 
 void dinara::dset64Test(

@@ -25,6 +25,13 @@ Assembler::Assembler(
     size_t largeDataPageSizeArgument) :
     MultithreadedObject(*this)
 {
+    markers = make_shared<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>>();
+    markerKmerIds = make_shared<MemoryMapped::VectorOfVectors<KmerId, uint64_t>>();
+    sortedMarkers = make_shared<MemoryMapped::VectorOfVectors<pair<KmerId, uint32_t>, uint64_t>>();
+    lowFrequencyMarkers = make_shared<MemoryMapped::VectorOfVectors<uint32_t, uint64_t>>();
+    align6Markers = make_shared<MemoryMapped::VectorOfVectors<Align6Marker, uint64_t>>();
+    containmentParent = make_shared<MemoryMapped::Vector<ReadId>>();
+
     largeDataFileNamePrefix = largeDataFileNamePrefixArgument;
 
     if(createNew) {
@@ -266,7 +273,7 @@ void Assembler::waitForSaveBinaryDataThreads()
 
 void Assembler::saveMarkers() const
 {
-    markers.save(saveBinaryDataDirectory + "Markers");
+    markers->save(saveBinaryDataDirectory + "Markers");
 }
 
 

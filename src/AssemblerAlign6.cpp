@@ -33,12 +33,12 @@ void Assembler::alignOrientedReads6(
     array<vector<Align6Marker>, 2> orientedReadAlign6MarkersVectors;
     array<span<Align6Marker>, 2> orientedReadAlign6MarkersSpans;
 
-    if(align6Markers.isOpen()) {
+    if(align6Markers->isOpen()) {
 
         // We precomputed the Align6Markers for all oriented reads.
         // Make the spans point to them.
         for(uint64_t i=0; i<2; i++) {
-            orientedReadAlign6MarkersSpans[i] = align6Markers[orientedReadIds[i].getValue()];
+            orientedReadAlign6MarkersSpans[i] = (*align6Markers)[orientedReadIds[i].getValue()];
         }
 
     } else {
@@ -47,7 +47,7 @@ void Assembler::alignOrientedReads6(
         // Conpute them here, storing in the two vectors,
         // and making the spans point to the vectors.
         for(uint64_t i=0; i<2; i++) {
-            const uint64_t markerCount = markers[orientedReadIds[i].getValue()].size();
+            const uint64_t markerCount = (*markers)[orientedReadIds[i].getValue()].size();
             orientedReadAlign6MarkersVectors[i].resize(markerCount);
             orientedReadAlign6MarkersSpans[i]  = span<Align6Marker>(orientedReadAlign6MarkersVectors[i].begin(), markerCount);
             getOrientedReadAlign6Markers(orientedReadIds[i], orientedReadAlign6MarkersSpans[i]);
@@ -64,7 +64,7 @@ void Assembler::computeAlign6Markers(uint64_t threadCount)
 {
     // Check that we have what we need.
     checkMarkersAreOpen();
-    const uint64_t orientedReadCount = markers.size();
+    const uint64_t orientedReadCount = markers->size();
 
     // Adjust the numbers of threads, if necessary.
     if(threadCount == 0) {
@@ -72,9 +72,9 @@ void Assembler::computeAlign6Markers(uint64_t threadCount)
     }
 
     // Make space for the Align6Markers for each oriented read.
-    align6Markers.createNew(largeDataName("tmp-Align6Markers"), largeDataPageSize);
+    align6Markers->createNew(largeDataName("tmp-Align6Markers"), largeDataPageSize);
     for(uint64_t i=0; i<orientedReadCount; i++) {
-        align6Markers.appendVector(markers[i].size());
+        align6Markers->appendVector((*markers)[i].size());
     }
 
     // Compute them.
@@ -87,7 +87,7 @@ void Assembler::computeAlign6Markers(uint64_t threadCount)
 
 void Assembler::accessAlign6Markers()
 {
-    align6Markers.accessExistingReadOnly(largeDataName("tmp-Align6Markers"));
+    align6Markers->accessExistingReadOnly(largeDataName("tmp-Align6Markers"));
 }
 
 
@@ -103,7 +103,7 @@ void Assembler::computeAlign6MarkersThreadFunction(size_t /* threadId */)
             const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(i));
 
             // Compute the Align6Markers for this oriented read.
-            getOrientedReadAlign6Markers(orientedReadId, align6Markers[i]);
+            getOrientedReadAlign6Markers(orientedReadId, (*align6Markers)[i]);
         }
     }
 }

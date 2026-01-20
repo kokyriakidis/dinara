@@ -199,7 +199,7 @@ void Assembler::createReadGraph2(
     vector<bool> keepAlignment(alignmentData.size(), false);
 
     // Find the number of reads and oriented reads.
-    const ReadId orientedReadCount = uint32_t(markers.size());
+    const ReadId orientedReadCount = uint32_t(markers->size());
     DINARA_ASSERT((orientedReadCount % 2) == 0);
     const ReadId readCount = orientedReadCount / 2;
 

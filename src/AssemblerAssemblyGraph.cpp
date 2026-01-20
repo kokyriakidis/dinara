@@ -1482,7 +1482,7 @@ void Assembler::colorGfaWithTwoReads(
         // Find marker graph edges.
         computeOrientedReadMarkerGraphPath(
             orientedReadId,
-            0, uint32_t(markers.size(orientedReadId.getValue())-1),
+            0, uint32_t(markers->size(orientedReadId.getValue())-1),
             markerGraphPath, pathOrdinals);
 
         // Find corresponding assembly graph edges.
@@ -1556,7 +1556,7 @@ void Assembler::writeOrientedReadPath(
     vector< pair<uint32_t, uint32_t> > pathOrdinals;
     computeOrientedReadMarkerGraphPath(
         orientedReadId,
-        0, uint32_t(markers.size(orientedReadId.getValue())-1),
+        0, uint32_t(markers->size(orientedReadId.getValue())-1),
         markerGraphPath, pathOrdinals);
 
 
@@ -1856,7 +1856,7 @@ void Assembler::assembleAssemblyGraphEdge(
     AssembledSegment& assembledSegment)
 {
     assembleMarkerGraphPath(
-        assemblerInfo->readRepresentation, assemblerInfo->k, *reads, markers, markerGraph, markerGraphPath,
+        assemblerInfo->readRepresentation, assemblerInfo->k, *reads, *markers, markerGraph, markerGraphPath,
         storeCoverageData, assembledSegment);
 }
 

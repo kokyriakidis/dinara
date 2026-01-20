@@ -8,7 +8,9 @@ using namespace dinara;
 
 // Expplicit instantiationn.
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<MarkerKmers>;
+}
 
 
 

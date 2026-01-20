@@ -640,13 +640,13 @@ void Assembler::computeAlignments(
 
     // Cleanup.
     if(alignOptions.alignMethod == 4) {
-        sortedMarkers.remove();
+        sortedMarkers->remove();
     }
     if(alignOptions.alignMethod == 5) {
-        lowFrequencyMarkers.remove();
+        lowFrequencyMarkers->remove();
     }
     if(alignOptions.alignMethod == 6) {
-        align6Markers.remove();
+        align6Markers->remove();
     }
 
     cout << "Found and stored " << alignmentData.size() << " good alignments." << endl;
@@ -796,8 +796,8 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                     if(i < alignmentCandidatesAlignmentsData.alignments.size()) {
                         // Use precomputed alignment.
                         alignment = alignmentCandidatesAlignmentsData.alignments[i];
-                        uint32_t mCount0 = uint32_t(markers[orientedReadIds[0].getValue()].size());
-                        uint32_t mCount1 = uint32_t(markers[orientedReadIds[1].getValue()].size());
+                        uint32_t mCount0 = uint32_t((*markers)[orientedReadIds[0].getValue()].size());
+                        uint32_t mCount1 = uint32_t((*markers)[orientedReadIds[1].getValue()].size());
                         alignmentInfo.create(alignment, mCount0, mCount1);
                         precomputedUsed = true;
                     }
@@ -970,11 +970,11 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 thisAlignmentData.te = alignment.te;
             } else {
                 // Fallback: Compute coordinates from markers (Legacy path for other aligners)
-                const auto markers0 = markers[orientedReadIds[0].getValue()];
+                const auto markers0 = (*markers)[orientedReadIds[0].getValue()];
                 uint32_t qs_marker = markers0[alignmentInfo.data[0].firstOrdinal].position;
                 uint32_t qe_marker = markers0[alignmentInfo.data[0].lastOrdinal].position + uint32_t(assemblerInfo->k);
     
-                const auto markers1 = markers[orientedReadIds[1].getValue()];
+                const auto markers1 = (*markers)[orientedReadIds[1].getValue()];
                 uint32_t ts_marker = markers1[alignmentInfo.data[1].firstOrdinal].position;
                 uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
     
@@ -1628,7 +1628,7 @@ void Assembler::flagPalindromicReadsThreadFunction(uint64_t)
 
             // Calculate Metrics
             const uint32_t alignedMarkerCount = alignmentInfo.markerCount;
-            const uint32_t totalMarkerCount = uint32_t(markers[OrientedReadId(readId, 0).getValue()].size());
+            const uint32_t totalMarkerCount = uint32_t((*markers)[OrientedReadId(readId, 0).getValue()].size());
             const double alignedFraction = alignmentInfo.alignedFraction(0);
             const uint32_t alignmentRange = alignmentInfo.range(0);
 
