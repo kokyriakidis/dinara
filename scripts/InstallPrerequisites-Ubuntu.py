@@ -527,10 +527,7 @@ def installShasta2():
         
         os.chdir("shasta2")
         
-        # Patch shasta2: Disable read following to assemble stage F only
-        # This comments out the findAndConnectAssemblyPaths call in AssemblyGraph::simplifyAndAssemble
-        print("Patching shasta2 to disable read following (stage F only)...")
-        runCommand("sed -i 's/findAndConnectAssemblyPaths(/\\/\\/ findAndConnectAssemblyPaths(/g' src/AssemblyGraph.cpp")
+
         
         # Build shasta2 library (Python Module + Static Lib)
         # The option -DBUILD_STATIC_LIBRARY=ON was added recently to shasta2.
