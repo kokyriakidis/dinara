@@ -27,23 +27,20 @@ struct CandidateEC {
 
 // Hifiasm SnpStats equivalent
 struct SnpStats {
-    uint32_t site; // Position on Query Read
-    uint32_t occ[4]; // A, C, G, T counts
-    uint32_t occ_0;
-    uint32_t occ_1; 
-    uint32_t fwd_ref_cov; // Ref Count on Strand 0 (Forward). For Strand Bias check.
+    uint32_t site;    // Position on Query Read
+    uint32_t occ_0;   // Ref support
+    uint32_t occ_1;   // Alt support
+    uint32_t fwd_ref_cov; // Ref Count on Strand 0 (Forward)
     char refBase; 
     char altBase; 
-    
-    int score; // Output of DP
+    int score;        // Output of DP
     
     SnpStats() {
-        memset(occ, 0, sizeof(occ));
-        occ_0 = occ_1 = 0;
-        overlap_num = 0;
-        refBase = 0; altBase = 0;
-        score = 0;
         site = (uint32_t)-1;
+        occ_0 = occ_1 = 0;
+        fwd_ref_cov = 0;
+        refBase = altBase = 0;
+        score = 0;
     }
 };
 
@@ -105,7 +102,6 @@ struct HifiasmECScratchPad {
     vector<uint64_t> flatAnyBits; // Other mismatches at site
     vector<uint64_t> flatHpBits;
     vector<SweepEvent> events;
-    vector<uint32_t> siteAnyCov;
     vector<uint64_t> active;
 
     // Internal helper buffers for detectSVSites
@@ -114,6 +110,8 @@ struct HifiasmECScratchPad {
     vector<uint8_t> unpackedRead;
     vector<uint8_t> covered;
     vector<uint32_t> path;
+    vector<uint64_t> supportBits;
+    vector<uint64_t> conflictBits;
 
     void clear() {
         candidates.clear();
@@ -134,13 +132,14 @@ struct HifiasmECScratchPad {
         flatAnyBits.clear();
         flatHpBits.clear();
         events.clear();
-        siteAnyCov.clear();
         active.clear();
         rawSVs.clear();
         svIndices.clear();
         unpackedRead.clear();
         covered.clear();
         path.clear();
+        supportBits.clear();
+        conflictBits.clear();
     }
 };
 
@@ -161,10 +160,6 @@ inline int base2int(char c) {
     }
 }
 
-/**
- * @brief Checks if a site is part of a homopolymer run or low-complexity region.
- * Uses the pre-unpacked sequence for maximum speed.
- */
 /**
  * @brief Checks if a site is part of a homopolymer run or low-complexity region.
  * Templated to support both raw uint8_t arrays (query) and direct read views (targets).
@@ -216,34 +211,7 @@ static bool isHomopolymerMasked(const SeqType& seq, int64_t len, uint32_t pos) {
     return false;
 }
 
-/**
- * @brief Robustness filter parity with is_hpc_vec (Correct.cpp:9383).
- * Checks if a site remains informative after removing suspected homopolymer evidence.
- */
-static bool isHpcVecMasked(SnpStats& ai, uint32_t id, const vector<HaplotypeEvidence>& hapEvidence, uint32_t s_hap_cov, uint32_t infor_cov) {
-    uint32_t n0 = ai.occ_0;
-    uint32_t n1 = ai.occ_1;
-    
-    // Find evidence for this site
-    auto it = std::lower_bound(hapEvidence.begin(), hapEvidence.end(), ai.site, [](const HaplotypeEvidence& ev, uint32_t s){
-        return ev.site < s;
-    });
 
-    while(it != hapEvidence.end() && it->site == ai.site) {
-        if(it->hp) {
-            if(it->type == 1 && it->overlapSite == id) {
-                if(n1 > 0) n1--; 
-            }
-            // Note: Dinara's hapEvidence currently only stores mismatches (Type 1).
-            // Hifiasm's is_hpc_vec also subtracts Ref-HP coverage.
-            // However, our mismatch-based occ_0 usually remains stable.
-        }
-        it++;
-    }
-    
-    if(n0 < 2 || n1 < 2 || n0 < s_hap_cov || n1 < infor_cov) return true;
-    return false;
-}
 
 /**
  * @brief Identifies potential heterozygous sites (SNPs) by aggregating alignment evidence.
@@ -432,7 +400,7 @@ static void detectHetSites(
         // Important: Hifiasm creates a separate SnpStats for EACH alternative base that passes threshold.
         for (uint8_t altBaseIdx = 0; altBaseIdx < 4; ++altBaseIdx) {
             const uint32_t misCount = misCountPerBase[altBaseIdx];
-            if (misCount <= 1) continue; // Hifiasm occ_thres = 1
+            if (misCount < 2) continue; // Initial detection threshold (DP later requires 3)
 
             // Alt Strand Bias Check (Hifiasm parity in push_info)
             uint32_t altReadsFwd = 0;
@@ -442,17 +410,24 @@ static void detectHetSites(
                     if (ovId < candidates.size() && !candidates[ovId].isRev) altReadsFwd++;
                 }
             }
+
+            // --- Hifiasm Parity: Strand Bias Filtering ---
+            // Filter Alt Allele Bias
             if (misCount > 2) { 
                 if (altReadsFwd + 2 >= misCount && altReadsFwd >= misCount * 0.95) continue;
                 if (altReadsFwd <= 2 && altReadsFwd <= misCount * 0.05) continue;
             }
+
+            // Note: Site-level Ref Bias already checked above (lines 426-430).
+            // No need for a second check here unless we have extremely high multiallelic complexity.
 
             // Emit Valid SNP Stats for this specific [Site, AltBase] pair
             SnpStats stat;
             stat.site = site;
             stat.occ_1 = misCount; 
             stat.occ_0 = refCov + 1; // +1 for query support
-            stat.fwd_ref_cov = 1; // Simplified for parity
+            uint32_t refReadsFwd = (totalReadsFwd >= totalAltReadsFwd) ? (totalReadsFwd - totalAltReadsFwd) : 0;
+            stat.fwd_ref_cov = refReadsFwd + 1; // +1 for query support (Forward by convention)
             stat.refBase = queryRead[site].character();
             stat.altBase = Base::fromInteger(altBaseIdx).character();
             
@@ -467,10 +442,6 @@ static void detectHetSites(
     }
 }
 
-/**
- * @brief Bit-parallel version of Hifiasm's is_hpc_vec.
- * Checks if a site remains informative after removing HP-suspect evidence.
- */
 /**
  * @brief Bit-parallel version of Hifiasm's is_hpc_vec.
  * Checks if a site remains informative after removing HP-suspect evidence.
@@ -544,9 +515,20 @@ inline int64_t comput_sc_rphase_strict(
         p1 |= (aI & aJ);
     }
     
-    // Parity: Must have at least one supporting read for both alleles (nn[0]>0 && nn[1]>0)
+    // Parity check: Link MUST be supported on both haplotypes
     if (!p0 || !p1) return INT64_MIN;
-    return 1; // Hifiasm unweighted DP
+
+    // Hifiasm Weighted Scoring: Sum of popcounts of Ref-Ref and Alt-Alt support.
+    // This favors links with higher overlap depth.
+    uint64_t score = 0;
+    for (size_t k = 0; k < nWords; ++k) {
+        const uint64_t rI = rowI[2*k], aI = rowI[2*k+1], oI = anyI[k];
+        const uint64_t rJ = rowJ[2*k], aJ = rowJ[2*k+1], oJ = anyJ[k];
+        const uint64_t rareRef = oI & oJ;
+        score += __builtin_popcountll((rI | rareRef) & (rJ | rareRef));
+        score += __builtin_popcountll(aI & aJ);
+    }
+    return (int64_t)score;
 }
 
 // --------------------------------------------------------
@@ -655,7 +637,7 @@ static void gen_rphase_dp(
     
     for (size_t candIdx = 0; candIdx < nCands; ++candIdx) {
         const auto& cand = candidates[candIdx];
-        const auto& view = assembler.reads->getRead(cand.targetId);
+        const auto& view = assembler.getReads().getRead(cand.targetId);
         
         // Only iterate over SNPs that this candidate actually covers
         auto itStart = std::lower_bound(uniqueSites.begin(), uniqueSites.end(), cand.qs);
@@ -737,10 +719,80 @@ static void gen_rphase_dp(
             curr = p[curr];
         }
     }
+}
 
-    // --- Phase 3: Compaction & Index Remapping ---
+// --------------------------------------------------------
+// Function: generate_haplotypes_naive_HiFi
+// --------------------------------------------------------
+/**
+ * @brief High-performance bit-parallel alignment validation.
+ * Keeps an alignment if it consistently supports exactly one haplotype
+ * across all validated DP-chain SNVs, with zero noise alleles.
+ */
+static void generate_haplotypes_naive_HiFi(
+    Assembler& /* assembler */,
+    HifiasmECScratchPad& scratch
+) {
+    const size_t nCands = scratch.candidates.size();
+    const size_t nWords = (nCands + 63) / 64;
+    const size_t nSites = scratch.snpStats.size();
+
+    // Reset scores
+    for (auto& cand : scratch.candidates) cand.score = 0;
+
+    auto& supportRef = scratch.supportBits;
+    auto& supportAlt = scratch.conflictBits;
+    auto& globalOther = scratch.active; // Reuse scratchpad buffer
+    supportRef.assign(nWords, 0);
+    supportAlt.assign(nWords, 0);
+    globalOther.assign(nWords, 0);
+
+    // Phase 1: Global support/conflict aggregation (O(ValidatedSites * Words))
+    for (size_t i = 0; i < nSites; ++i) {
+        if (scratch.snpStats[i].score != 1) continue;
+        
+        const uint64_t* row = &scratch.flatBits[i * 2 * nWords];
+        const uint64_t* rowAny = &scratch.flatAnyBits[i * nWords];
+        
+        for (size_t w = 0; w < nWords; ++w) {
+            supportRef[w] |= row[2 * w];
+            supportAlt[w] |= row[2 * w + 1];
+            globalOther[w] |= rowAny[w];
+        }
+    }
+
+    // Phase 2: Alignment-level keep decision (O(Candidates))
+    for (size_t c = 0; c < nCands; ++c) {
+        size_t w = c >> 6;
+        uint64_t mask = (1ULL << (c & 63));
+        bool supportsRef = supportRef[w] & mask;
+        bool supportsAlt = supportAlt[w] & mask;
+        bool hasOther = globalOther[w] & mask;
+
+        // --- Hifiasm Parity Filter ---
+        // An alignment is KEPT if it does not contradict the phased haplotypes.
+        // Contradictions are:
+        // 1. Bridges both haplotypes: (supportsRef AND supportsAlt)
+        // 2. Contains noise/third alleles at validated sites: (hasOther)
+        
+        bool isConflict = (supportsRef && supportsAlt) || hasOther;
+        
+        if (!isConflict) {
+            scratch.candidates[c].score = 1;
+        }
+    }
+}
+
+/**
+ * @brief Finalizes the SNV set and evidence mappings after validation.
+ */
+static void compactPhasedSites(HifiasmECScratchPad& scratch) {
+    auto& snpStats = scratch.snpStats;
+    auto& hapEvidence = scratch.hapEvidence;
+    const size_t nSites = snpStats.size();
     auto& indexMap = scratch.indexMap;
     indexMap.assign(nSites, -1);
+    
     size_t writeIdx = 0;
     for (size_t i = 0; i < nSites; ++i) {
         if (snpStats[i].score == 1) {
@@ -754,37 +806,9 @@ static void gen_rphase_dp(
     for (auto& ev : hapEvidence) {
         if (ev.overlapSite < nSites) {
             int newIdx = indexMap[ev.overlapSite];
-            ev.overlapSite = (newIdx >= 0) ? (uint32_t)newIdx : invalid<uint32_t>();
+            ev.overlapSite = (newIdx >= 0) ? (uint32_t)newIdx : invalid<uint32_t>;
         } else {
-            ev.overlapSite = invalid<uint32_t>();
-        }
-    }
-}
-
-// --------------------------------------------------------
-// Function: generate_haplotypes_naive_HiFi
-// --------------------------------------------------------
-static void generate_haplotypes_naive_HiFi(
-    Assembler& assembler,
-    HifiasmECScratchPad& scratch
-) {
-    auto& snpStats = scratch.snpStats;
-    auto& hapEvidence = scratch.hapEvidence;
-    auto& candidates = scratch.candidates;
-
-    if (snpStats.empty()) return;
-
-    // Reset scores for all candidates
-    for (auto& cand : candidates) cand.score = 0;
-
-    // Mark candidates that support any validated SNP in the DP chain.
-    for (const auto& ev : hapEvidence) {
-        if (ev.overlapSite < snpStats.size()) {
-            const auto& s = snpStats[ev.overlapSite];
-            // If the SNP at this evidence was validated by DP.
-            if (s.score == 1 && ev.overlapID < candidates.size()) {
-                candidates[ev.overlapID].score = 1; 
-            }
+            ev.overlapSite = invalid<uint32_t>;
         }
     }
 }
@@ -805,8 +829,15 @@ static void detectSVSites(
     auto& svStats = scratch.svStats;
     auto& rawSVs = scratch.rawSVs;
     rawSVs.clear();
+    svEvidence.clear();
+    svStats.clear();
 
-    for(size_t k=0; k<candidates.size(); k++) {
+    const int32_t SV_MIN_LEN = 20;     // Hifiasm standard for SV-based recovery
+    const int32_t SV_WINDOW = 50;      // Window for clustering nearby indels
+    const double SV_SIZE_RATIO = 0.20; // 20% size variation allowed in a cluster
+
+    // --- Phase 1: SV Collection ---
+    for(size_t k = 0; k < candidates.size(); ++k) {
         const auto& cand = candidates[k];
         const auto& ad = alignmentData[cand.alignmentId];
         size_t evidenceId = ad.info.alignmentId;
@@ -814,22 +845,22 @@ static void detectSVSites(
         if(evidenceId == invalid<size_t>) continue;
 
         span<const IndelEvidence> indels;
-        
         if(ad.readIds[1] == queryReadId) {
             indels = assembler.alignedEvidenceStore.getIndels0(evidenceId);
         } else if(ad.readIds[0] == queryReadId) {
             indels = assembler.alignedEvidenceStore.getIndels1(evidenceId);
-        } else {
-            continue;
-        }
+        } else continue;
 
         for(const auto& ev : indels) {
-            if(ev.type() == 0 && ev.len() >= 16) {
+            const uint32_t len = ev.len();
+            if(len >= (uint32_t)SV_MIN_LEN) {
+                // Determine position on query read
                 if(ev.pos() >= cand.qs && ev.pos() < cand.qe) {
                      RawSV sv;
                      sv.overlapID = (uint32_t)k;
-                     sv.site = ev.pos() + (ev.len() / 2);
-                     sv.size = -(int64_t)ev.len(); 
+                     sv.site = ev.pos();
+                     // Use sign to distinguish Ins (+) from Del (-)
+                     sv.size = ev.isInsertion() ? (int64_t)len : -(int64_t)len;
                      rawSVs.push_back(sv);
                 }
             }
@@ -838,48 +869,75 @@ static void detectSVSites(
     
     if(rawSVs.empty()) return;
     
+    // Sort by site for windowed clustering
     std::sort(rawSVs.begin(), rawSVs.end(), [](const RawSV& a, const RawSV& b){
         return a.site < b.site;
     });
     
-    for(size_t i=0; i<rawSVs.size(); ) {
-        uint32_t site = rawSVs[i].site;
+    // --- Phase 2: Windowed Clustering & Frequency Validation ---
+    for(size_t i = 0; i < rawSVs.size(); ) {
+        uint32_t startPos = rawSVs[i].site;
         int64_t refSize = rawSVs[i].size; 
         
-        uint32_t endWin = site + 50;
-        auto& indices = scratch.svIndices;
-        indices.clear();
-        while(i < rawSVs.size() && rawSVs[i].site < endWin) {
-            indices.push_back(i);
-            i++;
+        size_t j = i;
+        int supportCount = 0;
+        
+        // Peek ahead to find support within window and size ratio
+        while(j < rawSVs.size() && rawSVs[j].site < startPos + SV_WINDOW) {
+            int64_t sz = rawSVs[j].size;
+            // Check if same type (sign) and similar size
+            if ((sz > 0) == (refSize > 0)) {
+                int64_t diff = std::abs(sz - refSize);
+                if (diff <= std::abs(refSize) * SV_SIZE_RATIO) {
+                    supportCount++;
+                }
+            }
+            j++;
         }
         
-        int validCount = 0;
-        for(size_t idx : indices) {
-             if(std::abs((double)(rawSVs[idx].size - refSize)) < std::abs((double)refSize)*0.25) { 
-                 validCount++;
-             }
-        }
-        
-        if(validCount >= 3) {
-            SnpStats stat;
-            stat.site = site;
-            stat.occ_1 = validCount;
-            stat.occ_0 = (uint32_t)(candidates.size() - validCount);
-            stat.score = -1;
+        // Hifiasm Parity: Recover alignment if SV has >= 3 supporting reads and strand balance
+        if(supportCount >= 3) {
+            // Check Strand Bias for SV (Parity with ha_ec_st_bs for SVs)
+            int svFwdCount = 0;
+            for(size_t k = i; k < j; ++k) {
+                int64_t sz = rawSVs[k].size;
+                if ((sz > 0) == (refSize > 0) && std::abs(sz - refSize) <= std::abs(refSize) * SV_SIZE_RATIO) {
+                    if (!candidates[rawSVs[k].overlapID].isRev) svFwdCount++;
+                }
+            }
             
-            for(size_t idx : indices) {
-                int64_t sz = rawSVs[idx].size;
-                 if(std::abs((double)(sz - refSize)) < std::abs((double)refSize)*0.25) { 
-                     HaplotypeEvidence ev;
-                     ev.overlapID = rawSVs[idx].overlapID;
-                     ev.site = site;
-                     ev.type = 2; // SV
-                     ev.overlapSite = (uint32_t)svStats.size();
-                     svEvidence.push_back(ev); 
-                 }
+            // Refined bias thresholds matching ha_ec_st_bs
+            if (supportCount > 5) {
+                if (svFwdCount < 1 || svFwdCount >= supportCount) { // High confidence mode
+                     if (svFwdCount < supportCount * 0.05 || svFwdCount > supportCount * 0.95) {
+                         i++; continue; 
+                     }
+                }
+            } else if (svFwdCount == 0 || svFwdCount == supportCount) {
+                 // Low coverage SVs MUST be seen on both strands
+                 i++; continue;
+            }
+
+            SnpStats stat;
+            stat.site = startPos;
+            stat.score = 1; // Mark as "Validated SV"
+            
+            // Re-scan to populate evidence for this specific validated SV cluster
+            for(size_t k = i; k < j; ++k) {
+                int64_t sz = rawSVs[k].size;
+                if ((sz > 0) == (refSize > 0) && std::abs(sz - refSize) <= std::abs(refSize) * SV_SIZE_RATIO) {
+                    HaplotypeEvidence ev;
+                    ev.overlapID = rawSVs[k].overlapID;
+                    ev.site = startPos;
+                    ev.type = 2; // Type SV
+                    ev.overlapSite = (uint32_t)svStats.size();
+                    svEvidence.push_back(ev);
+                }
             }
             svStats.push_back(stat);
+            i = j; // Move to next cluster
+        } else {
+            i++; // Move to next potential seed
         }
     }
 }
@@ -888,12 +946,14 @@ static void detectSVSites(
 // Function: generate_haplotypes_sv
 // --------------------------------------------------------
 static void generate_haplotypes_sv(
-    Assembler& assembler,
+    Assembler& /* assembler */,
     HifiasmECScratchPad& scratch
 ) {
     auto& svEvidence = scratch.svEvidence;
     auto& candidates = scratch.candidates;
-    if(svEvidence.empty()) return;
+    
+    // Simple recovery: If a read supports a validated, frequent SV, we keep it.
+    // This acts as a fallback for reads where SNV phasing was too sparse or fragmented.
     for(const auto& ev : svEvidence) {
         if(ev.overlapID < candidates.size()) {
             candidates[ev.overlapID].score = 1; 
@@ -972,56 +1032,108 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     }
 
                     if(candidates.empty()) continue;
+
+                    // [DEBUG] Initial Alignments
+                    if (readId == 0) {
+                        cout << "[DEBUG] Initial - Read 0,0 Alignments:" << endl;
+                        for (const auto& cand : candidates) {
+                            cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                        }
+                    }
                     
                     // 1. SNP Detection Phase
-                    // Collect all mismatches from aligned reads and filter them 
-                    // based on coverage, strand bias, and homopolymer proximity.
                     detectHetSites(*this, *reads, readId, alignmentData, scratch);
                     
                     // 2. Phasing Phase (DP)
-                    // Use Dynamic Programming to find the longest consistent chain of SNPs.
-                    // This separates heterozygous sites from sequencing errors.
                     gen_rphase_dp(*this, scratch);
                     
                     // 3. Alignment Validation
-                    // Reads that support the validated SNV chain are marked as 'Keep'.
                     generate_haplotypes_naive_HiFi(*this, scratch);
 
+                    // [DEBUG] After SNV Validation
+                    if (readId == 0) {
+                        cout << "[DEBUG] SNV Phasing - Read 0,0 Keep Set:" << endl;
+                        for (const auto& cand : candidates) {
+                            if (cand.score > 0) {
+                                cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                            }
+                        }
+                    }
+
+                    compactPhasedSites(scratch);
+
                     // 4. Structural Variant (SV) Phase
-                    // Perform a secondary check for large Indels (SVs) to recover links
-                    // that SNV-based phasing might miss.
                     detectSVSites(*this, *reads, readId, alignmentData, scratch);
                     generate_haplotypes_sv(*this, scratch);
+
+                    // [DEBUG] After SV Recovery
+                    if (readId == 0) {
+                        cout << "[DEBUG] SV Recovery - Read 0,0 Keep Set:" << endl;
+                        for (const auto& cand : candidates) {
+                            if (cand.score > 0) {
+                                cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                            }
+                        }
+                    }
                     
-                    // Final Keep Decision
-                    // If an alignment supports either an SNV chain or an SV chain, it is retained.
-                    if(!candidates.empty()) {
-                         for(const auto& cand : candidates) {
-                              if (cand.score > 0) {
-                                   keepAlignment[cand.alignmentId] = 1;
-                              }
+                    // --- Connectivity Heuristic ---
+                    // A read is "informative" if it has at least one SNV or SV 
+                    // that survived filtering and was validated (score == 1).
+                    // compactPhasedSites already pruned snpStats to score == 1 only.
+                    const bool isInformativeRead = !scratch.snpStats.empty() || !scratch.svStats.empty();
+
+                    // Pre-calculate which candidates cover at least one informative site
+                    // using a local bitset for O(N_Evidence) instead of O(N_Cands * N_Evidence).
+                    vector<uint8_t> candCoversInfo(candidates.size(), 0);
+                    for (const auto& ev : scratch.hapEvidence) {
+                        if (ev.overlapSite != invalid<uint32_t> && ev.overlapID < candidates.size()) {
+                            candCoversInfo[ev.overlapID] = 1;
+                        }
+                    }
+                    for (const auto& ev : scratch.svEvidence) {
+                         if (ev.overlapID < candidates.size()) {
+                             candCoversInfo[ev.overlapID] = 1;
                          }
+                    }
+
+                    // Final Keep Decision & Flag Management
+                    if (readId == 0) cout << "[DEBUG] Final Connectivity - Read 0,0 Keep Set:" << endl;
+
+                    for(size_t c = 0; c < candidates.size(); ++c) {
+                        auto& cand = candidates[c];
+                        auto& ad = alignmentData[cand.alignmentId];
+                        
+                        // Decision Logic:
+                        // 1. If the read is NOT informative (homozygous/repetitive), we KEEP all overlaps.
+                        // 2. If the read IS informative, we only KEEP overlaps that don't conflict (cand.score == 1).
+                        bool keep = !isInformativeRead || (cand.score > 0);
+
+                        if (readId == 0 && keep) {
+                            cout << "  - Target: " << cand.targetId << ", Strand: " << (cand.isRev ? "R" : "F") << " (AlignId: " << cand.alignmentId << ")" << endl;
+                        }
+
+                        // Set Directional Deletion Flags (readIds[0] <= readIds[1] invariant)
+                        if (readId == ad.readIds[0]) {
+                            ad.isDeleted0 = !keep;
+                        } else {
+                            ad.isDeleted1 = !keep;
+                        }
+
+                        // Set Assembly Flags (shared across threads, logical OR)
+                        if (keep) ad.info.isInReadGraph = 1;
+                        if (candCoversInfo[c]) ad.coversHetSite = true;
                     }
                 }
         });
     }
 
+
     for(auto& t : threads) t.join();
 
-    // Prune Alignment Data
-    uint64_t deletedCount = 0;
-    for(size_t i=0; i<alignmentData.size(); i++) {
-        if(!keepAlignment[i]) {
-            if(!alignmentData[i].isDeleted()) {
-                 alignmentData[i].setDeleted(true);
-                 deletedCount++;
-            }
-        }
-    }
-    cout << timestamp << "Parity EC Round 1 Complete. Deleted: " << deletedCount << endl;
+    cout << timestamp << "Parity EC Round 1 Complete." << endl;
 }
 
-void Assembler::performHifiasmECFinalFilteringParity(uint64_t threadCount)
+void Assembler::performHifiasmECFinalFilteringParity(uint64_t /* threadCount */)
 {
     cout << timestamp << "=== Hifiasm Parity EC Final Filtering (ha_ec_ff) ===" << endl;
 }

@@ -583,11 +583,11 @@ void dinara::main::assemble(
     // Filter Best Hit Alignments (Hifiasm Parity)
     assembler.filterBestHitAlignments(threadCount);
 
-    // // =========================================================================
-    // // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
-    // // =========================================================================
-    // // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
-    // assembler.performHifiasmECParity(threadCount);
+    // =========================================================================
+    // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
+    // =========================================================================
+    // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
+    assembler.performHifiasmECParity(threadCount);
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // //   ma_hit_sub          -> filterLocalSegments
     // //   detect_chimeric_reads -> detectChimericReads  
