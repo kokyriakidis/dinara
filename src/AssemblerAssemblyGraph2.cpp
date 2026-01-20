@@ -35,7 +35,7 @@ void Assembler::createAssemblyGraph2(
         assemblerInfo->k,
         getReads().getFlags(),
         getReads(),
-        markers,
+        *markers,
         markerGraph,
         pruneLength,
         mode2Options,

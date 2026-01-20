@@ -479,7 +479,7 @@ private:
 
     // The markers on all oriented reads. Indexed by OrientedReadId::getValue().
 public:
-    MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t> markers;
+    shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> markers;
 private:
     void checkMarkersAreOpen() const;
 
@@ -514,7 +514,7 @@ public:
 
     // KmerIds for all markers. Indexed by OrientedReadId::getValue().
     // Only stored during alignment computation, and then freed.
-    MemoryMapped::VectorOfVectors<KmerId, uint64_t> markerKmerIds;
+    shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> markerKmerIds;
     void computeMarkerKmerIds(uint64_t threadCount);
     void cleanupMarkerKmerIds();
 private:
@@ -525,7 +525,7 @@ private:
     // Indexed by orientedReadId.getValue().
     // Used by alignment method 4.
 public:
-    MemoryMapped::VectorOfVectors< pair<KmerId, uint32_t>, uint64_t> sortedMarkers;
+    shared_ptr<MemoryMapped::VectorOfVectors< pair<KmerId, uint32_t>, uint64_t>> sortedMarkers;
     void computeSortedMarkers(uint64_t threadCount);
     bool accessSortedMarkers();
 private:
@@ -541,7 +541,7 @@ private:
     // Used by alignment method 5. It is only stored durign alignment
     // computation.
 public:
-    MemoryMapped::VectorOfVectors<uint32_t, uint64_t> lowFrequencyMarkers;
+    shared_ptr<MemoryMapped::VectorOfVectors<uint32_t, uint64_t>> lowFrequencyMarkers;
     void computeLowFrequencyMarkers(uint64_t maxMarkerFrequency, uint64_t threadCount);
     void computeLowFrequencyMarkers(
         const span<const KmerId>&,  // The marker k-mers for the oriented reads (sorted by ordinal)
@@ -563,7 +563,7 @@ private:
     // Indexed by orientedReadId.getValue().
     // Used by alignment method 6.
 public:
-    MemoryMapped::VectorOfVectors<Align6Marker, uint64_t> align6Markers;
+    shared_ptr<MemoryMapped::VectorOfVectors<Align6Marker, uint64_t>> align6Markers;
     void computeAlign6Markers(uint64_t threadCount);
     void accessAlign6Markers();
 private:
@@ -744,7 +744,7 @@ private:
     
     // Mapping from contained read to its container (parent).
     // Initialized to invalidReadId.
-    MemoryMapped::Vector<ReadId> containmentParent;
+    shared_ptr<MemoryMapped::Vector<ReadId>> containmentParent;
 
 
     // Check if an alignment between two reads should be suppressed,
@@ -2008,8 +2008,8 @@ private:
     public:
         uint64_t minFreq;
         uint64_t maxFreq;
-        MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t> oldMarkers;
-        MemoryMapped::VectorOfVectors<KmerId, uint64_t> oldMarkerKmerIds;
+        shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> oldMarkers;
+        shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> oldMarkerKmerIds;
     };
     ApplyKmerCountFilterData applyKmerCountFilterData;
 

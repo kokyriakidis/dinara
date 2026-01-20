@@ -120,8 +120,8 @@ void Assembler::computeInducedAlignments(
 
 
     // Main loop over markers in orientedReadId0.
-    const MarkerId firstMarkerId = markers.begin(orientedReadId0.getValue()) - markers.begin();
-    const uint32_t markerCount = uint32_t(markers.size(orientedReadId0.getValue()));
+    const MarkerId firstMarkerId = markers->begin(orientedReadId0.getValue()) - markers->begin();
+    const uint32_t markerCount = uint32_t(markers->size(orientedReadId0.getValue()));
     for(uint32_t ordinal0=0; ordinal0<markerCount; ordinal0++) {
         const MarkerId markerId0 = firstMarkerId + ordinal0;
 
@@ -203,8 +203,8 @@ void Assembler::fillCompressedOrdinals(
     for(uint64_t i=0; i<2; i++) {
         const OrientedReadId orientedReadId = orientedReadIds[i];
 
-        const MarkerId firstMarkerId = markers.begin(orientedReadId.getValue()) - markers.begin();
-        const uint32_t markerCount = uint32_t(markers.size(orientedReadId.getValue()));
+        const MarkerId firstMarkerId = markers->begin(orientedReadId.getValue()) - markers->begin();
+        const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
         ordinalTable[i].resize(markerCount);
 
         uint32_t compressedOrdinal = 0;

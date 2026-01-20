@@ -128,15 +128,15 @@ void Assembler::alignOrientedReads4(
     // Get the marker KmerIds for the two oriented reads.
     array<span<KmerId>, 2> orientedReadKmerIds;
     array<vector<KmerId>, 2> orientedReadKmerIdsVectors;
-    if(markerKmerIds.isOpen()) {
-        orientedReadKmerIds[0] = markerKmerIds[orientedReadId0.getValue()];
-        orientedReadKmerIds[1] = markerKmerIds[orientedReadId1.getValue()];
+    if(markerKmerIds->isOpen()) {
+        orientedReadKmerIds[0] = (*markerKmerIds)[orientedReadId0.getValue()];
+        orientedReadKmerIds[1] = (*markerKmerIds)[orientedReadId1.getValue()];
     } else {
         // This is slower and will happen if markerKmerIds is not available.
         // Resize the vectors and make the spans point to the vectors.
         // Then call getOrientedReadMarkerKmerIds to fill them in.
-        orientedReadKmerIdsVectors[0].resize(markers.size(orientedReadId0.getValue()));
-        orientedReadKmerIdsVectors[1].resize(markers.size(orientedReadId1.getValue()));
+        orientedReadKmerIdsVectors[0].resize(markers->size(orientedReadId0.getValue()));
+        orientedReadKmerIdsVectors[1].resize(markers->size(orientedReadId1.getValue()));
         orientedReadKmerIds[0] = span<KmerId>(orientedReadKmerIdsVectors[0]);
         orientedReadKmerIds[1] = span<KmerId>(orientedReadKmerIdsVectors[1]);
         getOrientedReadMarkerKmerIds(orientedReadId0, orientedReadKmerIds[0]);
@@ -149,14 +149,14 @@ void Assembler::alignOrientedReads4(
     // Use the ones from sortedMarkers if available, or else compute them.
     array<span< pair<KmerId, uint32_t> >, 2> orientedReadSortedMarkersSpans;
     array<vector< pair<KmerId, uint32_t> >, 2> orientedReadSortedMarkers;
-    if(sortedMarkers.isOpen()) {
+    if(sortedMarkers->isOpen()) {
 
         // Make the spans point to the stored sorted markers.
         if(debug) {
             cout << "Using stored sorted markers." << endl;
         }
-        orientedReadSortedMarkersSpans[0] = sortedMarkers[orientedReadId0.getValue()];
-        orientedReadSortedMarkersSpans[1] = sortedMarkers[orientedReadId1.getValue()];
+        orientedReadSortedMarkersSpans[0] = (*sortedMarkers)[orientedReadId0.getValue()];
+        orientedReadSortedMarkersSpans[1] = (*sortedMarkers)[orientedReadId1.getValue()];
 
     } else {
 
@@ -202,9 +202,9 @@ void Assembler::computeSortedMarkers(uint64_t threadCount)
 {
     // Check that we have what we need.
     checkMarkersAreOpen();
-    const uint64_t orientedReadCount = markers.size();
-    DINARA_ASSERT(markerKmerIds.isOpen());
-    DINARA_ASSERT(markerKmerIds.size() == orientedReadCount);
+    const uint64_t orientedReadCount = markers->size();
+    DINARA_ASSERT(markerKmerIds->isOpen());
+    DINARA_ASSERT(markerKmerIds->size() == orientedReadCount);
 
     // Adjust the numbers of threads, if necessary.
     if(threadCount == 0) {
@@ -212,9 +212,9 @@ void Assembler::computeSortedMarkers(uint64_t threadCount)
     }
 
     // Do it.
-    sortedMarkers.createNew(largeDataName("SortedMarkers"), largeDataPageSize);
+    sortedMarkers->createNew(largeDataName("SortedMarkers"), largeDataPageSize);
     for(uint64_t i=0; i<orientedReadCount; i++) {
-        sortedMarkers.appendVector(markers[i].size());
+        sortedMarkers->appendVector((*markers)[i].size());
     }
     const uint64_t batchSize = 100;
     setupLoadBalancing(orientedReadCount, batchSize);
@@ -233,9 +233,9 @@ void Assembler::computeSortedMarkersThreadFunction(uint64_t)
         for(uint64_t i=begin; i!=end; i++) {
 
             // Access the marker KmerIs and sorted markers for this oriented read.
-            const auto kmerIds = markerKmerIds[i];
+            const auto kmerIds = (*markerKmerIds)[i];
             const uint64_t markerCount = kmerIds.size();
-            const span< pair<KmerId, uint32_t> > sm = sortedMarkers[i];
+            const span< pair<KmerId, uint32_t> > sm = (*sortedMarkers)[i];
             DINARA_ASSERT(sm.size() == markerCount);
 
             // Copy the KmerId's and ordinals.
@@ -267,7 +267,7 @@ void Assembler::computeSortedMarkersThreadFunction1(size_t threadId)
             // Set the number of sorted markers for this oriented read.
             // There is no need to use the multithreaded version
             // as only one thread works on each oriented read.
-            sortedMarkers.incrementCount(i, markers.size(i));
+            sortedMarkers->incrementCount(i, markers->size(i));
         };
     }
 }
@@ -284,8 +284,8 @@ void Assembler::computeSortedMarkersThreadFunction2(size_t threadId)
         for(uint64_t i=begin; i!=end; i++) {
 
             // Access the markers and sorted markers for this oriented read.
-            const span<CompressedMarker> m = markers[i];
-            const span< pair<KmerId, uint32_t> > sm = sortedMarkers[i];
+            const span<CompressedMarker> m = (*markers)[i];
+            const span< pair<KmerId, uint32_t> > sm = (*sortedMarkers)[i];
             const uint64_t markerCount = m.size();
             DINARA_ASSERT(sm.size() == markerCount);
 
@@ -309,7 +309,7 @@ void Assembler::computeSortedMarkersThreadFunction2(size_t threadId)
 bool Assembler::accessSortedMarkers()
 {
     try {
-        sortedMarkers.accessExistingReadOnly(largeDataName("SortedMarkers"));
+        sortedMarkers->accessExistingReadOnly(largeDataName("SortedMarkers"));
         return true;
     } catch(exception&) {
         return false;

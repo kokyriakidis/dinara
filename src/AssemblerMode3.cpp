@@ -75,7 +75,7 @@ void Assembler::mode3Assembly(
 
     mode3Assembler = make_shared<Mode3Assembler>(
         mappedMemoryOwner,
-        assemblerInfo->k, getReads(), markers,
+        assemblerInfo->k, getReads(), *markers,
         anchorsPointer, threadCount, options, debug);
 }
 
@@ -92,21 +92,21 @@ void Assembler::mode3Reassembly(
 
     // Create the Anchors from binary data.
     shared_ptr<mode3::Anchors> anchorsPointer =
-        make_shared<mode3::Anchors>(mappedMemoryOwner, getReads(), assemblerInfo->k, markers);
+        make_shared<mode3::Anchors>(mappedMemoryOwner, getReads(), assemblerInfo->k, *markers);
 
     // Run the Mode 3 assembly.
     mode3Assembler = make_shared<Mode3Assembler>(
         mappedMemoryOwner,
-        assemblerInfo->k, getReads(), markers,
+        assemblerInfo->k, getReads(), *markers,
         anchorsPointer, threadCount, options, debug);
 }
 
 void Assembler::accessMode3Assembler()
 {
     shared_ptr<mode3::Anchors> anchorsPointer =
-        make_shared<mode3::Anchors>(MappedMemoryOwner(*this), getReads(), assemblerInfo->k, markers);
+        make_shared<mode3::Anchors>(MappedMemoryOwner(*this), getReads(), assemblerInfo->k, *markers);
     mode3Assembler = make_shared<Mode3Assembler>(*this,
-        assemblerInfo->k, getReads(), markers,
+        assemblerInfo->k, getReads(), *markers,
         anchorsPointer, httpServerData.assemblerOptions->assemblyOptions.mode3Options);
 }
 
@@ -281,7 +281,7 @@ void Assembler::fillMode3AssemblyPathStep(const vector<string>& request, ostream
 
     // Local assembly for this assembly step.
     mode3::LocalAssembly localAssembly(
-        assemblerInfo->k, getReads(), markers, mode3Assembler->anchors(),
+        assemblerInfo->k, getReads(), *markers, mode3Assembler->anchors(),
         edgeIdA, edgeIdB, minVertexCoverage,
         options,
         httpServerData.assemblerOptions->assemblyOptions.mode3Options.localAssemblyOptions,
@@ -442,7 +442,7 @@ void Assembler::createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId)
             }
 
             // If this vertex has duplicate ReadIds, no primary edge can begin here.
-            if(markerGraph.vertexHasDuplicateReadIds(vertexId0, markers)) {
+            if(markerGraph.vertexHasDuplicateReadIds(vertexId0, *markers)) {
                 continue;
             }
 
@@ -454,7 +454,7 @@ void Assembler::createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId)
 
                 // Find the next marker graph vertex visited by this OrientedReadId.
                 const uint32_t ordinal1 = ordinal0 + 1;
-                const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+                const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
                 if(ordinal1 == orientedReadMarkers.size()) {
                     // There is no next vertex.
                     continue;
@@ -470,8 +470,8 @@ void Assembler::createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId)
                 }
 
                 // Get the sequence between these two markers.
-                const uint32_t position0 = uint32_t(markers.begin()[markerId0].position) + kHalf;
-                const uint32_t position1 = uint32_t(markers.begin()[markerId1].position) + kHalf;
+                const uint32_t position0 = uint32_t(markers->begin()[markerId0].position) + kHalf;
+                const uint32_t position1 = uint32_t(markers->begin()[markerId1].position) + kHalf;
                 sequence.clear();
                 for(uint32_t position=position0; position<position1; position++) {
                     const Base base = reads.getOrientedReadBase(orientedReadId, position);
@@ -509,7 +509,7 @@ void Assembler::createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId)
                 if(info.markerIntervals.size() > maxPrimaryCoverage) {
                     continue;
                 }
-                if(markerGraph.vertexHasDuplicateReadIds(info.vertexId1, markers)) {
+                if(markerGraph.vertexHasDuplicateReadIds(info.vertexId1, *markers)) {
                     continue;
                 }
 
@@ -611,7 +611,7 @@ void Assembler::alignmentFreeAssembly(
                 MappedMemoryOwner(*this),
                 getReads(),
                 assemblerInfo->k,
-                markers,
+                *markers,
                 markerKmers,
                 mode3Options.minAnchorCoverage,
                 mode3Options.maxAnchorCoverage,
@@ -622,7 +622,7 @@ void Assembler::alignmentFreeAssembly(
                 MappedMemoryOwner(*this),
                 getReads(),
                 assemblerInfo->k,
-                markers,
+                *markers,
                 anchorFileAbsolutePaths,
                 mode3Options.minAnchorCoverage,
                 mode3Options.maxAnchorCoverage,

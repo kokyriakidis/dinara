@@ -11,7 +11,9 @@ using namespace dinara;
 #include <numeric>
 
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<LowHash0>;
+}
 
 
 // Class LowHash0 uses the LowHash0 algorithm to find candidate pairs

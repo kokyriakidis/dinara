@@ -25,7 +25,7 @@ void Assembler::findAlignmentCandidatesLowHash0(
     // Note: kmerChecker is not required here - we only use markerKmerIds,
     // which can be computed without kmerChecker (e.g., when using SIMD minimizers).
     checkMarkersAreOpen();
-    const ReadId readCount = ReadId(markers.size() / 2);
+    const ReadId readCount = ReadId(markers->size() / 2);
     DINARA_ASSERT(readCount > 0);
 
     // Create the alignment candidates.
@@ -44,7 +44,7 @@ void Assembler::findAlignmentCandidatesLowHash0(
         minFrequency,
         threadCount,
         getReads(),
-        markerKmerIds,
+        *markerKmerIds,
         alignmentCandidates.candidates,
         readLowHashStatistics,
         largeDataFileNamePrefix,
@@ -237,8 +237,8 @@ void Assembler::writeAlignmentCandidates(bool useReadName, bool verbose) const
             for(const auto& feature: features) {
                 const ReadId readId0 = candidate.readIds[0];
                 const ReadId readId1 = candidate.readIds[1];
-                const uint32_t markerCount0 = uint32_t(markers.size(OrientedReadId(readId0, 0).getValue()));
-                const uint32_t markerCount1 = uint32_t(markers.size(OrientedReadId(readId1, 0).getValue()));
+                const uint32_t markerCount0 = uint32_t(markers->size(OrientedReadId(readId0, 0).getValue()));
+                const uint32_t markerCount1 = uint32_t(markers->size(OrientedReadId(readId1, 0).getValue()));
                 const uint32_t ordinal0 = feature[0];
                 const uint32_t ordinal1 = feature[1];
 

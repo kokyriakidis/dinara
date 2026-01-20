@@ -98,7 +98,7 @@ void Assembler::createMarkerGraphVertices(
     }
 
     // Initialize computation of the global marker graph.
-    data.orientedMarkerCount = markers.totalSize();
+    data.orientedMarkerCount = markers->totalSize();
 
     data.disjointSetTable.createNew(
         largeDataName("tmp-DisjointSetTable"),
@@ -800,7 +800,7 @@ void Assembler::createMarkerGraphVerticesDebug1(uint64_t stage)
     for(ReadId readId=0; readId<readCount; readId++) {
         for(Strand strand=0; strand<2; strand++) {
             const OrientedReadId orientedReadId(readId, strand);
-            const uint64_t thisOrientedReadMarkerCount = markers.size(orientedReadId.getValue());
+            const uint64_t thisOrientedReadMarkerCount = markers->size(orientedReadId.getValue());
             for(uint32_t ordinal=0; ordinal<thisOrientedReadMarkerCount; ordinal++) {
                 const MarkerId markerId = getMarkerId(orientedReadId, ordinal);
                 DINARA_ASSERT(markerId == markerIdCheck++);
@@ -867,8 +867,8 @@ void Assembler::checkMarkerGraphVertices(
 {
     checkMarkersAreOpen();
     checkMarkerGraphVerticesAreAvailable();
-    DINARA_ASSERT(markers.totalSize() == markerGraph.vertexTable.size());
-    const MarkerId markerCount = markers.totalSize();
+    DINARA_ASSERT(markers->totalSize() == markerGraph.vertexTable.size());
+    const MarkerId markerCount = markers->totalSize();
 
 
 
@@ -992,7 +992,7 @@ void Assembler::getMarkerGraphVertices(
     OrientedReadId orientedReadId,
     vector< pair<uint32_t, MarkerGraph::VertexId> >& v)
 {
-    const uint32_t markerCount = uint32_t(markers.size(orientedReadId.getValue()));
+    const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
     v.clear();
     for(uint32_t ordinal=0; ordinal<markerCount; ordinal++) {
         const MarkerGraph::VertexId vertexId =
@@ -1058,7 +1058,7 @@ void Assembler::getGlobalMarkerGraphVertexChildren(
         tie(info.orientedReadId, info.ordinals[0]) = findMarkerId(markerId);
 
         // Find the next marker that is contained in a vertex.
-        const auto markerCount = markers.size(info.orientedReadId.getValue());
+        const auto markerCount = markers->size(info.orientedReadId.getValue());
         for(info.ordinals[1]=info.ordinals[0]+1; info.ordinals[1]<markerCount; ++info.ordinals[1]) {
 
             // Find the vertex id.
@@ -1121,7 +1121,7 @@ void Assembler::getMarkerIntervals(
         tie(orientedReadId, ordinal0) = findMarkerId(markerId0);
 
         // Find the next marker for this oriented read that is contained in a vertex.
-        const span<const CompressedMarker> markers1 = markers[orientedReadId.getValue()];
+        const span<const CompressedMarker> markers1 = (*markers)[orientedReadId.getValue()];
         uint32_t ordinal1 = ordinal0 + 1;
         for(; ordinal1<markers1.size(); ++ordinal1) {
 
@@ -1354,7 +1354,7 @@ void Assembler::findMarkerGraphReverseComplementEdgesThreadFunction1(uint64_t)
                 resortedMarkers.clear();
                 const span<MarkerInterval> markerIntervalsRc = markerGraph.edgeMarkerIntervals[edgeIdRc];
                 for(MarkerInterval markerInterval: markerIntervalsRc) {
-                    const uint32_t markerCount = uint32_t(markers.size(markerInterval.orientedReadId.getValue()));
+                    const uint32_t markerCount = uint32_t(markers->size(markerInterval.orientedReadId.getValue()));
                     markerInterval.orientedReadId.flipStrand();
                     markerInterval.ordinals[0] = markerCount - 1 - markerInterval.ordinals[0];
                     markerInterval.ordinals[1] = markerCount - 1 - markerInterval.ordinals[1];
@@ -1550,7 +1550,7 @@ void Assembler::checkMarkerGraphIsStrandSymmetricThreadFunction2(uint64_t)
                     markerInterval0.orientedReadId.getStrand()
                     == 1 - markerInterval1.orientedReadId.getStrand());
                 const uint32_t markerCount = uint32_t(
-                    markers.size(markerInterval0.orientedReadId.getValue()));
+                    markers->size(markerInterval0.orientedReadId.getValue()));
                 DINARA_ASSERT(
                     markerInterval0.ordinals[0]
                     == markerCount - 1 - markerInterval1.ordinals[1]);
@@ -2876,7 +2876,7 @@ void Assembler::computeMarkerGraphVertexConsensusSequence(
     markerPositions.reserve(markerIds.size());
     for(const MarkerId markerId: markerIds) {
         markerInfos.push_back(findMarkerId(markerId));
-        markerPositions.push_back(markers.begin()[markerId].position);
+        markerPositions.push_back(markers->begin()[markerId].position);
     }
 
 
@@ -2967,7 +2967,7 @@ void Assembler::computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
         }
 
         // Check the number of RLE bases.
-        const span<CompressedMarker> orientedReadMarkers = markers[markerInterval.orientedReadId.getValue()];
+        const span<CompressedMarker> orientedReadMarkers = (*markers)[markerInterval.orientedReadId.getValue()];
         const CompressedMarker& marker0 = orientedReadMarkers[markerInterval.ordinals[0]];
         const CompressedMarker& marker1 = orientedReadMarkers[markerInterval.ordinals[1]];
         const uint64_t rleBaseCount = marker1.position - marker0.position;
@@ -2996,7 +2996,7 @@ void Assembler::computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
         }
         const MarkerInterval& markerInterval = markerIntervals[detail.iShortest];
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Get the two markers.
         const CompressedMarker& marker0 = orientedReadMarkers[markerInterval.ordinals[0]];
@@ -3068,7 +3068,7 @@ void Assembler::computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
     for(size_t i=0; i!=markerCount; i++) {
         const MarkerInterval& markerInterval = markerIntervals[i];
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Get the two markers.
         DINARA_ASSERT(markerInterval.ordinals[1] > markerInterval.ordinals[0]);
@@ -3111,7 +3111,7 @@ void Assembler::computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
         for(size_t i=0; i!=markerCount; i++) {
             const MarkerInterval& markerInterval = markerIntervals[i];
             const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
             // Get the two markers.
             DINARA_ASSERT(markerInterval.ordinals[1] > markerInterval.ordinals[0]);
@@ -3177,7 +3177,7 @@ void Assembler::computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
     for(size_t i=0; i!=markerCount; i++) {
         const MarkerInterval& markerInterval = markerIntervals[i];
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
         // Get the two markers and their positions.
         const CompressedMarker& marker0 = orientedReadMarkers[markerInterval.ordinals[0]];
@@ -4438,7 +4438,7 @@ void Assembler::computeMarkerGraphVerticesCoverageDataThreadFunction(size_t thre
             markerPositions.clear();
             for(const MarkerId markerId: markerIds) {
                 markerInfos.push_back(findMarkerId(markerId));
-                markerPositions.push_back(markers.begin()[markerId].position);
+                markerPositions.push_back(markers->begin()[markerId].position);
             }
 
             // Loop over the k base positions in this vertex.
@@ -4920,7 +4920,7 @@ void Assembler::computeOrientedReadMarkerGraphPath(
     vector< pair<uint32_t, uint32_t> >& pathOrdinals
     ) const
 {
-    const uint64_t markerCount = markers.size(orientedReadId.getValue());
+    const uint64_t markerCount = markers->size(orientedReadId.getValue());
     DINARA_ASSERT(lastOrdinal >= firstOrdinal);
     DINARA_ASSERT(firstOrdinal < markerCount);
     DINARA_ASSERT(lastOrdinal < markerCount);
@@ -5071,7 +5071,7 @@ void Assembler::findNextMarkerGraphVertices(
         OrientedReadId orientedReadId;
         uint32_t ordinal;
         tie(orientedReadId, ordinal) = findMarkerId(markerId);
-        const uint32_t markerCount = uint32_t(markers.size(orientedReadId.getValue()));
+        const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
         MarkerGraph::VertexId nextVertexId = MarkerGraph::invalidVertexId;
         uint32_t ordinalEnd = min(markerCount, ordinal + maxSkip + 1);
         for(++ordinal; ordinal<ordinalEnd; ++ordinal) {
@@ -5175,5 +5175,5 @@ KmerId Assembler::getMarkerGraphVertexKmerId(MarkerGraphVertexId vertexId) const
         vertexId,
         assemblerInfo->k,
         *reads,
-        markers);
+        *markers);
 }

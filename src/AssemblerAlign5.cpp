@@ -23,15 +23,15 @@ void Assembler::alignOrientedReads5(
     // Get the marker KmerIds for the two oriented reads.
     array<span<KmerId>, 2> allMarkerKmerIds;
     array<vector<KmerId>, 2> allMarkerKmerIdsVectors;
-    if(markerKmerIds.isOpen()) {
-        allMarkerKmerIds[0] = markerKmerIds[orientedReadId0.getValue()];
-        allMarkerKmerIds[1] = markerKmerIds[orientedReadId1.getValue()];
+    if(markerKmerIds->isOpen()) {
+        allMarkerKmerIds[0] = (*markerKmerIds)[orientedReadId0.getValue()];
+        allMarkerKmerIds[1] = (*markerKmerIds)[orientedReadId1.getValue()];
     } else {
         // This is slower and will happen if markerKmerIds is not available.
         // Resize the vectors and make the spans point to the vectors.
         // Then call getOrientedReadMarkerKmerIds to fill them in.
-        allMarkerKmerIdsVectors[0].resize(markers.size(orientedReadId0.getValue()));
-        allMarkerKmerIdsVectors[1].resize(markers.size(orientedReadId1.getValue()));
+        allMarkerKmerIdsVectors[0].resize(markers->size(orientedReadId0.getValue()));
+        allMarkerKmerIdsVectors[1].resize(markers->size(orientedReadId1.getValue()));
         allMarkerKmerIds[0] = span<KmerId>(allMarkerKmerIdsVectors[0]);
         allMarkerKmerIds[1] = span<KmerId>(allMarkerKmerIdsVectors[1]);
         getOrientedReadMarkerKmerIds(orientedReadId0, allMarkerKmerIds[0]);
@@ -42,10 +42,10 @@ void Assembler::alignOrientedReads5(
     // Get the low frequency markers in the two oriented reads, sorted by KmerId.
     array< span<uint32_t>, 2> lowFrequencyOrdinals;
     array< vector<uint32_t>, 2> lowFrequencyOrdinalsVectors;
-    if(lowFrequencyMarkers.isOpen()) {
+    if(lowFrequencyMarkers->isOpen()) {
         // Use the stored copy.
-        lowFrequencyOrdinals[0] = lowFrequencyMarkers[orientedReadId0.getValue()];
-        lowFrequencyOrdinals[1] = lowFrequencyMarkers[orientedReadId1.getValue()];
+        lowFrequencyOrdinals[0] = (*lowFrequencyMarkers)[orientedReadId0.getValue()];
+        lowFrequencyOrdinals[1] = (*lowFrequencyMarkers)[orientedReadId1.getValue()];
     }
     else {
         // Compute them and store in the local vectors, then have the spans point to them.
@@ -643,7 +643,7 @@ void Assembler::computeLowFrequencyMarkers(
     uint64_t threadCount)
 {
     // Check that we have what we need.
-    DINARA_ASSERT(markerKmerIds.isOpen());
+    DINARA_ASSERT(markerKmerIds->isOpen());
 
     // Get the number of reads.
     const uint64_t readCount = getReads().readCount();
@@ -657,19 +657,19 @@ void Assembler::computeLowFrequencyMarkers(
     computeLowFrequencyMarkersData.maxMarkerFrequency = maxMarkerFrequency;
 
     // Initialize the low frequency markers.
-    lowFrequencyMarkers.createNew(largeDataName("LowFrequencyMarkers"), largeDataPageSize);
+    lowFrequencyMarkers->createNew(largeDataName("LowFrequencyMarkers"), largeDataPageSize);
 
     // Pass 1 just counts the number of low frequency markers for each oriented read.
     const uint64_t batchSize = 1;
-    lowFrequencyMarkers.beginPass1(2 * readCount);
+    lowFrequencyMarkers->beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::computeLowFrequencyMarkersThreadFunctionPass1, threadCount);
 
     // Pass 2 stores the low frequency markers for each oriented read.
     setupLoadBalancing(getReads().readCount(), batchSize);
-    lowFrequencyMarkers.beginPass2();
+    lowFrequencyMarkers->beginPass2();
     runThreads(&Assembler::computeLowFrequencyMarkersThreadFunctionPass2, threadCount);
-    lowFrequencyMarkers.endPass2(false, true);
+    lowFrequencyMarkers->endPass2(false, true);
 }
 
 
@@ -698,19 +698,19 @@ void Assembler::computeLowFrequencyMarkersThreadFunctionPass12(uint64_t pass)
 
                 // Compute the low frequency markers.
                 computeLowFrequencyMarkers(
-                    markerKmerIds[orientedReadId.getValue()],
+                    (*markerKmerIds)[orientedReadId.getValue()],
                     maxMarkerFrequency,
                     lowFrequencyOrdinals);
 
                 if(pass == 1) {
                     // Just make space for them.
-                    lowFrequencyMarkers.incrementCountMultithreaded(
+                    lowFrequencyMarkers->incrementCountMultithreaded(
                         orientedReadId.getValue(),
                         lowFrequencyOrdinals.size());
                 } else {
                     // Store them.
                     copy(lowFrequencyOrdinals.begin(), lowFrequencyOrdinals.end(),
-                        lowFrequencyMarkers.begin(orientedReadId.getValue()));
+                        lowFrequencyMarkers->begin(orientedReadId.getValue()));
                 }
             }
         }

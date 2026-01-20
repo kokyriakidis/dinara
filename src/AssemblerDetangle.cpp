@@ -79,7 +79,7 @@ void Assembler::detangle()
     // Do the detangling.
     const double basesPerMarker =
         double(assemblerInfo->baseCount) /
-        double(markers.totalSize()/2);
+        double(markers->totalSize()/2);
     graph.detangle(basesPerMarker, assemblyGraph);
 
 
@@ -381,7 +381,7 @@ void Assembler::detangle2(
     // Do the detangling.
     const double basesPerMarker =
         double(assemblerInfo->baseCount) /
-        double(markers.totalSize()/2);
+        double(markers->totalSize()/2);
     graph.detangle(basesPerMarker, assemblyGraph);
 
 

@@ -36,7 +36,9 @@ namespace seqan = seqan2;
 #include <numeric>
 
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<AssemblyGraph2>;
+}
 
 
 // The constructor creates an edge for each linear path

@@ -31,7 +31,7 @@ void Assembler::computePseudoPath(
     using SegmentId = AssemblyGraphEdgeId;
 
     // Compute the marker graph path.
-    const uint64_t markerCount = markers.size(orientedReadId.getValue());
+    const uint64_t markerCount = markers->size(orientedReadId.getValue());
     if(markerCount < 2) {
         pathOrdinals.clear();
         path.clear();

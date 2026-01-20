@@ -97,7 +97,7 @@ void Assembler::writeReadsSummary()
 
     reads->checkReadsAreOpen();
     reads->checkReadNamesAreOpen();
-    DINARA_ASSERT(markers.isOpen());
+    DINARA_ASSERT(markers->isOpen());
 
     // Count the number of alignment candidates for each read.
     vector<uint64_t> alignmentCandidatesCount(reads->readCount(), 0);
@@ -131,7 +131,7 @@ void Assembler::writeReadsSummary()
         copy(readName.begin(), readName.end(), ostream_iterator<char>(csv));
         csv << ",";
 
-        const uint64_t markerCount = markers.size(orientedReadId.getValue());
+        const uint64_t markerCount = markers->size(orientedReadId.getValue());
         double markerDensity = 0.;
         if(assemblerInfo->readRepresentation == 1) {
 
@@ -174,7 +174,7 @@ void Assembler::writeReadsSummary()
         csv << markerDensity << ",";
 
         // Maximum marker offset (offset between consecutive markers).
-        const auto readMarkers = markers[orientedReadId.getValue()];
+        const auto readMarkers = (*markers)[orientedReadId.getValue()];
         uint64_t position = 0;
         uint64_t maximumMarkerOffset = 0;
         for(const auto marker: readMarkers) {

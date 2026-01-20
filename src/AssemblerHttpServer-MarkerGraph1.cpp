@@ -253,7 +253,7 @@ void Assembler::exploreMarkerGraph1(
 
     // Create the local marker graph.
     LocalMarkerGraph1 graph(
-        markers,
+        *markers,
         markerGraph,
         vertexId,
         maxDistance,
@@ -544,7 +544,7 @@ void Assembler::writeHtmlMarkerGraphEdgePairInfo(
         else if(itB == endB or ((itA!=endA) and (itA->orientedReadId < itB->orientedReadId))) {
             // This oriented read only appears in edge A.
             const OrientedReadId orientedReadId = itA->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(getReads().getReadRawSequenceLength(orientedReadId.getReadId()));
 
             // Get the positions of edge A in this oriented read.
@@ -580,7 +580,7 @@ void Assembler::writeHtmlMarkerGraphEdgePairInfo(
         else if(itA == endA or ((itB!=endB) and (itB->orientedReadId < itA->orientedReadId))) {
             // This oriented read only appears in edge B.
             const OrientedReadId orientedReadId = itB->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(getReads().getReadRawSequenceLength(orientedReadId.getReadId()));
 
             // Get the positions of edge B in this oriented read.
@@ -616,7 +616,7 @@ void Assembler::writeHtmlMarkerGraphEdgePairInfo(
         else {
             // This oriented read appears in both edges.
             const OrientedReadId orientedReadId = itA->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(getReads().getReadRawSequenceLength(orientedReadId.getReadId()));
 
             // Get the positions of edge A in this oriented read.

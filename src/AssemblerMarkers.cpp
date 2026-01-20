@@ -28,12 +28,12 @@ void Assembler::findMarkers(uint64_t threadCount)
     reads->checkReadsAreOpen();
     DINARA_ASSERT(kmerChecker);
 
-    markers.createNew(largeDataName("Markers"), largeDataPageSize);
+    markers->createNew(largeDataName("Markers"), largeDataPageSize);
     MarkerFinder markerFinder(
         assemblerInfo->k,
         *kmerChecker,
         getReads(),
-        markers,
+        *markers,
         threadCount);
 
 }
@@ -217,10 +217,10 @@ void Assembler::findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s
     findMarkersSimdClosedSyncmersData.w = s; 
 
     // Create the markers data structure.
-    markers.createNew(largeDataName("Markers"), largeDataPageSize);
+    markers->createNew(largeDataName("Markers"), largeDataPageSize);
     
     // Create the markerKmerIds data structure.
-    markerKmerIds.createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
+    markerKmerIds->createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
 
     // Adjust the numbers of threads, if necessary.
     if(threadCount == 0) {
@@ -231,25 +231,25 @@ void Assembler::findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s
     const uint64_t readCount = reads->readCount();
     const uint64_t batchSize = 100; // Adjust batch size as needed.
 
-    markers.beginPass1(2 * readCount);
-    markerKmerIds.beginPass1(2 * readCount);
+    markers->beginPass1(2 * readCount);
+    markerKmerIds->beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::findMarkersSimdClosedSyncmersPass1, threadCount);
 
     // Pass 2: Store markers.
-    markers.beginPass2();
-    markerKmerIds.beginPass2();
+    markers->beginPass2();
+    markerKmerIds->beginPass2();
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::findMarkersSimdClosedSyncmersPass2, threadCount);
     
-    markers.endPass2(false);
-    markerKmerIds.endPass2(false);
+    markers->endPass2(false);
+    markerKmerIds->endPass2(false);
 
     // Report.
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
     performanceLog << timestamp << "Finding markers using SIMD closed syncmers completed in " << tTotal << " s." << endl;
-    cout << "Created " << markers.totalSize() << " markers using SIMD closed syncmers." << endl;
+    cout << "Created " << markers->totalSize() << " markers using SIMD closed syncmers." << endl;
 }
 
 void Assembler::findMarkersSimdClosedSyncmersPass1(size_t /* threadId */)
@@ -274,12 +274,12 @@ void Assembler::findMarkersSimdClosedSyncmersPass1(size_t /* threadId */)
             const auto markers = getSortedUniquePositionsAndIds(
                 readId, *reads, k_target, sketcher, kmerChecker, readSequence);
 
-            this->markers.incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
-            this->markers.incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
+            this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
+            this->markers->incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
             
             // MarkerKmerIds must match markers counts exactly.
-            markerKmerIds.incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
-            markerKmerIds.incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
+            markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), markers.size());
+            markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), markers.size());
         }
     }
     simd_sketcher_free(sketcher);
@@ -304,11 +304,11 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
 
             if(markers.empty()) continue;
 
-            CompressedMarker* markerPointerStrand0 = this->markers.begin(OrientedReadId(readId, 0).getValue());
-            CompressedMarker* markerPointerStrand1 = this->markers.end(OrientedReadId(readId, 1).getValue()) - 1;
+            CompressedMarker* markerPointerStrand0 = this->markers->begin(OrientedReadId(readId, 0).getValue());
+            CompressedMarker* markerPointerStrand1 = this->markers->end(OrientedReadId(readId, 1).getValue()) - 1;
             
-            KmerId* kmerIdPointerStrand0 = markerKmerIds.begin(OrientedReadId(readId, 0).getValue());
-            KmerId* kmerIdPointerStrand1 = markerKmerIds.end(OrientedReadId(readId, 1).getValue()) - 1;
+            KmerId* kmerIdPointerStrand0 = markerKmerIds->begin(OrientedReadId(readId, 0).getValue());
+            KmerId* kmerIdPointerStrand1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
 
             for(const auto& val : markers) {
                 uint32_t position = val.first;
@@ -344,12 +344,12 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
 
 void Assembler::accessMarkers()
 {
-    markers.accessExistingReadOnly(largeDataName("Markers"));
+    markers->accessExistingReadOnly(largeDataName("Markers"));
 }
 
 void Assembler::checkMarkersAreOpen() const
 {
-    if(!markers.isOpen()) {
+    if(!markers->isOpen()) {
         throw runtime_error("Markers are not accessible.");
     }
 }
@@ -365,7 +365,7 @@ void Assembler::writeMarkers(ReadId readId, Strand strand, const string& fileNam
 
     // Get the markers.
     const OrientedReadId orientedReadId(readId, strand);
-    const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+    const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
 
     // Write them out.
     ofstream csv(fileName);
@@ -390,7 +390,7 @@ void Assembler::getMarkersSortedByKmerId(
     OrientedReadId orientedReadId,
     vector<MarkerWithOrdinal>& markersSortedByKmerId) const
 {
-    markersSortedByKmerId.resize(markers.size(orientedReadId.getValue()));
+    markersSortedByKmerId.resize(markers->size(orientedReadId.getValue()));
     getOrientedReadMarkers(orientedReadId, markersSortedByKmerId);
     sort(markersSortedByKmerId.begin(), markersSortedByKmerId.end());
 }
@@ -403,7 +403,7 @@ MarkerId Assembler::getMarkerId(
     OrientedReadId orientedReadId, uint32_t ordinal) const
 {
     return
-        (markers.begin(orientedReadId.getValue()) - markers.begin())
+        (markers->begin(orientedReadId.getValue()) - markers->begin())
         + ordinal;
 }
 
@@ -413,7 +413,7 @@ MarkerId Assembler::getReverseComplementMarkerId(
     OrientedReadId orientedReadIdRc = orientedReadId;
     orientedReadIdRc.flipStrand();
 
-    const uint32_t markerCount = uint32_t(markers.size(orientedReadId.getValue()));
+    const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
 
     return getMarkerId(orientedReadIdRc, markerCount - 1 - ordinal);
 
@@ -428,7 +428,7 @@ MarkerId Assembler::getReverseComplementMarkerId(
 pair<OrientedReadId, uint32_t>
     Assembler::findMarkerId(MarkerId markerId) const
 {
-    return dinara::findMarkerId(markerId, markers);
+    return dinara::findMarkerId(markerId, *markers);
 }
 
 
@@ -443,7 +443,7 @@ MarkerId Assembler::findReverseComplement(MarkerId markerId) const
 	tie(orientedReadId, ordinal) = findMarkerId(markerId);
 
 	// Reverse complement.
-	ordinal = uint32_t(markers.size(orientedReadId.getValue()) - 1 - ordinal);
+	ordinal = uint32_t(markers->size(orientedReadId.getValue()) - 1 - ordinal);
 	orientedReadId.flipStrand();
 
 	// Return the corresponding Markerid.
@@ -457,7 +457,7 @@ void Assembler::computeMarkerKmerIds(uint64_t threadCount)
     performanceLog << timestamp << "Gathering marker KmerIds." << endl;
 
     // optimization: if we already have them (from findMarkersSimdClosedSyncmers), don't recompute.
-    if(markerKmerIds.isOpen()) {
+    if(markerKmerIds->isOpen()) {
         performanceLog << timestamp << "Marker KmerIds are already present. Skipping computation." << endl;
         return;
     }
@@ -473,17 +473,17 @@ void Assembler::computeMarkerKmerIds(uint64_t threadCount)
 
     // Do it.
     // The layout is identical to that used by the markers.
-    markerKmerIds.createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
+    markerKmerIds->createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
     for(uint64_t readId=0; readId<readCount; readId++) {
         const OrientedReadId orientedReadId0(uint32_t(readId), 0);
         const OrientedReadId orientedReadId1(uint32_t(readId), 1);
-        const uint64_t readMarkerCount = markers.size(orientedReadId0.getValue());
-        DINARA_ASSERT(markers.size(orientedReadId1.getValue()) == readMarkerCount);
+        const uint64_t readMarkerCount = markers->size(orientedReadId0.getValue());
+        DINARA_ASSERT(markers->size(orientedReadId1.getValue()) == readMarkerCount);
         for(uint64_t strand=0; strand<2; strand++) {
-            markerKmerIds.appendVector(readMarkerCount);
+            markerKmerIds->appendVector(readMarkerCount);
         }
     }
-    markerKmerIds.unreserve();
+    markerKmerIds->unreserve();
     const uint64_t batchSize = 100;
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::computeMarkerKmerIdsThreadFunction, threadCount);
@@ -500,8 +500,8 @@ void Assembler::computeMarkerKmerIds(uint64_t threadCount)
         for(uint64_t strand=0; strand<2; strand++) {
 
             const OrientedReadId orientedReadId = OrientedReadId(ReadId(readId), Strand(strand));
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
-            const auto orientedReadMarkerKmerIds = markerKmerIds[orientedReadId.getValue()];
+            const auto orientedReadMarkers = (*markers)[orientedReadId.getValue()];
+            const auto orientedReadMarkerKmerIds = (*markerKmerIds)[orientedReadId.getValue()];
             const uint64_t orientedReadMarkerCount = orientedReadMarkers.size();
             DINARA_ASSERT(orientedReadMarkerKmerIds.size() == orientedReadMarkerCount);
 
@@ -530,7 +530,7 @@ void Assembler::computeMarkerKmerIds(uint64_t threadCount)
 
 void Assembler::cleanupMarkerKmerIds()
 {
-    markerKmerIds.remove();
+    markerKmerIds->remove();
 }
 
 
@@ -550,8 +550,8 @@ void Assembler::computeMarkerKmerIdsThreadFunction(uint64_t)
 
             getReadMarkerKmerIds(
                 ReadId(readId),
-                markerKmerIds[orientedReadId0.getValue()],
-                markerKmerIds[orientedReadId1.getValue()]);
+                (*markerKmerIds)[orientedReadId0.getValue()],
+                (*markerKmerIds)[orientedReadId1.getValue()]);
         }
     }
 
@@ -579,7 +579,7 @@ Kmer Assembler::getOrientedReadMarkerKmerStrand0(ReadId readId, uint32_t ordinal
     const uint64_t k = assemblerInfo->k;
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
 
     Kmer kmer0;
     extractKmer(read, uint64_t(orientedReadMarkers0[ordinal0].position), k, kmer0);
@@ -596,7 +596,7 @@ Kmer Assembler::getOrientedReadMarkerKmerStrand1(ReadId readId, uint32_t ordinal
     // We only have the read stored without reverse complement, so get it from there...
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     const uint64_t ordinal0 = readMarkerCount - 1 - ordinal1;
     Kmer kmer0;
@@ -640,7 +640,7 @@ void Assembler::getOrientedReadMarkerKmersStrand0(ReadId readId, const span<Kmer
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmers0.size() == readMarkerCount);
 
@@ -661,7 +661,7 @@ void Assembler::getOrientedReadMarkerKmersStrand1(ReadId readId, const span<Kmer
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmers1.size() == readMarkerCount);
 
@@ -701,7 +701,7 @@ void Assembler::getOrientedReadMarkerKmerIdsStrand0(ReadId readId, const span<Km
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmerIds0.size() == readMarkerCount);
 
@@ -722,7 +722,7 @@ void Assembler::getOrientedReadMarkerKmerIdsStrand1(ReadId readId, const span<Km
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmerIds1.size() == readMarkerCount);
 
@@ -764,7 +764,7 @@ void Assembler::getOrientedReadMarkersStrand0(
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(markers0.size() == readMarkerCount);
 
@@ -790,8 +790,8 @@ void Assembler::getOrientedReadMarkersStrand1(
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
     const OrientedReadId orientedReadId1(readId, 1);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
-    const auto orientedReadMarkers1 = markers[orientedReadId1.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
+    const auto orientedReadMarkers1 = (*markers)[orientedReadId1.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(markers1.size() == readMarkerCount);
 
@@ -838,7 +838,7 @@ void Assembler::getOrientedReadAlign6MarkersStrand0(
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(align6Markers.size() == readMarkerCount);
 
@@ -867,8 +867,8 @@ void Assembler::getOrientedReadAlign6MarkersStrand1(
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
     const OrientedReadId orientedReadId1(readId, 1);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
-    const auto orientedReadMarkers1 = markers[orientedReadId1.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
+    const auto orientedReadMarkers1 = (*markers)[orientedReadId1.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(align6Markers.size() == readMarkerCount);
 
@@ -899,7 +899,7 @@ void Assembler::getReadMarkerKmers(
     // Access the information we need for this read.
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(uint32_t(readId), 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmers0.size() == readMarkerCount);
     DINARA_ASSERT(kmers1.size() == readMarkerCount);
@@ -934,7 +934,7 @@ void Assembler::getReadMarkerKmerIds(
     // Access the information we need for this read.
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(uint32_t(readId), 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(kmerIds0.size() == readMarkerCount);
     DINARA_ASSERT(kmerIds1.size() == readMarkerCount);
@@ -966,7 +966,7 @@ Kmer Assembler::getOrientedReadMarkerKmer(OrientedReadId orientedReadId, uint64_
     const Strand strand = orientedReadId.getStrand();
     const auto read = reads->getRead(readId);
     const OrientedReadId orientedReadId0(uint32_t(readId), 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
 
     if(strand == 0) {
 
@@ -996,7 +996,7 @@ KmerId Assembler::getOrientedReadMarkerKmerId(OrientedReadId orientedReadId, uin
     const Strand strand = orientedReadId.getStrand();
     const auto read = reads->getRead(readId);
     const OrientedReadId orientedReadId0(uint32_t(readId), 0);
-    const auto orientedReadMarkers0 = markers[orientedReadId0.getValue()];
+    const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
 
     if(strand == 0) {
 
@@ -1021,9 +1021,9 @@ void Assembler::countKmers(
     uint64_t threadCount,
     const string& globalFrequencyOverrideDirectory)
 {
-    DINARA_ASSERT(markers.isOpen());
+    DINARA_ASSERT(markers->isOpen());
     kmerCounter = make_shared<KmerCounter>(
-        assemblerInfo->k, getReads(), markers, *this, threadCount);
+        assemblerInfo->k, getReads(), *markers, *this, threadCount);
 
 
 
@@ -1070,7 +1070,7 @@ void Assembler::countKmers(
 
 void Assembler::accessKmerCounts()
 {
-    DINARA_ASSERT(markers.isOpen());
+    DINARA_ASSERT(markers->isOpen());
     kmerCounter = make_shared<KmerCounter>(assemblerInfo->k, *this);
 }
 
@@ -1084,7 +1084,7 @@ void Assembler::createMarkerKmers(uint64_t threadCount)
         assemblerInfo->k,
         mappedMemoryOwner,
         getReads(),
-        markers,
+        *markers,
         threadCount);
 }
 
@@ -1098,19 +1098,19 @@ void Assembler::accessMarkerKmers()
         assemblerInfo->k,
         mappedMemoryOwner,
         getReads(),
-        markers);
+        *markers);
 }
 
 
 // Count k-mers from pre-calculated Marker KmerIds.
 void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
 {
-    DINARA_ASSERT(markerKmerIds.isOpen());
+    DINARA_ASSERT(markerKmerIds->isOpen());
     
     // Create KmerCounter from markerKmerIds.
     kmerCounter = make_shared<KmerCounter>(
         assemblerInfo->k,
-        markerKmerIds, 
+        *markerKmerIds, 
         *this, 
         threadCount);
     
@@ -1134,31 +1134,28 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
 
     // Check prerequisites.
     checkMarkersAreOpen();
-    DINARA_ASSERT(markerKmerIds.isOpen());
+    DINARA_ASSERT(markerKmerIds->isOpen());
     if(!kmerCounter) {
         throw runtime_error("KmerCounter is required for marker filtering.");
     }
 
-    // Move current markers/ids to oldMarkers by renaming files on disk.
-    // VectorOfVectors does not support move assignment, so we use renaming.
-    const string markersName = markers.getName(); 
-    const string markersNameOld = markersName + "-Old";
-    markers.rename(markersNameOld);
-    applyKmerCountFilterData.oldMarkers.accessExistingReadOnly(markersNameOld);
-    markers.close(); // Close the current handle so we can create a new one.
+    // Move current markers/ids to oldMarkers by switching pointers.
+    // This avoids invalid renames in anonymous memory mode.
+    const string markersName = markers->getName(); 
+    const string kmerIdsName = markerKmerIds->getName();
 
-    const string kmerIdsName = markerKmerIds.getName();
-    const string kmerIdsNameOld = kmerIdsName + "-Old";
-    markerKmerIds.rename(kmerIdsNameOld);
-    applyKmerCountFilterData.oldMarkerKmerIds.accessExistingReadOnly(kmerIdsNameOld);
-    markerKmerIds.close(); // Close the current handle so we can create a new one.
+    applyKmerCountFilterData.oldMarkers = markers;
+    markers = make_shared<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>>();
+    
+    applyKmerCountFilterData.oldMarkerKmerIds = markerKmerIds;
+    markerKmerIds = make_shared<MemoryMapped::VectorOfVectors<KmerId, uint64_t>>();
 
     applyKmerCountFilterData.minFreq = minFreq;
     applyKmerCountFilterData.maxFreq = maxFreq;
 
     // Create new markers structure (overwriting/creating fresh files).
-    markers.createNew(markersName, largeDataPageSize);
-    markerKmerIds.createNew(kmerIdsName, largeDataPageSize);
+    markers->createNew(markersName, largeDataPageSize);
+    markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
 
     // Adjust threads.
     if(threadCount == 0) {
@@ -1169,32 +1166,36 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     const uint64_t batchSize = 100;
 
     // Pass 1: Count valid markers.
-    markers.beginPass1(2 * readCount);
-    markerKmerIds.beginPass1(2 * readCount);
+    markers->beginPass1(2 * readCount);
+    markerKmerIds->beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::applyKmerCountFilterThreadFunctionPass1, threadCount);
 
     // Pass 2: Store valid markers.
-    markers.beginPass2();
-    markerKmerIds.beginPass2();
+    markers->beginPass2();
+    markerKmerIds->beginPass2();
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::applyKmerCountFilterThreadFunctionPass2, threadCount);
     
-    markers.endPass2(false);
-    markerKmerIds.endPass2(false);
+    markers->endPass2(false);
+    markerKmerIds->endPass2(false);
 
     // Capture old size before removal.
-    const uint64_t oldTotalSize = applyKmerCountFilterData.oldMarkers.totalSize();
+    const uint64_t oldTotalSize = applyKmerCountFilterData.oldMarkers->totalSize();
 
     // Clean up old markers.
-    applyKmerCountFilterData.oldMarkers.remove();
-    applyKmerCountFilterData.oldMarkerKmerIds.remove();
+    applyKmerCountFilterData.oldMarkers->remove();
+    applyKmerCountFilterData.oldMarkerKmerIds->remove();
+
+    // Release the old markers pointers.
+    applyKmerCountFilterData.oldMarkers.reset();
+    applyKmerCountFilterData.oldMarkerKmerIds.reset();
 
     // Report.
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
     performanceLog << timestamp << "Marker filtering completed in " << tTotal << " s." << endl;
-    cout << "Filtered markers: kept " << markers.totalSize() << " out of " 
+    cout << "Filtered markers: kept " << markers->totalSize() << " out of " 
          << oldTotalSize << "." << endl;
 }
 
@@ -1208,8 +1209,8 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
             
             // Get markers for this read from oldMarkers.
             const OrientedReadId orientedReadId(readId, 0);
-            const auto oldReadMarkers = applyKmerCountFilterData.oldMarkers[orientedReadId.getValue()];
-            const auto oldReadMarkerKmerIds = applyKmerCountFilterData.oldMarkerKmerIds[orientedReadId.getValue()];
+            const auto oldReadMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId.getValue()];
+            const auto oldReadMarkerKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId.getValue()];
             
             uint64_t validCount = 0;
             if(oldReadMarkers.size() > 0) {
@@ -1231,11 +1232,11 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
                 }
             }
 
-            markers.incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
-            markers.incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
+            markers->incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
+            markers->incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
             
-            markerKmerIds.incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
-            markerKmerIds.incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
+            markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
+            markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
         }
     }
 }
@@ -1249,19 +1250,19 @@ void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             
             const OrientedReadId orientedReadId0(readId, 0);
-            const auto oldReadMarkers = applyKmerCountFilterData.oldMarkers[orientedReadId0.getValue()];
-            const auto oldReadMarkerKmerIds = applyKmerCountFilterData.oldMarkerKmerIds[orientedReadId0.getValue()];
+            const auto oldReadMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId0.getValue()];
+            const auto oldReadMarkerKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId0.getValue()];
             
             if(oldReadMarkers.size() == 0) continue;
 
             const LongBaseSequenceView read = reads->getRead(readId);
 
             // Get pointers for storing markers.
-            CompressedMarker* markerPointerStrand0 = markers.begin(orientedReadId0.getValue());
-            CompressedMarker* markerPointerStrand1 = markers.end(OrientedReadId(readId, 1).getValue()) - 1;
+            CompressedMarker* markerPointerStrand0 = markers->begin(orientedReadId0.getValue());
+            CompressedMarker* markerPointerStrand1 = markers->end(OrientedReadId(readId, 1).getValue()) - 1;
             
-            KmerId* kmerIdPointerStrand0 = markerKmerIds.begin(orientedReadId0.getValue());
-            KmerId* kmerIdPointerStrand1 = markerKmerIds.end(OrientedReadId(readId, 1).getValue()) - 1;
+            KmerId* kmerIdPointerStrand0 = markerKmerIds->begin(orientedReadId0.getValue());
+            KmerId* kmerIdPointerStrand1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
 
             for(size_t i=0; i<oldReadMarkers.size(); i++) {
                 KmerId kmerId = oldReadMarkerKmerIds[i]; // Strand 0 ID

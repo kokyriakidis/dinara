@@ -28,8 +28,8 @@ ProjectedAlignment::ProjectedAlignment(
         },
         alignment,
         {
-            assembler.markers[orientedReadIds[0].getValue()],
-            assembler.markers[orientedReadIds[1].getValue()]
+            (*assembler.markers)[orientedReadIds[0].getValue()],
+            (*assembler.markers)[orientedReadIds[1].getValue()]
         },
         method)
 {

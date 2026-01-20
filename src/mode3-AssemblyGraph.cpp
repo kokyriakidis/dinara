@@ -33,7 +33,9 @@ using namespace mode3;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
+namespace dinara {
 template class MultithreadedObject<AssemblyGraph>;
+}
 
 
 

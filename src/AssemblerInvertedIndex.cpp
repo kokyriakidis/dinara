@@ -846,7 +846,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     // 1. Build the Inverted Index.
     // We assume markerKmerIds and markers are populated and consistent.
     checkMarkersAreOpen();
-    if(!markerKmerIds.isOpen()) {
+    if(!markerKmerIds->isOpen()) {
         throw runtime_error("Marker KmerIds not available for Inverted Index.");
     }
     
@@ -855,7 +855,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
 
     // Allocate huge vector.
     // Total markers = markers.totalSize().
-    const uint64_t totalMarkers = markers.totalSize();
+    const uint64_t totalMarkers = markers->totalSize();
     cout << "Building Inverted Index for " << totalMarkers << " markers." << endl;
     // invertedIndexData.occurrences.resize(totalMarkers); // Initial resize removed, now exact resize after counting.
 
@@ -907,7 +907,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     // -------------------------------------------------------------------------
 
     checkMarkersAreOpen();
-    const ReadId readCount = ReadId(markers.size() / 2);
+    const ReadId readCount = ReadId(markers->size() / 2);
     vector<uint64_t> threadMarkerCounts(threadCount, 0);
     vector<size_t> threadOffsets(threadCount, 0);
 
@@ -921,7 +921,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         for(ReadId readId=start; readId!=end; ++readId) {
             // Only Strand 0. markers stores oriented reads.
             // 2 * readid = Strand 0.
-            count += markers[size_t(readId) << 1].size();
+            count += (*markers)[size_t(readId) << 1].size();
         }
         threadMarkerCounts[threadId] = count;
     };
@@ -954,8 +954,8 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         size_t offset = threadOffsets[threadId];
 
         for(ReadId readId=start; readId!=end; ++readId) {
-            const auto& readMarkers = markers[size_t(readId) << 1];
-            const auto& readKmerIds = markerKmerIds[size_t(readId) << 1];
+            const auto& readMarkers = (*markers)[size_t(readId) << 1];
+            const auto& readKmerIds = (*markerKmerIds)[size_t(readId) << 1];
             
             if(readMarkers.size() != readKmerIds.size()) {
                  continue; 
@@ -1153,8 +1153,8 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     // Use InvertedIndexFinder pattern.
     InvertedIndexFinder finder(
         getReads(),
-        markers,
-        markerKmerIds,
+        *markers,
+        *markerKmerIds,
         invertedIndexData,
         alignmentCandidates.candidates,
         alignmentCandidatesAlignmentsData.alignments, // Added

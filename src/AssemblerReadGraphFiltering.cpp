@@ -1365,10 +1365,10 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
 {
     cout << timestamp << "Removing contained reads (ma_hit_contained_advance) - Serial Execution for Strict Parity..." << endl;
     
-    if (!containmentParent.isOpen) {
-        containmentParent.createNew(largeDataName("ContainmentParent"), largeDataPageSize);
-        containmentParent.resize(reads->readCount());
-        std::fill(containmentParent.begin(), containmentParent.end(), ReadId(invalidReadId));
+    if (!containmentParent->isOpen) {
+        containmentParent->createNew(largeDataName("ContainmentParent"), largeDataPageSize);
+        containmentParent->resize(reads->readCount());
+        std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
     }
 
     uint64_t containedCount = 0;
@@ -1439,7 +1439,7 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
                 validReadIntervals[qn].isDeleted = true;
                 
                 // "set_R_to_U" -> Record containment
-                containmentParent[qn] = tn;
+                (*containmentParent)[qn] = tn;
                 containedCount++;
                 
                 // Break inner loop? Hifiasm does NOT break inner loop immediately?
@@ -1452,7 +1452,7 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
             } else if (result == 2) { // MA_HT_TCONT: Target (tn) contained in Query (i)
                 // Mark target deleted
                 validReadIntervals[tn].isDeleted = true;
-                containmentParent[tn] = qn;
+                (*containmentParent)[tn] = qn;
                 containedCount++;
                 
                 // Note: We do NOT break here, because Query `i` is still alive and might contain others.
@@ -1462,13 +1462,13 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
     
     // Transitive Reduction of Containment Tree & Cleanup (Parity: transfor_R_to_U)
     cout << timestamp << "Transitive reduction..." << endl;
-    for(size_t i=0; i<containmentParent.size(); i++) {
-        if (containmentParent[i] != invalidReadId) {
-            ReadId parent = containmentParent[i];
-            while(containmentParent[parent] != invalidReadId) {
-                parent = containmentParent[parent];
+    for(size_t i=0; i<containmentParent->size(); i++) {
+        if ((*containmentParent)[i] != invalidReadId) {
+            ReadId parent = (*containmentParent)[i];
+            while((*containmentParent)[parent] != invalidReadId) {
+                parent = (*containmentParent)[parent];
             }
-            containmentParent[i] = parent; // Path compression
+            (*containmentParent)[i] = parent; // Path compression
 
             // This corresponds to 'coverage_cut[i].del = 1'
             validReadIntervals[i].isDeleted = true;
@@ -1574,7 +1574,7 @@ void Assembler::removeContainedReadsThreadFunction(size_t /* threadId */)
                 }
                 
                 // set_R_to_U equivalent: record containment relationship
-                containmentParent[r0] = r1;
+                (*containmentParent)[r0] = r1;
                 validReadIntervals[r0].isDeleted = true;
                 
             } else if (result == 2) {
@@ -1590,7 +1590,7 @@ void Assembler::removeContainedReadsThreadFunction(size_t /* threadId */)
                 }
                 
                 // set_R_to_U equivalent: record containment relationship
-                containmentParent[r1] = r0;
+                (*containmentParent)[r1] = r0;
                 validReadIntervals[r1].isDeleted = true;
             }
             // result == 0 (normal dovetail), -1 (internal), -2 (short): do nothing
