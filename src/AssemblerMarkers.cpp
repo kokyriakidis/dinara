@@ -1145,9 +1145,15 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     const string kmerIdsName = markerKmerIds->getName();
 
     applyKmerCountFilterData.oldMarkers = markers;
+    if(!markersName.empty()) {
+        applyKmerCountFilterData.oldMarkers->rename(markersName + ".old");
+    }
     markers = make_shared<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>>();
     
     applyKmerCountFilterData.oldMarkerKmerIds = markerKmerIds;
+    if(!kmerIdsName.empty()) {
+        applyKmerCountFilterData.oldMarkerKmerIds->rename(kmerIdsName + ".old");
+    }
     markerKmerIds = make_shared<MemoryMapped::VectorOfVectors<KmerId, uint64_t>>();
 
     applyKmerCountFilterData.minFreq = minFreq;

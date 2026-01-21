@@ -764,31 +764,26 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    // // Construct the mode3::Anchors from marker graph (for HTTP server visualization).
-    // // This must be done BEFORE createShasta2Anchors.
-    // anchors =
-    //     make_shared<mode3::Anchors>(
-    //         MappedMemoryOwner(assembler),
-    //         assembler.getReads(),
-    //         assembler.assemblerInfo->k,
-    //         assembler.markers,
-    //         assembler.markerGraph,
-    //         minPrimaryCoverage,
-    //         maxPrimaryCoverage,
-    //         threadCount,
-    //         true); // createFromVertices
+    // Construct the mode3::Anchors from marker graph (for HTTP server visualization).
+    // This must be done BEFORE createShasta2Anchors.
+    anchors =
+        make_shared<mode3::Anchors>(
+            MappedMemoryOwner(assembler),
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            *assembler.markers,
+            assembler.markerGraph,
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount,
+            true); // createFromVertices
     
 
-    // // Compute oriented read journeys.
-    // anchors->computeJourneys(threadCount);
+    // Compute oriented read journeys.
+    anchors->computeJourneys(threadCount);
 
-    // // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
-
-    // Create shasta2 anchors equivalent to the marker graph vertices.
-    // This allows downstream processing using shasta2 tools.
-    createShasta2Anchors(assembler, threadCount);
-
+    // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
+    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
     // Store elapsed time for assembly.
     const auto steadyClock1 = std::chrono::steady_clock::now();
@@ -838,6 +833,11 @@ void dinara::main::assemble(
     performanceLog << "Average CPU utilization: " << averageCpuUtilization << endl;
     performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
         int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
+
+
+    // Create shasta2 anchors equivalent to the marker graph vertices.
+    // This allows downstream processing using shasta2 tools.
+    createShasta2Anchors(assembler, assemblerOptions, threadCount);
 
 }
 

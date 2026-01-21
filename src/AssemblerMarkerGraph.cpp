@@ -1172,7 +1172,7 @@ void Assembler::findMarkerGraphReverseComplementVertices(uint64_t threadCount)
     // vertex id for each vertex.
     if(not markerGraph.reverseComplementVertex.isOpen) {
         markerGraph.reverseComplementVertex.createNew(
-            largeDataName("MarkerGraphReverseComplementeVertex"),
+            largeDataName("MarkerGraphReverseComplementVertex"),
             largeDataPageSize);
     }
     markerGraph.reverseComplementVertex.resize(vertexCount);
