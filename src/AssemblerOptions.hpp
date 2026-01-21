@@ -97,6 +97,7 @@ public:
     vector <string> inputFileNames;
     vector <string> anchorFileNames;
     string assemblyDirectory;
+    string shasta2OutputDirectory;
     string command;
     string memoryMode;
     string memoryBacking;

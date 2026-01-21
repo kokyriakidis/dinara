@@ -202,6 +202,11 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         default_value("DinaraRun"),
         "Name of the output directory. If command is assemble, this directory must not exist.")
 
+        ("output",
+        value<string>(&commandLineOnlyOptions.shasta2OutputDirectory)->
+        default_value("ShastaRun"),
+        "Shasta2 output directory.")
+
         ("command",
         value<string>(&commandLineOnlyOptions.command)->
         default_value("assemble"),
