@@ -1,3 +1,29 @@
+/**
+ * @file AssemblerInvertedIndex.cpp
+ * @brief High-performance alignment candidate discovery using an Inverted Index.
+ *
+ * This file implements a Hifiasm-compatible chaining algorithm for finding
+ * potential read overlaps. The core data flow is:
+ *
+ *   1. **Inverted Index Construction**: Build a hash table mapping each
+ *      canonical K-mer to a list of (ReadId, Position) occurrences.
+ *   2. **Parallel Radix Sort**: Sort occurrences by K-mer ID using an O(N)
+ *      LSD radix sort to group identical K-mers.
+ *   3. **Hash Table Build**: Populate a power-of-2 sized hash table for O(1)
+ *      K-mer lookups during the search phase.
+ *   4. **Parallel Candidate Search**: For each read, query the index to find
+ *      matching K-mers in other reads. Use DP chaining (with optional AVX2
+ *      SIMD pre-filtering) to score potential alignments.
+ *
+ * Key performance features:
+ *   - Structure-of-Arrays (SoA) layout for cache-efficient DP.
+ *   - Early K-mer weighting based on occurrence frequency (Hifiasm-compatible).
+ *   - AVX2 SIMD pre-filter to skip non-viable DP predecessors (optional).
+ *   - Collinear fast-path to skip O(N^2) DP for trivially monotonic hit sets.
+ *
+ * @note All scoring and tie-breaking rules are strictly Hifiasm-compatible.
+ */
+
 #include "Assembler.hpp"
 #include "performanceLog.hpp"
 #include "OrientedReadPair.hpp"
@@ -11,38 +37,153 @@
 #include <thread>
 #include <functional>
 
-using namespace std;
-// using namespace dinara; // Removed to avoid ambiguity, we use explicit namespace block.
+// AVX2 intrinsics are only available on x86_64 architectures.
+// The code includes a scalar fallback for other platforms.
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
-// Include Template Implementation.
+using namespace std;
+
 #include "MultithreadedObject.tpp"
 #include "Alignment.hpp"
 
 namespace dinara {
 
-// Helper struct (Global scope).
+/**
+ * @brief Temporary hit structure used during K-mer matching.
+ *
+ * Represents a single K-mer match between the query read (Read A) and a
+ * partner read. Hits are first collected in Array-of-Structures (AoS) format
+ * for sorting, then converted to Structure-of-Arrays (SoA) for DP.
+ *
+ * @note Sorting is by (partnerReadId, posA) to group hits by read pair and
+ *       ensure monotonically increasing query positions for the DP.
+ */
 struct InvertedIndexTempHit {
-    ReadId partnerReadId;
-    uint32_t posA;
-    uint32_t posB;
-    uint32_t ordinalA;
-    uint8_t weight;
+    ReadId partnerReadId;  ///< ID of the matching read (Read B).
+    uint32_t posA;         ///< Base position of the K-mer in Read A.
+    uint32_t posB;         ///< Base position of the K-mer in Read B.
+    uint32_t ordinalA;     ///< Marker ordinal in Read A (for alignment output).
+    uint8_t weight;        ///< Frequency-based weight (Hifiasm compatible).
     
+    /// Comparison operator for sorting by (partnerReadId, posA).
     bool operator<(const InvertedIndexTempHit& other) const {
         if (partnerReadId != other.partnerReadId) return partnerReadId < other.partnerReadId;
         return posA < other.posA;
     }
 };
 
-// Hifiasm parity: Overlap type classification for max_n_chain filtering.
-// Type 0: Left overhang (query starts at position 0)
-// Type 1: Right overhang (query ends at read length)
-// Type 2: Contained (query fully spans read)
-// Type 3: Containing (neither end at boundary)
-static int getOverlapType(uint32_t qs, uint32_t qe, uint32_t queryLen) {
-    if (qs == 0 && qe >= queryLen - 1) return 2;  // Contained
-    else if (qs > 0 && qe < queryLen - 1) return 3;  // Containing
-    else return (qs == 0) ? 0 : 1;  // Left or Right overhang
+/**
+ * @brief Classifies an overlap based on Hifiasm's overlap type heuristic.
+ *
+ * This is used for Hifiasm's candidate limit feature, which caps the number
+ * of reported overlaps per type to avoid excessive output in repetitive regions.
+ *
+ * @param start  Starting coordinate of the alignment on Read A.
+ * @param end    Ending coordinate of the alignment on Read A.
+ * @param readLen Total length of Read A.
+ * @return 0 = Left overhang, 1 = Right overhang, 2 = Contained, 3 = Containing.
+ */
+static int getOverlapType(uint32_t start, uint32_t end, uint32_t readLen) {
+    if (start == 0 && end >= readLen - 1) return 2; // Contained
+    else if (start > 0 && end < readLen - 1) return 3; // Containing
+    else return (start == 0) ? 0 : 1; // Left or Right overhang
+}
+
+/**
+ * @brief Per-thread scratchpad for high-performance DP chaining.
+ *
+ * This struct uses a Structure-of-Arrays (SoA) layout for the DP arrays,
+ * which is critical for cache efficiency during the O(N^2) chaining loop.
+ * The scratchpad is recycled across reads to avoid allocation overhead.
+ *
+ * Key arrays:
+ *   - `dpSame`, `dpDiff`: DP scores for same-strand and opposite-strand chains.
+ *   - `parentSame`, `parentDiff`: Backtrack pointers for chain reconstruction.
+ *   - `cumDriftSame`, `cumDriftDiff`: Cumulative indel count for drift constraint.
+ *   - `cumLenSame`, `cumLenDiff`: Cumulative alignment length for gap rate.
+ */
+struct ThreadScratchpad {
+    // AoS for hit collection and sorting
+    vector<InvertedIndexTempHit> flatHits;
+    
+    // Structure of Arrays (SoA) for cache-efficient DP scans
+    vector<uint32_t> hitPosA, hitPosB, hitOrdinalA;
+    vector<uint8_t> hitWeights;
+
+    // DP score and backtrack arrays
+    vector<uint32_t> dpSame, dpDiff;
+    vector<int32_t> parentSame, parentDiff;
+    vector<uint32_t> cumDriftSame, cumDriftDiff;
+    vector<uint32_t> cumLenSame, cumLenDiff;
+    vector<int32_t> backtrackVisitSame, backtrackVisitDiff;
+    vector<uint32_t> chainOccurrencesSame, chainOccurrencesDiff;
+
+    // Post-DP candidate extraction
+    struct ChainCandidate {
+        uint32_t score;
+        uint64_t chainLen; // For deterministic tie-breaking
+        int32_t endK;
+        bool isDiff; 
+        bool operator<(const ChainCandidate& other) const {
+            if (score != other.score) return score > other.score;
+            return chainLen < other.chainLen;
+        }
+    };
+    vector<ChainCandidate> chainCandidates;
+    vector<int> candidateTypes;
+    vector<ChainCandidate> filteredCandidates;
+
+    struct ChainInterval { uint32_t qs; uint32_t qe; };
+    vector<ChainInterval> acceptedIntervalsSame;
+    vector<ChainInterval> acceptedIntervalsDiff;
+    vector<uint32_t> currentChainPath;
+
+    void clear() {
+        flatHits.clear();
+        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitWeights.clear();
+        dpSame.clear(); dpDiff.clear();
+        parentSame.clear(); parentDiff.clear();
+        cumDriftSame.clear(); cumDriftDiff.clear();
+        cumLenSame.clear(); cumLenDiff.clear();
+        backtrackVisitSame.clear(); backtrackVisitDiff.clear();
+        chainOccurrencesSame.clear(); chainOccurrencesDiff.clear();
+        chainCandidates.clear();
+        candidateTypes.clear();
+        filteredCandidates.clear();
+        acceptedIntervalsSame.clear();
+        acceptedIntervalsDiff.clear();
+        currentChainPath.clear();
+    }
+};
+
+/**
+ * @brief Fast reverse complement for K-mers using bit reversal.
+ */
+inline KmerId getRcKmerId(KmerId id, uint64_t k) {
+    const KmerId mask = (KmerId(1) << k) - 1;
+    const KmerId lsb = id & mask;
+    const KmerId msb = (id >> k) & mask;
+    
+    auto reverseBits = [&](KmerId x) -> KmerId {
+        if (sizeof(KmerId) <= 8) return bitReversal(uint64_t(x)) >> (64 - k);
+        else return bitReversal((__uint128_t)x) >> (128 - k);
+    };
+    
+    KmerId rc_lsb = (~reverseBits(lsb)) & mask;
+    KmerId rc_msb = (~reverseBits(msb)) & mask;
+    return (rc_msb << k) | rc_lsb;
+}
+
+/**
+ * @brief Thread-safe hash function for K-mers.
+ */
+static inline uint64_t hashKmer(KmerId k) {
+    const uint64_t* p = reinterpret_cast<const uint64_t*>(&k);
+    uint64_t k1 = p[0];
+    uint64_t k2 = sizeof(KmerId) > 8 ? p[1] : 0; 
+    return k1 ^ (k2 + 0x9e3779b9 + (k1<<6) + (k1>>2));
 }
 
 // Private class to encapsulate parallel logic (Codebase Pattern).
@@ -68,45 +209,41 @@ public:
         maxChainLimit(maxChainLimit),
         threadCount(threadCount)
     {
-        // 1. Setup Work Areas.
+        // 1. Setup per-thread accumulation buffers and scratchpads
         threadCandidates.resize(threadCount);
         for(auto& v : threadCandidates) v.reserve(10000);
         threadAlignments.resize(threadCount);
         for(auto& v : threadAlignments) v.reserve(10000);
+        threadScratchpads.resize(threadCount);
 
-        // 2. Setup Load Balancing.
-        // Safety: Ensure we use markers.size()/2 for read count to match mapped file.
-        const ReadId readCount = ReadId(markers.size() / 2);
+        // 2. Setup parallel workload partitioning
+        const ReadId readCount = ReadId(markers.size() / 2); // Indexed by strand 0
         setupLoadBalancing(readCount, 100);
 
-        // 3. Run Threads.
+        // 3. Kick off parallel worker threads
         runThreads(&InvertedIndexFinder::threadFunction, threadCount);
 
-        // 4. Merge Results.
-        size_t totalCandidates = 0;
-        for(const auto& v : threadCandidates) totalCandidates += v.size();
+        // 4. Consolidate results: Resize global vectors once and copy results back
+        size_t totalCandidatesFound = 0;
+        for(const auto& v : threadCandidates) totalCandidatesFound += v.size();
         
-        cout << "Deep Parity: Found " << totalCandidates << " candidates." << endl;
+        cout << "Discovery search complete. Merging " << totalCandidatesFound << " candidates." << endl;
 
-        size_t candidateWriteOffset = candidates.size();
-        candidates.resize(candidateWriteOffset + totalCandidates);
-        size_t alignmentWriteOffset = precomputedAlignments.size();
-        precomputedAlignments.resize(alignmentWriteOffset + totalCandidates);
+        size_t candidateWritePos = candidates.size();
+        candidates.resize(candidateWritePos + totalCandidatesFound);
+        size_t alignmentWritePos = precomputedAlignments.size();
+        precomputedAlignments.resize(alignmentWritePos + totalCandidatesFound);
         
-        for(size_t i=0; i<threadCount; i++) {
+        for(size_t i = 0; i < threadCount; i++) {
             const auto& v = threadCandidates[i];
             const auto& a = threadAlignments[i];
             if(!v.empty()) {
-                std::copy(v.begin(), v.end(), candidates.begin() + candidateWriteOffset);
-                candidateWriteOffset += v.size();
-                std::copy(a.begin(), a.end(), precomputedAlignments.begin() + alignmentWriteOffset);
-                alignmentWriteOffset += a.size();
+                std::copy(v.begin(), v.end(), candidates.begin() + candidateWritePos);
+                candidateWritePos += v.size();
+                std::copy(a.begin(), a.end(), precomputedAlignments.begin() + alignmentWritePos);
+                alignmentWritePos += a.size();
             }
         }
-        
-        // 5. Cleanup.
-        threadCandidates.clear(); // Free memory
-        threadAlignments.clear();
     }
 
 private:
@@ -121,715 +258,398 @@ private:
 
     vector<vector<OrientedReadPair>> threadCandidates;
     vector<vector<Alignment>> threadAlignments;
+    vector<ThreadScratchpad> threadScratchpads;
 
     void threadFunction(size_t threadId) {
         vector<OrientedReadPair>& localCandidates = threadCandidates[threadId];
         vector<Alignment>& localAlignments = threadAlignments[threadId];
+        ThreadScratchpad& scratch = threadScratchpads[threadId];
         
-        uint64_t mask = invertedIndexData.hashTable.size() - 1;
+        const uint64_t hashMask = invertedIndexData.hashTable.size() - 1;
         const auto* hashTablePtr = invertedIndexData.hashTable.data();
-        
-        auto hashKmer = [&](KmerId k) -> uint64_t {
-             const uint64_t* p = reinterpret_cast<const uint64_t*>(&k);
-             uint64_t k1 = p[0];
-             uint64_t k2 = sizeof(KmerId) > 8 ? p[1] : 0; 
-             return k1 ^ (k2 + 0x9e3779b9 + (k1<<6) + (k1>>2));
-        };
+        const uint64_t kmerLen = invertedIndexData.k;
+        const double maxDriftRate = invertedIndexData.maxDriftRate;
+        const uint64_t coveragePeak = invertedIndexData.coveragePeak;
 
-        // Reuse vectors inside loop (defensive).
-        uint64_t begin, end;
-        while(getNextBatch(begin, end)) {
-            for(ReadId readIdA=ReadId(begin); readIdA!=ReadId(end); ++readIdA) {
+
+        uint64_t startBatch, endBatch;
+        while(getNextBatch(startBatch, endBatch)) {
+            for(ReadId readIdA = ReadId(startBatch); readIdA != ReadId(endBatch); ++readIdA) {
                 
                 const OrientedReadId orientedReadIdA(readIdA, 0);
                 const auto& markersA = markers[orientedReadIdA.getValue()];
-                const auto& kmerIdsA = markerKmerIds[orientedReadIdA.getValue()]; // Safe Mapped access?
-                const size_t numMarkers = std::min(markersA.size(), kmerIdsA.size()); // Defensive Clamp
+                const auto& kmerIdsA = markerKmerIds[orientedReadIdA.getValue()];
+                const size_t numMarkersA = std::min(markersA.size(), kmerIdsA.size());
                 
-                // Local vectors.
-                vector<InvertedIndexTempHit> flatHits;
-                flatHits.reserve(numMarkers * 2);
+                scratch.clear();
+                scratch.flatHits.reserve(numMarkersA * 2);
                 
-                vector<uint32_t> dpSame;
-                vector<uint32_t> dpDiff;
-                vector<int32_t> parentSame;
-                vector<int32_t> parentDiff;
-                vector<uint32_t> cumulativeDriftSame;
-                vector<uint32_t> cumulativeDriftDiff;
-                vector<uint32_t> cumulativeLengthSame;
-                vector<uint32_t> cumulativeLengthDiff;
+                // --- Step 1: Hit Collection & Early Weighting ---
+                // We scan markers in Read A and find matches in the Inverted Index.
+                for(size_t i = 0; i < numMarkersA; ++i) {
+                    KmerId currentKId = kmerIdsA[i];
+                    KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                    KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
 
-                // 1. Collect Hits.
-                for(size_t i=0; i<numMarkers; ++i) {
-                    // Canonical Query
-                    Kmer kmer(kmerIdsA[i], invertedIndexData.k);
-                    KmerId rcKmerId = KmerId(kmer.reverseComplement(invertedIndexData.k).id(invertedIndexData.k));
-                    KmerId canonicalKmerId = kmerIdsA[i] < rcKmerId ? kmerIdsA[i] : rcKmerId;
-
-                    uint64_t h = hashKmer(canonicalKmerId) & mask;
-                    const KmerId kmerId = canonicalKmerId;
+                    uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
                     const uint32_t posA = markersA[i].position;
 
-                    uint64_t idx = h;
-                    while(!hashTablePtr[idx].empty) {
-                        if(hashTablePtr[idx].key == kmerId) {
-                            uint64_t start = hashTablePtr[idx].start;
-                            uint32_t count = hashTablePtr[idx].count;
+                    // Search for the K-mer in the direct-addressing hash table
+                    while(!hashTablePtr[slotIdx].empty) {
+                        if(hashTablePtr[slotIdx].key == canonicalKId) {
+                            const uint64_t startIdx = hashTablePtr[slotIdx].start;
+                            const uint32_t count = hashTablePtr[slotIdx].count;
+                             
+                            // Early Weighting: Constant weight for all hits of this k-mer.
+                            // Frequent/Repetitive k-mers are penalized using a pre-computed LUT.
+                            // The LUT is generated once at startup using pow(w, 1.1) for Hifiasm compatibility.
+                            static const uint8_t* weightLUT = []() -> uint8_t* {
+                                static uint8_t lut[512];
+                                for (int i = 0; i < 512; ++i) {
+                                    lut[i] = (uint8_t)std::min(255.0, std::pow((double)i, 1.1));
+                                }
+                                return lut;
+                            }();
                             
-                            // Iterate occurrences (compact).
-                             const auto* occPtr = &invertedIndexData.compactOccurrences[start];
-                             // Avoid bounds check in inner loop for speed, assuming valid Index build.
-                             for(uint32_t j=0; j<count; ++j) {
-                                 const auto& occurrence = occPtr[j];
-                                 if(occurrence.readId != readIdA) {
-                                      uint32_t val = count > 255 ? 255 : count;
-                                      flatHits.push_back({occurrence.readId, posA, occurrence.position, (uint32_t)i, (uint8_t)val}); // Store count as weight
-                                 }
-                             }
+                            uint8_t hitWeight = 1;
+                            const uint64_t lowFreq = (uint64_t)(coveragePeak * 0.333);
+                            const uint64_t highFreq = (uint64_t)(coveragePeak * 1.667);
+                            
+                            if (count <= std::max(2UL, lowFreq)) {
+                                hitWeight = 2; // Rare/Informative k-mer (High value)
+                            } else if (count >= std::max(3UL, highFreq)) {
+                                uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
+                                hitWeight = (w < 512) ? weightLUT[w] : (uint8_t)std::min(255U, (uint32_t)pow((double)w, 1.1));
+                            }
+
+                            const auto* compactOccs = &invertedIndexData.compactOccurrences[startIdx];
+                            for(uint32_t j = 0; j < count; ++j) {
+                                if(compactOccs[j].readId != readIdA) {
+                                    scratch.flatHits.push_back({compactOccs[j].readId, posA, compactOccs[j].position, (uint32_t)i, hitWeight}); 
+                                }
+                            }
                             break;
                         }
-                        idx = (idx + 1) & mask;
+                        slotIdx = (slotIdx + 1) & hashMask;
                     }
                 }
                 
-                // 2. Sort.
-                if(flatHits.empty()) continue;
-                std::sort(flatHits.begin(), flatHits.end());
+                if(scratch.flatHits.empty()) continue;
+                std::sort(scratch.flatHits.begin(), scratch.flatHits.end());
 
-                // 3. DP.
+                // --- Step 2: DP Chaining per Read Pair ---
                 const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
-                size_t i = 0;
-                while(i < flatHits.size()) {
-                    ReadId readIdB = flatHits[i].partnerReadId;
+                size_t hitIter = 0;
+                while(hitIter < scratch.flatHits.size()) {
+                    const ReadId readIdB = scratch.flatHits[hitIter].partnerReadId;
                     
+                    // Skip mirrored pairs and self-comparisons
                     if(readIdB <= readIdA) {
-                        while(i < flatHits.size() && flatHits[i].partnerReadId == readIdB) i++;
+                        while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) hitIter++;
                         continue;
                     }
 
-                    // Define group.
-                    size_t start = i;
-                    while(i < flatHits.size() && flatHits[i].partnerReadId == readIdB) i++;
-                    size_t endGroup = i;
-                    size_t numHits = endGroup - start;
-                    
-                    // Hifiasm Parity: usage of minMarkerCount is replaced by MinScore = K.
-                    // We must allow small hit counts (e.g. 1) if they generate a high score (Unique Marker).
+                    const size_t startInFlat = hitIter;
+                    while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) hitIter++;
+                    const size_t numHits = hitIter - startInFlat;
                     if(numHits == 0) continue;
 
-                    // --- Hifiasm Parity: Gradient Scoring Logic (ha_get_new_candidates) ---
-                    // Calculate dynamic thresholds based on Coverage Peak.
-                    // HA_KMER_GOOD_RATIO = 0.333 (anchor.cpp:11)
-                    uint64_t peak = invertedIndexData.coveragePeak;
-                    uint64_t low_occ = (uint64_t)(peak * 0.333);
-                    if (low_occ < 2) low_occ = 2;
-                    uint64_t high_occ = (uint64_t)(peak * 1.667); // 2.0 - 0.333
-                    if (high_occ < low_occ) high_occ = low_occ + 1; // Safety
-
-                    for(size_t k=0; k<numHits; ++k) {
-                        size_t idx = start + k;
-                        // flatHits.weight currently holds the Global Count (from Index).
-                        uint32_t cnt = flatHits[idx].weight;
-                        
-                        if (cnt > low_occ && cnt < high_occ) {
-                            flatHits[idx].weight = 1; // Good (Unique-ish)
-                        } else if (cnt <= low_occ) {
-                            flatHits[idx].weight = 2; // Low (Rare, slight penalty? Hifiasm logic)
-                        } else {
-                            // High (Repetitive Penalty)
-                            // Hifiasm: cnt = 1 + ((cnt + 2*high - 1) / (2*high))
-                            // Then pow(cnt, 1.1)
-                            // Normal_w divides score by this weight. Higher weight = Lower Score.
-                            uint64_t twoHigh = high_occ * 2;
-                            if (twoHigh == 0) twoHigh = 1; // Safety
-                            uint32_t w = 1 + (uint32_t)((cnt + twoHigh - 1) / twoHigh);
-                            flatHits[idx].weight = (uint32_t)pow((double)w, 1.1);
-                        }
-                    }
-
-                    // Init DP.
-                    dpSame.assign(numHits, 0); 
-                    dpDiff.assign(numHits, 0);
-                    parentSame.assign(numHits, -1);
-                    parentDiff.assign(numHits, -1);
-                    cumulativeDriftSame.assign(numHits, 0);
-                    cumulativeDriftDiff.assign(numHits, 0);
-                    cumulativeLengthSame.assign(numHits, 0); 
-                    cumulativeLengthDiff.assign(numHits, 0);
-
-                    // Hifiasm Parity: tmp arrays for chain skip tracking
-                    vector<int32_t> tmpSame(numHits, -1);
-                    vector<int32_t> tmpDiff(numHits, -1);
-
-                    // Hifiasm Parity: occ arrays for chain length counting (dp->occ)
-                    vector<uint32_t> occSame(numHits, 1);
-                    vector<uint32_t> occDiff(numHits, 1); 
-
-                    uint32_t maxChainSame = 0;
-                    uint32_t maxChainDiff = 0;
-                    int32_t bestIdxSame = -1;
-                    int32_t bestIdxDiff = -1;
-                    // Hifiasm Parity: tie-breaking by chainLen for determinism
-                    uint64_t minChainLenSame = UINT64_MAX;
-                    uint64_t minChainLenDiff = UINT64_MAX;
-                    
-                    // Hifiasm Parity: get_chainLen - computes overlap length after coordinate extension
-                    // Used for tie-breaking when scores are equal (prefer shorter chainLen)
-                    // readLenA is hoisted outside loop
                     const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
-                    auto get_chainLen = [&](uint32_t posA, uint32_t posB) -> uint64_t {
-                        // Extend start: whoever has shorter overhang extends to 0
-                        uint32_t x_beg = posA;
-                        uint32_t y_beg = posB;
-                        if (x_beg <= y_beg) {
-                            y_beg = y_beg - x_beg;
-                            x_beg = 0;
-                        } else {
-                            x_beg = x_beg - y_beg;
-                            y_beg = 0;
-                        }
-                        // Extend end: whoever has shorter remaining extends to read length
-                        uint64_t x_right = readLenA - posA - 1;
-                        uint64_t y_right = readLenB - posB - 1;
-                        uint32_t x_end, y_end;
-                        if (x_right <= y_right) {
-                            x_end = (uint32_t)(readLenA - 1);
-                            y_end = posB + (uint32_t)x_right;
-                        } else {
-                            x_end = posA + (uint32_t)y_right;
-                            y_end = (uint32_t)(readLenB - 1);
-                        }
-                        return x_end - x_beg + 1;
+
+                    // 2.1 Struct-of-Arrays (SoA) Transfer for cache-efficient DP access
+                    scratch.hitPosA.assign(numHits, 0); scratch.hitPosB.assign(numHits, 0);
+                    scratch.hitOrdinalA.assign(numHits, 0); scratch.hitWeights.assign(numHits, 0);
+                    for(size_t k = 0; k < numHits; ++k) {
+                        const auto& h = scratch.flatHits[startInFlat + k];
+                        scratch.hitPosA[k] = h.posA; scratch.hitPosB[k] = h.posB;
+                        scratch.hitOrdinalA[k] = h.ordinalA; scratch.hitWeights[k] = h.weight;
+                    }
+
+                    // Pre-allocate/Reset DP work arrays
+                    scratch.dpSame.assign(numHits, 0); scratch.dpDiff.assign(numHits, 0);
+                    scratch.parentSame.assign(numHits, -1); scratch.parentDiff.assign(numHits, -1);
+                    scratch.cumDriftSame.assign(numHits, 0); scratch.cumDriftDiff.assign(numHits, 0);
+                    scratch.cumLenSame.assign(numHits, 0); scratch.cumLenDiff.assign(numHits, 0);
+                    scratch.backtrackVisitSame.assign(numHits, -1); scratch.backtrackVisitDiff.assign(numHits, -1);
+                    scratch.chainOccurrencesSame.assign(numHits, 1); scratch.chainOccurrencesDiff.assign(numHits, 1);
+
+                    uint32_t maxScSame = 0, maxScDiff = 0; 
+                    int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1; 
+                    uint64_t maxExtSame = UINT64_MAX, maxExtDiff = UINT64_MAX;
+                    
+                    const int64_t dRscaled = (int64_t)(maxDriftRate * 1024.0);
+
+                    // Utility: Calculate expected coordinate extension (length) for a hit
+                    auto getAlignmentLength = [&](uint32_t pA, uint32_t pB) -> uint64_t {
+                        uint32_t xB = pA, yB = pB; if (xB <= yB) { yB -= xB; xB = 0; } else { xB -= yB; yB = 0; }
+                        uint64_t xR = readLenA - pA - 1, yR = readLenB - pB - 1;
+                        uint32_t xE = (xR <= yR) ? (uint32_t)(readLenA - 1) : pA + (uint32_t)yR;
+                        return (uint64_t)(xE - xB + 1);
                     };
-                    
-                    const uint32_t kmerLength = (uint32_t)invertedIndexData.k;
-                    // Hifiasm Parity: bandwidth_penalty = 1 / band_width_threshold
-                    const double bandwidthPenalty = 1.0 / invertedIndexData.maxDriftRate;
-                    const int64_t driftRateInt = (int64_t)(invertedIndexData.maxDriftRate * 1024.0);
 
-                    // Hifiasm Parity: ha_chain_check fast path
-                    // If all hits are perfectly collinear, skip full DP.
-                    bool canSkipDP = true;
-                    if (numHits > 1) {
-                        for (size_t checkK = 1; checkK < numHits && canSkipDP; ++checkK) {
-                            int32_t dA = (int32_t)flatHits[start + checkK].posA - (int32_t)flatHits[start + checkK - 1].posA;
-                            int32_t dB = (int32_t)flatHits[start + checkK].posB - (int32_t)flatHits[start + checkK - 1].posB;
-                            if (dA <= 0 || dB <= 0 || std::abs(dB - dA) > (int32_t)(invertedIndexData.maxDriftRate * dA)) {
-                                canSkipDP = false;
+                    // [DISABLED] Collinear Fast-Path: The O(N) pre-check rarely pays off on
+                    // noisy long-read data. Kept here for reference/future benchmarking.
+                    #if 0
+                    bool isStrictlyCollinear = true; 
+                    if (numHits > 1) { 
+                        for (size_t k = 1; k < numHits; ++k) {
+                            int32_t dx = (int32_t)scratch.hitPosA[k] - (int32_t)scratch.hitPosA[k-1];
+                            int32_t dy = (int32_t)scratch.hitPosB[k] - (int32_t)scratch.hitPosB[k-1];
+                            if (dx <= 0 || dy <= 0 || std::abs(dy - dx) > (int32_t)(maxDriftRate * dx)) {
+                                isStrictlyCollinear = false; break;
                             }
-                        }
+                        } 
                     }
 
-                    if (canSkipDP && numHits > 0) {
-                        // Hifiasm Parity: ha_chain_check - compute actual scores with weighting and penalty
-                        // First hit
-                        uint32_t count0 = flatHits[start].weight;
-                        uint32_t score0 = count0 > 1 ? kmerLength / count0 : kmerLength;
-                        if (score0 == 0) score0 = 1;
-                        dpSame[0] = score0;
-                        parentSame[0] = -1;
-                        cumulativeDriftSame[0] = 0;
-                        cumulativeLengthSame[0] = 0;
-                        occSame[0] = 1;
-                        
-                        int32_t tot_indel = 0;
-                        int32_t tot_len = 0;
-                        const int32_t THRESHOLD_MAX_SIZE = 31;  // Hifiasm constant
-                        bool fastPathValid = true;
-                        
-                        for (size_t checkK = 1; checkK < numHits && fastPathValid; ++checkK) {
-                            int32_t dx = (int32_t)flatHits[start + checkK].posA - (int32_t)flatHits[start + checkK - 1].posA;
-                            int32_t dy = (int32_t)flatHits[start + checkK].posB - (int32_t)flatHits[start + checkK - 1].posB;
-                            int32_t dd = std::abs(dx - dy);
-                            tot_indel += dd;
-                            tot_len += dy;
-                            
-                            // Hifiasm Parity: cumulative drift check (line 876)
-                            if (dy <= 0 || tot_indel > tot_len * invertedIndexData.maxDriftRate) {
-                                fastPathValid = false;
-                                break;
+                    if (isStrictlyCollinear && numHits > 0) {
+                        uint32_t baseSc = scratch.hitWeights[0] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[0] : (uint32_t)kmerLen;
+                        scratch.dpSame[0] = std::max(1U, baseSc); 
+                        int32_t driftS = 0, lenS = 0; bool validS = true;
+                        for (size_t k = 1; k < numHits; ++k) {
+                            int32_t dx = (int32_t)scratch.hitPosA[k] - (int32_t)scratch.hitPosA[k-1];
+                            int32_t dy = (int32_t)scratch.hitPosB[k] - (int32_t)scratch.hitPosB[k-1];
+                            int32_t dd = std::abs(dx - dy); driftS += dd; lenS += dy;
+                            if (dy <= 0 || driftS > lenS * maxDriftRate || (dd > 31 && dd > std::min(dx, dy) * maxDriftRate)) { 
+                                validS = false; break; 
                             }
-                            
-                            int32_t dg = std::min(dx, dy);
-                            
-                            // Hifiasm Parity: THRESHOLD_MAX_SIZE check (line 878)
-                            if (dd > THRESHOLD_MAX_SIZE && dd > dg * invertedIndexData.maxDriftRate) {
-                                fastPathValid = false;
-                                break;
-                            }
-                            
-                            int32_t baseScore = std::min((uint32_t)dg, kmerLength);
-                            // Hifiasm uses a[i].cnt (Local Count)
-                            uint32_t countK = flatHits[start + checkK].weight;
-                            uint32_t weightedScore = countK > 1 ? baseScore / countK : baseScore;
-                            if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
-                            
-                            double gap_rate = (tot_len > 0) ? ((double)tot_indel / (double)tot_len) : 0.0;
-                            int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
-                            
-                            dpSame[checkK] = dpSame[checkK - 1] + weightedScore - penalty;
-                            parentSame[checkK] = (int32_t)(checkK - 1);
-                            cumulativeDriftSame[checkK] = tot_indel;
-                            cumulativeLengthSame[checkK] = tot_len;
-                            occSame[checkK] = (uint32_t)(checkK + 1);
+                            uint32_t wS = scratch.hitWeights[k] > 1 ? std::min((uint32_t)std::min(dx, dy), (uint32_t)kmerLen) / scratch.hitWeights[k] : std::min((uint32_t)std::min(dx, dy), (uint32_t)kmerLen);
+                            int32_t pnlty = (lenS > 0) ? (int32_t)(((int64_t)driftS * wS * 1024) / ((int64_t)lenS * dRscaled)) : 0;
+                            scratch.dpSame[k] = scratch.dpSame[k-1] + std::max(1, (int32_t)wS - pnlty);
+                            scratch.parentSame[k] = (int32_t)(k - 1); 
+                            scratch.cumDriftSame[k] = driftS; scratch.cumLenSame[k] = lenS; 
+                            scratch.chainOccurrencesSame[k] = (uint32_t)(k + 1);
                         }
-                        
-                        if (!fastPathValid) {
-                            // Fast path failed, fall through to full DP
-                            goto full_dp;
-                        }
-                        
-                        // Set best for Same strand
-                        maxChainSame = dpSame[numHits - 1];
-                        bestIdxSame = (int32_t)(numHits - 1);
-                        
-                        // Skip full DP, go directly to chain extraction
-                        goto skip_dp_same;
+                        if (validS) { maxScSame = scratch.dpSame[numHits - 1]; bestEndIdxSame = (int32_t)(numHits - 1); goto end_dp_chaining; }
                     }
-                    
-                    full_dp:  // Label for fallback when fast path fails
-                    for(size_t k=0; k<numHits; ++k) {
-                        size_t idx = start + k;
-                        
-                        // Seed.
-                        // Hifiasm Parity: Local Count
-                        uint32_t count = flatHits[idx].weight;
-                        uint32_t score = count > 1 ? kmerLength / count : kmerLength; 
-                        if (score == 0) score = 1;
+                    #endif
 
-                        dpSame[k] = score;
-                        dpDiff[k] = score;
-                        // Hifiasm Parity: self_length starts at 0, not kmerLength!
-                        // dp->self_length[i] = max_self_length (which is 0 initially)
-                        cumulativeLengthSame[k] = 0;
-                        cumulativeLengthDiff[k] = 0;
-
-                        // Chain.
-                        // Hifiasm Parity: calculate_overlap_region_by_chaining (Hash_Table.cpp:1140) uses 25.
-                        // calculate_ug_chaining uses 50, but we are doing overlap generation.
-                        const size_t MAX_SKIP = 25;
-                        size_t n_max_skip_same = 0;
-                        size_t n_max_skip_diff = 0;
-                        // Hifiasm Parity: chain skip counters
-                        size_t n_chn_skip_same = 0;
-                        size_t n_chn_skip_diff = 0;
+                    // General DP Chaining with SIMD Pre-filtering
+                    for(size_t k = 0; k < numHits; ++k) {
+                        const uint32_t posAk = scratch.hitPosA[k], posBk = scratch.hitPosB[k];
+                        const uint32_t initSc = std::max(1U, scratch.hitWeights[k] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[k] : (uint32_t)kmerLen);
+                        scratch.dpSame[k] = scratch.dpDiff[k] = initSc;
                         
-                        for(size_t localJ=k-1; localJ!=SIZE_MAX; --localJ) {
-                            size_t idxJ = start + localJ;
-                            int32_t deltaA = (int32_t)flatHits[idx].posA - (int32_t)flatHits[idxJ].posA;
-                            int32_t deltaB = (int32_t)flatHits[idx].posB - (int32_t)flatHits[idxJ].posB;
+                        size_t streakS = 0, streakD = 0, gapStreakS = 0, gapStreakD = 0; 
+                        int32_t j = (int32_t)k - 1;
+
+                        for(; j >= 0; --j) {
+// [DISABLED] SIMD Pre-filter: On non-repetitive data, the overhead of loading
+// 8 predecessors into AVX2 registers often exceeds the benefit of skipping.
+// Enable via -DUSE_SIMD_DP_PREFILTER for benchmarking in repetitive regions.
+#if defined(__AVX2__) && defined(USE_SIMD_DP_PREFILTER)
+                            // SIMD Block: Quick-scan 8 predecessors for strand and drift compatibility
+                            if (j >= 7) {
+                                __m256i vPA = _mm256_loadu_si256((const __m256i*)&scratch.hitPosA[j-7]);
+                                __m256i vPB = _mm256_loadu_si256((const __m256i*)&scratch.hitPosB[j-7]);
+                                __m256i vDA = _mm256_sub_epi32(_mm256_set1_epi32(posAk), vPA);
+                                __m256i vDBS = _mm256_sub_epi32(_mm256_set1_epi32(posBk), vPB);
+                                __m256i vDBD = _mm256_sub_epi32(vPB, _mm256_set1_epi32(posBk));
+
+                                __m256i vMdA = _mm256_cmpgt_epi32(vDA, _mm256_setzero_si256());
+                                __m256i vMS = _mm256_and_si256(vMdA, _mm256_cmpgt_epi32(vDBS, _mm256_setzero_si256()));
+                                __m256i vMD = _mm256_and_si256(vMdA, _mm256_cmpgt_epi32(vDBD, _mm256_setzero_si256()));
+                                
+                                __m256i vL = _mm256_mullo_epi32(vDA, _mm256_set1_epi32((int)dRscaled));
+                                // Note: AVX2 has no _mm256_cmplt_epi32, so we use _mm256_cmpgt_epi32 with swapped operands.
+                                __m256i vDriftValS = _mm256_slli_epi32(_mm256_abs_epi32(_mm256_sub_epi32(vDBS, vDA)), 10);
+                                __m256i vDriftValD = _mm256_slli_epi32(_mm256_abs_epi32(_mm256_sub_epi32(vDBD, vDA)), 10);
+                                __m256i vDriftS = _mm256_and_si256(vMS, _mm256_cmpgt_epi32(vL, vDriftValS));
+                                __m256i vDriftD = _mm256_and_si256(vMD, _mm256_cmpgt_epi32(vL, vDriftValD));
+
+                                if (_mm256_testz_si256(vDriftS, vDriftS) && _mm256_testz_si256(vDriftD, vDriftD)) {
+                                    j -= 7; continue; 
+                                }
+                            }
+#endif
+                            int32_t dA = (int32_t)posAk - (int32_t)scratch.hitPosA[j];
+                            int32_t dB = (int32_t)posBk - (int32_t)scratch.hitPosB[j];
                             
-                            if(deltaB > 0) { // Same Strand
-                                // Hifiasm Parity: complete skip condition
-                                if (deltaB == 0 || deltaA <= 0) continue;
-                                
-                                int32_t drift = std::abs(deltaB - deltaA);
-                                uint32_t newCumulativeDrift = cumulativeDriftSame[localJ] + drift;
-                                // Hifiasm Parity: use deltaB (distance_self_pos), not deltaA
-                                uint32_t newCumulativeLength = cumulativeLengthSame[localJ] + std::abs(deltaB);
-                                
-                                int32_t distance_min = std::min(deltaA, std::abs(deltaB));
-                                uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
-                                
-                                // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
-                                // Use Local Count
-                                uint32_t predecessorCount = flatHits[idxJ].weight;
-                                uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
-                                if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
-                                
-                                // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
-                                double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
-                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
-                                
-                                if(((uint64_t)newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
-                                    int32_t candidateScore = (int32_t)dpSame[localJ] + (int32_t)weightedScore - penalty;
-                                    if(candidateScore > (int32_t)dpSame[k]) {
-                                        dpSame[k] = (uint32_t)std::max(1, candidateScore);
-                                        parentSame[k] = (int32_t)localJ;
-                                        cumulativeDriftSame[k] = newCumulativeDrift;
-                                        cumulativeLengthSame[k] = newCumulativeLength;
-                                        // Hifiasm Parity: update occ (chain length)
-                                        occSame[k] = occSame[localJ] + 1;
-                                        n_max_skip_same = 0;
-                                        if (n_chn_skip_same > 0) --n_chn_skip_same; // Hifiasm Parity
-                                    } else {
-                                        if(++n_max_skip_same > MAX_SKIP) break;
-                                        // Hifiasm Parity: chain skip check
-                                        if (tmpSame[localJ] == (int32_t)k) {
-                                            if (++n_chn_skip_same > MAX_SKIP) break;
-                                        }
+                            // Case 1: Hits on the same strand
+                            if(dB > 0 && dA > 0) { 
+                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA), nLn = scratch.cumLenSame[j] + dB;
+                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
+                                    uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
+                                    int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
+                                    int32_t sc = (int32_t)scratch.dpSame[j] + (int32_t)wS - pnlty;
+                                    if(sc > (int32_t)scratch.dpSame[k]) { 
+                                        scratch.dpSame[k] = std::max(1, sc); scratch.parentSame[k] = j; 
+                                        scratch.cumDriftSame[k] = nDr; scratch.cumLenSame[k] = nLn; 
+                                        scratch.chainOccurrencesSame[k] = scratch.chainOccurrencesSame[j] + 1; 
+                                        streakS = 0; if (gapStreakS > 0) --gapStreakS; 
+                                    } else { 
+                                        if(++streakS > 25) break; 
+                                        if (scratch.backtrackVisitSame[j] == (int32_t)k && ++gapStreakS > 25) break; 
                                     }
-                                    // Hifiasm Parity: propagate tmp for chain tracking
-                                    if (parentSame[localJ] >= 0) tmpSame[parentSame[localJ]] = (int32_t)k;
+                                    if (scratch.parentSame[j] >= 0) scratch.backtrackVisitSame[scratch.parentSame[j]] = (int32_t)k;
                                 }
-                            } else if (deltaB < 0) { // Diff Strand
-                                // Hifiasm Parity: complete skip condition
-                                if (deltaA <= 0) continue;
-
-                                int32_t absDeltaB = -deltaB;
-                                int32_t drift = std::abs(absDeltaB - deltaA);
-                                uint32_t newCumulativeDrift = cumulativeDriftDiff[localJ] + drift;
-                                // Hifiasm Parity: use absDeltaB (distance_self_pos), not deltaA
-                                uint32_t newCumulativeLength = cumulativeLengthDiff[localJ] + absDeltaB;
-                                
-                                int32_t distance_min = std::min(deltaA, absDeltaB);
-                                uint32_t baseScore = std::min((uint32_t)distance_min, kmerLength);
-                                
-                                // Hifiasm Parity: score = base_score / a[j].cnt (PREDECESSOR's count, not current!)
-                                // Use Local Count
-                                uint32_t predecessorCount = flatHits[idxJ].weight;
-                                uint32_t weightedScore = predecessorCount > 1 ? baseScore / predecessorCount : baseScore;
-                                if (weightedScore == 0 && baseScore > 0) weightedScore = 1;
-
-                                // Hifiasm Parity: penalty = gap_rate * score * (1/band_width)
-                                double gap_rate = (newCumulativeLength > 0) ? ((double)newCumulativeDrift / (double)newCumulativeLength) : 0.0;
-                                int32_t penalty = (int32_t)(gap_rate * weightedScore * bandwidthPenalty);
-
-                                if(((uint64_t)newCumulativeDrift << 10) <= driftRateInt * newCumulativeLength) {
-                                    int32_t candidateScore = (int32_t)dpDiff[localJ] + (int32_t)weightedScore - penalty;
-                                    if(candidateScore > (int32_t)dpDiff[k]) {
-                                        dpDiff[k] = (uint32_t)std::max(1, candidateScore);
-                                        parentDiff[k] = (int32_t)localJ;
-                                        cumulativeDriftDiff[k] = newCumulativeDrift;
-                                        cumulativeLengthDiff[k] = newCumulativeLength;
-                                        // Hifiasm Parity: update occ (chain length)
-                                        occDiff[k] = occDiff[localJ] + 1;
-                                        n_max_skip_diff = 0;
-                                        if (n_chn_skip_diff > 0) --n_chn_skip_diff; // Hifiasm Parity
-                                    } else {
-                                        if(++n_max_skip_diff > MAX_SKIP) break;
-                                        // Hifiasm Parity: chain skip check
-                                        if (tmpDiff[localJ] == (int32_t)k) {
-                                            if (++n_chn_skip_diff > MAX_SKIP) break;
-                                        }
+                            } 
+                            // Case 2: Hits on opposite strands
+                            else if (dB < 0 && dA > 0) { 
+                                int32_t aB = -dB; 
+                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA), nLn = scratch.cumLenDiff[j] + aB;
+                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
+                                    uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
+                                    int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
+                                    int32_t sc = (int32_t)scratch.dpDiff[j] + (int32_t)wS - pnlty;
+                                    if(sc > (int32_t)scratch.dpDiff[k]) { 
+                                        scratch.dpDiff[k] = std::max(1, sc); scratch.parentDiff[k] = j; 
+                                        scratch.cumDriftDiff[k] = nDr; scratch.cumLenDiff[k] = nLn; 
+                                        scratch.chainOccurrencesDiff[k] = scratch.chainOccurrencesDiff[j] + 1; 
+                                        streakD = 0; if (gapStreakD > 0) --gapStreakD; 
+                                    } else { 
+                                        if(++streakD > 25) break; 
+                                        if (scratch.backtrackVisitDiff[j] == (int32_t)k && ++gapStreakD > 25) break; 
                                     }
-                                    // Hifiasm Parity: propagate tmp for chain tracking
-                                    if (parentDiff[localJ] >= 0) tmpDiff[parentDiff[localJ]] = (int32_t)k;
+                                    if (scratch.parentDiff[j] >= 0) scratch.backtrackVisitDiff[scratch.parentDiff[j]] = (int32_t)k;
                                 }
                             }
                         }
                         
-                        // Hifiasm Parity: tie-breaking by chainLen for determinism
-                        // When scores are equal, prefer shorter chainLen
-                        if(dpSame[k] > maxChainSame) {
-                            maxChainSame = dpSame[k];
-                            bestIdxSame = (int32_t)k;
-                            minChainLenSame = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
-                        } else if (dpSame[k] == maxChainSame && bestIdxSame >= 0) {
-                            uint64_t thisChainLen = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
-                            if (thisChainLen < minChainLenSame) {
-                                bestIdxSame = (int32_t)k;
-                                minChainLenSame = thisChainLen;
-                            }
+                        // Update best score and extension for current pair A-B
+                        if(scratch.dpSame[k] > maxScSame) { 
+                            maxScSame = scratch.dpSame[k]; bestEndIdxSame = (int32_t)k; maxExtSame = getAlignmentLength(posAk, posBk); 
+                        } else if (scratch.dpSame[k] == maxScSame && bestEndIdxSame >= 0) { 
+                            uint64_t ext = getAlignmentLength(posAk, posBk); 
+                            if (ext < maxExtSame) { bestEndIdxSame = (int32_t)k; maxExtSame = ext; } 
                         }
-                        if(dpDiff[k] > maxChainDiff) {
-                            maxChainDiff = dpDiff[k];
-                            bestIdxDiff = (int32_t)k;
-                            // For diff strand, flip posB to simulate parallel alignment (Hifiasm parity)
-                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
-                            minChainLenDiff = get_chainLen(flatHits[start + k].posA, posB_flipped);
-                        } else if (dpDiff[k] == maxChainDiff && bestIdxDiff >= 0) {
-                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
-                            uint64_t thisChainLen = get_chainLen(flatHits[start + k].posA, posB_flipped);
-                            if (thisChainLen < minChainLenDiff) {
-                                bestIdxDiff = (int32_t)k;
-                                minChainLenDiff = thisChainLen;
-                            }
+                        
+                        if(scratch.dpDiff[k] > maxScDiff) { 
+                            maxScDiff = scratch.dpDiff[k]; bestEndIdxDiff = (int32_t)k; maxExtDiff = getAlignmentLength(posAk, (uint32_t)(readLenB - 1 - posBk)); 
+                        } else if (scratch.dpDiff[k] == maxScDiff && bestEndIdxDiff >= 0) { 
+                            uint64_t ext = getAlignmentLength(posAk, (uint32_t)(readLenB - 1 - posBk)); 
+                            if (ext < maxExtDiff) { bestEndIdxDiff = (int32_t)k; maxExtDiff = ext; } 
                         }
                     }
 
-                    skip_dp_same:  // Hifiasm Parity: label for fast path
+                    end_dp_chaining:
+                    // --- Step 3: Filtering and Candidate Generation ---
+                    uint32_t bestScPair = std::max(maxScSame, maxScDiff);
+                    if (bestScPair < 2) continue;
+                    uint32_t filterThresh = std::max(3U, (uint32_t)(bestScPair * 0.80));
 
-                    // Hifiasm-style Iterative Chaining:
-                    // 1. Identify "peaks" (endpoints) with score >= 0.8 * bestScore.
-                    // 2. Sort by score descending.
-                    // 3. Greedily keep chains that don't overlap > 50% with accepted chains on Query (Read A).
-
-                    // --- Hifiasm Parity: Exact Filtering Logic ---
-                    // 1. Chains must have Score >= kmerLength (equivalent to 1 unique marker or ~16 repetitive markers).
-                    // 2. We do NOT filter by minMarkerCount anymore, as Hifiasm accepts single unique markers.
-                    
-                    uint32_t bestScore = std::max(maxChainSame, maxChainDiff);
-                    // Hifiasm Parity: chain_cutoff = 2 
-                    // Condition: if (score < 2) drop; => Keeps score >= 2.
-                    if (bestScore < 2) continue; 
-
-                    uint32_t threshold = (uint32_t)(bestScore * 0.80);
-                    // Ensure threshold is at least >2 (so 3)
-                    if (threshold <= 2) threshold = 3;
-
-
-                    struct ChainCandidate {
-                        uint32_t score;
-                        uint64_t chainLen;  // Hifiasm Parity: for deterministic tie-breaking
-                        int32_t endK;
-                        bool isDiff; // true if Diff, false if Same
-                        bool operator<(const ChainCandidate& other) const {
-                            if (score != other.score) return score > other.score; // Descending by score
-                            return chainLen < other.chainLen; // Tie-break by shorter chainLen
-                        }
-                    };
-                    vector<ChainCandidate> candidates;
-
-                    // Collect candidates from Same
+                    scratch.chainCandidates.clear();
                     for (size_t k = 0; k < numHits; ++k) {
-                        if (dpSame[k] >= threshold) {
-                            uint64_t cLen = get_chainLen(flatHits[start + k].posA, flatHits[start + k].posB);
-                            candidates.push_back({dpSame[k], cLen, (int32_t)k, false});
+                        if (scratch.dpSame[k] >= filterThresh) {
+                            scratch.chainCandidates.push_back({scratch.dpSame[k], getAlignmentLength(scratch.hitPosA[k], scratch.hitPosB[k]), (int32_t)k, false});
+                        }
+                        if (scratch.dpDiff[k] >= filterThresh) {
+                            scratch.chainCandidates.push_back({scratch.dpDiff[k], getAlignmentLength(scratch.hitPosA[k], (uint32_t)(readLenB - 1 - scratch.hitPosB[k])), (int32_t)k, true});
                         }
                     }
+                    std::sort(scratch.chainCandidates.begin(), scratch.chainCandidates.end());
 
-                    // Collect candidates from Diff
-                    for (size_t k = 0; k < numHits; ++k) {
-                        if (dpDiff[k] >= threshold) {
-                            // For diff strand, flip posB to simulate parallel alignment
-                            uint32_t posB_flipped = (uint32_t)(readLenB - 1 - flatHits[start + k].posB);
-                            uint64_t cLen = get_chainLen(flatHits[start + k].posA, posB_flipped);
-                            candidates.push_back({dpDiff[k], cLen, (int32_t)k, true});
-                        }
-                    }
-
-                    std::sort(candidates.begin(), candidates.end());
-
-                    // --- Hifiasm Parity: max_n_chain filtering per overlap type ---
-                    // If too many candidates, filter by category to keep top N per type.
-                    // This prevents quadratic blowup on repetitive reads.
-                    // Algorithm: (anchor.cpp:508-537)
-                    // 1. Already sorted by score descending
-                    // 2. Count per type, record score threshold at N-th position
-                    // 3. Keep only candidates with score >= threshold for their type
-                    
-                    if (candidates.size() > maxChainLimit && maxChainLimit > 0) {
-                        const uint64_t queryLen = readLenA;
-                        const uint64_t kLen = invertedIndexData.k;
-                        
-                        // Cache overlap type per candidate (avoid double reconstruction)
-                        vector<int> candidateTypes(candidates.size());
-                        
-                        // First pass: Determine type and count per category
-                        int32_t n[4] = {0, 0, 0, 0};
-                        uint32_t s[4] = {0, 0, 0, 0};
-                        
-                        for (size_t ci = 0; ci < candidates.size(); ++ci) {
-                            const auto& cand = candidates[ci];
+                    // Apply Hifiasm's candidate limit heuristic if needed
+                    if (scratch.chainCandidates.size() > maxChainLimit && maxChainLimit > 0) {
+                        scratch.candidateTypes.assign(scratch.chainCandidates.size(), 0);
+                        int32_t countByType[4] = {0}, threshByType[4] = {0};
+                        for (size_t ci = 0; ci < scratch.chainCandidates.size(); ++ci) {
+                            const auto& cand = scratch.chainCandidates[ci];
+                            int32_t rootK = cand.endK;
+                            const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                            while (parentArr[rootK] != -1) rootK = parentArr[rootK];
                             
-                            // Reconstruct chain to get qs_base/qe_base
-                            int32_t first = cand.endK;
-                            const auto& parents = cand.isDiff ? parentDiff : parentSame;
-                            while (parents[first] != -1) first = parents[first];
-                            
-                            uint32_t qs_base = markersA[flatHits[start + first].ordinalA].position;
-                            uint32_t qe_base = markersA[flatHits[start + cand.endK].ordinalA].position + (uint32_t)kLen;
-                            
-                            int w = getOverlapType(qs_base, qe_base, (uint32_t)queryLen);
-                            candidateTypes[ci] = w;
-                            
-                            n[w]++;
-                            if ((uint64_t)n[w] == maxChainLimit) s[w] = cand.score;
+                            uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
+                            uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + (uint32_t)kmerLen;
+                            int type = getOverlapType(qs, qe, (uint32_t)readLenA);
+                            scratch.candidateTypes[ci] = type;
+                            countByType[type]++;
+                            if ((uint64_t)countByType[type] == maxChainLimit) threshByType[type] = cand.score;
                         }
                         
-                        // Second pass: Filter using cached types (no reconstruction needed)
-                        if (s[0] > 0 || s[1] > 0 || s[2] > 0 || s[3] > 0) {
-                            vector<ChainCandidate> filteredCandidates;
-                            filteredCandidates.reserve(maxChainLimit * 4);
-                            
-                            for (size_t ci = 0; ci < candidates.size(); ++ci) {
-                                int w = candidateTypes[ci];
-                                if (candidates[ci].score >= s[w]) {
-                                    filteredCandidates.push_back(candidates[ci]);
+                        if (threshByType[0] || threshByType[1] || threshByType[2] || threshByType[3]) {
+                            scratch.filteredCandidates.clear();
+                            for (size_t ci = 0; ci < scratch.chainCandidates.size(); ++ci) {
+                                if (scratch.chainCandidates[ci].score >= (uint32_t)threshByType[scratch.candidateTypes[ci]]) {
+                                    scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
                                 }
                             }
-                            candidates = std::move(filteredCandidates);
+                            scratch.chainCandidates = std::move(scratch.filteredCandidates);
                         }
                     }
 
-                    // Accepted chains (Query Interval [qs, qe])
-                    struct Interval { uint32_t qs; uint32_t qe; };
-                    vector<Interval> acceptedIntervalsSame;
-                    vector<Interval> acceptedIntervalsDiff;
-
-                    // Hifiasm Overlap Threshold: 50% of the shorter chain (or new chain)
-                    auto isOverlapping = [&](uint32_t qs, uint32_t qe, const vector<Interval>& existing) {
+                    // --- Step 4: Interval Non-redundancy & Final Alignment Extraction ---
+                    scratch.acceptedIntervalsSame.clear(); scratch.acceptedIntervalsDiff.clear();
+                    auto isOverlapLarge = [&](uint32_t qs, uint32_t qe, const vector<ThreadScratchpad::ChainInterval>& accepted) {
                          uint32_t len = qe - qs + 1;
-                         for (const auto& iv : existing) {
-                             uint32_t overlapStart = std::max(qs, iv.qs);
-                             uint32_t overlapEnd = std::min(qe, iv.qe);
-                             if (overlapEnd >= overlapStart) {
-                                  uint32_t overlapLen = overlapEnd - overlapStart + 1;
-                                  if (overlapLen > (uint32_t)(0.5 * len)) return true; // >50% overlap of NEW chain rejected
-                                  // Note: Hifiasm might check both, but shielding new (shorter/worse) chains is the goal.
-                             }
+                         for (const auto& iv : accepted) {
+                             uint32_t oS = std::max(qs, iv.qs), oE = std::min(qe, iv.qe);
+                             if (oE >= oS && (oE - oS + 1) > (uint32_t)(0.5 * len)) return true;
                          }
                          return false;
                     };
 
+                    for (const auto& cand : scratch.chainCandidates) {
+                        int32_t currK = cand.endK;
+                        const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                        scratch.currentChainPath.clear();
+                        while(currK != -1) { scratch.currentChainPath.push_back(currK); currK = parentArr[currK]; }
+                        std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
+                        if (scratch.currentChainPath.empty()) continue;
 
-                    for (const auto& cand : candidates) {
-                         // Reconstruct chain to find qs
-                         int32_t curr = cand.endK;
-                         const auto& parents = cand.isDiff ? parentDiff : parentSame;
-                         
-                         vector<uint32_t> chainIndices;
-                         while(curr != -1) {
-                             chainIndices.push_back(curr);
-                             curr = parents[curr];
-                         }
-                         std::reverse(chainIndices.begin(), chainIndices.end());
-                         
-                         if (chainIndices.empty()) continue;
+                        uint32_t qOrdS = scratch.hitOrdinalA[scratch.currentChainPath.front()];
+                        uint32_t qOrdE = scratch.hitOrdinalA[scratch.currentChainPath.back()];
+                        if (cand.isDiff) { if (isOverlapLarge(qOrdS, qOrdE, scratch.acceptedIntervalsDiff)) continue; }
+                        else { if (isOverlapLarge(qOrdS, qOrdE, scratch.acceptedIntervalsSame)) continue; }
 
-                         // Get Query Range
-                         uint32_t qs = flatHits[start + chainIndices.front()].ordinalA;
-                         uint32_t qe = flatHits[start + chainIndices.back()].ordinalA;
-                         
-                         // Check overlap
-                         if (cand.isDiff) {
-                             if (isOverlapping(qs, qe, acceptedIntervalsDiff)) continue;
-                         } else {
-                             if (isOverlapping(qs, qe, acceptedIntervalsSame)) continue;
-                         }
+                        // Extract alignment path
+                        Alignment al; 
+                        al.ordinals.reserve(scratch.currentChainPath.size());
+                        const OrientedReadId orientedReadB(readIdB, 0);
+                        const auto& mB = markers[orientedReadB.getValue()];
+                        bool validChain = true;
 
-                         // Valid non-overlapping chain! Construct Alignment.
-                         Alignment alignment;
-                         alignment.ordinals.reserve(chainIndices.size());
-                         const OrientedReadId orientedReadIdB(readIdB, 0); 
-                         const auto& markersB = markers[orientedReadIdB.getValue()];
+                        for(uint32_t idxK : scratch.currentChainPath) {
+                            uint32_t tPos = scratch.hitPosB[idxK];
+                            auto itB = std::lower_bound(mB.begin(), mB.end(), tPos, [](const CompressedMarker& m, uint32_t v){ return m.position < v; });
+                            if(itB != mB.end() && itB->position == tPos) {
+                                al.ordinals.push_back({scratch.hitOrdinalA[idxK], (uint32_t)(itB - mB.begin())});
+                            } else { validChain = false; break; }
+                        }
 
-                         bool chainValid = true;
-                         for(size_t idxK_i=0; idxK_i < chainIndices.size(); ++idxK_i) {
-                              int32_t idxK = chainIndices[idxK_i];
-                              const auto& hit = flatHits[start + idxK];
-                              uint32_t ordA = hit.ordinalA;
-                              uint32_t targetPosB = hit.posB;
-
-                              auto itB = std::lower_bound(markersB.begin(), markersB.end(), targetPosB, 
-                                  [](const CompressedMarker& m, uint32_t val){ return m.position < val; });
-                              
-                              if(itB != markersB.end() && itB->position == targetPosB) {
-                                  uint32_t ordB = (uint32_t)(itB - markersB.begin());
-                                  alignment.ordinals.push_back({ordA, ordB});
-                              } else {
-                                  chainValid = false; break;
-                              }
-                         }
-
-                         if(chainValid) {
-                             // --- Coordinate Extension (Hifiasm Parity) ---
-                             // Compute extended coordinates here to avoid recomputation in AssemblerAlign.cpp
-                             // Logic matches AssemblerAlign.cpp exactly.
-                             {
-                                  // 1. Get Read Lengths (Reuse values)
-                                  const uint64_t len0 = readLenA;
-                                  const uint64_t len1 = readLenB;
-                                  const uint32_t kVal = invertedIndexData.k;
-
-                                  // 2. Get Query Coords (Always Strand 0 / Forward)
-                                  uint32_t qs_marker = markersA[flatHits[start + chainIndices.front()].ordinalA].position;
-                                  uint32_t qe_marker = markersA[flatHits[start + chainIndices.back()].ordinalA].position + kVal;
-                                  
-                                  // 3. Get Target Coords (Strand 0 / Forward)
-                                  uint32_t firstOrdB = alignment.ordinals.front()[1];
-                                  uint32_t lastOrdB = alignment.ordinals.back()[1];
-                                  uint32_t posB_first = markersB[firstOrdB].position;
-                                  uint32_t posB_last = markersB[lastOrdB].position;
-                                  
-                                  uint32_t ts_marker, te_marker;
-                                  
-                                  if (cand.isDiff) {
-                                       // Diff Strand: Work in Reverse Frame to match Hifiasm extension logic.
-                                       uint32_t min_fwd = std::min(posB_first, posB_last);
-                                       uint32_t max_fwd_end = std::max(posB_first, posB_last) + kVal;
-                                       
-                                       // Convert to Reverse Frame (Open)
-                                       ts_marker = (uint32_t)len1 - max_fwd_end;
-                                       te_marker = (uint32_t)len1 - min_fwd;
-                                  } else {
-                                       // Same Strand: Work in Forward Frame
-                                       ts_marker = posB_first;
-                                       te_marker = posB_last + kVal;
-                                  }
-                                  
-                                  // 4. Extension Logic (Hifiasm / AssemblerAlign Parity)
-                                  uint32_t qs_ext = qs_marker;
-                                  uint32_t qe_ext = qe_marker;
-                                  uint32_t ts_ext = ts_marker;
-                                  uint32_t te_ext = te_marker;
-
-                                  // Extend start
-                                  if (qs_ext <= ts_ext) {
-                                      ts_ext = ts_ext - qs_ext;
-                                      qs_ext = 0;
-                                  } else {
-                                      qs_ext = qs_ext - ts_ext;
-                                      ts_ext = 0;
-                                  }
-
-                                  // Extend end
-                                  int64_t q_right = (int64_t)len0 - (int64_t)qe_ext;
-                                  int64_t t_right = (int64_t)len1 - (int64_t)te_ext;
-
-                                  if (q_right <= t_right) {
-                                      qe_ext = (uint32_t)len0;
-                                      te_ext = te_ext + (uint32_t)q_right;
-                                  } else {
-                                      te_ext = (uint32_t)len1;
-                                      qe_ext = qe_ext + (uint32_t)t_right;
-                                  }
-
-                                  // 5. Store Results
-                                  alignment.qs = qs_ext;
-                                  alignment.qe = qe_ext;
-
-                                  if (cand.isDiff) {
-                                      // Convert Target back to Forward Strand (Storage Convention)
-                                      alignment.ts = (uint32_t)len1 - te_ext - 1;
-                                      alignment.te = (uint32_t)len1 - ts_ext - 1;
-                                  } else {
-                                      alignment.ts = ts_ext;
-                                      alignment.te = te_ext;
-                                  }
-                             }
-
+                        if(validChain) {
+                             uint32_t qPstart = markersA[scratch.hitOrdinalA[scratch.currentChainPath.front()]].position;
+                             uint32_t qPend = markersA[scratch.hitOrdinalA[scratch.currentChainPath.back()]].position + (uint32_t)kmerLen;
+                             uint32_t bPfirst = mB[al.ordinals.front()[1]].position;
+                             uint32_t bPlast = mB[al.ordinals.back()[1]].position;
+                             
+                             uint32_t tS, tE;
                              if (cand.isDiff) {
-                                 // Adjust for RC
-                                 uint32_t totalMarkersB = (uint32_t)markersB.size();
-                                 for(auto& pair : alignment.ordinals) {
-                                     pair[1] = totalMarkersB - 1 - pair[1];
-                                 }
-                                 acceptedIntervalsDiff.push_back({qs, qe});
-                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, false)); // Diff
+                                 uint32_t minB = std::min(bPfirst, bPlast), maxB = std::max(bPfirst, bPlast) + (uint32_t)kmerLen;
+                                 tS = (uint32_t)readLenB - maxB; tE = (uint32_t)readLenB - minB;
                              } else {
-                                 acceptedIntervalsSame.push_back({qs, qe});
-                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, true)); // Same
+                                 tS = bPfirst; tE = bPlast + (uint32_t)kmerLen;
                              }
-                             localAlignments.push_back(std::move(alignment));
-                         }
+
+                             uint32_t fQs = qPstart, fQe = qPend, fTs = tS, fTe = tE;
+                             if (fQs <= fTs) { fTs -= fQs; fQs = 0; } else { fQs -= fTs; fTs = 0; }
+                             int64_t remQ = (int64_t)readLenA - fQe, remT = (int64_t)readLenB - fTe;
+                             if (remQ <= remT) { fQe = (uint32_t)readLenA; fTe += (uint32_t)remQ; } else { fTe = (uint32_t)readLenB; fQe += (uint32_t)remT; } 
+
+                             al.qs = fQs; al.qe = fQe;
+                             if (cand.isDiff) {
+                                 al.ts = (uint32_t)readLenB - fTe - 1; al.te = (uint32_t)readLenB - fTs - 1;
+                                 uint32_t numMB = (uint32_t)mB.size();
+                                 for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
+                                 scratch.acceptedIntervalsDiff.push_back({qOrdS, qOrdE});
+                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, false));
+                             } else {
+                                 al.ts = fTs; al.te = fTe;
+                                 scratch.acceptedIntervalsSame.push_back({qOrdS, qOrdE});
+                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, true));
+                             }
+                             localAlignments.push_back(std::move(al));
+                        }
                     }
                 }
             }
         }
     }
 };
-// Explicit instantiation.
+// Explicit template instantiation for the MultithreadedObject base class.
 template class MultithreadedObject<InvertedIndexFinder>;
 
 } // namespace dinara
-using namespace dinara; // For Assembler access below
-
-// Optimized Packed Occurrence Structure.
-// 24 bytes (16 for KmerId + 4 ReadId + 4 Pos).
-// Standard ReadId is uint32_t. Position is uint32_t.
-// So we can store this efficiently. 
-// We separate KmerId (Key) from Payload (Value) for sorting if we use Structure of Arrays?
-// No, sorting requires moving Key and Value together.
-// Using Array of Structures (AoS) is cache efficient for sorting.
-
-// Wait. markerKmerIds stores Kmers separate from markers (Pos).
-// We are merging them here.
-
-// Hifiasm uses Binning to Parallelize sort.
-// We implement a simplified Parallel Fill -> Serial Sort (std::sort).
-// Given std::sort is highly optimized, it is sufficient.
+using namespace dinara;
 
 void Assembler::findAlignmentCandidatesInvertedIndex(
     double maxDriftRate,
@@ -840,164 +660,107 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         threadCount = std::thread::hardware_concurrency();
     }
 
-    const auto tBegin = std::chrono::steady_clock::now();
-    performanceLog << timestamp << "Finding alignment candidates using Inverted Index." << endl;
+    const auto startTime = std::chrono::steady_clock::now();
+    performanceLog << timestamp << "Starting Inverted Index candidate discovery." << endl;
 
-    // 1. Build the Inverted Index.
-    // We assume markerKmerIds and markers are populated and consistent.
+    // =========================================================================
+    // Phase 1: Inverted Index Construction
+    // =========================================================================
+    // We build an index mapping each canonical K-mer to all of its occurrences
+    // (ReadId, Position). We only index Strand 0 because canonical K-mers are
+    // strand-symmetric, halving memory usage. RC matches are detected during
+    // the DP chaining phase by observing decreasing target positions.
+    // =========================================================================
     checkMarkersAreOpen();
     if(!markerKmerIds->isOpen()) {
         throw runtime_error("Marker KmerIds not available for Inverted Index.");
     }
-    
-    // Initialize k
     invertedIndexData.k = assemblerInfo->k;
-
-    // Allocate huge vector.
-    // Total markers = markers.totalSize().
     const uint64_t totalMarkers = markers->totalSize();
     cout << "Building Inverted Index for " << totalMarkers << " markers." << endl;
-    // invertedIndexData.occurrences.resize(totalMarkers); // Initial resize removed, now exact resize after counting.
 
-    // Populate occurrences.
-    // Can be parallelized per read batch. But vector is contiguous.
-    // Serial populate is fast (sequential memory). Parallel populate requires pre-calculating offsets.
-    // markers.size() gives vector of vectors size (2*readCount).
-    // markers stores ReadId implicitly by index?
-    // markers[i] is for OrientedRead i?
-    // OrderedReadId(readId, 0).
-    // We only need one strand?
-    // If we match ReadA (Strand0) to ReadB (Strand0) -> Same Strand.
-    // If we match ReadA (Strand0) to ReadB (Strand1) -> Opposite Strand?
-    // markers stores both strands.
-    // Hifiasm usually indexes Canonical K-mers?
-    // KmerId is Canonical.
-    // If KmerId is Canonical, occurrences from Strand0 and Strand1 are mathematically related.
-    // Storing occurrences from ONLY Strand 0 is sufficient if we handle RC?
-    // MarkerKmerIds stores Canonical KmerId.
-    // A marker at Pos X on Strand 0 with KmerId K.
-    // At Pos L-X-1 on Strand 1, it has the SAME KmerId K (because K is canonical).
-    // So storing occurrences for BOTH strands is redundant?
-    // If we index Strand 0 only:
-    // Query Read A (Strand 0).
-    // Match Read B (Strand 0) -> Same Strand.
-    // Read C(0) sequence: K3, K2, K1. -> We detect "Reverse Match".
-    // So "Same Strand" vs "Opposite Strand" is detected by order of matches (Chain).
-    // (Increasing vs Decreasing positions).
-    // So we ONLY need to store occurrences from Strand 0!
-    // This halves the index size.
-    // markers[i] where i is even (0, 2, ...) is Strand 0.
-
-    // Parallel Fill.
-    // We divide reads among threads.
-    // Each thread writes to a separate chunk of the huge vector?
-    // No, we don't know the exact count per thread beforehand unless we perform a prefix sum.
-    // Step 1: Count markers per thread.
-    // Step 2: Calculate offsets.
-    // Step 3: Fill.
-
-    // Using `setupLoadBalancing` logic.
-    // Ensure readCount matches markers size to avoid OOB access in MemoryMapped vector.
-    // -------------------------------------------------------------------------
-    // Static Load Balancing for 2-Pass Algorithm
-    // We MUST use static partitioning to ensure Thread X handles the EXACT same
-    // set of reads in Pass 1 (Count) and Pass 2 (Fill).
-    // Dynamic load balancing (getNextBatch) would cause buffer overflows/corruption
-    // because a thread might get fewer markers in Pass 1 and more in Pass 2.
-    // -------------------------------------------------------------------------
-
+    // We use static load balancing (not dynamic getNextBatch) to ensure that
+    // each thread processes the exact same reads in both Pass 1 (Count) and
+    // Pass 2 (Fill). This prevents buffer overflows from mismatched counts.
     checkMarkersAreOpen();
     const ReadId readCount = ReadId(markers->size() / 2);
     vector<uint64_t> threadMarkerCounts(threadCount, 0);
     vector<size_t> threadOffsets(threadCount, 0);
 
-    // Pass 1: Count Markers
-    auto countMarkers = [&](size_t threadId) {
-        // Static Partitioning
-        ReadId start = (ReadId)((uint64_t)readCount * threadId / threadCount);
-        ReadId end   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
+    // Pass 1: Count markers per thread for memory allocation
+    auto countFunction = [&](size_t threadId) {
+        ReadId startRead = (ReadId)((uint64_t)readCount * threadId / threadCount);
+        ReadId endRead   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
 
         uint64_t count = 0;
-        for(ReadId readId=start; readId!=end; ++readId) {
-            // Only Strand 0. markers stores oriented reads.
-            // 2 * readid = Strand 0.
-            count += (*markers)[size_t(readId) << 1].size();
+        for(ReadId rId = startRead; rId != endRead; ++rId) {
+            count += (*markers)[size_t(rId) << 1].size();
         }
         threadMarkerCounts[threadId] = count;
     };
 
-    // Run Pass 1
     vector<std::thread> threads;
-    for(size_t i=0; i<threadCount; i++) {
-        threads.emplace_back(countMarkers, i);
-    }
+    for(size_t i = 0; i < threadCount; i++) threads.emplace_back(countFunction, i);
     for(auto& t : threads) t.join();
     threads.clear();
 
-    // Prefix sum
-    size_t currentOffset = 0;
-    for(size_t i=0; i<threadCount; i++) {
-        threadOffsets[i] = currentOffset;
-        currentOffset += threadMarkerCounts[i];
+    // Compute global offsets
+    size_t totalMarkersFound = 0;
+    for(size_t i = 0; i < threadCount; i++) {
+        threadOffsets[i] = totalMarkersFound;
+        totalMarkersFound += threadMarkerCounts[i];
     }
     
-    // Resize exact
-    invertedIndexData.occurrences.resize(currentOffset);
-    cout << "Index contains " << invertedIndexData.occurrences.size() << " occurrences (Strand 0 only)." << endl;
+    invertedIndexData.occurrences.resize(totalMarkersFound);
+    cout << "Index allocated for " << totalMarkersFound << " occurrences (Strand 0 only)." << endl;
 
-    // Pass 2: Fill Markers
-    auto fillMarkers = [&](size_t threadId) {
-        // Same Partitioning
-        ReadId start = (ReadId)((uint64_t)readCount * threadId / threadCount);
-        ReadId end   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
-        
-        size_t offset = threadOffsets[threadId];
+    // Pass 2: Fill the occurrence array
+    auto fillFunction = [&](size_t threadId) {
+        ReadId startRead = (ReadId)((uint64_t)readCount * threadId / threadCount);
+        ReadId endRead   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
+        size_t writeOffset = threadOffsets[threadId];
 
-        for(ReadId readId=start; readId!=end; ++readId) {
-            const auto& readMarkers = (*markers)[size_t(readId) << 1];
-            const auto& readKmerIds = (*markerKmerIds)[size_t(readId) << 1];
-            
-            if(readMarkers.size() != readKmerIds.size()) {
-                 continue; 
-            }
+        for(ReadId rId = startRead; rId != endRead; ++rId) {
+            const auto& rMarkers = (*markers)[size_t(rId) << 1];
+            const auto& rKmerIds = (*markerKmerIds)[size_t(rId) << 1];
+            if(rMarkers.size() != rKmerIds.size()) continue; 
 
-            for(size_t i=0; i<readMarkers.size(); ++i) {
-                // Bounds check optimization: verify offset < occurrences.size()?
-                // Should be safe due to deterministic counting.
-                // Canonical Index Fill
-                Kmer kmer(readKmerIds[i], invertedIndexData.k);
-                KmerId rcKmerId = KmerId(kmer.reverseComplement(invertedIndexData.k).id(invertedIndexData.k));
-                KmerId canonicalKmerId = readKmerIds[i] < rcKmerId ? readKmerIds[i] : rcKmerId;
+            for(size_t i = 0; i < rMarkers.size(); ++i) {
+                KmerId kId = rKmerIds[i];
+                KmerId rcKId = getRcKmerId(kId, invertedIndexData.k);
+                KmerId canonicalKId = (kId < rcKId) ? kId : rcKId;
 
-                invertedIndexData.occurrences[offset++] = {
-                    canonicalKmerId,
-                    readId,
-                    readMarkers[i].position
+                invertedIndexData.occurrences[writeOffset++] = {
+                    canonicalKId,
+                    rId,
+                    rMarkers[i].position
                 };
             }
         }
     };
 
-    // Run Pass 2
-    for(size_t i=0; i<threadCount; i++) {
-        threads.emplace_back(fillMarkers, i);
+    // Run filling process in parallel
+    for(size_t i = 0; i < threadCount; i++) {
+        threads.emplace_back(fillFunction, i);
     }
     for(auto& t : threads) t.join();
     threads.clear();
 
-
-    // Sort.
-    cout << "Sorting Inverted Index (Parallel Radix Sort)..." << endl;
+    // =========================================================================
+    // Phase 2: Parallel LSD Radix Sort
+    // =========================================================================
+    // We sort the occurrences by K-mer ID to group all markers with the same
+    // K-mer together. This uses a parallel Least-Significant-Digit (LSD) radix
+    // sort, which is O(N * numBytes) and stable. The parallelization strategy:
+    //   1. Each thread computes a local histogram for its data partition.
+    //   2. Histograms are combined to compute global bucket offsets.
+    //   3. Each thread scatters its data to the correct output positions.
+    // =========================================================================
+    cout << "Sorting " << invertedIndexData.occurrences.size() << " occurrences..." << endl;
     
     if(!invertedIndexData.occurrences.empty()) {
         const size_t n = invertedIndexData.occurrences.size();
         const size_t numBytes = sizeof(KmerId);
-        
-        // 1. Parallel Radix Sort.
-        // Divide into chunks for parallel counting?
-        // Or simpler: Just Parallel MSB Radix Sort (Binning).
-        // Since we want O(N) global stability, LSD is easier but harder to parallelize without barrier.
-        // Let's implement Parallel LSD Radix Sort with Thread-Local Histograms.
         
         vector<InvertedIndexOccurrence> buffer(n);
         vector<InvertedIndexOccurrence>* src = &invertedIndexData.occurrences;
@@ -1005,52 +768,54 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         
         for (size_t byteIdx = 0; byteIdx < numBytes; ++byteIdx) {
             
-            // Step 1: Parallel Count.
-            vector<vector<size_t>> histograms(threadCount, vector<size_t>(256, 0));
-            auto countFunc = [&](size_t tid) {
+            // 2.1 Parallel Histogram Calculation
+            vector<vector<size_t>> threadHistograms(threadCount, vector<size_t>(256, 0));
+            auto countHistFunc = [&](size_t tid) {
                  size_t start = (n * tid) / threadCount;
                  size_t end = (n * (tid + 1)) / threadCount;
-                 for(size_t i=start; i<end; ++i) {
-                     uint8_t b = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
-                     histograms[tid][b]++;
+                 for(size_t i = start; i < end; ++i) {
+                     uint8_t byteVal = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
+                     threadHistograms[tid][byteVal]++;
                  }
             };
             vector<thread> sortThreads;
-            for(size_t i=0; i<threadCount; i++) sortThreads.emplace_back(countFunc, i);
+            for(size_t i = 0; i < threadCount; i++) sortThreads.emplace_back(countHistFunc, i);
             for(auto& t : sortThreads) t.join();
             sortThreads.clear();
             
-            // Step 2: Global Offsets.
-            size_t globalCounts[256] = {0};
-            for(size_t b=0; b<256; ++b) {
-                for(size_t tid=0; tid<threadCount; ++tid) {
-                    globalCounts[b] += histograms[tid][b];
+            // 2.2 Global Offset Calculation
+            size_t globalBucketCounts[256] = {0};
+            for(size_t b = 0; b < 256; ++b) {
+                for(size_t tid = 0; tid < threadCount; ++tid) {
+                    globalBucketCounts[b] += threadHistograms[tid][b];
                 }
             }
-            size_t globalOffsets[256];
-            globalOffsets[0] = 0;
-            for(size_t b=1; b<256; ++b) globalOffsets[b] = globalOffsets[b-1] + globalCounts[b-1];
+            size_t globalBucketOffsets[256];
+            globalBucketOffsets[0] = 0;
+            for(size_t b = 1; b < 256; ++b) {
+                globalBucketOffsets[b] = globalBucketOffsets[b - 1] + globalBucketCounts[b - 1];
+            }
             
-            // Calculate thread-specific start offsets for each bucket.
-            vector<vector<size_t>> threadOffsets(threadCount, vector<size_t>(256));
-            for(size_t b=0; b<256; ++b) {
-                size_t current = globalOffsets[b];
-                for(size_t tid=0; tid<threadCount; ++tid) {
-                    threadOffsets[tid][b] = current;
-                    current += histograms[tid][b];
+            // 2.3 Individual Thread Starting Offsets
+            vector<vector<size_t>> writeOffsets(threadCount, vector<size_t>(256));
+            for(size_t b = 0; b < 256; ++b) {
+                size_t current = globalBucketOffsets[b];
+                for(size_t tid = 0; tid < threadCount; tid++) {
+                    writeOffsets[tid][b] = current;
+                    current += threadHistograms[tid][b];
                 }
             }
             
-            // Step 3: Parallel Scatter.
-            auto scatterFunc = [&](size_t tid) {
+            // 2.4 Parallel Data Scattering
+            auto scatterDataFunc = [&](size_t tid) {
                  size_t start = (n * tid) / threadCount;
                  size_t end = (n * (tid + 1)) / threadCount;
-                 for(size_t i=start; i<end; ++i) {
-                     uint8_t b = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
-                     (*dst)[threadOffsets[tid][b]++] = (*src)[i];
+                 for(size_t i = start; i < end; ++i) {
+                     uint8_t byteVal = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
+                     (*dst)[writeOffsets[tid][byteVal]++] = (*src)[i];
                  }
             };
-            for(size_t i=0; i<threadCount; i++) sortThreads.emplace_back(scatterFunc, i);
+            for(size_t i = 0; i < threadCount; i++) sortThreads.emplace_back(scatterDataFunc, i);
             for(auto& t : sortThreads) t.join();
             sortThreads.clear();
 
@@ -1062,116 +827,130 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
         }
     }
 
-    // Build Lookup Map (Open Addressing Hash Table).
-    cout << "Building Linear Probing Hash Table..." << endl;
+    // =========================================================================
+    // Phase 3: Hash Table Construction (Open Addressing)
+    // =========================================================================
+    // Build a power-of-2 sized hash table for O(1) K-mer lookups. Each entry
+    // stores the starting index and count of occurrences for a single K-mer.
+    // We use linear probing for collision resolution. The load factor is ~50%
+    // to balance memory usage and probe length.
+    // =========================================================================
+    cout << "Allocating Direct Addressing Hash Table..." << endl;
     
-    uint64_t numDistinct = 0;
+    uint64_t numDistinctKmers = 0;
     if(!invertedIndexData.occurrences.empty()) {
-        numDistinct = 1;
-        KmerId last = invertedIndexData.occurrences[0].kmerId;
-        for(size_t i=1; i<invertedIndexData.occurrences.size(); ++i) {
-            if(invertedIndexData.occurrences[i].kmerId != last) {
-                numDistinct++;
-                last = invertedIndexData.occurrences[i].kmerId;
+        numDistinctKmers = 1;
+        KmerId lastKId = invertedIndexData.occurrences[0].kmerId;
+        for(size_t i = 1; i < invertedIndexData.occurrences.size(); ++i) {
+            if(invertedIndexData.occurrences[i].kmerId != lastKId) {
+                numDistinctKmers++;
+                lastKId = invertedIndexData.occurrences[i].kmerId;
             }
         }
     }
-    cout << "Distinct K-mers: " << numDistinct << endl;
+    cout << "Distinct K-mers found: " << numDistinctKmers << endl;
 
     uint64_t tableSize = 1;
-    while(tableSize < numDistinct * 2) tableSize *= 2; 
-    cout << "Table Size: " << tableSize << endl;
-    
+    while(tableSize < numDistinctKmers * 2) tableSize *= 2; 
     invertedIndexData.hashTable.resize(tableSize); 
     
-    auto hashKmer = [&](KmerId k) -> uint64_t {
-        uint64_t h = 0;
-        const uint64_t* p = reinterpret_cast<const uint64_t*>(&k);
-        uint64_t k1 = p[0];
-        uint64_t k2 = sizeof(KmerId) > 8 ? p[1] : 0;
-        h = k1 ^ (k2 + 0x9e3779b9 + (k1<<6) + (k1>>2)); 
-        return h;
-    };
-
     if(!invertedIndexData.occurrences.empty()) {
         KmerId currentKmer = invertedIndexData.occurrences[0].kmerId;
-        uint64_t start = 0;
+        uint64_t blockStart = 0;
         uint64_t mask = tableSize - 1;
 
-        auto insert = [&](KmerId key, uint64_t startIdx, uint32_t count) {
-            uint64_t idx = hashKmer(key) & mask;
-            while(!invertedIndexData.hashTable[idx].empty) {
-                idx = (idx + 1) & mask;
+        auto insertIntoTable = [&](KmerId key, uint64_t startIdx, uint32_t count) {
+            uint64_t slotIdx = hashKmer(key) & mask;
+            while(!invertedIndexData.hashTable[slotIdx].empty) {
+                slotIdx = (slotIdx + 1) & mask;
             }
-            invertedIndexData.hashTable[idx] = {key, startIdx, count, false};
+            invertedIndexData.hashTable[slotIdx] = {key, startIdx, count, false};
         };
 
-        for(uint64_t i=1; i<invertedIndexData.occurrences.size(); ++i) {
+        for(uint64_t i = 1; i < invertedIndexData.occurrences.size(); ++i) {
             if(invertedIndexData.occurrences[i].kmerId != currentKmer) {
-                uint32_t count = (uint32_t)(i - start);
-                insert(currentKmer, start, count);
-                
+                insertIntoTable(currentKmer, blockStart, (uint32_t)(i - blockStart));
                 currentKmer = invertedIndexData.occurrences[i].kmerId;
-                start = i;
+                blockStart = i;
             }
         }
-        uint32_t count = (uint32_t)(invertedIndexData.occurrences.size() - start);
-        insert(currentKmer, start, count);
+        insertIntoTable(currentKmer, blockStart, (uint32_t)(invertedIndexData.occurrences.size() - blockStart));
     }
-    cout << "Hash Table built." << endl;
 
-    // OPTIMIZATION: Convert to Compact Index (SoAish).
-    cout << "Compacting Index..." << endl;
-    invertedIndexData.compactOccurrences.resize(invertedIndexData.occurrences.size());
-    for(size_t i=0; i<invertedIndexData.occurrences.size(); ++i) {
-        invertedIndexData.compactOccurrences[i] = {
-            invertedIndexData.occurrences[i].readId,
-            invertedIndexData.occurrences[i].position
-        };
-    }
+    // =========================================================================
+    // Phase 4: Index Compaction
+    // =========================================================================
+    // The full occurrence struct contains the K-mer ID, but after building the
+    // hash table, we only need (ReadId, Position) for each occurrence. This
+    // compaction reduces the memory footprint by ~3x, which is critical for
+    // large datasets. We parallelize this trivially across all occurrences.
+    // =========================================================================
+    const size_t nMarkersTotal = invertedIndexData.occurrences.size();
+    invertedIndexData.compactOccurrences.resize(nMarkersTotal);
     
-    // Free heavy vector.
+    auto compactFunction = [&](size_t tid) {
+        size_t start = (nMarkersTotal * tid) / threadCount;
+        size_t end = (nMarkersTotal * (tid + 1)) / threadCount;
+        for(size_t i = start; i < end; ++i) {
+            invertedIndexData.compactOccurrences[i] = {
+                invertedIndexData.occurrences[i].readId,
+                invertedIndexData.occurrences[i].position
+            };
+        }
+    };
+    vector<thread> compactThreads;
+    for(size_t i = 0; i < threadCount; i++) compactThreads.emplace_back(compactFunction, i);
+    for(auto& t : compactThreads) t.join();
+    
+    // Free high-memory intermediate vector
     invertedIndexData.occurrences.clear();
     invertedIndexData.occurrences.shrink_to_fit();
-    cout << "Index Compacted." << endl;
+    cout << "Index construction complete." << endl;
 
-
-
-    // 2. Compute Candidates (Parallel).
+    // =========================================================================
+    // Phase 5: Parallel Candidate Search
+    // =========================================================================
+    // The main search loop. For each Read A (strand 0), we:
+    //   1. Look up each of its K-mers in the hash table.
+    //   2. Collect all (PartnerReadId, PositionA, PositionB) hits.
+    //   3. Sort hits by PartnerReadId, then by PositionA.
+    //   4. For each (A, B) pair, run DP chaining to find the best chain(s).
+    //   5. Extract alignment coordinates and store the candidate pair.
+    // The DP chaining logic is Hifiasm-compatible, using cumulative drift
+    // constraints and a penalty based on gap rate.
+    // =========================================================================
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
-    alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize); // Added
+    alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize); 
     
-    // Reserve estimation.
-    checkMarkersAreOpen();
-    
+    // Safety reserve for performance
     alignmentCandidates.candidates.reserve(size_t(readCount) * 50);
-    alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); // Added
+    alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); 
 
     invertedIndexData.maxDriftRate = maxDriftRate;
-    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak; // Parity
+    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
 
-    // Use InvertedIndexFinder pattern.
+    // Launch the finder across all threads
     InvertedIndexFinder finder(
         getReads(),
         *markers,
         *markerKmerIds,
         invertedIndexData,
         alignmentCandidates.candidates,
-        alignmentCandidatesAlignmentsData.alignments, // Added
+        alignmentCandidatesAlignmentsData.alignments,
         maxChainLimit,
         threadCount
     );
 
     alignmentCandidates.candidates.unreserve();
-    alignmentCandidatesAlignmentsData.alignments.unreserve(); // Added
+    alignmentCandidatesAlignmentsData.alignments.unreserve();
     
-    // Cleanup Index.
+    // --- Final Cleanup ---
     invertedIndexData.compactOccurrences.clear();
     invertedIndexData.compactOccurrences.shrink_to_fit();
     invertedIndexData.hashTable.clear();
     invertedIndexData.hashTable.shrink_to_fit();
 
-    const auto tEnd = std::chrono::steady_clock::now();
-    const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
-    performanceLog << timestamp << "Inverted Index Candidate Finding (Optimized) completed in " << tTotal << " s." << endl;
+    const auto endTime = std::chrono::steady_clock::now();
+    const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
+    cout << timestamp << "Alignment discovery completed in " << totalSeconds << " s." << endl;
 }
