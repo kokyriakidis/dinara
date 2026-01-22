@@ -11,6 +11,8 @@
 #include "MultithreadedObject.hpp"
 #include "dinaraTypes.hpp"
 
+#include <unordered_map>
+
 
 
 namespace dinara {
@@ -19,6 +21,20 @@ namespace dinara {
     class CompressedMarker;
     class KmerDistributionInfo;
     class Reads;
+    
+    // Custom hasher for KmerId (which may be __uint128_t or larger).
+    // std::hash does not provide a specialization for 128-bit types.
+    struct KmerIdHasher {
+        size_t operator()(const KmerId& k) const noexcept {
+            // XOR the high and low 64-bit halves of the KmerId.
+            const uint64_t* p = reinterpret_cast<const uint64_t*>(&k);
+            uint64_t h = p[0];
+            if constexpr (sizeof(KmerId) > 8) {
+                h ^= p[1] + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            return static_cast<size_t>(h);
+        }
+    };
 }
 
 
@@ -58,6 +74,13 @@ public:
 
     uint64_t getFrequency(KmerId) const;
     uint64_t getFrequency(const Kmer&) const;
+    
+    // Optimized O(1) lookup for pre-canonicalized KmerIds.
+    // Caller is responsible for computing the canonical form before calling.
+    uint64_t getFrequencyFast(KmerId canonicalKmerId) const;
+    
+    // Build the frequency LUT for O(1) lookups. Call after createHistogram().
+    void buildFrequencyLUT();
 
     // Override the frequencies stored in this KmerCounter
     // with the ones obtained from another KmerCounter.
@@ -84,6 +107,9 @@ private:
     // pairs(KmerId, frequency).
 public:
     MemoryMapped::VectorOfVectors<pair<KmerId, uint64_t>, uint64_t> kmerIdFrequencies;
+    
+    // Optimized LUT for O(1) frequency lookups. Built by buildFrequencyLUT().
+    std::unordered_map<KmerId, uint64_t, KmerIdHasher> frequencyLUT;
 private:
 
 

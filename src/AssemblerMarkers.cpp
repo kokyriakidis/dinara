@@ -1119,6 +1119,9 @@ void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
     ofstream csv("KmerFrequencyHistogram.csv");
     kmerCounter->writeHistogram(csv);
     kmerCounter->getHistogramInfo(assemblerInfo->kmerDistributionInfo);
+    
+    // Build the frequency LUT for O(1) lookups in applyKmerCountFilter.
+    kmerCounter->buildFrequencyLUT();
 
     cout << "Marker k-mer coverage distribution:"
         " low "   << assemblerInfo->kmerDistributionInfo.coverageLow <<
@@ -1126,21 +1129,54 @@ void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
         ", high " << assemblerInfo->kmerDistributionInfo.coverageHigh << endl;
 }
 
-// Prune existing markers based on KmerCounter frequencies using markerKmerIds.
+/**
+ * @brief High-performance marker frequency filtering using precomputed caches.
+ *
+ * This function filters markers based on k-mer frequency, keeping only those
+ * within [minFreq, maxFreq]. It uses a two-pass algorithm with extensive caching
+ * to minimize redundant computation:
+ *
+ * **Algorithm Overview:**
+ *   1. **Parallel Initialization**: Allocate per-read caches for validity bits,
+ *      read lengths, and reverse complement KmerIds.
+ *   2. **Pass 1 (Count & Cache)**: For each marker, compute canonical KmerId,
+ *      lookup frequency in O(1) LUT, and if valid:
+ *      - Set bit in packed validity bitset
+ *      - Cache the rcKmerId for Pass 2
+ *      - Increment marker count for VectorOfVectors allocation
+ *   3. **Pass 2 (Store)**: Using only cached data (no frequency lookups):
+ *      - Check validity from bitset
+ *      - Copy marker to new structure
+ *      - Use cached rcKmerId for strand 1 (no reverseComplement needed)
+ *
+ * **Performance Optimizations:**
+ *   - O(1) frequency lookup via pre-built unordered_map LUT
+ *   - Packed validity bitset (8 markers per byte)
+ *   - Cached read lengths (avoids Reads data structure access)
+ *   - Cached rcKmerIds (eliminates reverseComplement in Pass 2)
+ *   - Parallel initialization of per-read caches
+ *   - Bitwise operations for bitset indexing (>> 3, & 7)
+ *
+ * @param minFreq Minimum k-mer frequency threshold (inclusive)
+ * @param maxFreq Maximum k-mer frequency threshold (inclusive)
+ * @param threadCount Number of worker threads (0 = auto-detect)
+ */
 void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount)
 {
-    performanceLog << timestamp << "Filtering markers based on KmerCounter frequency (Fast ID path)." << endl;
+    performanceLog << timestamp << "Filtering markers by frequency [" 
+                   << minFreq << ", " << maxFreq << "]." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
-    // Check prerequisites.
+    // =========================================================================
+    // Phase 0: Prerequisites and Data Structure Setup
+    // =========================================================================
     checkMarkersAreOpen();
     DINARA_ASSERT(markerKmerIds->isOpen());
     if(!kmerCounter) {
         throw runtime_error("KmerCounter is required for marker filtering.");
     }
 
-    // Move current markers/ids to oldMarkers by switching pointers.
-    // This avoids invalid renames in anonymous memory mode.
+    // Swap current markers to "old" pointers for in-place filtering.
     const string markersName = markers->getName(); 
     const string kmerIdsName = markerKmerIds->getName();
 
@@ -1159,11 +1195,9 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     applyKmerCountFilterData.minFreq = minFreq;
     applyKmerCountFilterData.maxFreq = maxFreq;
 
-    // Create new markers structure (overwriting/creating fresh files).
     markers->createNew(markersName, largeDataPageSize);
     markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
 
-    // Adjust threads.
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
@@ -1171,13 +1205,53 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     const uint64_t readCount = reads->readCount();
     const uint64_t batchSize = 100;
 
-    // Pass 1: Count valid markers.
+    // =========================================================================
+    // Phase 1: Parallel Cache Initialization
+    // =========================================================================
+    // Allocate per-read data structures in parallel to reduce init time.
+    // Each read gets:
+    //   - validityBits: packed bitset (1 bit per marker)
+    //   - readLength: cached to avoid Reads access in Pass 2
+    //   - rcKmerIds: vector of rcKmerIds for valid markers only
+    applyKmerCountFilterData.markerValidity.resize(readCount);
+    applyKmerCountFilterData.readLengths.resize(readCount);
+    applyKmerCountFilterData.rcKmerIds.resize(readCount);
+    
+    {
+        std::vector<std::thread> initThreads;
+        initThreads.reserve(threadCount);
+        
+        auto initFunction = [this, readCount, threadCount](size_t tid) {
+            const ReadId startRead = static_cast<ReadId>((readCount * tid) / threadCount);
+            const ReadId endRead = static_cast<ReadId>((readCount * (tid + 1)) / threadCount);
+            
+            for(ReadId rId = startRead; rId < endRead; ++rId) {
+                const size_t n = (*applyKmerCountFilterData.oldMarkers)[OrientedReadId(rId, 0).getValue()].size();
+                applyKmerCountFilterData.markerValidity[rId].resize((n + 7) >> 3, 0);  // ceil(n/8)
+                applyKmerCountFilterData.readLengths[rId] = reads->getReadRawSequenceLength(rId);
+                applyKmerCountFilterData.rcKmerIds[rId].reserve(n >> 2);  // ~25% expected valid
+            }
+        };
+        
+        for(size_t tid = 0; tid < threadCount; ++tid) {
+            initThreads.emplace_back(initFunction, tid);
+        }
+        for(auto& t : initThreads) {
+            t.join();
+        }
+    }
+
+    // =========================================================================
+    // Phase 2: Pass 1 - Count Valid Markers & Populate Caches
+    // =========================================================================
     markers->beginPass1(2 * readCount);
     markerKmerIds->beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::applyKmerCountFilterThreadFunctionPass1, threadCount);
 
-    // Pass 2: Store valid markers.
+    // =========================================================================
+    // Phase 3: Pass 2 - Store Valid Markers Using Cached Data
+    // =========================================================================
     markers->beginPass2();
     markerKmerIds->beginPass2();
     setupLoadBalancing(readCount, batchSize);
@@ -1186,67 +1260,110 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     markers->endPass2(false);
     markerKmerIds->endPass2(false);
 
-    // Capture old size before removal.
+    // =========================================================================
+    // Phase 4: Cleanup
+    // =========================================================================
     const uint64_t oldTotalSize = applyKmerCountFilterData.oldMarkers->totalSize();
 
-    // Clean up old markers.
     applyKmerCountFilterData.oldMarkers->remove();
     applyKmerCountFilterData.oldMarkerKmerIds->remove();
-
-    // Release the old markers pointers.
     applyKmerCountFilterData.oldMarkers.reset();
     applyKmerCountFilterData.oldMarkerKmerIds.reset();
+    
+    // Release cache memory.
+    applyKmerCountFilterData.markerValidity.clear();
+    applyKmerCountFilterData.markerValidity.shrink_to_fit();
+    applyKmerCountFilterData.readLengths.clear();
+    applyKmerCountFilterData.readLengths.shrink_to_fit();
+    applyKmerCountFilterData.rcKmerIds.clear();
+    applyKmerCountFilterData.rcKmerIds.shrink_to_fit();
 
-    // Report.
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
     performanceLog << timestamp << "Marker filtering completed in " << tTotal << " s." << endl;
-    cout << "Filtered markers: kept " << markers->totalSize() << " out of " 
-         << oldTotalSize << "." << endl;
+    cout << "Filtered markers: " << markers->totalSize() << " / " << oldTotalSize 
+         << " (" << (100.0 * markers->totalSize() / oldTotalSize) << "%)." << endl;
 }
 
+/**
+ * @brief Pass 1: Count valid markers and populate caches.
+ *
+ * For each marker in each read:
+ *   1. Compute canonical KmerId (min of forward and RC)
+ *   2. Lookup frequency in O(1) LUT
+ *   3. If within [minFreq, maxFreq]:
+ *      - Set validity bit in packed bitset
+ *      - Cache rcKmerId for use in Pass 2
+ *      - Increment marker count
+ *
+ * This is the computationally expensive pass, but it only runs once.
+ * All computed data is cached for Pass 2 to consume.
+ */
 void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
 {
     const uint64_t k = assemblerInfo->k;
+    const uint64_t minF = applyKmerCountFilterData.minFreq;
+    const uint64_t maxF = applyKmerCountFilterData.maxFreq;
     
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             
-            // Get markers for this read from oldMarkers.
             const OrientedReadId orientedReadId(readId, 0);
-            const auto oldReadMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId.getValue()];
-            const auto oldReadMarkerKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId.getValue()];
+            const auto oldMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId.getValue()];
+            const auto oldKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId.getValue()];
+            const size_t n = oldMarkers.size();
+            
+            if(n == 0) continue;
+            
+            auto& validityBits = applyKmerCountFilterData.markerValidity[readId];
+            auto& rcCache = applyKmerCountFilterData.rcKmerIds[readId];
             
             uint64_t validCount = 0;
-            if(oldReadMarkers.size() > 0) {
-                for(size_t i=0; i<oldReadMarkers.size(); i++) {
-                    // Check frequency using ID (no Read access).
-                    KmerId kmerId = oldReadMarkerKmerIds[i]; // Strand 0 ID.
-                    
-                    // Canonicalize for checking (since KmerCounter tracks canonical).
-                    // Although KmerCounter could be built non-canonical, it's safer to query canonical.
-                    Kmer kmer(kmerId, k);
-                    KmerId rcKmerId = kmer.reverseComplement(k).id(k);
-                    KmerId canonical = std::min(kmerId, rcKmerId);
+            
+            for(size_t i = 0; i < n; ++i) {
+                // Compute canonical form: min(kmerId, rcKmerId).
+                const KmerId kmerId = oldKmerIds[i];
+                const Kmer kmer(kmerId, k);
+                const KmerId rcKmerId = kmer.reverseComplement(k).id(k);
+                const KmerId canonical = std::min(kmerId, rcKmerId);
 
-                    const uint64_t freq = kmerCounter->getFrequency(canonical);
-                    
-                    if(freq >= applyKmerCountFilterData.minFreq && freq <= applyKmerCountFilterData.maxFreq) {
-                        validCount++;
-                    }
+                // O(1) frequency lookup.
+                const uint64_t freq = kmerCounter->getFrequencyFast(canonical);
+                
+                if(freq >= minF && freq <= maxF) {
+                    // Set validity bit using bitwise ops (>> 3 = /8, & 7 = %8).
+                    validityBits[i >> 3] |= (uint8_t(1) << (i & 7));
+                    // Cache rcKmerId for Pass 2 (avoids recomputing reverseComplement).
+                    rcCache.push_back(rcKmerId);
+                    ++validCount;
                 }
             }
 
-            markers->incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
-            markers->incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
-            
-            markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), validCount);
-            markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), validCount);
+            // Update marker counts for both strands.
+            const uint64_t orid0 = orientedReadId.getValue();
+            const uint64_t orid1 = OrientedReadId(readId, 1).getValue();
+            markers->incrementCount(orid0, validCount);
+            markers->incrementCount(orid1, validCount);
+            markerKmerIds->incrementCount(orid0, validCount);
+            markerKmerIds->incrementCount(orid1, validCount);
         }
     }
 }
 
+
+/**
+ * @brief Pass 2: Store valid markers using only cached data.
+ *
+ * This pass is highly optimized:
+ *   - Validity is checked from packed bitset (no frequency lookup)
+ *   - Read length is from cache (no Reads access)
+ *   - rcKmerId is from cache (no reverseComplement computation)
+ *
+ * The only work per valid marker is:
+ *   - Copy position and kmerId to strand 0
+ *   - Compute strand 1 position and copy cached rcKmerId
+ */
 void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
 {
     const uint64_t k = assemblerInfo->k;
@@ -1256,45 +1373,42 @@ void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             
             const OrientedReadId orientedReadId0(readId, 0);
-            const auto oldReadMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId0.getValue()];
-            const auto oldReadMarkerKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId0.getValue()];
+            const auto oldMarkers = (*applyKmerCountFilterData.oldMarkers)[orientedReadId0.getValue()];
+            const auto oldKmerIds = (*applyKmerCountFilterData.oldMarkerKmerIds)[orientedReadId0.getValue()];
+            const size_t n = oldMarkers.size();
             
-            if(oldReadMarkers.size() == 0) continue;
+            if(n == 0) continue;
 
-            const LongBaseSequenceView read = reads->getRead(readId);
+            // All data from caches - no external lookups.
+            const uint64_t readLen = applyKmerCountFilterData.readLengths[readId];
+            const auto& validityBits = applyKmerCountFilterData.markerValidity[readId];
+            const auto& rcCache = applyKmerCountFilterData.rcKmerIds[readId];
 
-            // Get pointers for storing markers.
-            CompressedMarker* markerPointerStrand0 = markers->begin(orientedReadId0.getValue());
-            CompressedMarker* markerPointerStrand1 = markers->end(OrientedReadId(readId, 1).getValue()) - 1;
-            
-            KmerId* kmerIdPointerStrand0 = markerKmerIds->begin(orientedReadId0.getValue());
-            KmerId* kmerIdPointerStrand1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
+            // Output pointers.
+            CompressedMarker* outMarker0 = markers->begin(orientedReadId0.getValue());
+            CompressedMarker* outMarker1 = markers->end(OrientedReadId(readId, 1).getValue()) - 1;
+            KmerId* outKmerId0 = markerKmerIds->begin(orientedReadId0.getValue());
+            KmerId* outKmerId1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
 
-            for(size_t i=0; i<oldReadMarkers.size(); i++) {
-                KmerId kmerId = oldReadMarkerKmerIds[i]; // Strand 0 ID
-                
-                Kmer kmer(kmerId, k);
-                KmerId rcKmerId = kmer.reverseComplement(k).id(k);
-                KmerId canonical = std::min(kmerId, rcKmerId);
+            size_t rcIdx = 0;  // Index into dense rcCache array.
 
-                const uint64_t freq = kmerCounter->getFrequency(canonical);
-                
-                if(freq >= applyKmerCountFilterData.minFreq && freq <= applyKmerCountFilterData.maxFreq) {
-                    const uint32_t position = oldReadMarkers[i].position;
+            for(size_t i = 0; i < n; ++i) {
+                // Check validity bit using bitwise ops.
+                if((validityBits[i >> 3] >> (i & 7)) & 1) {
+                    const uint32_t pos = oldMarkers[i].position;
+                    const KmerId kmerId = oldKmerIds[i];
                     
-                    // Strand 0
-                    markerPointerStrand0->position = position;
-                    ++markerPointerStrand0;
-                    
-                    *kmerIdPointerStrand0 = kmerId;
-                    ++kmerIdPointerStrand0;
+                    // Strand 0: direct copy.
+                    outMarker0->position = pos;
+                    *outKmerId0 = kmerId;
+                    ++outMarker0;
+                    ++outKmerId0;
 
-                    // Strand 1 (Derived from Strand 0 info + read len)
-                    markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
-                    --markerPointerStrand1;
-                    
-                    *kmerIdPointerStrand1 = rcKmerId; // Store correct Strand 1 ID (RC)
-                    --kmerIdPointerStrand1;
+                    // Strand 1: reverse complement position, cached rcKmerId.
+                    outMarker1->position = static_cast<uint32_t>(readLen - k - pos);
+                    *outKmerId1 = rcCache[rcIdx++];
+                    --outMarker1;
+                    --outKmerId1;
                 }
             }
         }
