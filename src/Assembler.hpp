@@ -2010,6 +2010,18 @@ private:
         uint64_t maxFreq;
         shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> oldMarkers;
         shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> oldMarkerKmerIds;
+        
+        // Optimization: Cache validity bits per read to avoid redundant work in Pass2.
+        // Each vector<uint8_t> is a packed bitset (8 markers per byte).
+        std::vector<std::vector<uint8_t>> markerValidity;
+        
+        // Cache read lengths to avoid accessing Reads in Pass2.
+        std::vector<uint64_t> readLengths;
+        
+        // Cache reverse complement KmerIds per read, computed in Pass1.
+        // Only valid markers have their rcKmerId stored (sparse storage by index).
+        // This eliminates the reverseComplement() call in Pass2.
+        std::vector<std::vector<KmerId>> rcKmerIds;
     };
     ApplyKmerCountFilterData applyKmerCountFilterData;
 

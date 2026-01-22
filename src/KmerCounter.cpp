@@ -323,6 +323,39 @@ uint64_t KmerCounter::getFrequency(const Kmer& kmer) const
 
 
 
+
+
+// Build the frequency LUT for O(1) lookups.
+// This populates an unordered_map from the bucketed hash table.
+void KmerCounter::buildFrequencyLUT()
+{
+    frequencyLUT.clear();
+    
+    // Reserve approximate space to avoid rehashing
+    uint64_t totalKmers = 0;
+    for(uint64_t bucketId = 0; bucketId < kmerIdFrequencies.size(); ++bucketId) {
+        totalKmers += kmerIdFrequencies[bucketId].size();
+    }
+    frequencyLUT.reserve(totalKmers);
+    
+    // Populate the LUT
+    for(uint64_t bucketId = 0; bucketId < kmerIdFrequencies.size(); ++bucketId) {
+        const auto bucket = kmerIdFrequencies[bucketId];
+        for(const auto& p : bucket) {
+            frequencyLUT[p.first] = p.second;
+        }
+    }
+}
+
+
+// O(1) lookup for pre-canonicalized KmerIds.
+uint64_t KmerCounter::getFrequencyFast(KmerId canonicalKmerId) const
+{
+    auto it = frequencyLUT.find(canonicalKmerId);
+    return (it != frequencyLUT.end()) ? it->second : 0;
+}
+
+
 void KmerCounter::getHistogramInfo(KmerDistributionInfo& info) const
 {
     // Set coverageLow to the first value where the histogram starts increasing.
