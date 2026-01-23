@@ -564,7 +564,11 @@ void dinara::main::assemble(
         const uint64_t maxChainLimit = std::max(100UL, coveragePeak * 5);
         
         // Inverted Index Method (Hifiasm-like).
-        assembler.findAlignmentCandidatesInvertedIndex(
+        // Phase 1-4: Build the inverted index
+        assembler.buildInvertedIndex(threadCount);
+        
+        // Phase 5: Run DP chaining to find alignment candidates
+        assembler.chainAlignmentCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
             threadCount

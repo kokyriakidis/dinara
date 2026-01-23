@@ -651,17 +651,15 @@ template class MultithreadedObject<InvertedIndexFinder>;
 } // namespace dinara
 using namespace dinara;
 
-void Assembler::findAlignmentCandidatesInvertedIndex(
-    double maxDriftRate,
-    uint64_t maxChainLimit,
-    uint64_t threadCount
-) {
+// =============================================================================
+// Phase 1-4: Build the inverted index for overlap candidate discovery.
+// =============================================================================
+void Assembler::buildInvertedIndex(uint64_t threadCount) {
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
 
-    const auto startTime = std::chrono::steady_clock::now();
-    performanceLog << timestamp << "Starting Inverted Index candidate discovery." << endl;
+    performanceLog << timestamp << "Building Inverted Index..." << endl;
 
     // =========================================================================
     // Phase 1: Inverted Index Construction
@@ -906,9 +904,30 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     invertedIndexData.occurrences.clear();
     invertedIndexData.occurrences.shrink_to_fit();
     cout << "Index construction complete." << endl;
+}
+
+// =============================================================================
+// Phase 5: Run DP chaining on the built index to find alignment candidates.
+// =============================================================================
+void Assembler::chainAlignmentCandidates(
+    double maxDriftRate,
+    uint64_t maxChainLimit,
+    uint64_t threadCount
+) {
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const auto startTime = std::chrono::steady_clock::now();
+    performanceLog << timestamp << "Starting DP chaining for alignment candidates." << endl;
+
+    // Check that buildInvertedIndex has been called
+    if(invertedIndexData.compactOccurrences.empty()) {
+        throw runtime_error("chainAlignmentCandidates: buildInvertedIndex must be called first.");
+    }
 
     // =========================================================================
-    // Phase 5: Parallel Candidate Search
+    // Parallel Candidate Search
     // =========================================================================
     // The main search loop. For each Read A (strand 0), we:
     //   1. Look up each of its K-mers in the hash table.
@@ -923,6 +942,7 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize); 
     
     // Safety reserve for performance
+    const ReadId readCount = ReadId(markers->size() / 2);
     alignmentCandidates.candidates.reserve(size_t(readCount) * 50);
     alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); 
 
@@ -953,4 +973,16 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     const auto endTime = std::chrono::steady_clock::now();
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
     cout << timestamp << "Alignment discovery completed in " << totalSeconds << " s." << endl;
+}
+
+// =============================================================================
+// Convenience wrapper that calls both buildInvertedIndex and chainAlignmentCandidates.
+// =============================================================================
+void Assembler::findAlignmentCandidatesInvertedIndex(
+    double maxDriftRate,
+    uint64_t maxChainLimit,
+    uint64_t threadCount
+) {
+    buildInvertedIndex(threadCount);
+    chainAlignmentCandidates(maxDriftRate, maxChainLimit, threadCount);
 }
