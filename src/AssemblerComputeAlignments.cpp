@@ -365,3 +365,195 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
     
     thisThreadCompressedAlignments.unreserve();
 }
+
+
+
+void Assembler::filterSecondaryAlignmentsPerReadPair(uint64_t threadCount)
+{
+    // --- Hifiasm-style per-read-pair redundancy filtering ---
+    // For each read r0, consider all overlaps to a given partner read (r1).
+    // Keep the strongest chains and delete redundant/secondary ones:
+    // - score ratio filter (hifiasm -p 0.8)
+    // - overlap-on-r0 filter (hifiasm -M 0.5)
+
+    const auto tBegin = steady_clock::now();
+    cout << timestamp << "Filtering secondary alignments per read pair begins." << endl;
+
+    removedSecondaryAlignmentCount = 0;
+
+    // Run threads.
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100); // Batch size heuristic.
+    runThreads(&Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction, threadCount);
+
+    const auto tEnd = steady_clock::now();
+    const double tSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "Filtering secondary alignments per read pair ends in " << tSeconds << " s." << endl;
+    cout << timestamp << "Removed " << removedSecondaryAlignmentCount << " redundant alignments (marked isDeleted)." << endl;
+}
+
+
+
+void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
+{
+    uint64_t begin, end;
+    uint64_t localRemovedCount = 0;
+
+    // Reuse buffers across reads to avoid repeated allocations.
+    struct CandidateInfo {
+        uint32_t alignmentId;
+        int64_t score;
+        uint64_t qs;
+        uint64_t qe;
+    };
+    vector<CandidateInfo> group;
+    vector<CandidateInfo> kept;
+    group.reserve(16);
+    kept.reserve(16);
+
+    // Default batch size from setupLoadBalancing.
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); r0++) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) {
+                continue;
+            }
+
+            group.clear();
+            kept.clear();
+
+            ReadId currentTarget = invalidReadId;
+
+            auto flushGroup = [&]() {
+                if(group.empty()) {
+                    return;
+                }
+                if(group.size() == 1) {
+                    // A single alignment for this read pair cannot be redundant.
+                    return;
+                }
+
+                // Sort group by score descending.
+                sort(group.begin(), group.end(), [](const CandidateInfo& a, const CandidateInfo& b) {
+                    return a.score > b.score;
+                });
+
+                kept.clear();
+                const int64_t bestScore = group[0].score;
+
+                for(const auto& cand : group) {
+                    bool drop = false;
+
+                    // 1) Score ratio filter (hifiasm -p 0.8), done with integer math:
+                    // cand.score < bestScore * 0.8  <=>  cand.score * 5 < bestScore * 4
+                    if(cand.score * 5 < bestScore * 4) {
+                        drop = true;
+                    } else {
+                        // 2) Overlap filter on r0 (hifiasm -M 0.5), integer math:
+                        // oLen > 0.5 * len  <=>  2*oLen > len
+                        const uint64_t len = cand.qe - cand.qs;
+                        for(const auto& existing : kept) {
+                            const uint64_t oStart = max(cand.qs, existing.qs);
+                            const uint64_t oEnd = min(cand.qe, existing.qe);
+                            if(oEnd > oStart) {
+                                const uint64_t oLen = oEnd - oStart;
+                                if(oLen * 2 > len) {
+                                    drop = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if(drop) {
+                        alignmentData[cand.alignmentId].setDeleted(true);
+                        localRemovedCount++;
+                    } else {
+                        kept.push_back(cand);
+                    }
+                }
+            };
+
+            // alignmentTable[OrientedReadId(r0,0)] is already sorted by partner OrientedReadId,
+            // so partner ReadIds are contiguous (strand 0/1 are adjacent for the same read).
+            // Skip the prefix where the partner oriented read id is < orientedR0 (partner read id < r0).
+            // This avoids scanning alignments that would be skipped by canonical ordering checks.
+            size_t firstIndex = 0;
+            {
+                size_t lo = 0;
+                size_t hi = table.size();
+                while(lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const uint32_t alignmentId = table[mid];
+                    const OrientedReadId other = alignmentData[alignmentId].getOther(orientedR0);
+                    if(other < orientedR0) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                firstIndex = lo;
+            }
+
+            for(size_t tableIndex = firstIndex; tableIndex < table.size(); ++tableIndex) {
+                const uint32_t alignmentId = table[tableIndex];
+                const auto& ad = alignmentData[alignmentId];
+
+                // Mark self-overlaps as deleted immediately.
+                if(ad.readIds[0] == ad.readIds[1]) {
+                    alignmentData[alignmentId].setDeleted(true);
+                    localRemovedCount++;
+                    continue;
+                }
+
+                // Canonical ordering: only process from the smaller ReadId side.
+                // AlignmentData is expected to be stored with readIds[0] < readIds[1].
+                // So for this r0, we only act when r0 == readIds[0].
+                if(ad.readIds[0] != r0) {
+                    continue;
+                }
+                const ReadId target = ad.readIds[1];
+
+                if(target != currentTarget) {
+                    flushGroup();
+                    group.clear();
+                    currentTarget = target;
+                }
+
+                const auto& info = ad.info;
+
+                // Overlap length on r0.
+                const uint64_t overlapLenOnR0 = uint64_t(ad.qe) - uint64_t(ad.qs);
+
+                // Hifiasm affine score approximation if metrics are available.
+                const bool hasMetrics =
+                    (info.mismatchCount != invalid<uint32_t>) &&
+                    (info.gapCount != invalid<uint32_t>);
+
+                int64_t score;
+                if(hasMetrics) {
+                    // Score ~= 2*Len - 6*Mis - 4*GapBases - 4*GapEvents
+                    score = 2 * int64_t(overlapLenOnR0)
+                          - 6 * int64_t(info.mismatchCount)
+                          - 4 * int64_t(info.gapCount);
+                    if(info.gapEventCount != invalid<uint32_t>) {
+                        score -= 4 * int64_t(info.gapEventCount);
+                    }
+                } else {
+                    score = 2 * int64_t(overlapLenOnR0);
+                }
+
+                // Overlap interval on r0 (forward coordinates).
+                const uint64_t qs = ad.qs;
+                const uint64_t qe = ad.qe;
+
+                group.push_back(CandidateInfo{alignmentId, score, qs, qe});
+            }
+
+            flushGroup();
+        }
+    }
+
+    removedSecondaryAlignmentCount += localRemovedCount;
+}
