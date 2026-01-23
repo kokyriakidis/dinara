@@ -17,6 +17,7 @@ namespace dinara {
     struct SnpEvidence {
         uint16_t data;
 
+        static const uint16_t MAX_DELTA = 16383; // 2^14 - 1
         static const uint16_t DELTA_MASK = 0xFFFC;
         static const uint16_t BASE_MASK = 0x0003;
         static const int BASE_SHIFT = 0;

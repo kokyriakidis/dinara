@@ -578,7 +578,9 @@ private:
     public:
         MemoryMapped::Vector<Alignment> alignments;
     };
+public:
     AlignmentCandidatesAlignmentsData alignmentCandidatesAlignmentsData;
+private:
     
     // Low level functions to get marker Kmers/KmerIds of an oriented read.
     // They are obtained from the reads and not from CompressedMarker::kmerId,
@@ -770,7 +772,9 @@ private:
     // Alignment candidates found by the LowHash algorithm.
     // They all have readId0<readId1.
     // They are interpreted with readId0 on strand 0.
+public:
     AlignmentCandidates alignmentCandidates;
+private:
 
 public:
     void writeAlignmentCandidates(bool useReadName=false, bool verbose=false) const;
@@ -1949,7 +1953,18 @@ public:
     // Prune existing markers based on KmerCounter frequencies.
     void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount);
 
-    // Alignment candidates using Inverted Index.
+    // Alignment candidates using Inverted Index (modular pipeline).
+    // Phase 1-4: Build the inverted index for overlap candidate discovery.
+    void buildInvertedIndex(uint64_t threadCount);
+
+    // Phase 5: Run DP chaining on the built index to find alignment candidates.
+    void chainAlignmentCandidates(
+        double maxDriftRate,
+        uint64_t maxChainLimit,
+        uint64_t threadCount
+    );
+
+    // Convenience wrapper that calls both buildInvertedIndex and chainAlignmentCandidates.
     void findAlignmentCandidatesInvertedIndex(
         double maxDriftRate,
         uint64_t maxChainLimit,

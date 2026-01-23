@@ -495,16 +495,17 @@ void Assembler::computeAlignments(
     // Compute the alignments.
     data.threadAlignmentData.resize(threadCount);
     data.threadCompressedAlignments.resize(threadCount);
-
     data.threadEvidenceStores.resize(threadCount);
+    
+    // Always resize these to avoid SIGSEGV during aggregation, even if not used.
+    data.threadProjectedAlignmentTime.assign(threadCount, 0.0);
+    data.threadCollectionTime.assign(threadCount, 0.0);
+    data.threadFilteredByErrorRate.assign(threadCount, 0);
+    data.threadFilteredByErrorRateGap.assign(threadCount, 0);
+    data.threadFilteredByGapCount.assign(threadCount, 0);
 
     if (assemblerInfo->readGraphCreationMethod == 5) {
         data.threadVariantClusteringPositionPairs.resize(threadCount);
-        data.threadProjectedAlignmentTime.resize(threadCount, 0.0);
-        data.threadCollectionTime.resize(threadCount, 0.0);
-        data.threadFilteredByErrorRate.resize(threadCount, 0);
-        data.threadFilteredByErrorRateGap.resize(threadCount, 0);
-        data.threadFilteredByGapCount.resize(threadCount, 0);
     }
     
     performanceLog << timestamp << "Alignment computation begins." << endl;
@@ -596,14 +597,19 @@ void Assembler::computeAlignments(
     // Aggregate timing statistics from all threads
     double totalProjectedAlignmentTime = 0.0;
     double totalCollectionTime = 0.0;
-    for (size_t i = 0; i < threadCount; i++) {
-        totalProjectedAlignmentTime += data.threadProjectedAlignmentTime[i];
-        totalCollectionTime += data.threadCollectionTime[i];
-    }
+    double estimatedProjectedWallTime = 0.0;
+    double estimatedCollectionWallTime = 0.0;
     
-    // Estimate wall-clock time by dividing summed thread time by thread count
-    const double estimatedProjectedWallTime = totalProjectedAlignmentTime / threadCount;
-    const double estimatedCollectionWallTime = totalCollectionTime / threadCount;
+    if (assemblerInfo->readGraphCreationMethod == 5) {
+        for (size_t i = 0; i < threadCount; i++) {
+            totalProjectedAlignmentTime += data.threadProjectedAlignmentTime[i];
+            totalCollectionTime += data.threadCollectionTime[i];
+        }
+    
+        // Estimate wall-clock time by dividing summed thread time by thread count
+        estimatedProjectedWallTime = totalProjectedAlignmentTime / threadCount;
+        estimatedCollectionWallTime = totalCollectionTime / threadCount;
+    }
 
     if (assemblerInfo->readGraphCreationMethod == 5) {
         uint64_t totalFilteredByErrorRate = 0;
@@ -620,21 +626,23 @@ void Assembler::computeAlignments(
         cout << "Alignments filtered by gap error rate (> 0.006): " << totalFilteredByErrorRateGap << endl;
         cout << "Alignments filtered by gap count (> 64): " << totalFilteredByGapCount << endl;
     }
-    variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
-    variantClusteringCollectionTime = estimatedCollectionWallTime;
-    
-    cout << "\nVariant clustering collection timing (estimated wall-clock):" << endl;
-    cout << "  Projected alignment: ~" << estimatedProjectedWallTime << " s" << endl;
-    cout << "  Position pair collection: ~" << estimatedCollectionWallTime << " s" << endl;
-    performanceLog << timestamp << "Projected alignment (estimated wall-clock): " << estimatedProjectedWallTime << " s" << endl;
-    performanceLog << timestamp << "Collection (estimated wall-clock): " << estimatedCollectionWallTime << " s" << endl;
-    
-    // Store position pairs collected by each thread
-    performanceLog << timestamp << "Storing position pairs for variant clustering." << endl;
-    cout << timestamp << "Storing position pairs for variant clustering." << endl;
-    storeVariantClusteringPositionPairs(threadCount, data);
-    performanceLog << timestamp << "Done storing position pairs for variant clustering." << endl;
-    cout << timestamp << "Done storing position pairs for variant clustering." << endl;
+    if (assemblerInfo->readGraphCreationMethod == 5) {
+        variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
+        variantClusteringCollectionTime = estimatedCollectionWallTime;
+        
+        cout << "\nVariant clustering collection timing (estimated wall-clock):" << endl;
+        cout << "  Projected alignment: ~" << estimatedProjectedWallTime << " s" << endl;
+        cout << "  Position pair collection: ~" << estimatedCollectionWallTime << " s" << endl;
+        performanceLog << timestamp << "Projected alignment (estimated wall-clock): " << estimatedProjectedWallTime << " s" << endl;
+        performanceLog << timestamp << "Collection (estimated wall-clock): " << estimatedCollectionWallTime << " s" << endl;
+        
+        // Store position pairs collected by each thread
+        performanceLog << timestamp << "Storing position pairs for variant clustering." << endl;
+        cout << timestamp << "Storing position pairs for variant clustering." << endl;
+        storeVariantClusteringPositionPairs(threadCount, data);
+        performanceLog << timestamp << "Done storing position pairs for variant clustering." << endl;
+        cout << timestamp << "Done storing position pairs for variant clustering." << endl;
+    }
 
 
 
@@ -757,7 +765,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
     vector< pair<uint64_t, double> > elapsedTime;
 #endif
 
-    const uint64_t messageFrequency = min(1000000UL, alignmentCandidates.candidates.size()/20);
+    const uint64_t messageFrequency = max(1UL, min(1000000UL, alignmentCandidates.candidates.size()/20));
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
@@ -872,7 +880,6 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 
             // If the alignment has too few markers, skip it.
             if(alignment.ordinals.size() < minAlignedMarkerCount) {
-                // cout << orientedReadIds[0] << " " << orientedReadIds[1] << " too few markers." << endl;
                 continue;
             }
 
@@ -886,7 +893,6 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             uint32_t rightTrim;
             tie(leftTrim, rightTrim) = alignmentInfo.computeTrim();
             if(leftTrim>maxTrim || rightTrim>maxTrim) {
-                // cout << orientedReadIds[0] << " " << orientedReadIds[1] << " too much trim." << endl;
                 continue;
             }
 
@@ -1067,6 +1073,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             
 
 
+
             // --- Populate AlignedEvidenceStore (APES/TASSD) ---
             // The AlignedEvidenceStore uses a dual-stream architecture (Target-View vs Query-View)
             // to allow O(1) lookups of evidence during phasing without re-projecting.
@@ -1115,16 +1122,16 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 
                         if (!qRev) { // Stream 1
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapLen) {
-                                store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
-                                lastSnpQ += 16383; adv += 16383;
+                            while(adv + SnpEvidence::MAX_DELTA <= gapLen) {
+                                store.addSnp1(SnpEvidence::MAX_DELTA, getQ(lastSnpQ + SnpEvidence::MAX_DELTA).value);
+                                lastSnpQ += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
                         if (!tRev) { // Stream 0
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapT) {
-                                store.addSnp0(16383, getT(lastSnpT + 16383).value);
-                                lastSnpT += 16383; adv += 16383;
+                            while(adv + SnpEvidence::MAX_DELTA <= gapT) {
+                                store.addSnp0(SnpEvidence::MAX_DELTA, getT(lastSnpT + SnpEvidence::MAX_DELTA).value);
+                                lastSnpT += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
                     }
@@ -1139,16 +1146,16 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 
                         if (!qRev) {
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapQ) {
-                                store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
-                                lastSnpQ += 16383; adv += 16383;
+                            while(adv + SnpEvidence::MAX_DELTA <= gapQ) {
+                                store.addSnp1(SnpEvidence::MAX_DELTA, getQ(lastSnpQ + SnpEvidence::MAX_DELTA).value);
+                                lastSnpQ += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
                         if (!tRev) {
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapT) {
-                                store.addSnp0(16383, getT(lastSnpT + 16383).value);
-                                lastSnpT += 16383; adv += 16383;
+                            while(adv + SnpEvidence::MAX_DELTA <= gapT) {
+                                store.addSnp0(SnpEvidence::MAX_DELTA, getT(lastSnpT + SnpEvidence::MAX_DELTA).value);
+                                lastSnpT += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
 
@@ -1156,9 +1163,9 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                         currentT = segment.positionsA[1];
 
                         // 2. Steps
-                        for(const auto& step : segment.alignment) {
-                            bool advQ = step.first;
-                            bool advT = step.second;
+                        for(auto it = segment.alignment.begin(); it != segment.alignment.end(); ) {
+                            bool advQ = it->first;
+                            bool advT = it->second;
                             
                             if (advQ && advT) { // Match/Mismatch
                                 if (getQ(currentQ) != getT(currentT)) {
@@ -1166,32 +1173,42 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                                     // Use getQ/getT directly (already returns Aligned/Canonical Bases)
                                     if (!qRev) { // Stream 1 expects Target Base
                                         uint32_t d = currentQ - lastSnpQ;
-                                        while(d >= 16383) {
-                                            store.addSnp1(16383, getQ(lastSnpQ + 16383).value);
-                                            lastSnpQ += 16383; d -= 16383;
+                                        while(d > SnpEvidence::MAX_DELTA) {
+                                            store.addSnp1(SnpEvidence::MAX_DELTA, getQ(lastSnpQ + SnpEvidence::MAX_DELTA).value);
+                                            lastSnpQ += SnpEvidence::MAX_DELTA; d -= SnpEvidence::MAX_DELTA;
                                         }
                                         store.addSnp1((uint16_t)d, getT(currentT).value);
                                         lastSnpQ = currentQ;
                                     }
                                     if (!tRev) { // Stream 0 expects Query Base
                                         uint32_t d = currentT - lastSnpT;
-                                        while(d >= 16383) {
-                                            store.addSnp0(16383, getT(lastSnpT + 16383).value);
-                                            lastSnpT += 16383; d -= 16383;
+                                        while(d > SnpEvidence::MAX_DELTA) {
+                                            store.addSnp0(SnpEvidence::MAX_DELTA, getT(lastSnpT + SnpEvidence::MAX_DELTA).value);
+                                            lastSnpT += SnpEvidence::MAX_DELTA; d -= SnpEvidence::MAX_DELTA;
                                         }
                                         store.addSnp0((uint16_t)d, getQ(currentQ).value);
                                         lastSnpT = currentT;
                                     }
                                 }
                                 currentQ++; currentT++;
-                            } else if (!advQ && advT) { // Gap in Q
-                                if (!qRev) store.addIndel1(currentQ, 1, 0); // Ins in T relative to Q
-                                if (!tRev) store.addIndel0(currentT, 1, 1); // Del in Q relative to T
-                                currentT++;
-                            } else if (advQ && !advT) { // Gap in T
-                                if (!qRev) store.addIndel1(currentQ, 1, 1); // Del in T relative to Q
-                                if (!tRev) store.addIndel0(currentT, 1, 0); // Ins in Q relative to T
-                                currentQ++;
+                                ++it;
+                            } else {
+                                uint32_t len = 0;
+                                auto it2 = it;
+                                while(it2 != segment.alignment.end() && it2->first == advQ && it2->second == advT) {
+                                    len++;
+                                    ++it2;
+                                }
+                                if (!advQ && advT) { // Gap in Q
+                                    if (!qRev) store.addIndel1(currentQ, len, 0); // Ins in T relative to Q
+                                    if (!tRev) store.addIndel0(currentT, len, 1); // Del in Q relative to T
+                                    currentT += len;
+                                } else if (advQ && !advT) { // Gap in T
+                                    if (!qRev) store.addIndel1(currentQ, len, 1); // Del in T relative to Q
+                                    if (!tRev) store.addIndel0(currentT, len, 0); // Ins in Q relative to T
+                                    currentQ += len;
+                                }
+                                it = it2;
                             }
                         }
                         currentQ = segment.positionsB[0];
@@ -1205,17 +1222,17 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                     if (!qRev && endQ > currentQ) {
                         uint32_t gap = endQ - currentQ;
                         uint32_t adv = 0;
-                        while(adv + 16383 <= gap) {
-                            store.addSnp1(16383, getQ(lastSnpQ+16383).value);
-                            lastSnpQ += 16383; adv += 16383;
+                        while(adv + SnpEvidence::MAX_DELTA <= gap) {
+                            store.addSnp1(SnpEvidence::MAX_DELTA, getQ(lastSnpQ + SnpEvidence::MAX_DELTA).value);
+                            lastSnpQ += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                         }
                     }
                     if (!tRev && endT > currentT) {
                         uint32_t gap = endT - currentT;
                         uint32_t adv = 0;
-                        while(adv + 16383 <= gap) {
-                            store.addSnp0(16383, getT(lastSnpT+16383).value);
-                            lastSnpT += 16383; adv += 16383;
+                        while(adv + SnpEvidence::MAX_DELTA <= gap) {
+                            store.addSnp0(SnpEvidence::MAX_DELTA, getT(lastSnpT + SnpEvidence::MAX_DELTA).value);
+                            lastSnpT += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                         }
                     }
                 }
@@ -1250,19 +1267,19 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                         
                         if (qRev) {
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapQ) {
-                                // Dummy at Canonical `lastSnpQ + 16383`.
+                            while(adv + SnpEvidence::MAX_DELTA <= gapQ) {
+                                // Dummy at Canonical `lastSnpQ + SnpEvidence::MAX_DELTA`.
                                 // To get base, we Map Canonical -> Oriented.
-                                // Oriented = qRawLen - 1 - (lastSnpQ + 16383).
-                                store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ + 16383)).value);
-                                lastSnpQ += 16383; adv += 16383;
+                                // Oriented = qRawLen - 1 - (lastSnpQ + SnpEvidence::MAX_DELTA).
+                                store.addSnp1(SnpEvidence::MAX_DELTA, getQ(qRawLen - 1 - (lastSnpQ + SnpEvidence::MAX_DELTA)).value);
+                                lastSnpQ += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
                         if (tRev) {
                             uint32_t adv = 0;
-                            while(adv + 16383 <= gapT) {
-                                store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT + 16383)).value);
-                                lastSnpT += 16383; adv += 16383;
+                            while(adv + SnpEvidence::MAX_DELTA <= gapT) {
+                                store.addSnp0(SnpEvidence::MAX_DELTA, getT(tRawLen - 1 - (lastSnpT + SnpEvidence::MAX_DELTA)).value);
+                                lastSnpT += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                             }
                         }
 
@@ -1270,7 +1287,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                         currentT = segment.positionsB[1];
                         
                         // 2. Steps (Reverse)
-                        for (auto sIt = segment.alignment.rbegin(); sIt != segment.alignment.rend(); ++sIt) {
+                        for (auto sIt = segment.alignment.rbegin(); sIt != segment.alignment.rend(); ) {
                             bool advQ = sIt->first;
                             bool advT = sIt->second;
                             
@@ -1283,35 +1300,44 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 
                                     if (qRev) {
                                         uint32_t d = canQ - lastSnpQ;
-                                        while(d >= 16383) {
-                                            store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ+16383)).value);
-                                            lastSnpQ += 16383; d -= 16383;
+                                        while(d > SnpEvidence::MAX_DELTA) {
+                                            store.addSnp1(SnpEvidence::MAX_DELTA, getQ(qRawLen - 1 - (lastSnpQ + SnpEvidence::MAX_DELTA)).value);
+                                            lastSnpQ += SnpEvidence::MAX_DELTA; d -= SnpEvidence::MAX_DELTA;
                                         }
                                         store.addSnp1((uint16_t)d, getT(currentT).value); // Partner Base
                                         lastSnpQ = canQ;
                                     }
                                     if (tRev) {
                                         uint32_t d = canT - lastSnpT;
-                                        while(d >= 16383) {
-                                            store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT+16383)).value);
-                                            lastSnpT += 16383; d -= 16383;
+                                        while(d > SnpEvidence::MAX_DELTA) {
+                                            store.addSnp0(SnpEvidence::MAX_DELTA, getT(tRawLen - 1 - (lastSnpT + SnpEvidence::MAX_DELTA)).value);
+                                            lastSnpT += SnpEvidence::MAX_DELTA; d -= SnpEvidence::MAX_DELTA;
                                         }
                                         store.addSnp0((uint16_t)d, getQ(currentQ).value); // Partner Base
                                         lastSnpT = canT;
                                     }
                                 }
-                            } else if (!advQ && advT) { // Gap in Q -> Dec T
-                                currentT--;
-                                // Canonical T: tRawLen - 1 - currentT
-                                if (tRev) store.addIndel0(tRawLen - 1 - currentT, 1, 1); // Del in Q
-                                // Relative to Q? Q didn't move. 
-                                // Canonical Q position is effectively "between" bases (insertion in T).
-                                // Anchor at previous Canonical Q: qRawLen - 1 - currentQ.
-                                if (qRev) store.addIndel1(qRawLen - 1 - currentQ, 1, 0); // Ins in T
-                            } else if (advQ && !advT) { // Gap in T -> Dec Q
-                                currentQ--;
-                                if (qRev) store.addIndel1(qRawLen - 1 - currentQ, 1, 1); // Del in T
-                                if (tRev) store.addIndel0(tRawLen - 1 - currentT, 1, 0); // Ins in Q
+                                ++sIt;
+                            } else {
+                                uint32_t len = 0;
+                                auto sIt2 = sIt;
+                                while(sIt2 != segment.alignment.rend() && sIt2->first == advQ && sIt2->second == advT) {
+                                    len++;
+                                    ++sIt2;
+                                }
+                                if (!advQ && advT) { // Gap in Q -> Dec T
+                                    // Canonical T: tRawLen - 1 - newest currentT
+                                    // newest currentT = currentT - len
+                                    // Canonical start pos = tRawLen - 1 - (currentT - 1)
+                                    if (tRev) store.addIndel0(tRawLen - 1 - (currentT - 1), len, 1); // Del in Q
+                                    if (qRev) store.addIndel1(qRawLen - 1 - currentQ, len, 0); // Ins in T
+                                    currentT -= len;
+                                } else if (advQ && !advT) { // Gap in T -> Dec Q
+                                    if (qRev) store.addIndel1(qRawLen - 1 - (currentQ - 1), len, 1); // Del in T
+                                    if (tRev) store.addIndel0(tRawLen - 1 - currentT, len, 0); // Ins in Q
+                                    currentQ -= len;
+                                }
+                                sIt = sIt2;
                             }
                         }
                         currentQ = segment.positionsA[0];
@@ -1329,17 +1355,17 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                     if (qRev && currentQ > endQ_Oriented) {
                         uint32_t gap = currentQ - endQ_Oriented;
                         uint32_t adv = 0;
-                        while(adv + 16383 <= gap) {
-                            store.addSnp1(16383, getQ(qRawLen - 1 - (lastSnpQ+16383)).value);
-                            lastSnpQ += 16383; adv += 16383;
+                        while(adv + SnpEvidence::MAX_DELTA <= gap) {
+                            store.addSnp1(SnpEvidence::MAX_DELTA, getQ(qRawLen - 1 - (lastSnpQ + SnpEvidence::MAX_DELTA)).value);
+                            lastSnpQ += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                         }
                     }
                     if (tRev && currentT > endT_Oriented) {
                         uint32_t gap = currentT - endT_Oriented;
                         uint32_t adv = 0;
-                        while(adv + 16383 <= gap) {
-                            store.addSnp0(16383, getT(tRawLen - 1 - (lastSnpT+16383)).value);
-                            lastSnpT += 16383; adv += 16383;
+                        while(adv + SnpEvidence::MAX_DELTA <= gap) {
+                            store.addSnp0(SnpEvidence::MAX_DELTA, getT(tRawLen - 1 - (lastSnpT + SnpEvidence::MAX_DELTA)).value);
+                            lastSnpT += SnpEvidence::MAX_DELTA; adv += SnpEvidence::MAX_DELTA;
                         }
                     }
                 }
