@@ -589,8 +589,8 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
-    // Filter Best Hit Alignments (Hifiasm Parity)
-    assembler.filterBestHitAlignments(threadCount);
+    // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
+    assembler.filterSecondaryAlignmentsPerReadPair(threadCount);
 
     // =========================================================================
     // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
