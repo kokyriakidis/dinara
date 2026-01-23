@@ -986,3 +986,333 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     buildInvertedIndex(threadCount);
     chainAlignmentCandidates(maxDriftRate, maxChainLimit, threadCount);
 }
+
+// =============================================================================
+// Chain pre-imported PAF candidates using the inverted index.
+// This assumes buildInvertedIndex has been called and alignmentCandidates.candidates
+// has been populated by importAlignmentCandidatesFromPaf.
+// =============================================================================
+void Assembler::chainPafCandidates(
+    double maxDriftRate,
+    uint64_t maxChainLimit,
+    uint64_t threadCount
+) {
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const auto startTime = std::chrono::steady_clock::now();
+    performanceLog << timestamp << "Starting DP chaining for PAF-imported candidates." << endl;
+
+    // Check that buildInvertedIndex has been called
+    if(invertedIndexData.compactOccurrences.empty() && invertedIndexData.hashTable.empty()) {
+        throw runtime_error("chainPafCandidates: buildInvertedIndex must be called first.");
+    }
+
+    // Check that PAF candidates have been imported
+    if(!alignmentCandidates.candidates.isOpen || alignmentCandidates.candidates.size() == 0) {
+        throw runtime_error("chainPafCandidates: No candidates imported. Call importAlignmentCandidatesFromPaf first.");
+    }
+
+    cout << timestamp << "Chaining " << alignmentCandidates.candidates.size() << " PAF-imported candidates..." << endl;
+
+    // Store parameters for chaining
+    invertedIndexData.maxDriftRate = maxDriftRate;
+    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
+
+    // Create output storage for chained alignments
+    alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize);
+    alignmentCandidatesAlignmentsData.alignments.reserve(alignmentCandidates.candidates.size());
+
+    // Store original candidates before we modify them
+    vector<OrientedReadPair> originalCandidates;
+    originalCandidates.reserve(alignmentCandidates.candidates.size());
+    for(size_t i = 0; i < alignmentCandidates.candidates.size(); i++) {
+        originalCandidates.push_back(alignmentCandidates.candidates[i]);
+    }
+
+    // Clear and prepare to repopulate with chained results
+    alignmentCandidates.candidates.clear();
+    alignmentCandidates.candidates.reserve(originalCandidates.size());
+
+    // Setup threading
+    const uint64_t hashMask = invertedIndexData.hashTable.size() - 1;
+    const auto* hashTablePtr = invertedIndexData.hashTable.data();
+    const uint64_t kmerLen = invertedIndexData.k;
+    const double maxDriftRateLocal = invertedIndexData.maxDriftRate;
+    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+
+    // Thread-local results
+    vector<vector<OrientedReadPair>> threadCandidates(threadCount);
+    vector<vector<Alignment>> threadAlignments(threadCount);
+    
+    // Per-thread processing
+    const size_t batchSize = std::max(size_t(1), originalCandidates.size() / (threadCount * 10));
+    setupLoadBalancing(originalCandidates.size(), batchSize);
+
+    vector<std::thread> threads;
+    for(size_t tid = 0; tid < threadCount; tid++) {
+        threads.emplace_back([&, tid]() {
+            ThreadScratchpad scratch;
+            vector<OrientedReadPair>& localCandidates = threadCandidates[tid];
+            vector<Alignment>& localAlignments = threadAlignments[tid];
+            
+            const int64_t dRscaled = (int64_t)(maxDriftRateLocal * 1024.0);
+            
+            uint64_t startBatch, endBatch;
+            while(getNextBatch(startBatch, endBatch)) {
+                for(size_t idx = startBatch; idx < endBatch; idx++) {
+                    const OrientedReadPair& pair = originalCandidates[idx];
+                    const ReadId readIdA = pair.readIds[0];
+                    const ReadId readIdB = pair.readIds[1];
+                    const bool pafSameStrand = pair.isSameStrand;
+
+                    const OrientedReadId orientedReadIdA(readIdA, 0);
+                    const OrientedReadId orientedReadIdB(readIdB, 0);
+                    const auto& markersA = (*markers)[orientedReadIdA.getValue()];
+                    const auto& kmerIdsA = (*markerKmerIds)[orientedReadIdA.getValue()];
+                    const auto& markersB = (*markers)[orientedReadIdB.getValue()];
+                    const auto& kmerIdsB = (*markerKmerIds)[orientedReadIdB.getValue()];
+                    
+                    const size_t numMarkersA = std::min(markersA.size(), kmerIdsA.size());
+                    const size_t numMarkersB = std::min(markersB.size(), kmerIdsB.size());
+                    
+                    if(numMarkersA == 0 || numMarkersB == 0) continue;
+
+                    const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
+                    const uint64_t readLenB = reads->getReadRawSequenceLength(readIdB);
+
+                    // Build position lookup for read B
+                    std::map<uint32_t, uint32_t> posBToOrdinalB;
+                    for(size_t j = 0; j < numMarkersB; j++) {
+                        posBToOrdinalB[markersB[j].position] = (uint32_t)j;
+                    }
+
+                    // Collect k-mer matches between the pair
+                    scratch.clear();
+                    scratch.flatHits.reserve(numMarkersA);
+
+                    for(size_t i = 0; i < numMarkersA; i++) {
+                        KmerId currentKId = kmerIdsA[i];
+                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                        KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                        
+                        uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
+                        const uint32_t posA = markersA[i].position;
+
+                        // Search hash table for this k-mer
+                        while(!hashTablePtr[slotIdx].empty) {
+                            if(hashTablePtr[slotIdx].key == canonicalKId) {
+                                const uint64_t startIdx = hashTablePtr[slotIdx].start;
+                                const uint32_t count = hashTablePtr[slotIdx].count;
+                                
+                                // Compute weight
+                                static const uint8_t* weightLUT = []() -> uint8_t* {
+                                    static uint8_t lut[512];
+                                    for (int i = 0; i < 512; ++i) {
+                                        lut[i] = (uint8_t)std::min(255.0, std::pow((double)i, 1.1));
+                                    }
+                                    return lut;
+                                }();
+                                
+                                uint8_t hitWeight = 1;
+                                const uint64_t lowFreq = (uint64_t)(coveragePeak * 0.333);
+                                const uint64_t highFreq = (uint64_t)(coveragePeak * 1.667);
+                                
+                                if (count <= std::max(2UL, lowFreq)) {
+                                    hitWeight = 2;
+                                } else if (count >= std::max(3UL, highFreq)) {
+                                    uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
+                                    hitWeight = (w < 512) ? weightLUT[w] : (uint8_t)std::min(255U, (uint32_t)pow((double)w, 1.1));
+                                }
+
+                                // Find occurrences in read B only
+                                const auto* compactOccs = &invertedIndexData.compactOccurrences[startIdx];
+                                for(uint32_t j = 0; j < count; j++) {
+                                    if(compactOccs[j].readId == readIdB) {
+                                        scratch.flatHits.push_back({readIdB, posA, compactOccs[j].position, (uint32_t)i, hitWeight});
+                                    }
+                                }
+                                break;
+                            }
+                            slotIdx = (slotIdx + 1) & hashMask;
+                        }
+                    }
+
+                    if(scratch.flatHits.empty()) {
+                        // No shared k-mers found, keep original candidate without chained alignment
+                        localCandidates.push_back(pair);
+                        localAlignments.push_back(Alignment());
+                        continue;
+                    }
+
+                    // Sort hits by position
+                    std::sort(scratch.flatHits.begin(), scratch.flatHits.end(), 
+                        [](const InvertedIndexTempHit& a, const InvertedIndexTempHit& b) {
+                            return a.posA < b.posA;
+                        });
+
+                    const size_t numHits = scratch.flatHits.size();
+
+                    // Transfer to SoA
+                    scratch.hitPosA.assign(numHits, 0);
+                    scratch.hitPosB.assign(numHits, 0);
+                    scratch.hitOrdinalA.assign(numHits, 0);
+                    scratch.hitWeights.assign(numHits, 0);
+                    for(size_t k = 0; k < numHits; k++) {
+                        scratch.hitPosA[k] = scratch.flatHits[k].posA;
+                        scratch.hitPosB[k] = scratch.flatHits[k].posB;
+                        scratch.hitOrdinalA[k] = scratch.flatHits[k].ordinalA;
+                        scratch.hitWeights[k] = scratch.flatHits[k].weight;
+                    }
+
+                    // Run DP chaining (same-strand only if PAF says same strand, else opposite)
+                    scratch.dpSame.assign(numHits, 0);
+                    scratch.dpDiff.assign(numHits, 0);
+                    scratch.parentSame.assign(numHits, -1);
+                    scratch.parentDiff.assign(numHits, -1);
+                    scratch.cumDriftSame.assign(numHits, 0);
+                    scratch.cumDriftDiff.assign(numHits, 0);
+                    scratch.cumLenSame.assign(numHits, 0);
+                    scratch.cumLenDiff.assign(numHits, 0);
+
+                    uint32_t maxScSame = 0, maxScDiff = 0;
+                    int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1;
+
+                    for(size_t k = 0; k < numHits; k++) {
+                        const uint32_t posAk = scratch.hitPosA[k], posBk = scratch.hitPosB[k];
+                        const uint32_t initSc = std::max(1U, scratch.hitWeights[k] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[k] : (uint32_t)kmerLen);
+                        scratch.dpSame[k] = scratch.dpDiff[k] = initSc;
+
+                        for(int32_t j = (int32_t)k - 1; j >= 0; --j) {
+                            int32_t dA = (int32_t)posAk - (int32_t)scratch.hitPosA[j];
+                            int32_t dB = (int32_t)posBk - (int32_t)scratch.hitPosB[j];
+
+                            // Same strand case
+                            if(dB > 0 && dA > 0) {
+                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA);
+                                uint32_t nLn = scratch.cumLenSame[j] + dB;
+                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
+                                    uint32_t wS = std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
+                                    int32_t sc = (int32_t)scratch.dpSame[j] + (int32_t)wS;
+                                    if(sc > (int32_t)scratch.dpSame[k]) {
+                                        scratch.dpSame[k] = std::max(1, sc);
+                                        scratch.parentSame[k] = j;
+                                        scratch.cumDriftSame[k] = nDr;
+                                        scratch.cumLenSame[k] = nLn;
+                                    }
+                                }
+                            }
+                            // Opposite strand case
+                            else if(dB < 0 && dA > 0) {
+                                int32_t aB = -dB;
+                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA);
+                                uint32_t nLn = scratch.cumDriftDiff[j] + aB;
+                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
+                                    uint32_t wS = std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
+                                    int32_t sc = (int32_t)scratch.dpDiff[j] + (int32_t)wS;
+                                    if(sc > (int32_t)scratch.dpDiff[k]) {
+                                        scratch.dpDiff[k] = std::max(1, sc);
+                                        scratch.parentDiff[k] = j;
+                                        scratch.cumDriftDiff[k] = nDr;
+                                        scratch.cumLenDiff[k] = nLn;
+                                    }
+                                }
+                            }
+                        }
+
+                        if(scratch.dpSame[k] > maxScSame) { maxScSame = scratch.dpSame[k]; bestEndIdxSame = (int32_t)k; }
+                        if(scratch.dpDiff[k] > maxScDiff) { maxScDiff = scratch.dpDiff[k]; bestEndIdxDiff = (int32_t)k; }
+                    }
+
+                    // Extract best chain based on PAF strand info
+                    bool useSameStrand = pafSameStrand ? (maxScSame >= maxScDiff) : (maxScDiff > maxScSame);
+                    int32_t bestEndIdx = useSameStrand ? bestEndIdxSame : bestEndIdxDiff;
+                    const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
+
+                    if(bestEndIdx < 0) {
+                        localCandidates.push_back(pair);
+                        localAlignments.push_back(Alignment());
+                        continue;
+                    }
+
+                    // Backtrack to get chain
+                    scratch.currentChainPath.clear();
+                    int32_t currK = bestEndIdx;
+                    while(currK != -1) {
+                        scratch.currentChainPath.push_back(currK);
+                        currK = parentArr[currK];
+                    }
+                    std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
+
+                    // Build alignment
+                    Alignment al;
+                    al.ordinals.reserve(scratch.currentChainPath.size());
+                    bool validChain = true;
+
+                    for(uint32_t idxK : scratch.currentChainPath) {
+                        uint32_t tPos = scratch.hitPosB[idxK];
+                        auto it = posBToOrdinalB.find(tPos);
+                        if(it != posBToOrdinalB.end()) {
+                            al.ordinals.push_back({scratch.hitOrdinalA[idxK], it->second});
+                        } else {
+                            validChain = false;
+                            break;
+                        }
+                    }
+
+                    if(validChain && !al.ordinals.empty()) {
+                        // Set alignment coordinates
+                        uint32_t qPstart = markersA[al.ordinals.front()[0]].position;
+                        uint32_t qPend = markersA[al.ordinals.back()[0]].position + (uint32_t)kmerLen;
+                        uint32_t tPstart = markersB[al.ordinals.front()[1]].position;
+                        uint32_t tPend = markersB[al.ordinals.back()[1]].position + (uint32_t)kmerLen;
+
+                        al.qs = qPstart;
+                        al.qe = qPend;
+                        al.ts = tPstart;
+                        al.te = tPend;
+
+                        // Flip ordinals for opposite strand
+                        if(!useSameStrand) {
+                            uint32_t numMB = (uint32_t)markersB.size();
+                            for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
+                        }
+
+                        localCandidates.push_back(OrientedReadPair(readIdA, readIdB, useSameStrand));
+                        localAlignments.push_back(std::move(al));
+                    } else {
+                        localCandidates.push_back(pair);
+                        localAlignments.push_back(Alignment());
+                    }
+                }
+            }
+        });
+    }
+
+    for(auto& t : threads) t.join();
+
+    // Merge results
+    for(size_t tid = 0; tid < threadCount; tid++) {
+        for(const auto& c : threadCandidates[tid]) {
+            alignmentCandidates.candidates.push_back(c);
+        }
+        for(const auto& a : threadAlignments[tid]) {
+            alignmentCandidatesAlignmentsData.alignments.push_back(a);
+        }
+    }
+
+    alignmentCandidates.candidates.unreserve();
+    alignmentCandidatesAlignmentsData.alignments.unreserve();
+
+    // Cleanup inverted index data
+    invertedIndexData.compactOccurrences.clear();
+    invertedIndexData.compactOccurrences.shrink_to_fit();
+    invertedIndexData.hashTable.clear();
+    invertedIndexData.hashTable.shrink_to_fit();
+
+    const auto endTime = std::chrono::steady_clock::now();
+    const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
+    cout << timestamp << "PAF candidate chaining completed in " << totalSeconds << " s." << endl;
+    cout << timestamp << "Chained " << alignmentCandidates.candidates.size() << " candidates." << endl;
+}

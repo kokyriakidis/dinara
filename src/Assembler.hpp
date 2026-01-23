@@ -803,6 +803,14 @@ public:
     vector<OrientedReadPair> getAlignmentCandidates() const;
     void computeCandidateTable();
     void importAlignmentCandidatesFromPaf(const string& pafFilePath);
+    
+    // Chain pre-imported PAF candidates using the inverted index.
+    // buildInvertedIndex must be called before this.
+    void chainPafCandidates(
+        double maxDriftRate,
+        uint64_t maxChainLimit,
+        uint64_t threadCount
+    );
 
 private:
     void checkAlignmentCandidatesAreOpen() const;

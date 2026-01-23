@@ -555,19 +555,24 @@ void dinara::main::assemble(
     // }
 
 
-    // Find alignment candidates.
+    // Compute maxChainLimit from coverage (Hifiasm parity: max(100, hom_cov * 5))
+    const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+    const uint64_t maxChainLimit = std::max(100UL, coveragePeak * 5);
+
+    // Always build the inverted index for k-mer lookups (needed by both paths)
+    assembler.buildInvertedIndex(threadCount);
+
+    // Find and chain alignment candidates.
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
+        // PAF path: Import candidate pairs from PAF, then chain them using the inverted index.
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
+        assembler.chainPafCandidates(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
+            threadCount
+        );
     } else {
-        // Compute maxChainLimit from coverage (Hifiasm parity: max(100, hom_cov * 5))
-        const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
-        const uint64_t maxChainLimit = std::max(100UL, coveragePeak * 5);
-        
-        // Inverted Index Method (Hifiasm-like).
-        // Phase 1-4: Build the inverted index
-        assembler.buildInvertedIndex(threadCount);
-        
-        // Phase 5: Run DP chaining to find alignment candidates
+        // Inverted Index path: Discover candidate pairs via k-mer matches and chain them.
         assembler.chainAlignmentCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
