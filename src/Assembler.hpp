@@ -314,6 +314,12 @@ public:
         uint64_t threadCount
     );
 
+    // New unified alignment flow with evidence storage.
+    void computeAlignmentsWithEvidence(
+        const AlignOptions&,
+        uint64_t threadCount
+    );
+
     // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
     void performPhasing(uint64_t threadCount);
     void accessAlignmentData();
@@ -1124,6 +1130,7 @@ private:
 
     // Private functions and data used by computeAlignments.
     void computeAlignmentsThreadFunction(size_t threadId);
+    void computeAlignmentsWithEvidenceThreadFunction(size_t threadId);
     class ComputeAlignmentsData {
     public:
 

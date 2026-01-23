@@ -248,39 +248,34 @@ static void detectHetSites(
         
         if (evidenceId == invalid<size_t>) continue;
 
-        span<const SnpEvidence> snps;
-        uint32_t currentPos = 0; 
-        
-        // Map SNP coordinates from the alignment to the query read.
-        if (ad.readIds[1] == queryReadId) {
-            snps = assembler.alignedEvidenceStore.getSnps0(evidenceId);
-            currentPos = ad.ts;
-        } else if (ad.readIds[0] == queryReadId) {
-            snps = assembler.alignedEvidenceStore.getSnps1(evidenceId);
-            currentPos = ad.qs;
-        } else {
-            continue;
-        }
-
         // Apply boundary adjustments (typically 0 for ONT).
         const uint32_t bd = 0; 
         const uint32_t c_qs = cand.qs + bd;
         const uint32_t c_qe = (cand.qe > bd) ? (cand.qe - bd) : cand.qs;
         if (c_qe < c_qs) continue;
 
-        for (const auto& ev : snps) {
-            // Jump directly to the next coordinate where a mismatch exists
-            currentPos += ev.delta();
-            if (currentPos >= c_qs && currentPos < c_qe) {
-                hapEvidence.push_back({
-                    .overlapID = (uint32_t)k,
-                    .site = currentPos,
-                    .overlapSite = 0, // Assigned during filtering
-                    .type = 1,        // Mismatch
-                    .misBase = ev.base(),
-                    .hp = false       // Assigned in Phase 3
-                });
+        // Map SNP coordinates from the alignment to the query read and iterate in range.
+        const uint32_t evidenceId32 = uint32_t(evidenceId);
+        auto addEv = [&](uint32_t currentPos, uint8_t base) {
+            if (currentPos < unpacked.size() && base == unpacked[currentPos]) {
+                return;
             }
+            hapEvidence.push_back({
+                .overlapID = (uint32_t)k,
+                .site = currentPos,
+                .overlapSite = 0, // Assigned during filtering
+                .type = 1,        // Mismatch
+                .misBase = base,
+                .hp = false       // Assigned in Phase 3
+            });
+        };
+
+        if (ad.readIds[1] == queryReadId) {
+            assembler.alignedEvidenceStore.forEachSnp0InRange(evidenceId32, c_qs, c_qe, addEv);
+        } else if (ad.readIds[0] == queryReadId) {
+            assembler.alignedEvidenceStore.forEachSnp1InRange(evidenceId32, c_qs, c_qe, addEv);
+        } else {
+            continue;
         }
     }
     
@@ -564,26 +559,58 @@ static void gen_rphase_dp(
     // Populate Alt and AnyOther Bits in a single pass.
     // flatBits[2*w] = Ref alleles, flatBits[2*w+1] = Alt alleles.
     // flatAnyBits[w] = Any bases that are neither Ref nor Alt (noise/third alleles).
+    auto& allMisBits = scratch.supportBits; // Temporary; overwritten later.
     size_t evIdx = 0;
-    for (size_t i = 0; i < nSites; ++i) {
+    for (size_t i = 0; i < nSites; ) {
         const uint32_t s = snpStats[i].site;
-        const char alt_c = snpStats[i].altBase;
-        uint64_t* row = &flatBits[i * 2 * nWords];
-        uint64_t* rowAny = &flatAnyBits[i * nWords];
 
-        while (evIdx < hapEvidence.size() && hapEvidence[evIdx].site < s) evIdx++;
+        // Group all [site, alt] rows for this site to avoid re-scanning hapEvidence
+        // once per alt allele.
+        size_t j = i + 1;
+        while (j < nSites && snpStats[j].site == s) ++j;
+
+        // Map alt base (0..3) -> row index in [i, j) if present.
+        int rowForBase[4] = {-1, -1, -1, -1};
+        for (size_t r = i; r < j; ++r) {
+            const int b = base2int(snpStats[r].altBase);
+            if (b >= 0 && b < 4) rowForBase[b] = int(r);
+        }
+
+        allMisBits.assign(nWords, 0);
+
+        // Find evidence at this site.
+        while (evIdx < hapEvidence.size() && hapEvidence[evIdx].site < s) ++evIdx;
         size_t nextEv = evIdx;
         while (nextEv < hapEvidence.size() && hapEvidence[nextEv].site == s) {
-            uint32_t ovId = hapEvidence[nextEv].overlapID;
+            const uint32_t ovId = hapEvidence[nextEv].overlapID;
             if (ovId < nCands) {
-                if (Base::fromInteger(hapEvidence[nextEv].misBase).character() == alt_c) {
-                    row[2 * (ovId >> 6) + 1] |= (1ULL << (ovId & 63));
-                } else {
-                    rowAny[ovId >> 6] |= (1ULL << (ovId & 63));
+                const size_t w = ovId >> 6;
+                const uint64_t mask = 1ULL << (ovId & 63);
+
+                allMisBits[w] |= mask;
+
+                const uint8_t b = hapEvidence[nextEv].misBase;
+                if (b < 4) {
+                    const int rowIndex = rowForBase[b];
+                    if (rowIndex >= 0) {
+                        uint64_t* row = &flatBits[size_t(rowIndex) * 2 * nWords];
+                        row[2 * w + 1] |= mask;
+                    }
                 }
             }
-            nextEv++;
+            ++nextEv;
         }
+
+        // For each [site, alt] row, "AnyOther" are mismatches not equal to that alt.
+        for (size_t r = i; r < j; ++r) {
+            const uint64_t* row = &flatBits[r * 2 * nWords];
+            uint64_t* rowAny = &flatAnyBits[r * nWords];
+            for (size_t w = 0; w < nWords; ++w) {
+                rowAny[w] = allMisBits[w] & ~row[2 * w + 1];
+            }
+        }
+
+        i = j;
     }
 
     // Populate Ref Bits using a Sweep-line approach.
@@ -852,19 +879,27 @@ static void detectSVSites(
             indels = assembler.alignedEvidenceStore.getIndels1(evidenceId);
         } else continue;
 
-        for(const auto& ev : indels) {
-            const uint32_t len = ev.len();
-            if(len >= (uint32_t)SV_MIN_LEN) {
-                // Determine position on query read
-                if(ev.pos() >= cand.qs && ev.pos() < cand.qe) {
-                     RawSV sv;
-                     sv.overlapID = (uint32_t)k;
-                     sv.site = ev.pos();
-                     // Use sign to distinguish Ins (+) from Del (-)
-                     sv.size = ev.isInsertion() ? (int64_t)len : -(int64_t)len;
-                     rawSVs.push_back(sv);
-                }
-            }
+        const uint32_t c_qs = (uint32_t)cand.qs;
+        const uint32_t c_qe = (uint32_t)cand.qe;
+        if (c_qe <= c_qs || indels.empty()) continue;
+
+        // Evidence is expected to be non-decreasing within each per-alignment slice.
+        auto it = std::lower_bound(
+            indels.begin(), indels.end(), c_qs,
+            [](const IndelEvidence& e, uint32_t value) { return e.pos() < value; }
+        );
+        for (; it != indels.end(); ++it) {
+            const uint32_t pos = it->pos();
+            if (pos >= c_qe) break;
+            const uint32_t len = it->len();
+            if (len < (uint32_t)SV_MIN_LEN) continue;
+
+            RawSV sv;
+            sv.overlapID = (uint32_t)k;
+            sv.site = pos;
+            // Use sign to distinguish Ins (+) from Del (-)
+            sv.size = it->isInsertion() ? (int64_t)len : -(int64_t)len;
+            rawSVs.push_back(sv);
         }
     }
     

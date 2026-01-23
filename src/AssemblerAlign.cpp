@@ -517,17 +517,49 @@ void Assembler::computeAlignments(
 
     // Store the alignments found by each thread.
     performanceLog << timestamp << "Storing the alignment found by each thread." << endl;
-    alignmentData.createNew(largeDataName("AlignmentData"), largeDataPageSize);
+
+    // Pre-size global containers to avoid repeated remaps/reallocations.
+    uint64_t totalAlignments = 0;
+    uint64_t totalEvidenceIndex = 0;
+    uint64_t totalSnp0 = 0;
+    uint64_t totalIndel0 = 0;
+    uint64_t totalSnp1 = 0;
+    uint64_t totalIndel1 = 0;
+    uint64_t totalSnpCheckpoints0 = 0;
+    uint64_t totalSnpCheckpoints1 = 0;
+    for(size_t threadId=0; threadId<threadCount; threadId++) {
+        totalAlignments += data.threadAlignmentData[threadId].size();
+        const AlignedEvidenceStore& localStore = data.threadEvidenceStores[threadId];
+        totalEvidenceIndex += localStore.index.size();
+        totalSnp0 += localStore.snpStream0.size();
+        totalIndel0 += localStore.indelStream0.size();
+        totalSnp1 += localStore.snpStream1.size();
+        totalIndel1 += localStore.indelStream1.size();
+        totalSnpCheckpoints0 += localStore.snpCheckpoints0.size();
+        totalSnpCheckpoints1 += localStore.snpCheckpoints1.size();
+    }
+
+    alignmentData.createNew(largeDataName("AlignmentData"), largeDataPageSize, 0, totalAlignments);
     compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
+
+    alignedEvidenceStore.clear();
+    alignedEvidenceStore.reserve(
+        totalEvidenceIndex,
+        totalSnp0,
+        totalSnpCheckpoints0,
+        totalIndel0,
+        totalSnp1,
+        totalSnpCheckpoints1,
+        totalIndel1
+    );
 
     
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         const vector<AlignmentData>& threadAlignmentData = data.threadAlignmentData[threadId];
-        size_t idShift = alignmentData.size(); // Current global count serves as offset
-        for(const AlignmentData& ad_: threadAlignmentData) {
-            AlignmentData ad = ad_;
-            ad.info.alignmentId += idShift;
+        const size_t idShift = alignmentData.size(); // Current global count serves as offset
+        for(const AlignmentData& ad: threadAlignmentData) {
             alignmentData.push_back(ad);
+            alignmentData.back().info.alignmentId += idShift;
         }
 
         const auto threadCompressedAlignments = data.threadCompressedAlignments[threadId];
@@ -546,24 +578,19 @@ void Assembler::computeAlignments(
         
         // Append Indexes (Adjusting offsets)
         uint64_t globalSnpOffset0 = alignedEvidenceStore.snpStream0.size();
+        uint64_t globalSnpCheckpointOffset0 = alignedEvidenceStore.snpCheckpoints0.size();
         uint64_t globalIndelOffset0 = alignedEvidenceStore.indelStream0.size();
         uint64_t globalSnpOffset1 = alignedEvidenceStore.snpStream1.size();
+        uint64_t globalSnpCheckpointOffset1 = alignedEvidenceStore.snpCheckpoints1.size();
         uint64_t globalIndelOffset1 = alignedEvidenceStore.indelStream1.size();
         
-        alignedEvidenceStore.reserve(
-            alignedEvidenceStore.index.size() + localStore.index.size(),
-            alignedEvidenceStore.snpStream0.size() + localStore.snpStream0.size(),
-            alignedEvidenceStore.indelStream0.size() + localStore.indelStream0.size()
-        );
-        // Reserve Stream1 as well
-        alignedEvidenceStore.snpStream1.reserve(alignedEvidenceStore.snpStream1.size() + localStore.snpStream1.size());
-        alignedEvidenceStore.indelStream1.reserve(alignedEvidenceStore.indelStream1.size() + localStore.indelStream1.size());
-
         for (auto& entry : localStore.index) {
             entry.snpOffset0 += globalSnpOffset0;
             entry.indelOffset0 += globalIndelOffset0;
+            entry.snpCheckpointOffset0 += globalSnpCheckpointOffset0;
             entry.snpOffset1 += globalSnpOffset1;
             entry.indelOffset1 += globalIndelOffset1;
+            entry.snpCheckpointOffset1 += globalSnpCheckpointOffset1;
             alignedEvidenceStore.index.push_back(entry);
         }
 
@@ -573,6 +600,11 @@ void Assembler::computeAlignments(
             localStore.snpStream0.begin(),
             localStore.snpStream0.end()
         );
+        alignedEvidenceStore.snpCheckpoints0.insert(
+            alignedEvidenceStore.snpCheckpoints0.end(),
+            localStore.snpCheckpoints0.begin(),
+            localStore.snpCheckpoints0.end()
+        );
         alignedEvidenceStore.indelStream0.insert(
             alignedEvidenceStore.indelStream0.end(),
             localStore.indelStream0.begin(),
@@ -580,6 +612,7 @@ void Assembler::computeAlignments(
         );
         
         alignedEvidenceStore.snpStream1.insert(alignedEvidenceStore.snpStream1.end(), localStore.snpStream1.begin(), localStore.snpStream1.end());
+        alignedEvidenceStore.snpCheckpoints1.insert(alignedEvidenceStore.snpCheckpoints1.end(), localStore.snpCheckpoints1.begin(), localStore.snpCheckpoints1.end());
         alignedEvidenceStore.indelStream1.insert(alignedEvidenceStore.indelStream1.end(), localStore.indelStream1.begin(), localStore.indelStream1.end());
 
         // Clear local store to free memory immediately
@@ -916,7 +949,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 *this,
                 orientedReadIds,
                 alignment,
-                ProjectedAlignment::Method::QuickRaw);
+                ProjectedAlignment::Method::QuickRawSparse);
             const auto tProjEnd = steady_clock::now();
             
             alignmentInfo.errorRate = float(projectedAlignment.errorRate());
@@ -1062,6 +1095,79 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             thisAlignmentData.isDeleted0 = false;
             thisAlignmentData.isDeleted1 = false;
 
+            // --- Populate AlignedEvidenceStore (APES/TASSD) ---
+            // Store sparse mismatch/indel evidence (no per-base trace scanning).
+            {
+                AlignedEvidenceStore& store = data.threadEvidenceStores[threadId];
+                thisAlignmentData.info.alignmentId = store.beginAlignment();
+
+                const LongBaseSequenceView tView = reads->getRead(orientedReadIds[1].getReadId());
+                const bool tRev = orientedReadIds[1].getStrand();
+                DINARA_ASSERT(tView.baseCount <= uint64_t(SnpEvidence::POS_MASK) + 1ULL);
+                const uint32_t tRawLen = uint32_t(tView.baseCount);
+
+                static const uint8_t complementBase[4] = {3, 2, 1, 0};
+
+                // Stream 1 (read0/query-view): store read1 base in the oriented frame.
+                for(const auto& m : projectedAlignment.sparseMismatches) {
+                    store.addSnp1(m.position0, m.base1);
+                }
+                for(const auto& indel : projectedAlignment.sparseIndels) {
+                    if(indel.op == 'I') {
+                        store.addIndel1(indel.position0, indel.length, 0);
+                    } else if(indel.op == 'D') {
+                        store.addIndel1(indel.position0, indel.length, 1);
+                    } else {
+                        DINARA_ASSERT(0);
+                    }
+                }
+
+                // Stream 0 (read1/target-view): positions are in read1 forward coordinates.
+                if(!tRev) {
+                    for(const auto& m : projectedAlignment.sparseMismatches) {
+                        store.addSnp0(m.position1, m.base0);
+                    }
+                    for(const auto& indel : projectedAlignment.sparseIndels) {
+                        if(indel.op == 'I') {
+                            store.addIndel0(indel.position1, indel.length, 1);
+                        } else if(indel.op == 'D') {
+                            store.addIndel0(indel.position1, indel.length, 0);
+                        } else {
+                            DINARA_ASSERT(0);
+                        }
+                    }
+                } else {
+                    // Opposite strand: emit in increasing canonical coordinates and
+                    // complement read0 base into read1's forward frame.
+                    for(auto it = projectedAlignment.sparseMismatches.rbegin();
+                        it != projectedAlignment.sparseMismatches.rend(); ++it) {
+
+                        const uint32_t posOriented = it->position1;
+                        DINARA_ASSERT(posOriented < tRawLen);
+                        const uint32_t pos = (tRawLen - 1U) - posOriented;
+                        DINARA_ASSERT(it->base0 < 4);
+                        store.addSnp0(pos, complementBase[it->base0]);
+                    }
+
+                    for(auto it = projectedAlignment.sparseIndels.rbegin();
+                        it != projectedAlignment.sparseIndels.rend(); ++it) {
+
+                        const uint32_t posOriented = it->position1;
+                        DINARA_ASSERT(posOriented < tRawLen);
+                        if(it->op == 'I') {
+                            const uint32_t pos = tRawLen - (posOriented + it->length);
+                            store.addIndel0(pos, it->length, 1);
+                        } else if(it->op == 'D') {
+                            const uint32_t pos = (tRawLen - 1U) - posOriented;
+                            store.addIndel0(pos, it->length, 0);
+                        } else {
+                            DINARA_ASSERT(0);
+                        }
+                    }
+                }
+            }
+
+            // Store AlignmentData and the corresponding compressed alignment (same order).
             threadAlignmentData.push_back(thisAlignmentData);
 
             // Store the alignment in compressed form.
@@ -1071,6 +1177,8 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 compressedAlignment.c_str() + compressedAlignment.size()
             );
             
+#if 0
+            threadAlignmentData.push_back(thisAlignmentData);
 
 
 
@@ -1370,6 +1478,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                     }
                 }
             } // End Pass 2
+#endif
         }
     }
 
@@ -2124,4 +2233,3 @@ void Assembler::suppressAlignmentCandidatesThreadFunction(uint64_t)
 
     }
 }
-
