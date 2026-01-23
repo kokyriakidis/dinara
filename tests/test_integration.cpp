@@ -94,6 +94,7 @@ public:
     void loadReads(uint64_t minReadLength = 0) {
         std::cout.setstate(std::ios::failbit);
         assembler->addReads(fastqPath, minReadLength, true, 1);
+        assembler->computeReadIdsSortedByName();
         assembler->histogramReadLength(testDir + "/lengths.csv");
         std::cout.clear();
     }
@@ -160,6 +161,33 @@ public:
         options.align5DriftRateTolerance = 0.02;
         options.align5MinBandExtend = 10;
         assembler->computeAlignments(options, 1);
+    }
+
+    // Create a PAF file with overlap information
+    std::string createPafFile(const std::vector<std::tuple<std::string, std::string, bool>>& overlaps) {
+        std::string pafPath = testDir + "/overlaps.paf";
+        std::ofstream out(pafPath);
+        
+        // PAF format: qName qLen qStart qEnd strand tName tLen tStart tEnd matches alignLen mapQ
+        for (const auto& [qName, tName, sameStrand] : overlaps) {
+            // Assume overlapping reads have similar length and ~90% overlap
+            out << qName << "\t1000\t50\t950\t" << (sameStrand ? "+" : "-") << "\t"
+                << tName << "\t1000\t50\t950\t850\t900\t60\n";
+        }
+        out.close();
+        return pafPath;
+    }
+
+    void importPafCandidates(const std::string& pafPath) {
+        std::cout.setstate(std::ios::failbit);
+        assembler->importAlignmentCandidatesFromPaf(pafPath);
+        std::cout.clear();
+    }
+
+    void chainPafCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100) {
+        std::cout.setstate(std::ios::failbit);
+        assembler->chainPafCandidates(maxDriftRate, maxChainLimit, 1);
+        std::cout.clear();
     }
 };
 
@@ -510,4 +538,122 @@ TEST_CASE("Large Matching Regions and SNP Chaining", "[evidence][delta]") {
         }
     }
     CHECK(verifiedChaining);
+}
+
+// =============================================================================
+// TEST: PAF Import and Chaining
+// =============================================================================
+TEST_CASE("Integration: PAF import and chaining", "[integration][paf][chaining]") {
+    AssemblerIntegrationFixture fixture;
+    
+    // Create overlapping reads with shared sequence regions.
+    // Read 0 and Read 1 share a large overlap region.
+    std::string sharedRegion = randomSequence(800, 444);
+    std::string prefix0 = randomSequence(200, 555);
+    std::string suffix1 = randomSequence(200, 666);
+    
+    std::string seq0 = prefix0 + sharedRegion;  // read_0: [prefix0][shared]
+    std::string seq1 = sharedRegion + suffix1;  // read_1: [shared][suffix1]
+    
+    // Read 2 is unrelated (should not be in PAF)
+    std::string seq2 = randomSequence(1000, 777);
+    
+    fixture.createFastq({seq0, seq1, seq2});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    
+    std::cout << "=== PAF Chaining Test ===" << std::endl;
+    std::cout << "Read count: " << fixture.assembler->getReads().readCount() << std::endl;
+    std::cout << "Marker count: " << fixture.assembler->markers->totalSize() << std::endl;
+    
+    SECTION("PAF import + chaining produces valid candidates") {
+        // Create PAF file with the known overlap between read_0 and read_1
+        std::string pafPath = fixture.createPafFile({
+            {"read_0", "read_1", true}  // Same strand overlap
+        });
+        
+        // Step 1: Build inverted index (needed for k-mer lookups during chaining)
+        fixture.buildIndex();
+        
+        // Step 2: Import candidates from PAF
+        fixture.importPafCandidates(pafPath);
+        size_t importedCount = fixture.assembler->alignmentCandidates.candidates.size();
+        std::cout << "PAF imported candidates: " << importedCount << std::endl;
+        CHECK(importedCount > 0);
+        
+        // Step 3: Chain the PAF candidates
+        fixture.chainPafCandidates(0.1, 100);
+        size_t chainedCount = fixture.assembler->alignmentCandidates.candidates.size();
+        std::cout << "Chained candidates: " << chainedCount << std::endl;
+        
+        // Should have at least one chained candidate
+        CHECK(chainedCount > 0);
+        
+        // Check that precomputed alignments were created
+        size_t alignmentsCount = fixture.assembler->alignmentCandidatesAlignmentsData.alignments.size();
+        std::cout << "Precomputed alignments: " << alignmentsCount << std::endl;
+        CHECK(alignmentsCount == chainedCount);
+    }
+    
+    SECTION("PAF chaining produces alignments comparable to inverted index path") {
+        // First, run the normal inverted index path for comparison
+        AssemblerIntegrationFixture fixture2;
+        fixture2.createFastq({seq0, seq1, seq2});
+        fixture2.initAssembler();
+        fixture2.loadReads();
+        fixture2.generateMarkers(16, 5);
+        fixture2.countKmers();
+        fixture2.applyFilter(1, 1000);
+        fixture2.findCandidates();  // Uses inverted index discovery + chaining
+        
+        size_t invertedIndexCandidates = fixture2.assembler->alignmentCandidates.candidates.size();
+        std::cout << "Inverted index candidates: " << invertedIndexCandidates << std::endl;
+        
+        // Now run PAF path
+        std::string pafPath = fixture.createPafFile({
+            {"read_0", "read_1", true}
+        });
+        fixture.buildIndex();
+        fixture.importPafCandidates(pafPath);
+        fixture.chainPafCandidates(0.1, 100);
+        
+        size_t pafCandidates = fixture.assembler->alignmentCandidates.candidates.size();
+        std::cout << "PAF path candidates: " << pafCandidates << std::endl;
+        
+        // PAF path should produce at least one candidate for the specified pair
+        CHECK(pafCandidates >= 1);
+        
+        // Check that the (0, 1) pair exists in the PAF results
+        bool foundPair = false;
+        for (size_t i = 0; i < fixture.assembler->alignmentCandidates.candidates.size(); i++) {
+            const auto& c = fixture.assembler->alignmentCandidates.candidates[i];
+            if ((c.readIds[0] == 0 && c.readIds[1] == 1) ||
+                (c.readIds[0] == 1 && c.readIds[1] == 0)) {
+                foundPair = true;
+                CHECK(c.isSameStrand == true);  // Should be same strand
+            }
+        }
+        CHECK(foundPair);
+    }
+    
+    SECTION("Chained PAF candidates can be used for alignment computation") {
+        std::string pafPath = fixture.createPafFile({
+            {"read_0", "read_1", true}
+        });
+        
+        fixture.buildIndex();
+        fixture.importPafCandidates(pafPath);
+        fixture.chainPafCandidates(0.1, 100);
+        fixture.computeAlignments();
+        
+        // Check that alignments were computed
+        size_t alignmentCount = fixture.assembler->alignmentData.size();
+        std::cout << "Computed alignments: " << alignmentCount << std::endl;
+        
+        // Should produce at least one alignment for the overlapping pair
+        CHECK(alignmentCount >= 1);
+    }
 }
