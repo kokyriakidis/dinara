@@ -584,8 +584,8 @@ void dinara::main::assemble(
     assembler.computeCandidateTable();
 
 
-    // Compute alignments.
-    assembler.computeAlignments(
+    // Compute alignments with variant evidence storage.
+    assembler.computeAlignmentsWithEvidence(
         assemblerOptions.alignOptions,
         threadCount);
 

@@ -15,19 +15,154 @@
 #include "../src/Assembler.hpp"
 #include "../src/Reads.hpp"
 #include "../src/KmerCounter.hpp"
+#include "../src/ProjectedAlignment.hpp"
 #include "../src/DINARA_ASSERT.hpp"
+#include "../src/markerAccessFunctions.hpp"
 
 // Standard library
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <filesystem>
 #include <string>
-#include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <random>
+#include <stdexcept>
+#include <tuple>
+#include <unistd.h>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 using namespace dinara;
+
+namespace {
+class ScopedSilenceIo {
+public:
+    ScopedSilenceIo()
+        : nullStream("/dev/null")
+        , oldCoutBuf(std::cout.rdbuf())
+        , oldCerrBuf(std::cerr.rdbuf())
+    {
+        std::cout.rdbuf(nullStream.rdbuf());
+        std::cerr.rdbuf(nullStream.rdbuf());
+    }
+
+    ~ScopedSilenceIo()
+    {
+        std::cout.rdbuf(oldCoutBuf);
+        std::cerr.rdbuf(oldCerrBuf);
+    }
+
+    ScopedSilenceIo(const ScopedSilenceIo&) = delete;
+    ScopedSilenceIo& operator=(const ScopedSilenceIo&) = delete;
+
+private:
+    std::ofstream nullStream;
+    std::streambuf* oldCoutBuf;
+    std::streambuf* oldCerrBuf;
+};
+
+template<class F>
+decltype(auto) withSilencedIo(F&& f)
+{
+    ScopedSilenceIo silence;
+    return std::forward<F>(f)();
+}
+
+class ScopedCurrentPath {
+public:
+    explicit ScopedCurrentPath(const fs::path& p) : old(fs::current_path())
+    {
+        fs::current_path(p);
+    }
+    ~ScopedCurrentPath() { fs::current_path(old); }
+
+    ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+    ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+private:
+    fs::path old;
+};
+
+template<class F>
+decltype(auto) withSilencedIoInDir(const fs::path& dir, F&& f)
+{
+    ScopedCurrentPath scoped(dir);
+    return withSilencedIo(std::forward<F>(f));
+}
+
+fs::path makeUniqueTempDir(const std::string& prefix)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto base = fs::temp_directory_path();
+
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto suffix =
+            std::to_string(::getpid()) + "_" +
+            std::to_string(counter.fetch_add(1)) + "_" +
+            std::to_string(uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::path dir = base / (prefix + suffix);
+        std::error_code ec;
+        if (fs::create_directory(dir, ec)) {
+            return dir;
+        }
+    }
+    throw std::runtime_error("Failed to create unique temp directory under " + base.string());
+}
+
+std::string toString(LongBaseSequenceView view)
+{
+    std::string s;
+    s.resize(view.baseCount);
+    for (size_t i = 0; i < view.baseCount; ++i) {
+        static const char map[] = {'A', 'C', 'G', 'T'};
+        s[i] = map[view[i].value & 3U];
+    }
+    return s;
+}
+
+template<class AlignmentDataContainer>
+uint32_t findAlignmentEvidenceId(
+    const AlignmentDataContainer& alignmentData,
+    ReadId a,
+    ReadId b,
+    std::optional<bool> expectedSameStrand = std::nullopt)
+{
+    for (const auto& ad : alignmentData) {
+        if (ad.isDeleted()) continue;
+        const bool matchesPair =
+            (ad.readIds[0] == a && ad.readIds[1] == b) ||
+            (ad.readIds[0] == b && ad.readIds[1] == a);
+        if (!matchesPair) continue;
+        if (expectedSameStrand && ad.isSameStrand != *expectedSameStrand) continue;
+        return uint32_t(ad.info.alignmentId);
+    }
+    return invalid<uint32_t>;
+}
+
+template<class AlignmentDataContainer>
+const AlignmentData* findAlignmentDataPtr(
+    const AlignmentDataContainer& alignmentData,
+    ReadId a,
+    ReadId b,
+    std::optional<bool> expectedSameStrand = std::nullopt)
+{
+    for (const auto& ad : alignmentData) {
+        if (ad.isDeleted()) continue;
+        const bool matchesPair =
+            (ad.readIds[0] == a && ad.readIds[1] == b) ||
+            (ad.readIds[0] == b && ad.readIds[1] == a);
+        if (!matchesPair) continue;
+        if (expectedSameStrand && ad.isSameStrand != *expectedSameStrand) continue;
+        return &ad;
+    }
+    return nullptr;
+}
+} // namespace
 
 // =============================================================================
 // HELPER: Generate random DNA sequence
@@ -48,15 +183,13 @@ std::string randomSequence(size_t length, uint32_t seed = 42) {
 // =============================================================================
 class AssemblerIntegrationFixture {
 public:
-    std::string testDir;
-    std::string fastqPath;
+    fs::path testDir;
+    fs::path fastqPath;
     std::unique_ptr<Assembler> assembler;
     
     AssemblerIntegrationFixture() {
-        // Create unique temp directory
-        testDir = "/tmp/dinara_integration_" + std::to_string(std::rand() % 100000);
-        fs::create_directories(testDir);
-        fastqPath = testDir + "/test_reads.fastq";
+        testDir = makeUniqueTempDir("dinara_integration_");
+        fastqPath = testDir / "test_reads.fastq";
     }
     
     ~AssemblerIntegrationFixture() {
@@ -68,72 +201,58 @@ public:
     
     void createFastq(const std::vector<std::string>& sequences) {
         std::ofstream out(fastqPath);
+        if (!out) {
+            throw std::runtime_error("Failed to open " + fastqPath.string());
+        }
         for (size_t i = 0; i < sequences.size(); i++) {
             out << "@read_" << i << "\n";
             out << sequences[i] << "\n";
             out << "+\n";
             out << std::string(sequences[i].size(), '~') << "\n";
         }
-        out.close();
     }
     
     void initAssembler() {
-        // Suppress cout during test
-        std::cout.setstate(std::ios::failbit);
-        
-        assembler = std::make_unique<Assembler>(
-            testDir + "/",
-            true,   // createNew
-            0,      // readRepresentation = raw
-            4096    // pageSize
-        );
-        
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] {
+            assembler = std::make_unique<Assembler>(
+                testDir.string() + "/",
+                true,   // createNew
+                0,      // readRepresentation = raw
+                4096    // pageSize
+            );
+        });
     }
     
     void loadReads(uint64_t minReadLength = 0) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->addReads(fastqPath, minReadLength, true, 1);
-        assembler->computeReadIdsSortedByName();
-        assembler->histogramReadLength(testDir + "/lengths.csv");
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] {
+            assembler->addReads(fastqPath.string(), minReadLength, true, 1);
+            assembler->computeReadIdsSortedByName();
+        });
     }
     
     void generateMarkers(int k = 16, int s = 4) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->findMarkersSimdClosedSyncmers(1, k, s);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->findMarkersSimdClosedSyncmers(1, k, s); });
     }
     
     void countKmers() {
-        std::cout.setstate(std::ios::failbit);
-        assembler->countKmersFromMarkerKmerIds(1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->countKmersFromMarkerKmerIds(1); });
     }
     
     void applyFilter(uint64_t minFreq, uint64_t maxFreq) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->applyKmerCountFilter(minFreq, maxFreq, 1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->applyKmerCountFilter(minFreq, maxFreq, 1); });
     }
     
     void findCandidates() {
-        std::cout.setstate(std::ios::failbit);
-        assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, 1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, 1); });
     }
 
     // Granular pipeline for testing
     void buildIndex() {
-        std::cout.setstate(std::ios::failbit);
-        assembler->buildInvertedIndex(1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->buildInvertedIndex(1); });
     }
 
     void chainCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, 1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, 1); });
     }
     
     void computeAlignments() {
@@ -160,34 +279,60 @@ public:
         options.align4MaxDistanceFromBoundary = 100;
         options.align5DriftRateTolerance = 0.02;
         options.align5MinBandExtend = 10;
-        assembler->computeAlignments(options, 1);
+        options.maxErrorRate = 0.3; // Higher for synthetic tests
+        withSilencedIoInDir(testDir, [&] { assembler->computeAlignmentsWithEvidence(options, 1); });
     }
 
+    struct PafOverlapSpec {
+        std::string qName;
+        std::string tName;
+        bool sameStrand;
+        uint32_t qStart;
+        uint32_t qEnd;
+        uint32_t tStart;
+        uint32_t tEnd;
+    };
+
     // Create a PAF file with overlap information
-    std::string createPafFile(const std::vector<std::tuple<std::string, std::string, bool>>& overlaps) {
-        std::string pafPath = testDir + "/overlaps.paf";
+    std::string createPafFile(const std::vector<PafOverlapSpec>& overlaps) {
+        std::string pafPath = (testDir / "overlaps.paf").string();
         std::ofstream out(pafPath);
-        
-        // PAF format: qName qLen qStart qEnd strand tName tLen tStart tEnd matches alignLen mapQ
-        for (const auto& [qName, tName, sameStrand] : overlaps) {
-            // Assume overlapping reads have similar length and ~90% overlap
-            out << qName << "\t1000\t50\t950\t" << (sameStrand ? "+" : "-") << "\t"
-                << tName << "\t1000\t50\t950\t850\t900\t60\n";
+        if (!out) {
+            throw std::runtime_error("Failed to open " + pafPath);
         }
-        out.close();
+
+        const auto& reads = assembler->getReads();
+
+        // PAF format: qName qLen qStart qEnd strand tName tLen tStart tEnd matches alignLen mapQ
+        for (const auto& ov : overlaps) {
+            const ReadId qId = reads.getReadId(ov.qName);
+            const ReadId tId = reads.getReadId(ov.tName);
+            const uint64_t qLen = reads.getReadRawSequenceLength(qId);
+            const uint64_t tLen = reads.getReadRawSequenceLength(tId);
+
+            if (ov.qEnd > qLen || ov.tEnd > tLen || ov.qStart >= ov.qEnd || ov.tStart >= ov.tEnd) {
+                throw std::runtime_error("Invalid PAF overlap coordinates for " + ov.qName + " vs " + ov.tName);
+            }
+
+            const uint32_t qSpan = ov.qEnd - ov.qStart;
+            const uint32_t tSpan = ov.tEnd - ov.tStart;
+            const uint32_t alignLen = std::min(qSpan, tSpan);
+            const uint32_t matches = alignLen; // synthetic exact overlap
+
+            out << ov.qName << "\t" << qLen << "\t" << ov.qStart << "\t" << ov.qEnd << "\t"
+                << (ov.sameStrand ? "+" : "-") << "\t"
+                << ov.tName << "\t" << tLen << "\t" << ov.tStart << "\t" << ov.tEnd << "\t"
+                << matches << "\t" << alignLen << "\t60\n";
+        }
         return pafPath;
     }
 
     void importPafCandidates(const std::string& pafPath) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->importAlignmentCandidatesFromPaf(pafPath);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->importAlignmentCandidatesFromPaf(pafPath); });
     }
 
     void chainPafCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100) {
-        std::cout.setstate(std::ios::failbit);
-        assembler->chainPafCandidates(maxDriftRate, maxChainLimit, 1);
-        std::cout.clear();
+        withSilencedIoInDir(testDir, [&] { assembler->chainPafCandidates(maxDriftRate, maxChainLimit, 1); });
     }
 };
 
@@ -227,7 +372,12 @@ TEST_CASE("Integration: Assembler read loading", "[integration][reads]") {
     fixture.initAssembler();
     fixture.loadReads();
     
-    CHECK(fixture.assembler->getReads().readCount() == 2);
+    const auto& reads = fixture.assembler->getReads();
+    REQUIRE(reads.readCount() == 2);
+    CHECK(toString(reads.getRead(0)) == seq1);
+    CHECK(toString(reads.getRead(1)) == seq2);
+    CHECK(std::string(reads.getReadName(0).begin(), reads.getReadName(0).end()) == "read_0");
+    CHECK(std::string(reads.getReadName(1).begin(), reads.getReadName(1).end()) == "read_1");
 }
 
 // =============================================================================
@@ -245,25 +395,23 @@ TEST_CASE("Integration: Marker generation from syncmers", "[integration][markers
     fixture.loadReads();
     fixture.generateMarkers(15, 5);
     
-    SECTION("Markers are created") {
-        auto* markers = fixture.assembler->markers.get();
-        
-        // Read 0 strand 0
-        size_t count0 = markers->size(OrientedReadId(0, 0).getValue());
-        CHECK(count0 > 0);
-        
-        // Read 0 strand 1 (RC) should have same count
-        size_t count1 = markers->size(OrientedReadId(0, 1).getValue());
-        CHECK(count0 == count1);
-    }
-    
-    SECTION("Markers have valid positions") {
-        auto* markers = fixture.assembler->markers.get();
-        auto readMarkers = (*markers)[OrientedReadId(0, 0).getValue()];
-        
-        for (const auto& marker : readMarkers) {
-            // Position should be within read bounds
-            CHECK(marker.position + 15 <= seq.size());
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    // Read 0 strand 0
+    const auto read0Strand0 = OrientedReadId(0, 0).getValue();
+    const auto read0Strand1 = OrientedReadId(0, 1).getValue();
+    const size_t count0 = markers->size(read0Strand0);
+    const size_t count1 = markers->size(read0Strand1);
+    REQUIRE(count0 > 0);
+    CHECK(count0 == count1);
+
+    // Markers are sorted and within bounds.
+    const auto readMarkers = (*markers)[read0Strand0];
+    for (size_t i = 0; i < readMarkers.size(); ++i) {
+        CHECK(uint32_t(readMarkers[i].position) + 15 <= seq.size());
+        if (i > 0) {
+            CHECK(uint32_t(readMarkers[i - 1].position) <= uint32_t(readMarkers[i].position));
         }
     }
 }
@@ -285,24 +433,21 @@ TEST_CASE("Integration: K-mer counting", "[integration][counting]") {
     fixture.generateMarkers(15, 5);
     fixture.countKmers();
     
-    SECTION("K-mer frequencies are computed") {
-        auto& kmerCounter = *(fixture.assembler->kmerCounter);
-        CHECK(kmerCounter.kmerIdFrequencies.size() > 0);
+    auto& kmerCounter = *(fixture.assembler->kmerCounter);
+    REQUIRE(kmerCounter.kmerIdFrequencies.size() > 0);
+
+    bool foundFreq1 = false;
+    bool foundFreq2Plus = false;
+    uint64_t maxFreq = 0;
+    for (auto& kv : kmerCounter.kmerIdFrequencies) {
+        const uint64_t freq = kv.second;
+        maxFreq = std::max(maxFreq, freq);
+        if (freq == 1) foundFreq1 = true;
+        if (freq >= 2) foundFreq2Plus = true;
     }
-    
-    SECTION("Duplicate sequences increase frequency") {
-        auto& kmerCounter = *(fixture.assembler->kmerCounter);
-        
-        // At least some k-mers should have frequency >= 2
-        bool foundHighFreq = false;
-        for (auto& [kmerId, freq] : kmerCounter.kmerIdFrequencies) {
-            if (freq >= 2) {
-                foundHighFreq = true;
-                break;
-            }
-        }
-        CHECK(foundHighFreq);
-    }
+    CHECK(foundFreq1);      // seqSH contributes rare markers
+    CHECK(foundFreq2Plus);  // seqLG duplicated
+    CHECK(maxFreq >= 2);
 }
 
 // =============================================================================
@@ -320,22 +465,52 @@ TEST_CASE("Integration: Marker filtering by frequency", "[integration][filtering
     fixture.createFastq({seqLG, seqLG, seqSH});
     fixture.initAssembler();
     fixture.loadReads();
-    fixture.generateMarkers(15, 5);
+    const uint64_t k = 15;
+    fixture.generateMarkers(int(k), 5);
     fixture.countKmers();
     
-    uint64_t markersBefore = fixture.assembler->markers->totalSize();
+    auto* markersBeforePtr = fixture.assembler->markers.get();
+    REQUIRE(markersBeforePtr != nullptr);
+
+    const uint64_t markersBefore = markersBeforePtr->totalSize();
+    const auto read0s0 = markersBeforePtr->size(OrientedReadId(0, 0).getValue());
+    const auto read2s0 = markersBeforePtr->size(OrientedReadId(2, 0).getValue());
     
     // Filter: keep only k-mers with frequency >= 2
     fixture.applyFilter(2, 1000);
     
-    uint64_t markersAfter = fixture.assembler->markers->totalSize();
+    auto* markersAfterPtr = fixture.assembler->markers.get();
+    REQUIRE(markersAfterPtr != nullptr);
+    const uint64_t markersAfter = markersAfterPtr->totalSize();
+    const auto read0s0After = markersAfterPtr->size(OrientedReadId(0, 0).getValue());
+    const auto read2s0After = markersAfterPtr->size(OrientedReadId(2, 0).getValue());
     
-    SECTION("Filtering reduces marker count") {
-        CHECK(markersAfter <= markersBefore);
-    }
-    
-    SECTION("High-frequency markers are retained") {
-        CHECK(markersAfter > 0);
+    CHECK(markersAfter <= markersBefore);
+    REQUIRE(markersAfter > 0);
+    REQUIRE(read0s0After > 0);
+    CHECK(read0s0After <= read0s0);
+
+    // The unique read (read_2) should lose essentially all its markers under minFreq=2.
+    CHECK(read2s0After == 0);
+
+    // Every remaining marker must have k-mer frequency within the requested bounds.
+    const auto& reads = fixture.assembler->getReads();
+    auto& kmerCounter = *(fixture.assembler->kmerCounter);
+    kmerCounter.buildFrequencyLUT();
+
+    for (uint32_t orientedReadIdValue = 0; orientedReadIdValue < markersAfterPtr->size(); ++orientedReadIdValue) {
+        const OrientedReadId orientedReadId = OrientedReadId::fromValue(orientedReadIdValue);
+        const auto orientedMarkers = (*markersAfterPtr)[orientedReadIdValue];
+        for (uint32_t ordinal = 0; ordinal < orientedMarkers.size(); ++ordinal) {
+            const Kmer kmer = dinara::getOrientedReadMarkerKmer(
+                orientedReadId, ordinal, k, reads, *markersAfterPtr);
+            const KmerId id = KmerId(kmer.id(k));
+            const KmerId rc = KmerId(kmer.reverseComplement(k).id(k));
+            const KmerId canonical = std::min(id, rc);
+            const uint64_t freq = kmerCounter.getFrequencyFast(canonical);
+            CHECK(freq >= 2);
+            CHECK(freq <= 1000);
+        }
     }
 }
 
@@ -390,98 +565,85 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     fixture.generateMarkers(16, 5);
     fixture.countKmers();
     fixture.applyFilter(1, 1000); 
-    
-    std::cout << "Read count: " << fixture.assembler->getReads().readCount() << std::endl;
-    std::cout << "Marker count: " << fixture.assembler->markers->totalSize() << std::endl;
-    std::cout << "Coverage peak: " << fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak << std::endl;
-    
+
     fixture.findCandidates();
-    std::cout << "Candidates found: " << fixture.assembler->alignmentCandidates.candidates.size() << std::endl;
-    
     fixture.computeAlignments();
-    std::cout << "AlignedEvidenceStore size: " << fixture.assembler->alignedEvidenceStore.index.size() << std::endl;
-    
-    SECTION("AlignedEvidenceStore is populated") {
-        CHECK(fixture.assembler->alignedEvidenceStore.index.size() > 0);
-    }
-    
-    SECTION("SNP is detected and correctly projected (F-F)") {
-        bool foundSnp = false;
-        const auto& store = fixture.assembler->alignedEvidenceStore;
-        
-        // Find alignment between Read 0 (Target/Read1 in candidates) and Read 1 (Query/Read0)
-        // InvertedIndex finds pairs (A, B) where A < B. 
-        // Here readIds are [0, 1, 2, 3].
-        // Candidate (0, 1) has Read 1 as Target (Stream0) and Read 0 as Query (Stream1).
-        
-        for (size_t i = 0; i < store.index.size(); i++) {
-            const auto& candidate = fixture.assembler->alignmentCandidates.candidates[i];
-            if (candidate.readIds[0] == 0 && candidate.readIds[1] == 1) {
-                const auto& entry = store.index[i];
-                // Check Stream 0 (Projected to Read 1)
-                // Read 0 base at 1500 is targetBase. Read 1 base at 1500 is otherBase.
-                // If we project Read 0 to Read 1, Read 1 is target.
-                // The difference is targetBase.
-                if (entry.snpCount0 > 0) {
-                    foundSnp = true;
-                    // Note: Base is stored as 2-bit code (0=A, 1=C, 2=G, 3=T)
-                    // We just check that we have a SNP near 1500
-                    const auto& snp = store.snpStream0[entry.snpOffset0];
-                    // Position is stored as absolute on target
-                    // Wait, APES stores Delta for SNPs.
-                    // First SNP has Delta relative to 0? Or relative to start of alignment?
-                    // Checked code: Delta is relative to previous SNP.
-                    // First SNP delta is relative to 0? 
-                    // Actually, let's just check raw position if available or sum deltas.
-                }
-            }
+
+    const auto& store = fixture.assembler->alignedEvidenceStore;
+    const auto& reads = fixture.assembler->getReads();
+    const auto& alignmentData = fixture.assembler->alignmentData;
+    CAPTURE(store.index.size());
+    CAPTURE(alignmentData.size());
+    REQUIRE(store.index.size() > 0);
+    REQUIRE(alignmentData.size() > 0);
+
+    // --- SNP (read_0 vs read_1, same strand) ---
+    const AlignmentData* ad01 = findAlignmentDataPtr(alignmentData, ReadId(0), ReadId(1), true);
+    REQUIRE(ad01 != nullptr);
+    const uint32_t ev01 = uint32_t(ad01->info.alignmentId);
+    const OrientedReadId q01(ad01->readIds[0], 0);
+    const OrientedReadId t01(ad01->readIds[1], ad01->isSameStrand ? 0 : 1);
+    const uint8_t expectedQ01 = reads.getOrientedReadBase(q01, 1500).value;
+    const uint8_t expectedT01 = reads.getOrientedReadBase(t01, 1500).value;
+
+    std::vector<std::pair<uint32_t, uint8_t>> s0_01;
+    store.forEachSnp0InRange(ev01, 1490, 1510, [&](uint32_t pos, uint8_t base) { s0_01.push_back({pos, base}); });
+    std::vector<std::pair<uint32_t, uint8_t>> s1_01;
+    store.forEachSnp1InRange(ev01, 1490, 1510, [&](uint32_t pos, uint8_t base) { s1_01.push_back({pos, base}); });
+    REQUIRE(s0_01.size() == 1);
+    REQUIRE(s1_01.size() == 1);
+    CHECK(s0_01[0].first == 1500);
+    CHECK(s1_01[0].first == 1500);
+    CHECK(s0_01[0].second == expectedQ01);
+    CHECK(s1_01[0].second == expectedT01);
+
+    // --- Deletion (read_0 vs read_2) ---
+    const uint32_t ev02 = findAlignmentEvidenceId(alignmentData, ReadId(0), ReadId(2));
+    REQUIRE(ev02 != invalid<uint32_t>);
+    const auto indels0 = store.getIndels0(ev02);
+    const auto indels1 = store.getIndels1(ev02);
+    REQUIRE_FALSE((indels0.empty() && indels1.empty()));
+
+    // The injected deletion was 50bp starting at read_0 coordinate 1000+475=1475.
+    uint32_t sumInWindow0 = 0;
+    uint32_t sumInWindow1 = 0;
+    for (const auto& ev : indels0) if (ev.pos() >= 1450 && ev.pos() <= 1550) sumInWindow0 += ev.len();
+    for (const auto& ev : indels1) if (ev.pos() >= 1450 && ev.pos() <= 1550) sumInWindow1 += ev.len();
+    CHECK(std::max(sumInWindow0, sumInWindow1) >= 45);
+
+    // --- F-R orientation (read_0 vs read_3, different strands) ---
+    const AlignmentData* ad03 = nullptr;
+    for (const auto& ad : alignmentData) {
+        if (ad.isDeleted()) continue;
+        if (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(3) && ad.isSameStrand == false) {
+            ad03 = &ad;
+            break;
         }
-        CHECK(foundSnp);
     }
-    
-    SECTION("Deletion is detected and correctly sized") {
-        bool foundIndel = false;
-        const auto& store = fixture.assembler->alignedEvidenceStore;
-        
-        for (size_t i = 0; i < store.index.size(); i++) {
-            const auto& candidate = fixture.assembler->alignmentCandidates.candidates[i];
-            if ((candidate.readIds[0] == 0 && candidate.readIds[1] == 2) ||
-                (candidate.readIds[0] == 2 && candidate.readIds[1] == 0)) {
-                const auto& entry = store.index[i];
-                if (entry.indelCount0 > 0 || entry.indelCount1 > 0) {
-                    foundIndel = true;
-                    uint32_t totalLen = 0;
-                    for (uint32_t j = 0; j < entry.indelCount0; ++j) {
-                        totalLen += store.indelStream0[entry.indelOffset0 + j].len();
-                    }
-                    for (uint32_t j = 0; j < entry.indelCount1; ++j) {
-                        totalLen += store.indelStream1[entry.indelOffset1 + j].len();
-                    }
-                    CHECK(totalLen >= 45);
-                }
-            }
-        }
-        CHECK(foundIndel);
+    if (!ad03) {
+        ad03 = findAlignmentDataPtr(alignmentData, ReadId(0), ReadId(3), false);
     }
-    
-    SECTION("F-R orientation produces consistent evidence") {
-        const auto& store = fixture.assembler->alignedEvidenceStore;
-        bool foundFR = false;
-        for (size_t i = 0; i < store.index.size(); i++) {
-            const auto& candidate = fixture.assembler->alignmentCandidates.candidates[i];
-            // Read 0 and Read 3 are F and R respectively.
-            if ((candidate.readIds[0] == 0 && candidate.readIds[1] == 3) ||
-                (candidate.readIds[0] == 3 && candidate.readIds[1] == 0)) {
-                CHECK(candidate.isSameStrand == false);
-                foundFR = true;
-                const auto& entry = store.index[i];
-                // Read 3 is RC of Read 1. Read 1 had a SNP relative to Read 0 at 1500.
-                // Read 0 (F) and Read 3 (R) should still show evidence of that difference.
-                CHECK(entry.snpCount0 + entry.snpCount1 > 0);
-            }
-        }
-        CHECK(foundFR);
-    }
+    REQUIRE(ad03 != nullptr);
+    CHECK(ad03->isSameStrand == false);
+    const uint32_t ev03 = uint32_t(ad03->info.alignmentId);
+    const OrientedReadId q03(ad03->readIds[0], 0);
+    const OrientedReadId t03(ad03->readIds[1], ad03->isSameStrand ? 0 : 1);
+    const uint8_t expectedQ03 = reads.getOrientedReadBase(q03, 1500).value;
+    const uint8_t expectedT03 = reads.getOrientedReadBase(t03, 1500).value;
+    static const uint8_t complementBase[4] = {3, 2, 1, 0};
+    const uint32_t tRawLen03 = uint32_t(reads.getReadRawSequenceLength(ad03->readIds[1]));
+    const uint32_t expectedS0Pos03 = tRawLen03 - 1U - 1500U;
+
+    std::vector<std::pair<uint32_t, uint8_t>> s0_03;
+    store.forEachSnp0InRange(ev03, 1490, 1510, [&](uint32_t pos, uint8_t base) { s0_03.push_back({pos, base}); });
+    std::vector<std::pair<uint32_t, uint8_t>> s1_03;
+    store.forEachSnp1InRange(ev03, 1490, 1510, [&](uint32_t pos, uint8_t base) { s1_03.push_back({pos, base}); });
+    REQUIRE(s0_03.size() == 1);
+    REQUIRE(s1_03.size() == 1);
+    CHECK(s0_03[0].first == expectedS0Pos03);
+    CHECK(s1_03[0].first == 1500);
+    CHECK(s0_03[0].second == complementBase[expectedQ03]);
+    CHECK(s1_03[0].second == expectedT03);
 }
 
 TEST_CASE("Large Matching Regions and SNP Chaining", "[evidence][delta]") {
@@ -511,33 +673,160 @@ TEST_CASE("Large Matching Regions and SNP Chaining", "[evidence][delta]") {
     // 5. Compute Projected Alignments on the chained candidates
     fixture.computeAlignments();
 
-    // 5. Verify Evidence Store
     const auto& store = fixture.assembler->alignedEvidenceStore;
-    CHECK(store.index.size() > 0);
+    const auto& alignmentData = fixture.assembler->alignmentData;
+    REQUIRE(store.index.size() > 0);
+    REQUIRE(alignmentData.size() > 0);
 
-    bool verifiedChaining = false;
-    for (size_t i = 0; i < store.index.size(); i++) {
-        const auto& entry = store.index[i];
-        if (entry.snpCount0 > 1) { // 35k mismatch should trigger > 1 entry (hops)
-            verifiedChaining = true;
-            uint32_t absolutePos = 0;
-            for (uint32_t j = 0; j < entry.snpCount0; ++j) {
-                absolutePos += store.snpStream0[entry.snpOffset0 + j].delta();
-            }
-            // Should reach variant at 35,000
-            CHECK(absolutePos == 35000);
-            
-            // Check that hops were added (should have at least 2 entries of MAX_DELTA)
-            int hopCount = 0;
-            for (uint32_t j = 0; j < entry.snpCount0; ++j) {
-                if (store.snpStream0[entry.snpOffset0 + j].delta() == SnpEvidence::MAX_DELTA) {
-                    hopCount++;
-                }
-            }
-            CHECK(hopCount >= 2); // 35,000 / 16,383 = ~2.1 hops
-        }
+    const uint32_t evidenceId = findAlignmentEvidenceId(alignmentData, ReadId(0), ReadId(1), true);
+    REQUIRE(evidenceId != invalid<uint32_t>);
+
+    // A single SNP at 35k should decode correctly (with hop tokens as needed).
+    std::vector<uint32_t> positions;
+    store.forEachSnp0InRange(evidenceId, 34990, 35010, [&](uint32_t pos, uint8_t /*base*/) {
+        positions.push_back(pos);
+    });
+    REQUIRE(positions.size() == 1);
+    CHECK(positions[0] == 35000);
+
+    const auto tokens = store.getSnps0(evidenceId);
+    const uint32_t expectedHops = 35000 / SnpEvidence::MAX_DELTA;
+    REQUIRE(tokens.size() == expectedHops + 1);
+    uint32_t hopCount = 0;
+    for (const auto& t : tokens) if (t.isHop()) ++hopCount;
+    CHECK(hopCount == expectedHops);
+}
+
+TEST_CASE("AlignedEvidenceStore delta encoding and range decoding", "[evidence][delta][checkpoints]") {
+    using dinara::AlignedEvidenceStore;
+    using dinara::SnpEvidence;
+
+    // This is a focused correctness test for the delta-encoded SNP token stream:
+    // - Handles deltas larger than 14 bits using hop tokens.
+    // - Handles delta exactly MAX_DELTA using a hop + delta(0) SNP token.
+    // - Checkpointed range decoding returns correct absolute positions.
+
+    AlignedEvidenceStore store;
+    store.reserve(4, 0, 0);
+
+    // Alignment 0: exact MAX_DELTA.
+    store.beginAlignment();
+    store.addSnp0(SnpEvidence::MAX_DELTA, 2);
+    store.addSnp1(SnpEvidence::MAX_DELTA, 3);
+    {
+        auto tokens = store.getSnps0(0);
+        REQUIRE(tokens.size() == 2);
+        CHECK(tokens[0].delta() == SnpEvidence::MAX_DELTA);
+        CHECK(tokens[0].isHop());
+        CHECK(tokens[1].delta() == 0);
+        CHECK_FALSE(tokens[1].isHop());
+
+        std::vector<uint32_t> positions;
+        store.forEachSnp0InRange(0, 0, SnpEvidence::MAX_DELTA + 1, [&](uint32_t pos, uint8_t /*base*/) {
+            positions.push_back(pos);
+        });
+        REQUIRE(positions.size() == 1);
+        CHECK(positions[0] == SnpEvidence::MAX_DELTA);
+
+        std::vector<uint32_t> positions1;
+        store.forEachSnp1InRange(0, 0, SnpEvidence::MAX_DELTA + 1, [&](uint32_t pos, uint8_t /*base*/) {
+            positions1.push_back(pos);
+        });
+        REQUIRE(positions1.size() == 1);
+        CHECK(positions1[0] == SnpEvidence::MAX_DELTA);
     }
-    CHECK(verifiedChaining);
+
+    // Alignment 1: huge delta requiring multiple hops.
+    store.beginAlignment();
+    const uint32_t hugePos = 50000;
+    store.addSnp0(hugePos, 1);
+    store.addSnp1(hugePos, 2);
+    {
+        auto tokens = store.getSnps0(1);
+        // Expect floor(hugePos / MAX_DELTA) hops + 1 SNP token.
+        const uint32_t expectedHops = hugePos / SnpEvidence::MAX_DELTA;
+        REQUIRE(tokens.size() == expectedHops + 1);
+        for (uint32_t i = 0; i < expectedHops; ++i) {
+            CHECK(tokens[i].isHop());
+            CHECK(tokens[i].delta() == SnpEvidence::MAX_DELTA);
+        }
+        CHECK_FALSE(tokens[expectedHops].isHop());
+
+        std::vector<uint32_t> positions;
+        store.forEachSnp0InRange(1, 0, hugePos + 1, [&](uint32_t pos, uint8_t /*base*/) {
+            positions.push_back(pos);
+        });
+        REQUIRE(positions.size() == 1);
+        CHECK(positions[0] == hugePos);
+
+        // Range query that should include it.
+        positions.clear();
+        store.forEachSnp0InRange(1, hugePos, hugePos + 1, [&](uint32_t pos, uint8_t /*base*/) {
+            positions.push_back(pos);
+        });
+        REQUIRE(positions.size() == 1);
+        CHECK(positions[0] == hugePos);
+
+        // Range query that should exclude it.
+        positions.clear();
+        store.forEachSnp0InRange(1, hugePos + 1, hugePos + 100, [&](uint32_t /*pos*/, uint8_t /*base*/) {
+            positions.push_back(0);
+        });
+        CHECK(positions.empty());
+
+        std::vector<uint32_t> positions1;
+        store.forEachSnp1InRange(1, hugePos, hugePos + 1, [&](uint32_t pos, uint8_t /*base*/) {
+            positions1.push_back(pos);
+        });
+        REQUIRE(positions1.size() == 1);
+        CHECK(positions1[0] == hugePos);
+    }
+
+    // Alignment 2: dense tokens to exercise checkpoints and seeking.
+    store.beginAlignment();
+    for (uint32_t p = 0; p < 200; ++p) {
+        store.addSnp0(p, uint8_t(p & 3));
+    }
+    {
+        std::vector<uint32_t> positions;
+        store.forEachSnp0InRange(2, 150, 155, [&](uint32_t pos, uint8_t /*base*/) {
+            positions.push_back(pos);
+        });
+        REQUIRE(positions.size() == 5);
+        CHECK(positions[0] == 150);
+        CHECK(positions[1] == 151);
+        CHECK(positions[2] == 152);
+        CHECK(positions[3] == 153);
+        CHECK(positions[4] == 154);
+    }
+}
+
+TEST_CASE("AlignedEvidenceStore indel evidence handles small and large positions", "[evidence][indel]") {
+    using dinara::AlignedEvidenceStore;
+
+    AlignedEvidenceStore store;
+    store.reserve(1, 0, 0);
+    store.beginAlignment();
+
+    // Store a small and a large indel position (absolute positions, monotonic).
+    store.addIndel0(100, 25, 1);     // deletion
+    store.addIndel0(50000, 30, 0);   // insertion
+
+    auto indels = store.getIndels0(0);
+    REQUIRE(indels.size() == 2);
+    CHECK(indels[0].pos() == 100);
+    CHECK(indels[0].len() == 25);
+    CHECK(indels[0].isDeletion());
+
+    CHECK(indels[1].pos() == 50000);
+    CHECK(indels[1].len() == 30);
+    CHECK(indels[1].isInsertion());
+
+    // Mirror the range-scan logic used in detectSVSites (lower_bound + early stop).
+    auto it = std::lower_bound(indels.begin(), indels.end(), uint32_t(49900),
+        [](const dinara::IndelEvidence& e, uint32_t value) { return e.pos() < value; });
+    REQUIRE(it != indels.end());
+    CHECK(it->pos() == 50000);
 }
 
 // =============================================================================
@@ -564,96 +853,204 @@ TEST_CASE("Integration: PAF import and chaining", "[integration][paf][chaining]"
     fixture.generateMarkers(16, 5);
     fixture.countKmers();
     fixture.applyFilter(1, 1000);
-    
-    std::cout << "=== PAF Chaining Test ===" << std::endl;
-    std::cout << "Read count: " << fixture.assembler->getReads().readCount() << std::endl;
-    std::cout << "Marker count: " << fixture.assembler->markers->totalSize() << std::endl;
-    
-    SECTION("PAF import + chaining produces valid candidates") {
-        // Create PAF file with the known overlap between read_0 and read_1
-        std::string pafPath = fixture.createPafFile({
-            {"read_0", "read_1", true}  // Same strand overlap
-        });
-        
-        // Step 1: Build inverted index (needed for k-mer lookups during chaining)
-        fixture.buildIndex();
-        
-        // Step 2: Import candidates from PAF
-        fixture.importPafCandidates(pafPath);
-        size_t importedCount = fixture.assembler->alignmentCandidates.candidates.size();
-        std::cout << "PAF imported candidates: " << importedCount << std::endl;
-        CHECK(importedCount > 0);
-        
-        // Step 3: Chain the PAF candidates
-        fixture.chainPafCandidates(0.1, 100);
-        size_t chainedCount = fixture.assembler->alignmentCandidates.candidates.size();
-        std::cout << "Chained candidates: " << chainedCount << std::endl;
-        
-        // Should have at least one chained candidate
-        CHECK(chainedCount > 0);
-        
-        // Check that precomputed alignments were created
-        size_t alignmentsCount = fixture.assembler->alignmentCandidatesAlignmentsData.alignments.size();
-        std::cout << "Precomputed alignments: " << alignmentsCount << std::endl;
-        CHECK(alignmentsCount == chainedCount);
-    }
-    
-    SECTION("PAF chaining produces alignments comparable to inverted index path") {
-        // First, run the normal inverted index path for comparison
-        AssemblerIntegrationFixture fixture2;
-        fixture2.createFastq({seq0, seq1, seq2});
-        fixture2.initAssembler();
-        fixture2.loadReads();
-        fixture2.generateMarkers(16, 5);
-        fixture2.countKmers();
-        fixture2.applyFilter(1, 1000);
-        fixture2.findCandidates();  // Uses inverted index discovery + chaining
-        
-        size_t invertedIndexCandidates = fixture2.assembler->alignmentCandidates.candidates.size();
-        std::cout << "Inverted index candidates: " << invertedIndexCandidates << std::endl;
-        
-        // Now run PAF path
-        std::string pafPath = fixture.createPafFile({
-            {"read_0", "read_1", true}
-        });
-        fixture.buildIndex();
-        fixture.importPafCandidates(pafPath);
-        fixture.chainPafCandidates(0.1, 100);
-        
-        size_t pafCandidates = fixture.assembler->alignmentCandidates.candidates.size();
-        std::cout << "PAF path candidates: " << pafCandidates << std::endl;
-        
-        // PAF path should produce at least one candidate for the specified pair
-        CHECK(pafCandidates >= 1);
-        
-        // Check that the (0, 1) pair exists in the PAF results
-        bool foundPair = false;
-        for (size_t i = 0; i < fixture.assembler->alignmentCandidates.candidates.size(); i++) {
-            const auto& c = fixture.assembler->alignmentCandidates.candidates[i];
-            if ((c.readIds[0] == 0 && c.readIds[1] == 1) ||
-                (c.readIds[0] == 1 && c.readIds[1] == 0)) {
-                foundPair = true;
-                CHECK(c.isSameStrand == true);  // Should be same strand
-            }
+
+    // Create PAF file with the known exact overlap between read_0 and read_1:
+    // read_0: [prefix0][shared] => overlap is [200,1000)
+    // read_1: [shared][suffix1] => overlap is [0,800)
+    const std::string pafPath = fixture.createPafFile({
+        AssemblerIntegrationFixture::PafOverlapSpec{
+            "read_0", "read_1", true,
+            uint32_t(prefix0.size()), uint32_t(seq0.size()),
+            0U, uint32_t(sharedRegion.size())
         }
-        CHECK(foundPair);
+    });
+
+    fixture.buildIndex();
+    fixture.importPafCandidates(pafPath);
+    const size_t importedCount = fixture.assembler->alignmentCandidates.candidates.size();
+    CAPTURE(importedCount);
+    REQUIRE(importedCount >= 1);
+
+    bool foundPairImported = false;
+    for (size_t i = 0; i < importedCount; ++i) {
+        const auto& c = fixture.assembler->alignmentCandidates.candidates[i];
+        if ((c.readIds[0] == 0 && c.readIds[1] == 1) || (c.readIds[0] == 1 && c.readIds[1] == 0)) {
+            foundPairImported = true;
+            CHECK(c.isSameStrand == true);
+        }
     }
-    
-    SECTION("Chained PAF candidates can be used for alignment computation") {
-        std::string pafPath = fixture.createPafFile({
-            {"read_0", "read_1", true}
+    REQUIRE(foundPairImported);
+
+    fixture.chainPafCandidates(0.1, 100);
+    const size_t chainedCount = fixture.assembler->alignmentCandidates.candidates.size();
+    const size_t precomputedAlignments = fixture.assembler->alignmentCandidatesAlignmentsData.alignments.size();
+    CAPTURE(chainedCount);
+    CAPTURE(precomputedAlignments);
+    REQUIRE(chainedCount > 0);
+    CHECK(precomputedAlignments == chainedCount);
+
+    // Compare that inverted-index discovery also finds the same pair.
+    AssemblerIntegrationFixture fixture2;
+    fixture2.createFastq({seq0, seq1, seq2});
+    fixture2.initAssembler();
+    fixture2.loadReads();
+    fixture2.generateMarkers(16, 5);
+    fixture2.countKmers();
+    fixture2.applyFilter(1, 1000);
+    fixture2.findCandidates();
+    bool foundPairInverted = false;
+    for (const auto& c : fixture2.assembler->alignmentCandidates.candidates) {
+        if ((c.readIds[0] == 0 && c.readIds[1] == 1) || (c.readIds[0] == 1 && c.readIds[1] == 0)) {
+            foundPairInverted = true;
+            break;
+        }
+    }
+    CHECK(foundPairInverted);
+
+    // Chained PAF candidates can be used for alignment computation.
+    fixture.computeAlignments();
+    const size_t alignmentCount = fixture.assembler->alignmentData.size();
+    CAPTURE(alignmentCount);
+    REQUIRE(alignmentCount >= 1);
+
+    const AlignmentData* ad01 = findAlignmentDataPtr(fixture.assembler->alignmentData, ReadId(0), ReadId(1), true);
+    REQUIRE(ad01 != nullptr);
+    const uint32_t evidenceId = uint32_t(ad01->info.alignmentId);
+
+    // Alignment should cover most of the true overlap.
+    CHECK(uint32_t(ad01->qe - ad01->qs) >= 700);
+    CHECK(uint32_t(ad01->te - ad01->ts) >= 700);
+
+    // This overlap has no injected variants, so evidence streams should be empty (or at least empty in the overlapped range).
+    std::vector<uint32_t> snpPos;
+    fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+        evidenceId, uint32_t(prefix0.size()), uint32_t(seq0.size()), [&](uint32_t pos, uint8_t) { snpPos.push_back(pos); });
+    CHECK(snpPos.empty());
+
+    const auto indels0 = fixture.assembler->alignedEvidenceStore.getIndels0(evidenceId);
+    const auto indels1 = fixture.assembler->alignedEvidenceStore.getIndels1(evidenceId);
+    const uint32_t ovBegin = uint32_t(prefix0.size());
+    const uint32_t ovEnd = uint32_t(seq0.size());
+    for (const auto& ev : indels0) {
+        const bool outside = (ev.pos() < ovBegin) || (ev.pos() >= ovEnd);
+        CHECK(outside);
+    }
+    for (const auto& ev : indels1) {
+        const bool outside = (ev.pos() < ovBegin) || (ev.pos() >= ovEnd);
+        CHECK(outside);
+    }
+}
+
+TEST_CASE("Integration: AlignedEvidenceStore stores SNP and indel evidence", "[integration][evidence][variants]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Create reads with deterministic variants.
+    std::string prefix = randomSequence(500, 123);
+    std::string mid = randomSequence(200, 789);
+    std::string suffix = randomSequence(500, 456);
+
+    std::string seq0 = prefix + mid + suffix;
+    std::string seq1 = seq0;
+
+    // Inject 5 SNPs in seq1.
+    const std::array<uint32_t, 5> snpSites{510U, 540U, 570U, 600U, 630U};
+    for (uint32_t site : snpSites) {
+        seq1[site] = otherBase(seq1[site]);
+    }
+
+    // Inject a 15bp deletion in seq1 near the middle (affects indel evidence).
+    seq1.erase(650, 15);
+
+    fixture.createFastq({seq0, seq1});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(10, 3);
+    fixture.countKmers();
+    fixture.applyFilter(1, 100);
+    fixture.findCandidates();
+    fixture.computeAlignments();
+
+    const auto& store = fixture.assembler->alignedEvidenceStore;
+    const auto& alignmentData = fixture.assembler->alignmentData;
+    REQUIRE(alignmentData.size() >= 1);
+
+    const uint32_t evidenceId = findAlignmentEvidenceId(alignmentData, ReadId(0), ReadId(1), true);
+    REQUIRE(evidenceId != invalid<uint32_t>);
+
+    // Verify each injected SNP is present and projects a base from read_0 in target coordinates.
+    const auto& reads = fixture.assembler->getReads();
+    for (uint32_t site : snpSites) {
+        std::vector<uint8_t> bases;
+        store.forEachSnp0InRange(evidenceId, site, site + 1, [&](uint32_t pos, uint8_t base) {
+            CHECK(pos == site);
+            bases.push_back(base);
         });
-        
-        fixture.buildIndex();
-        fixture.importPafCandidates(pafPath);
-        fixture.chainPafCandidates(0.1, 100);
-        fixture.computeAlignments();
-        
-        // Check that alignments were computed
-        size_t alignmentCount = fixture.assembler->alignmentData.size();
-        std::cout << "Computed alignments: " << alignmentCount << std::endl;
-        
-        // Should produce at least one alignment for the overlapping pair
-        CHECK(alignmentCount >= 1);
+        REQUIRE(bases.size() == 1);
+        CHECK(bases[0] == reads.getOrientedReadBase(OrientedReadId(ReadId(0), 0), site).value);
     }
+
+    // Verify the 15bp event exists in indel evidence near the expected locus.
+    const auto indels0 = store.getIndels0(evidenceId);
+    const auto indels1 = store.getIndels1(evidenceId);
+    REQUIRE_FALSE((indels0.empty() && indels1.empty()));
+    uint32_t totalIndelLen = 0;
+    for (const auto& indel : indels0) if (indel.pos() >= 635 && indel.pos() <= 665) totalIndelLen += indel.len();
+    for (const auto& indel : indels1) if (indel.pos() >= 635 && indel.pos() <= 665) totalIndelLen += indel.len();
+    CHECK(totalIndelLen >= 15);
+}
+
+TEST_CASE("Integration: AlignedEvidenceStore handles large SNP deltas and mixed variants", "[integration][evidence][delta][indel]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Create 20kb reads to test large SNP deltas (> 16383) with an indel.
+    std::string seq0 = randomSequence(20000, 111);
+    std::string seq1 = seq0;
+
+    // Inject SNP at 100.
+    seq1[100] = otherBase(seq1[100]);
+
+    // Inject SNP at 18000 (far from the first SNP).
+    seq1[18000] = otherBase(seq1[18000]);
+
+    // Inject a 10bp deletion at 10000 (on target).
+    seq1.erase(10000, 10);
+
+    fixture.createFastq({seq0, seq1});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(10, 3);
+    fixture.countKmers();
+    fixture.applyFilter(1, 100);
+    fixture.findCandidates();
+    fixture.computeAlignments();
+
+    const auto& store = fixture.assembler->alignedEvidenceStore;
+    const auto& alignmentData = fixture.assembler->alignmentData;
+    REQUIRE(alignmentData.size() >= 1);
+
+    const uint32_t evidenceId = findAlignmentEvidenceId(alignmentData, ReadId(0), ReadId(1), true);
+    REQUIRE(evidenceId != invalid<uint32_t>);
+
+    // The far SNP should force hop tokens in the delta stream.
+    const auto tokens = store.getSnps0(evidenceId);
+    bool foundHop = false;
+    for (const auto& t : tokens) if (t.isHop()) { foundHop = true; break; }
+    CHECK(foundHop);
+
+    // Verify we can find the near SNP at 100, and a far SNP around 18000 (may shift by indel in target coords).
+    std::vector<uint32_t> positions;
+    store.forEachSnp0InRange(evidenceId, 0, 20050, [&](uint32_t pos, uint8_t /*base*/) { positions.push_back(pos); });
+    CHECK(std::find(positions.begin(), positions.end(), 100U) != positions.end());
+    const bool hasFar =
+        (std::find(positions.begin(), positions.end(), 17990U) != positions.end()) ||
+        (std::find(positions.begin(), positions.end(), 18000U) != positions.end());
+    CHECK(hasFar);
+
+    // Verify the 10bp deletion exists near 10000.
+    const auto indels0 = store.getIndels0(evidenceId);
+    const auto indels1 = store.getIndels1(evidenceId);
+    uint32_t totalMixedIndelLen = 0;
+    for (const auto& indel : indels0) if (indel.pos() >= 9990 && indel.pos() <= 10010) totalMixedIndelLen += indel.len();
+    for (const auto& indel : indels1) if (indel.pos() >= 9990 && indel.pos() <= 10010) totalMixedIndelLen += indel.len();
+    CHECK(totalMixedIndelLen >= 10);
 }

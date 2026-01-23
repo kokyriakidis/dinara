@@ -13,3 +13,7 @@ install_manifest.txt
 
 # Install directory
 dinara-install/
+ 
+# IDEs
+.idea/
+.vscode/

@@ -44,17 +44,24 @@ file(GLOB DINARA_SRC_FILES
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*main\\.cpp$")
 
 # Find required libraries
-find_library(ASTARPA_LIB astarpa_c HINTS ${DINARA_BUILD_DIR}/lib)
-find_library(POASTA_LIB poasta_c HINTS ${DINARA_BUILD_DIR}/lib)
-find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c HINTS ${DINARA_BUILD_DIR}/lib)
-find_library(SHASTA2_LIB shasta2 HINTS ${DINARA_BUILD_DIR}/lib)
-find_library(ABPOA_LIB abpoa HINTS ${DINARA_BUILD_DIR}/lib)
+find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_library(POASTA_LIB poasta_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_library(SHASTA2_LIB shasta2 PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_library(ABPOA_LIB abpoa PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 
 # Integration test executable
 add_executable(test_integration
     test_integration.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
+)
+
+# Some toolchains in this environment can produce non-executable output files
+# (missing +x), which makes CTest fail with "permission denied".
+add_custom_command(TARGET test_integration POST_BUILD
+    COMMAND chmod +x $<TARGET_FILE:test_integration>
+    VERBATIM
 )
 
 # Link all required libraries
@@ -64,6 +71,17 @@ target_link_libraries(test_integration
     ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB}
 )
 
+# Ensure the test binary uses the same curated Dinara dependency builds at runtime.
+set_target_properties(test_integration PROPERTIES
+    BUILD_RPATH "${DINARA_BUILD_DIR}/lib"
+)
+
 # Enable CTest
 enable_testing()
 add_test(NAME IntegrationTests COMMAND test_integration)
+
+# CI/dev environments can have LD_LIBRARY_PATH pointing at /usr/local/lib first.
+# Force our curated dependency builds (in ${DINARA_BUILD_DIR}/lib) to take precedence.
+set_tests_properties(IntegrationTests PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${DINARA_BUILD_DIR}/lib"
+)

@@ -63,6 +63,9 @@ ProjectedAlignment::ProjectedAlignment(
         case Method::QuickRaw:
             constructQuickRaw();
             break;
+        case Method::QuickRawSparse:
+            constructQuickRawSparse();
+            break;
         default:
             DINARA_ASSERT(0);
     }
@@ -236,6 +239,74 @@ void ProjectedAlignment::constructQuickRaw()
 
 
 
+// Similar to constructQuickRaw, but does not store per-base alignment traces.
+// Instead, it stores sparse mismatch and indel events that are sufficient to
+// populate AlignedEvidenceStore efficiently.
+void ProjectedAlignment::constructQuickRawSparse()
+{
+    // Reuse a single segment object to reduce allocations.
+    ProjectedAlignmentSegment segment;
+
+    sparseMismatches.clear();
+    sparseIndels.clear();
+
+    // Initialize statistics.
+    totalLength = {0, 0};
+    totalEditDistance = 0;
+    mismatchCount = 0;
+    totalDeletionCount = 0;
+    totalGapEventCount = 0;
+    hasLargeIndel = false;
+    maxIndelSize = 0;
+
+    // Loop over pairs of consecutive aligned markers (A, B).
+    for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
+        const uint64_t iA = iB - 1;
+
+        // Store in the segment the ordinals of these pair of consecutive aligned markers.
+        segment.ordinalsA = alignment.ordinals[iA];
+        segment.ordinalsB = alignment.ordinals[iB];
+
+        // Store the corresponding positions.
+        for(uint64_t i=0; i<2; i++) {
+            segment.positionsA[i] = markers[i][segment.ordinalsA[i]].position + kHalf;
+            segment.positionsB[i] = markers[i][segment.ordinalsB[i]].position + kHalf;
+        }
+
+        // Fill in the base sequences.
+        fillSequences(segment);
+
+        // Accumulate total lengths (even for identical sequences).
+        for(uint64_t i=0; i<2; i++) {
+            totalLength[i] += segment.sequences[i].size();
+        }
+
+        // If the raw sequences are the same, there is no contribution.
+        if(segment.sequences[0] == segment.sequences[1]) {
+            continue;
+        }
+
+        // Align them and collect sparse diffs.
+        segment.computeAlignmentSparse(
+            matchScore, mismatchScore, gapScore,
+            sparseMismatches, sparseIndels);
+
+        // Accumulate statistics.
+        totalEditDistance += segment.editDistance;
+        mismatchCount += segment.mismatchCount;
+        totalDeletionCount += segment.deletionCount;
+        totalGapEventCount += segment.gapEventCount;
+        if(segment.hasLargeIndel) {
+            hasLargeIndel = true;
+        }
+        if(segment.maxIndelSize > maxIndelSize) {
+            maxIndelSize = segment.maxIndelSize;
+        }
+    }
+}
+
+
+
 ProjectedAlignmentSegment::ProjectedAlignmentSegment(
     uint32_t kHalf,
     const array<uint32_t, 2>& ordinalsA,
@@ -388,6 +459,139 @@ void ProjectedAlignmentSegment::computeAlignment(
         DINARA_ASSERT(position1 == sequence1.size());
     }
 
+}
+
+
+
+void ProjectedAlignmentSegment::computeAlignmentSparse(
+    int64_t /* matchScore */,
+    int64_t /* mismatchScore */,
+    int64_t /* gapScore */,
+    vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
+    vector<ProjectedAlignmentSparseIndel>& sparseIndels)
+{
+    const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(sequences[0]);
+    const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(sequences[1]);
+
+    // This is only called when the sequences differ.
+    DINARA_ASSERT(sequence0 != sequence1);
+
+    // Convert sequences to ASCII for A*PA2 using thread_local buffers to avoid allocations.
+    static thread_local vector<uint8_t> asciiSequence0;
+    static thread_local vector<uint8_t> asciiSequence1;
+    asciiSequence0.clear();
+    asciiSequence1.clear();
+    asciiSequence0.reserve(sequence0.size());
+    asciiSequence1.reserve(sequence1.size());
+
+    static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
+
+    for(uint8_t b : sequence0) {
+        asciiSequence0.push_back(b < 4 ? baseToAscii[b] : 'N');
+    }
+    for(uint8_t b : sequence1) {
+        asciiSequence1.push_back(b < 4 ? baseToAscii[b] : 'N');
+    }
+
+    char* cigar = nullptr;
+    size_t cigarLen = 0;
+    const int64_t cost = astarpa2_simple(
+        asciiSequence0.data(), asciiSequence0.size(),
+        asciiSequence1.data(), asciiSequence1.size(),
+        (unsigned char**)&cigar, &cigarLen);
+
+    editDistance = cost;
+
+    // Parse CIGAR and collect sparse differences.
+    uint64_t position0 = 0;
+    uint64_t position1 = 0;
+    mismatchCount = 0;
+    deletionCount = 0;
+    gapEventCount = 0;
+    hasLargeIndel = false;
+    maxIndelSize = 0;
+
+    size_t currentVal = 0;
+    for(size_t i=0; i<cigarLen; i++) {
+        const char c = cigar[i];
+        if(isdigit(c)) {
+            currentVal = currentVal * 10 + size_t(c - '0');
+            continue;
+        }
+
+        if(currentVal == 0) {
+            currentVal = 1;
+        }
+
+        if(c == 'M' || c == '=' || c == 'X') {
+            // Match/mismatch block: record mismatches.
+            for(size_t k=0; k<currentVal; ++k) {
+                const uint8_t b0 = sequence0[position0 + k];
+                const uint8_t b1 = sequence1[position1 + k];
+                if(b0 != b1) {
+                    sparseMismatches.push_back(ProjectedAlignmentSparseMismatch{
+                        uint32_t(positionsA[0] + uint32_t(position0 + k)),
+                        uint32_t(positionsA[1] + uint32_t(position1 + k)),
+                        b0,
+                        b1
+                    });
+                    ++mismatchCount;
+                }
+            }
+            position0 += currentVal;
+            position1 += currentVal;
+
+        } else if(c == 'D') {
+            // Gap in sequence1 (target).
+            sparseIndels.push_back(ProjectedAlignmentSparseIndel{
+                uint32_t(positionsA[0] + uint32_t(position0)),
+                uint32_t(positionsA[1] + uint32_t(position1)),
+                uint32_t(currentVal),
+                'D'
+            });
+            position0 += currentVal;
+            deletionCount += currentVal;
+            ++gapEventCount;
+            if(currentVal >= 6) {
+                hasLargeIndel = true;
+            }
+            if(currentVal > maxIndelSize) {
+                maxIndelSize = uint32_t(currentVal);
+            }
+
+        } else if(c == 'I') {
+            // Gap in sequence0 (query).
+            sparseIndels.push_back(ProjectedAlignmentSparseIndel{
+                uint32_t(positionsA[0] + uint32_t(position0)),
+                uint32_t(positionsA[1] + uint32_t(position1)),
+                uint32_t(currentVal),
+                'I'
+            });
+            position1 += currentVal;
+            deletionCount += currentVal;
+            ++gapEventCount;
+            if(currentVal >= 6) {
+                hasLargeIndel = true;
+            }
+            if(currentVal > maxIndelSize) {
+                maxIndelSize = uint32_t(currentVal);
+            }
+
+        } else if(c == 'H') {
+            // Hard clips do not consume sequence.
+            // astarpa2_simple is not expected to generate these, but tolerate.
+        } else {
+            // Unexpected CIGAR op for A*PA2 simple alignment.
+            DINARA_ASSERT(0);
+        }
+
+        currentVal = 0;
+    }
+
+    astarpa_free_cigar((unsigned char*)cigar);
+
+    DINARA_ASSERT(position0 == sequence0.size());
+    DINARA_ASSERT(position1 == sequence1.size());
 }
 
 

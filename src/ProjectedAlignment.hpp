@@ -26,6 +26,20 @@ namespace dinara {
     class CompressedMarker;
     class LongBaseSequenceView;
     class OrientedReadId;
+
+    struct ProjectedAlignmentSparseMismatch {
+        uint32_t position0;
+        uint32_t position1;
+        uint8_t base0;
+        uint8_t base1;
+    };
+
+    struct ProjectedAlignmentSparseIndel {
+        uint32_t position0;
+        uint32_t position1;
+        uint32_t length;
+        char op; // 'I' or 'D'
+    };
 }
 
 
@@ -69,6 +83,12 @@ public:
         int64_t matchScore,
         int64_t mismatchScore,
         int64_t gapScore);
+    void computeAlignmentSparse(
+        int64_t matchScore,
+        int64_t mismatchScore,
+        int64_t gapScore,
+        vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
+        vector<ProjectedAlignmentSparseIndel>& sparseIndels);
 
     // The Base sequences in RLE represenation.
     array<vector<Base>, 2> rleSequences;
@@ -116,11 +136,14 @@ public:
 class dinara::ProjectedAlignment {
 public:
     vector<ProjectedAlignmentSegment> segments;
+    vector<ProjectedAlignmentSparseMismatch> sparseMismatches;
+    vector<ProjectedAlignmentSparseIndel> sparseIndels;
 
     enum class Method {
         All,        // Do both RLE and raw alignments, store all segments.
         QuickRle,   // Only do RLE alignments, only store segments where the two RLE sequences differ.
         QuickRaw,   // Only do raw alignments, only store segments where the two raw sequences differ.
+        QuickRawSparse, // Only do raw alignments, store sparse diffs (no full alignment trace).
     };
 
     ProjectedAlignment(
@@ -140,6 +163,7 @@ public:
     void constructAll();
     void constructQuickRle();
     void constructQuickRaw();
+    void constructQuickRawSparse();
     
     // Flag to indicate if the projected alignment touches the ends of the markers.
     bool touchesMarkerEnds = false;
@@ -217,4 +241,3 @@ public:
     // Find pairs of mismatching positions in the raw alignments.
     void getMismatchPositions(vector< array<uint32_t, 2> >&) const;
 };
-

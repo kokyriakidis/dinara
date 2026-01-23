@@ -244,6 +244,7 @@ public:
     int maxBand;
     int sameChannelReadAlignmentSuppressDeltaThreshold;
     bool suppressContainments;
+    double maxErrorRate;
 
     // Align4.
     uint64_t align4DeltaX;
