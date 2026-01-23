@@ -11,6 +11,7 @@
 #include <cstring> // For memset
 #include <immintrin.h> // For AVX2
 #include "AlignedEvidenceStore.hpp" 
+#include "chrono.hpp"
 
 using namespace dinara;
 using namespace std;
@@ -263,7 +264,7 @@ static void detectHetSites(
             hapEvidence.push_back({
                 .overlapID = (uint32_t)k,
                 .site = currentPos,
-                .overlapSite = 0, // Assigned during filtering
+                .overlapSite = invalid<uint32_t>, // Assigned during filtering
                 .type = 1,        // Mismatch
                 .misBase = base,
                 .hp = false       // Assigned in Phase 3
@@ -350,24 +351,33 @@ static void detectHetSites(
         
         // Collect all evidence for this specific site into base-specific counts.
         uint32_t misCountPerBase[4] = {0, 0, 0, 0};
+        uint32_t misCountFwdPerBase[4] = {0, 0, 0, 0};
         uint32_t totalMisCount = 0;
+        uint32_t totalAltReadsFwd = 0;
         while (evidenceIdx < hapEvidence.size() && hapEvidence[evidenceIdx].site == site) {
-            uint8_t base = hapEvidence[evidenceIdx].misBase;
+            const auto& ev = hapEvidence[evidenceIdx];
+            const uint8_t base = ev.misBase;
             if (base < 4) {
                 misCountPerBase[base]++;
                 totalMisCount++;
+                const uint32_t ovId = ev.overlapID;
+                if (ovId < candidates.size() && !candidates[ovId].isRev) {
+                    misCountFwdPerBase[base]++;
+                    totalAltReadsFwd++;
+                }
             }
             evidenceIdx++;
         }
-        
-        // Homopolymer Masking (Lazy check, once per site)
-        bool hp = isHomopolymerMasked(unpacked.data(), (int64_t)queryRead.baseCount, site);
-        // Ensure all evidence at this site inherits the HP status for DP filtering
-        for (size_t j = startIdx; j < evidenceIdx; ++j) {
-            hapEvidence[j].hp = hp;
-        }
-        if (hp) continue;
 
+        // Quick reject: no allele has enough support to become an informative site.
+        uint32_t maxMisCount = 0;
+        for (uint8_t b = 0; b < 4; ++b) {
+            maxMisCount = std::max(maxMisCount, misCountPerBase[b]);
+        }
+        if (maxMisCount < 2) {
+            continue;
+        }
+        
         // O(1) Lookup for Coverage
         const uint32_t totalCov = siteTotalCov[siteIdx];
         const uint32_t totalReadsFwd = siteFwdCov[siteIdx];
@@ -377,21 +387,21 @@ static void detectHetSites(
         if (totalCov < 5) continue; 
         
         // Reference Strand Bias (All Ref on Forward).
-        // Calculate altReadsFwd for the WHOLE site to derive refReadsFwd.
-        uint32_t totalAltReadsFwd = 0;
-        for (size_t j = startIdx; j < evidenceIdx; ++j) {
-             const uint32_t ovId = hapEvidence[j].overlapID;
-             if (ovId < candidates.size() && !candidates[ovId].isRev) {
-                 totalAltReadsFwd++;
-             }
-        }
         // Hifiasm Parity: is_st_bs (Correct.cpp:9234). 
         // Checks Ref Strand Bias (Extreme case only for Parity).
         if (refCov > 2) {
             uint32_t refReadsFwd = (totalReadsFwd >= totalAltReadsFwd) ? (totalReadsFwd - totalAltReadsFwd) : 0;
-            if (refReadsFwd + 2 >= refCov && refReadsFwd >= refCov * 0.95) continue;
-            if (refReadsFwd <= 2 && refReadsFwd <= refCov * 0.05) continue;
+            // Integer math: x >= 0.95*y  <=>  100*x >= 95*y
+            if ((refReadsFwd + 2 >= refCov) && (uint64_t(refReadsFwd) * 100ULL >= uint64_t(refCov) * 95ULL)) continue;
+            // Integer math: x <= 0.05*y  <=>  100*x <= 5*y
+            if ((refReadsFwd <= 2) && (uint64_t(refReadsFwd) * 100ULL <= uint64_t(refCov) * 5ULL)) continue;
         }
+
+        // Determine which alternative alleles are worth emitting for this site.
+        uint32_t rowIndexForBase[4] = {
+            invalid<uint32_t>, invalid<uint32_t>, invalid<uint32_t>, invalid<uint32_t>
+        };
+        uint32_t validAltCount = 0;
 
         // Important: Hifiasm creates a separate SnpStats for EACH alternative base that passes threshold.
         for (uint8_t altBaseIdx = 0; altBaseIdx < 4; ++altBaseIdx) {
@@ -399,41 +409,64 @@ static void detectHetSites(
             if (misCount < 2) continue; // Initial detection threshold (DP later requires 3)
 
             // Alt Strand Bias Check (Hifiasm parity in push_info)
-            uint32_t altReadsFwd = 0;
-            for (size_t j = startIdx; j < evidenceIdx; ++j) {
-                if (hapEvidence[j].misBase == altBaseIdx) {
-                    const uint32_t ovId = hapEvidence[j].overlapID;
-                    if (ovId < candidates.size() && !candidates[ovId].isRev) altReadsFwd++;
-                }
-            }
+            const uint32_t altReadsFwd = misCountFwdPerBase[altBaseIdx];
 
             // --- Hifiasm Parity: Strand Bias Filtering ---
             // Filter Alt Allele Bias
             if (misCount > 2) { 
-                if (altReadsFwd + 2 >= misCount && altReadsFwd >= misCount * 0.95) continue;
-                if (altReadsFwd <= 2 && altReadsFwd <= misCount * 0.05) continue;
+                if ((altReadsFwd + 2 >= misCount) && (uint64_t(altReadsFwd) * 100ULL >= uint64_t(misCount) * 95ULL)) continue;
+                if ((altReadsFwd <= 2) && (uint64_t(altReadsFwd) * 100ULL <= uint64_t(misCount) * 5ULL)) continue;
             }
 
             // Note: Site-level Ref Bias already checked above (lines 426-430).
             // No need for a second check here unless we have extremely high multiallelic complexity.
+
+            // Defer emission until after homopolymer masking for this site.
+            rowIndexForBase[altBaseIdx] = 0;
+            validAltCount++;
+        }
+
+        if (validAltCount == 0) {
+            continue;
+        }
+
+        // Homopolymer masking is relatively expensive. Do it only after cheaper filters passed.
+        if (isHomopolymerMasked(unpacked.data(), (int64_t)queryRead.baseCount, site)) {
+            continue;
+        }
+
+        const uint32_t refReadsFwdSite = (totalReadsFwd >= totalAltReadsFwd) ? (totalReadsFwd - totalAltReadsFwd) : 0;
+
+        // Emit Valid SNP Stats for each surviving [Site, AltBase] pair and record its row index.
+        for (uint8_t altBaseIdx = 0; altBaseIdx < 4; ++altBaseIdx) {
+            if (rowIndexForBase[altBaseIdx] == invalid<uint32_t>) {
+                continue;
+            }
+
+            const uint32_t misCount = misCountPerBase[altBaseIdx];
 
             // Emit Valid SNP Stats for this specific [Site, AltBase] pair
             SnpStats stat;
             stat.site = site;
             stat.occ_1 = misCount; 
             stat.occ_0 = refCov + 1; // +1 for query support
-            uint32_t refReadsFwd = (totalReadsFwd >= totalAltReadsFwd) ? (totalReadsFwd - totalAltReadsFwd) : 0;
-            stat.fwd_ref_cov = refReadsFwd + 1; // +1 for query support (Forward by convention)
+            stat.fwd_ref_cov = refReadsFwdSite + 1; // +1 for query support (Forward by convention)
             stat.refBase = queryRead[site].character();
             stat.altBase = Base::fromInteger(altBaseIdx).character();
-            
-            // Assign overlapSite only for evidence matching this specific alt base
-            for (size_t j = startIdx; j < evidenceIdx; ++j) {
-                if (hapEvidence[j].misBase == altBaseIdx) {
-                    hapEvidence[j].overlapSite = (uint32_t)snpStats.size();
+
+            rowIndexForBase[altBaseIdx] = (uint32_t)snpStats.size();
+            snpStats.push_back(stat);
+        }
+
+        // Assign overlapSite for evidence that matches an emitted alt base at this site.
+        for (size_t j = startIdx; j < evidenceIdx; ++j) {
+            const uint8_t b = hapEvidence[j].misBase;
+            if (b < 4) {
+                const uint32_t row = rowIndexForBase[b];
+                if (row != invalid<uint32_t>) {
+                    hapEvidence[j].overlapSite = row;
                 }
             }
-            snpStats.push_back(stat);
         }
     }
 }
@@ -1008,6 +1041,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
     cout << timestamp << "=== Hifiasm Parity EC Pipeline (Round 1) ===" << endl;
 
     const uint64_t readCount = reads->readCount();
+    const auto tBeginAll = steady_clock::now();
         
     // Use uint8_t for thread-safe byte addressing
     vector<uint8_t> keepAlignment(alignmentData.size(), 0); 
@@ -1017,6 +1051,21 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
     uint64_t chunkSize = readCount / threadCount;
     if(chunkSize == 0) chunkSize = 1;
 
+    struct alignas(64) PhaseTiming {
+        double gatherCandidates = 0.;
+        double snpDetect = 0.;
+        double dp = 0.;
+        double validateSnv = 0.;
+        double compact = 0.;
+        double svDetect = 0.;
+        double validateSv = 0.;
+        double finalizeFlags = 0.;
+        uint64_t readsVisited = 0;
+        uint64_t readsWithAlignments = 0;
+        uint64_t readsWithCandidates = 0;
+    };
+    vector<PhaseTiming> timings(threadCount);
+
     for(uint64_t t=0; t<threadCount; t++) {
         threads.emplace_back([&, t]() {
             uint64_t start = t * chunkSize;
@@ -1024,8 +1073,10 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 
             // Thread-local scratchpad to eliminate per-read allocations
             HifiasmECScratchPad scratch;
+            PhaseTiming& timing = timings[t];
 
             for(uint64_t readId = start; readId < end; readId++) {
+                timing.readsVisited++;
                 // Unified Pipeline (TASSD Accelerated)
                 uint32_t strand = 0;
                 OrientedReadId orientedReadId(dinara::ReadId(readId), strand);
@@ -1033,12 +1084,14 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 
                 const auto& alignments = alignmentTable[orientedReadId.getValue()];
                 if(alignments.empty()) continue;
+                timing.readsWithAlignments++;
 
                     // Clear scratchpad for next read
                     scratch.clear();
                     auto& candidates = scratch.candidates;
                     candidates.reserve(alignments.size());
                     
+                    const auto tGatherBegin = steady_clock::now();
                     for(uint32_t alignmentId : alignments) {
                         const auto& thisAlignmentData = alignmentData[alignmentId];
                         
@@ -1067,19 +1120,27 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         
                         candidates.push_back(candidate);
                     }
+                    timing.gatherCandidates += seconds(steady_clock::now() - tGatherBegin);
 
                     if(candidates.empty()) continue;
+                    timing.readsWithCandidates++;
                     
                     bool isDebugRead = false;
                     
                     // 1. SNP Detection Phase
+                    const auto tSnpBegin = steady_clock::now();
                     detectHetSites(*this, *reads, readId, alignmentData, scratch);
+                    timing.snpDetect += seconds(steady_clock::now() - tSnpBegin);
                     
                     // 2. Phasing Phase (DP)
+                    const auto tDpBegin = steady_clock::now();
                     gen_rphase_dp(*this, scratch);
+                    timing.dp += seconds(steady_clock::now() - tDpBegin);
                     
                     // 3. Alignment Validation
+                    const auto tValidateSnvBegin = steady_clock::now();
                     generate_haplotypes_naive_HiFi(*this, scratch);
+                    timing.validateSnv += seconds(steady_clock::now() - tValidateSnvBegin);
 
                     // Pick first 2 informative reads for debug tracking
                     if (debugInformativeCount < 2) {
@@ -1106,11 +1167,18 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         if (filteredBySnv.empty()) cout << "    * (None)" << endl;
                     }
 
+                    const auto tCompactBegin = steady_clock::now();
                     compactPhasedSites(scratch);
+                    timing.compact += seconds(steady_clock::now() - tCompactBegin);
 
                     // 4. Structural Variant (SV) Phase
+                    const auto tSvDetectBegin = steady_clock::now();
                     detectSVSites(*this, *reads, readId, alignmentData, scratch);
+                    timing.svDetect += seconds(steady_clock::now() - tSvDetectBegin);
+
+                    const auto tValidateSvBegin = steady_clock::now();
                     generate_haplotypes_sv(*this, scratch);
+                    timing.validateSv += seconds(steady_clock::now() - tValidateSvBegin);
 
                     if (isDebugRead) {
                         cout << "  - Recovered by SV Detection (backbone support):" << endl;
@@ -1158,6 +1226,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         if (!anyFinalDeletions) cout << "    * (None)" << endl;
                     }
 
+                    const auto tFinalizeBegin = steady_clock::now();
                     for(size_t c = 0; c < candidates.size(); ++c) {
                         auto& cand = candidates[c];
                         auto& ad = alignmentData[cand.alignmentId];
@@ -1180,12 +1249,43 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         if (keep) ad.info.isInReadGraph = 1;
                         if (candCoversInfo[c]) ad.coversHetSite = true;
                     }
+                    timing.finalizeFlags += seconds(steady_clock::now() - tFinalizeBegin);
                 }
         });
     }
 
 
-    for(auto& t : threads) t.join();
+    for(auto& th : threads) th.join();
+
+    PhaseTiming total;
+    for(const auto& t : timings) {
+        total.gatherCandidates += t.gatherCandidates;
+        total.snpDetect += t.snpDetect;
+        total.dp += t.dp;
+        total.validateSnv += t.validateSnv;
+        total.compact += t.compact;
+        total.svDetect += t.svDetect;
+        total.validateSv += t.validateSv;
+        total.finalizeFlags += t.finalizeFlags;
+        total.readsVisited += t.readsVisited;
+        total.readsWithAlignments += t.readsWithAlignments;
+        total.readsWithCandidates += t.readsWithCandidates;
+    }
+
+    const double tAll = seconds(steady_clock::now() - tBeginAll);
+    cout << timestamp << "Parity EC Round 1 timings (sum over threads):" << endl;
+    cout << timestamp << "  gather candidates: " << total.gatherCandidates << " s" << endl;
+    cout << timestamp << "  SNP detect:        " << total.snpDetect << " s" << endl;
+    cout << timestamp << "  DP phase:          " << total.dp << " s" << endl;
+    cout << timestamp << "  SNV validate:      " << total.validateSnv << " s" << endl;
+    cout << timestamp << "  compact sites:     " << total.compact << " s" << endl;
+    cout << timestamp << "  SV detect:         " << total.svDetect << " s" << endl;
+    cout << timestamp << "  SV validate:       " << total.validateSv << " s" << endl;
+    cout << timestamp << "  finalize flags:    " << total.finalizeFlags << " s" << endl;
+    cout << timestamp << "Parity EC Round 1 wall time: " << tAll << " s"
+         << " (reads=" << total.readsVisited
+         << ", withAlignments=" << total.readsWithAlignments
+         << ", withCandidates=" << total.readsWithCandidates << ")" << endl;
 
     cout << timestamp << "Parity EC Round 1 Complete." << endl;
 }

@@ -1131,3 +1131,213 @@ TEST_CASE("Integration: filterSecondaryAlignmentsPerReadPair removes redundant d
     CHECK(afterTotal == beforeTotal);
     CHECK(afterActive == 1);
 }
+
+TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch evidence for informative-site coverage", "[integration][hifiasm][ec][parity]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Query read (0): baseline.
+    const size_t readLen = 4000;
+    std::string seq0 = randomSequence(readLen, 12345);
+
+    // Construct a robust, informative biallelic SNP with plenty of support,
+    // and mixed orientation, to survive strict filters.
+    const size_t P = 1500;
+    const size_t Q = 500;
+    const std::string safeWindow = "ACGTTGCACTGATCGTACGTA"; // 21bp
+    REQUIRE(P >= 10);
+    REQUIRE(P + 10 < seq0.size());
+    seq0.replace(P - 10, safeWindow.size(), safeWindow);
+
+    std::string seqAlt = seq0;
+    seqAlt[P] = otherBase(seqAlt[P]);
+
+    // Build reads:
+    // - 3 forward alt
+    // - 3 reverse alt (stored as RC, aligned as reverse strand)
+    // - 3 forward ref (one of them is "noisy ref" with a singleton mismatch at Q)
+    // - 3 reverse ref (stored as RC)
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0
+
+    std::vector<uint32_t> altReadIndices;
+    std::vector<uint32_t> refReadIndices;
+
+    auto addForward = [&](const std::string& s) {
+        const uint32_t idx = uint32_t(seqs.size());
+        seqs.push_back(s);
+        return idx;
+    };
+    auto addReverse = [&](const std::string& s) {
+        const uint32_t idx = uint32_t(seqs.size());
+        seqs.push_back(reverseComplement(s));
+        return idx;
+    };
+
+    for (int i = 0; i < 3; ++i) altReadIndices.push_back(addForward(seqAlt));
+    for (int i = 0; i < 3; ++i) altReadIndices.push_back(addReverse(seqAlt));
+
+    // Forward refs.
+    refReadIndices.push_back(addForward(seq0));
+    refReadIndices.push_back(addForward(seq0));
+    std::string seqNoisyRef = seq0;
+    seqNoisyRef[Q] = otherBase(seqNoisyRef[Q]);
+    const uint32_t noisyRefIndex = addForward(seqNoisyRef);
+    refReadIndices.push_back(noisyRefIndex);
+
+    // Reverse refs.
+    for (int i = 0; i < 3; ++i) refReadIndices.push_back(addReverse(seq0));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    auto countPairAlignments = [&](ReadId a, ReadId b) -> uint64_t {
+        uint64_t n = 0;
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool isPair =
+                (ad.readIds[0] == a && ad.readIds[1] == b) ||
+                (ad.readIds[0] == b && ad.readIds[1] == a);
+            if (isPair) ++n;
+        }
+        return n;
+    };
+    REQUIRE(countPairAlignments(ReadId(0), ReadId(altReadIndices.front())) >= 1);
+    REQUIRE(countPairAlignments(ReadId(0), ReadId(noisyRefIndex)) >= 1);
+
+    // Sanity-check that the evidence store actually contains the engineered SNP at P
+    // for an alt overlap, and the singleton mismatch at Q for the noisy ref overlap.
+    auto baseToInt = [&](char c) -> uint8_t {
+        if (c == 'A') return 0;
+        if (c == 'C') return 1;
+        if (c == 'G') return 2;
+        if (c == 'T') return 3;
+        return 4;
+    };
+
+    // Find whether there exists an alignment for (read_0, other) that covers `pos`
+    // and has a SNP at `pos` in the query coordinate, and return the strand flag
+    // used by parity EC (`isRev = !isSameStrand`).
+    auto findSnpSupportAt = [&](uint32_t otherReadIdx, uint32_t pos, bool& isRevOut) -> bool {
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool isPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(otherReadIdx)) ||
+                (ad.readIds[0] == ReadId(otherReadIdx) && ad.readIds[1] == ReadId(0));
+            if (!isPair) continue;
+            if (ad.info.alignmentId == invalid<size_t>) continue;
+
+            const bool queryIsRead0 = (ad.readIds[0] == ReadId(0));
+            const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+            const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+            if (!(qs <= pos && qe > pos)) continue;
+
+            bool found = false;
+            uint8_t base = 4;
+            if (queryIsRead0) {
+                fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                    uint32_t(ad.info.alignmentId), pos, pos + 1,
+                    [&](uint32_t p, uint8_t b) { if (p == pos) { found = true; base = b; } }
+                );
+            } else {
+                fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                    uint32_t(ad.info.alignmentId), pos, pos + 1,
+                    [&](uint32_t p, uint8_t b) { if (p == pos) { found = true; base = b; } }
+                );
+            }
+            if (found) {
+                REQUIRE(base < 4);
+                REQUIRE(base != baseToInt(seqs[0][pos]));
+                isRevOut = !ad.isSameStrand;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Identify which overlaps actually contribute the engineered mismatch at P.
+    std::vector<uint32_t> altSupportAtP;
+    bool hasAltFwd = false;
+    bool hasAltRev = false;
+    for (uint32_t idx : altReadIndices) {
+        bool isRev = false;
+        if (findSnpSupportAt(idx, uint32_t(P), isRev)) {
+            altSupportAtP.push_back(idx);
+            hasAltRev |= isRev;
+            hasAltFwd |= !isRev;
+        }
+    }
+    REQUIRE(altSupportAtP.size() >= 3);
+    REQUIRE(hasAltFwd);
+    REQUIRE(hasAltRev);
+
+    // The noisy ref overlap must contain the singleton mismatch at Q and must NOT
+    // contain the engineered SNP at P.
+    {
+        bool isRev = false;
+        REQUIRE(findSnpSupportAt(noisyRefIndex, uint32_t(Q), isRev));
+        CHECK_FALSE(findSnpSupportAt(noisyRefIndex, uint32_t(P), isRev));
+    }
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    // In this synthetic setup, the only potential informative SNP is at position P.
+    // Verify that `coversHetSite` matches that position (no off-by-one / wrong projection).
+    auto alignmentHasSnpAtQueryPos = [&](const AlignmentData& ad, uint32_t pos) -> bool {
+        if (ad.info.alignmentId == invalid<size_t>) return false;
+        const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(0));
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        if (!(qs <= pos && qe > pos)) return false;
+
+        bool found = false;
+        if (queryIsRead0) {
+            fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        } else {
+            fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        }
+        return found;
+    };
+
+    bool foundAnyAltMarked = false;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool hasSnpAtP = alignmentHasSnpAtQueryPos(ad, uint32_t(P));
+        if (ad.coversHetSite) {
+            CHECK(hasSnpAtP);
+        }
+        if (hasSnpAtP && ad.coversHetSite) {
+            foundAnyAltMarked = true;
+        }
+    }
+    REQUIRE(foundAnyAltMarked);
+
+    // The noisy ref overlap has only a singleton mismatch at Q (pos != P), so it must not be
+    // mapped to an informative SNP row at P and must not get coversHetSite.
+    bool noisyHasCoversHetSite = false;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        const bool isPair =
+            (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(noisyRefIndex)) ||
+            (ad.readIds[0] == ReadId(noisyRefIndex) && ad.readIds[1] == ReadId(0));
+        if (!isPair) continue;
+        noisyHasCoversHetSite |= ad.coversHetSite;
+        CHECK_FALSE(alignmentHasSnpAtQueryPos(ad, uint32_t(P)));
+        CHECK(alignmentHasSnpAtQueryPos(ad, uint32_t(Q)));
+    }
+    CHECK_FALSE(noisyHasCoversHetSite);
+}
