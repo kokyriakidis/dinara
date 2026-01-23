@@ -1054,3 +1054,80 @@ TEST_CASE("Integration: AlignedEvidenceStore handles large SNP deltas and mixed 
     for (const auto& indel : indels1) if (indel.pos() >= 9990 && indel.pos() <= 10010) totalMixedIndelLen += indel.len();
     CHECK(totalMixedIndelLen >= 10);
 }
+
+TEST_CASE("Integration: filterSecondaryAlignmentsPerReadPair removes redundant duplicates", "[integration][filtering][besthit]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Two near-identical reads to ensure a single strong overlap candidate is found.
+    std::string seq0 = randomSequence(3000, 4242);
+    std::string seq1 = seq0;
+    // Add a tiny number of SNPs to avoid accidental perfect-repeat corner cases, but keep overlap strong.
+    seq1[100] = otherBase(seq1[100]);
+    seq1[2500] = otherBase(seq1[2500]);
+
+    fixture.createFastq({seq0, seq1});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    // Create chained candidates first.
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 100);
+
+    auto& candidates = fixture.assembler->alignmentCandidates.candidates;
+    auto& chainedAlignments = fixture.assembler->alignmentCandidatesAlignmentsData.alignments;
+    REQUIRE(candidates.size() == chainedAlignments.size());
+    REQUIRE(candidates.size() >= 1);
+
+    // Find the 0-1 candidate.
+    uint64_t baseIndex = invalid<uint64_t>;
+    for (uint64_t i = 0; i < candidates.size(); ++i) {
+        const auto& c = candidates[i];
+        if (c.readIds[0] == ReadId(0) && c.readIds[1] == ReadId(1)) {
+            baseIndex = i;
+            break;
+        }
+    }
+    REQUIRE(baseIndex != invalid<uint64_t>);
+
+    // Duplicate the same (read0,read1) candidate/alignment twice.
+    const auto baseCand = candidates[baseIndex];
+    const auto baseAln = chainedAlignments[baseIndex];
+    candidates.push_back(baseCand);
+    chainedAlignments.push_back(baseAln);
+    candidates.push_back(baseCand);
+    chainedAlignments.push_back(baseAln);
+
+    REQUIRE(candidates.size() == chainedAlignments.size());
+
+    // Compute base-space alignments and evidence; this will create multiple AlignmentData
+    // entries for the same read pair.
+    fixture.computeAlignments();
+
+    auto countPair = [&](bool onlyActive) -> uint64_t {
+        uint64_t n = 0;
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool isPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(1)) ||
+                (ad.readIds[0] == ReadId(1) && ad.readIds[1] == ReadId(0));
+            if (!isPair) continue;
+            if (onlyActive && ad.isDeleted()) continue;
+            ++n;
+        }
+        return n;
+    };
+
+    const uint64_t beforeTotal = countPair(false);
+    const uint64_t beforeActive = countPair(true);
+    REQUIRE(beforeTotal >= 3);
+    REQUIRE(beforeActive >= 3);
+
+    fixture.assembler->filterSecondaryAlignmentsPerReadPair(1);
+
+    const uint64_t afterTotal = countPair(false);
+    const uint64_t afterActive = countPair(true);
+    CHECK(afterTotal == beforeTotal);
+    CHECK(afterActive == 1);
+}

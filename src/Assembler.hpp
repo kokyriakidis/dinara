@@ -698,11 +698,11 @@ private:
     };
     FlagPalindromicReadsData flagPalindromicReadsData;
 
-    // Filter optimal alignments (Best Hit)
-    void filterBestHitAlignmentsThreadFunction(size_t threadId);
-    std::atomic<uint64_t> removedBestHitCount;
+    // Filter secondary/redundant alignments per read pair (hifiasm-style).
+    void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
+    std::atomic<uint64_t> removedSecondaryAlignmentCount;
 public:
-    void filterBestHitAlignments(uint64_t threadCount);
+    void filterSecondaryAlignmentsPerReadPair(uint64_t threadCount);
 public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
@@ -1247,7 +1247,7 @@ public:
     
     // Create read graph directly from OverlapIndex (Option A: direct use, no alignmentData mapping)
     
-    // Create read graph from alignments after filterBestHitAlignments (no phasing)
+    // Create read graph from alignments after filterSecondaryAlignmentsPerReadPair (no phasing)
     void createReadGraphFromFilteredAlignments();
     
     // Temporary or permanent member

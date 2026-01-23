@@ -397,23 +397,24 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
 
 
 
-// Main function to create variant clusters
-void Assembler::filterBestHitAlignments(uint64_t threadCount)
+void Assembler::filterSecondaryAlignmentsPerReadPair(uint64_t threadCount)
 {
-    // --- Best Hit Alignment Filtering (hifiasm-style) ---
-    // Efficiently implemented using alignmentTable iteration (reads -> overlaps).
-    
-    cout << timestamp << "Filtering alignments to keep Best Hit per read pair (Variant Clustering Phase)." << endl;
-    
-    // Reset counter
-    removedBestHitCount = 0;
+    // --- Hifiasm-style per-read-pair redundancy filtering ---
+    // For each read r0, consider all overlaps to a given partner read (r1).
+    // Keep the strongest chains and delete redundant/secondary ones:
+    // - score ratio filter (hifiasm -p 0.8)
+    // - overlap-on-r0 filter (hifiasm -M 0.5)
+
+    cout << timestamp << "Filtering secondary alignments per read pair." << endl;
+
+    removedSecondaryAlignmentCount = 0;
     
     // Run threads
     const uint64_t readCount = reads->readCount();
     setupLoadBalancing(readCount, 100); // Batch size heuristic
-    runThreads(&Assembler::filterBestHitAlignmentsThreadFunction, threadCount);
+    runThreads(&Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction, threadCount);
 
-    cout << timestamp << "Removed " << removedBestHitCount << " redundant alignments (marked isDeleted)." << endl;
+    cout << timestamp << "Removed " << removedSecondaryAlignmentCount << " redundant alignments (marked isDeleted)." << endl;
 }
 
 // Main function to create variant clusters
@@ -1001,152 +1002,63 @@ void Assembler::performGlobalVariantClustering(
 
 
 
-void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
+void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
 {
     uint64_t begin, end;
     uint64_t localRemovedCount = 0;
 
-    // We use a small vector to avoid repeated allocations, clearing it each iteration.
-    std::vector<std::pair<ReadId, uint32_t>> candidates;
-    
+    // Reuse buffers across reads to avoid repeated allocations.
+    struct CandidateInfo {
+        uint32_t alignmentId;
+        int64_t score;
+        uint64_t qs;
+        uint64_t qe;
+    };
+    std::vector<CandidateInfo> group;
+    std::vector<CandidateInfo> kept;
+    group.reserve(16);
+    kept.reserve(16);
+
     // Default batch size from setupLoadBalancing
     while(getNextBatch(begin, end)) {
         for(ReadId r0 = ReadId(begin); r0 != ReadId(end); r0++) {
-            
-            candidates.clear();
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) continue;
 
-            // Helper to collect alignments for an oriented version of r0
-            // Since we are inside a member function, we can't easily use a local lambda 
-            // capturing 'candidates' efficiently if we want to keep it simple, 
-            // but we can just inline the logic or use a simple lambda.
-            auto collectCandidates = [&](OrientedReadId orientedR0) {
-                const auto& table = alignmentTable[orientedR0.getValue()];
-                for (uint32_t alignmentId : table) {
-                    const auto& ad = alignmentData[alignmentId];
-                    ReadId rA = ad.readIds[0];
-                    ReadId rB = ad.readIds[1];
-                    ReadId target = (rA == r0) ? rB : rA;
-                    
-                    // Mark self-overlaps as deleted immediately
-                    if (rA == rB) {
-                        alignmentData[alignmentId].setDeleted(true);
-                        localRemovedCount++;
-                        continue;
-                    }
-                    
-                    // Enforce canonical ordering: only process if r0 < target.
-                    if (r0 > target) continue;
-                    
-                    candidates.push_back({target, alignmentId});
-                }
-            };
-            
-            collectCandidates(OrientedReadId(r0, 0));
-            collectCandidates(OrientedReadId(r0, 1));
-            
-            if (candidates.empty()) continue;
-            
-            // Sort by target
-            std::sort(candidates.begin(), candidates.end());
-            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            group.clear();
+            kept.clear();
 
-            size_t n = candidates.size();
+            ReadId currentTarget = invalidReadId;
 
-            // Structure to cache computed score and range for overlap check
-            struct CandidateInfo {
-                uint32_t alignmentId;
-                int64_t score;
-                uint64_t qs;
-                uint64_t qe;
-                ReadId r0; // Store r0 to check which side to use
-            };
+            auto flushGroup = [&]() {
+                if(group.empty()) return;
 
-            for(size_t i = 0; i < n; ) {
-                ReadId currentTarget = candidates[i].first;
-                size_t j = i;
-                
-                // Collect all candidates for this target
-                std::vector<CandidateInfo> group;
-                
-                while(j < n && candidates[j].first == currentTarget) {
-                    uint32_t alignmentId = candidates[j].second;
-                    const auto& ad = alignmentData[alignmentId];
-                    const auto& info = ad.info;
-
-                    // Calculate metrics
-                    uint64_t overlapLenOnR0;
-                    if (ad.readIds[0] == r0) {
-                        overlapLenOnR0 = (uint64_t)ad.qe - (uint64_t)ad.qs;
-                    } else {
-                        overlapLenOnR0 = (uint64_t)ad.te - (uint64_t)ad.ts;
-                    }
-
-                    int64_t score;
-                    bool hasMetrics = (info.mismatchCount != invalid<uint32_t>) && (info.gapCount != invalid<uint32_t>);
-                    
-                    if (hasMetrics) {
-                        // Hifiasm Affine Score (map-hifi approximation: M=2, X=4, O=4, E=2)
-                        // Score ~= 2*Len - 6*Mis - 4*GapBases - 4*GapEvents
-                        score = 2 * (int64_t)overlapLenOnR0 
-                              - 6 * (int64_t)info.mismatchCount 
-                              - 4 * (int64_t)info.gapCount;
-                        
-                        if (info.gapEventCount != invalid<uint32_t>) {
-                            score -= 4 * (int64_t)info.gapEventCount;
-                        }
-
-
-                    } else {
-                        // Fallback: Use Marker Count or Length as proxy
-                        // Make it negative-ish relative to "real" scores if we prefer real metrics
-                        // But if no metrics, we can't do affine. Use raw length * 2.
-                        score = 2 * (int64_t)overlapLenOnR0; 
-                    }
-
-                    // Get Range on r0 for overlap check
-                    uint64_t qs, qe;
-                    if (ad.readIds[0] == r0) {
-                        qs = ad.qs;
-                        qe = ad.qe;
-                    } else {
-                        qs = ad.ts;
-                        qe = ad.te;
-                    }
-
-                    group.push_back({alignmentId, score, qs, qe, r0});
-                    j++;
-                }
-
-                // Sort group by score descending
+                // Sort group by score descending.
                 std::sort(group.begin(), group.end(), [](const CandidateInfo& a, const CandidateInfo& b) {
                     return a.score > b.score;
                 });
 
-                // Greedily keep non-overlapping candidates that pass score ratio
-                std::vector<CandidateInfo> kept;
-                int64_t bestScore = group.empty() ? 0 : group[0].score; // First is best due to sort
+                kept.clear();
+                const int64_t bestScore = group[0].score;
 
                 for (const auto& cand : group) {
                     bool drop = false;
-                    
-                    // 1. Score Ratio Filter (Hifiasm -p 0.8)
-                    // We only apply this relative to the BEST chain for this pair.
-                    if (cand.score < bestScore * 0.8) {
+
+                    // 1) Score ratio filter (hifiasm -p 0.8), done with integer math:
+                    // cand.score < bestScore * 0.8  <=>  cand.score * 5 < bestScore * 4
+                    if (cand.score * 5 < bestScore * 4) {
                         drop = true;
-                    } 
-                    else {
-                        // 2. Overlap Filter (Hifiasm -M 0.5)
-                        uint64_t len = cand.qe - cand.qs; 
-                        
+                    } else {
+                        // 2) Overlap filter on r0 (hifiasm -M 0.5), integer math:
+                        // oLen > 0.5 * len  <=>  2*oLen > len
+                        const uint64_t len = cand.qe - cand.qs;
                         for (const auto& existing : kept) {
-                            // Check overlap on r0
-                            uint64_t oStart = std::max(cand.qs, existing.qs);
-                            uint64_t oEnd = std::min(cand.qe, existing.qe);
-                            
+                            const uint64_t oStart = std::max(cand.qs, existing.qs);
+                            const uint64_t oEnd = std::min(cand.qe, existing.qe);
                             if (oEnd > oStart) {
-                                uint64_t oLen = oEnd - oStart;
-                                // Hifiasm Threshold: > 50% of the NEW (shorter/worse) chain
-                                if (oLen > 0.5 * len) {
+                                const uint64_t oLen = oEnd - oStart;
+                                if (oLen * 2 > len) {
                                     drop = true;
                                     break;
                                 }
@@ -1161,10 +1073,66 @@ void Assembler::filterBestHitAlignmentsThreadFunction(size_t)
                         kept.push_back(cand);
                     }
                 }
+            };
 
-                i = j;
+            // alignmentTable[OrientedReadId(r0,0)] is already sorted by partner OrientedReadId,
+            // so partner ReadIds are contiguous (strand 0/1 are adjacent for the same read).
+            for (const uint32_t alignmentId : table) {
+                const auto& ad = alignmentData[alignmentId];
+
+                // Mark self-overlaps as deleted immediately.
+                if (ad.readIds[0] == ad.readIds[1]) {
+                    alignmentData[alignmentId].setDeleted(true);
+                    localRemovedCount++;
+                    continue;
+                }
+
+                // Canonical ordering: only process from the smaller ReadId side.
+                const ReadId target = ad.getOther(r0);
+                if (r0 > target) {
+                    continue;
+                }
+
+                if (target != currentTarget) {
+                    flushGroup();
+                    group.clear();
+                    currentTarget = target;
+                }
+
+                const auto& info = ad.info;
+
+                // Overlap length on r0.
+                const uint64_t overlapLenOnR0 = (ad.readIds[0] == r0) ?
+                    (uint64_t(ad.qe) - uint64_t(ad.qs)) :
+                    (uint64_t(ad.te) - uint64_t(ad.ts));
+
+                // Hifiasm affine score approximation if metrics are available.
+                const bool hasMetrics =
+                    (info.mismatchCount != invalid<uint32_t>) &&
+                    (info.gapCount != invalid<uint32_t>);
+
+                int64_t score;
+                if (hasMetrics) {
+                    // Score ~= 2*Len - 6*Mis - 4*GapBases - 4*GapEvents
+                    score = 2 * int64_t(overlapLenOnR0)
+                          - 6 * int64_t(info.mismatchCount)
+                          - 4 * int64_t(info.gapCount);
+                    if (info.gapEventCount != invalid<uint32_t>) {
+                        score -= 4 * int64_t(info.gapEventCount);
+                    }
+                } else {
+                    score = 2 * int64_t(overlapLenOnR0);
+                }
+
+                // Overlap interval on r0 (forward coordinates).
+                const uint64_t qs = (ad.readIds[0] == r0) ? ad.qs : ad.ts;
+                const uint64_t qe = (ad.readIds[0] == r0) ? ad.qe : ad.te;
+
+                group.push_back(CandidateInfo{alignmentId, score, qs, qe});
             }
+
+            flushGroup();
         }
     }
-    removedBestHitCount += localRemovedCount;
+    removedSecondaryAlignmentCount += localRemovedCount;
 }
