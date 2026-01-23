@@ -377,7 +377,10 @@ void KmerCounter::getHistogramInfo(KmerDistributionInfo& info) const
             previousFrequency = frequency;
         }
     }
-    DINARA_ASSERT(info.coverageLow != invalid<uint64_t>);
+    if(info.coverageLow == invalid<uint64_t>) {
+        info.coverageLow = 1;
+        frequencyAtCoverageLow = previousFrequency;
+    }
 
 
 
@@ -405,7 +408,9 @@ void KmerCounter::getHistogramInfo(KmerDistributionInfo& info) const
             break;
         }
     }
-    DINARA_ASSERT(info.coverageHigh != invalid<uint64_t>);
+    if(info.coverageHigh == invalid<uint64_t>) {
+        info.coverageHigh = info.coveragePeak;
+    }
 }
 
 

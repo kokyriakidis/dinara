@@ -1,4 +1,5 @@
 build/
+tests/build_tests/
 external/
 
 # CMake build artifacts
