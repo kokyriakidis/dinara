@@ -11,20 +11,24 @@ using namespace dinara;
 
 void Assembler::createReadGraph6()
 {
+    createReadGraph6(std::thread::hardware_concurrency());
+}
+
+void Assembler::createReadGraph6(uint64_t threadCount)
+{
     cout << timestamp << "createReadGraph6 begins." << endl;
 
     // Check required data
     checkAlignmentDataAreOpen();
     // checkPhasingCigarsAreOpen(); // Removed: PhasingCigars replaced by AlignedEvidenceStore
 
-    const uint64_t threadCount = std::thread::hardware_concurrency();
     const uint64_t totalAlignments = alignmentData.size();
     
     // Helper to count active alignments (not deleted)
     auto countActiveAlignments = [this]() -> uint64_t {
         uint64_t active = 0;
         for(uint64_t i = 0; i < alignmentData.size(); i++) {
-            if(!alignmentData[i].isDeleted()) active++;
+            if(alignmentData[i].keptByBothSides()) active++;
         }
         return active;
     };
@@ -33,8 +37,8 @@ void Assembler::createReadGraph6()
     auto countPhasingFlags = [this]() -> std::pair<uint64_t, uint64_t> {
         uint64_t del0 = 0, del1 = 0;
         for(uint64_t i = 0; i < alignmentData.size(); i++) {
-            if(alignmentData[i].isDeleted0) del0++;
-            if(alignmentData[i].isDeleted1) del1++;
+            if(alignmentData[i].isDeleted0()) del0++;
+            if(alignmentData[i].isDeleted1()) del1++;
         }
         return {del0, del1};
     };
@@ -47,6 +51,11 @@ void Assembler::createReadGraph6()
          << ", isDeleted1=" << initDel1 
          << ", active=" << countActiveAlignments() << endl;
     
+    // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
+    // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
+    // DeleteReasonChemical so later steps can avoid them.
+    applyOntChemicalArcMask(threadCount);
+
     // Hifiasm parity: Full pre-graph filtering pipeline
     // Order matches Hifiasm's clean_graph / gen_init_sg flow
     
@@ -58,8 +67,8 @@ void Assembler::createReadGraph6()
          << ", active=" << countActiveAlignments() << endl;
     
     // Step 2: Find valid read segments (ma_hit_sub equivalent)
-    // Finds longest contiguous region with coverage >= minCoverage
-    const uint64_t minCoverage = 3;  // Hifiasm default min_dp
+    // Hifiasm default min_dp is asm_opt.min_overlap_coverage (default 0).
+    const uint64_t minCoverage = 0;
     filterLocalSegments(minCoverage, threadCount);
     
     // Count deleted reads
@@ -70,8 +79,16 @@ void Assembler::createReadGraph6()
     cout << timestamp << "[DIAG] After filterLocalSegments: " << deletedReads << "/" << reads->readCount() << " reads marked deleted" << endl;
     cout << timestamp << "[DIAG] After filterLocalSegments: active alignments=" << countActiveAlignments() << endl;
     
-    // Step 3: Clip overlaps to valid regions (ma_hit_cut equivalent)  
-    // Also normalizes coordinates to 0-based relative to valid region
+    // Step 3: Detect chimeric reads (detect_chimeric_reads)
+    // Runs after ma_hit_sub and before ma_hit_cut in hifiasm.
+    detectChimericReads(threadCount);
+    auto [afterChimericDel0, afterChimericDel1] = countPhasingFlags();
+    cout << timestamp << "[DIAG] After detectChimericReads: isDeleted0=" << afterChimericDel0
+         << ", isDeleted1=" << afterChimericDel1
+         << ", active=" << countActiveAlignments() << endl;
+
+    // Step 4: Clip overlaps to valid regions (ma_hit_cut equivalent)
+    // Also normalizes coordinates to 0-based relative to valid region.
     const uint64_t minOverlapLength = 50;  // Hifiasm default mini_overlap_length
     applyCoverageCuts(minOverlapLength, threadCount);
     auto [afterCutDel0, afterCutDel1] = countPhasingFlags();
@@ -79,7 +96,7 @@ void Assembler::createReadGraph6()
          << ", isDeleted1=" << afterCutDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // Step 4: Filter hanging overlaps (ma_hit_flt equivalent)
+    // Step 5: Filter hanging overlaps (ma_hit_flt equivalent)
     // Removes overlaps with excessive overhangs
     const uint64_t maxHang = 1000;
     const double maxHangRate = 0.8;
@@ -89,7 +106,7 @@ void Assembler::createReadGraph6()
          << ", isDeleted1=" << afterHangDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
+    // Step 6: Remove contained reads (ma_hit_contained_advance equivalent)
     // Marks fully contained reads and removes their overlaps
     removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
     auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
@@ -97,15 +114,6 @@ void Assembler::createReadGraph6()
          << ", isDeleted1=" << afterContainDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // Step 6: Chimeric read detection (gen_chemical_arc_rf equivalent)
-    // Detects reads with coverage gaps
-    detectChimericReads(threadCount);
-    rescueChimericReads(threadCount);
-    auto [afterChimericDel0, afterChimericDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After chimeric detection: isDeleted0=" << afterChimericDel0 
-         << ", isDeleted1=" << afterChimericDel1 
-         << ", active=" << countActiveAlignments() << endl;
-
     // Step 7: Final filtering pass - apply phasing decisions
     const uint64_t alignmentCount = alignmentData.size();
     std::vector<bool> keepAlignment(alignmentCount, true);
@@ -120,8 +128,8 @@ void Assembler::createReadGraph6()
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
         
-        // 1. Check dual phasing flags (conservative AND: keep only if BOTH agree)
-        if(ad.isDeleted()) {
+        // 1. Conservative AND: keep an overlap only if BOTH reads keep it.
+        if(!ad.keptByBothSides()) {
             keepAlignment[i] = false;
             ad.info.isInReadGraph = 0;
             phasedOutCount++;
@@ -132,6 +140,13 @@ void Assembler::createReadGraph6()
         if (validReadIntervals.size() > 0) {
             if (validReadIntervals[ad.readIds[0]].isDeleted || 
                 validReadIntervals[ad.readIds[1]].isDeleted) {
+                const AlignmentData::DeleteReasonMask already =
+                    ad.deleteReasons0 | ad.deleteReasons1;
+                const AlignmentData::DeleteReasonMask majorReadLevel =
+                    AlignmentData::DeleteReasonContained | AlignmentData::DeleteReasonChimeric;
+                if ((already & majorReadLevel) == 0) {
+                    ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonLocal);
+                }
                 keepAlignment[i] = false;
                 ad.info.isInReadGraph = 0;
                 containedCount++;
@@ -142,6 +157,7 @@ void Assembler::createReadGraph6()
         // 3. Check palindromic reads
         if (reads->getFlags(ad.readIds[0]).isPalindromic || 
             reads->getFlags(ad.readIds[1]).isPalindromic) {
+            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonPalindromic);
             keepAlignment[i] = false;
             ad.info.isInReadGraph = 0;
             palindromicCount++;
@@ -181,37 +197,45 @@ void Assembler::createReadGraphFromFilteredAlignments()
     checkAlignmentDataAreOpen();
 
     const uint64_t alignmentCount = alignmentData.size();
-    std::vector<bool> keepAlignment(alignmentCount, true);
+    std::vector<uint8_t> keepAlignmentByte(alignmentCount, 0);
     uint64_t keptCount = 0;
-    uint64_t deletedCount = 0;
+    uint64_t filteredCount = 0;
 
-    #pragma omp parallel for reduction(+:keptCount, deletedCount)
+    #pragma omp parallel for reduction(+:keptCount, filteredCount)
     for(uint64_t i = 0; i < alignmentCount; i++) {
         AlignmentData& ad = alignmentData[i];
-        if (ad.isDeleted()) {
-            keepAlignment[i] = false;
-            ad.info.isInReadGraph = 0; // Ensure consistent state
-            deletedCount++;
-        } else {
-            // Also check if reads are marked deleted globally (e.g. from chimeras/containment)
-            if (validReadIntervals.size() > 0) {
-                 if (validReadIntervals[ad.readIds[0]].isDeleted || 
-                     validReadIntervals[ad.readIds[1]].isDeleted) {
-                     keepAlignment[i] = false;
-                     ad.info.isInReadGraph = 0;
-                     deletedCount++;
-                     continue;
-                 }
-            }
-            
-            ad.info.isInReadGraph = 1;
-            keptCount++;
+        // Hifiasm-style conservative keep rule: keep an overlap only if BOTH reads keep it.
+        const bool keptByBothSides = ad.keptByBothSides();
+        if (!keptByBothSides) {
+            keepAlignmentByte[i] = 0;
+            ad.info.isInReadGraph = 0;
+            filteredCount++;
+            continue;
         }
+
+        // Also check if reads are marked deleted globally (e.g. from chimeras/containment).
+        if (validReadIntervals.size() > 0) {
+            if (validReadIntervals[ad.readIds[0]].isDeleted ||
+                validReadIntervals[ad.readIds[1]].isDeleted) {
+                keepAlignmentByte[i] = 0;
+                ad.info.isInReadGraph = 0;
+                filteredCount++;
+                continue;
+            }
+        }
+
+        keepAlignmentByte[i] = 1;
+        ad.info.isInReadGraph = 1;
+        keptCount++;
     }
 
-    cout << timestamp << "Filtered out " << deletedCount << " alignments." << endl;
+    cout << timestamp << "Filtered out " << filteredCount << " alignments." << endl;
     cout << timestamp << "Kept " << keptCount << " / " << alignmentCount << " alignments for read graph." << endl;
 
+    std::vector<bool> keepAlignment(alignmentCount, false);
+    for (uint64_t i = 0; i < alignmentCount; ++i) {
+        keepAlignment[i] = (keepAlignmentByte[i] != 0);
+    }
     createReadGraphUsingSelectedAlignments(keepAlignment);
     cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
 }

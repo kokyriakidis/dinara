@@ -473,6 +473,18 @@ class dinara::AlignmentData :
     public dinara::OrientedReadPair {
 public:
 
+    using DeleteReasonMask = uint16_t;
+    static constexpr DeleteReasonMask DeleteReasonNone        = 0;
+    static constexpr DeleteReasonMask DeleteReasonPhase       = 1u << 0; // EC phasing decision
+    static constexpr DeleteReasonMask DeleteReasonSecondary   = 1u << 1; // Redundant/secondary per-read-pair filtering
+    static constexpr DeleteReasonMask DeleteReasonChemical    = 1u << 2; // ONT chemical chimera masking
+    static constexpr DeleteReasonMask DeleteReasonChimeric    = 1u << 3; // Chimeric read filtering
+    static constexpr DeleteReasonMask DeleteReasonLocal       = 1u << 4; // ma_hit_sub / local segment filtering
+    static constexpr DeleteReasonMask DeleteReasonCoverageCut = 1u << 5; // ma_hit_cut / coverage cuts
+    static constexpr DeleteReasonMask DeleteReasonHanging     = 1u << 6; // ma_hit_flt / hanging overlap filter
+    static constexpr DeleteReasonMask DeleteReasonContained   = 1u << 7; // ma_hit_contained_advance / contained read removal
+    static constexpr DeleteReasonMask DeleteReasonPalindromic = 1u << 8; // palindromic read filtering
+
     // The AlignmentInfo computed with the first read on strand 0.
     AlignmentInfo info;
 
@@ -482,18 +494,44 @@ public:
     // Flags
     bool coversHetSite = false;
     
-    // Directional deletion flags for phasing resolution
-    // isDeleted0: phasing decision from readIds[0]'s perspective
-    // isDeleted1: phasing decision from readIds[1]'s perspective
-    // An overlap is only kept if BOTH reads agree (conservative AND)
-    bool isDeleted0 = false;
-    bool isDeleted1 = false;
-    
-    // Helper: returns true if BOTH directions marked as deleted (conservative)
-    bool isDeleted() const { return isDeleted0 && isDeleted1; }
-    
-    // Helper: set both flags (for non-phasing deletion, e.g., filtering)
-    void setDeleted(bool val) { isDeleted0 = isDeleted1 = val; }
+    // Directional deletion reason bitmasks.
+    // deleteReasons0: reasons from readIds[0]'s perspective
+    // deleteReasons1: reasons from readIds[1]'s perspective
+    // An overlap is only kept for graph purposes if BOTH sides have no deletion reasons (conservative AND).
+    DeleteReasonMask deleteReasons0 = DeleteReasonNone;
+    DeleteReasonMask deleteReasons1 = DeleteReasonNone;
+
+    bool isDeleted0() const { return deleteReasons0 != DeleteReasonNone; }
+    bool isDeleted1() const { return deleteReasons1 != DeleteReasonNone; }
+    bool keptByBothSides() const { return !isDeleted0() && !isDeleted1(); }
+    bool isDeleted() const { return isDeleted0() && isDeleted1(); } // fully deleted (both sides)
+
+    void addDeleteReasonsBoth(DeleteReasonMask reasons)
+    {
+        deleteReasons0 |= reasons;
+        deleteReasons1 |= reasons;
+    }
+    void addDeleteReasonsFromReadPerspective(ReadId readId, DeleteReasonMask reasons)
+    {
+        if (readIds[0] == readId) {
+            deleteReasons0 |= reasons;
+        } else {
+            deleteReasons1 |= reasons;
+        }
+    }
+    void clearDeleteReasonsFromReadPerspective(ReadId readId, DeleteReasonMask reasons)
+    {
+        if (readIds[0] == readId) {
+            deleteReasons0 &= ~reasons;
+        } else {
+            deleteReasons1 &= ~reasons;
+        }
+    }
+    void clearDeleteReasonsBoth(DeleteReasonMask reasons)
+    {
+        deleteReasons0 &= ~reasons;
+        deleteReasons1 &= ~reasons;
+    }
     
     bool hasLargeIndel = false;
 

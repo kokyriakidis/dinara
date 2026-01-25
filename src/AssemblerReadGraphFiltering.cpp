@@ -1,15 +1,251 @@
 #include "Assembler.hpp"
 #include "Reads.hpp" // For Reads class definition
+#include "hifiasmCoordinateTransforms.hpp"
 #include "timestamp.hpp"      // For timestamp
 // #include "loadBalancing.hpp" // Removed: caused compilation error
 #include <algorithm>
 #include <vector>
+#include <limits>
 
 // For debugging/logging
 #include <iostream>
 
 using namespace dinara;
 using namespace std;
+
+namespace {
+    inline bool isDeletedFromReadPerspective(const dinara::AlignmentData& ad, dinara::ReadId readId)
+    {
+        if (ad.readIds[0] == readId) {
+            return ad.isDeleted0();
+        } else {
+            return ad.isDeleted1();
+        }
+    }
+}
+
+static int ma_hit2arc_containment(
+    int32_t qs, int32_t qe, int32_t ql,
+    int32_t ts, int32_t te, int32_t tl,
+    bool isReverse,
+    int32_t max_hang,
+    double int_frac,
+    int32_t min_ovlp);
+
+namespace {
+    constexpr uint32_t HifiasmWindow = 375;
+    constexpr uint32_t HifiasmThresholdMaxSize = 31;
+    constexpr double HifiasmMaxOvDiffEc = 0.04;
+
+    inline char complementBase(char c)
+    {
+        switch (c) {
+        case 'A': return 'T';
+        case 'C': return 'G';
+        case 'G': return 'C';
+        case 'T': return 'A';
+        case 'a': return 't';
+        case 'c': return 'g';
+        case 'g': return 'c';
+        case 't': return 'a';
+        default: return 'N';
+        }
+    }
+
+    inline void extractReadSubstring(
+        const Reads& reads,
+        ReadId readId,
+        uint32_t start,
+        uint32_t length,
+        bool reverseComplement,
+        std::vector<char>& out)
+    {
+        out.resize(length);
+        const auto& read = reads.getRead(readId);
+        const uint32_t readLen = uint32_t(read.baseCount);
+        if (length == 0) return;
+
+        if (!reverseComplement) {
+            for (uint32_t i = 0; i < length; ++i) {
+                const uint32_t pos = start + i;
+                out[i] = (pos < readLen) ? read[pos].character() : 'N';
+            }
+        } else {
+            for (uint32_t i = 0; i < length; ++i) {
+                const uint32_t pos = start + (length - 1U - i);
+                const char b = (pos < readLen) ? read[pos].character() : 'N';
+                out[i] = complementBase(b);
+            }
+        }
+    }
+
+    inline bool determineOverlapRegion(
+        int threshold,
+        int64_t yStart,
+        int64_t yLen,
+        int64_t windowLen,
+        int& extraBegin,
+        int& extraEnd,
+        int64_t& clippedYStart,
+        int64_t& clippedYLen)
+    {
+        if (yStart < 0 || yStart >= yLen ||
+            (yLen - yStart + 2 * threshold + HifiasmThresholdMaxSize) < windowLen) {
+            return false;
+        }
+
+        extraBegin = 0;
+        extraEnd = 0;
+        clippedYStart = yStart - threshold;
+        clippedYLen = std::min<int64_t>(windowLen, yLen - clippedYStart);
+        extraEnd = int(windowLen - clippedYLen);
+        if (clippedYStart < 0) {
+            extraBegin = int(-clippedYStart);
+            clippedYStart = 0;
+            clippedYLen -= extraBegin;
+        }
+        return clippedYLen > 0;
+    }
+
+    inline int minEditDistancePatternToAnySubstring(const char* pattern, int m, const char* text, int n)
+    {
+        std::vector<int16_t> prev(n + 1);
+        std::vector<int16_t> curr(n + 1);
+        std::fill(prev.begin(), prev.end(), 0);
+
+        for (int i = 1; i <= m; ++i) {
+            curr[0] = int16_t(i);
+            for (int j = 1; j <= n; ++j) {
+                const int cost = (pattern[i - 1] == text[j - 1]) ? 0 : 1;
+                const int a = prev[j] + 1;
+                const int b = curr[j - 1] + 1;
+                const int c = prev[j - 1] + cost;
+                curr[j] = int16_t(std::min({a, b, c}));
+            }
+            prev.swap(curr);
+        }
+
+        int best = prev[0];
+        for (int j = 1; j <= n; ++j) best = std::min(best, int(prev[j]));
+        return best;
+    }
+
+    inline bool verifySingleWindow(
+        const Reads& reads,
+        uint32_t xStart,
+        uint32_t xEndInclusive,
+        uint32_t overlapXs,
+        uint32_t overlapYs,
+        ReadId xId,
+        ReadId yId,
+        bool xStrand,
+        double maxOvDiffEc,
+        std::vector<char>& xBuf,
+        std::vector<char>& yBuf)
+    {
+        if (xEndInclusive < xStart) return false;
+        const uint32_t xLen = xEndInclusive - xStart + 1;
+        if (xLen == 0) return false;
+
+        int threshold = int(double(xLen) * maxOvDiffEc);
+        if (threshold == 0 && xLen >= 4) threshold = 1;
+        const int64_t windowLen = int64_t(xLen) + (int64_t(threshold) << 1);
+
+        const int64_t yReadLen = int64_t(reads.getReadRawSequenceLength(yId));
+        const int64_t yStart = int64_t(xStart) - int64_t(overlapXs) + int64_t(overlapYs);
+
+        int extraBegin = 0;
+        int extraEnd = 0;
+        int64_t clippedYStart = 0;
+        int64_t clippedYLen = 0;
+        if (!determineOverlapRegion(threshold, yStart, yReadLen, windowLen, extraBegin, extraEnd, clippedYStart, clippedYLen)) {
+            return false;
+        }
+
+        extractReadSubstring(reads, xId, xStart, xLen, xStrand, xBuf);
+
+        yBuf.assign(size_t(windowLen), 'N');
+        std::vector<char> yCore;
+        extractReadSubstring(reads, yId, uint32_t(clippedYStart), uint32_t(clippedYLen), false, yCore);
+        std::copy(yCore.begin(), yCore.end(), yBuf.begin() + extraBegin);
+
+        const int dist = minEditDistancePatternToAnySubstring(xBuf.data(), int(xBuf.size()), yBuf.data(), int(yBuf.size()));
+        return dist <= threshold;
+    }
+
+    inline bool boundaryVerify(
+        const Reads& reads,
+        uint32_t qIntervalStart,
+        uint32_t qIntervalEnd,
+        ReadId qId,
+        ReadId tId,
+        uint32_t qs,
+        uint32_t ts,
+        uint32_t te,
+        bool rev,
+        std::vector<char>& xBuf,
+        std::vector<char>& yBuf)
+    {
+        if (qIntervalEnd <= qIntervalStart) return false;
+        const uint32_t intervalLen = qIntervalEnd - qIntervalStart;
+
+        const uint32_t tLen = uint32_t(reads.getReadRawSequenceLength(tId));
+        const uint32_t xs = qs;
+        const uint32_t ys = rev ? (tLen - te) : ts;
+
+        uint32_t tIntervalStart = (qIntervalStart - xs) + ys;
+        if (tIntervalStart >= tLen) return false;
+        uint32_t tIntervalEndInclusive = tIntervalStart + intervalLen - 1;
+        if (tIntervalEndInclusive >= tLen) tIntervalEndInclusive = tLen - 1;
+        if (tIntervalEndInclusive < tIntervalStart) return false;
+
+        const uint32_t tIntervalLen = tIntervalEndInclusive - tIntervalStart + 1;
+        if (tIntervalLen <= HifiasmWindow) {
+            return verifySingleWindow(
+                reads,
+                tIntervalStart,
+                tIntervalEndInclusive,
+                ys,
+                xs,
+                tId,
+                qId,
+                rev,
+                HifiasmMaxOvDiffEc,
+                xBuf,
+                yBuf);
+        }
+
+        if (!verifySingleWindow(
+                reads,
+                tIntervalStart,
+                tIntervalStart + HifiasmWindow - 1,
+                ys,
+                xs,
+                tId,
+                qId,
+                rev,
+                HifiasmMaxOvDiffEc,
+                xBuf,
+                yBuf)) {
+            return false;
+        }
+        if (!verifySingleWindow(
+                reads,
+                tIntervalEndInclusive - HifiasmWindow + 1,
+                tIntervalEndInclusive,
+                ys,
+                xs,
+                tId,
+                qId,
+                rev,
+                HifiasmMaxOvDiffEc,
+                xBuf,
+                yBuf)) {
+            return false;
+        }
+        return true;
+    }
+}
 
 // This function implements logic similar to miniasm's ma_hit_sub function.
 // It analyzes the coverage depth along a read induced by its overlaps.
@@ -59,6 +295,178 @@ void Assembler::filterLocalSegments(
     cout << timestamp << "Local segment filtering complete." << endl;
 }
 
+// ----------------------------------------------------------------------------
+// ONT Chemical Arc Masking (gen_chemical_arc_rf equivalent)
+// ----------------------------------------------------------------------------
+// Hifiasm uses this only for ONT to detect "chemical" chimeras by finding
+// low-coverage stretches along a read, using all overlaps (independent of EC/phasing).
+// We compute a per-read minimum overlap depth (after trimming flanks) and mark all
+// overlaps incident to reads with minDepth <= chemicalArcCov.
+//
+// Important: this MUST use all overlaps, not just the currently "kept" overlaps, or it
+// can artificially reduce depth and over-call chemical chimeras.
+
+void Assembler::applyOntChemicalArcMask(uint64_t threadCount)
+{
+    applyOntChemicalArcMask(chemicalArcCov, chemicalArcFlank, chemicalArcDupRate, threadCount);
+}
+
+void Assembler::applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount)
+{
+    cout << timestamp << "Applying ONT chemical arc mask..." << endl;
+
+    reads->checkReadsAreOpen();
+    checkAlignmentDataAreOpen();
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const uint64_t readCount = reads->readCount();
+
+    chemicalArcCov = chemicalCov;
+    chemicalArcFlank = chemicalFlank;
+    chemicalArcDupRate = dupRate;
+
+    // Clear any previous chemical markings but keep all other deletion reasons.
+    for (uint64_t i = 0; i < alignmentData.size(); ++i) {
+        alignmentData[i].clearDeleteReasonsBoth(AlignmentData::DeleteReasonChemical);
+    }
+
+    chemicalArcMask.assign(readCount, uint8_t(0xFF));
+
+    setupLoadBalancing(readCount, 64);
+    runThreads(&Assembler::applyOntChemicalArcMaskThreadFunction, threadCount);
+
+    uint64_t chemReadCount = 0;
+    for (uint64_t r = 0; r < chemicalArcMask.size(); ++r) {
+        if (chemicalArcMask[r] <= chemicalArcCov) {
+            ++chemReadCount;
+        }
+    }
+    cout << timestamp << "ONT chemical arc mask: " << chemReadCount << " reads flagged." << endl;
+
+    // Mirror hifiasm pass-1 symmetric deletion: delete overlaps if either endpoint is flagged.
+    if (chemReadCount) {
+        for (uint64_t alignmentId = 0; alignmentId < alignmentData.size(); ++alignmentId) {
+            AlignmentData& ad = alignmentData[alignmentId];
+            const ReadId r0 = ad.readIds[0];
+            const ReadId r1 = ad.readIds[1];
+            const bool del =
+                (r0 < chemicalArcMask.size() && chemicalArcMask[r0] <= chemicalArcCov) ||
+                (r1 < chemicalArcMask.size() && chemicalArcMask[r1] <= chemicalArcCov);
+            if (del) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonChemical);
+            }
+        }
+    }
+
+    cout << timestamp << "ONT chemical arc mask complete." << endl;
+}
+
+void Assembler::applyOntChemicalArcMaskThreadFunction(size_t /* threadId */)
+{
+    const uint64_t flank = chemicalArcFlank;
+    const uint64_t covCut = chemicalArcCov;
+    const double dupRate = chemicalArcDupRate;
+
+    std::vector<uint64_t> events;
+    events.reserve(256);
+
+    uint64_t begin, end;
+    while (getNextBatch(begin, end)) {
+        for (ReadId r = ReadId(begin); r < ReadId(end); ++r) {
+            const uint32_t len = uint32_t(reads->getReadRawSequenceLength(r));
+            events.clear();
+
+            const OrientedReadId oid(r, 0);
+            if (oid.getValue() < alignmentTable.size()) {
+                const auto& table = alignmentTable[oid.getValue()];
+                for (uint32_t alignmentId : table) {
+                    const AlignmentData& ad = alignmentData[alignmentId];
+
+                    // Use all overlaps regardless of deletion reasons (hifiasm resets del first).
+                    uint32_t qs0 = 0, qe0 = 0, os0 = 0, oe0 = 0;
+                    ReadId other = invalidReadId;
+                    if (ad.readIds[0] == r) {
+                        qs0 = ad.qs; qe0 = ad.qe;
+                        os0 = ad.ts; oe0 = ad.te;
+                        other = ad.readIds[1];
+                    } else if (ad.readIds[1] == r) {
+                        qs0 = ad.ts; qe0 = ad.te;
+                        os0 = ad.qs; oe0 = ad.qe;
+                        other = ad.readIds[0];
+                    } else {
+                        continue;
+                    }
+
+                    if (qe0 <= qs0) continue;
+
+                    uint32_t qs = qs0;
+                    uint32_t qe = qe0;
+
+                    if (qs > 0) {
+                        const uint64_t qs64 = uint64_t(qs) + flank;
+                        qs = (qs64 > uint64_t(len)) ? len : uint32_t(qs64);
+                    }
+                    if (qe < len) {
+                        qe = (qe > flank) ? uint32_t(uint64_t(qe) - flank) : 0U;
+                    }
+                    if (qe <= qs) continue;
+
+                    if (!ad.isSameStrand) {
+                        const uint32_t otherLen = uint32_t(reads->getReadRawSequenceLength(other));
+                        const uint32_t rr = (otherLen >= len) ? (otherLen - len) : (len - otherLen);
+                        if (double(rr) <= double(len) * dupRate && double(rr) <= double(otherLen) * dupRate) {
+                            const uint32_t uncoveredThis = len - (qe0 - qs0);
+                            const uint32_t uncoveredOther = otherLen - (oe0 - os0);
+                            if (double(uncoveredThis) <= double(len) * dupRate &&
+                                double(uncoveredOther) <= double(otherLen) * dupRate) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    events.push_back(uint64_t(qs) << 1);
+                    events.push_back((uint64_t(qe) << 1) | 1ULL);
+                }
+            }
+
+            std::sort(events.begin(), events.end());
+
+            int32_t dp = 0;
+            uint32_t st = 0;
+            int32_t minCov = std::numeric_limits<int32_t>::max();
+
+            for (const uint64_t ev : events) {
+                const int32_t oldDp = dp;
+                if (ev & 1ULL) {
+                    --dp;
+                } else {
+                    ++dp;
+                }
+                const uint32_t pos = uint32_t(ev >> 1);
+                if (pos > st) {
+                    if (oldDp < minCov) minCov = oldDp;
+                    st = pos;
+                }
+            }
+            if (len > st) {
+                if (dp < minCov) minCov = dp;
+            }
+            if (minCov == std::numeric_limits<int32_t>::max()) {
+                minCov = 0;
+            }
+
+            if (uint64_t(minCov) <= covCut) {
+                chemicalArcMask[r] = uint8_t(minCov);
+            } else {
+                chemicalArcMask[r] = uint8_t(0xFF);
+            }
+        }
+    }
+}
+
 void Assembler::filterLocalSegmentsThreadFunction(size_t /* threadId */)
 {
     // Minimal depth (min_dp in miniasm)
@@ -85,7 +493,8 @@ void Assembler::filterLocalSegmentsThreadFunction(size_t /* threadId */)
     // I will use a const for now to allow compilation, but add TODO.
     // OR better: I can modify the header now to add the configuration variable.
     
-    const uint64_t minDp = (this->localSegmentMinCoverage > 0) ? this->localSegmentMinCoverage : 3;
+    // Hifiasm parity (ma_hit_sub): if min_dp <= 1, keep the full read interval.
+    const uint64_t minDp = this->localSegmentMinCoverage;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
@@ -108,7 +517,9 @@ void Assembler::filterLocalSegmentsThreadFunction(size_t /* threadId */)
                 const auto& table = alignmentTable[orientedR0.getValue()];
                 for (uint32_t alignmentId : table) {
                     const auto& ad = alignmentData[alignmentId];
-                     if (ad.isDeleted()) continue; // Skip deleted
+                    // Hifiasm parity: only overlaps that are present in this read's adjacency.
+                    // A global alignment can be deleted directionally by parity EC.
+                    if (isDeletedFromReadPerspective(ad, r0)) continue;
 
                     // We use the explicit coordinates provided in AlignmentData (qs, qe, ts, te).
                     // These are assumed to be 0-based coordinates on the Forward strand of the read.
@@ -241,8 +652,9 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t /* threadId *
         for(uint64_t i=begin; i!=end; i++) {
             AlignmentData& ad = alignmentData[i];
             
-            // If already deleted, skip.
-            if(ad.isDeleted()) continue;
+            // Hifiasm parity: structural filters operate on overlaps that survived previous filters.
+            // Our equivalent of h->del==0 is keptByBothSides().
+            if(!ad.keptByBothSides()) continue;
 
             ReadId qn = ad.readIds[0];
             ReadId tn = ad.readIds[1];
@@ -257,28 +669,75 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t /* threadId *
             const auto& rt = validReadIntervals[tn];
 
             // "if any of target read and the query read has no enough coverage" -> del
-            if (rq.isDeleted || rt.isDeleted) {
-                ad.setDeleted(true);
-                continue;
-            }
+            if (rq.isDeleted || rt.isDeleted) continue;
 
             // Alias internal coords for readability matching reference code
             int32_t qs, qe, ts, te;
-            
+
+            // Hifiasm parity note:
+            // For ONT/HiFi string-graph cleaning, hifiasm uses overlap boundaries coming from
+            // the aligner/PAF (not the tip-extended "approximate" boundaries used in some
+            // seed-chain stages). If we feed tip-extended boundaries into ma_hit_cut, we can
+            // dramatically over-call containment later.
+            //
+            // In Dinara, when marker ordinals are available for this alignment we can cheaply
+            // recover non-extended overlap bounds from the first/last aligned markers and use
+            // those as the input to ma_hit_cut.
+            auto getRawBoundsIfAvailable = [&](uint32_t& outQs, uint32_t& outQe, uint32_t& outTs, uint32_t& outTe) -> bool {
+                if (!markers || !markers->isOpen()) return false;
+                const auto& d0 = ad.info.data[0];
+                const auto& d1 = ad.info.data[1];
+                if (d0.markerCount == 0 || d1.markerCount == 0) return false;
+                if (d0.firstOrdinal > d0.lastOrdinal || d1.firstOrdinal > d1.lastOrdinal) return false;
+
+                const OrientedReadId oid0(ad.readIds[0], 0);
+                const OrientedReadId oid1(ad.readIds[1], ad.isSameStrand ? 0 : 1);
+                const auto& m0 = (*markers)[oid0.getValue()];
+                const auto& m1 = (*markers)[oid1.getValue()];
+                if (d0.lastOrdinal >= m0.size() || d1.lastOrdinal >= m1.size()) return false;
+
+                const uint32_t k = uint32_t(assemblerInfo->k);
+                const uint32_t qs0 = m0[d0.firstOrdinal].position;
+                const uint32_t qe0 = m0[d0.lastOrdinal].position + k;
+
+                const uint32_t tsOriented = m1[d1.firstOrdinal].position;
+                const uint32_t teOriented = m1[d1.lastOrdinal].position + k;
+                const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(ad.readIds[1]));
+
+                uint32_t ts0 = tsOriented;
+                uint32_t te0 = teOriented;
+                if (!ad.isSameStrand) {
+                    const auto p = dinara::rcIntervalToForward(tLen, tsOriented, teOriented);
+                    ts0 = p.first;
+                    te0 = p.second;
+                }
+
+                // Basic sanity.
+                const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(ad.readIds[0]));
+                if (qs0 >= qe0 || qe0 > qLen) return false;
+                if (ts0 >= te0 || te0 > tLen) return false;
+
+                outQs = qs0; outQe = qe0; outTs = ts0; outTe = te0;
+                return true;
+            };
+
+            uint32_t rawQs = ad.qs, rawQe = ad.qe, rawTs = ad.ts, rawTe = ad.te;
+            (void)getRawBoundsIfAvailable(rawQs, rawQe, rawTs, rawTe);
+
             // Logic mirroring ma_hit_cut coordinate projection
             if (!ad.isSameStrand) { // Different Strand (p->rev)
                 // Anti-parallel projection
-                qs = (int32_t)ad.te < (int32_t)rt.end ? (int32_t)ad.qs : (int32_t)ad.qs + ((int32_t)ad.te - (int32_t)rt.end);
-                qe = (int32_t)ad.ts > (int32_t)rt.start ? (int32_t)ad.qe : (int32_t)ad.qe - ((int32_t)rt.start - (int32_t)ad.ts);
-                ts = (int32_t)ad.qe < (int32_t)rq.end ? (int32_t)ad.ts : (int32_t)ad.ts + ((int32_t)ad.qe - (int32_t)rq.end);
-                te = (int32_t)ad.qs > (int32_t)rq.start ? (int32_t)ad.te : (int32_t)ad.te - ((int32_t)rq.start - (int32_t)ad.qs);
+                qs = (int32_t)rawTe < (int32_t)rt.end ? (int32_t)rawQs : (int32_t)rawQs + ((int32_t)rawTe - (int32_t)rt.end);
+                qe = (int32_t)rawTs > (int32_t)rt.start ? (int32_t)rawQe : (int32_t)rawQe - ((int32_t)rt.start - (int32_t)rawTs);
+                ts = (int32_t)rawQe < (int32_t)rq.end ? (int32_t)rawTs : (int32_t)rawTs + ((int32_t)rawQe - (int32_t)rq.end);
+                te = (int32_t)rawQs > (int32_t)rq.start ? (int32_t)rawTe : (int32_t)rawTe - ((int32_t)rq.start - (int32_t)rawQs);
 
             } else { // Same Strand
                 // Parallel offset
-                qs = (int32_t)ad.ts > (int32_t)rt.start ? (int32_t)ad.qs : (int32_t)ad.qs + ((int32_t)rt.start - (int32_t)ad.ts);
-                qe = (int32_t)ad.te < (int32_t)rt.end ? (int32_t)ad.qe : (int32_t)ad.qe - ((int32_t)ad.te - (int32_t)rt.end);
-                ts = (int32_t)ad.qs > (int32_t)rq.start ? (int32_t)ad.ts : (int32_t)ad.ts + ((int32_t)rq.start - (int32_t)ad.qs);
-                te = (int32_t)ad.qe < (int32_t)rq.end ? (int32_t)ad.te : (int32_t)ad.te - ((int32_t)ad.qe - (int32_t)rq.end);
+                qs = (int32_t)rawTs > (int32_t)rt.start ? (int32_t)rawQs : (int32_t)rawQs + ((int32_t)rt.start - (int32_t)rawTs);
+                qe = (int32_t)rawTe < (int32_t)rt.end ? (int32_t)rawQe : (int32_t)rawQe - ((int32_t)rawTe - (int32_t)rt.end);
+                ts = (int32_t)rawQs > (int32_t)rq.start ? (int32_t)rawTs : (int32_t)rawTs + ((int32_t)rq.start - (int32_t)rawQs);
+                te = (int32_t)rawQe < (int32_t)rq.end ? (int32_t)rawTe : (int32_t)rawTe - ((int32_t)rawQe - (int32_t)rq.end);
             }
 
             // "cut by self coverage" - Strict Clip to valid bounds
@@ -305,7 +764,7 @@ void Assembler::applyCoverageCutsToAlignmentsThreadFunction(size_t /* threadId *
                 ad.ts = (uint32_t)norm_ts;
                 ad.te = (uint32_t)norm_te;
             } else {
-                ad.setDeleted(true);
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonCoverageCut);
             }
         }
     }
@@ -326,23 +785,16 @@ void Assembler::applyCoverageCutsCleanupThreadFunction(size_t /* threadId */)
             // Check neighbors
             bool hasSurvivingEdge = false;
             
-            // Check strand 0 (and strand 1 implicitly via edges)
+            // Hifiasm parity: sources[i] is a per-read adjacency, so we only count overlaps that
+            // are kept from this read's perspective.
             const auto& table = alignmentTable[OrientedReadId(r, 0).getValue()];
-            for(uint32_t alignmentId : table) {
-                if (!alignmentData[alignmentId].isDeleted()) {
-                    hasSurvivingEdge = true;
-                    break;
-                }
-            }
-            // Check strand 1 (just in case edges are partitioned, though Dinara usually links both)
-            if (!hasSurvivingEdge) {
-                const auto& table1 = alignmentTable[OrientedReadId(r, 1).getValue()];
-                for(uint32_t alignmentId : table1) {
-                    if (!alignmentData[alignmentId].isDeleted()) {
-                        hasSurvivingEdge = true;
-                        break;
-                    }
-                }
+            for (uint32_t alignmentId : table) {
+                const auto& ad = alignmentData[alignmentId];
+                if(!ad.keptByBothSides()) continue;
+                const ReadId other = (ad.readIds[0] == r) ? ad.readIds[1] : ad.readIds[0];
+                if (other < validReadIntervals.size() && validReadIntervals[other].isDeleted) continue;
+                hasSurvivingEdge = true;
+                break;
             }
 
             if (!hasSurvivingEdge) {
@@ -391,7 +843,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
         for(uint64_t i=begin; i!=end; i++) {
             AlignmentData& ad = alignmentData[i];
             
-            if(ad.isDeleted()) continue;
+            if(!ad.keptByBothSides()) continue;
 
             ReadId qn = ad.readIds[0];
             ReadId tn = ad.readIds[1];
@@ -408,10 +860,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
             } else {
                 const auto& rq = validReadIntervals[qn];
                 const auto& rt = validReadIntervals[tn];
-                if (rq.isDeleted || rt.isDeleted) {
-                    ad.setDeleted(true);
-                    continue;
-                }
+                if (rq.isDeleted || rt.isDeleted) continue;
                 ql = rq.end - rq.start;
                 tl = rt.end - rt.start;
                 // qs0 = rq.start;
@@ -427,7 +876,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
             
             // Re-check length just in case
             if (qe <= qs || te <= ts) {
-                ad.setDeleted(true);
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
                 continue;
             }
 
@@ -451,65 +900,18 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
             int32_t q3Hang = (int32_t)ql - (int32_t)qe;
             int32_t ext3 = (q3Hang < tl3) ? q3Hang : tl3;
 
-            // --- Filter Logic ---
-            // 1. Max Hang Check
-            // "if (ext5 > max_hang || ext3 > max_hang ...)"
-            bool badShape = (ext5 > (int32_t)maxHang) || (ext3 > (int32_t)maxHang);
+            const int result = ma_hit2arc_containment(
+                (int32_t)qs, (int32_t)qe, (int32_t)ql,
+                (int32_t)ts, (int32_t)te, (int32_t)tl,
+                !ad.isSameStrand,
+                (int32_t)maxHang,
+                maxHangRate,
+                (int32_t)minOvlp
+            );
 
-            if (!badShape) {
-                // 2. Hang Rate Check
-                // "|| h->qe - qs < (h->qe - qs + ext5 + ext3) * int_frac"
-                // "|| h->te - h->ts < (h->te - h->ts + ext5 + ext3) * int_frac"
-                // Check both query and target overlap ratio? 
-                // Reference checks OR, so if EITHER side is too short relative to total, fail.
-                
-                int32_t qOvlp = (int32_t)qe - (int32_t)qs;
-                int32_t tOvlp = (int32_t)te - (int32_t)ts;
-                int32_t totalSpanQ = qOvlp + ext5 + ext3;
-                int32_t totalSpanT = tOvlp + ext5 + ext3; // ext used for both? yes per miniasm logic
-
-                if (qOvlp < (totalSpanQ * maxHangRate) || tOvlp < (totalSpanT * maxHangRate)) {
-                    badShape = true;
-                }
-            }
-            
-            // 3. Min Overlap Check (using extended spans or core?)
-            // "if ((int)h->qe - qs + ext5 + ext3 < min_ovlp ...)"
-            // Checks extended length?
-            if (!badShape) {
-                 int32_t qOvlp = (int32_t)qe - (int32_t)qs;
-                 int32_t tOvlp = (int32_t)te - (int32_t)ts;
-                 if ((qOvlp + ext5 + ext3 < (int32_t)minOvlp) || (tOvlp + ext5 + ext3 < (int32_t)minOvlp)) {
-                     // return MA_HT_SHORT_OVLP -> Fail
-                     badShape = true;
-                 }
-            }
-            
-            // 4. Containment Classification (Hifiasm ma_hit_flt Parity)
-            // Hifiasm ma_hit_flt: "if (r < 0 || r == MA_HT_QCONT || r == MA_HT_TCONT)" -> Delete.
-            // Contained reads must be deleted here as edges. 
-            // ma_hit2arc checks containment if badShape is false? No, it checks containment explicitly.
-            
-            bool isQCont = false;
-            bool isTCont = false;
-            
-            // Query contained in Target
-            // qs <= tl5 (Left fits) AND (ql - qe) <= tl3 (Right fits)
-            if ((int32_t)qs <= tl5 && ((int32_t)ql - (int32_t)qe) <= tl3) {
-                isQCont = true;
-            }
-            // Target contained in Query
-            // qs >= tl5 (Left extended) AND (ql - qe) >= tl3 (Right extended)
-            if ((int32_t)qs >= tl5 && ((int32_t)ql - (int32_t)qe) >= tl3) {
-                isTCont = true;
-            }
-            
-            if (isQCont || isTCont) {
-                badShape = true;
-            }
-            
-            if (badShape) {
-                ad.setDeleted(true);
+            // Hifiasm parity (Overlaps.cpp:1898): keep dovetails and containments; delete INT/SHORT.
+            if (result < 0) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
             }
         }
     }
@@ -525,160 +927,169 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t /* threadId */)
 void Assembler::detectChimericReads(uint64_t threadCount)
 {
     cout << timestamp << "Detecting chimeric reads..." << endl;
-    
-    // Resize the chimeric flag vector
-    isChimericRead.createNew(largeDataName("IsChimericRead"), largeDataPageSize);
-    isChimericRead.resize(reads->readCount());
-    std::fill(isChimericRead.begin(), isChimericRead.end(), false);
 
-    // Access necessary data
     reads->checkReadsAreOpen();
     checkAlignmentDataAreOpen();
-    
-    // Ensure alignmentTable is accessible
-    if (!alignmentTable.isOpen()) {
-        alignmentTable.accessExistingReadOnly(largeDataName("AlignmentTable"));
-    }
 
-    const uint64_t batchSize = 1;
-    setupLoadBalancing(reads->readCount(), batchSize);
+    const uint64_t readCount = reads->readCount();
+
+    if (!isChimericRead.isOpen) {
+        isChimericRead.createNew(largeDataName("IsChimericRead"), largeDataPageSize);
+        isChimericRead.resize(readCount);
+    }
+    std::fill(isChimericRead.begin(), isChimericRead.end(), false);
+
+    // Thread-safe temp storage (MemoryMapped::Vector<bool> is bit-packed).
+    chimericReadTmp.assign(readCount, 0);
+
+    setupLoadBalancing(readCount, 64);
     runThreads(&Assembler::detectChimericReadsThreadFunction, threadCount);
 
-    // Count chimeric reads and mark them as deleted in validReadIntervals
+    // Apply deletions serially (hifiasm delete_all_edges equivalent).
     uint64_t chimericCount = 0;
-    for(size_t i=0; i<isChimericRead.size(); i++) {
-        if(isChimericRead[i]) {
-            chimericCount++;
-            // IMPORTANT: Propagate status to validReadIntervals for downstream filtering
-            if (i < validReadIntervals.size()) {
-                validReadIntervals[i].isDeleted = true;
-            }
+    for (ReadId r = 0; r < readCount; ++r) {
+        if (!chimericReadTmp[r]) continue;
+        ++chimericCount;
+        isChimericRead[r] = true;
+        if (r < validReadIntervals.size()) {
+            validReadIntervals[r].isDeleted = true;
         }
     }
-    cout << timestamp << "Detected " << chimericCount << " chimeric reads." << endl;
-    if (chimericCount > 0) {
-        cout << timestamp << "  -> Marked these reads as deleted in validReadIntervals." << endl;
+
+    if (chimericCount) {
+        for (uint64_t alignmentId = 0; alignmentId < alignmentData.size(); ++alignmentId) {
+            AlignmentData& ad = alignmentData[alignmentId];
+            const ReadId r0 = ad.readIds[0];
+            const ReadId r1 = ad.readIds[1];
+            if (r0 < readCount && chimericReadTmp[r0]) { ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonChimeric); continue; }
+            if (r1 < readCount && chimericReadTmp[r1]) { ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonChimeric); continue; }
+        }
     }
+
+    cout << timestamp << "Detected " << chimericCount << " chimeric reads." << endl;
 }
 
 void Assembler::detectChimericReadsThreadFunction(size_t /* threadId */)
 {
-    // Hifiasm Parity Implementation (detect_chimeric_reads: Overlaps.cpp:2449)
-    
-    // Struct to hold max_left / max_right intervals
+    // Hifiasm parity (Overlaps.cpp:2449 detect_chimeric_reads).
+    // Called after ma_hit_sub and before ma_hit_cut: coordinates are still absolute.
+    constexpr double shiftRate = 0.06;   // asm_opt.max_ov_diff_final * 2.0, default 0.03 * 2
+    constexpr float overlapRate = 0.1f;  // collect_contain overlap_rate
+
     struct SubRegion { uint32_t s, e; };
+    std::vector<char> xBuf;
+    std::vector<char> yBuf;
 
-    uint64_t start, end;
-    while(getNextBatch(start, end)) {
-        for(ReadId readId = ReadId(start); readId < ReadId(end); readId++) {
-            
-            uint64_t rLen = reads->getReadRawSequenceLength(readId);
-            OrientedReadId oid(readId, 0);
-
-            // Access alignments
+    uint64_t begin, end;
+    while (getNextBatch(begin, end)) {
+        for (ReadId qId = ReadId(begin); qId < ReadId(end); ++qId) {
+            const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qId));
+            const OrientedReadId oid(qId, 0);
             if (oid.getValue() >= alignmentTable.size()) continue;
-            auto alignments = alignmentTable[oid.getValue()];
-            
-            SubRegion max_left = { (uint32_t)rLen, 0 };
-            SubRegion max_right = { (uint32_t)rLen, 0 };
-            
-            // --- 1. collect_sides ---
-            // "if(qs == 0) update max_left; if(qe == rLen) update max_right"
-            // Hifiasm uses strict 0/rLen. 
-            // In Dinara, marker coordinates might start at offset > 0 (e.g. k-mer position).
-            // To achieve result parity (detecting ~1300 chimeras), we use a tolerance.
-            const uint32_t tipTolerance = 500;
 
-            for (uint32_t alignmentId : alignments) {
+            SubRegion maxLeft{qLen, 0};
+            SubRegion maxRight{qLen, 0};
+
+            // 1) collect_sides: anchors that touch the read ends exactly.
+            const auto& table = alignmentTable[oid.getValue()];
+            for (uint32_t alignmentId : table) {
                 const AlignmentData& ad = alignmentData[alignmentId];
                 if (ad.isDeleted()) continue;
-                
-                // Get coords on readId
+                if (isDeletedFromReadPerspective(ad, qId)) continue;
+
                 uint32_t qs, qe;
-                if (ad.readIds[0] == readId) { qs = ad.qs; qe = ad.qe; }
+                if (ad.readIds[0] == qId) { qs = ad.qs; qe = ad.qe; }
                 else { qs = ad.ts; qe = ad.te; }
 
-                // Check Left Anchor (qs ~ 0)
-                if (qs <= tipTolerance) {
-                    if (qs < max_left.s) max_left.s = qs;
-                    if (qe > max_left.e) max_left.e = qe;
+                if (qs == 0) {
+                    if (qs < maxLeft.s) maxLeft.s = qs;
+                    if (qe > maxLeft.e) maxLeft.e = qe;
                 }
-                
-                // Check Right Anchor (qe ~ rLen)
-                if (qe >= (uint32_t)rLen - tipTolerance) {
-                    if (qs < max_right.s) max_right.s = qs;
-                    if (qe > max_right.e) max_right.e = qe;
+                if (qe == qLen) {
+                    if (qs < maxRight.s) maxRight.s = qs;
+                    if (qe > maxRight.e) maxRight.e = qe;
                 }
             }
-            
-            // "if(max_left.s == rLen || max_right.s == rLen) continue;"
-            // Means we didn't find any left anchor or any right anchor.
-            // Hifiasm treats these as "End Nodes" and does not flag them as chimeric.
-            if (max_left.s == (uint32_t)rLen || max_right.s == (uint32_t)rLen) {
-                continue;
-            }
-            
-            // --- 2. collect_contain ---
-            // Extend max_left.e and max_right.s using overlaps contained within them.
-            // Hifiasm: "if(qs < max_left.e && qe > max_left.e && max_left.e - qs > (overlap_rate * (qe -qs)))"
-            float overlap_rate = 0.1f;
-            uint32_t new_left_e = max_left.e;
-            uint32_t new_right_s = max_right.s;
-            
-            for (uint32_t alignmentId : alignments) {
+
+            // End node: missing one of the two anchors.
+            if (maxLeft.s == qLen || maxRight.s == qLen) continue;
+
+            // 2) collect_contain: extend anchors with contained overlaps.
+            uint32_t newLeftE = maxLeft.e;
+            uint32_t newRightS = maxRight.s;
+            for (uint32_t alignmentId : table) {
                 const AlignmentData& ad = alignmentData[alignmentId];
                 if (ad.isDeleted()) continue;
-                
+                if (isDeletedFromReadPerspective(ad, qId)) continue;
+
                 uint32_t qs, qe;
-                if (ad.readIds[0] == readId) { qs = ad.qs; qe = ad.qe; }
+                if (ad.readIds[0] == qId) { qs = ad.qs; qe = ad.qe; }
                 else { qs = ad.ts; qe = ad.te; }
 
-                if (qs != 0 && qe != (uint32_t)rLen) {
-                    // Contained overlap extension for Left
-                    if (qs < max_left.e && qe > max_left.e) {
-                         uint32_t len = qe - qs;
-                         if (len > 0 && (max_left.e - qs) > (uint32_t)(overlap_rate * (float)len)) {
-                             if (qe > new_left_e) new_left_e = qe;
-                         }
+                if (qs == 0 || qe == qLen) continue;
+                const uint32_t len = qe - qs;
+                if (len == 0) continue;
+
+                if (qs < maxLeft.e && qe > maxLeft.e) {
+                    if ((maxLeft.e - qs) > uint32_t(overlapRate * float(len))) {
+                        if (qe > maxLeft.e && qe > newLeftE) newLeftE = qe;
                     }
-                    // Contained overlap extension for Right
-                    if (qs < max_right.s && qe > max_right.s) {
-                        uint32_t len = qe - qs;
-                        if (len > 0 && (qe - max_right.s) > (uint32_t)(overlap_rate * (float)len)) {
-                            if (qs < new_right_s) new_right_s = qs;
-                        }
+                }
+                if (qs < maxRight.s && qe > maxRight.s) {
+                    if ((qe - maxRight.s) > uint32_t(overlapRate * float(len))) {
+                        if (qs < maxRight.s && qs < newRightS) newRightS = qs;
                     }
                 }
             }
-            max_left.e = new_left_e;
-            max_right.s = new_right_s;
-            
-            // --- 3. Check for Overlap ---
-            // "if (max_left.e > max_right.s && (max_left.e - max_right.s >= rLen * shift_rate)) continue;"
-            // If they overlap sufficiently, it's a good read.
-            // We assume shift_rate=0 for basic check.
-            if (max_left.e > max_right.s) {
+            maxLeft.e = newLeftE;
+            maxRight.s = newRightS;
+
+            // 3) shift-rate overlap check.
+            if (maxLeft.e > maxRight.s && (maxLeft.e - maxRight.s) >= uint32_t(double(qLen) * shiftRate)) {
                 continue;
             }
-            
-            // --- 4. Chimeric Flagging ---
-            // If we are here, max_left.e <= max_right.s (Gap Exists or barely touch).
-            // Hifiasm performs expensive "intersection_check" here.
-            // For structural parity, we flag as chimeric if the gap is not bridged.
-            // If the anchors don't meet, and no contained reads bridged them (step 2), then it's chimeric.
-            
-            isChimericRead[readId] = true;
-            validReadIntervals[readId].isDeleted = true;
 
-            // Immediate Edge Deletion (Hifiasm Parity: delete_all_edges)
-            // Iterate over ALL edges of this read (Strand 0 and Strand 1) and mark them deleted.
-            for (int strand=0; strand<2; strand++) {
-                OrientedReadId oid(readId, strand);
-                if (oid.getValue() < alignmentTable.size()) {
-                    for(uint32_t alignmentId : alignmentTable[oid.getValue()]) {
-                        alignmentData[alignmentId].setDeleted(true);
+            // 4) simple chimera: uncovered gap.
+            if (maxLeft.e <= maxRight.s) {
+                chimericReadTmp[qId] = 1;
+                continue;
+            }
+
+            // 5) complex chimera: small overlap; verify by base-level window checks.
+            const uint32_t intervalS = maxRight.s;
+            const uint32_t intervalE = maxLeft.e;
+
+            bool isChimeric = false;
+            for (uint32_t alignmentId : table) {
+                const AlignmentData& ad = alignmentData[alignmentId];
+                if (ad.isDeleted()) continue;
+                if (isDeletedFromReadPerspective(ad, qId)) continue;
+
+                ReadId tId;
+                uint32_t qs, qe, ts, te;
+                bool rev;
+                if (ad.readIds[0] == qId) {
+                    tId = ad.readIds[1];
+                    qs = ad.qs; qe = ad.qe;
+                    ts = ad.ts; te = ad.te;
+                    rev = !ad.isSameStrand;
+                } else {
+                    tId = ad.readIds[0];
+                    qs = ad.ts; qe = ad.te;
+                    ts = ad.qs; te = ad.qe;
+                    rev = !ad.isSameStrand;
+                }
+
+                if (qs <= intervalS && qe >= intervalE) {
+                    if (!boundaryVerify(*reads, intervalS, intervalE, qId, tId, qs, ts, te, rev, xBuf, yBuf)) {
+                        isChimeric = true;
+                        break;
                     }
                 }
+            }
+
+            if (isChimeric) {
+                chimericReadTmp[qId] = 1;
             }
         }
     }
@@ -865,7 +1276,7 @@ void Assembler::rescueChimericReadsThreadFunction(size_t /* threadId */)
                         }
                         
                         if (!keep) {
-                            ad.setDeleted(true);
+                            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonChimeric);
                         }
                     }
                 }
@@ -932,7 +1343,7 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t /* threadId */)
                 const AlignmentData& ad = alignmentData[alignmentId];
                 
                 // Check for directional conflict: exactly one flag set
-                bool hasConflict = (ad.isDeleted0 != ad.isDeleted1);
+                bool hasConflict = (ad.isDeleted0() != ad.isDeleted1());
                 if (!hasConflict) continue;
                 
                 // For this read's perspective, check which flag corresponds to this read
@@ -942,11 +1353,11 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t /* threadId */)
                 if (ad.readIds[0] == readId) {
                     qs = ad.qs;
                     qe = ad.qe;
-                    thisReadDeleted = ad.isDeleted0; // This read's decision
+                    thisReadDeleted = ad.isDeleted0(); // This read's decision
                 } else {
                     qs = ad.ts;
                     qe = ad.te;
-                    thisReadDeleted = ad.isDeleted1; // This read's decision
+                    thisReadDeleted = ad.isDeleted1(); // This read's decision
                 }
                 
                 // We want to rescue overlaps where THIS read said "delete" but other said "keep"
@@ -1004,13 +1415,7 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t /* threadId */)
                     // Only rescue if this overlap spans the consensus region
                     if (qs <= max_interval_s && qe >= max_interval_e) {
                         AlignmentData& ad = alignmentData[alignmentId];
-                        
-                        // Clear the flag for this read's direction
-                        if (ad.readIds[0] == readId) {
-                            ad.isDeleted0 = false;
-                        } else {
-                            ad.isDeleted1 = false;
-                        }
+                        ad.clearDeleteReasonsFromReadPerspective(readId, AlignmentData::DeleteReasonPhase);
                     }
                 }
             }
@@ -1271,7 +1676,7 @@ void Assembler::detectChimericReadsFromAnchorsThreadFunction(size_t /* threadId 
                          // Race condition if someone reads it.
                          // Standard for this codebase: marking reads is preferred.
                          // But user asked to mirror delete_all_edges.
-                         alignmentData[alignmentId].setDeleted(true);
+                        alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonChimeric);
                      }
                 };
                 deleteEdges(OrientedReadId(r0, 0));
@@ -1361,240 +1766,119 @@ static int ma_hit2arc_containment(
 }
 
 
-void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t /* threadCount */)
+void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
-    cout << timestamp << "Removing contained reads (ma_hit_contained_advance) - Serial Execution for Strict Parity..." << endl;
-    
+    cout << timestamp << "Removing contained reads (ma_hit_contained_advance equivalent)..." << endl;
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
     if (!containmentParent->isOpen) {
         containmentParent->createNew(largeDataName("ContainmentParent"), largeDataPageSize);
         containmentParent->resize(reads->readCount());
-        std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
     }
+    std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
 
-    uint64_t containedCount = 0;
-    
-    // Hifiasm Iterates Reads Serially (Overlaps.cpp:1794)
-    for(ReadId i=0; i<reads->readCount(); i++) {
-        if (validReadIntervals[i].isDeleted) continue;
-        
-        // Iterate alignments for Read i (Strand 0)
-        // Hifiasm iterates sources[i] which contains all overlaps for i.
-        OrientedReadId oid(i, 0);
+    uint64_t containedReadCount = 0;
+
+    const uint64_t readCount = reads->readCount();
+    for (ReadId qn = 0; qn < readCount; ++qn) {
+        if (qn >= validReadIntervals.size() || validReadIntervals[qn].isDeleted) continue;
+
+        const auto& vrQ = validReadIntervals[qn];
+        const int32_t ql = int32_t(vrQ.end - vrQ.start);
+        if (ql <= 0) continue;
+
+        const OrientedReadId oid(qn, 0);
         if (oid.getValue() >= alignmentTable.size()) continue;
-        
-        const auto& table = alignmentTable[oid.getValue()];
-        for(uint32_t alignmentId : table) {
-             AlignmentData& ad = alignmentData[alignmentId];
-             
-             // "if(h->del) continue;"
-             if (ad.isDeleted()) continue;
-             
-             // Identify Query (i) and Target (neighbor)
-             ReadId qn = i;
-             ReadId tn;
-             int32_t qs, qe, ts, te;
-             bool isReverse = !ad.isSameStrand;
-             
-             // Determine usage of coordinates based on who is Query
-             // AlignmentData stores [readId0, readId1].
-             // Coordinates are [qs, qe] for r0, [ts, te] for r1.
-             if (ad.readIds[0] == i) {
-                 tn = ad.readIds[1];
-                 qs = (int32_t)ad.qs; qe = (int32_t)ad.qe;
-                 ts = (int32_t)ad.ts; te = (int32_t)ad.te;
-             } else {
-                 tn = ad.readIds[0];
-                 // If i is r1 (Target in AD), then for THIS check, i is Query.
-                 // So we must SWAP the roles of Q and T coordinates from AD perspective.
-                 // "qs" for this check (on Read i) comes from ad.ts/te.
-                 // "ts" for this check (on Read tn) comes from ad.qs/qe.
-                 qs = (int32_t)ad.ts; qe = (int32_t)ad.te;
-                 ts = (int32_t)ad.qs; te = (int32_t)ad.qe;
-             }
-             
-             // "if(sq->del || st->del) continue;"
-             if (validReadIntervals[tn].isDeleted) continue;
 
-             const auto& vrQ = validReadIntervals[qn];
-             const auto& vrT = validReadIntervals[tn];
-             int32_t ql = (int32_t)(vrQ.end - vrQ.start);
-             int32_t tl = (int32_t)(vrT.end - vrT.start);
-             
-             // Call Hifiasm Logic Helper
-             // Note: qs/qe/ts/te are already normalized by applyCoverageCuts (Step 3).
-             // Matches Hifiasm expectation of being relative to valid region.
-             
-             int result = ma_hit2arc_containment(
+        const auto& table = alignmentTable[oid.getValue()];
+        for (uint32_t alignmentId : table) {
+            const AlignmentData& ad = alignmentData[alignmentId];
+            // Hifiasm parity: contained-read logic runs only on overlaps that survived prior filters (h->del==0).
+            if(!ad.keptByBothSides()) continue;
+
+            const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
+            if (tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
+
+            const auto& vrT = validReadIntervals[tn];
+            const int32_t tl = int32_t(vrT.end - vrT.start);
+            if (tl <= 0) continue;
+
+            // Build the overlap record from qn's perspective (equivalent to sources[qn].buffer[j]).
+            // Parity with hifiasm set_reverse_overlap: swap query/target intervals without
+            // additional coordinate transforms (coordinates are always in each read's forward frame).
+            const bool rev = !ad.isSameStrand;
+            int32_t qs = 0, qe = 0, ts = 0, te = 0;
+            if (ad.readIds[0] == qn) {
+                qs = int32_t(ad.qs);
+                qe = int32_t(ad.qe);
+                ts = int32_t(ad.ts);
+                te = int32_t(ad.te);
+            } else {
+                // qn is readIds[1].
+                qs = int32_t(ad.ts);
+                qe = int32_t(ad.te);
+                ts = int32_t(ad.qs);
+                te = int32_t(ad.qe);
+            }
+            if (qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
+            if (qs >= qe || ts >= te) continue;
+            if (qs > ql || qe > ql || ts > tl || te > tl) continue;
+
+            const int result = ma_hit2arc_containment(
                 qs, qe, ql,
                 ts, te, tl,
-                isReverse,
-                (int32_t)maxHang,
+                rev,
+                int32_t(maxHang),
                 maxHangRate,
-                (int32_t)minOverlapLength
+                int32_t(minOverlapLength)
             );
-            
-            if (result == 1) { // MA_HT_QCONT: Query (i) contained in Target (tn)
-                // "delete_all_edges(qn)" -> Mark read deleted implies all edges invalid
-                // We mark read as deleted immediately.
+
+            if (result == 1) {
+                // Query read is contained in target.
                 validReadIntervals[qn].isDeleted = true;
-                
-                // "set_R_to_U" -> Record containment
                 (*containmentParent)[qn] = tn;
-                containedCount++;
-                
-                // Break inner loop? Hifiasm does NOT break inner loop immediately?
-                // `delete_all_edges` clears the buffer?
-                // If we delete all edges, checking further overlaps for `i` is pointless?
-                // Hifiasm `delete_all_edges(sources... i)`. It sets `p->del=1` for all overlaps in `sources[i]`.
-                // So yes, we should stop processing `i`.
-                break; 
-                
-            } else if (result == 2) { // MA_HT_TCONT: Target (tn) contained in Query (i)
-                // Mark target deleted
+                ++containedReadCount;
+                break;
+            } else if (result == 2) {
+                // Target read is contained in query.
                 validReadIntervals[tn].isDeleted = true;
                 (*containmentParent)[tn] = qn;
-                containedCount++;
-                
-                // Note: We do NOT break here, because Query `i` is still alive and might contain others.
+                ++containedReadCount;
             }
         }
     }
-    
-    // Transitive Reduction of Containment Tree & Cleanup (Parity: transfor_R_to_U)
-    cout << timestamp << "Transitive reduction..." << endl;
-    for(size_t i=0; i<containmentParent->size(); i++) {
-        if ((*containmentParent)[i] != invalidReadId) {
-            ReadId parent = (*containmentParent)[i];
-            while((*containmentParent)[parent] != invalidReadId) {
-                parent = (*containmentParent)[parent];
-            }
-            (*containmentParent)[i] = parent; // Path compression
 
-            // This corresponds to 'coverage_cut[i].del = 1'
-            validReadIntervals[i].isDeleted = true;
-            containedCount++;
+    // Parity with transfor_R_to_U: path compression to final container.
+    for (ReadId r = 0; r < readCount; ++r) {
+        if ((*containmentParent)[r] == ReadId(invalidReadId)) continue;
+        ReadId root = (*containmentParent)[r];
+        while (root != ReadId(invalidReadId) && (*containmentParent)[root] != ReadId(invalidReadId)) {
+            root = (*containmentParent)[root];
+        }
+        (*containmentParent)[r] = root;
+    }
+
+    // Remove all alignments incident to deleted reads (contained reads are deleted in validReadIntervals).
+    for (uint64_t alignmentId = 0; alignmentId < alignmentData.size(); ++alignmentId) {
+        AlignmentData& ad = alignmentData[alignmentId];
+        const ReadId r0 = ad.readIds[0];
+        const ReadId r1 = ad.readIds[1];
+        if (r0 < validReadIntervals.size() && validReadIntervals[r0].isDeleted) {
+            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
+            continue;
+        }
+        if (r1 < validReadIntervals.size() && validReadIntervals[r1].isDeleted) {
+            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
+            continue;
         }
     }
-    
-    // 2. Remove all alignments involving contained reads (Cleanup)
-    // The snippet does `delete_all_edges` immediately.
-    // We do it in a pass or rely on graph construction to respect `isDeleted`.
-    // Let's enforce it in validReadIntervals which is checked by ReadGraph5.
-    // Also, we can launch a thread pass to mark AlignmentData::isDeleted if strictly needed for other steps.
-    // For now, setting validReadIntervals::isDeleted is sufficient as ReadGraph5 checks it.
-    
-    cout << timestamp << "Identified " << containedCount << " contained reads." << endl;
+
+    // Parity with the final pass in ma_hit_contained_advance: delete reads that now have no remaining overlaps.
+    setupLoadBalancing(readCount, 1000);
+    runThreads(&Assembler::applyCoverageCutsCleanupThreadFunction, threadCount);
+
+    cout << timestamp << "Identified " << containedReadCount << " contained reads." << endl;
 }
-
-void Assembler::removeContainedReadsThreadFunction(size_t /* threadId */)
-{
-    // Exact hifiasm ma_hit_contained_advance logic
-    // Iterates over alignments and checks containment using ma_hit2arc logic
-    
-    uint64_t start, end;
-    while(getNextBatch(start, end)) {
-        for(uint64_t i = start; i < end; i++) {
-            AlignmentData& ad = alignmentData[i];
-            
-            // Skip already deleted alignments
-            if (ad.isDeleted()) continue;
-            
-            ReadId r0 = ad.readIds[0];
-            ReadId r1 = ad.readIds[1];
-            
-            // Skip if either read is already marked as deleted (coverage_cut[i].del)
-            if (validReadIntervals[r0].isDeleted || validReadIntervals[r1].isDeleted) {
-                continue;
-            }
-            
-            // Get valid region lengths (equivalent to sq->e - sq->s in hifiasm)
-            // Uses the valid regions detected by filterLocalSegments (ma_hit_sub equivalent)
-            const auto& vr0 = validReadIntervals[r0];
-            const auto& vr1 = validReadIntervals[r1];
-            int32_t ql = (int32_t)(vr0.end - vr0.start);
-            int32_t tl = (int32_t)(vr1.end - vr1.start);
-            
-            // IMPORTANT: After applyCoverageCuts, coordinates are already normalized (0-based relative to valid region)
-            // So we use them directly without subtracting vr.start again
-            int32_t qs = (int32_t)ad.qs;
-            int32_t qe = (int32_t)ad.qe;
-            int32_t ts = (int32_t)ad.ts;
-            int32_t te = (int32_t)ad.te;
-            bool isReverse = ad.isSameStrand ? false : true;  // ad.isSameStrand means forward, !isSameStrand means reverse
-
-
-            
-            // Use the exact hifiasm containment check
-            int result = ma_hit2arc_containment(
-                qs, qe, ql,
-                ts, te, tl,
-                isReverse,
-                (int32_t)this->hangingFilterMaxHang,
-                this->hangingFilterMaxHangRate,
-                (int32_t)this->hangingFilterMinOverlap
-            );
-            
-            static std::atomic<int> debugCount(0);
-            if (result == 1 && debugCount < 10) { // QCONT
-                 debugCount++;
-                 // Recalculate overhangs for debug
-                 int32_t tl5, tl3;
-                 if (isReverse) {
-                    tl5 = tl - te;
-                    tl3 = ts;
-                 } else {
-                    tl5 = ts;
-                    tl3 = tl - te;
-                 }
-                 int32_t ext5 = std::min(qs, tl5);
-                 int32_t ext3 = std::min(ql - qe, tl3);
-                 
-                 std::stringstream ss;
-                 ss << "Debug QCONT: R" << r0 << " in R" << r1 
-                    << " qs=" << qs << " qe=" << qe << " ql=" << ql 
-                    << " ts=" << ts << " te=" << te << " tl=" << tl
-                    << " tl5=" << tl5 << " tl3=" << tl3 << " ext5=" << ext5 << " ext3=" << ext3 << endl;
-                 cout << ss.str();
-            }
-            
-            if (result == 1) {
-                // MA_HT_QCONT: Query (r0) is contained in Target (r1)
-                ad.setDeleted(true);
-                
-                // delete_single_edge equivalent: delete the reverse edge from r1 to r0
-                // (This is complex to implement without the full edge structure, 
-                //  but we mark the alignment deleted which is equivalent)
-                
-                // delete_all_edges equivalent: mark all alignments involving r0 as deleted
-                for(uint32_t strand = 0; strand < 2; strand++) {
-                    OrientedReadId oid(r0, strand);
-                    for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
-                        alignmentData[otherAlignId].setDeleted(true);
-                    }
-                }
-                
-                // set_R_to_U equivalent: record containment relationship
-                (*containmentParent)[r0] = r1;
-                validReadIntervals[r0].isDeleted = true;
-                
-            } else if (result == 2) {
-                // MA_HT_TCONT: Target (r1) is contained in Query (r0)
-                ad.setDeleted(true);
-                
-                // delete_all_edges equivalent: mark all alignments involving r1 as deleted  
-                for(uint32_t strand = 0; strand < 2; strand++) {
-                    OrientedReadId oid(r1, strand);
-                    for(uint32_t otherAlignId : alignmentTable[oid.getValue()]) {
-                        alignmentData[otherAlignId].setDeleted(true);
-                    }
-                }
-                
-                // set_R_to_U equivalent: record containment relationship
-                (*containmentParent)[r1] = r0;
-                validReadIntervals[r1].isDeleted = true;
-            }
-            // result == 0 (normal dovetail), -1 (internal), -2 (short): do nothing
-        }
-    }
-}
-

@@ -273,8 +273,8 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
             thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
             thisAlignmentData.coversHetSite = false;
-            thisAlignmentData.isDeleted0 = false;
-            thisAlignmentData.isDeleted1 = false;
+            thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
+            thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
 
             // --- Populate AlignedEvidenceStore (APES/TASSD) ---
             // Evidence is stored in dual streams (Target-View and Query-View)
@@ -467,7 +467,7 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                     }
 
                     if(drop) {
-                        alignmentData[cand.alignmentId].setDeleted(true);
+                        alignmentData[cand.alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
                         localRemovedCount++;
                     } else {
                         kept.push_back(cand);
@@ -502,7 +502,7 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
 
                 // Mark self-overlaps as deleted immediately.
                 if(ad.readIds[0] == ad.readIds[1]) {
-                    alignmentData[alignmentId].setDeleted(true);
+                    alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
                     localRemovedCount++;
                     continue;
                 }

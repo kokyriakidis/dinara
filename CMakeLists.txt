@@ -64,6 +64,12 @@ if(BUILD_PYTHON_MODULE)
     add_subdirectory(PythonModule)
 endif(BUILD_PYTHON_MODULE)
 
+# Tests
+include(CTest) # defines BUILD_TESTING option and enables CTest integration
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
+
 
 # Install to the dinara-install directory.
 set(CMAKE_INSTALL_PREFIX .)
@@ -77,5 +83,4 @@ install(DIRECTORY conf DESTINATION dinara-install)
 
 # Install the docs directory.
 install(DIRECTORY docs DESTINATION dinara-install)
-
 
