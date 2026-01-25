@@ -25,6 +25,7 @@
  */
 
 #include "Assembler.hpp"
+#include "hifiasmCoordinateTransforms.hpp"
 #include "performanceLog.hpp"
 #include "OrientedReadPair.hpp"
 #include "timestamp.hpp"
@@ -627,7 +628,9 @@ private:
 
                              al.qs = fQs; al.qe = fQe;
                              if (cand.isDiff) {
-                                 al.ts = (uint32_t)readLenB - fTe - 1; al.te = (uint32_t)readLenB - fTs - 1;
+                                 const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), fTs, fTe);
+                                 al.ts = p.first;
+                                 al.te = p.second;
                                  uint32_t numMB = (uint32_t)mB.size();
                                  for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
                                  scratch.acceptedIntervalsDiff.push_back({qOrdS, qOrdE});

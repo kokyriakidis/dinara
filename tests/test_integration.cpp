@@ -351,6 +351,17 @@ std::string reverseComplement(const std::string& seq) {
     return rc;
 }
 
+namespace dinara::hifiasmEcTestHooks {
+    int64_t scoreLinkStrict(
+        const std::vector<uint64_t>& flatBits,
+        const std::vector<uint64_t>& flatAnyBits,
+        size_t siteI,
+        size_t siteJ,
+        size_t nWords);
+    void resetDpSameSiteComparisons();
+    uint64_t getDpSameSiteComparisons();
+}
+
 // =============================================================================
 // HELPER: Toggle base (for SNPs)
 // =============================================================================
@@ -644,6 +655,273 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     CHECK(s1_03[0].first == 1500);
     CHECK(s0_03[0].second == complementBase[expectedQ03]);
     CHECK(s1_03[0].second == expectedT03);
+}
+
+TEST_CASE("Integration: ma_hit_flt keeps contained overlaps", "[integration][hifiasm][filter]") {
+    AssemblerIntegrationFixture fixture;
+
+    // 3 reads: 0 is contained in 1, and 2 has an internal overlap to 1.
+    fixture.createFastq({randomSequence(1000, 1), randomSequence(1500, 2), randomSequence(1000, 3)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(2);
+
+        // Alignment 0: QCONT (query read 0 is fully contained in target read 1).
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 1000;
+            ad.ts = 250; ad.te = 1250;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+
+        // Alignment 1: internal match (should be removed by ma_hit_flt).
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(2), ReadId(1), true), info);
+            ad.qs = 200; ad.qe = 800;   // internal on query
+            ad.ts = 100; ad.te = 700;   // internal on target
+            fixture.assembler->alignmentData[1] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+    });
+
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted());
+    CHECK(fixture.assembler->alignmentData[1].isDeleted());
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons0 & AlignmentData::DeleteReasonHanging) != 0);
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons1 & AlignmentData::DeleteReasonHanging) != 0);
+}
+
+TEST_CASE("Integration: ma_hit_cut skips deleted endpoints", "[integration][hifiasm][filter]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 11), randomSequence(1000, 12)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        ad.qs = 0; ad.qe = 1000;
+        ad.ts = 0; ad.te = 1000;
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        // With min_dp=2, a single overlap yields depth 1, so both reads get deleted in ma_hit_sub.
+        fixture.assembler->filterLocalSegments(2, 1);
+
+        // Hifiasm parity: ma_hit_cut skips overlaps if either endpoint read is deleted; it does not force-delete the edge.
+        fixture.assembler->applyCoverageCuts(50, 1);
+    });
+
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted());
+    CHECK(fixture.assembler->alignmentData[0].deleteReasons0 == AlignmentData::DeleteReasonNone);
+    CHECK(fixture.assembler->alignmentData[0].deleteReasons1 == AlignmentData::DeleteReasonNone);
+}
+
+TEST_CASE("Integration: ma_hit_contained_advance does not RC-map swapped intervals", "[integration][hifiasm][filter]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 41), randomSequence(1000, 42)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        // One reverse-strand overlap. When viewed from read 1's perspective, the query/target
+        // intervals must be swapped without RC-mapping (hifiasm set_reverse_overlap parity).
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), false), info);
+            ad.qs = 0; ad.qe = 900;
+            ad.ts = 0; ad.te = 900;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+        fixture.assembler->removeContainedReads(1000, 0.8, 50, 1);
+    });
+
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted());
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons0 & AlignmentData::DeleteReasonContained) == 0);
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons1 & AlignmentData::DeleteReasonContained) == 0);
+}
+
+TEST_CASE("Integration: detect_chimeric_reads deletes edges for simple chimera", "[integration][hifiasm][filter]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 21), randomSequence(1000, 22), randomSequence(1000, 23)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // For read 0 (length 1000), create a left anchor (qs==0) and right anchor (qe==rLen),
+        // with a gap between them -> simple chimera.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 400;
+            ad.ts = 0; ad.te = 400;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(2), true), info);
+            ad.qs = 600; ad.qe = 1000;
+            ad.ts = 0; ad.te = 400;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+        // Control overlap not involving read 0.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 2;
+            AlignmentData ad(OrientedReadPair(ReadId(1), ReadId(2), true), info);
+            ad.qs = 0; ad.qe = 1000;
+            ad.ts = 0; ad.te = 1000;
+            fixture.assembler->alignmentData[2] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->detectChimericReads(1);
+    });
+
+    CHECK(fixture.assembler->alignmentData[0].isDeleted());
+    CHECK(fixture.assembler->alignmentData[1].isDeleted());
+    CHECK_FALSE(fixture.assembler->alignmentData[2].isDeleted());
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons0 & AlignmentData::DeleteReasonChimeric) != 0);
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons1 & AlignmentData::DeleteReasonChimeric) != 0);
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons0 & AlignmentData::DeleteReasonChimeric) != 0);
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons1 & AlignmentData::DeleteReasonChimeric) != 0);
+}
+
+TEST_CASE("Integration: ONT chemical arc mask deletes overlaps for low-depth reads", "[integration][hifiasm][filter][ont][chemical]") {
+    AssemblerIntegrationFixture fixture;
+
+    // 4 reads. Read 0 has two full-length overlaps (min depth >=2) => not flagged.
+    // Read 3 has two non-overlapping intervals => min depth == 0 => flagged.
+    fixture.createFastq({
+        randomSequence(2000, 31),
+        randomSequence(2000, 32),
+        randomSequence(2000, 33),
+        randomSequence(2000, 34),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(4);
+
+        // Read 0 overlaps (0,1) and (0,2) spanning the full read.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 2000;
+            ad.ts = 0; ad.te = 2000;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(2), true), info);
+            ad.qs = 0; ad.qe = 2000;
+            ad.ts = 0; ad.te = 2000;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+
+        // Read 3 has two disjoint overlaps (gap in the middle).
+        {
+            AlignmentInfo info;
+            info.alignmentId = 2;
+            AlignmentData ad(OrientedReadPair(ReadId(1), ReadId(3), true), info);
+            // Interval on read 3: [0,800)
+            ad.qs = 0; ad.qe = 2000;
+            ad.ts = 0; ad.te = 800;
+            fixture.assembler->alignmentData[2] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 3;
+            AlignmentData ad(OrientedReadPair(ReadId(2), ReadId(3), true), info);
+            // Interval on read 3: [1200,2000)
+            ad.qs = 0; ad.qe = 2000;
+            ad.ts = 1200; ad.te = 2000;
+            fixture.assembler->alignmentData[3] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        // Use a small flank and cov=1 to make the test robust on short reads.
+        fixture.assembler->applyOntChemicalArcMask(1, 0, 0.02, 1);
+    });
+
+    // Overlaps incident to read 3 are chemically deleted.
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted());
+    CHECK_FALSE(fixture.assembler->alignmentData[1].isDeleted());
+    CHECK(fixture.assembler->alignmentData[2].isDeleted());
+    CHECK(fixture.assembler->alignmentData[3].isDeleted());
+    CHECK((fixture.assembler->alignmentData[2].deleteReasons0 & AlignmentData::DeleteReasonChemical) != 0);
+    CHECK((fixture.assembler->alignmentData[2].deleteReasons1 & AlignmentData::DeleteReasonChemical) != 0);
+    CHECK((fixture.assembler->alignmentData[3].deleteReasons0 & AlignmentData::DeleteReasonChemical) != 0);
+    CHECK((fixture.assembler->alignmentData[3].deleteReasons1 & AlignmentData::DeleteReasonChemical) != 0);
+}
+
+TEST_CASE("Integration: reverse overlap coordinates do not underflow", "[integration][hifiasm][coords]") {
+    AssemblerIntegrationFixture fixture;
+
+    const std::string seq = randomSequence(5000, 4242);
+    const std::string seqRc = reverseComplement(seq);
+
+    fixture.createFastq({seq, seqRc});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    const AlignmentData* ad = findAlignmentDataPtr(fixture.assembler->alignmentData, ReadId(0), ReadId(1), false);
+    REQUIRE(ad != nullptr);
+    REQUIRE_FALSE(ad->isSameStrand);
+
+    const uint32_t len0 = uint32_t(fixture.assembler->getReads().getReadRawSequenceLength(ReadId(0)));
+    const uint32_t len1 = uint32_t(fixture.assembler->getReads().getReadRawSequenceLength(ReadId(1)));
+
+    CHECK(ad->qs <= ad->qe);
+    CHECK(ad->qe <= len0);
+    CHECK(ad->ts <= ad->te);
+    CHECK(ad->te <= len1);
 }
 
 TEST_CASE("Large Matching Regions and SNP Chaining", "[evidence][delta]") {
@@ -1130,6 +1408,427 @@ TEST_CASE("Integration: filterSecondaryAlignmentsPerReadPair removes redundant d
     const uint64_t afterActive = countPair(true);
     CHECK(afterTotal == beforeTotal);
     CHECK(afterActive == 1);
+
+    // Ensure redundant alignments are annotated as secondary on both sides.
+    uint64_t secondaryDeleted = 0;
+    uint64_t secondaryKept = 0;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        const bool isPair =
+            (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(1)) ||
+            (ad.readIds[0] == ReadId(1) && ad.readIds[1] == ReadId(0));
+        if (!isPair) continue;
+        const bool hasSecondary0 = (ad.deleteReasons0 & AlignmentData::DeleteReasonSecondary) != 0;
+        const bool hasSecondary1 = (ad.deleteReasons1 & AlignmentData::DeleteReasonSecondary) != 0;
+        if (ad.isDeleted()) {
+            CHECK(hasSecondary0);
+            CHECK(hasSecondary1);
+            ++secondaryDeleted;
+        } else if (ad.keptByBothSides()) {
+            CHECK_FALSE(hasSecondary0);
+            CHECK_FALSE(hasSecondary1);
+            ++secondaryKept;
+        }
+    }
+    CHECK(secondaryKept == 1);
+    CHECK(secondaryDeleted >= 2);
+}
+
+TEST_CASE("Integration: gen_rphase_dp skips same-site transitions", "[integration][dp][parity]") {
+    using dinara::hifiasmEcTestHooks::getDpSameSiteComparisons;
+    using dinara::hifiasmEcTestHooks::resetDpSameSiteComparisons;
+
+    resetDpSameSiteComparisons();
+
+    AssemblerIntegrationFixture fixture;
+
+    // Build a small multiallelic site on read_0 at position P:
+    // - 3 overlaps support alt=C
+    // - 3 overlaps support alt=G
+    // - 2 overlaps support ref (query base)
+    // Each alt has at least one reverse-oriented overlap to avoid strand-bias filtering.
+    std::string seq0 = randomSequence(2000, 91231);
+    const size_t P = 777;
+    seq0[P] = 'A';
+
+    auto makeVariant = [&](char altBase) {
+        std::string s = seq0;
+        s[P] = altBase;
+        return s;
+    };
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0);
+
+    // Ref-supporting overlaps.
+    seqs.push_back(seq0);
+    seqs.push_back(reverseComplement(seq0));
+
+    // Alt=C (2 forward, 1 reverse)
+    seqs.push_back(makeVariant('C'));
+    seqs.push_back(makeVariant('C'));
+    seqs.push_back(reverseComplement(makeVariant('C')));
+
+    // Alt=G (2 forward, 1 reverse)
+    seqs.push_back(makeVariant('G'));
+    seqs.push_back(makeVariant('G'));
+    seqs.push_back(reverseComplement(makeVariant('G')));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // Run parity EC to trigger gen_rphase_dp.
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    // With the same-site transition skip, the DP should never attempt to score
+    // links between different alleles of the same genomic position.
+    CHECK(getDpSameSiteComparisons() == 0);
+}
+
+TEST_CASE("Integration: comput_sc_rphase_strict requires both haplotype supports", "[integration][dp][parity][score]") {
+    using dinara::hifiasmEcTestHooks::scoreLinkStrict;
+
+    // Two sites, one 64-bit word of candidates.
+    const size_t nWords = 1;
+    const size_t nSites = 2;
+    std::vector<uint64_t> flatBits(nSites * 2 * nWords, 0);
+    std::vector<uint64_t> flatAnyBits(nSites * nWords, 0);
+
+    auto setRef = [&](size_t site, uint32_t cand) {
+        flatBits[site * 2 * nWords + 2 * 0] |= (1ULL << (cand & 63));
+    };
+    auto setAlt = [&](size_t site, uint32_t cand) {
+        flatBits[site * 2 * nWords + 2 * 0 + 1] |= (1ULL << (cand & 63));
+    };
+
+    SECTION("Missing ref-ref support => no link") {
+        // alt-alt reads (support hap1 across both)
+        setAlt(0, 2); setAlt(1, 2);
+        setAlt(0, 3); setAlt(1, 3);
+        // ref-only at site 0 (do not cover site 1)
+        setRef(0, 0);
+        setRef(0, 1);
+        // ref-only at site 1 (do not cover site 0)
+        setRef(1, 4);
+        setRef(1, 5);
+
+        CHECK(scoreLinkStrict(flatBits, flatAnyBits, 0, 1, nWords) == INT64_MIN);
+    }
+
+    SECTION("Missing alt-alt support => no link") {
+        flatBits.assign(nSites * 2 * nWords, 0);
+        // ref-ref reads (support hap0 across both)
+        setRef(0, 0); setRef(1, 0);
+        setRef(0, 1); setRef(1, 1);
+        // alt-only at site 0 (do not cover site 1)
+        setAlt(0, 2);
+        setAlt(0, 3);
+        // alt-only at site 1 (do not cover site 0)
+        setAlt(1, 4);
+        setAlt(1, 5);
+
+        CHECK(scoreLinkStrict(flatBits, flatAnyBits, 0, 1, nWords) == INT64_MIN);
+    }
+
+    SECTION("Both ref-ref and alt-alt support => link score is finite") {
+        flatBits.assign(nSites * 2 * nWords, 0);
+        // ref-ref
+        setRef(0, 0); setRef(1, 0);
+        // alt-alt
+        setAlt(0, 1); setAlt(1, 1);
+        // extra non-covering evidence at one site should not break link
+        setRef(0, 2);
+        setAlt(1, 3);
+
+        const int64_t sc = scoreLinkStrict(flatBits, flatAnyBits, 0, 1, nWords);
+        CHECK(sc != INT64_MIN);
+    }
+
+    SECTION("Third allele at only one site => link is rejected") {
+        flatBits.assign(nSites * 2 * nWords, 0);
+        flatAnyBits.assign(nSites * nWords, 0);
+
+        // Ensure both haplotype supports would exist without the third-allele issue.
+        setRef(0, 0); setRef(1, 0);
+        setAlt(0, 1); setAlt(1, 1);
+
+        // Candidate 2: "Other" at site 0, Ref at site 1 => should invalidate the entire link.
+        flatAnyBits[0] |= (1ULL << 2);
+        setRef(1, 2);
+
+        CHECK(scoreLinkStrict(flatBits, flatAnyBits, 0, 1, nWords) == INT64_MIN);
+    }
+
+    SECTION("Third allele at both sites counts as ref-ref support (rareRef)") {
+        flatBits.assign(nSites * 2 * nWords, 0);
+        flatAnyBits.assign(nSites * nWords, 0);
+
+        // Candidate 0: other at both sites => treated as ref-ref support.
+        flatAnyBits[0] |= (1ULL << 0);
+        flatAnyBits[1] |= (1ULL << 0);
+
+        // Candidate 1: alt-alt support.
+        setAlt(0, 1); setAlt(1, 1);
+
+        const int64_t sc = scoreLinkStrict(flatBits, flatAnyBits, 0, 1, nWords);
+        CHECK(sc != INT64_MIN);
+    }
+}
+
+TEST_CASE("Integration: high coveragePeak suppresses DP site retention (singleton site)", "[integration][hifiasm][ec][parity][cc]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Build exactly one informative SNP site on read_0 (singleton chain):
+    // totalCov=5 (>=5), occ_1=3, occ_0=3 (refCov=2 + query).
+    std::string seq0 = randomSequence(2000, 616161);
+    const size_t P = 777;
+    seq0[P] = 'A';
+    auto altC = [&] {
+        std::string s = seq0;
+        s[P] = 'C';
+        return s;
+    };
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0);                 // read_0 (query)
+    seqs.push_back(seq0);                 // ref overlap 1
+    seqs.push_back(reverseComplement(seq0)); // ref overlap 2 (reverse)
+    seqs.push_back(altC());               // alt overlap 1
+    seqs.push_back(altC());               // alt overlap 2
+    seqs.push_back(reverseComplement(altC())); // alt overlap 3 (reverse)
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // Force a very high coveragePeak (cc becomes very large in DP).
+    // With DP enabled, hifiasm compacts the SNP list to score==1 sites (occ_0>=cc),
+    // so this should eliminate SNP sites before trans-closure runs (no overlaps removed).
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 200;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto alignmentHasSnpAtQueryPos = [&](const AlignmentData& ad, uint32_t pos) -> bool {
+        if (ad.info.alignmentId == invalid<size_t>) return false;
+        const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(0));
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        if (!(qs <= pos && qe > pos)) return false;
+        bool found = false;
+        if (queryIsRead0) {
+            fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        } else {
+            fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        }
+        return found;
+    };
+
+    bool sawAltAtP = false;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool hasP = alignmentHasSnpAtQueryPos(ad, uint32_t(P));
+        const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        if (hasP) sawAltAtP = true;
+        CHECK_FALSE(deletedFromRead0);
+        CHECK_FALSE(ad.coversHetSite);
+    }
+    REQUIRE(sawAltAtP);
+}
+
+TEST_CASE("Integration: high coveragePeak suppresses DP site retention (chained sites)", "[integration][hifiasm][ec][parity][cc]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Two SNP sites on read_0 that form a valid DP chain (alt-alt and ref-ref support exist).
+    std::string seq0 = randomSequence(2000, 717171);
+    const size_t P1 = 500;
+    const size_t P2 = 1200;
+    seq0[P1] = 'A';
+    seq0[P2] = 'A';
+
+    auto altC2 = [&] {
+        std::string s = seq0;
+        s[P1] = 'C';
+        s[P2] = 'C';
+        return s;
+    };
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+
+    // Ref-ref overlaps (2 forward, 1 reverse)
+    seqs.push_back(seq0);
+    seqs.push_back(seq0);
+    seqs.push_back(reverseComplement(seq0));
+
+    // Alt-alt overlaps (2 forward, 1 reverse)
+    seqs.push_back(altC2());
+    seqs.push_back(altC2());
+    seqs.push_back(reverseComplement(altC2()));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // Make cc very large in DP. With DP enabled, no SNP sites survive into trans-closure.
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 200;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto alignmentHasSnpAtQueryPos = [&](const AlignmentData& ad, uint32_t pos) -> bool {
+        if (ad.info.alignmentId == invalid<size_t>) return false;
+        const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(0));
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        if (!(qs <= pos && qe > pos)) return false;
+        bool found = false;
+        if (queryIsRead0) {
+            fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        } else {
+            fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        }
+        return found;
+    };
+
+    bool sawAlt = false;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool hasP1 = alignmentHasSnpAtQueryPos(ad, uint32_t(P1));
+        const bool hasP2 = alignmentHasSnpAtQueryPos(ad, uint32_t(P2));
+        const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        if (hasP1 || hasP2) sawAlt = true;
+        CHECK_FALSE(deletedFromRead0);
+        CHECK_FALSE(ad.coversHetSite);
+    }
+    REQUIRE(sawAlt);
+}
+
+TEST_CASE("Integration: homopolymer context can suppress singleton DP sites (target HP mask)", "[integration][hifiasm][ec][parity][hpc]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Create one SNP site on read_0 at position P where:
+    // - query has 'C' (breaks a homopolymer)
+    // - alt overlaps have a 6-A homopolymer spanning P and show 'A' at P (HP-suspect)
+    // In hifiasm's DP (no-QV) path, singleton sites can be rejected if overlaps are
+    // homopolymer-suspect (is_hpc_vec behavior). This suppresses the SNP site before
+    // trans-closure runs, so no overlaps are filtered here.
+    std::string seq0 = randomSequence(2000, 818181);
+    const size_t P = 777;
+
+    // Make the region around P an A-run in the alt reads: positions [P-3, P+2] are 'A'.
+    for (int d = -3; d <= 2; ++d) {
+        seq0[size_t(int(P) + d)] = 'A';
+    }
+    // Break the run on the query at the SNP site.
+    seq0[P] = 'C';
+
+    auto altA = [&] {
+        std::string s = seq0;
+        s[P] = 'A'; // restores a 6-A run around P
+        return s;
+    };
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0);                    // read_0 query (ref base = C)
+    // Ref overlaps: 5 total so occ_0 = refCov + query >= 6 (needed for hifiasm cc cut_bd=6)
+    seqs.push_back(seq0);                    // ref overlap 1
+    seqs.push_back(reverseComplement(seq0)); // ref overlap 2 (reverse)
+    seqs.push_back(seq0);                    // ref overlap 3
+    seqs.push_back(seq0);                    // ref overlap 4
+    seqs.push_back(reverseComplement(seq0)); // ref overlap 5 (reverse)
+    // Alt overlaps (2 forward + 1 reverse) => occ_1=3, totalCov=8
+    seqs.push_back(altA());
+    seqs.push_back(altA());
+    seqs.push_back(reverseComplement(altA()));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // cc is hifiasm-style (cut_rate=0.7, cut_bd=6). For small coverage peaks it floors to 6;
+    // the extra ref overlaps above ensure the singleton passes occ_0>=cc so the HP check is exercised.
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto alignmentHasSnpAtQueryPos = [&](const AlignmentData& ad, uint32_t pos) -> bool {
+        if (ad.info.alignmentId == invalid<size_t>) return false;
+        const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(0));
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        if (!(qs <= pos && qe > pos)) return false;
+        bool found = false;
+        if (queryIsRead0) {
+            fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        } else {
+            fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                evidenceId, pos, pos + 1,
+                [&](uint32_t p, uint8_t /*b*/) { if (p == pos) found = true; }
+            );
+        }
+        return found;
+    };
+
+    bool sawAltAtP = false;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool hasP = alignmentHasSnpAtQueryPos(ad, uint32_t(P));
+        const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        if (hasP) sawAltAtP = true;
+        CHECK_FALSE(deletedFromRead0);
+        CHECK_FALSE(ad.coversHetSite);
+    }
+    REQUIRE(sawAltAtP);
 }
 
 TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch evidence for informative-site coverage", "[integration][hifiasm][ec][parity]") {
@@ -1143,10 +1842,67 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
     // and mixed orientation, to survive strict filters.
     const size_t P = 1500;
     const size_t Q = 500;
-    const std::string safeWindow = "ACGTTGCACTGATCGTACGTA"; // 21bp
-    REQUIRE(P >= 10);
-    REQUIRE(P + 10 < seq0.size());
-    seq0.replace(P - 10, safeWindow.size(), safeWindow);
+    // Ensure the region around P is NOT flagged as HP-suspect by the ONT-style
+    // hpc_mask_ff predicate (HPC_PL=12, HPC_RR=4, HPC_CC=2), otherwise the
+    // singleton is_hpc_vec step could legitimately reject the site.
+    auto ontHpcMask = [&](const std::string& s, size_t pos) -> bool {
+        const int64_t len = (int64_t)s.size();
+        const int64_t p = (int64_t)pos;
+        const int64_t hpc_len = 12;
+        const int64_t hpc_min = 4;
+        const int64_t hpc_cut = 2;
+        const int64_t e = (p + hpc_len <= len) ? (p + hpc_len) : len;
+        const int64_t beg = (p >= hpc_len) ? (p - hpc_len) : 0;
+        for (int64_t r = 1; r <= hpc_min; ++r) {
+            const int64_t rc = r * hpc_cut;
+            int64_t k;
+            // Including p, forward check
+            for (k = p + r; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            int64_t ze = k;
+            for (k = p - 1; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            int64_t zs = k + 1;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            // Excluding p, forward check
+            for (k = p + r + 1; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            ze = k; zs = p + 1;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            // Including p, reverse check
+            for (k = p - r; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            zs = k + 1;
+            for (k = p + 1; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            ze = k;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            // Excluding p, reverse check
+            for (k = p - r - 1; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            zs = k + 1; ze = p;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+        }
+        return false;
+    };
+
+    const size_t windowHalf = 30; // Must be >= HPC_PL
+    REQUIRE(P >= windowHalf);
+    REQUIRE(P + windowHalf < seq0.size());
+
+    std::string safeWindow;
+    const size_t center = windowHalf;
+    for (uint32_t attempt = 0; attempt < 5000; ++attempt) {
+        safeWindow = randomSequence(2 * windowHalf + 1, 9000 + attempt);
+        if (!ontHpcMask(safeWindow, center)) {
+            const std::string safeWindowRc = reverseComplement(safeWindow);
+            if (!ontHpcMask(safeWindowRc, safeWindowRc.size() - 1 - center)) {
+                break;
+            }
+        }
+    }
+    REQUIRE(safeWindow.size() == 2 * windowHalf + 1);
+
+    seq0.replace(P - windowHalf, safeWindow.size(), safeWindow);
+    REQUIRE_FALSE(ontHpcMask(seq0, P));
+    REQUIRE_FALSE(ontHpcMask(reverseComplement(seq0), (readLen - 1 - P)));
 
     std::string seqAlt = seq0;
     seqAlt[P] = otherBase(seqAlt[P]);
@@ -1340,4 +2096,577 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
         CHECK(alignmentHasSnpAtQueryPos(ad, uint32_t(Q)));
     }
     CHECK_FALSE(noisyHasCoversHetSite);
+}
+
+TEST_CASE("Integration: performHifiasmECParity removes trans overlaps (ALT-supporting) like hifiasm", "[integration][hifiasm][ec][parity][trans]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 2500;
+    std::string seq0 = randomSequence(readLen, 424242);
+    const size_t P = 1200;
+
+    // Ensure the region around P is NOT flagged by the ONT-style hpc_mask_ff predicate
+    // for both the reference and alternative base, and for both strands.
+    auto ontHpcMask = [&](const std::string& s, size_t pos) -> bool {
+        const int64_t len = (int64_t)s.size();
+        const int64_t p = (int64_t)pos;
+        const int64_t hpc_len = 12;
+        const int64_t hpc_min = 4;
+        const int64_t hpc_cut = 2;
+        const int64_t e = (p + hpc_len <= len) ? (p + hpc_len) : len;
+        const int64_t beg = (p >= hpc_len) ? (p - hpc_len) : 0;
+        for (int64_t r = 1; r <= hpc_min; ++r) {
+            const int64_t rc = r * hpc_cut;
+            int64_t k;
+            for (k = p + r; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            int64_t ze = k;
+            for (k = p - 1; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            int64_t zs = k + 1;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            for (k = p + r + 1; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            ze = k; zs = p + 1;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            for (k = p - r; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            zs = k + 1;
+            for (k = p + 1; (k < e) && ((k - r) >= beg) && (s[size_t(k)] == s[size_t(k - r)]); ++k) {}
+            ze = k;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+
+            for (k = p - r - 1; (k >= beg) && ((k + r) < e) && (s[size_t(k)] == s[size_t(k + r)]); --k) {}
+            zs = k + 1; ze = p;
+            if (((ze - zs) > r) && ((ze - zs) >= rc)) return true;
+        }
+        return false;
+    };
+
+    const size_t windowHalf = 30;
+    REQUIRE(P >= windowHalf);
+    REQUIRE(P + windowHalf < seq0.size());
+
+    std::string safeWindow;
+    for (uint32_t attempt = 0; attempt < 10000; ++attempt) {
+        safeWindow = randomSequence(2 * windowHalf + 1, 99000 + attempt);
+        std::string safeWindowAlt = safeWindow;
+        safeWindowAlt[windowHalf] = otherBase(safeWindowAlt[windowHalf]);
+
+        if (ontHpcMask(safeWindow, windowHalf)) continue;
+        if (ontHpcMask(safeWindowAlt, windowHalf)) continue;
+
+        const std::string rc = reverseComplement(safeWindow);
+        const std::string rcAlt = reverseComplement(safeWindowAlt);
+        const size_t rcPos = rc.size() - 1 - windowHalf;
+        if (ontHpcMask(rc, rcPos)) continue;
+        if (ontHpcMask(rcAlt, rcPos)) continue;
+        break;
+    }
+    REQUIRE(safeWindow.size() == 2 * windowHalf + 1);
+
+    seq0.replace(P - windowHalf, safeWindow.size(), safeWindow);
+    REQUIRE_FALSE(ontHpcMask(seq0, P));
+
+    std::string seqAlt = seq0;
+    seqAlt[P] = otherBase(seqAlt[P]);
+    REQUIRE_FALSE(ontHpcMask(seqAlt, P));
+
+    // Build reads:
+    // With hifiasm-parity cc (cut_bd=6), we need enough ref support so the singleton
+    // SNP can satisfy occ_0 >= 6 (refCov+query >= 6). Use 5 ref overlaps and 3 alt overlaps.
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+    const uint32_t ref1 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref2 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seq0));
+    const uint32_t ref4 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref5 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seq0));
+
+    const uint32_t alt1 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+    const uint32_t alt2 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+    const uint32_t alt3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seqAlt));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // cc is computed like hifiasm (cut_rate=0.7, cut_bd=6) from coveragePeak; for low peaks
+    // it still floors to 6, so coverage must come from overlaps (already ensured above).
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto expectDeletedFromRead0 = [&](uint32_t other, bool shouldDelete) {
+        const auto& ads = fixture.assembler->alignmentData;
+        const AlignmentData* found = nullptr;
+        for (const auto& ad : ads) {
+            const bool matchesPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(other)) ||
+                (ad.readIds[0] == ReadId(other) && ad.readIds[1] == ReadId(0));
+            if (!matchesPair) continue;
+            found = &ad;
+            break;
+        }
+        REQUIRE(found != nullptr);
+
+        const bool deletedFromRead0 = (found->readIds[0] == ReadId(0)) ? found->isDeleted0() : found->isDeleted1();
+        CHECK(deletedFromRead0 == shouldDelete);
+        CHECK(found->coversHetSite == shouldDelete); // only ALT-supporting overlaps should have mismatch evidence at P
+    };
+
+    expectDeletedFromRead0(ref1, false);
+    expectDeletedFromRead0(ref2, false);
+    expectDeletedFromRead0(ref3, false);
+    expectDeletedFromRead0(ref4, false);
+    expectDeletedFromRead0(ref5, false);
+
+    expectDeletedFromRead0(alt1, true);
+    expectDeletedFromRead0(alt2, true);
+    expectDeletedFromRead0(alt3, true);
+}
+
+TEST_CASE("Integration: performHifiasmECParity drops adjacent SNP sites like hifiasm", "[integration][hifiasm][ec][parity][adjacent]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 2500;
+    std::string seq0 = randomSequence(readLen, 515151);
+    const size_t P = 1200;
+    const size_t P2 = P + 1;
+    REQUIRE(P2 < seq0.size());
+
+    // Engineer a clean adjacent-variant pair.
+    seq0[P] = 'A';
+    seq0[P2] = 'A';
+    std::string seqAlt = seq0;
+    seqAlt[P] = 'C';
+    seqAlt[P2] = 'C';
+
+    // Build reads:
+    // With hifiasm-parity cc (cut_bd=6), ensure there is enough ref support so sites
+    // would otherwise validate (then adjacency filtering is the reason no overlaps are removed).
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+    seqs.push_back(seq0);
+    seqs.push_back(seq0);
+    seqs.push_back(reverseComplement(seq0));
+    seqs.push_back(seq0);
+    seqs.push_back(reverseComplement(seq0));
+    seqs.push_back(seqAlt);
+    seqs.push_back(seqAlt);
+    seqs.push_back(reverseComplement(seqAlt));
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    // Adjacent sites should be dropped at the HiFi overlap-marking stage, so
+    // the read becomes non-informative and no overlaps are removed.
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.isDeleted()) continue;
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        CHECK_FALSE(deletedFromRead0);
+        CHECK_FALSE(ad.coversHetSite);
+    }
+}
+
+TEST_CASE("Integration: performHifiasmECParity multi_check rescues weak sites and removes trans overlaps", "[integration][hifiasm][ec][parity][multicheck]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 1200;
+    std::string seq0 = randomSequence(readLen, 616161);
+
+    // Create many weak SNPs supported by exactly 2 ALT overlaps out of 5 total overlaps
+    // (occ_1=2, totalCov=5 => below informative threshold 3), plus 2 isolated sites
+    // that survive the multi_check +/-32bp neighbor filter.
+    std::vector<size_t> variantSites;
+    variantSites.push_back(50);   // isolated
+    variantSites.push_back(1100); // isolated
+    for (size_t p = 300; p < 610; p += 5) { // dense cluster (will be discarded by +/-32 filter)
+        variantSites.push_back(p);
+    }
+
+    for (const size_t p : variantSites) {
+        seq0[p] = 'A';
+    }
+    std::string seqAlt = seq0;
+    for (const size_t p : variantSites) {
+        seqAlt[p] = 'C';
+    }
+
+    // Reads: query + 5 ref overlaps + 2 alt overlaps = totalCov=7 at all variant sites.
+    // Ensure occ_0 = refCov + query >= 6 so DP (cc cut_bd=6) keeps these sites and
+    // multi_check can run on the DP-retained SNP list.
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+    
+    const uint32_t ref1 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref2 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seq0)); // reverse
+    const uint32_t ref4 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref5 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seq0)); // reverse
+
+    const uint32_t alt1 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+    const uint32_t alt2 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // cc is hifiasm-style (cut_bd=6), but multi_check is independent of DP validation and
+    // should still rescue repeated weak sites.
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto expectDeletedFromRead0 = [&](uint32_t other, bool shouldDelete) {
+        const auto& ads = fixture.assembler->alignmentData;
+        const AlignmentData* found = nullptr;
+        for (const auto& ad : ads) {
+            const bool matchesPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(other)) ||
+                (ad.readIds[0] == ReadId(other) && ad.readIds[1] == ReadId(0));
+            if (!matchesPair) continue;
+            found = &ad;
+            break;
+        }
+        REQUIRE(found != nullptr);
+
+        const bool deletedFromRead0 = (found->readIds[0] == ReadId(0)) ? found->isDeleted0() : found->isDeleted1();
+        CHECK(deletedFromRead0 == shouldDelete);
+    };
+
+    // Multi_check should validate weak sites and then remove ALT overlaps (TRANS).
+    expectDeletedFromRead0(ref1, false);
+    expectDeletedFromRead0(ref2, false);
+    expectDeletedFromRead0(ref3, false);
+    expectDeletedFromRead0(ref4, false);
+    expectDeletedFromRead0(ref5, false);
+    expectDeletedFromRead0(alt1, true);
+    expectDeletedFromRead0(alt2, true);
+}
+
+TEST_CASE("Integration: multi_check does not use ref support from trans overlaps", "[integration][hifiasm][ec][parity][multicheck][ciscounts]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 1600;
+    std::string seq0 = randomSequence(readLen, 717272);
+
+    // Two strong sites (X,Y) split overlaps into ALT (trans) and REF (cis).
+    const size_t X = 400;
+    const size_t Y = 450;
+    seq0[X] = 'A';
+    seq0[Y] = 'A';
+
+    // Many weak sites that are ALT only on 2 overlaps, REF on trans overlaps (3 overlaps).
+    // Globally these sites have occ_1=2 and occ_0 boosted by trans ref support; after hifiasm-style
+    // trans-closure "not real allele" decrements, occ_0 drops to 1 (query only) and these sites must
+    // NOT be rescued by multi_check.
+    std::vector<size_t> weakSites;
+    weakSites.push_back(900);   // isolated (keep outside the strong-site helper overlaps)
+    weakSites.push_back(1200);  // isolated
+    for (size_t p = 520; p < 720; p += 5) weakSites.push_back(p); // dense cluster to satisfy up=0.04
+
+    std::string seqCis = seq0;
+    for (size_t p : weakSites) {
+        seq0[p] = 'A';
+        seqCis[p] = 'C'; // ALT only on cis overlaps
+    }
+    // Ensure (X,Y) differ only on trans overlaps.
+    seqCis[X] = 'A';
+    seqCis[Y] = 'A';
+
+    std::string seqTrans = seq0;
+    seqTrans[X] = 'C'; // ALT at validated site
+    seqTrans[Y] = 'C'; // ALT at validated site
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+
+    // Add extra REF overlaps at the strong sites (X,Y) using contained prefix reads.
+    // They overlap the strong sites but do not cover the weak-site cluster (>=520),
+    // so they raise occ_0 at X/Y without contributing REF support at weak sites.
+    const size_t strongPrefixLen = 500; // covers X=400,Y=450 but excludes weakSites cluster starting at 520
+    REQUIRE(strongPrefixLen <= seq0.size());
+    const std::string seqPrefix = seq0.substr(0, strongPrefixLen);
+    seqs.push_back(seqPrefix);
+    seqs.push_back(seqPrefix);
+    seqs.push_back(reverseComplement(seqPrefix));
+
+    // Two overlaps that carry ALT at weak sites, REF at (X,Y).
+    const uint32_t cis1 = uint32_t(seqs.size()); seqs.push_back(seqCis);
+    const uint32_t cis2 = uint32_t(seqs.size()); seqs.push_back(seqCis);
+
+    // TRANS overlaps (5) - ALT at X, REF at weak sites.
+    // Having 5 trans overlaps ensures weak sites start with occ_0 = 6 (refCov+query),
+    // so they survive DP but are removed from multi_check after occ_0 decrements to 1.
+    const uint32_t tr1 = uint32_t(seqs.size()); seqs.push_back(seqTrans);
+    const uint32_t tr2 = uint32_t(seqs.size()); seqs.push_back(seqTrans);
+    const uint32_t tr3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seqTrans)); // reverse
+    const uint32_t tr4 = uint32_t(seqs.size()); seqs.push_back(seqTrans);
+    const uint32_t tr5 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seqTrans)); // reverse
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    // TRANS overlaps must be removed (due to validated site X).
+    auto deletedFromRead0 = [&](uint32_t other) -> bool {
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool matchesPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(other)) ||
+                (ad.readIds[0] == ReadId(other) && ad.readIds[1] == ReadId(0));
+            if (!matchesPair) continue;
+            return (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        }
+        REQUIRE(false);
+        return false;
+    };
+
+    CHECK_FALSE(deletedFromRead0(cis1));
+    CHECK_FALSE(deletedFromRead0(cis2));
+    CHECK(deletedFromRead0(tr1));
+    CHECK(deletedFromRead0(tr2));
+    CHECK(deletedFromRead0(tr3));
+    CHECK(deletedFromRead0(tr4));
+    CHECK(deletedFromRead0(tr5));
+}
+
+TEST_CASE("Integration: performHifiasmECParity excludes gap overlaps from SNP-site coverage", "[integration][hifiasm][ec][parity][gap][coverage]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 2200;
+    const size_t P = 1100;
+    const size_t delLen = 10;
+    REQUIRE(P + delLen < readLen);
+
+    // Build a sequence where the deleted segment (starting at P) is unique, to make
+    // gap placement deterministic. Enforce the SNP base first so uniqueness is checked
+    // against the actual sequence used for alignment.
+    std::string seq0;
+    for (uint32_t attempt = 0; attempt < 500; ++attempt) {
+        seq0 = randomSequence(readLen, 888000 + attempt);
+        seq0[P] = 'A';
+        const std::string delSeq = seq0.substr(P, delLen);
+        const size_t first = seq0.find(delSeq);
+        const size_t second = seq0.find(delSeq, first + 1);
+        if (first == P && second == std::string::npos) break;
+    }
+    REQUIRE(seq0.size() == readLen);
+    std::string seqAlt = seq0;
+    seqAlt[P] = 'C';
+
+    // One overlap has a deletion relative to the query (so the query has an insertion / gap on coverage).
+    std::string seqGap = seq0;
+    seqGap.erase(P, delLen);
+
+    // Reads:
+    // - 3 ALT overlaps (mismatch at P) => occ_1=3
+    // - 1 REF overlap
+    // - 1 GAP overlap: does NOT provide a base at P and must not count toward ref coverage.
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0);                    // read_0 query
+    seqs.push_back(seqAlt);                  // read_1 alt
+    seqs.push_back(seqAlt);                  // read_2 alt
+    seqs.push_back(seqAlt);                  // read_3 alt
+    seqs.push_back(seq0);                    // read_4 ref
+    seqs.push_back(seqGap);                  // read_5 gap (shorter)
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    // Verify we have an insertion (gap) event on the query side for the (read_0, read_5) overlap that spans P.
+    const AlignmentData* gapAd = nullptr;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        const bool matchesPair =
+            (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(5)) ||
+            (ad.readIds[0] == ReadId(5) && ad.readIds[1] == ReadId(0));
+        if (!matchesPair) continue;
+        gapAd = &ad;
+        break;
+    }
+    REQUIRE(gapAd != nullptr);
+    REQUIRE(gapAd->info.alignmentId != invalid<size_t>);
+
+    const auto& store = fixture.assembler->alignedEvidenceStore;
+    const uint32_t evidenceId = uint32_t(gapAd->info.alignmentId);
+    span<const IndelEvidence> gapIndels =
+        (gapAd->readIds[0] == ReadId(0)) ? store.getIndels1(evidenceId) : store.getIndels0(evidenceId);
+    bool spansP = false;
+    for (const auto& e : gapIndels) {
+        // In Dinara's query-coordinate indel stream, type==1 corresponds to query bases
+        // that have no aligned partner (gap in the other read), i.e. a coverage hole.
+        if (!e.isDeletion()) continue;
+        const uint32_t b = e.pos();
+        const uint32_t epos = b + e.len();
+        if (b <= P && P < epos) {
+            spansP = true;
+            break;
+        }
+    }
+    REQUIRE(spansP);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    // With correct gap-aware coverage, P is not informative and the read is non-informative,
+    // so no overlaps are deleted and none are marked as covering het sites.
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
+        const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        CHECK_FALSE(deletedFromRead0);
+        CHECK_FALSE(ad.coversHetSite);
+    }
+}
+
+TEST_CASE("Integration: performHifiasmECParity filters SV/large-indel overlaps like hifiasm", "[integration][hifiasm][ec][parity][sv]") {
+    AssemblerIntegrationFixture fixture;
+
+    const size_t readLen = 3000;
+    const size_t P = 1500;
+    const size_t delLen = 30; // >= SV_MIN_LEN (20)
+    REQUIRE(P + delLen < readLen);
+
+    // Make the deleted segment unique so the indel anchors at the intended position.
+    std::string seq0;
+    for (uint32_t attempt = 0; attempt < 500; ++attempt) {
+        seq0 = randomSequence(readLen, 991000 + attempt);
+        const std::string delSeq = seq0.substr(P, delLen);
+        const size_t first = seq0.find(delSeq);
+        const size_t second = seq0.find(delSeq, first + 1);
+        if (first == P && second == std::string::npos) break;
+    }
+    REQUIRE(seq0.size() == readLen);
+
+    // ALT allele overlaps: delete a 30bp segment (query has an insertion relative to these overlaps).
+    std::string seqAlt = seq0;
+    seqAlt.erase(P, delLen);
+
+    std::vector<std::string> seqs;
+    seqs.push_back(seq0); // read_0 query
+
+    // 3 ALT overlaps (one reverse) and 3 REF overlaps (one reverse) to satisfy strand-balance checks.
+    const uint32_t alt1 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+    const uint32_t alt2 = uint32_t(seqs.size()); seqs.push_back(seqAlt);
+    const uint32_t alt3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seqAlt)); // reverse
+
+    const uint32_t ref1 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref2 = uint32_t(seqs.size()); seqs.push_back(seq0);
+    const uint32_t ref3 = uint32_t(seqs.size()); seqs.push_back(reverseComplement(seq0)); // reverse
+
+    fixture.createFastq(seqs);
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+    fixture.buildIndex();
+    fixture.chainCandidates(0.1, 200);
+    fixture.computeAlignments();
+
+    auto requireLargeIndelEvidenceNearP = [&](uint32_t other) {
+        const AlignmentData* adPtr = nullptr;
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool matchesPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(other)) ||
+                (ad.readIds[0] == ReadId(other) && ad.readIds[1] == ReadId(0));
+            if (!matchesPair) continue;
+            adPtr = &ad;
+            break;
+        }
+        REQUIRE(adPtr != nullptr);
+        REQUIRE(adPtr->info.alignmentId != invalid<size_t>);
+
+        const auto& store = fixture.assembler->alignedEvidenceStore;
+        const uint32_t evidenceId = uint32_t(adPtr->info.alignmentId);
+        span<const IndelEvidence> indels =
+            (adPtr->readIds[0] == ReadId(0)) ? store.getIndels1(evidenceId) : store.getIndels0(evidenceId);
+
+        uint32_t sumLenInWindow = 0;
+        for (const auto& e : indels) {
+            const uint32_t pos = e.pos();
+            if (pos + 100 < P) continue;
+            if (pos > P + 100) continue;
+            sumLenInWindow += e.len();
+        }
+        CAPTURE(other);
+        CAPTURE(sumLenInWindow);
+        REQUIRE(sumLenInWindow >= delLen);
+    };
+
+    requireLargeIndelEvidenceNearP(alt1);
+    requireLargeIndelEvidenceNearP(alt2);
+    requireLargeIndelEvidenceNearP(alt3);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->performHifiasmECParity(1);
+    });
+
+    auto deletedFromRead0 = [&](uint32_t other) -> bool {
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool matchesPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(other)) ||
+                (ad.readIds[0] == ReadId(other) && ad.readIds[1] == ReadId(0));
+            if (!matchesPair) continue;
+            return (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
+        }
+        REQUIRE(false);
+        return false;
+    };
+
+    // SV allele overlaps should be filtered (trans), ref overlaps kept.
+    CHECK(deletedFromRead0(alt1));
+    CHECK(deletedFromRead0(alt2));
+    CHECK(deletedFromRead0(alt3));
+
+    CHECK_FALSE(deletedFromRead0(ref1));
+    CHECK_FALSE(deletedFromRead0(ref2));
+    CHECK_FALSE(deletedFromRead0(ref3));
 }

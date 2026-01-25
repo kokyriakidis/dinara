@@ -709,6 +709,8 @@ public:
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void applyOntChemicalArcMask(uint64_t threadCount);
+    void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
 
 private:
     // Filter local segments (coverage based) - thread function
@@ -746,10 +748,14 @@ private:
     double hangingFilterMaxHangRate = 0.8;
     uint64_t hangingFilterMinOverlap = 0;
 
+    // ONT chemical arc masking (hifiasm gen_chemical_arc_rf equivalent).
+    void applyOntChemicalArcMaskThreadFunction(size_t threadId);
+    uint64_t chemicalArcCov = 1;
+    uint64_t chemicalArcFlank = 256;
+    double chemicalArcDupRate = 0.02;
+    std::vector<uint8_t> chemicalArcMask;
 
-    // Remove contained reads (ma_hit_contained_advance equivalent) - thread function
-    void removeContainedReadsThreadFunction(size_t threadId);
-    
+
     // Mapping from contained read to its container (parent).
     // Initialized to invalidReadId.
     shared_ptr<MemoryMapped::Vector<ReadId>> containmentParent;
@@ -959,6 +965,9 @@ private:
     
     // Store reads identified as chimeric
     MemoryMapped::Vector<bool> isChimericRead;
+    // Thread-safe temporary buffer used when detecting chimeric reads in parallel.
+    // We avoid writing to MemoryMapped::Vector<bool> concurrently because it is bit-packed.
+    std::vector<uint8_t> chimericReadTmp;
 
 public:
 
@@ -1090,6 +1099,15 @@ private:
     // The order in compressedAlignments matches that in alignmentData.
 public:
     MemoryMapped::Vector<AlignmentData> alignmentData;
+#ifdef DINARA_TESTING
+public:
+    // Test-only hook: allows integration tests to construct a consistent alignmentTable
+    // from manually-populated alignmentData.
+    void computeAlignmentTableForTesting()
+    {
+        computeAlignmentTable();
+    }
+#endif
 private:
     MemoryMapped::VectorOfVectors<char, uint64_t> compressedAlignments;
 
@@ -1239,6 +1257,7 @@ public:
     // Read graph creation method 6: Uses CIGAR-based phasing (isDeleted0/isDeleted1 flags)
     // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
     void createReadGraph6();
+    void createReadGraph6(uint64_t threadCount);
     
     // Canonical per-Read overlap storage  // Convert alignmentData to OverlapIndex
     

@@ -1,16 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
 project(dinara_tests)
 
+# Repository root (works both when configuring `tests/` directly and when added
+# via `add_subdirectory(tests)` from the repo root).
+set(DINARA_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+
 # C++ dialect
 add_definitions(-std=c++23)
 
 # Debug symbols for tests
 add_definitions(-ggdb3 -O0)
 
+# Enable test-only hooks in dinara sources.
+add_definitions(-DDINARA_TESTING)
+
 # Include directories
-include_directories(${CMAKE_SOURCE_DIR}/../src)
-include_directories(${CMAKE_SOURCE_DIR}/../srcMain)
-include_directories(${CMAKE_SOURCE_DIR}/../external/catch2)
+include_directories(${DINARA_ROOT}/src)
+include_directories(${DINARA_ROOT}/srcMain)
+include_directories(${DINARA_ROOT}/external/catch2)
 
 # Figure out if we are on Intel (as opposed to ARM).
 set(X86_64 OFF)
@@ -37,8 +44,8 @@ add_library(catch_main OBJECT catch_main.cpp)
 
 # Get all dinara source files EXCEPT main.cpp
 file(GLOB DINARA_SRC_FILES 
-    ${CMAKE_SOURCE_DIR}/../src/*.cpp
-    ${CMAKE_SOURCE_DIR}/../srcMain/*.cpp
+    ${DINARA_ROOT}/src/*.cpp
+    ${DINARA_ROOT}/srcMain/*.cpp
 )
 # Remove main.cpp (it has its own main())
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*main\\.cpp$")
@@ -49,6 +56,7 @@ find_library(POASTA_LIB poasta_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SHASTA2_LIB shasta2 PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(ABPOA_LIB abpoa PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_package(ZLIB REQUIRED)
 
 # Integration test executable
 add_executable(test_integration
@@ -65,11 +73,25 @@ add_custom_command(TARGET test_integration POST_BUILD
 )
 
 # Link all required libraries
-target_link_libraries(test_integration
-    atomic boost_system boost_program_options boost_chrono boost_serialization 
-    spoa png z lapack blas gfortran z m pthread
-    ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB}
-)
+if(APPLE)
+    target_link_libraries(test_integration
+        atomic boost_system boost_program_options boost_chrono boost_serialization
+        spoa png lapack blas gfortran m pthread
+        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
+        ZLIB::ZLIB
+    )
+else()
+    # Most of our dependencies are static .a libraries, so we need either strict
+    # ordering or a link group to resolve transitive symbols.
+    target_link_libraries(test_integration
+        atomic boost_system boost_program_options boost_chrono boost_serialization
+        spoa png lapack blas gfortran m pthread
+        -Wl,--start-group
+        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
+        ZLIB::ZLIB
+        -Wl,--end-group
+    )
+endif()
 
 # Ensure the test binary uses the same curated Dinara dependency builds at runtime.
 set_target_properties(test_integration PROPERTIES

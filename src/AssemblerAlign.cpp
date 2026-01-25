@@ -3,6 +3,7 @@
 
 // Dinara.
 #include "Assembler.hpp"
+#include "hifiasmCoordinateTransforms.hpp"
 #include "Alignment.hpp"
 #include "AlignmentGraph.hpp"
 #include "Align4.hpp"
@@ -1068,14 +1069,11 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 // --- Convert target coordinates to FORWARD STRAND (hifiasm convention) ---
                 // When isSameStrand=false (reverse), the ts/te are on the reverse-complement strand.
                 // We need to flip them to represent positions on the forward strand.
-                // Hifiasm formula (Hash_Table.cpp:403-410):
-                //   x_pos_s = xLen - x_pos_e - 1
-                //   y_pos_s = yLen - y_pos_e - 1
                 if (!candidate.isSameStrand) {
-                    // Convert from reverse strand coords to forward strand coords
-                    // Hifiasm uses closed coordinates: x_pos_s = xLen - x_pos_e - 1
-                    thisAlignmentData.ts = (uint32_t)len1 - te_ext - 1;
-                    thisAlignmentData.te = (uint32_t)len1 - ts_ext - 1;
+                    // Convert reverse-complement half-open interval [ts_ext, te_ext) to forward [ts, te).
+                    const auto p = dinara::rcIntervalToForward(uint32_t(len1), ts_ext, te_ext);
+                    thisAlignmentData.ts = p.first;
+                    thisAlignmentData.te = p.second;
                 } else {
                     thisAlignmentData.ts = ts_ext;
                     thisAlignmentData.te = te_ext;
@@ -1091,9 +1089,9 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Alignment covers an informative het site
             thisAlignmentData.coversHetSite = false;
             
-            // Alignment is deleted/filtered (both flags false by default)
-            thisAlignmentData.isDeleted0 = false;
-            thisAlignmentData.isDeleted1 = false;
+            // Alignment deletion reasons (none by default)
+            thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
+            thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
 
             // --- Populate AlignedEvidenceStore (APES/TASSD) ---
             // Store sparse mismatch/indel evidence (no per-base trace scanning).

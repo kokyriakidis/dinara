@@ -593,79 +593,14 @@ void dinara::main::assemble(
     assembler.filterSecondaryAlignmentsPerReadPair(threadCount);
 
     // =========================================================================
-    // Hifiasm-style Overlap Filtering Pipeline (EC Stage - Parity)
+    // Hifiasm-style Overlap Filtering + Clean ReadGraph (Parity)
     // =========================================================================
     // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
     assembler.performHifiasmECParity(threadCount);
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
-    // //   ma_hit_sub          -> filterLocalSegments
-    // //   detect_chimeric_reads -> detectChimericReads  
-    // //   ma_hit_cut          -> applyCoverageCuts
-    // //   ma_hit_flt          -> filterHangingOverlaps
-    // //   ma_hit_contained_advance -> removeContainedReads
-
-    // Parameters matching hifiasm defaults (from CommandLines.cpp)
-    const uint64_t minCoverage = 0;          // min_overlap_coverage (asm_opt.min_overlap_coverage)
-    const uint64_t minOverlapLength = 50;    // min_overlap_Len (asm_opt.min_overlap_Len)
-    const uint64_t maxHangLength = 1000;     // max_hang_Len (asm_opt.max_hang_Len)
-    const double maxHangRate = 0.8;          // max_hang_rate (asm_opt.max_hang_rate)
-
-    // Helper lambda to count deleted alignments
-    auto countDeleted = [&assembler]() -> uint64_t {
-        uint64_t count = 0;
-        for (uint64_t i = 0; i < assembler.alignmentData.size(); i++) {
-            if (assembler.alignmentData[i].isDeleted()) count++;
-        }
-        return count;
-    };
-
-    uint64_t totalAlignments = assembler.alignmentData.size();
-    uint64_t deletedBefore = countDeleted();
-    uint64_t deletedAfter = 0;
-
-
-    cout << timestamp << "=== Hifiasm Filtering Debug ===" << endl;
-    cout << timestamp << "Total alignments: " << totalAlignments << ", already deleted: " << deletedBefore << endl;
-
-    cout << timestamp << "Filtering local segments (ma_hit_sub)..." << endl;
-    assembler.filterLocalSegments(minCoverage, threadCount);
-    deletedAfter = countDeleted();
-    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
-    deletedBefore = deletedAfter;
-
-    cout << timestamp << "Detecting chimeric reads..." << endl;
-    assembler.detectChimericReads(threadCount);
-    deletedAfter = countDeleted();
-    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
-    deletedBefore = deletedAfter;
-
-    cout << timestamp << "Applying coverage cuts (ma_hit_cut)..." << endl;
-    assembler.applyCoverageCuts(minOverlapLength, threadCount);
-    deletedAfter = countDeleted();
-    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
-    deletedBefore = deletedAfter;
-
-    cout << timestamp << "Filtering hanging overlaps (ma_hit_flt)..." << endl;
-    assembler.filterHangingOverlaps(maxHangLength, maxHangRate, minOverlapLength, threadCount);
-    deletedAfter = countDeleted();
-    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
-    deletedBefore = deletedAfter;
-
-    cout << timestamp << "Removing contained reads (ma_hit_contained_advance)..." << endl;
-    assembler.removeContainedReads(maxHangLength, maxHangRate, minOverlapLength, threadCount);
-    deletedAfter = countDeleted();
-    cout << timestamp << "  -> Deleted: " << (deletedAfter - deletedBefore) << " (total deleted: " << deletedAfter << ")" << endl;
-
-    cout << timestamp << "Hifiasm-style filtering complete." << endl;
-    cout << timestamp << "=== Summary: " << deletedAfter << "/" << totalAlignments << " deleted, " 
-         << (totalAlignments - deletedAfter) << " remaining ===" << endl;
-    // =========================================================================
-
-
-
-    // Create read graph from filtered alignments (no phasing)
-    // This now uses alignments after all hifiasm-style filtering
-    assembler.createReadGraphFromFilteredAlignments();
+    // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
+    // This uses conservative AND parity semantics (both reads must keep the overlap).
+    assembler.createReadGraph6(threadCount);
 
 
     // // Build canonical per-Read overlap index (Hifiasm-style storage)
