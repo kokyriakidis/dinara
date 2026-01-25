@@ -120,11 +120,29 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     
     uint64_t keptCount = 0;
     uint64_t phasedOutCount = 0;
+    uint64_t filteredByPhase = 0;
+    uint64_t filteredBySecondary = 0;
+    uint64_t filteredByChemical = 0;
+    uint64_t filteredByLocalSegment = 0;
+    uint64_t filteredByCoverageCut = 0;
+    uint64_t filteredByHanging = 0;
+    uint64_t filteredByContained = 0;
     uint64_t palindromicCount = 0;
     uint64_t chimericCount = 0;
     uint64_t containedCount = 0;
 
-    #pragma omp parallel for reduction(+:keptCount, phasedOutCount, palindromicCount, chimericCount, containedCount)
+    auto classifyFilterReason = [&](const AlignmentData& ad) {
+        const AlignmentData::DeleteReasonMask reasons = ad.deleteReasons0 | ad.deleteReasons1;
+        if (reasons & AlignmentData::DeleteReasonPhase) ++filteredByPhase;
+        if (reasons & AlignmentData::DeleteReasonSecondary) ++filteredBySecondary;
+        if (reasons & AlignmentData::DeleteReasonChemical) ++filteredByChemical;
+        if (reasons & AlignmentData::DeleteReasonLocal) ++filteredByLocalSegment;
+        if (reasons & AlignmentData::DeleteReasonCoverageCut) ++filteredByCoverageCut;
+        if (reasons & AlignmentData::DeleteReasonHanging) ++filteredByHanging;
+        if (reasons & AlignmentData::DeleteReasonContained) ++filteredByContained;
+    };
+
+    #pragma omp parallel for reduction(+:keptCount, phasedOutCount, filteredByPhase, filteredBySecondary, filteredByChemical, filteredByLocalSegment, filteredByCoverageCut, filteredByHanging, filteredByContained, palindromicCount, chimericCount, containedCount)
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
         
@@ -133,6 +151,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
             keepAlignment[i] = false;
             ad.info.isInReadGraph = 0;
             phasedOutCount++;
+            classifyFilterReason(ad);
             continue;
         }
         
@@ -180,6 +199,17 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     }
 
     cout << timestamp << "Phasing removed " << phasedOutCount << " alignments." << endl;
+    if (phasedOutCount) {
+        cout << timestamp << "  reasons among not-kept overlaps:"
+             << " phase=" << filteredByPhase
+             << " secondary=" << filteredBySecondary
+             << " chemical=" << filteredByChemical
+             << " ma_hit_sub(read)=" << filteredByLocalSegment
+             << " ma_hit_cut=" << filteredByCoverageCut
+             << " ma_hit_flt=" << filteredByHanging
+             << " ma_hit_contained=" << filteredByContained
+             << endl;
+    }
     cout << timestamp << "Contained/deleted reads removed " << containedCount << " alignments." << endl;
     cout << timestamp << "Palindromic filter removed " << palindromicCount << " alignments." << endl;
     cout << timestamp << "Chimeric filter removed " << chimericCount << " alignments." << endl;

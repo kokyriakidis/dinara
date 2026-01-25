@@ -1782,6 +1782,18 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
 
     uint64_t containedReadCount = 0;
 
+    // Parity with hifiasm delete_all_edges: when a read is identified as contained, immediately
+    // delete all overlaps incident to it. This avoids later passes scanning/processing edges
+    // that will be removed anyway and is typically faster when total alignments is huge.
+    auto deleteAllEdgesForRead = [&](ReadId r) {
+        const OrientedReadId oid(r, 0);
+        if (oid.getValue() >= alignmentTable.size()) return;
+        const auto& table = alignmentTable[oid.getValue()];
+        for (const uint32_t alignmentId : table) {
+            alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
+        }
+    };
+
     const uint64_t readCount = reads->readCount();
     for (ReadId qn = 0; qn < readCount; ++qn) {
         if (qn >= validReadIntervals.size() || validReadIntervals[qn].isDeleted) continue;
@@ -1838,15 +1850,21 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
 
             if (result == 1) {
                 // Query read is contained in target.
-                validReadIntervals[qn].isDeleted = true;
-                (*containmentParent)[qn] = tn;
-                ++containedReadCount;
+                if (!validReadIntervals[qn].isDeleted) {
+                    validReadIntervals[qn].isDeleted = true;
+                    (*containmentParent)[qn] = tn;
+                    deleteAllEdgesForRead(qn);
+                    ++containedReadCount;
+                }
                 break;
             } else if (result == 2) {
                 // Target read is contained in query.
-                validReadIntervals[tn].isDeleted = true;
-                (*containmentParent)[tn] = qn;
-                ++containedReadCount;
+                if (!validReadIntervals[tn].isDeleted) {
+                    validReadIntervals[tn].isDeleted = true;
+                    (*containmentParent)[tn] = qn;
+                    deleteAllEdgesForRead(tn);
+                    ++containedReadCount;
+                }
             }
         }
     }
@@ -1859,21 +1877,6 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
             root = (*containmentParent)[root];
         }
         (*containmentParent)[r] = root;
-    }
-
-    // Remove all alignments incident to deleted reads (contained reads are deleted in validReadIntervals).
-    for (uint64_t alignmentId = 0; alignmentId < alignmentData.size(); ++alignmentId) {
-        AlignmentData& ad = alignmentData[alignmentId];
-        const ReadId r0 = ad.readIds[0];
-        const ReadId r1 = ad.readIds[1];
-        if (r0 < validReadIntervals.size() && validReadIntervals[r0].isDeleted) {
-            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
-            continue;
-        }
-        if (r1 < validReadIntervals.size() && validReadIntervals[r1].isDeleted) {
-            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
-            continue;
-        }
     }
 
     // Parity with the final pass in ma_hit_contained_advance: delete reads that now have no remaining overlaps.
