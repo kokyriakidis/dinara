@@ -729,14 +729,6 @@ private:
     // Temporary storage for filtering parameter, accessible by thread function.
     uint64_t localSegmentMinCoverage = 0;
 
-    // Chimeric read detection (From Anchors / Miniasm style)
-    void detectChimericReadsFromAnchorsThreadFunction(size_t threadId);
-    void detectChimericReadsFromAnchors(double shiftRate, uint64_t ulThres, uint64_t threadCount);
-    
-    // Config for anchor detection
-    double chimericShiftRate = 0.06;
-    uint64_t chimericUlThres = 2;
-
     // Apply coverage cuts (ma_hit_cut equivalent) - thread functions
     void applyCoverageCutsToAlignmentsThreadFunction(size_t threadId);
     void applyCoverageCutsCleanupThreadFunction(size_t threadId);
@@ -1107,6 +1099,32 @@ public:
     {
         computeAlignmentTable();
     }
+
+    struct ValidReadIntervalForTesting {
+        uint32_t start = 0;
+        uint32_t end = 0;
+        bool isDeleted = false;
+    };
+
+    ValidReadIntervalForTesting getValidReadIntervalForTesting(ReadId readId) const
+    {
+        if (readId >= validReadIntervals.size()) {
+            return {};
+        }
+        const auto& v = validReadIntervals[readId];
+        return {v.start, v.end, v.isDeleted};
+    }
+
+    ReadId getContainmentRootForTesting(ReadId readId) const
+    {
+        if (!containmentParent || !containmentParent->isOpen) {
+            return ReadId(invalidReadId);
+        }
+        if (readId >= containmentParent->size()) {
+            return ReadId(invalidReadId);
+        }
+        return (*containmentParent)[readId];
+    }
 #endif
 private:
     MemoryMapped::VectorOfVectors<char, uint64_t> compressedAlignments;
@@ -1247,22 +1265,12 @@ public:
     void accessReadGraphAllAlignmentsReadWrite();
     void checkReadGraphAllAlignmentsIsOpen() const;
 
-
-
-    // Functions and data related to read graph creation method 5.
-    // This assumes that createReadGraph5 is multithreaded.
-    // Simplifications are possible if this is not the case.
-    void createReadGraph5();
-    
     // Read graph creation method 6: Uses CIGAR-based phasing (isDeleted0/isDeleted1 flags)
     // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
     void createReadGraph6();
     void createReadGraph6(uint64_t threadCount);
     
     // Canonical per-Read overlap storage  // Convert alignmentData to OverlapIndex
-    
-    // Read graph creation method 7: Uses canonical OverlapIndex with is_match/del flags
-    void createReadGraph7();
     
     // Create read graph directly from OverlapIndex (Option A: direct use, no alignmentData mapping)
     
@@ -1272,15 +1280,6 @@ public:
     // Temporary or permanent member
     uint64_t minAlleleCoverage = 5; // Threshold from main.cpp
     void computeClusterValidityThreadFunction(uint64_t threadId);
-    void createReadGraph5ThreadFunction(uint64_t threadId);
-
-    // Data that should be accessible to all threads.
-    // The Assembler stores a single instance of that.
-    class CreateReadGraph5Data {
-    public:
-    };
-    CreateReadGraph5Data createReadGraph5Data;
-
     // Storage for position pairs collected during alignment computation
     MemoryMapped::Vector< pair<OrientedReadId, uint32_t> > variantClusteringPositionPairs;
     void accessVariantClusteringPositionPairsReadOnly();

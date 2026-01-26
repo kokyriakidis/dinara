@@ -734,6 +734,131 @@ TEST_CASE("Integration: ma_hit_cut skips deleted endpoints", "[integration][hifi
     CHECK(fixture.assembler->alignmentData[0].deleteReasons1 == AlignmentData::DeleteReasonNone);
 }
 
+TEST_CASE("Integration: ma_hit_sub selects the max-depth interval", "[integration][hifiasm][filter][sub]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Read 0 has depth>=2 only on [400,600); reads 1 and 2 have only depth 1 everywhere.
+    fixture.createFastq({randomSequence(1000, 201), randomSequence(1000, 202), randomSequence(1000, 203)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(2);
+
+        // Overlap 0: [0,600) on read 0.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 600;
+            ad.ts = 0; ad.te = 600;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+
+        // Overlap 1: [400,1000) on read 0.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(2), true), info);
+            ad.qs = 400; ad.qe = 1000;
+            ad.ts = 0; ad.te = 600;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(2, 1);
+    });
+
+    const auto v0 = fixture.assembler->getValidReadIntervalForTesting(ReadId(0));
+    CHECK_FALSE(v0.isDeleted);
+    CHECK(v0.start == 400);
+    CHECK(v0.end == 600);
+
+    const auto v1 = fixture.assembler->getValidReadIntervalForTesting(ReadId(1));
+    const auto v2 = fixture.assembler->getValidReadIntervalForTesting(ReadId(2));
+    CHECK(v1.isDeleted);
+    CHECK(v2.isDeleted);
+}
+
+TEST_CASE("Integration: ma_hit_cut trims and normalizes overlaps to valid segments", "[integration][hifiasm][filter][cut]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Build a case where read 0's valid region is [100,900] and read 1's valid region is [200,800].
+    // The overlap (0,1) is full-length in raw coordinates and must be trimmed + normalized.
+    fixture.createFastq({
+        randomSequence(1000, 301),
+        randomSequence(1000, 302),
+        randomSequence(1000, 303),
+        randomSequence(1000, 304),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // Full-length overlap between reads 0 and 1.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 1000;
+            ad.ts = 0; ad.te = 1000;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+
+        // Second overlap to give read 0 depth>=2 only on [100,900].
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(2), true), info);
+            ad.qs = 100; ad.qe = 900;
+            ad.ts = 0; ad.te = 800;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+
+        // Second overlap to give read 1 depth>=2 only on [200,800].
+        {
+            AlignmentInfo info;
+            info.alignmentId = 2;
+            AlignmentData ad(OrientedReadPair(ReadId(1), ReadId(3), true), info);
+            ad.qs = 200; ad.qe = 800;
+            ad.ts = 0; ad.te = 600;
+            fixture.assembler->alignmentData[2] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(2, 1);
+
+        const auto v0 = fixture.assembler->getValidReadIntervalForTesting(ReadId(0));
+        const auto v1 = fixture.assembler->getValidReadIntervalForTesting(ReadId(1));
+        REQUIRE_FALSE(v0.isDeleted);
+        REQUIRE_FALSE(v1.isDeleted);
+        REQUIRE(v0.start == 100);
+        REQUIRE(v0.end == 900);
+        REQUIRE(v1.start == 200);
+        REQUIRE(v1.end == 800);
+
+        fixture.assembler->applyCoverageCuts(50, 1);
+    });
+
+    const AlignmentData& a01 = fixture.assembler->alignmentData[0];
+    REQUIRE_FALSE(a01.isDeleted());
+    CHECK(a01.deleteReasons0 == AlignmentData::DeleteReasonNone);
+    CHECK(a01.deleteReasons1 == AlignmentData::DeleteReasonNone);
+
+    // After trimming and normalization:
+    // - read0 segment is [100,900], read1 segment is [200,800]
+    // - intersection in raw coordinates is [200,800]
+    // - normalized: on read0 => [100,700], on read1 => [0,600]
+    CHECK(a01.qs == 100);
+    CHECK(a01.qe == 700);
+    CHECK(a01.ts == 0);
+    CHECK(a01.te == 600);
+}
+
 TEST_CASE("Integration: ma_hit_contained_advance does not RC-map swapped intervals", "[integration][hifiasm][filter]") {
     AssemblerIntegrationFixture fixture;
 
@@ -767,6 +892,122 @@ TEST_CASE("Integration: ma_hit_contained_advance does not RC-map swapped interva
     CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted());
     CHECK((fixture.assembler->alignmentData[0].deleteReasons0 & AlignmentData::DeleteReasonContained) == 0);
     CHECK((fixture.assembler->alignmentData[0].deleteReasons1 & AlignmentData::DeleteReasonContained) == 0);
+}
+
+TEST_CASE("Integration: try_rescue_overlaps clears directional phase deletions on consensus span", "[integration][hifiasm][filter][rescue]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({
+        randomSequence(1000, 501),
+        randomSequence(1000, 502),
+        randomSequence(1000, 503),
+        randomSequence(1000, 504),
+        randomSequence(1000, 505),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(4);
+
+        // Four conflict overlaps: read 0 deletes (phase) but other endpoints keep.
+        // All intervals share the consensus intersection [300,650).
+        const std::array<std::pair<uint32_t, uint32_t>, 4> qIntervals = {{
+            {0, 700},
+            {100, 900},
+            {200, 800},
+            {300, 650},
+        }};
+        for (uint32_t i = 0; i < 4; ++i) {
+            AlignmentInfo info;
+            info.alignmentId = i;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1 + i), true), info);
+            ad.qs = qIntervals[i].first;
+            ad.qe = qIntervals[i].second;
+            ad.ts = 0;
+            ad.te = qIntervals[i].second - qIntervals[i].first;
+            ad.addDeleteReasonsFromReadPerspective(ReadId(0), AlignmentData::DeleteReasonPhase);
+            fixture.assembler->alignmentData[i] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->rescuePhasedOverlaps(4, 1);
+    });
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        const auto& ad = fixture.assembler->alignmentData[i];
+        CHECK_FALSE(ad.isDeleted0());
+        CHECK_FALSE(ad.isDeleted1());
+        CHECK(ad.deleteReasons0 == AlignmentData::DeleteReasonNone);
+        CHECK(ad.deleteReasons1 == AlignmentData::DeleteReasonNone);
+    }
+}
+
+TEST_CASE("Integration: ma_hit_contained_advance compresses containment chains", "[integration][hifiasm][filter][contained][chain]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Chain: 0 contained in 1, 1 contained in 2. Keep (2,3) as a dovetail so container stays alive.
+    fixture.createFastq({
+        randomSequence(500, 601),
+        randomSequence(800, 602),
+        randomSequence(1200, 603),
+        randomSequence(1200, 604),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // 0 in 1.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 0; ad.qe = 500;
+            ad.ts = 100; ad.te = 600;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+        // 1 in 2.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(1), ReadId(2), true), info);
+            ad.qs = 0; ad.qe = 800;
+            ad.ts = 200; ad.te = 1000;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+        // 2 dovetail 3 (kept, and NOT a containment).
+        {
+            AlignmentInfo info;
+            info.alignmentId = 2;
+            AlignmentData ad(OrientedReadPair(ReadId(2), ReadId(3), true), info);
+            ad.qs = 0; ad.qe = 1100;
+            ad.ts = 100; ad.te = 1200;
+            fixture.assembler->alignmentData[2] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+        fixture.assembler->removeContainedReads(1000, 0.8, 50, 1);
+    });
+
+    CHECK(fixture.assembler->getContainmentRootForTesting(ReadId(0)) == ReadId(2));
+    CHECK(fixture.assembler->getContainmentRootForTesting(ReadId(1)) == ReadId(2));
+    CHECK(fixture.assembler->getContainmentRootForTesting(ReadId(2)) == ReadId(invalidReadId));
+
+    // Contained overlaps are deleted with the contained reason.
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons0 & AlignmentData::DeleteReasonContained) != 0);
+    CHECK((fixture.assembler->alignmentData[0].deleteReasons1 & AlignmentData::DeleteReasonContained) != 0);
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons0 & AlignmentData::DeleteReasonContained) != 0);
+    CHECK((fixture.assembler->alignmentData[1].deleteReasons1 & AlignmentData::DeleteReasonContained) != 0);
+
+    // The dovetail edge (2,3) remains.
+    CHECK_FALSE(fixture.assembler->alignmentData[2].isDeleted());
 }
 
 TEST_CASE("Integration: detect_chimeric_reads deletes edges for simple chimera", "[integration][hifiasm][filter]") {

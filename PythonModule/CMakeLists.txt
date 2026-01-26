@@ -35,7 +35,7 @@ endif(BUILD_NATIVE)
 add_definitions(-DDINARA_PYTHON_API)
 
 # Sources files.
-file(GLOB SOURCES ../src/*.cpp)
+file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp)
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
