@@ -43,7 +43,7 @@ add_library(catch_main OBJECT catch_main.cpp)
 # ============================================================================
 
 # Get all dinara source files EXCEPT main.cpp
-file(GLOB DINARA_SRC_FILES 
+file(GLOB DINARA_SRC_FILES CONFIGURE_DEPENDS
     ${DINARA_ROOT}/src/*.cpp
     ${DINARA_ROOT}/srcMain/*.cpp
 )

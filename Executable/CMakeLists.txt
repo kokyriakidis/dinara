@@ -31,7 +31,7 @@ if(BUILD_NATIVE)
 endif(BUILD_NATIVE)
 
 # Source files
-file(GLOB SOURCES ../src/*.cpp ../srcMain/*.cpp)
+file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../srcMain/*.cpp)
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
