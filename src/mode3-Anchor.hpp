@@ -134,6 +134,19 @@ public:
         uint64_t threadCount,
         bool createFromVertices = false);
 
+    // This constructor creates Anchors from a selected subset of marker graph vertices.
+    // Each selected vertex generates a forward anchor and its reverse-complement anchor.
+    Anchors(
+        const MappedMemoryOwner&,
+        const Reads& reads,
+        uint64_t k,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        const MarkerGraph&,
+        const vector<MarkerGraphVertexId>& selectedVertexIds,
+        uint64_t minPrimaryCoverage,
+        uint64_t maxPrimaryCoverage,
+        uint64_t threadCount);
+
     // This constructor creates the Anchors from marker k-mers.
     Anchors(
         const MappedMemoryOwner&,
@@ -325,6 +338,7 @@ private:
         bool createFromVertices;
 
         const MarkerGraph* markerGraphPointer;
+        const vector<MarkerGraphVertexId>* selectedVertexIdsPointer = nullptr;
 
         // The marker intervals of the anchors found by each thread.
         class ThreadMarkerInterval {
@@ -340,6 +354,7 @@ private:
     ConstructFromMarkerGraphData constructFromMarkerGraphData;
     void constructFromMarkerGraphThreadFunction(uint64_t threadId);
     void constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId);
+    void constructFromSelectedMarkerGraphVerticesThreadFunction(uint64_t threadId);
 
 
     // Data and functions used when constructing the Anchors from marker k-mers.

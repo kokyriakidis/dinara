@@ -17,6 +17,9 @@
 #include "MemoryMappedObject.hpp"
 #include "MultithreadedObject.hpp"
 #include "ReadGraph.hpp"
+#include "StringGraph.hpp"
+#include "UnitigGraph.hpp"
+#include "OrientedUnitigId.hpp"
 
 #include "ReadId.hpp"
 #include "AlignedEvidenceStore.hpp"
@@ -64,6 +67,8 @@ namespace dinara {
     class LocalMarkerGraph0;
     class LocalReadGraph;
     class LocalReadGraphTriangles;
+    class LocalStringGraph;
+    class LocalUnitigGraph;
     class LocalMarkerGraph0RequestParameters;
     class LongBaseSequences;
     class MarkerConnectivityGraph;
@@ -359,6 +364,25 @@ public:
         // the number of virtual processors is used.
         uint64_t threadCount
     );
+
+    // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
+    // overlap start/end events on each oriented read (using read-graph overlaps).
+    // This produces fewer anchors than using all marker graph vertices, while preserving
+    // marker-graph semantics for each anchor.
+    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
+    // Create mode3 anchors from marker graph vertices selected as follows:
+    // - Use a sweep-line over overlap start/end events for each oriented read (from readGraph overlaps).
+    // - For each maximal interval where the active overlap count is >0, scan all marker ordinals in the interval
+    //   and select the marker graph vertex (canonicalized by RC) with maximum vertex coverage in the requested range.
+    // This produces significantly fewer, stronger anchors than using all marker graph vertices.
+    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
 
 
 
@@ -1220,6 +1244,8 @@ private:
 public:
     ReadGraph readGraph;
     ReadGraph readGraphAllAlignments;
+    StringGraph stringGraph;
+    UnitigGraph unitigGraph;
     void createReadGraph(
         uint32_t maxAlignmentCount,
         bool preferAlignedFraction);
@@ -1243,6 +1269,12 @@ public:
     void accessReadGraph();
     void accessReadGraphReadWrite();
     void checkReadGraphIsOpen() const;
+    void accessStringGraph();
+    void accessStringGraphReadWrite();
+    void checkStringGraphIsOpen() const;
+    void accessUnitigGraph();
+    void accessUnitigGraphReadWrite();
+    void checkUnitigGraphIsOpen() const;
     void removeReadGraphBridges(uint64_t maxDistance);
     void analyzeReadGraph();
     void readGraphClustering();
@@ -1479,7 +1511,30 @@ public:
     // Create the ReadGraph given a bool vector that specifies which
     // alignments should be used in the read graph.
     void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
+    void createStringGraphUsingSelectedAlignments(const vector<bool>& keepAlignment);
+    void createUnitigGraphFromStringGraph();
     void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
+    void cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipReads);
+    void cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads);
+    void cleanStringGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
+    void cleanStringGraphDropOverlapRoundsHifiasm(
+        uint32_t cleanRounds,
+        double minDropRate,
+        double maxDropRate,
+        uint32_t maxShortTipReads,
+        uint32_t finalMinOverlapLen);
+    uint64_t cleanStringGraphBreakShortCycles(uint32_t maxCycleReads);
+
+    void cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs);
+    void cleanUnitigGraphPreCleanHifiasm(uint32_t maxShortTipUnitigs);
+    void cleanUnitigGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
+    void cleanUnitigGraphDropOverlapRoundsHifiasm(
+        uint32_t cleanRounds,
+        double minDropRate,
+        double maxDropRate,
+        uint32_t maxShortTipUnitigs,
+        uint32_t finalMinOverlapLen);
+    uint64_t cleanUnitigGraphBreakShortCycles(uint32_t maxCycleUnitigs);
 
 
 
@@ -1518,6 +1573,23 @@ private:
         bool allowInconsistentAlignmentEdges,
         double timeout,         // Or 0 for no timeout.
         LocalReadGraph&);
+
+    bool createLocalStringGraph(
+        const vector<OrientedReadId>& starts,
+        uint32_t maxDistance,
+        bool allowChimericReads,
+        bool followOutgoing,
+        bool followIncoming,
+        double timeout,
+        LocalStringGraph&);
+
+    bool createLocalUnitigGraph(
+        const vector<OrientedUnitigId>& starts,
+        uint32_t maxDistance,
+        bool followOutgoing,
+        bool followIncoming,
+        double timeout,
+        LocalUnitigGraph&);
 
     // Triangle analysis of the local read graph.
     // Returns a vector of triangles and their alignment residuals,
@@ -2698,6 +2770,8 @@ public:
     void alignSequencesInBaseRepresentation(const vector<string>&, ostream&);
     void exploreAlignmentGraph(const vector<string>&, ostream&);
     void exploreReadGraph(const vector<string>&, ostream&);
+    void exploreStringGraph(const vector<string>&, ostream&);
+    void exploreUnitigGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);
     void exploreDirectedReadGraph(const vector<string>&, ostream&);
     void exploreCompressedAssemblyGraph(const vector<string>&, ostream&);

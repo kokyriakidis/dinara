@@ -657,6 +657,607 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     CHECK(s1_03[0].second == expectedT03);
 }
 
+TEST_CASE("Integration: Overlap-event anchors select vertices uniquely", "[integration][anchors][events]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Two reads with enough markers. We will manually construct:
+    // - a single read-graph overlap (and its RC twin)
+    // - a minimal marker graph with two canonical vertices (and their RC vertices)
+    // such that the overlap start/end events map to those vertices.
+    fixture.createFastq({randomSequence(4000, 501), randomSequence(4000, 502)});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // -----------------------
+        // Alignment + ReadGraph
+        // -----------------------
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        info.isInReadGraph = 1;
+        info.markerCount = lastOrdinal + 1 - firstOrdinal;
+        info.data[0] = AlignmentInfo::Data(m0, firstOrdinal, lastOrdinal);
+        info.data[1] = AlignmentInfo::Data(m1, firstOrdinal, lastOrdinal);
+        info.minOrdinalOffset = 0;
+        info.maxOrdinalOffset = 0;
+        info.averageOrdinalOffset = 0;
+        info.maxSkip = 0;
+        info.maxDrift = 0;
+
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+
+        fixture.assembler->readGraph.edges.resize(2);
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0p, r1p};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[0] = e;
+        }
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0m, r1m};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[1] = e;
+        }
+
+        // connectivity is indexed by orientedReadIdValue = readId*2 + strand.
+        // Index 0: r0+, 1: r0-, 2: r1+, 3: r1-.
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        conn.appendVector(); // 0
+        conn.append(0);
+        conn.appendVector(); // 1
+        conn.append(1);
+        conn.appendVector(); // 2
+        conn.append(0);
+        conn.appendVector(); // 3
+        conn.append(1);
+
+        // -----------------------
+        // Minimal MarkerGraph
+        // -----------------------
+        auto& mg = fixture.assembler->markerGraph;
+        mg.constructVertices();
+        mg.vertices().createNew("", 4096);
+        mg.vertexTable.createNew("", 4096);
+        mg.vertexTable.resize(markers->totalSize());
+        std::fill(mg.vertexTable.begin(), mg.vertexTable.end(), MarkerGraph::invalidCompressedVertexId);
+
+        // Two canonical vertices and their reverse complements:
+        //  vertex0 <-> vertex2, vertex1 <-> vertex3.
+        const MarkerGraphVertexId v0 = 0;
+        const MarkerGraphVertexId v1 = 1;
+        const MarkerGraphVertexId v2 = 2;
+        const MarkerGraphVertexId v3 = 3;
+
+        mg.reverseComplementVertex.createNew("", 4096);
+        mg.reverseComplementVertex.resize(4);
+        mg.reverseComplementVertex[v0] = v2;
+        mg.reverseComplementVertex[v2] = v0;
+        mg.reverseComplementVertex[v1] = v3;
+        mg.reverseComplementVertex[v3] = v1;
+
+        const MarkerId r0p_first = fixture.assembler->getMarkerId(r0p, firstOrdinal);
+        const MarkerId r1p_first = fixture.assembler->getMarkerId(r1p, firstOrdinal);
+        const MarkerId r0p_after = fixture.assembler->getMarkerId(r0p, lastOrdinal + 1);
+        const MarkerId r1p_after = fixture.assembler->getMarkerId(r1p, lastOrdinal + 1);
+
+        const uint32_t rcFirstOrdinal0 = uint32_t(m0) - 1 - firstOrdinal;
+        const uint32_t rcFirstOrdinal1 = uint32_t(m1) - 1 - firstOrdinal;
+        const uint32_t rcAfterOrdinal0 = uint32_t(m0) - 1 - (lastOrdinal + 1);
+        const uint32_t rcAfterOrdinal1 = uint32_t(m1) - 1 - (lastOrdinal + 1);
+
+        const MarkerId r0m_first = fixture.assembler->getMarkerId(r0m, rcFirstOrdinal0);
+        const MarkerId r1m_first = fixture.assembler->getMarkerId(r1m, rcFirstOrdinal1);
+        const MarkerId r0m_after = fixture.assembler->getMarkerId(r0m, rcAfterOrdinal0);
+        const MarkerId r1m_after = fixture.assembler->getMarkerId(r1m, rcAfterOrdinal1);
+
+        // Vertex 0: overlap "start" event markers.
+        {
+            vector<MarkerId> ids = {r0p_first, r1p_first};
+            std::sort(ids.begin(), ids.end());
+            mg.vertices().appendVector();
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(v0));
+            }
+        }
+        // Vertex 1: overlap "end" event markers (last+1).
+        {
+            vector<MarkerId> ids = {r0p_after, r1p_after};
+            std::sort(ids.begin(), ids.end());
+            mg.vertices().appendVector();
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(v1));
+            }
+        }
+        // Vertex 2: RC of vertex 0.
+        {
+            vector<MarkerId> ids = {r0m_first, r1m_first};
+            std::sort(ids.begin(), ids.end());
+            mg.vertices().appendVector();
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(v2));
+            }
+        }
+        // Vertex 3: RC of vertex 1.
+        {
+            vector<MarkerId> ids = {r0m_after, r1m_after};
+            std::sort(ids.begin(), ids.end());
+            mg.vertices().appendVector();
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(v3));
+            }
+        }
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() == 4); // 2 canonical vertices * (forward+RC)
+
+    // Verify that each (forward, rc) pair is consecutive and consistent.
+    for(mode3::AnchorId a = 0; a < anchors->size(); a += 2) {
+        const auto forward = (*anchors)[a];
+        const auto reverse = (*anchors)[a + 1];
+        REQUIRE(forward.size() == reverse.size());
+        for(size_t i = 0; i < forward.size(); ++i) {
+            const auto f = forward[i];
+            auto expected = f;
+            expected.orientedReadId.flipStrand();
+            const uint64_t markerCount = fixture.assembler->markers->size(expected.orientedReadId.getValue());
+            expected.ordinal0 = uint32_t(markerCount) - 1 - f.ordinal0;
+
+            const auto r = reverse[forward.size() - 1 - i];
+            CHECK(r.orientedReadId == expected.orientedReadId);
+            CHECK(r.ordinal0 == expected.ordinal0);
+        }
+    }
+}
+
+TEST_CASE("Integration: Best-per-interval anchors pick the max-coverage vertex inside the interval", "[integration][anchors][events][best]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Four reads. We manually construct readGraph overlaps so that read 0 has one active overlap interval,
+    // and construct a marker graph where:
+    // - The highest-coverage interior vertex contains both strands for read 0 (duplicate ReadId) and must be skipped.
+    // - The next-best interior vertex is clean and should be selected.
+    fixture.createFastq({
+        randomSequence(4000, 601),
+        randomSequence(4000, 602),
+        randomSequence(4000, 603),
+        randomSequence(4000, 604),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const OrientedReadId r2p(ReadId(2), 0);
+    const OrientedReadId r2m(ReadId(2), 1);
+    const OrientedReadId r3p(ReadId(3), 0);
+    const OrientedReadId r3m(ReadId(3), 1);
+
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    const uint32_t m2 = uint32_t(markers->size(r2p.getValue()));
+    const uint32_t m3 = uint32_t(markers->size(r3p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+    REQUIRE(m2 > 16);
+    REQUIRE(m3 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+    REQUIRE(lastOrdinal + 1 < m2);
+    REQUIRE(lastOrdinal + 1 < m3);
+
+    const uint32_t interiorBadOrdinal = 2;
+    const uint32_t interiorGoodOrdinal = 3;
+    REQUIRE(interiorBadOrdinal >= firstOrdinal);
+    REQUIRE(interiorBadOrdinal < lastOrdinal + 1);
+    REQUIRE(interiorGoodOrdinal >= firstOrdinal);
+    REQUIRE(interiorGoodOrdinal < lastOrdinal + 1);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // -----------------------
+        // AlignmentData: (0,1), (0,2), (0,3) all same-strand, same ordinal interval.
+        // -----------------------
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        auto fillAlignment = [&](size_t idx, ReadId otherReadId) {
+            AlignmentInfo info;
+            info.alignmentId = idx;
+            info.isInReadGraph = 1;
+            info.markerCount = lastOrdinal + 1 - firstOrdinal;
+
+            info.data[0] = AlignmentInfo::Data(m0, firstOrdinal, lastOrdinal);
+            uint32_t otherMarkerCount = 0;
+            if(otherReadId == ReadId(1)) otherMarkerCount = m1;
+            if(otherReadId == ReadId(2)) otherMarkerCount = m2;
+            if(otherReadId == ReadId(3)) otherMarkerCount = m3;
+            info.data[1] = AlignmentInfo::Data(otherMarkerCount, firstOrdinal, lastOrdinal);
+
+            info.minOrdinalOffset = 0;
+            info.maxOrdinalOffset = 0;
+            info.averageOrdinalOffset = 0;
+            info.maxSkip = 0;
+            info.maxDrift = 0;
+
+            AlignmentData ad(OrientedReadPair(ReadId(0), otherReadId, true), info);
+            fixture.assembler->alignmentData[idx] = ad;
+        };
+        fillAlignment(0, ReadId(1));
+        fillAlignment(1, ReadId(2));
+        fillAlignment(2, ReadId(3));
+
+        // -----------------------
+        // ReadGraph edges: each alignment yields an edge for + strand and an edge for - strand.
+        // We only need connectivity for read 0 (both strands) but keep it consistent for endpoints too.
+        // -----------------------
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+        fixture.assembler->readGraph.edges.resize(6);
+
+        auto setEdge = [&](size_t edgeIndex, OrientedReadId a, OrientedReadId b, uint64_t alignmentId) {
+            ReadGraphEdge e;
+            e.orientedReadIds = {a, b};
+            e.alignmentId = alignmentId;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[edgeIndex] = e;
+        };
+        setEdge(0, r0p, r1p, 0);
+        setEdge(1, r0m, r1m, 0);
+        setEdge(2, r0p, r2p, 1);
+        setEdge(3, r0m, r2m, 1);
+        setEdge(4, r0p, r3p, 2);
+        setEdge(5, r0m, r3m, 2);
+
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        // orientedReadCount = 8 (4 reads * 2 strands).
+        // Build vectors in order 0..7.
+        conn.appendVector(); // 0 r0+
+        conn.append(0); conn.append(2); conn.append(4);
+        conn.appendVector(); // 1 r0-
+        conn.append(1); conn.append(3); conn.append(5);
+
+        conn.appendVector(); // 2 r1+
+        conn.append(0);
+        conn.appendVector(); // 3 r1-
+        conn.append(1);
+
+        conn.appendVector(); // 4 r2+
+        conn.append(2);
+        conn.appendVector(); // 5 r2-
+        conn.append(3);
+
+        conn.appendVector(); // 6 r3+
+        conn.append(4);
+        conn.appendVector(); // 7 r3-
+        conn.append(5);
+
+        // -----------------------
+        // Minimal MarkerGraph:
+        // - boundary at firstOrdinal maps to low-coverage vertex v0 (2 markers: r0,r1)
+        // - boundary at afterLast maps to low-coverage vertex v2 (2 markers: r0,r1)
+        // - interior ordinal maps to:
+        //     v4: highest coverage but *invalid* (contains r0+ and r0- -> duplicate ReadId)
+        //     v6: next-best coverage and valid (unique ReadIds)
+        // RC pairs are (0<->1), (2<->3), (4<->5), (6<->7).
+        // -----------------------
+        auto& mg = fixture.assembler->markerGraph;
+        mg.constructVertices();
+        mg.vertices().createNew("", 4096);
+        mg.vertexTable.createNew("", 4096);
+        mg.vertexTable.resize(markers->totalSize());
+        std::fill(mg.vertexTable.begin(), mg.vertexTable.end(), MarkerGraph::invalidCompressedVertexId);
+
+        mg.reverseComplementVertex.createNew("", 4096);
+        mg.reverseComplementVertex.resize(8);
+        mg.reverseComplementVertex[0] = 1;
+        mg.reverseComplementVertex[1] = 0;
+        mg.reverseComplementVertex[2] = 3;
+        mg.reverseComplementVertex[3] = 2;
+        mg.reverseComplementVertex[4] = 5;
+        mg.reverseComplementVertex[5] = 4;
+        mg.reverseComplementVertex[6] = 7;
+        mg.reverseComplementVertex[7] = 6;
+
+        const MarkerId r0_first = fixture.assembler->getMarkerId(r0p, firstOrdinal);
+        const MarkerId r1_first = fixture.assembler->getMarkerId(r1p, firstOrdinal);
+        const MarkerId r0_after = fixture.assembler->getMarkerId(r0p, lastOrdinal + 1);
+        const MarkerId r1_after = fixture.assembler->getMarkerId(r1p, lastOrdinal + 1);
+
+        const MarkerId r0_bad = fixture.assembler->getMarkerId(r0p, interiorBadOrdinal);
+        const MarkerId r1_bad = fixture.assembler->getMarkerId(r1p, interiorBadOrdinal);
+        const MarkerId r2_bad = fixture.assembler->getMarkerId(r2p, interiorBadOrdinal);
+        const MarkerId r3_bad = fixture.assembler->getMarkerId(r3p, interiorBadOrdinal);
+
+        const uint32_t rcBadOrdinal0 = uint32_t(m0) - 1 - interiorBadOrdinal;
+        const MarkerId r0m_bad = fixture.assembler->getMarkerId(r0m, rcBadOrdinal0);
+
+        const MarkerId r0_good = fixture.assembler->getMarkerId(r0p, interiorGoodOrdinal);
+        const MarkerId r1_good = fixture.assembler->getMarkerId(r1p, interiorGoodOrdinal);
+        const MarkerId r2_good = fixture.assembler->getMarkerId(r2p, interiorGoodOrdinal);
+        const MarkerId r3_good = fixture.assembler->getMarkerId(r3p, interiorGoodOrdinal);
+
+        // Build 8 vertices in order.
+        mg.vertices().clear();
+
+        // Vertex 0: start boundary (low coverage, 2 markers).
+        mg.vertices().appendVector();
+        {
+            std::vector<MarkerId> ids = {r0_first, r1_first};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(0));
+            }
+        }
+
+        // Vertex 1: rc partner (unused content for this test).
+        mg.vertices().appendVector();
+
+        // Vertex 2: end boundary (low coverage, 2 markers).
+        mg.vertices().appendVector();
+        {
+            std::vector<MarkerId> ids = {r0_after, r1_after};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(2));
+            }
+        }
+
+        // Vertex 3: rc partner (unused content).
+        mg.vertices().appendVector();
+
+        // Vertex 4: interior (highest coverage but invalid due to duplicate ReadId: r0+ and r0-).
+        mg.vertices().appendVector();
+        {
+            std::vector<MarkerId> ids = {r0_bad, r0m_bad, r1_bad, r2_bad, r3_bad};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(4));
+            }
+        }
+
+        // Vertex 5: rc partner (unused content).
+        mg.vertices().appendVector();
+
+        // Vertex 6: interior (next-best, valid, unique ReadIds).
+        mg.vertices().appendVector();
+        {
+            std::vector<MarkerId> ids = {r0_good, r1_good, r2_good, r3_good};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(6));
+            }
+        }
+
+        // Vertex 7: rc partner for vertex 6 (valid).
+        mg.vertices().appendVector();
+        {
+            const uint32_t rcGoodOrdinal0 = uint32_t(m0) - 1 - interiorGoodOrdinal;
+            const uint32_t rcGoodOrdinal1 = uint32_t(m1) - 1 - interiorGoodOrdinal;
+            const uint32_t rcGoodOrdinal2 = uint32_t(m2) - 1 - interiorGoodOrdinal;
+            const uint32_t rcGoodOrdinal3 = uint32_t(m3) - 1 - interiorGoodOrdinal;
+
+            const MarkerId r0m_good = fixture.assembler->getMarkerId(r0m, rcGoodOrdinal0);
+            const MarkerId r1m_good = fixture.assembler->getMarkerId(r1m, rcGoodOrdinal1);
+            const MarkerId r2m_good = fixture.assembler->getMarkerId(r2m, rcGoodOrdinal2);
+            const MarkerId r3m_good = fixture.assembler->getMarkerId(r3m, rcGoodOrdinal3);
+
+            std::vector<MarkerId> ids = {r0m_good, r1m_good, r2m_good, r3m_good};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(7));
+            }
+        }
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() == 2); // one selected vertex => (forward + rc)
+
+    const auto a0 = (*anchors)[0];
+    REQUIRE(a0.coverage() == 4);
+    // All plus-strand read ids appear at the interior ordinal.
+    {
+        std::vector<OrientedReadId> ids;
+        for(const auto& mi : a0) {
+            ids.push_back(mi.orientedReadId);
+        }
+        std::sort(ids.begin(), ids.end(), [](const OrientedReadId& a, const OrientedReadId& b) {
+            return a.getValue() < b.getValue();
+        });
+        REQUIRE(ids.size() == 4);
+        CHECK(ids[0] == OrientedReadId(ReadId(0), 0));
+        CHECK(ids[1] == OrientedReadId(ReadId(1), 0));
+        CHECK(ids[2] == OrientedReadId(ReadId(2), 0));
+        CHECK(ids[3] == OrientedReadId(ReadId(3), 0));
+    }
+}
+
+TEST_CASE("Integration: Best-per-interval anchors fall back to duplicate-ReadId vertex when no clean vertex exists", "[integration][anchors][events][best][fallback]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(4000, 701), randomSequence(4000, 702)});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+
+    const uint32_t interiorOrdinal = 2;
+    const uint32_t rcInterior0 = uint32_t(m0) - 1 - interiorOrdinal;
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        info.isInReadGraph = 1;
+        info.markerCount = lastOrdinal + 1 - firstOrdinal;
+        info.data[0] = AlignmentInfo::Data(m0, firstOrdinal, lastOrdinal);
+        info.data[1] = AlignmentInfo::Data(m1, firstOrdinal, lastOrdinal);
+        info.minOrdinalOffset = 0;
+        info.maxOrdinalOffset = 0;
+        info.averageOrdinalOffset = 0;
+        info.maxSkip = 0;
+        info.maxDrift = 0;
+
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+        fixture.assembler->readGraph.edges.resize(2);
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0p, r1p};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[0] = e;
+        }
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0m, r1m};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[1] = e;
+        }
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        conn.appendVector(); // r0+
+        conn.append(0);
+        conn.appendVector(); // r0-
+        conn.append(1);
+        conn.appendVector(); // r1+
+        conn.append(0);
+        conn.appendVector(); // r1-
+        conn.append(1);
+
+        // Marker graph with only one interior vertex in range, but it has duplicate ReadId (r0+ and r0-).
+        auto& mg = fixture.assembler->markerGraph;
+        mg.constructVertices();
+        mg.vertices().createNew("", 4096);
+        mg.vertexTable.createNew("", 4096);
+        mg.vertexTable.resize(markers->totalSize());
+        std::fill(mg.vertexTable.begin(), mg.vertexTable.end(), MarkerGraph::invalidCompressedVertexId);
+
+        mg.reverseComplementVertex.createNew("", 4096);
+        mg.reverseComplementVertex.resize(2);
+        mg.reverseComplementVertex[0] = 1;
+        mg.reverseComplementVertex[1] = 0;
+
+        mg.vertices().clear();
+        mg.vertices().appendVector();
+        {
+            const MarkerId r0p_mid = fixture.assembler->getMarkerId(r0p, interiorOrdinal);
+            const MarkerId r0m_mid = fixture.assembler->getMarkerId(r0m, rcInterior0);
+            const MarkerId r1p_mid = fixture.assembler->getMarkerId(r1p, interiorOrdinal);
+            std::vector<MarkerId> ids = {r0p_mid, r0m_mid, r1p_mid};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(0));
+            }
+        }
+        mg.vertices().appendVector(); // rc partner unused
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() == 2); // selected vertex => (forward + rc)
+
+    const auto a0 = (*anchors)[0];
+    // Must contain both strands for read 0 (duplicate ReadId), because no clean alternative exists.
+    bool hasR0p = false;
+    bool hasR0m = false;
+    for(const auto& mi : a0) {
+        if(mi.orientedReadId == r0p) hasR0p = true;
+        if(mi.orientedReadId == r0m) hasR0m = true;
+    }
+    CHECK(hasR0p);
+    CHECK(hasR0m);
+}
+
 TEST_CASE("Integration: ma_hit_flt keeps contained overlaps", "[integration][hifiasm][filter]") {
     AssemblerIntegrationFixture fixture;
 
@@ -1008,6 +1609,668 @@ TEST_CASE("Integration: ma_hit_contained_advance compresses containment chains",
 
     // The dovetail edge (2,3) remains.
     CHECK_FALSE(fixture.assembler->alignmentData[2].isDeleted());
+}
+
+TEST_CASE("Integration: StringGraph arcs follow hifiasm ma_hit2arc end selection", "[integration][stringgraph][arcs]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 701), randomSequence(1000, 702)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        // Construct a dovetail overlap in the query-to-target sense (qs > tl5, rev=0):
+        // query interval [200,1000), target interval [0,800).
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        ad.qs = 200; ad.qe = 1000;
+        ad.ts = 0;   ad.te = 800;
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+
+        std::vector<bool> keep(1, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+    });
+
+    REQUIRE(fixture.assembler->stringGraph.arcs.size() == 2);
+
+    const auto& a = fixture.assembler->stringGraph.arcs[0];
+    const auto& b = fixture.assembler->stringGraph.arcs[1];
+
+    // Expected: uEnd=0, vEnd=0 => 0+ -> 1+
+    CHECK(a.from == OrientedReadId(ReadId(0), 0).getValue());
+    CHECK(a.to == OrientedReadId(ReadId(1), 0).getValue());
+    CHECK(a.len == 200);
+    CHECK(a.overlapLen == 800);
+
+    // Twin is (to^1)->(from^1).
+    CHECK(b.from == (a.to ^ 1U));
+    CHECK(b.to == (a.from ^ 1U));
+    CHECK(b.len == a.len);
+    CHECK(b.overlapLen == a.overlapLen);
+
+    // Adjacency lists include both arcs.
+    {
+        std::vector<uint32_t> outFrom;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[a.from]) {
+            outFrom.push_back(arcId);
+        }
+        std::ranges::sort(outFrom);
+        CHECK(outFrom == std::vector<uint32_t>({0}));
+
+        std::vector<uint32_t> inTo;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.incoming[a.to]) {
+            inTo.push_back(arcId);
+        }
+        std::ranges::sort(inTo);
+        CHECK(inTo == std::vector<uint32_t>({0}));
+
+        std::vector<uint32_t> outRcFrom;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[b.from]) {
+            outRcFrom.push_back(arcId);
+        }
+        std::ranges::sort(outRcFrom);
+        CHECK(outRcFrom == std::vector<uint32_t>({1}));
+
+        std::vector<uint32_t> inRcTo;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.incoming[b.to]) {
+            inRcTo.push_back(arcId);
+        }
+        std::ranges::sort(inRcTo);
+        CHECK(inRcTo == std::vector<uint32_t>({1}));
+    }
+}
+
+TEST_CASE("Integration: StringGraph arcs use target forward coordinates with rev flag (no RC-mapping)", "[integration][stringgraph][arcs][rev]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 711), randomSequence(1000, 712)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        // Reverse-strand overlap where target interval is still in target's forward coordinates.
+        // Pick values that trigger the qs>tl5 branch in hifiasm's ma_hit2arc for rev=1:
+        // Choose values that survive ma_hit_flt internal-fraction checks and still satisfy qs>tl5:
+        // tl5 = tl - te = 10, qs = 100 => qs>tl5 and ext5=min(qs,tl5)=10.
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), false), info);
+        ad.qs = 100; ad.qe = 1000;
+        ad.ts = 0;   ad.te = 990;
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+    });
+
+    std::vector<bool> keep(1, true);
+    fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+    CAPTURE(fixture.assembler->alignmentData.size());
+    CAPTURE(fixture.assembler->alignmentData[0].qs);
+    CAPTURE(fixture.assembler->alignmentData[0].qe);
+    CAPTURE(fixture.assembler->alignmentData[0].ts);
+    CAPTURE(fixture.assembler->alignmentData[0].te);
+    CAPTURE(fixture.assembler->alignmentData[0].isSameStrand);
+    const auto v0 = fixture.assembler->getValidReadIntervalForTesting(ReadId(0));
+    const auto v1 = fixture.assembler->getValidReadIntervalForTesting(ReadId(1));
+    CAPTURE(v0.start);
+    CAPTURE(v0.end);
+    CAPTURE(v0.isDeleted);
+    CAPTURE(v1.start);
+    CAPTURE(v1.end);
+    CAPTURE(v1.isDeleted);
+
+    REQUIRE(fixture.assembler->stringGraph.arcs.size() == 2);
+    const auto& a = fixture.assembler->stringGraph.arcs[0];
+
+    // Expected from hifiasm ma_hit2arc for rev=1 and qs>tl5: uEnd=0, vEnd=1 => 0+ -> 1-
+    CHECK(a.from == OrientedReadId(ReadId(0), 0).getValue());
+    CHECK(a.to == OrientedReadId(ReadId(1), 1).getValue());
+    CHECK(a.len == 90);
+    CHECK(a.overlapLen == 910);
+
+    // Incoming/outgoing adjacency matches the arc endpoints.
+    {
+        std::vector<uint32_t> outFrom;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[a.from]) {
+            outFrom.push_back(arcId);
+        }
+        std::ranges::sort(outFrom);
+        CHECK(outFrom == std::vector<uint32_t>({0}));
+
+        std::vector<uint32_t> inTo;
+        for (const uint32_t arcId : fixture.assembler->stringGraph.incoming[a.to]) {
+            inTo.push_back(arcId);
+        }
+        std::ranges::sort(inTo);
+        CHECK(inTo == std::vector<uint32_t>({0}));
+    }
+}
+
+TEST_CASE("Integration: StringGraph transitive reduction removes transitive arcs (hifiasm asg_arc_del_trans)", "[integration][stringgraph][clean][transitive]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 721), randomSequence(1000, 722), randomSequence(1000, 723)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // Create arcs:
+        // 0+ -> 1+ len=100
+        // 0+ -> 2+ len=200 (transitive via 1+)
+        // 1+ -> 2+ len=50
+        // Use qs branch (qs > tl5 with tl5=ts=0) so len = qs and overlapLen = ql - qs.
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+
+        makeAlignment(0, ReadId(0), ReadId(1), 100);
+        makeAlignment(1, ReadId(0), ReadId(2), 200);
+        makeAlignment(2, ReadId(1), ReadId(2), 50);
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        std::vector<bool> keep(3, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        REQUIRE(fixture.assembler->stringGraph.arcs.size() == 6);
+
+        // Run only transitive reduction (skip tip cutting by passing maxShortTipReads=0).
+        fixture.assembler->cleanStringGraphInitialHifiasm(/*gapFuzz*/0, /*maxShortTipReads*/0);
+    });
+
+    // alignmentId=1 creates arcId=2 (and its twin arcId=3). It should be deleted as transitive.
+    CHECK(fixture.assembler->stringGraph.arcs[2].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[3].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[0].del == 0);
+    CHECK(fixture.assembler->stringGraph.arcs[4].del == 0);
+
+    // After cleanup, outgoing adjacency from 0+ should only contain arcId=0 (0+->1+).
+    const uint32_t v0 = OrientedReadId(ReadId(0), 0).getValue();
+    std::vector<uint32_t> out0;
+    for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[v0]) {
+        out0.push_back(arcId);
+    }
+    CHECK(out0 == std::vector<uint32_t>({0}));
+}
+
+TEST_CASE("Integration: StringGraph cuts short tips by read count (hifiasm asg_cut_tip)", "[integration][stringgraph][clean][tip]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 731), randomSequence(1000, 732), randomSequence(1000, 733)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(2);
+
+        // Chain: 0+ -> 1+ -> 2+.
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+        makeAlignment(0, ReadId(0), ReadId(1), 100);
+        makeAlignment(1, ReadId(1), ReadId(2), 100);
+
+        fixture.assembler->computeAlignmentTableForTesting();
+
+        std::vector<bool> keep(2, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        REQUIRE(fixture.assembler->stringGraph.readDeleted.isOpen);
+        REQUIRE(fixture.assembler->stringGraph.readDeleted.size() == 3);
+
+        // With maxShortTipReads=2, the 3-read chain is NOT removed.
+        fixture.assembler->cleanStringGraphInitialHifiasm(/*gapFuzz*/0, /*maxShortTipReads*/2);
+        CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(0)] == 0);
+        CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(1)] == 0);
+        CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(2)] == 0);
+
+        // With maxShortTipReads=3, the 3-read tip unitig is removed.
+        fixture.assembler->cleanStringGraphInitialHifiasm(/*gapFuzz*/0, /*maxShortTipReads*/3);
+    });
+
+    CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(0)] == 1);
+    CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(1)] == 1);
+    CHECK(fixture.assembler->stringGraph.readDeleted[ReadId(2)] == 1);
+
+    // All arcs should be deleted.
+    for (uint64_t arcId = 0; arcId < fixture.assembler->stringGraph.arcs.size(); ++arcId) {
+        CHECK(fixture.assembler->stringGraph.arcs[arcId].del == 1);
+    }
+}
+
+TEST_CASE("Integration: StringGraph pre-clean removes simple 1-step bubbles (topology only)", "[integration][stringgraph][clean][preclean]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({
+        randomSequence(1000, 741), randomSequence(1000, 742), randomSequence(1000, 743),
+        randomSequence(1000, 744), randomSequence(1000, 745), randomSequence(1000, 746),
+        randomSequence(1000, 747)
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(7);
+
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+
+        // Long chain into v=3 so it isn't a tip (prevents tip cutting from deleting the bubble source):
+        // 0 -> 1 -> 2 -> 3
+        makeAlignment(0, ReadId(0), ReadId(1), 100);
+        makeAlignment(1, ReadId(1), ReadId(2), 100);
+        makeAlignment(2, ReadId(2), ReadId(3), 100);
+
+        // Bubble at v=3: branches to 4 and 5 reconverge at 6.
+        // Strong branch: len=100 (ol=900)
+        // Weak branch:   len=400 (ol=600)
+        makeAlignment(3, ReadId(3), ReadId(4), 100);  // 3->4
+        makeAlignment(4, ReadId(3), ReadId(5), 400);  // 3->5 (weak)
+        makeAlignment(5, ReadId(4), ReadId(6), 100);  // 4->6
+        makeAlignment(6, ReadId(5), ReadId(6), 400);  // 5->6 (weak)
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        std::vector<bool> keep(7, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        // Run pre-clean (bubble removal + tip cutting).
+        fixture.assembler->cleanStringGraphPreCleanHifiasm(/*maxShortTipReads*/3);
+    });
+
+    // alignmentId=4 (3->5) => arcId=8,9 should be deleted by bubble removal.
+    CHECK(fixture.assembler->stringGraph.arcs[8].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[9].del == 1);
+
+    // alignmentId=6 (5->6) => arcId=12,13 should be deleted by bubble removal.
+    CHECK(fixture.assembler->stringGraph.arcs[12].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[13].del == 1);
+
+    // Strong branch remains.
+    CHECK(fixture.assembler->stringGraph.arcs[6].del == 0);   // 3->4
+    CHECK(fixture.assembler->stringGraph.arcs[10].del == 0);  // 4->6
+}
+
+TEST_CASE("Integration: StringGraph drop-short-overlaps prunes weak overlaps by ratio", "[integration][stringgraph][clean][drop]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 751), randomSequence(1000, 752), randomSequence(1000, 753)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // v=0 has two outgoing arcs:
+        // 0->1 strong (len=100 => ol=900)
+        // 0->2 weak   (len=700 => ol=300)
+        // Also add 1->2 so the weak edge isn't needed.
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+        makeAlignment(0, ReadId(0), ReadId(1), 100);
+        makeAlignment(1, ReadId(0), ReadId(2), 700);
+        makeAlignment(2, ReadId(1), ReadId(2), 100);
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        std::vector<bool> keep(3, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        // Drop with ratio 0.5: threshold ~ 450 => ol=300 should be deleted.
+        fixture.assembler->cleanStringGraphDropShortOverlaps(0.5, /*minOverlapLen*/0);
+    });
+
+    // alignmentId=1 creates arcId=2 and twin arcId=3.
+    CHECK(fixture.assembler->stringGraph.arcs[2].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[3].del == 1);
+    CHECK(fixture.assembler->stringGraph.arcs[0].del == 0);
+    CHECK(fixture.assembler->stringGraph.arcs[4].del == 0);
+
+    // After cleanup, outgoing adjacency from 0+ should only contain arcId=0.
+    const uint32_t v0 = OrientedReadId(ReadId(0), 0).getValue();
+    std::vector<uint32_t> out0;
+    for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[v0]) {
+        out0.push_back(arcId);
+    }
+    CHECK(out0 == std::vector<uint32_t>({0}));
+}
+
+TEST_CASE("Integration: StringGraph breaks simple short cycles", "[integration][stringgraph][clean][cycle]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 771), randomSequence(1000, 772), randomSequence(1000, 773)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+
+        // 0 -> 1 -> 2 -> 0 cycle.
+        makeAlignment(0, ReadId(0), ReadId(1), 100);
+        makeAlignment(1, ReadId(1), ReadId(2), 100);
+        makeAlignment(2, ReadId(2), ReadId(0), 100);
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        std::vector<bool> keep(3, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        // Break short cycles (<=100 reads).
+        const uint64_t broken = fixture.assembler->cleanStringGraphBreakShortCycles(100);
+        CHECK(broken > 0);
+    });
+
+    // The cycle should be broken by deleting exactly one overlap's arc pair on this simple case.
+    // At least one of the three alignment-derived arc pairs must be deleted.
+    const bool pair0Deleted = fixture.assembler->stringGraph.arcs[0].del && fixture.assembler->stringGraph.arcs[1].del;
+    const bool pair1Deleted = fixture.assembler->stringGraph.arcs[2].del && fixture.assembler->stringGraph.arcs[3].del;
+    const bool pair2Deleted = fixture.assembler->stringGraph.arcs[4].del && fixture.assembler->stringGraph.arcs[5].del;
+    CHECK((pair0Deleted || pair1Deleted || pair2Deleted));
+}
+
+TEST_CASE("Integration: StringGraph explorer can list active vertices from arcs", "[integration][stringgraph][http]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 761), randomSequence(1000, 762)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        ad.qs = 100; ad.qe = 1000;
+        ad.ts = 0;   ad.te = 900;
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        std::vector<bool> keep(1, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+    });
+
+    // Request without readId, but with listActive=on should not error and should list at least one vertex.
+    std::ostringstream html;
+    fixture.assembler->exploreStringGraph(std::vector<std::string>{
+        "exploreStringGraph", "listActive", "on", "activeLimit", "10"}, html);
+    const std::string s = html.str();
+    CHECK(s.find("Active vertices") != std::string::npos);
+    CHECK(s.find("exploreStringGraph?readId=") != std::string::npos);
+    const bool hasAtLeastOneVertex =
+        (s.find("0-0") != std::string::npos) || (s.find("1-0") != std::string::npos);
+    CHECK(hasAtLeastOneVertex);
+}
+
+TEST_CASE("Integration: UnitigGraph construction matches hifiasm ma_ug_gen boundaries", "[integration][unitiggraph][build]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({
+        randomSequence(1000, 801),
+        randomSequence(1000, 802),
+        randomSequence(1000, 803),
+        randomSequence(1000, 804),
+        randomSequence(1000, 805),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(4);
+
+        // Build a "fork into a merge" pattern at read 2:
+        //   0 -> 1 -> 2
+        //   3 -> 4 -> 2   (realized via (2,4) overlap whose RC twin is 4+ -> 2+)
+        //
+        // This makes read 2 have multiple incoming arcs, so unitigs stop before read 2.
+        {
+            AlignmentInfo info;
+            info.alignmentId = 0;
+            AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+            ad.qs = 200; ad.qe = 1000;
+            ad.ts = 0;   ad.te = 800;
+            fixture.assembler->alignmentData[0] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 1;
+            AlignmentData ad(OrientedReadPair(ReadId(1), ReadId(2), true), info);
+            ad.qs = 200; ad.qe = 1000;
+            ad.ts = 0;   ad.te = 800;
+            fixture.assembler->alignmentData[1] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 2;
+            AlignmentData ad(OrientedReadPair(ReadId(3), ReadId(4), true), info);
+            ad.qs = 200; ad.qe = 1000;
+            ad.ts = 0;   ad.te = 800;
+            fixture.assembler->alignmentData[2] = ad;
+        }
+        {
+            AlignmentInfo info;
+            info.alignmentId = 3;
+            // Overlap stored as (2,4). Choose coordinates that produce arc 2- -> 4-
+            // so that the RC twin becomes 4+ -> 2+ (second incoming arc into read 2).
+            AlignmentData ad(OrientedReadPair(ReadId(2), ReadId(4), true), info);
+            ad.qs = 0;   ad.qe = 800;
+            ad.ts = 200; ad.te = 1000;
+            fixture.assembler->alignmentData[3] = ad;
+        }
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        fixture.assembler->filterLocalSegments(0, 1);
+        fixture.assembler->applyCoverageCuts(50, 1);
+        fixture.assembler->filterHangingOverlaps(1000, 0.8, 50, 1);
+
+        std::vector<bool> keep(4, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+        fixture.assembler->createUnitigGraphFromStringGraph();
+    });
+
+    // Expect 3 unitigs: [0,1], [3,4], and [2] (in some orientation).
+    REQUIRE(fixture.assembler->unitigGraph.unitigs.size() == 3);
+
+    const auto findUnitigContaining = [&](uint32_t stringVertex) -> uint32_t {
+        for (uint32_t u = 0; u < fixture.assembler->unitigGraph.unitigs.size(); ++u) {
+            const auto path = fixture.assembler->unitigGraph.unitigPaths[u];
+            for (const uint64_t x : path) {
+                if (uint32_t(x >> 32) == stringVertex) {
+                    return u;
+                }
+            }
+        }
+        return uint32_t(invalidReadId);
+    };
+
+    const uint32_t v0p = OrientedReadId(ReadId(0), 0).getValue();
+    const uint32_t v1p = OrientedReadId(ReadId(1), 0).getValue();
+    const uint32_t v2m = OrientedReadId(ReadId(2), 1).getValue(); // unitig for read 2 starts at 2- (ma_ug_gen rule)
+    const uint32_t v3p = OrientedReadId(ReadId(3), 0).getValue();
+    const uint32_t v4p = OrientedReadId(ReadId(4), 0).getValue();
+
+    const uint32_t u01 = findUnitigContaining(v0p);
+    const uint32_t u34 = findUnitigContaining(v3p);
+    const uint32_t u2 = findUnitigContaining(v2m);
+    REQUIRE(u01 != uint32_t(invalidReadId));
+    REQUIRE(u34 != uint32_t(invalidReadId));
+    REQUIRE(u2 != uint32_t(invalidReadId));
+    CHECK(u01 == findUnitigContaining(v1p));
+    CHECK(u34 == findUnitigContaining(v4p));
+
+    // There should be unitig-graph arcs corresponding to the boundary overlaps into read 2.
+    // Specifically, one arc should be derived from the string arc 1+ -> 2+.
+    uint64_t stringArc12 = std::numeric_limits<uint64_t>::max();
+    for (uint64_t arcId = 0; arcId < fixture.assembler->stringGraph.arcs.size(); ++arcId) {
+        const auto& arc = fixture.assembler->stringGraph.arcs[arcId];
+        if (arc.del) continue;
+        if (arc.from == v1p && arc.to == OrientedReadId(ReadId(2), 0).getValue()) {
+            stringArc12 = arcId;
+            break;
+        }
+    }
+    REQUIRE(stringArc12 != std::numeric_limits<uint64_t>::max());
+
+    bool foundUnitigArc12 = false;
+    for (uint64_t arcId = 0; arcId < fixture.assembler->unitigGraph.arcs.size(); ++arcId) {
+        const auto& ua = fixture.assembler->unitigGraph.arcs[arcId];
+        if (ua.del) continue;
+        if (ua.stringArcId != stringArc12) continue;
+        const uint32_t fromUnitig = ua.from >> 1U;
+        const uint32_t toUnitig = ua.to >> 1U;
+        CHECK(fromUnitig == u01);
+        CHECK(toUnitig == u2);
+        foundUnitigArc12 = true;
+        break;
+    }
+    CHECK(foundUnitigArc12);
+}
+
+TEST_CASE("Integration: UnitigGraph transitive reduction removes transitive arcs (hifiasm asg_arc_del_trans)", "[integration][unitiggraph][clean][transitive]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 811)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // Construct a tiny unitig graph directly:
+        // 0+ -> 1+ -> 2+ and 0+ -> 2+ (transitive).
+        auto& ug = fixture.assembler->unitigGraph;
+        ug.remove();
+        ug.unitigs.createNew("", 4096);
+        ug.unitigPaths.createNew("", 4096);
+        ug.arcs.createNew("", 4096);
+        ug.outgoing.createNew("", 4096);
+        ug.incoming.createNew("", 4096);
+        ug.unitigDeleted.createNew("", 4096);
+
+        ug.unitigs.resize(3);
+        ug.unitigDeleted.resize(3);
+        std::fill(ug.unitigDeleted.begin(), ug.unitigDeleted.end(), uint8_t(0));
+
+        // Minimal path placeholders.
+        ug.unitigPaths.appendVector(std::vector<uint64_t>({}));
+        ug.unitigPaths.appendVector(std::vector<uint64_t>({}));
+        ug.unitigPaths.appendVector(std::vector<uint64_t>({}));
+
+        auto addArcPair = [&](uint32_t from, uint32_t to, uint32_t len, uint32_t overlapLen) {
+            UnitigGraphArc a;
+            a.from = from;
+            a.to = to;
+            a.len = len;
+            a.overlapLen = overlapLen;
+            a.del = 0;
+            ug.arcs.push_back(a);
+            UnitigGraphArc b = a;
+            b.from = to ^ 1U;
+            b.to = from ^ 1U;
+            ug.arcs.push_back(b);
+        };
+
+        const uint32_t v0p = (0U << 1) | 0U;
+        const uint32_t v1p = (1U << 1) | 0U;
+        const uint32_t v2p = (2U << 1) | 0U;
+        addArcPair(v0p, v1p, 100, 900);
+        addArcPair(v1p, v2p, 100, 900);
+        addArcPair(v0p, v2p, 210, 790);
+
+        const uint32_t vertexCount = 6;
+        ug.outgoing.beginPass1(vertexCount);
+        ug.incoming.beginPass1(vertexCount);
+        for (uint64_t arcId = 0; arcId < ug.arcs.size(); ++arcId) {
+            ug.outgoing.incrementCount(ug.arcs[arcId].from);
+            ug.incoming.incrementCount(ug.arcs[arcId].to);
+        }
+        ug.outgoing.beginPass2();
+        ug.incoming.beginPass2();
+        for (uint64_t arcId = 0; arcId < ug.arcs.size(); ++arcId) {
+            ug.outgoing.store(ug.arcs[arcId].from, uint32_t(arcId));
+            ug.incoming.store(ug.arcs[arcId].to, uint32_t(arcId));
+        }
+        ug.outgoing.endPass2();
+        ug.incoming.endPass2();
+    });
+
+    fixture.assembler->cleanUnitigGraphInitialHifiasm(/*gapFuzz*/0, /*maxShortTipUnitigs*/0);
+
+    // The transitive arc 0+ -> 2+ is the third arc pair (arcId 4 and 5).
+    CHECK(fixture.assembler->unitigGraph.arcs.size() == 6);
+    CHECK(fixture.assembler->unitigGraph.arcs[4].from == ((0U << 1) | 0U));
+    CHECK(fixture.assembler->unitigGraph.arcs[4].to == ((2U << 1) | 0U));
+    CHECK(fixture.assembler->unitigGraph.arcs[4].del == 1);
+    CHECK(fixture.assembler->unitigGraph.arcs[5].del == 1);
+
+    // Outgoing from 0+ should now only include the arc to 1+.
+    std::vector<uint32_t> out;
+    for (const uint32_t arcId : fixture.assembler->unitigGraph.outgoing[(0U << 1) | 0U]) {
+        out.push_back(arcId);
+    }
+    std::ranges::sort(out);
+    CHECK(out == std::vector<uint32_t>({0}));
 }
 
 TEST_CASE("Integration: detect_chimeric_reads deletes edges for simple chimera", "[integration][hifiasm][filter]") {

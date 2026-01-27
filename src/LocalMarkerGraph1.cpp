@@ -594,7 +594,7 @@ void LocalMarkerGraph1::writeHtml1(
         "<br><svg id='" << svgId <<
         "' width='" <<  sizePixels <<
         "' height='" << sizePixels <<
-        "' viewbox='" << xMin << " " << yMin << " " <<
+        "' viewBox='" << xMin << " " << yMin << " " <<
         xMax - xMin << " " <<
         yMax - yMin << "'"
         " font-size='" << fontSize << "' style='border-style:solid;border-color:Black;stroke-linecap:round'"
@@ -1064,4 +1064,3 @@ void LocalMarkerGraph1::removeLongLowCoverageChains(
     }
 
 }
-

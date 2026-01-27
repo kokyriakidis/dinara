@@ -1790,7 +1790,7 @@ void ClusterGraph::writeHtml(
         "<svg id='" << svgId <<
         "' width='" << options.sizePixels <<
         "' height='" << options.sizePixels <<
-        "' viewbox='" << viewportBox.xMin << " " << viewportBox.yMin << " " <<
+        "' viewBox='" << viewportBox.xMin << " " << viewportBox.yMin << " " <<
         viewportBox.xSize() << " " <<
         viewportBox.ySize() << "'"
         " style='background-color:#f0f0f0'"
@@ -1810,4 +1810,3 @@ void ClusterGraph::writeHtml(
     writeSvgControls(html);
     html << "</div>";
 }
-

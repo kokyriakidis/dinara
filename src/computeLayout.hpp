@@ -243,7 +243,11 @@ template<class Graph> dinara::ComputeLayoutReturnCode dinara::computeLayoutCusto
 
     BGL_FORALL_EDGES_T(e, graph, Graph) {
         auto it = edgeLengthMap.find(e);
-        DINARA_ASSERT(it != edgeLengthMap.end());
+        // Allow callers to provide an edgeLengthMap for only a subset of edges.
+        // Edges not present in the map are omitted from the layout input.
+        if(it == edgeLengthMap.end()) {
+            continue;
+        }
         const vertex_descriptor v0 = source(e, graph);
         const vertex_descriptor v1 = target(e, graph);
         inputFile << vertexIndexMap[v0] << " " << vertexIndexMap[v1] << " " <<
@@ -274,19 +278,28 @@ template<class Graph> dinara::ComputeLayoutReturnCode dinara::computeLayoutCusto
 
 
 
-    // Read the output file written by the custom layout program
-    // and fill in the position map.
+    // Read the output file written by the custom layout program.
+    // Do not assume it is written in the same order as BGL vertex iteration.
+    // The output is expected to contain lines of the form:
+    //   i x y
+    // where i is the vertex index (0..vertexCount-1) we wrote in the input file.
     ifstream outputFile(outputFileName);
     positionMap.clear();
-    BGL_FORALL_VERTICES_T(v, graph, Graph) {
-        uint64_t i;
-        double x, y;
-        outputFile >> i >> x >> y;
-        DINARA_ASSERT(vertexIndexMap[v] == i);
-        positionMap.insert(make_pair(v, array<double, 2>({x, y})));
-
+    uint64_t linesRead = 0;
+    uint64_t vertexIndex = 0;
+    double x = 0.;
+    double y = 0.;
+    while(outputFile >> vertexIndex >> x >> y) {
+        if(vertexIndex >= vertexCount) {
+            return ComputeLayoutReturnCode::Error;
+        }
+        const vertex_descriptor v = vertexVector[vertexIndex];
+        positionMap[v] = array<double, 2>({x, y});
+        ++linesRead;
     }
-    outputFile.clear();
+    if(linesRead != vertexCount) {
+        return ComputeLayoutReturnCode::Error;
+    }
     std::filesystem::remove(outputFileName);
 
 
@@ -295,4 +308,3 @@ template<class Graph> dinara::ComputeLayoutReturnCode dinara::computeLayoutCusto
 }
 
 #endif
-

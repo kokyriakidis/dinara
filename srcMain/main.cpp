@@ -602,51 +602,6 @@ void dinara::main::assemble(
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
 
-
-    // // Build canonical per-Read overlap index (Hifiasm-style storage)
-    // assembler.buildCanonicalOverlapIndex();
-    
-    // // Phasing using canonical storage (sets is_match/strong flags)
-    // assembler.performPhasingCanonical(threadCount);
-
-    // // Create the read graph using the usual method (maps OverlapIndex back to alignmentData)
-    // assembler.createReadGraph7();
-
-
-
-
-    
-
-    // // // Filter by Haplotype Phasing (ONT DP) - legacy path
-    // // assembler.performPhasing(threadCount);
-
-    // // // Variant clustering (not needed for canonical path)
-    // // assembler.performGlobalVariantClustering(
-    // //     assemblerOptions.markerGraphOptions.minCoverage,
-    // //     assemblerOptions.markerGraphOptions.maxCoverage,
-    // //     threadCount);
-
-
-    // // Marker KmerIds are freed here.
-    // // For align method 6 this is done earlier.
-    // if(assemblerOptions.alignOptions.alignMethod != 6) {
-    //     assembler.cleanupMarkerKmerIds();
-    // }
-
-
-    // // // Create the read graph (legacy paths).
-    // // assembler.createReadGraph5();
-    // // assembler.createReadGraph6();  // Uses AlignmentData with isDeleted0/1
-    
-    
-
-    // // // Create the cluster graph for visualization and exploration.
-    // // // This graph shows connections between valid clusters based on read paths.
-    // // // We save the full graph (minEdgeCoverage=0) to include all edges;
-    // // // filtering is done at exploration time in the HTTP server.
-    // // assembler.createClusterGraph(0);
-
-
     // Mode 3 assembly requires reads in raw representation (not RLE).
     DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
 
@@ -655,25 +610,6 @@ void dinara::main::assemble(
 
     // Declare anchors pointer here to avoid scope issues
     shared_ptr<mode3::Anchors> anchors;
-
-    // // cout << timestamp << "Creating anchors from het sites using variantclustering data." << endl;
-    // // anchors = make_shared<mode3::Anchors>(
-    // //     MappedMemoryOwner(assembler),
-    // //     assembler.getReads(),
-    // //     assembler.assemblerInfo->k,
-    // //     assembler.markers,
-    // //     assembler.variantClusteringClusterRepresentatives,
-    // //     *assembler.variantClusteringDisjointSets,
-    // //     assembler.variantClusteringPositionPairs,
-    // //     assembler.variantClusteringPositionPairAlleles,
-    // //     assembler.variantClusteringPositionPairContexts,
-    // //     assembler.variantClusteringValidClustersCompatible,
-    // //     assembler.variantClusteringMemberStatus,
-    // //     /*minClusterCoverage*/ 6,
-    // //     /*minAlleleCoverage*/ 5,
-    // //     /*minCommonKmerFraction*/ 0.8,
-    // //     threadCount);
-
 
     // Compute the coverage range for primary marker graph edges (anchors).
     // This is done BEFORE marker graph vertex creation so filtering happens at source.
@@ -705,22 +641,36 @@ void dinara::main::assemble(
         threadCount);
     
     // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+    assembler.findMarkerGraphReverseComplementVertices(threadCount, true);
 
 
     // Construct the mode3::Anchors from marker graph (for HTTP server visualization).
     // This must be done BEFORE createShasta2Anchors.
-    anchors =
-        make_shared<mode3::Anchors>(
-            MappedMemoryOwner(assembler),
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            *assembler.markers,
-            assembler.markerGraph,
+    if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+        "FromMarkerGraphVerticesAtOverlapEvents") {
+        anchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
             minPrimaryCoverage,
             maxPrimaryCoverage,
-            threadCount,
-            true); // createFromVertices
+            threadCount);
+    } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+        "FromMarkerGraphVerticesBestPerOverlapInterval") {
+        anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount);
+    } else {
+        anchors =
+            make_shared<mode3::Anchors>(
+                MappedMemoryOwner(assembler),
+                assembler.getReads(),
+                assembler.assemblerInfo->k,
+                *assembler.markers,
+                assembler.markerGraph,
+                minPrimaryCoverage,
+                maxPrimaryCoverage,
+                threadCount,
+                true); // createFromVertices
+    }
     
 
     // Compute oriented read journeys.

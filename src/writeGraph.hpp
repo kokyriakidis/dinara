@@ -102,7 +102,7 @@ template<class Graph> void dinara::WriteGraph::writeSvg(
 
     // Begin the svg.
     svg << "<svg id='" << svgId << "' width='" << width << "' height='" << height <<
-        "' viewbox='" << xMin << " " << yMin << " " << xMax-xMin << " " << yMax-yMin <<
+        "' viewBox='" << xMin << " " << yMin << " " << xMax-xMin << " " << yMax-yMin <<
         "'>\n";
 
 
@@ -223,7 +223,7 @@ template<class Graph> void dinara::WriteGraph::writeOrderedSvg(
 
     // Begin the svg.
     svg << "<svg id='" << svgId << "' width='" << width << "' height='" << height <<
-        "' viewbox='" << xMin << " " << yMin << " " << xMax-xMin << " " << yMax-yMin <<
+        "' viewBox='" << xMin << " " << yMin << " " << xMax-xMin << " " << yMax-yMin <<
         "'>\n";
 
     // Accumulate all the edge data
