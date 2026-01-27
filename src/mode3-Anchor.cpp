@@ -117,7 +117,7 @@ void Anchor::check() const
     const Anchor& anchor = *this;
 
     for(uint64_t i=1; i<size(); i++) {
-        DINARA_ASSERT(anchor[i-1].orientedReadId.getReadId() < anchor[i].orientedReadId.getReadId());
+        DINARA_ASSERT(anchor[i-1].orientedReadId < anchor[i].orientedReadId);
     }
 }
 

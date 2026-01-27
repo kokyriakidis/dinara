@@ -1,6 +1,7 @@
 #include "Reads.hpp"
 #include "AssemblerShasta2Anchors.hpp"
 #include "Assembler.hpp"
+#include "mode3-Anchor.hpp"
 #include "timestamp.hpp"
 #include "shasta2/Anchor.hpp"
 #include "shasta2/Reads.hpp"
@@ -204,6 +205,117 @@ namespace dinara {
         for(auto& t : threads) t.join();
     }
 
+    // Populate shasta2::Anchors from an existing dinara::mode3::Anchors.
+    // This is used to keep Shasta2 downstream assembly consistent with the same anchor
+    // selection logic used by Dinara (for example "BestPerOverlapInterval").
+    static void populateAnchorsFromMode3Anchors(
+        const mode3::Anchors& dinaraAnchors,
+        shasta2::Anchors& anchors,
+        uint64_t threadCount)
+    {
+        if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
+
+        const uint64_t anchorCount = dinaraAnchors.size();
+
+        anchors.anchorMarkerInfos.beginPass1(anchorCount);
+
+        std::vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t=0; t<threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                uint64_t batchSize = anchorCount / threadCount;
+                if(batchSize == 0) batchSize = 1;
+                const uint64_t begin = t * batchSize;
+                const uint64_t end = (t == threadCount - 1) ? anchorCount : std::min(anchorCount, begin + batchSize);
+                if(begin >= anchorCount) return;
+
+                std::vector<shasta2::AnchorMarkerInfo> amis;
+                for(uint64_t anchorId=begin; anchorId<end; anchorId++) {
+                    const mode3::Anchor a = dinaraAnchors[anchorId];
+                    amis.clear();
+                    amis.reserve(a.size());
+                    for(const auto& mi : a) {
+                        shasta2::AnchorMarkerInfo ami;
+                        ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
+                        ami.ordinal = mi.ordinal0;
+                        ami.positionInJourney = shasta2::invalid<uint32_t>;
+                        amis.push_back(ami);
+                    }
+
+                    std::sort(amis.begin(), amis.end());
+                    const auto last = std::unique(amis.begin(), amis.end(),
+                        [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
+                            return x.orientedReadId == y.orientedReadId;
+                        });
+                    const uint64_t uniqueCount = uint64_t(std::distance(amis.begin(), last));
+                    for(uint64_t k=0; k<uniqueCount; k++) {
+                        anchors.anchorMarkerInfos.incrementCount(anchorId);
+                    }
+                }
+            });
+        }
+        for(auto& th : threads) th.join();
+        threads.clear();
+
+        anchors.anchorMarkerInfos.beginPass2();
+
+        for(uint64_t t=0; t<threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                uint64_t batchSize = anchorCount / threadCount;
+                if(batchSize == 0) batchSize = 1;
+                const uint64_t begin = t * batchSize;
+                const uint64_t end = (t == threadCount - 1) ? anchorCount : std::min(anchorCount, begin + batchSize);
+                if(begin >= anchorCount) return;
+
+                std::vector<shasta2::AnchorMarkerInfo> amis;
+                for(uint64_t anchorId=begin; anchorId<end; anchorId++) {
+                    const mode3::Anchor a = dinaraAnchors[anchorId];
+                    amis.clear();
+                    amis.reserve(a.size());
+                    for(const auto& mi : a) {
+                        shasta2::AnchorMarkerInfo ami;
+                        ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
+                        ami.ordinal = mi.ordinal0;
+                        ami.positionInJourney = shasta2::invalid<uint32_t>;
+                        amis.push_back(ami);
+                    }
+
+                    std::sort(amis.begin(), amis.end());
+                    const auto last = std::unique(amis.begin(), amis.end(),
+                        [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
+                            return x.orientedReadId == y.orientedReadId;
+                        });
+                    amis.erase(last, amis.end());
+                    std::reverse(amis.begin(), amis.end());
+
+                    for(const auto& ami : amis) {
+                        anchors.anchorMarkerInfos.store(anchorId, ami);
+                    }
+                }
+            });
+        }
+        for(auto& th : threads) th.join();
+        threads.clear();
+
+        anchors.anchorMarkerInfos.endPass2();
+
+        anchors.anchorInfos.resize(anchorCount);
+        for(uint64_t t=0; t<threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                uint64_t batchSize = anchorCount / threadCount;
+                if(batchSize == 0) batchSize = 1;
+                const uint64_t begin = t * batchSize;
+                const uint64_t end = (t == threadCount - 1) ? anchorCount : std::min(anchorCount, begin + batchSize);
+                if(begin >= anchorCount) return;
+
+                for(uint64_t i=begin; i<end; ++i) {
+                    anchors.anchorInfos[i].kmerIndex = shasta2::invalid<uint64_t>;
+                }
+            });
+        }
+        for(auto& th : threads) th.join();
+    }
+
     shasta2::Tee shastaTee;
     ofstream shastaLog;
 
@@ -271,8 +383,20 @@ namespace dinara {
         shasta2::MappedMemoryOwner shastaOwner(dataDirectory, shastaPageSize);
 
         // Options: Anchor creation.
-        options.minAnchorCoverage = 10;
-        options.maxAnchorCoverage = 40;
+        // Use the same coverage range used for Dinara mode3 anchor creation, so Shasta2 sees
+        // the same anchors when we populate anchors from Dinara anchors.
+        uint64_t minAnchorCoverageDinara = dinaraOptions.assemblyOptions.mode3Options.minAnchorCoverage;
+        uint64_t maxAnchorCoverageDinara = dinaraOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
+        if((minAnchorCoverageDinara == 0) and (maxAnchorCoverageDinara == 0)) {
+            tie(minAnchorCoverageDinara, maxAnchorCoverageDinara) = assembler.getPrimaryCoverageRange();
+            minAnchorCoverageDinara = uint64_t(std::round(
+                double(minAnchorCoverageDinara) * dinaraOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
+            maxAnchorCoverageDinara = uint64_t(std::round(
+                double(maxAnchorCoverageDinara) * dinaraOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
+        }
+
+        options.minAnchorCoverage = uint32_t(minAnchorCoverageDinara);
+        options.maxAnchorCoverage = uint32_t(maxAnchorCoverageDinara);
         options.maxAnchorRepeatLength = {8, 3, 3, 3, 3};
 
         // Options: Anchor graph.
@@ -617,7 +741,25 @@ namespace dinara {
             shastaMarkers,
             shastaMarkerKmers);
 
-        populateAnchors(assembler, *shastaAnchors, threadCount);
+        const string& anchorMethod = dinaraOptions.assemblyOptions.mode3Options.anchorCreationMethod;
+        if(anchorMethod == "FromMarkerGraphVerticesBestPerOverlapInterval") {
+            cout << timestamp << "Populating Shasta2 anchors using Dinara BestPerOverlapInterval anchors..." << endl;
+            const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+                minAnchorCoverageDinara,
+                maxAnchorCoverageDinara,
+                threadCount);
+            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+        } else if(anchorMethod == "FromMarkerGraphVerticesAtOverlapEvents") {
+            cout << timestamp << "Populating Shasta2 anchors using Dinara OverlapEvents anchors..." << endl;
+            const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
+                minAnchorCoverageDinara,
+                maxAnchorCoverageDinara,
+                threadCount);
+            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+        } else {
+            // Default: treat marker graph vertices as anchors.
+            populateAnchors(assembler, *shastaAnchors, threadCount);
+        }
         
         cout << timestamp << "Shasta2 Anchors created (" << shastaAnchors->size() << " anchors)." << endl;
 

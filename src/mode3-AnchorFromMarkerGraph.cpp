@@ -130,6 +130,99 @@ Anchors::Anchors(
 
 
 
+// Create Anchors from a selected subset of marker graph vertices.
+Anchors::Anchors(
+    const MappedMemoryOwner& mappedMemoryOwner,
+    const Reads& reads,
+    uint64_t k,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    const MarkerGraph& markerGraph,
+    const vector<MarkerGraphVertexId>& selectedVertexIds,
+    uint64_t minPrimaryCoverage,
+    uint64_t maxPrimaryCoverage,
+    uint64_t threadCount) :
+    MultithreadedObject<Anchors>(*this),
+    MappedMemoryOwner(mappedMemoryOwner),
+    reads(reads),
+    k(k),
+    markers(markers)
+{
+    performanceLog << timestamp << "Anchor creation from selected marker graph vertices begins." << endl;
+
+    // Sanity checks and get kHalf.
+    DINARA_ASSERT((k % 2) == 0);
+    kHalf = k / 2;
+    DINARA_ASSERT(reads.representation == 0);
+    DINARA_ASSERT(markers.isOpen());
+    DINARA_ASSERT(markerGraph.vertices().isOpen());
+    DINARA_ASSERT(markerGraph.vertexTable.isOpen);
+    DINARA_ASSERT(markerGraph.reverseComplementVertex.isOpen);
+
+    // Adjust the numbers of threads, if necessary.
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    // Store the arguments so the threads can see them.
+    auto& data = constructFromMarkerGraphData;
+    data.minPrimaryCoverage = minPrimaryCoverage;
+    data.maxPrimaryCoverage = maxPrimaryCoverage;
+    data.createFromVertices = true;
+    data.markerGraphPointer = &markerGraph;
+    data.selectedVertexIdsPointer = &selectedVertexIds;
+
+    // Make space for the edges found by each thread.
+    data.threadMarkerIntervals.resize(threadCount);
+    data.threadSequences.resize(threadCount);
+
+    // Parallelize over the selected vertices.
+    const uint64_t batchSize = 1000;
+    setupLoadBalancing(selectedVertexIds.size(), batchSize);
+    runThreads(&Anchors::constructFromSelectedMarkerGraphVerticesThreadFunction, threadCount);
+
+    // Gather the Anchors found by all threads.
+    anchorMarkerIntervals.createNew(
+        largeDataName("AnchorMarkerIntervals"),
+        largeDataPageSize);
+    anchorSequences.createNew(
+        largeDataName("AnchorSequences"), largeDataPageSize);
+    for(uint64_t threadId=0; threadId<threadCount; threadId++) {
+        auto& threadMarkerIntervals = *data.threadMarkerIntervals[threadId];
+        auto& threadSequences = *data.threadSequences[threadId];
+        DINARA_ASSERT(threadMarkerIntervals.size() == threadSequences.size());
+        for(uint64_t i=0; i<threadMarkerIntervals.size(); i++) {
+            const auto thisAnchorMarkerIntervals = threadMarkerIntervals[i];
+            anchorMarkerIntervals.appendVector();
+            for(const auto& threadMarkerInterval: thisAnchorMarkerIntervals) {
+                anchorMarkerIntervals.append(
+                    AnchorMarkerInterval(threadMarkerInterval.orientedReadId, threadMarkerInterval.ordinal0));
+            }
+            const span<Base> sequence = threadSequences[i];
+            anchorSequences.appendVector(sequence.begin(), sequence.end());
+        }
+        threadMarkerIntervals.remove();
+        threadSequences.remove();
+        data.threadMarkerIntervals[threadId] = 0;
+        data.threadSequences[threadId] = 0;
+    }
+    data.threadMarkerIntervals.clear();
+    data.threadSequences.clear();
+    data.selectedVertexIdsPointer = nullptr;
+
+    cout << "Found " << anchorMarkerIntervals.size() << " anchors." << endl;
+
+    // Initialize the AnchorInfos with ordinalOffset=0 for vertex anchors.
+    anchorInfos.createNew(largeDataName("AnchorInfos"), largeDataPageSize);
+    anchorInfos.resize(anchorMarkerIntervals.size());
+    for(AnchorId anchorId=0; anchorId<anchorMarkerIntervals.size(); anchorId++) {
+        anchorInfos[anchorId].ordinalOffset = 0;
+    }
+
+    performanceLog << timestamp << "Anchor creation from selected marker graph vertices ends." << endl;
+}
+
+
+
 void Anchors::constructFromMarkerGraphThreadFunction(uint64_t threadId)
 {
     // Access the data set up by createPrimaryMarkerGraphEdges.
@@ -432,6 +525,95 @@ void Anchors::constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId)
             }
             markerIntervals.appendVector(currentAnchorMarkers);
             sequences.appendVector(vector<Base>()); // Empty sequence
+        }
+    }
+}
+
+
+void Anchors::constructFromSelectedMarkerGraphVerticesThreadFunction(uint64_t threadId)
+{
+    using ThreadMarkerInterval = ConstructFromMarkerGraphData::ThreadMarkerInterval;
+    auto& data = constructFromMarkerGraphData;
+    DINARA_ASSERT(data.selectedVertexIdsPointer);
+    const vector<MarkerGraphVertexId>& selectedVertexIds = *data.selectedVertexIdsPointer;
+
+    const uint64_t minPrimaryCoverage = data.minPrimaryCoverage;
+    const uint64_t maxPrimaryCoverage = data.maxPrimaryCoverage;
+
+    const MarkerGraph& markerGraph = *data.markerGraphPointer;
+    const auto& markerGraphVertices = markerGraph.vertices();
+
+    // Create the vector to contain the marker intervals for the Anchors found by this thread.
+    shared_ptr< MemoryMapped::VectorOfVectors<ThreadMarkerInterval, uint64_t> > markerIntervalsPointer =
+        make_shared< MemoryMapped::VectorOfVectors<ThreadMarkerInterval, uint64_t> >();
+    data.threadMarkerIntervals[threadId] = markerIntervalsPointer;
+    auto& markerIntervals = *markerIntervalsPointer;
+    markerIntervals.createNew(
+        largeDataName("tmp-ThreadAnchorMarkerIntervals-" + to_string(threadId)),
+        largeDataPageSize);
+
+    // Create the vector to contain the sequences for the Anchors found by this thread.
+    // For vertex-based anchors, sequences are empty.
+    shared_ptr< MemoryMapped::VectorOfVectors<Base, uint64_t> > sequencesPointer =
+        make_shared< MemoryMapped::VectorOfVectors<Base, uint64_t> >();
+    data.threadSequences[threadId] = sequencesPointer;
+    auto& sequences = *sequencesPointer;
+    sequences.createNew(
+        largeDataName("tmp-ThreadAnchorSequences-" + to_string(threadId)),
+        largeDataPageSize);
+
+    vector<ThreadMarkerInterval> currentAnchorMarkers;
+
+    uint64_t begin, end;
+    while(getNextBatch(begin, end)) {
+        for(uint64_t i=begin; i!=end; ++i) {
+            const MarkerGraphVertexId vertexId = selectedVertexIds[i];
+            const MarkerGraphVertexId rcVertexId = markerGraph.reverseComplementVertex[vertexId];
+            if(vertexId > rcVertexId) {
+                continue; // not canonical
+            }
+
+            const auto vertexMarkerIds = markerGraphVertices[vertexId];
+            if(vertexMarkerIds.size() < minPrimaryCoverage) {
+                continue;
+            }
+
+            currentAnchorMarkers.clear();
+            currentAnchorMarkers.reserve(vertexMarkerIds.size());
+            // Allow both strands of the same read (duplicate ReadId) when such a vertex is selected.
+            // Still ensure there are no duplicate oriented reads in the anchor.
+            ReadId lastOrientedReadValue = invalidReadId;
+            for(const MarkerId markerId: vertexMarkerIds) {
+                OrientedReadId orientedReadId;
+                uint32_t ordinal0;
+                tie(orientedReadId, ordinal0) = dinara::findMarkerId(markerId, markers);
+                const ReadId orientedReadValue = orientedReadId.getValue();
+                if(orientedReadValue == lastOrientedReadValue) {
+                    continue;
+                }
+                lastOrientedReadValue = orientedReadValue;
+                ThreadMarkerInterval interval;
+                interval.orientedReadId = orientedReadId;
+                interval.ordinal0 = ordinal0;
+                currentAnchorMarkers.push_back(interval);
+            }
+
+            if(currentAnchorMarkers.size() < minPrimaryCoverage || currentAnchorMarkers.size() > maxPrimaryCoverage) {
+                continue;
+            }
+
+            markerIntervals.appendVector(currentAnchorMarkers);
+            sequences.appendVector(vector<Base>());
+
+            // Reverse complement anchor.
+            std::reverse(currentAnchorMarkers.begin(), currentAnchorMarkers.end());
+            for(auto& interval : currentAnchorMarkers) {
+                interval.orientedReadId.flipStrand();
+                const uint64_t markerCount = markers.size(interval.orientedReadId.getValue());
+                interval.ordinal0 = uint32_t(markerCount) - 1 - interval.ordinal0;
+            }
+            markerIntervals.appendVector(currentAnchorMarkers);
+            sequences.appendVector(vector<Base>());
         }
     }
 }

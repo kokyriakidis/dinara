@@ -1162,7 +1162,8 @@ void AssemblerOptions::addConfigurableOptions()
         value<string>(&assemblyOptions.mode3Options.anchorCreationMethod)->
         default_value("FromMarkerGraphEdges"),
         "Selects the method used to create anchors for mode 3 assembly. "
-        "Can be: FromMarkerGraphEdges, FromMarkerKmers, FromJson.")
+        "Can be: FromMarkerGraphEdges, FromMarkerGraphVerticesAtOverlapEvents, "
+        "FromMarkerGraphVerticesBestPerOverlapInterval, FromMarkerKmers, FromJson.")
 
         ("Assembly.mode3.minAnchorCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.minAnchorCoverage)->
@@ -1787,4 +1788,3 @@ string dinara::convertBoolToPythonString(bool flag)
 {
     return flag ? "True" : "False";
 }
-

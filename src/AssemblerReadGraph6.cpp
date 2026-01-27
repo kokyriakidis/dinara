@@ -106,13 +106,13 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterHangDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // Step 6: Remove contained reads (ma_hit_contained_advance equivalent)
-    // Marks fully contained reads and removes their overlaps
-    removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0 
-         << ", isDeleted1=" << afterContainDel1 
-         << ", active=" << countActiveAlignments() << endl;
+    // // Step 6: Remove contained reads (ma_hit_contained_advance equivalent)
+    // // Marks fully contained reads and removes their overlaps
+    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+    //      << ", isDeleted1=" << afterContainDel1
+    //      << ", active=" << countActiveAlignments() << endl;
     
     // Step 7: Final filtering pass - apply phasing decisions
     const uint64_t alignmentCount = alignmentData.size();
@@ -217,6 +217,40 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 
     // Step 8: Create read graph from kept alignments
     createReadGraphUsingSelectedAlignments(keepAlignment);
+
+    // // Step 9: Create directed string graph arcs (hifiasm-style suffix->prefix)
+    // createStringGraphUsingSelectedAlignments(keepAlignment);
+    //
+    // // Step 10: Initial string-graph cleaning matching hifiasm defaults.
+    // // Hifiasm runs `asg_arc_del_trans(gap_fuzz)` inside `gen_init_sg`, then cuts short tips.
+    // // Defaults: gap_fuzz=1000, max_short_tip=3 (tip unitigs of <=3 reads).
+    // cleanStringGraphInitialHifiasm(/*gapFuzz*/1000, /*maxShortTipReads*/3);
+    //
+    // // Step 11: Next-stage topology clean (hifiasm pre_clean intent): remove very small bubbles + re-cut tips.
+    // cleanStringGraphPreCleanHifiasm(/*maxShortTipReads*/3);
+    //
+    // // Step 12: Additional cleanup rounds (approximate hifiasm clean_graph rounds):
+    // // progressively drop short overlaps by overlap-length ratio, with intermittent pre-clean.
+    // // Hifiasm defaults: clean_round=4, min_drop_rate=0.2, max_drop_rate=0.8, finalMinOverlapLen=2000.
+    // cleanStringGraphDropOverlapRoundsHifiasm(
+    //     /*cleanRounds*/4,
+    //     /*minDropRate*/0.2,
+    //     /*maxDropRate*/0.8,
+    //     /*maxShortTipReads*/3,
+    //     /*finalMinOverlapLen*/2000);
+    //
+    // // Next hifiasm stage: compress the cleaned string graph into unitigs.
+    // createUnitigGraphFromStringGraph();
+    //
+    // // Additional hifiasm-like cleaning at the unitig level (topology-only).
+    // cleanUnitigGraphInitialHifiasm(/*gapFuzz*/1000, /*maxShortTipUnitigs*/3);
+    // cleanUnitigGraphPreCleanHifiasm(/*maxShortTipUnitigs*/3);
+    // cleanUnitigGraphDropOverlapRoundsHifiasm(
+    //     /*cleanRounds*/4,
+    //     /*minDropRate*/0.2,
+    //     /*maxDropRate*/0.8,
+    //     /*maxShortTipUnitigs*/3,
+    //     /*finalMinOverlapLen*/2000);
     
     cout << timestamp << "createReadGraph6 completed." << endl;
 }

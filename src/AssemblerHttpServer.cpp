@@ -235,6 +235,8 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(alignSequencesInBaseRepresentation);
     DINARA_ADD_TO_FUNCTION_TABLE(assessAlignments);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreStringGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreUnitigGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph0);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph1);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphVertex);
@@ -504,6 +506,34 @@ void Assembler::writeNavigation(ostream& html) const
             });
     }
 
+    // String graph menu.
+    bool stringGraphIsAvailable = false;
+    try {
+        checkStringGraphIsOpen();
+        stringGraphIsAvailable = true;
+    } catch(...) {
+    }
+
+    if(stringGraphIsAvailable) {
+        writeNavigation(html, "String graph", {
+            {"String graph", "exploreStringGraph"},
+            });
+    }
+
+    // Unitig graph menu (optional).
+    bool unitigGraphIsAvailable = false;
+    try {
+        checkUnitigGraphIsOpen();
+        unitigGraphIsAvailable = true;
+    } catch(...) {
+    }
+
+    if(unitigGraphIsAvailable) {
+        writeNavigation(html, "Unitig graph", {
+            {"Unitig graph", "exploreUnitigGraph"},
+            });
+    }
+
 
     // Marker graph menu.
     if((assemblerInfo->assemblyMode != 3) or httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
@@ -744,6 +774,22 @@ void Assembler::accessAllSoft()
     } catch(const exception& e) {
         cout << "The read graph is not accessible." << endl;
         allDataAreAvailable = false;
+    }
+
+    // String graph is optional.
+    try {
+        accessStringGraph();
+    } catch(const exception& e) {
+        cout << "The string graph is not accessible." << endl;
+        // Don't set allDataAreAvailable = false since this is optional.
+    }
+
+    // Unitig graph is optional (built from the cleaned string graph).
+    try {
+        accessUnitigGraph();
+    } catch(const exception& e) {
+        cout << "The unitig graph is not accessible." << endl;
+        // Don't set allDataAreAvailable = false since this is optional.
     }
 
 

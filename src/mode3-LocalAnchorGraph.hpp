@@ -33,6 +33,17 @@ class dinara::mode3::LocalAnchorGraphDisplayOptions {
 public:
     uint64_t sizePixels;
     string layoutMethod;
+    double layoutTimeoutSeconds;
+
+    // Optional graph processing for visualization/debugging.
+    // raw: no additional processing.
+    // cleaned: hide edges without valid offsets, normalize directions by offset sign.
+    // reduced: cleaned + transitive reduction.
+    // bubble: reduced + highlight detected bubble edges.
+    string processingMode;
+    uint64_t transitiveFuzzBases;
+    double transitiveCoverageFactor;
+    uint64_t bubbleMaxDepth;
 
     // Vertices.
     double vertexSize;
@@ -76,9 +87,30 @@ class dinara::mode3::LocalAnchorGraphEdge {
 public:
     AnchorPairInfo info;
     uint64_t coverage;
+    uint8_t displayFlags = 0;
+
+    enum DisplayFlag : uint8_t {
+        Hidden = 1,
+        Transitive = 2,
+        Bubble = 4,
+        FlippedByOffset = 8
+    };
+
+    bool isHidden() const
+    {
+        return (displayFlags & Hidden) != 0;
+    }
 
     double coverageLoss() const
     {
+        // Robust against incomplete/invalid AnchorPairInfo.
+        // In normal operation, coverage <= common and common > 0.
+        if(info.common == 0) {
+            return 1.;
+        }
+        if(coverage >= info.common) {
+            return 0.;
+        }
         return double(info.common - coverage) / double(info.common);
     }
 };
@@ -117,6 +149,15 @@ public:
         ) const;
 
 private:
+    void prepareForDisplay(const LocalAnchorGraphDisplayOptions&);
+    void normalizeDirectionsByOffset();
+    void reduceTransitiveEdges(uint64_t fuzzBases, double coverageFactor);
+    void highlightBubbles(uint64_t maxDepth);
+
+    uint64_t hiddenEdgeCount = 0;
+    uint64_t transitiveEdgeCount = 0;
+    uint64_t flippedEdgeCount = 0;
+    uint64_t bubbleEdgeCount = 0;
 
     // Html/svg output without using svg output created by Graphviz.
     void writeHtml2(
@@ -126,6 +167,7 @@ private:
     // The position of each vertex in the computed layout.
     std::map<vertex_descriptor, array<double, 2> > layout;
     void computeLayout(const LocalAnchorGraphDisplayOptions&);
+    string layoutStatusMessage;
 
     // The bounding box of the computed layout.
     class Box {
@@ -134,8 +176,8 @@ private:
         double xMax;
         double yMin;
         double yMax;
-        double xSize() {return xMax - xMin;}
-        double ySize() {return yMax - yMin;}
+        double xSize() const {return xMax - xMin;}
+        double ySize() const {return yMax - yMin;}
         void makeSquare();
         void extend(double factor);
     };
