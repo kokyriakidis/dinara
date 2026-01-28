@@ -1062,6 +1062,13 @@ void Mode3Assembler::exploreLocalAnchorGraph(
     html << "<h1>Local anchor graph</h1>";
     html << "The local anchor graph has " << num_vertices(graph) <<
          " vertices and " << num_edges(graph) << " edges.";
+    if(num_edges(graph) == 0) {
+        html << "<p><b>Note:</b> No edges were found with the current filters "
+            "(minCoverage=" << minCoverage <<
+            (filterEdgesByCoverageLoss ? ", coverage-loss filter enabled" : ", coverage-loss filter disabled") <<
+            "). Try lowering minCoverage (for example 0 or 1), disabling the coverage-loss filter, "
+            "or starting from a different anchor id.";
+    }
 
     // Write it to html.
     graph.writeHtml(html, displayOptions);
@@ -1423,6 +1430,11 @@ const AssemblyGraphPostprocessor& Mode3Assembler::getAssemblyGraph(
     uint64_t componentId
     )
 {
+    if(!hasComponentData()) {
+        throw runtime_error(
+            "Mode3Assembler component data are not available. "
+            "This usually means mode 3 assembly was not run (only anchors were created).");
+    }
     auto it = assemblyGraphsMap.find({assemblyStage, componentId});
 
     if(it == assemblyGraphsMap.end()) {

@@ -29,6 +29,8 @@ but read-only form using MemoryMapped data structures.
 namespace dinara {
     class ReadGraph;
     class ReadGraphEdge;
+    class DirectedReadGraph;
+    class DirectedReadGraphArc;
 }
 
 
@@ -125,6 +127,62 @@ public:
         std::mt19937& randomSource,
         vector<ReadId>& cluster,
         bool debug) const;
+};
+
+// A directed read graph arc.
+// Vertices are oriented reads (OrientedReadId values).
+class dinara::DirectedReadGraphArc {
+public:
+    uint32_t from = 0;
+    uint32_t to = 0;
+
+    // The id of the alignment that corresponds to the arc.
+    uint64_t alignmentId : 62;
+    uint64_t crossesStrands : 1;
+    uint64_t hasInconsistentAlignment : 1;
+
+    DirectedReadGraphArc()
+    {
+        alignmentId = 0;
+        crossesStrands = 0;
+        hasInconsistentAlignment = 0;
+    }
+};
+
+
+// Directed read graph stored with memory-mapped data structures.
+// Arcs are indexed in outgoing/incoming adjacency lists.
+class dinara::DirectedReadGraph {
+public:
+    MemoryMapped::Vector<DirectedReadGraphArc> arcs;
+    MemoryMapped::VectorOfVectors<uint32_t, uint32_t> outgoing;
+    MemoryMapped::VectorOfVectors<uint32_t, uint32_t> incoming;
+
+    void unreserve()
+    {
+        if(arcs.isOpen) {
+            arcs.unreserve();
+        }
+        if(outgoing.isOpen()) {
+            outgoing.unreserve();
+        }
+        if(incoming.isOpen()) {
+            incoming.unreserve();
+        }
+    }
+
+    void remove()
+    {
+        if(arcs.isOpen) {
+            arcs.remove();
+        }
+        if(outgoing.isOpen()) {
+            outgoing.remove();
+        }
+        if(incoming.isOpen()) {
+            incoming.remove();
+        }
+    }
 };
 
 

@@ -169,6 +169,17 @@ public:
         uint64_t maxPrimaryCoverage,
         uint64_t threadCount);
 
+    // This constructor creates Anchors from explicit AnchorMarkerIntervals.
+    // Sequences are stored empty (vertex-style anchors).
+    Anchors(
+        const MappedMemoryOwner&,
+        const Reads& reads,
+        uint64_t k,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        const vector<vector<AnchorMarkerInterval>>& anchorMarkerIntervals,
+        uint32_t ordinalOffset,
+        uint64_t threadCount);
+
     // This constructor creates the Anchors from heterozygous sites (variant clustering).
     Anchors(
         const MappedMemoryOwner&,

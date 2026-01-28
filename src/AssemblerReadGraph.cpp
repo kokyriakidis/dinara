@@ -165,6 +165,7 @@ void Assembler::createReadGraph(
 
     // Create the read graph using the alignments we selected.
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 }
 
 
@@ -242,6 +243,84 @@ void Assembler::createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignme
 
 
 
+void Assembler::createDirectedReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment)
+{
+    // Create a directed version of the read graph.
+    // Vertices are oriented reads; each kept alignment yields two arcs (both directions),
+    // and we also emit the reverse-complemented arcs.
+
+    // Recreate from scratch.
+    directedReadGraph.remove();
+
+    // Create arcs.
+    directedReadGraph.arcs.createNew(largeDataName("DirectedReadGraphArcs"), largeDataPageSize);
+    const uint64_t readCount = reads->readCount();
+    const uint64_t vertexCount = 2 * readCount;
+
+    auto addArc = [&](OrientedReadId from, OrientedReadId to, uint64_t alignmentId) {
+        DirectedReadGraphArc arc;
+        arc.from = from.getValue();
+        arc.to = to.getValue();
+        arc.alignmentId = alignmentId & 0x3fff'ffff'ffff'ffff;
+        arc.crossesStrands = 0;
+        arc.hasInconsistentAlignment = 0;
+        directedReadGraph.arcs.push_back(arc);
+    };
+
+    for(size_t alignmentId=0; alignmentId<alignmentData.size(); alignmentId++) {
+
+        // Record whether this alignment is used in the read graph.
+        const bool keepThisAlignment = keepAlignment[alignmentId];
+        AlignmentData& alignment = alignmentData[alignmentId];
+        alignment.info.isInReadGraph = uint8_t(keepThisAlignment);
+
+        if(not keepThisAlignment) {
+            continue;
+        }
+
+        // Compute the oriented reads for this alignment (same convention as the undirected read graph).
+        OrientedReadId a(alignment.readIds[0], 0);
+        OrientedReadId b(alignment.readIds[1], alignment.isSameStrand ? 0 : 1);
+
+        // Arcs on the forward-oriented pair.
+        addArc(a, b, alignmentId);
+        addArc(b, a, alignmentId);
+
+        // Reverse complemented arcs.
+        a.flipStrand();
+        b.flipStrand();
+        addArc(a, b, alignmentId);
+        addArc(b, a, alignmentId);
+    }
+
+    directedReadGraph.unreserve();
+
+    // Build outgoing/incoming adjacency.
+    directedReadGraph.outgoing.createNew(largeDataName("DirectedReadGraphOutgoing"), largeDataPageSize);
+    directedReadGraph.incoming.createNew(largeDataName("DirectedReadGraphIncoming"), largeDataPageSize);
+
+    directedReadGraph.outgoing.beginPass1(vertexCount);
+    directedReadGraph.incoming.beginPass1(vertexCount);
+    for(const DirectedReadGraphArc& arc: directedReadGraph.arcs) {
+        DINARA_ASSERT(arc.from < vertexCount);
+        DINARA_ASSERT(arc.to < vertexCount);
+        directedReadGraph.outgoing.incrementCount(arc.from);
+        directedReadGraph.incoming.incrementCount(arc.to);
+    }
+    directedReadGraph.outgoing.beginPass2();
+    directedReadGraph.incoming.beginPass2();
+    for(size_t i=0; i<directedReadGraph.arcs.size(); i++) {
+        const DirectedReadGraphArc& arc = directedReadGraph.arcs[i];
+        directedReadGraph.outgoing.store(arc.from, uint32_t(i));
+        directedReadGraph.incoming.store(arc.to, uint32_t(i));
+    }
+    directedReadGraph.outgoing.endPass2();
+    directedReadGraph.incoming.endPass2();
+    directedReadGraph.unreserve();
+}
+
+
+
 void Assembler::accessReadGraph()
 {
     readGraph.edges.accessExistingReadOnly(largeDataName("ReadGraphEdges"));
@@ -261,6 +340,30 @@ void Assembler::checkReadGraphIsOpen() const
         throw runtime_error("Read graph connectivity is not accessible.");
     }
 
+}
+
+
+
+void Assembler::accessDirectedReadGraph()
+{
+    directedReadGraph.arcs.accessExistingReadOnly(largeDataName("DirectedReadGraphArcs"));
+    directedReadGraph.outgoing.accessExistingReadOnly(largeDataName("DirectedReadGraphOutgoing"));
+    directedReadGraph.incoming.accessExistingReadOnly(largeDataName("DirectedReadGraphIncoming"));
+}
+
+
+
+void Assembler::checkDirectedReadGraphIsOpen() const
+{
+    if(!directedReadGraph.arcs.isOpen) {
+        throw runtime_error("Directed read graph arcs are not accessible.");
+    }
+    if(!directedReadGraph.outgoing.isOpen()) {
+        throw runtime_error("Directed read graph outgoing adjacency is not accessible.");
+    }
+    if(!directedReadGraph.incoming.isOpen()) {
+        throw runtime_error("Directed read graph incoming adjacency is not accessible.");
+    }
 }
 
 
@@ -403,6 +506,162 @@ bool Assembler::createLocalReadGraph(
             }
         }
     }
+    return true;
+}
+
+
+
+// Create a local subgraph of the directed read graph,
+// starting at one or more given vertices and extending out to a specified
+// distance (number of arcs).
+// This returns a LocalReadGraph so it can be rendered/analyzed with the same
+// pipeline used for the undirected read graph.
+bool Assembler::createLocalDirectedReadGraph(
+        OrientedReadId start,
+        uint32_t maxDistance,
+        bool allowChimericReads,
+        bool allowCrossStrandEdges,
+        bool allowInconsistentAlignmentEdges,
+        double timeout,
+        LocalReadGraph& graph)
+{
+    const vector<OrientedReadId> starts = {start};
+    return createLocalDirectedReadGraph(
+        starts,
+        maxDistance,
+        allowChimericReads,
+        allowCrossStrandEdges,
+        allowInconsistentAlignmentEdges,
+        timeout,
+        graph);
+}
+
+
+
+bool Assembler::createLocalDirectedReadGraph(
+    const vector<OrientedReadId>& starts,
+    uint32_t maxDistance,
+    bool allowChimericReads,
+    bool allowCrossStrandEdges,
+    bool allowInconsistentAlignmentEdges,
+    double timeout,
+    LocalReadGraph& graph)
+{
+    const auto startTime = steady_clock::now();
+
+    // For rendering/analysis we store readGraph edge ids in LocalReadGraphEdge.globalEdgeId.
+    // So require both graphs to be available.
+    checkDirectedReadGraphIsOpen();
+    checkReadGraphIsOpen();
+
+    auto findReadGraphEdgeId = [&](OrientedReadId from, OrientedReadId to, uint64_t alignmentId) -> uint64_t {
+        for(const uint64_t edgeId: readGraph.connectivity[from.getValue()]) {
+            DINARA_ASSERT(edgeId < readGraph.edges.size());
+            const ReadGraphEdge& edge = readGraph.edges[edgeId];
+            if(edge.alignmentId != alignmentId) {
+                continue;
+            }
+            if(edge.getOther(from) == to) {
+                return edgeId;
+            }
+        }
+        return invalid<uint64_t>;
+    };
+
+
+    // Initialize a BFS starting at the start vertex.
+    std::queue<OrientedReadId> q;
+    for(const auto& start: starts) {
+        if(!allowChimericReads && reads->getFlags(start.getReadId()).isChimeric) {
+            continue;
+        }
+        graph.addVertex(
+            start,
+            uint32_t((*markers)[start.getValue()].size()),
+            reads->getFlags(start.getReadId()).isChimeric,
+            0);
+        q.push(start);
+    }
+
+    // Do the BFS.
+    while(!q.empty()) {
+
+        // Timeout check.
+        if(timeout > 0. && (seconds(steady_clock::now() - startTime) > timeout)) {
+            graph.clear();
+            return false;
+        }
+
+        const OrientedReadId orientedReadId0 = q.front();
+        q.pop();
+        const uint32_t distance0 = graph.getDistance(orientedReadId0);
+        const uint32_t distance1 = distance0 + 1;
+
+        const uint32_t v0 = orientedReadId0.getValue();
+        DINARA_ASSERT(v0 < directedReadGraph.outgoing.size());
+
+        // Traverse outgoing arcs. The directed read graph created by Dinara emits arcs in both
+        // directions, so this provides the same neighborhood as the undirected read graph.
+        for(const uint64_t arcId: directedReadGraph.outgoing[v0]) {
+            DINARA_ASSERT(arcId < directedReadGraph.arcs.size());
+            const DirectedReadGraphArc& arc = directedReadGraph.arcs[arcId];
+            DINARA_ASSERT(arc.from == v0);
+
+            const OrientedReadId orientedReadId1 = OrientedReadId::fromValue(ReadId(arc.to));
+
+            // If this read is flagged chimeric and we don't allow chimeric reads, skip.
+            if(!allowChimericReads && reads->getFlags(orientedReadId1.getReadId()).isChimeric) {
+                continue;
+            }
+
+            // Find the corresponding readGraph edge id.
+            const uint64_t globalEdgeId = findReadGraphEdgeId(orientedReadId0, orientedReadId1, arc.alignmentId);
+            if(globalEdgeId == invalid<uint64_t>) {
+                continue;
+            }
+            const ReadGraphEdge& globalEdge = readGraph.edges[globalEdgeId];
+
+            if(!allowCrossStrandEdges && globalEdge.crossesStrands) {
+                continue;
+            }
+            if(!allowInconsistentAlignmentEdges && globalEdge.hasInconsistentAlignment) {
+                continue;
+            }
+
+            // Get alignment information.
+            const AlignmentData& alignment = alignmentData[globalEdge.alignmentId];
+            const AlignmentInfo alignmentInfo = alignment.orient(orientedReadId0, orientedReadId1);
+            const uint32_t markerCount = alignmentInfo.markerCount;
+
+            if(distance0 < maxDistance) {
+                if(!graph.vertexExists(orientedReadId1)) {
+                    graph.addVertex(
+                        orientedReadId1,
+                        uint32_t((*markers)[orientedReadId1.getValue()].size()),
+                        reads->getFlags(orientedReadId1.getReadId()).isChimeric,
+                        distance1);
+                    q.push(orientedReadId1);
+                }
+                graph.addEdge(
+                    orientedReadId0,
+                    orientedReadId1,
+                    markerCount,
+                    globalEdgeId,
+                    globalEdge.crossesStrands == 1);
+            } else {
+                DINARA_ASSERT(distance0 == maxDistance);
+                if(graph.vertexExists(orientedReadId1)) {
+                    graph.addEdge(
+                        orientedReadId0,
+                        orientedReadId1,
+                        markerCount,
+                        globalEdgeId,
+                        globalEdge.crossesStrands == 1);
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1394,6 +1653,7 @@ void Assembler::removeReadGraphBridges(uint64_t maxDistance)
     readGraph.edges.remove();
     readGraph.connectivity.remove();
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 
     cout << timestamp << "After removing bridges, the read graph uses " <<
         count(keepAlignment.begin(), keepAlignment.end(), true) <<
@@ -2153,4 +2413,3 @@ void Assembler::flagInconsistentAlignmentsThreadFunction2(size_t threadId)
     }
     deduplicate(inconsistentEdgeIds);
 }
-

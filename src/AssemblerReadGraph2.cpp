@@ -245,4 +245,5 @@ void Assembler::createReadGraph2(
     cout << "Keeping " << keepCount << " alignments of " << keepAlignment.size() << endl;
 
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 }

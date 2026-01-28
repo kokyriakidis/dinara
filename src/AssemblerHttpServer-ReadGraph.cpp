@@ -33,6 +33,22 @@ void Assembler::exploreReadGraph(
 }
 
 
+
+void Assembler::exploreDirectedReadGraph(
+    const vector<string>& request,
+    ostream& html)
+{
+    if(readGraph.edges.isOpen && readGraph.connectivity.isOpen() &&
+        directedReadGraph.arcs.isOpen && directedReadGraph.outgoing.isOpen() && directedReadGraph.incoming.isOpen()) {
+        vector<string> request2 = request;
+        request2.push_back("useDirectedReadGraph=1");
+        exploreUndirectedReadGraph(request2, html);
+    } else {
+        html << "The directed read graph is not available." << endl;
+    }
+}
+
+
 bool Assembler::parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html){
     readIds.clear();
     string token;
@@ -120,6 +136,9 @@ void Assembler::exploreUndirectedReadGraph(
     using vertex_descriptor = LocalReadGraph::vertex_descriptor;
     using edge_descriptor = LocalReadGraph::edge_descriptor;
 
+    string useDirectedReadGraphString;
+    const bool useDirectedReadGraph = getParameterValue(request, "useDirectedReadGraph", useDirectedReadGraphString);
+
     // Get the parameters.
     vector<OrientedReadId> readIds;
     string readIdsString;
@@ -167,11 +186,15 @@ void Assembler::exploreUndirectedReadGraph(
 
     // Write the form.
     string readGraphHeading;
-    if (httpServerData.docsDirectory.empty()) {
-        readGraphHeading = "<h3>Display a local subgraph of the global alignment graph</h3>";
+    if(useDirectedReadGraph) {
+        readGraphHeading = "<h3>Display a local subgraph of the directed read graph</h3>";
     } else {
-        readGraphHeading =
-            "<h3>Display a local subgraph of the <a href='docs/ComputationalMethods.html#ReadGraph'>read graph</a></h3>";
+        if (httpServerData.docsDirectory.empty()) {
+            readGraphHeading = "<h3>Display a local subgraph of the global alignment graph</h3>";
+        } else {
+            readGraphHeading =
+                "<h3>Display a local subgraph of the <a href='docs/ComputationalMethods.html#ReadGraph'>read graph</a></h3>";
+        }
     }
     html << readGraphHeading <<
          "<form>"
@@ -309,10 +332,16 @@ void Assembler::exploreUndirectedReadGraph(
 
     // Create the local read graph.
     LocalReadGraph graph;
-    if(!createLocalReadGraph(readIds,
-        maxDistance,
-        allowChimericReads, allowCrossStrandEdges, allowInconsistentAlignmentEdges,
-        timeout, graph)) {
+    const bool created = useDirectedReadGraph ?
+        createLocalDirectedReadGraph(readIds,
+            maxDistance,
+            allowChimericReads, allowCrossStrandEdges, allowInconsistentAlignmentEdges,
+            timeout, graph) :
+        createLocalReadGraph(readIds,
+            maxDistance,
+            allowChimericReads, allowCrossStrandEdges, allowInconsistentAlignmentEdges,
+            timeout, graph);
+    if(!created) {
         html << "<p>Timeout for graph creation exceeded. Increase the timeout or reduce the maximum distance from the start vertex.";
         return;
     }
@@ -669,4 +698,3 @@ void Assembler::exploreUndirectedReadGraph(
     }
 
 }
-

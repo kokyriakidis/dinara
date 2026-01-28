@@ -158,6 +158,7 @@ void Assembler::createReadGraphUsingPseudoPaths(
     cout << timestamp << "Keeping " << keepCount << " alignments of " << keepAlignment.size() << endl;
     readGraph.remove();
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 }
 
 

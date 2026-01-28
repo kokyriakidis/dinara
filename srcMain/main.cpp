@@ -630,21 +630,26 @@ void dinara::main::assemble(
             ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
     }
 
-    // Create marker graph vertices with coverage filtering.
-    assembler.createMarkerGraphVertices(
-        minPrimaryCoverage,                             // minVertexCoverage (from options)
-        maxPrimaryCoverage,                             // maxVertexCoverage (from options)
-        0,                                              // minVertexCoveragePerStrand
-        true,                                           // allowDuplicateMarkers
-        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-        threadCount);
-    
-    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    assembler.findMarkerGraphReverseComplementVertices(threadCount, true);
+    const bool anchorsNeedMarkerGraphVertices =
+        assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromOverlapsBestPerOverlapInterval";
+
+    if(anchorsNeedMarkerGraphVertices) {
+        // Create marker graph vertices with coverage filtering.
+        assembler.createMarkerGraphVertices(
+            minPrimaryCoverage,                             // minVertexCoverage (from options)
+            maxPrimaryCoverage,                             // maxVertexCoverage (from options)
+            0,                                              // minVertexCoveragePerStrand
+            true,                                           // allowDuplicateMarkers
+            std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+            invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
+            threadCount);
+        
+        // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+        assembler.findMarkerGraphReverseComplementVertices(threadCount);
+    }
 
 
-    // Construct the mode3::Anchors from marker graph (for HTTP server visualization).
+    // Construct the mode3::Anchors (for HTTP server visualization).
     // This must be done BEFORE createShasta2Anchors.
     if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
         "FromMarkerGraphVerticesAtOverlapEvents") {
@@ -655,6 +660,12 @@ void dinara::main::assemble(
     } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
         "FromMarkerGraphVerticesBestPerOverlapInterval") {
         anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount);
+    } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+        "FromOverlapsBestPerOverlapInterval") {
+        anchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
             minPrimaryCoverage,
             maxPrimaryCoverage,
             threadCount);

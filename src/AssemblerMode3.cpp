@@ -527,6 +527,18 @@ void Assembler::createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId)
 
 void Assembler::exploreAnchor(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreAnchor(request, html);
 }
 
@@ -534,6 +546,18 @@ void Assembler::exploreAnchor(const vector<string>& request, ostream& html)
 
 void Assembler::exploreAnchorPair(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreAnchorPair(request, html);
 }
 
@@ -543,6 +567,18 @@ void Assembler::exploreJourney(const vector<string>& request, ostream& html)
 {
     DINARA_ASSERT(assemblerInfo->readRepresentation == 0);
     DINARA_ASSERT(assemblerInfo->assemblyMode == 3);
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreJourney(request, html);
 }
 
@@ -552,6 +588,18 @@ void Assembler::exploreReadFollowing(const vector<string>& request, ostream& htm
 {
     DINARA_ASSERT(assemblerInfo->readRepresentation == 0);
     DINARA_ASSERT(assemblerInfo->assemblyMode == 3);
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreReadFollowing(request, html);
 }
 
@@ -559,6 +607,18 @@ void Assembler::exploreReadFollowing(const vector<string>& request, ostream& htm
 
 void Assembler::exploreLocalAssembly(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreLocalAssembly(request, html);
 }
 
@@ -566,6 +626,18 @@ void Assembler::exploreLocalAssembly(const vector<string>& request, ostream& htm
 
 void Assembler::exploreLocalAnchorGraph(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreLocalAnchorGraph(request, html);
 }
 
@@ -573,6 +645,18 @@ void Assembler::exploreLocalAnchorGraph(const vector<string>& request, ostream& 
 
 void Assembler::exploreMode3AssemblyGraph(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreAssemblyGraph(request, html);
 }
 
@@ -580,6 +664,18 @@ void Assembler::exploreMode3AssemblyGraph(const vector<string>& request, ostream
 
 void Assembler::exploreSegment(const vector<string>& request, ostream& html)
 {
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreSegment(request, html);
 }
 
@@ -589,6 +685,18 @@ void Assembler::exploreReadFollowingAssemblyGraph(const vector<string>& request,
 {
     DINARA_ASSERT(assemblerInfo->readRepresentation == 0);
     DINARA_ASSERT(assemblerInfo->assemblyMode == 3);
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
     mode3Assembler->exploreReadFollowingAssemblyGraph(request, html);
 }
 

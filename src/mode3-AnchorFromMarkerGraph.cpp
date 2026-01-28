@@ -123,6 +123,8 @@ Anchors::Anchors(
     const uint32_t ordinalOffset = createFromVertices ? 0 : 1;
     for(AnchorInfo& anchorInfo: anchorInfos) {
         anchorInfo.ordinalOffset = ordinalOffset;
+        anchorInfo.componentId = invalid<uint32_t>;
+        anchorInfo.localAnchorIdInComponent = invalid<uint64_t>;
     }
 
     performanceLog << timestamp << "Anchor creation from the marker graph ends." << endl;
@@ -216,6 +218,8 @@ Anchors::Anchors(
     anchorInfos.resize(anchorMarkerIntervals.size());
     for(AnchorId anchorId=0; anchorId<anchorMarkerIntervals.size(); anchorId++) {
         anchorInfos[anchorId].ordinalOffset = 0;
+        anchorInfos[anchorId].componentId = invalid<uint32_t>;
+        anchorInfos[anchorId].localAnchorIdInComponent = invalid<uint64_t>;
     }
 
     performanceLog << timestamp << "Anchor creation from selected marker graph vertices ends." << endl;
@@ -606,12 +610,15 @@ void Anchors::constructFromSelectedMarkerGraphVerticesThreadFunction(uint64_t th
             sequences.appendVector(vector<Base>());
 
             // Reverse complement anchor.
-            std::reverse(currentAnchorMarkers.begin(), currentAnchorMarkers.end());
             for(auto& interval : currentAnchorMarkers) {
                 interval.orientedReadId.flipStrand();
                 const uint64_t markerCount = markers.size(interval.orientedReadId.getValue());
                 interval.ordinal0 = uint32_t(markerCount) - 1 - interval.ordinal0;
             }
+            std::sort(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                    return a.orientedReadId < b.orientedReadId;
+                });
             markerIntervals.appendVector(currentAnchorMarkers);
             sequences.appendVector(vector<Base>());
         }

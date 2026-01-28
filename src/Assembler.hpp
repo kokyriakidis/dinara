@@ -384,6 +384,23 @@ public:
         uint64_t maxAnchorCoverage,
         uint64_t threadCount);
 
+    // Like createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval, but each selected marker graph vertex
+    // is validated/split using the filtered readGraph overlaps among the oriented reads present in the vertex.
+    // This avoids a single bridging read collapsing two unrelated regions into one anchor.
+    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
+    // Create mode3 anchors directly from filtered overlaps without using markerGraph vertices.
+    // For each oriented read, sweep overlap start/end events to find maximal intervals with active overlaps,
+    // then select one marker ordinal per interval and gather matching marker ordinals on overlapping reads
+    // using AlignmentInfo ordinal-offset bounds and k-mer validation.
+    shared_ptr<mode3::Anchors> createAnchorsFromOverlapsBestPerOverlapInterval(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
 
 
     // Find the vertex of the global marker graph that contains a given marker.
@@ -733,6 +750,7 @@ public:
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
 
@@ -1241,11 +1259,12 @@ private:
 
     // Read graph and related functions and data.
     // For more information, see comments in ReadGraph.hpp.
-public:
-    ReadGraph readGraph;
-    ReadGraph readGraphAllAlignments;
-    StringGraph stringGraph;
-    UnitigGraph unitigGraph;
+	public:
+	    ReadGraph readGraph;
+	    ReadGraph readGraphAllAlignments;
+	    DirectedReadGraph directedReadGraph;
+	    StringGraph stringGraph;
+	    UnitigGraph unitigGraph;
     void createReadGraph(
         uint32_t maxAlignmentCount,
         bool preferAlignedFraction);
@@ -1269,6 +1288,8 @@ public:
     void accessReadGraph();
     void accessReadGraphReadWrite();
     void checkReadGraphIsOpen() const;
+    void accessDirectedReadGraph();
+    void checkDirectedReadGraphIsOpen() const;
     void accessStringGraph();
     void accessStringGraphReadWrite();
     void checkStringGraphIsOpen() const;
@@ -1508,10 +1529,11 @@ public:
 
 
 
-    // Create the ReadGraph given a bool vector that specifies which
-    // alignments should be used in the read graph.
-    void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
-    void createStringGraphUsingSelectedAlignments(const vector<bool>& keepAlignment);
+	    // Create the ReadGraph given a bool vector that specifies which
+	    // alignments should be used in the read graph.
+	    void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
+	    void createDirectedReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
+	    void createStringGraphUsingSelectedAlignments(const vector<bool>& keepAlignment);
     void createUnitigGraphFromStringGraph();
     void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
     void cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipReads);
@@ -1550,34 +1572,57 @@ private:
     void flagChimericReadsThreadFunction(size_t threadId);
 
 
-    // Create a local subgraph of the global read graph,
-    // starting at a given vertex and extending out to a specified
-    // distance (number of edges).
-    bool createLocalReadGraph(
-            OrientedReadId start,
-            uint32_t maxDistance,   // How far to go from starting oriented read.
+	    // Create a local subgraph of the global read graph,
+	    // starting at a given vertex and extending out to a specified
+	    // distance (number of edges).
+	    bool createLocalReadGraph(
+	            OrientedReadId start,
+	            uint32_t maxDistance,   // How far to go from starting oriented read.
+	            bool allowChimericReads,
+	            bool allowCrossStrandEdges,
+	            bool allowInconsistentAlignmentEdges,
+	            double timeout,         // Or 0 for no timeout.
+	            LocalReadGraph&);
+
+	    // Create a local subgraph of the global read graph,
+	    // starting at any number of  given vertexes and extending out to a specified
+	    // distance (number of edges).
+	    bool createLocalReadGraph(
+	        const vector<OrientedReadId>& starts,
+	        uint32_t maxDistance,   // How far to go from starting oriented read.
+	        bool allowChimericReads,
+	        bool allowCrossStrandEdges,
+	        bool allowInconsistentAlignmentEdges,
+	        double timeout,         // Or 0 for no timeout.
+	        LocalReadGraph&);
+
+        // Create a local subgraph of the directed read graph,
+        // starting at a given vertex and extending out to a specified
+        // distance (number of arcs).
+        // This is rendered as a LocalReadGraph and uses readGraph edge ids
+        // to preserve the same visualization/analysis pipeline as exploreReadGraph.
+        bool createLocalDirectedReadGraph(
+                OrientedReadId start,
+                uint32_t maxDistance,
+                bool allowChimericReads,
+                bool allowCrossStrandEdges,
+                bool allowInconsistentAlignmentEdges,
+                double timeout,
+                LocalReadGraph&);
+
+        bool createLocalDirectedReadGraph(
+            const vector<OrientedReadId>& starts,
+            uint32_t maxDistance,
             bool allowChimericReads,
             bool allowCrossStrandEdges,
             bool allowInconsistentAlignmentEdges,
-            double timeout,         // Or 0 for no timeout.
+            double timeout,
             LocalReadGraph&);
 
-    // Create a local subgraph of the global read graph,
-    // starting at any number of  given vertexes and extending out to a specified
-    // distance (number of edges).
-    bool createLocalReadGraph(
-        const vector<OrientedReadId>& starts,
-        uint32_t maxDistance,   // How far to go from starting oriented read.
-        bool allowChimericReads,
-        bool allowCrossStrandEdges,
-        bool allowInconsistentAlignmentEdges,
-        double timeout,         // Or 0 for no timeout.
-        LocalReadGraph&);
-
-    bool createLocalStringGraph(
-        const vector<OrientedReadId>& starts,
-        uint32_t maxDistance,
-        bool allowChimericReads,
+	    bool createLocalStringGraph(
+	        const vector<OrientedReadId>& starts,
+	        uint32_t maxDistance,
+	        bool allowChimericReads,
         bool followOutgoing,
         bool followIncoming,
         double timeout,

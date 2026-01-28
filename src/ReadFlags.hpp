@@ -25,6 +25,10 @@ public:
     // Set if the read is marked as chimeric.
     uint8_t isChimeric : 1;
 
+    // Set if the read is flagged as fully contained in another read.
+    // This is optional/diagnostic and does not by itself remove overlaps.
+    uint8_t isContained : 1;
+
     // The strand that this read will be assembled on.
     // Only used by Mode 2 assembly.
     // Set in flagCrossStrandReadGraphEdges2.

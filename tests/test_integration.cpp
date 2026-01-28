@@ -836,16 +836,24 @@ TEST_CASE("Integration: Overlap-event anchors select vertices uniquely", "[integ
         const auto forward = (*anchors)[a];
         const auto reverse = (*anchors)[a + 1];
         REQUIRE(forward.size() == reverse.size());
-        for(size_t i = 0; i < forward.size(); ++i) {
-            const auto f = forward[i];
+        // The reverse-complement anchor is stored sorted by OrientedReadId (like all anchors).
+        std::vector<dinara::mode3::AnchorMarkerInterval> expectedReverse;
+        expectedReverse.reserve(forward.size());
+        for(const auto& f : forward) {
             auto expected = f;
             expected.orientedReadId.flipStrand();
             const uint64_t markerCount = fixture.assembler->markers->size(expected.orientedReadId.getValue());
             expected.ordinal0 = uint32_t(markerCount) - 1 - f.ordinal0;
+            expectedReverse.push_back(expected);
+        }
+        std::sort(expectedReverse.begin(), expectedReverse.end(),
+            [](const dinara::mode3::AnchorMarkerInterval& x, const dinara::mode3::AnchorMarkerInterval& y) {
+                return x.orientedReadId < y.orientedReadId;
+            });
 
-            const auto r = reverse[forward.size() - 1 - i];
-            CHECK(r.orientedReadId == expected.orientedReadId);
-            CHECK(r.ordinal0 == expected.ordinal0);
+        for(size_t i = 0; i < reverse.size(); ++i) {
+            CHECK(reverse[i].orientedReadId == expectedReverse[i].orientedReadId);
+            CHECK(reverse[i].ordinal0 == expectedReverse[i].ordinal0);
         }
     }
 }
@@ -1256,6 +1264,552 @@ TEST_CASE("Integration: Best-per-interval anchors fall back to duplicate-ReadId 
     }
     CHECK(hasR0p);
     CHECK(hasR0m);
+}
+
+TEST_CASE("Integration: Best-per-interval anchor decomposition splits a vertex bridged by a single read", "[integration][anchors][events][best][decompose]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Five reads. We construct a single marker graph vertex containing markers from all five,
+    // but only one read (read 4) connects the two groups via overlaps. The decomposed anchor
+    // method must split this into two anchors (plus their reverse complements).
+    fixture.createFastq({
+        randomSequence(4000, 801),
+        randomSequence(4000, 802),
+        randomSequence(4000, 803),
+        randomSequence(4000, 804),
+        randomSequence(4000, 805),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const OrientedReadId r2p(ReadId(2), 0);
+    const OrientedReadId r2m(ReadId(2), 1);
+    const OrientedReadId r3p(ReadId(3), 0);
+    const OrientedReadId r3m(ReadId(3), 1);
+    const OrientedReadId r4p(ReadId(4), 0);
+    const OrientedReadId r4m(ReadId(4), 1);
+
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    const uint32_t m2 = uint32_t(markers->size(r2p.getValue()));
+    const uint32_t m3 = uint32_t(markers->size(r3p.getValue()));
+    const uint32_t m4 = uint32_t(markers->size(r4p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+    REQUIRE(m2 > 16);
+    REQUIRE(m3 > 16);
+    REQUIRE(m4 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    const uint32_t interiorOrdinal = 2;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+    REQUIRE(lastOrdinal + 1 < m2);
+    REQUIRE(lastOrdinal + 1 < m3);
+    REQUIRE(lastOrdinal + 1 < m4);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // Alignments:
+        // - Group A: (0,1)
+        // - Group B: (2,3)
+        // - Bridge read 4 overlaps to all in both groups.
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(6);
+
+        auto fillAlignment = [&](size_t idx, ReadId a, ReadId b, uint32_t ma, uint32_t mb) {
+            AlignmentInfo info;
+            info.alignmentId = idx;
+            info.isInReadGraph = 1;
+            info.markerCount = lastOrdinal + 1 - firstOrdinal;
+            info.data[0] = AlignmentInfo::Data(ma, firstOrdinal, lastOrdinal);
+            info.data[1] = AlignmentInfo::Data(mb, firstOrdinal, lastOrdinal);
+            info.minOrdinalOffset = 0;
+            info.maxOrdinalOffset = 0;
+            info.averageOrdinalOffset = 0;
+            info.maxSkip = 0;
+            info.maxDrift = 0;
+
+            AlignmentData ad(OrientedReadPair(a, b, true), info);
+            fixture.assembler->alignmentData[idx] = ad;
+        };
+
+        fillAlignment(0, ReadId(0), ReadId(1), m0, m1);
+        fillAlignment(1, ReadId(2), ReadId(3), m2, m3);
+        fillAlignment(2, ReadId(0), ReadId(4), m0, m4);
+        fillAlignment(3, ReadId(1), ReadId(4), m1, m4);
+        fillAlignment(4, ReadId(2), ReadId(4), m2, m4);
+        fillAlignment(5, ReadId(3), ReadId(4), m3, m4);
+
+        // ReadGraph edges: each alignment yields an edge for + and an edge for -.
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+        fixture.assembler->readGraph.edges.resize(12);
+
+        auto setEdge = [&](size_t edgeIndex, OrientedReadId a, OrientedReadId b, uint64_t alignmentId) {
+            ReadGraphEdge e;
+            e.orientedReadIds = {a, b};
+            e.alignmentId = alignmentId;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[edgeIndex] = e;
+        };
+        // Alignment 0: (0,1)
+        setEdge(0, r0p, r1p, 0);
+        setEdge(1, r0m, r1m, 0);
+        // Alignment 1: (2,3)
+        setEdge(2, r2p, r3p, 1);
+        setEdge(3, r2m, r3m, 1);
+        // Alignment 2: (0,4)
+        setEdge(4, r0p, r4p, 2);
+        setEdge(5, r0m, r4m, 2);
+        // Alignment 3: (1,4)
+        setEdge(6, r1p, r4p, 3);
+        setEdge(7, r1m, r4m, 3);
+        // Alignment 4: (2,4)
+        setEdge(8, r2p, r4p, 4);
+        setEdge(9, r2m, r4m, 4);
+        // Alignment 5: (3,4)
+        setEdge(10, r3p, r4p, 5);
+        setEdge(11, r3m, r4m, 5);
+
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        // orientedReadCount = 10 (5 reads * 2 strands). Build vectors in order 0..9.
+        conn.appendVector(); // 0 r0+
+        conn.append(0); conn.append(4);
+        conn.appendVector(); // 1 r0-
+        conn.append(1); conn.append(5);
+
+        conn.appendVector(); // 2 r1+
+        conn.append(0); conn.append(6);
+        conn.appendVector(); // 3 r1-
+        conn.append(1); conn.append(7);
+
+        conn.appendVector(); // 4 r2+
+        conn.append(2); conn.append(8);
+        conn.appendVector(); // 5 r2-
+        conn.append(3); conn.append(9);
+
+        conn.appendVector(); // 6 r3+
+        conn.append(2); conn.append(10);
+        conn.appendVector(); // 7 r3-
+        conn.append(3); conn.append(11);
+
+        conn.appendVector(); // 8 r4+
+        conn.append(4); conn.append(6); conn.append(8); conn.append(10);
+        conn.appendVector(); // 9 r4-
+        conn.append(5); conn.append(7); conn.append(9); conn.append(11);
+
+        // MarkerGraph: one vertex that contains all five reads on the + strand at interiorOrdinal.
+        auto& mg = fixture.assembler->markerGraph;
+        mg.constructVertices();
+        mg.vertices().createNew("", 4096);
+        mg.vertexTable.createNew("", 4096);
+        mg.vertexTable.resize(markers->totalSize());
+        std::fill(mg.vertexTable.begin(), mg.vertexTable.end(), MarkerGraph::invalidCompressedVertexId);
+
+        mg.reverseComplementVertex.createNew("", 4096);
+        mg.reverseComplementVertex.resize(2);
+        mg.reverseComplementVertex[0] = 1;
+        mg.reverseComplementVertex[1] = 0;
+
+        mg.vertices().clear();
+        mg.vertices().appendVector();
+        {
+            const MarkerId r0_mid = fixture.assembler->getMarkerId(r0p, interiorOrdinal);
+            const MarkerId r1_mid = fixture.assembler->getMarkerId(r1p, interiorOrdinal);
+            const MarkerId r2_mid = fixture.assembler->getMarkerId(r2p, interiorOrdinal);
+            const MarkerId r3_mid = fixture.assembler->getMarkerId(r3p, interiorOrdinal);
+            const MarkerId r4_mid = fixture.assembler->getMarkerId(r4p, interiorOrdinal);
+            std::vector<MarkerId> ids = {r0_mid, r1_mid, r2_mid, r3_mid, r4_mid};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(0));
+            }
+        }
+        mg.vertices().appendVector(); // rc partner unused
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() == 4); // two decomposed anchors => (forward + rc) each
+
+    bool foundGroupA = false;
+    bool foundGroupB = false;
+    for(dinara::mode3::AnchorId anchorId=0; anchorId<anchors->size(); ++anchorId) {
+        const auto a = (*anchors)[anchorId];
+        bool hasR0 = false, hasR1 = false, hasR2 = false, hasR3 = false, hasR4 = false;
+        for(const auto& mi : a) {
+            if(mi.orientedReadId == r0p) hasR0 = true;
+            if(mi.orientedReadId == r1p) hasR1 = true;
+            if(mi.orientedReadId == r2p) hasR2 = true;
+            if(mi.orientedReadId == r3p) hasR3 = true;
+            if(mi.orientedReadId == r4p) hasR4 = true;
+        }
+        if(hasR0) {
+            CHECK(hasR1);
+            CHECK_FALSE(hasR2);
+            CHECK_FALSE(hasR3);
+            CHECK_FALSE(hasR4);
+            foundGroupA = true;
+        }
+        if(hasR2) {
+            CHECK(hasR3);
+            CHECK_FALSE(hasR0);
+            CHECK_FALSE(hasR1);
+            CHECK_FALSE(hasR4);
+            foundGroupB = true;
+        }
+    }
+    CHECK(foundGroupA);
+    CHECK(foundGroupB);
+}
+
+TEST_CASE("Integration: Best-per-interval anchor decomposition splits a vertex connected by multiple weak cross-edges", "[integration][anchors][events][best][decompose][multibridge]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Six reads. Two tight clusters (0,1,2) and (3,4,5) with two weak cross-edges (0-3 and 1-4).
+    // This graph has no articulation point, but cross-edges have divergent neighbor sets and should be dropped.
+    fixture.createFastq({
+        randomSequence(4000, 901),
+        randomSequence(4000, 902),
+        randomSequence(4000, 903),
+        randomSequence(4000, 904),
+        randomSequence(4000, 905),
+        randomSequence(4000, 906),
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const OrientedReadId r2p(ReadId(2), 0);
+    const OrientedReadId r2m(ReadId(2), 1);
+    const OrientedReadId r3p(ReadId(3), 0);
+    const OrientedReadId r3m(ReadId(3), 1);
+    const OrientedReadId r4p(ReadId(4), 0);
+    const OrientedReadId r4m(ReadId(4), 1);
+    const OrientedReadId r5p(ReadId(5), 0);
+    const OrientedReadId r5m(ReadId(5), 1);
+
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    const uint32_t m2 = uint32_t(markers->size(r2p.getValue()));
+    const uint32_t m3 = uint32_t(markers->size(r3p.getValue()));
+    const uint32_t m4 = uint32_t(markers->size(r4p.getValue()));
+    const uint32_t m5 = uint32_t(markers->size(r5p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+    REQUIRE(m2 > 16);
+    REQUIRE(m3 > 16);
+    REQUIRE(m4 > 16);
+    REQUIRE(m5 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    const uint32_t interiorOrdinal = 2;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+    REQUIRE(lastOrdinal + 1 < m2);
+    REQUIRE(lastOrdinal + 1 < m3);
+    REQUIRE(lastOrdinal + 1 < m4);
+    REQUIRE(lastOrdinal + 1 < m5);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // Alignments for cluster A.
+        // Alignments for cluster B.
+        // Two cross edges: (0,3) and (1,4).
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(8);
+
+        auto fillAlignment = [&](size_t idx, ReadId a, ReadId b, uint32_t ma, uint32_t mb) {
+            AlignmentInfo info;
+            info.alignmentId = idx;
+            info.isInReadGraph = 1;
+            info.markerCount = lastOrdinal + 1 - firstOrdinal;
+            info.data[0] = AlignmentInfo::Data(ma, firstOrdinal, lastOrdinal);
+            info.data[1] = AlignmentInfo::Data(mb, firstOrdinal, lastOrdinal);
+            info.minOrdinalOffset = 0;
+            info.maxOrdinalOffset = 0;
+            info.averageOrdinalOffset = 0;
+            info.maxSkip = 0;
+            info.maxDrift = 0;
+
+            AlignmentData ad(OrientedReadPair(a, b, true), info);
+            fixture.assembler->alignmentData[idx] = ad;
+        };
+
+        // A clique: 0-1, 0-2, 1-2
+        fillAlignment(0, ReadId(0), ReadId(1), m0, m1);
+        fillAlignment(1, ReadId(0), ReadId(2), m0, m2);
+        fillAlignment(2, ReadId(1), ReadId(2), m1, m2);
+        // B clique: 3-4, 3-5, 4-5
+        fillAlignment(3, ReadId(3), ReadId(4), m3, m4);
+        fillAlignment(4, ReadId(3), ReadId(5), m3, m5);
+        fillAlignment(5, ReadId(4), ReadId(5), m4, m5);
+        // Cross edges
+        fillAlignment(6, ReadId(0), ReadId(3), m0, m3);
+        fillAlignment(7, ReadId(1), ReadId(4), m1, m4);
+
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+        fixture.assembler->readGraph.edges.resize(16);
+
+        auto setEdge = [&](size_t edgeIndex, OrientedReadId a, OrientedReadId b, uint64_t alignmentId) {
+            ReadGraphEdge e;
+            e.orientedReadIds = {a, b};
+            e.alignmentId = alignmentId;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[edgeIndex] = e;
+        };
+
+        // For each alignment, add + and -.
+        setEdge(0, r0p, r1p, 0); setEdge(1, r0m, r1m, 0);
+        setEdge(2, r0p, r2p, 1); setEdge(3, r0m, r2m, 1);
+        setEdge(4, r1p, r2p, 2); setEdge(5, r1m, r2m, 2);
+        setEdge(6, r3p, r4p, 3); setEdge(7, r3m, r4m, 3);
+        setEdge(8, r3p, r5p, 4); setEdge(9, r3m, r5m, 4);
+        setEdge(10, r4p, r5p, 5); setEdge(11, r4m, r5m, 5);
+        setEdge(12, r0p, r3p, 6); setEdge(13, r0m, r3m, 6);
+        setEdge(14, r1p, r4p, 7); setEdge(15, r1m, r4m, 7);
+
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        // orientedReadCount = 12 (6 reads * 2 strands) in order 0..11.
+        conn.appendVector(); // r0+
+        conn.append(0); conn.append(2); conn.append(12);
+        conn.appendVector(); // r0-
+        conn.append(1); conn.append(3); conn.append(13);
+
+        conn.appendVector(); // r1+
+        conn.append(0); conn.append(4); conn.append(14);
+        conn.appendVector(); // r1-
+        conn.append(1); conn.append(5); conn.append(15);
+
+        conn.appendVector(); // r2+
+        conn.append(2); conn.append(4);
+        conn.appendVector(); // r2-
+        conn.append(3); conn.append(5);
+
+        conn.appendVector(); // r3+
+        conn.append(6); conn.append(8); conn.append(12);
+        conn.appendVector(); // r3-
+        conn.append(7); conn.append(9); conn.append(13);
+
+        conn.appendVector(); // r4+
+        conn.append(6); conn.append(10); conn.append(14);
+        conn.appendVector(); // r4-
+        conn.append(7); conn.append(11); conn.append(15);
+
+        conn.appendVector(); // r5+
+        conn.append(8); conn.append(10);
+        conn.appendVector(); // r5-
+        conn.append(9); conn.append(11);
+
+        // MarkerGraph: one vertex contains all six reads on + strand at interiorOrdinal.
+        auto& mg = fixture.assembler->markerGraph;
+        mg.constructVertices();
+        mg.vertices().createNew("", 4096);
+        mg.vertexTable.createNew("", 4096);
+        mg.vertexTable.resize(markers->totalSize());
+        std::fill(mg.vertexTable.begin(), mg.vertexTable.end(), MarkerGraph::invalidCompressedVertexId);
+
+        mg.reverseComplementVertex.createNew("", 4096);
+        mg.reverseComplementVertex.resize(2);
+        mg.reverseComplementVertex[0] = 1;
+        mg.reverseComplementVertex[1] = 0;
+
+        mg.vertices().clear();
+        mg.vertices().appendVector();
+        {
+            const MarkerId r0_mid = fixture.assembler->getMarkerId(r0p, interiorOrdinal);
+            const MarkerId r1_mid = fixture.assembler->getMarkerId(r1p, interiorOrdinal);
+            const MarkerId r2_mid = fixture.assembler->getMarkerId(r2p, interiorOrdinal);
+            const MarkerId r3_mid = fixture.assembler->getMarkerId(r3p, interiorOrdinal);
+            const MarkerId r4_mid = fixture.assembler->getMarkerId(r4p, interiorOrdinal);
+            const MarkerId r5_mid = fixture.assembler->getMarkerId(r5p, interiorOrdinal);
+            std::vector<MarkerId> ids = {r0_mid, r1_mid, r2_mid, r3_mid, r4_mid, r5_mid};
+            std::sort(ids.begin(), ids.end());
+            for(const MarkerId id : ids) {
+                mg.vertices().append(id);
+                mg.vertexTable[id] = MarkerGraph::CompressedVertexId(uint64_t(0));
+            }
+        }
+        mg.vertices().appendVector(); // rc partner unused
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() == 4); // two anchors (A and B) + RC each
+
+    bool foundA = false;
+    bool foundB = false;
+    for(dinara::mode3::AnchorId anchorId=0; anchorId<anchors->size(); ++anchorId) {
+        const auto a = (*anchors)[anchorId];
+        bool has0=false, has1=false, has2=false, has3=false, has4=false, has5=false;
+        for(const auto& mi : a) {
+            if(mi.orientedReadId == r0p) has0 = true;
+            if(mi.orientedReadId == r1p) has1 = true;
+            if(mi.orientedReadId == r2p) has2 = true;
+            if(mi.orientedReadId == r3p) has3 = true;
+            if(mi.orientedReadId == r4p) has4 = true;
+            if(mi.orientedReadId == r5p) has5 = true;
+        }
+        if(has0 || has1 || has2) {
+            CHECK(has0);
+            CHECK(has1);
+            CHECK(has2);
+            CHECK_FALSE(has3);
+            CHECK_FALSE(has4);
+            CHECK_FALSE(has5);
+            foundA = true;
+        }
+        if(has3 || has4 || has5) {
+            CHECK_FALSE(has0);
+            CHECK_FALSE(has1);
+            CHECK_FALSE(has2);
+            CHECK(has3);
+            CHECK(has4);
+            CHECK(has5);
+            foundB = true;
+        }
+    }
+    CHECK(foundA);
+    CHECK(foundB);
+}
+
+TEST_CASE("Integration: Overlap-only best-per-interval anchors work without marker graph vertices", "[integration][anchors][overlaps][best]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Two identical reads => markers (k-mers) match at the same ordinals.
+    const std::string seq = randomSequence(4000, 1001);
+    fixture.createFastq({seq, seq});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+
+    auto* markers = fixture.assembler->markers.get();
+    REQUIRE(markers != nullptr);
+
+    const OrientedReadId r0p(ReadId(0), 0);
+    const OrientedReadId r0m(ReadId(0), 1);
+    const OrientedReadId r1p(ReadId(1), 0);
+    const OrientedReadId r1m(ReadId(1), 1);
+    const uint32_t m0 = uint32_t(markers->size(r0p.getValue()));
+    const uint32_t m1 = uint32_t(markers->size(r1p.getValue()));
+    REQUIRE(m0 > 16);
+    REQUIRE(m1 > 16);
+
+    const uint32_t firstOrdinal = 1;
+    const uint32_t lastOrdinal = 3;
+    REQUIRE(lastOrdinal + 1 < m0);
+    REQUIRE(lastOrdinal + 1 < m1);
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        // Alignment + ReadGraph (same as the overlap-event test, but we do not create a marker graph).
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(1);
+
+        AlignmentInfo info;
+        info.alignmentId = 0;
+        info.isInReadGraph = 1;
+        info.markerCount = lastOrdinal + 1 - firstOrdinal;
+        info.data[0] = AlignmentInfo::Data(m0, firstOrdinal, lastOrdinal);
+        info.data[1] = AlignmentInfo::Data(m1, firstOrdinal, lastOrdinal);
+        info.minOrdinalOffset = 0;
+        info.maxOrdinalOffset = 0;
+        info.averageOrdinalOffset = 0;
+        info.maxSkip = 0;
+        info.maxDrift = 0;
+
+        AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), true), info);
+        fixture.assembler->alignmentData[0] = ad;
+
+        fixture.assembler->readGraph.edges.createNew("", 4096);
+        fixture.assembler->readGraph.connectivity.createNew("", 4096);
+        fixture.assembler->readGraph.edges.resize(2);
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0p, r1p};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[0] = e;
+        }
+        {
+            ReadGraphEdge e;
+            e.orientedReadIds = {r0m, r1m};
+            e.alignmentId = 0;
+            e.crossesStrands = 0;
+            e.hasInconsistentAlignment = 0;
+            fixture.assembler->readGraph.edges[1] = e;
+        }
+
+        auto& conn = fixture.assembler->readGraph.connectivity;
+        conn.appendVector(); // r0+
+        conn.append(0);
+        conn.appendVector(); // r0-
+        conn.append(1);
+        conn.appendVector(); // r1+
+        conn.append(0);
+        conn.appendVector(); // r1-
+        conn.append(1);
+    });
+
+    auto anchors = withSilencedIoInDir(fixture.testDir, [&] {
+        return fixture.assembler->createAnchorsFromOverlapsBestPerOverlapInterval(
+            /*minAnchorCoverage*/ 2,
+            /*maxAnchorCoverage*/ 100,
+            /*threadCount*/ 2);
+    });
+    REQUIRE(anchors);
+    REQUIRE(anchors->size() >= 2); // at least one anchor + its RC anchor
+
+    // Verify we can find at least one anchor containing both reads on strand 0 and its RC on strand 1.
+    bool foundForward = false;
+    bool foundReverse = false;
+    for(uint64_t i=0; i<anchors->size(); ++i) {
+        const auto a = (*anchors)[i];
+        if(a.coverage() != 2) {
+            continue;
+        }
+        if(a[0].orientedReadId == r0p && a[1].orientedReadId == r1p) {
+            foundForward = true;
+        }
+        if(a[0].orientedReadId == r0m && a[1].orientedReadId == r1m) {
+            foundReverse = true;
+        }
+        if(foundForward && foundReverse) {
+            break;
+        }
+    }
+    CHECK(foundForward);
+    CHECK(foundReverse);
 }
 
 TEST_CASE("Integration: ma_hit_flt keeps contained overlaps", "[integration][hifiasm][filter]") {

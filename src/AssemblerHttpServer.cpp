@@ -235,6 +235,7 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(alignSequencesInBaseRepresentation);
     DINARA_ADD_TO_FUNCTION_TABLE(assessAlignments);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreStringGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreUnitigGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph0);
@@ -501,9 +502,20 @@ void Assembler::writeNavigation(ostream& html) const
     }
 
     if(readGraphIsAvailable) {
-        writeNavigation(html, "Read graph", {
+        bool directedReadGraphIsAvailable = false;
+        try {
+            checkDirectedReadGraphIsOpen();
+            directedReadGraphIsAvailable = true;
+        } catch(...) {
+        }
+
+        vector<pair<string, string>> items = {
             {"Read graph", "exploreReadGraph"},
-            });
+        };
+        if(directedReadGraphIsAvailable) {
+            items.push_back({"Directed read graph", "exploreDirectedReadGraph"});
+        }
+        writeNavigation(html, "Read graph", items);
     }
 
     // String graph menu.
@@ -774,6 +786,13 @@ void Assembler::accessAllSoft()
     } catch(const exception& e) {
         cout << "The read graph is not accessible." << endl;
         allDataAreAvailable = false;
+    }
+    // Directed read graph is optional.
+    try {
+        accessDirectedReadGraph();
+    } catch(const exception& e) {
+        cout << "The directed read graph is not accessible." << endl;
+        // Don't set allDataAreAvailable = false since this is optional.
     }
 
     // String graph is optional.
