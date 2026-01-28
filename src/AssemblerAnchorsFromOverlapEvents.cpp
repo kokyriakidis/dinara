@@ -143,8 +143,8 @@ namespace {
             }
             if(tryOrdinal1(center + int64_t(d))) {
                 return true;
-            }
-        }
+                    }
+                }
         return false;
     }
 
@@ -1465,6 +1465,9 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
 
             for(uint64_t v=begin; v<end; ++v) {
                 const OrientedReadId orientedReadId0(ReadId(v), 0);
+                if(reads->getFlags(orientedReadId0.getReadId()).isContained) {
+                    continue;
+                }
                 const uint32_t markerCount0 = uint32_t(markers->size(orientedReadId0.getValue()));
                 if(markerCount0 == 0) {
                     continue;
@@ -1571,7 +1574,12 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                     return false;
                 };
 
-                auto buildAnchorAtSeed = [&](uint32_t seedOrdinal, const Kmer& seedKmer, const vector<uint32_t>& edgeIds, vector<Interval>& anchorOut) -> void {
+                // Build an anchor for this seed marker by mapping the seed k-mer across all active overlaps.
+                // Returns the full (unique-read) support count. The stored anchor is capped to maxAnchorCoverage
+                // to keep memory bounded, but we still scan all overlaps to measure support accurately.
+                auto buildAnchorAtSeed = [&](uint32_t seedOrdinal, const Kmer& seedKmer,
+                    const vector<uint32_t>& edgeIds, vector<Interval>& anchorOut) -> uint32_t
+                {
                     anchorOut.clear();
                     anchorOut.reserve(64);
                     anchorOut.emplace_back(orientedReadId0, seedOrdinal);
@@ -1579,6 +1587,8 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                     std::unordered_set<ReadId> usedReadIds;
                     usedReadIds.reserve(128);
                     usedReadIds.insert(orientedReadId0.getReadId());
+                    uint32_t fullSupport = 1;
+                    const uint32_t storeLimit = uint32_t(maxAnchorCoverage);
 
                     for(const uint32_t activeEdgeId : edgeIds) {
                         const ReadGraphEdge& edge = readGraph.edges[activeEdgeId];
@@ -1620,12 +1630,13 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                             continue;
                         }
 
-                        anchorOut.emplace_back(orientedReadId1, ordinal1);
-                        usedReadIds.insert(readId1);
-                        if(anchorOut.size() >= maxAnchorCoverage) {
-                            break;
+                        ++fullSupport;
+                        if(anchorOut.size() < storeLimit) {
+                            anchorOut.emplace_back(orientedReadId1, ordinal1);
                         }
+                        usedReadIds.insert(readId1);
                     }
+                    return fullSupport;
                 };
 
                 vector<Interval> tmpAnchor;
@@ -1660,6 +1671,8 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                     // This overlap-event segment has a constant active overlap set.
                     // We further split long segments into shorter anchor intervals to avoid large gaps.
                     constexpr uint32_t maxIntervalMarkers = 200;
+                    const uint32_t segmentLen = segmentEnd - segmentStart;
+                    const bool splitSegment = (segmentLen <= maxIntervalMarkers);
 
                     // Early exit: even with perfect k-mer mapping, we cannot exceed 1 + (# unique reads in active edges).
                     segmentEdgeIds = activeEdgeIds;
@@ -1687,9 +1700,10 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                         }
                     }
 
-                    // Select one anchor per (possibly split) anchor interval.
-                    for(uint32_t intervalStart = segmentStart; intervalStart < segmentEnd; intervalStart += maxIntervalMarkers) {
-                        const uint32_t intervalEnd = std::min(segmentEnd, intervalStart + maxIntervalMarkers);
+                    // Select one anchor per interval. If the overlap-event segment is long, do not split it:
+                    // pick the best seed across the entire segment.
+                    for(uint32_t intervalStart = segmentStart; intervalStart < segmentEnd; intervalStart += (splitSegment ? maxIntervalMarkers : segmentLen)) {
+                        const uint32_t intervalEnd = splitSegment ? std::min(segmentEnd, intervalStart + maxIntervalMarkers) : segmentEnd;
                         const uint32_t intervalLen = intervalEnd - intervalStart;
                         if(intervalLen == 0) {
                             continue;
@@ -1706,7 +1720,8 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                         }
 
                         uint32_t bestSeed = invalid<uint32_t>;
-                        uint32_t bestSupport = 0;
+                        uint32_t bestScore = 0;        // capped to maxAnchorCoverage
+                        uint32_t bestFullSupport = 0;  // full unique-read support (can exceed maxAnchorCoverage)
                         bestAnchor.clear();
 
                         auto seedBetter = [&](uint32_t a, uint32_t b) -> bool {
@@ -1739,19 +1754,26 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                             if(shouldSkipKmerDueToRepeats(seedKmer)) {
                                 continue;
                             }
-                            buildAnchorAtSeed(seedOrdinal, seedKmer, segmentEdgeIds, tmpAnchor);
-                            const uint32_t support = uint32_t(tmpAnchor.size());
-                            if(support > bestSupport || (support == bestSupport && bestSeed != invalid<uint32_t> && seedBetter(seedOrdinal, bestSeed))) {
-                                bestSupport = support;
+                            const uint32_t fullSupport = buildAnchorAtSeed(seedOrdinal, seedKmer, segmentEdgeIds, tmpAnchor);
+                            if(fullSupport < minAnchorCoverage) {
+                                continue;
+                            }
+                            const uint32_t score = std::min<uint32_t>(fullSupport, uint32_t(maxAnchorCoverage));
+
+                            // Prefer higher score, then lower full support (avoids extremely high-multiplicity seeds
+                            // when a max-coverage seed exists), then tie-break by proximity to interval center.
+                            if(score > bestScore ||
+                               (score == bestScore && (bestSeed == invalid<uint32_t> || fullSupport < bestFullSupport)) ||
+                               (score == bestScore && fullSupport == bestFullSupport &&
+                                   bestSeed != invalid<uint32_t> && seedBetter(seedOrdinal, bestSeed))) {
+                                bestScore = score;
                                 bestSeed = seedOrdinal;
+                                bestFullSupport = fullSupport;
                                 bestAnchor = tmpAnchor;
-                                if(bestSupport >= maxAnchorCoverage) {
-                                    break;
-                                }
                             }
                         }
 
-                        if(bestSupport < minAnchorCoverage || bestSupport > maxAnchorCoverage) {
+                        if(bestSeed == invalid<uint32_t> || bestScore < minAnchorCoverage) {
                             continue;
                         }
 
@@ -1759,13 +1781,18 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
                             return a.orientedReadId < b.orientedReadId;
                         });
 
+                        // Cap stored membership to maxAnchorCoverage to keep candidates bounded.
+                        if(bestAnchor.size() > maxAnchorCoverage) {
+                            bestAnchor.resize(maxAnchorCoverage);
+                        }
+
                         CandidateAnchor candidate;
                         candidate.seedReadId = ReadId(v);
                         candidate.overlapIntervalIndex = overlapIntervalIndex;
                         candidate.intervalStart = intervalStart;
                         candidate.intervalEnd = intervalEnd;
                         candidate.seedOrdinal = bestSeed;
-                        candidate.support = bestSupport;
+                        candidate.support = bestScore;
                         candidate.anchor = std::move(bestAnchor);
                         outCandidates.push_back(std::move(candidate));
                     }
@@ -1789,6 +1816,30 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
 
     cout << timestamp << "Constructed " << candidates.size()
          << " candidate anchors from overlaps (one per overlap-event interval, with long-interval splitting)." << endl;
+
+    // Diagnostics: candidate support distribution (support is capped to maxAnchorCoverage).
+    {
+        uint64_t count = 0;
+        uint64_t sum = 0;
+        uint32_t minSupport = std::numeric_limits<uint32_t>::max();
+        uint32_t maxSupport = 0;
+        vector<uint64_t> hist(uint64_t(maxAnchorCoverage) + 1, 0);
+        for(const CandidateAnchor& c : candidates) {
+            ++count;
+            sum += c.support;
+            minSupport = std::min(minSupport, c.support);
+            maxSupport = std::max(maxSupport, c.support);
+            if(c.support <= maxAnchorCoverage) {
+                ++hist[c.support];
+            }
+        }
+        if(count) {
+            cout << timestamp << "[DIAG] Candidate anchor support (capped): "
+                 << "min=" << minSupport << " max=" << maxSupport
+                 << " mean=" << double(sum) / double(count)
+                 << " (n=" << count << ")." << endl;
+        }
+    }
 
     // Select anchors with cross-read overlap-interval claiming:
     // if a read already has an anchor in a given overlap-event interval, skip selecting another anchor for that interval.
@@ -1830,6 +1881,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
     };
 
     auto selectCandidate = [&](const CandidateAnchor& candidate, bool allowClaimedInRepair) -> bool {
+        (void)allowClaimedInRepair;
         const uint64_t v = uint64_t(candidate.seedReadId);
         if(v >= readCount) {
             return false;
@@ -1851,8 +1903,9 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
         anchor.emplace_back(OrientedReadId(candidate.seedReadId, 0), candidate.seedOrdinal);
         toClaim.emplace_back(candidate.seedReadId, candidate.overlapIntervalIndex);
 
-        // Add additional read intervals from this candidate, preferring unclaimed overlap-intervals.
-        // If allowClaimedInRepair is true, we can fall back to using already-claimed intervals to reach min coverage.
+        // Add additional read intervals from this candidate, preferring unclaimed overlap-intervals for claiming.
+        // Already-claimed intervals are allowed to contribute to the anchor (they improve coverage),
+        // but they are not re-claimed. This prevents coverage collapse as claiming progresses.
         vector<pair<Interval, pair<ReadId, uint32_t>>> claimedDeferred;
         claimedDeferred.reserve(candidate.anchor.size());
 
@@ -1868,9 +1921,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
             }
             const auto [rid, idx] = *keyOpt;
             if(intervalClaimed[rid][idx]) {
-                if(allowClaimedInRepair) {
-                    claimedDeferred.push_back({interval, {rid, idx}});
-                }
+                claimedDeferred.push_back({interval, {rid, idx}});
                 continue;
             }
             anchor.push_back(interval);
@@ -1880,10 +1931,11 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
             }
         }
 
-        if(allowClaimedInRepair && anchor.size() < minAnchorCoverage) {
+        // Fill remaining capacity with already-claimed intervals (no new claims) to improve coverage.
+        if(anchor.size() < maxAnchorCoverage) {
             for(const auto& x : claimedDeferred) {
                 anchor.push_back(x.first);
-                if(anchor.size() >= minAnchorCoverage || anchor.size() >= maxAnchorCoverage) {
+                if(anchor.size() >= maxAnchorCoverage) {
                     break;
                 }
             }
@@ -1921,6 +1973,31 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
 
     cout << timestamp << "Selected " << selected.size()
          << " anchors (strict=" << selectedStrict << ", repair=" << selectedRepair << ")." << endl;
+
+    // Diagnostics: selected anchor size distribution.
+    {
+        uint64_t count = 0;
+        uint64_t sum = 0;
+        uint64_t minSize = std::numeric_limits<uint64_t>::max();
+        uint64_t maxSize = 0;
+        vector<uint64_t> hist(uint64_t(maxAnchorCoverage) + 1, 0);
+        for(const auto& a : selected) {
+            const uint64_t n = a.size();
+            ++count;
+            sum += n;
+            minSize = std::min(minSize, n);
+            maxSize = std::max(maxSize, n);
+            if(n <= maxAnchorCoverage) {
+                ++hist[n];
+            }
+        }
+        if(count) {
+            cout << timestamp << "[DIAG] Selected anchor size: "
+                 << "min=" << minSize << " max=" << maxSize
+                 << " mean=" << double(sum) / double(count)
+                 << " (n=" << count << ")." << endl;
+        }
+    }
 
     uint64_t totalIntervals = 0;
     uint64_t claimedIntervals = 0;
