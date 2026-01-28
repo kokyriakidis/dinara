@@ -98,6 +98,11 @@ public:
     // The anchorIds in each component. Indexed by componentId.
     MemoryMapped::VectorOfVectors<mode3::AnchorId, uint64_t> componentAnchorIds;
 
+    bool hasComponentData() const
+    {
+        return componentDataAvailable;
+    }
+
 public:
 
     bool isSelfComplementaryComponent(uint64_t componentId) const;
@@ -153,5 +158,8 @@ public:
     const mode3::AssemblyGraphPostprocessor& getAssemblyGraph(
         const string& assemblyStage,
         uint64_t componentId
-        );
+    );
+
+private:
+    bool componentDataAvailable = false;
 };

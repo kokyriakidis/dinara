@@ -2527,6 +2527,7 @@ void Assembler::createReadGraph4withStrandSeparation(
     //
     //*
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 
 
     // Gather the vertices of each component.
@@ -2758,6 +2759,7 @@ void Assembler::createReadGraph4(
 
         // Create the read graph using the alignments we selected.
         createReadGraphUsingSelectedAlignments(keepAlignment);
+        createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 
         cout << timestamp << "Initial createReadGraph4 ends." << endl;
 
@@ -3417,7 +3419,6 @@ void Assembler::removeReadGraph()
 
     cout << timestamp << "Removed previous read graph files" << endl;
 }
-
 
 
 

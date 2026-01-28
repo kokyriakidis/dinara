@@ -113,6 +113,17 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
     //      << ", isDeleted1=" << afterContainDel1
     //      << ", active=" << countActiveAlignments() << endl;
+
+    // Step 6b: Diagnostic-only contained read detection (does not remove overlaps).
+    // Useful when experimenting with phasing/anchors without changing the overlap set.
+    flagContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    uint64_t containedFlagCount = 0;
+    for(ReadId r=0; r<reads->readCount(); ++r) {
+        if(reads->getFlags(r).isContained) {
+            ++containedFlagCount;
+        }
+    }
+    cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
     
     // Step 7: Final filtering pass - apply phasing decisions
     const uint64_t alignmentCount = alignmentData.size();
@@ -217,6 +228,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 
     // Step 8: Create read graph from kept alignments
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 
     // // Step 9: Create directed string graph arcs (hifiasm-style suffix->prefix)
     // createStringGraphUsingSelectedAlignments(keepAlignment);
@@ -301,5 +313,6 @@ void Assembler::createReadGraphFromFilteredAlignments()
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
     cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
 }

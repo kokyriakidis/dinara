@@ -76,8 +76,18 @@ Mode3Assembler::Mode3Assembler(
     options(options)
 {
     DINARA_ASSERT(anchorsPointer);
-    componentOrientedReadIds.accessExistingReadOnly(largeDataName("Mode3Assembler-componentOrientedReadIds"));
-    componentAnchorIds.accessExistingReadOnly(largeDataName("Mode3Assembler-componentAnchorIds"));
+    try {
+        componentOrientedReadIds.accessExistingReadOnly(largeDataName("Mode3Assembler-componentOrientedReadIds"));
+        componentAnchorIds.accessExistingReadOnly(largeDataName("Mode3Assembler-componentAnchorIds"));
+        componentDataAvailable = true;
+    } catch(const exception&) {
+        // Component data only exist if mode3 assembly was run.
+        // Keep the http server usable for anchor-level exploration (local anchor graph, etc.)
+        // even when no assembly graphs are available.
+        componentOrientedReadIds.close();
+        componentAnchorIds.close();
+        componentDataAvailable = false;
+    }
 }
 
 
@@ -537,4 +547,3 @@ void Mode3Assembler::writeConnectedComponent(uint64_t componentId) const
 
     }
 }
-

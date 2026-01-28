@@ -1148,7 +1148,11 @@ void LocalAnchorGraph::computeLayout(const LocalAnchorGraphDisplayOptions& optio
 
     // Compute layout on an induced subgraph containing only visible (non-hidden) edges.
     // This keeps hidden/no-offset edges from influencing the layout.
-    using LayoutGraph = boost::adjacency_list<boost::vecS, boost::vecS, boost::directedS>;
+    //
+    // Use setS for the out-edge container to avoid parallel edges.
+    // Parallel edges can cause edge_descriptor ordering collisions when used as a std::map key,
+    // leading to missing edge lengths and failures in custom layout (or degraded layouts if skipped).
+    using LayoutGraph = boost::adjacency_list<boost::setS, boost::vecS, boost::directedS>;
     using LayoutVertex = LayoutGraph::vertex_descriptor;
     using LayoutEdge = LayoutGraph::edge_descriptor;
 
@@ -1186,9 +1190,57 @@ void LocalAnchorGraph::computeLayout(const LocalAnchorGraphDisplayOptions& optio
         LayoutEdge le{};
         bool inserted = false;
         tie(le, inserted) = add_edge(LayoutVertex(i0), LayoutVertex(i1), layoutGraph);
-        if(inserted) {
+        auto it = edgeLengthMap.find(le);
+        if(it == edgeLengthMap.end()) {
             edgeLengthMap.insert({le, displayLength});
+        } else {
+            // Multiple original edges can collapse to the same (i0,i1) pair in the layout graph.
+            // Keep the smaller length so we don't artificially stretch the layout.
+            it->second = std::min(it->second, displayLength);
         }
+    }
+
+    // If there are no visible edges, there is nothing to lay out with a force-based method.
+    // Use the deterministic fallback layout immediately and keep an informative message.
+    if(edgeLengthMap.empty()) {
+        layoutStatusMessage = "No visible edges available for layout; using fallback layout.";
+
+        // Deterministic BFS-radial layout by stored vertex distance.
+        layout.clear();
+        std::map<uint64_t, vector<vertex_descriptor> > rings;
+        BGL_FORALL_VERTICES(v, graph, LocalAnchorGraph) {
+            rings[graph[v].distance].push_back(v);
+        }
+        for(auto& ring: rings) {
+            auto& vertices = ring.second;
+            std::sort(vertices.begin(), vertices.end(),
+                [&graph](const vertex_descriptor a, const vertex_descriptor b) {
+                    return graph[a].anchorId < graph[b].anchorId;
+                });
+        }
+
+        const double radiusStep = 100.;
+        const double twoPi = 2. * std::acos(-1.);
+        for(const auto& ring: rings) {
+            const uint64_t distance = ring.first;
+            const auto& vertices = ring.second;
+            const uint64_t k = vertices.size();
+            if(k == 0) {
+                continue;
+            }
+            double radius = radiusStep * double(distance);
+            if(distance == 0 and k > 1) {
+                radius = 0.2 * radiusStep;
+            }
+            for(uint64_t i=0; i<k; i++) {
+                const double angle = (k == 1) ? 0. : twoPi * double(i) / double(k);
+                const double x = radius * std::cos(angle);
+                const double y = radius * std::sin(angle);
+                layout.insert({vertices[i], array<double, 2>{x, y}});
+            }
+        }
+
+        return;
     }
 
     // Compute the graph layout.
@@ -1231,6 +1283,23 @@ void LocalAnchorGraph::computeLayout(const LocalAnchorGraphDisplayOptions& optio
                 continue;
             }
             layout.insert({originalVertices[i], p.second});
+        }
+    }
+
+    // Treat all-non-finite layouts as failure so we fall back to a deterministic layout.
+    if((rc == ComputeLayoutReturnCode::Success) and not layout.empty()) {
+        bool anyFinite = false;
+        for(const auto& p: layout) {
+            const double x = p.second[0];
+            const double y = p.second[1];
+            if(std::isfinite(x) and std::isfinite(y)) {
+                anyFinite = true;
+                break;
+            }
+        }
+        if(not anyFinite) {
+            rc = ComputeLayoutReturnCode::Error;
+            layout.clear();
         }
     }
 

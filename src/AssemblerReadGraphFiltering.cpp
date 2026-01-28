@@ -1511,3 +1511,114 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
 
     cout << timestamp << "Identified " << containedReadCount << " contained reads." << endl;
 }
+
+void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+{
+    cout << timestamp << "Flagging contained reads (diagnostic-only, does not remove overlaps)..." << endl;
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    // We will write into read flags.
+    reads->checkReadFlagsAreOpenForWriting();
+
+    if(validReadIntervals.empty()) {
+        throw runtime_error("flagContainedReads requires validReadIntervals (run filterLocalSegments/applyCoverageCuts first).");
+    }
+
+    if(!containmentParent->isOpen) {
+        containmentParent->createNew(largeDataName("ContainmentParent"), largeDataPageSize);
+        containmentParent->resize(reads->readCount());
+    }
+    std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
+
+    const uint64_t readCount = reads->readCount();
+
+    // Clear previous flags.
+    for(ReadId r=0; r<readCount; ++r) {
+        reads->setContainedFlag(r, false);
+    }
+
+    uint64_t containedReadCount = 0;
+
+    // Same containment test as removeContainedReads, but we only record the result.
+    for(ReadId qn = 0; qn < readCount; ++qn) {
+        if(qn >= validReadIntervals.size() || validReadIntervals[qn].isDeleted) continue;
+        if(reads->getFlags(qn).isContained) continue;
+
+        const auto& vrQ = validReadIntervals[qn];
+        const int32_t ql = int32_t(vrQ.end - vrQ.start);
+        if(ql <= 0) continue;
+
+        const OrientedReadId oid(qn, 0);
+        if(oid.getValue() >= alignmentTable.size()) continue;
+
+        const auto& table = alignmentTable[oid.getValue()];
+        for(uint32_t alignmentId : table) {
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if(!ad.keptByBothSides()) continue;
+
+            const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
+            if(tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
+            if(reads->getFlags(tn).isContained) continue;
+
+            const auto& vrT = validReadIntervals[tn];
+            const int32_t tl = int32_t(vrT.end - vrT.start);
+            if(tl <= 0) continue;
+
+            const bool rev = !ad.isSameStrand;
+            int32_t qs = 0, qe = 0, ts = 0, te = 0;
+            if(ad.readIds[0] == qn) {
+                qs = int32_t(ad.qs);
+                qe = int32_t(ad.qe);
+                ts = int32_t(ad.ts);
+                te = int32_t(ad.te);
+            } else {
+                qs = int32_t(ad.ts);
+                qe = int32_t(ad.te);
+                ts = int32_t(ad.qs);
+                te = int32_t(ad.qe);
+            }
+            if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
+            if(qs >= qe || ts >= te) continue;
+            if(qs > ql || qe > ql || ts > tl || te > tl) continue;
+
+            const int result = ma_hit2arc_containment(
+                qs, qe, ql,
+                ts, te, tl,
+                rev,
+                int32_t(maxHang),
+                maxHangRate,
+                int32_t(minOverlapLength)
+            );
+
+            if(result == 1) {
+                if(!reads->getFlags(qn).isContained) {
+                    reads->setContainedFlag(qn, true);
+                    (*containmentParent)[qn] = tn;
+                    ++containedReadCount;
+                }
+                break;
+            } else if(result == 2) {
+                if(!reads->getFlags(tn).isContained) {
+                    reads->setContainedFlag(tn, true);
+                    (*containmentParent)[tn] = qn;
+                    ++containedReadCount;
+                }
+            }
+        }
+    }
+
+    // Compress containment chains.
+    for(ReadId r = 0; r < readCount; ++r) {
+        if((*containmentParent)[r] == ReadId(invalidReadId)) continue;
+        ReadId root = (*containmentParent)[r];
+        while(root != ReadId(invalidReadId) && (*containmentParent)[root] != ReadId(invalidReadId)) {
+            root = (*containmentParent)[root];
+        }
+        (*containmentParent)[r] = root;
+    }
+
+    cout << timestamp << "Flagged " << containedReadCount << " contained reads." << endl;
+}

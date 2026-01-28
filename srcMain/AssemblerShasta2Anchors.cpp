@@ -245,7 +245,7 @@ namespace dinara {
                     std::sort(amis.begin(), amis.end());
                     const auto last = std::unique(amis.begin(), amis.end(),
                         [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
-                            return x.orientedReadId == y.orientedReadId;
+                            return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
                         });
                     const uint64_t uniqueCount = uint64_t(std::distance(amis.begin(), last));
                     for(uint64_t k=0; k<uniqueCount; k++) {
@@ -283,7 +283,7 @@ namespace dinara {
                     std::sort(amis.begin(), amis.end());
                     const auto last = std::unique(amis.begin(), amis.end(),
                         [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
-                            return x.orientedReadId == y.orientedReadId;
+                            return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
                         });
                     amis.erase(last, amis.end());
                     std::reverse(amis.begin(), amis.end());
@@ -316,6 +316,157 @@ namespace dinara {
         for(auto& th : threads) th.join();
     }
 
+    [[maybe_unused]] static void populateAnchorsFromMode3AnchorsWithShasta2KmerFilters(
+        const mode3::Anchors& dinaraAnchors,
+        shasta2::Anchors& anchors,
+        const shasta2::Markers& markers,
+        const shasta2::MarkerKmers& markerKmers,
+        uint64_t k,
+        const vector<uint64_t>& maxAnchorRepeatLength,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t /*threadCount*/)
+    {
+        const uint64_t inputAnchorCount = dinaraAnchors.size();
+        uint64_t skippedCoverage = 0;
+        uint64_t skippedEmpty = 0;
+        uint64_t skippedLowComplexity = 0;
+        uint64_t skippedMissingKmer = 0;
+        uint64_t skippedDupReadIdInKmer = 0;
+
+        // Cache for "this canonical marker k-mer has duplicate ReadIds in MarkerKmers".
+        // -1: unknown, 0: ok, 1: has duplicate ReadIds (repeat within a read -> skip).
+        vector<int8_t> hasDuplicateReadIdByKmerIndex(markerKmers.size(), int8_t(-1));
+
+        auto shouldSkipKmerDueToReadDuplicates = [&](uint64_t kmerIndex) -> bool {
+            int8_t& cached = hasDuplicateReadIdByKmerIndex[kmerIndex];
+            if(cached != int8_t(-1)) {
+                return cached != 0;
+            }
+            const auto markerInfos = markerKmers[kmerIndex];
+            bool hasDuplicate = false;
+            for(size_t i=1; i<markerInfos.size(); i++) {
+                if(markerInfos[i].orientedReadId.getReadId() == markerInfos[i-1].orientedReadId.getReadId()) {
+                    hasDuplicate = true;
+                    break;
+                }
+            }
+            cached = hasDuplicate ? int8_t(1) : int8_t(0);
+            return hasDuplicate;
+        };
+
+        auto shouldSkipKmerDueToLowComplexity = [&](const shasta2::Kmer& kmer) -> bool {
+            for(uint64_t i=0; i<maxAnchorRepeatLength.size(); i++) {
+                const uint64_t period = i + 1;
+                const uint64_t maxAllowedCopyNumber = maxAnchorRepeatLength[i];
+                if(kmer.countExactRepeatCopies(period, k) > maxAllowedCopyNumber) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        vector<uint64_t> keptInputAnchorIds;
+        keptInputAnchorIds.reserve(inputAnchorCount / 4);
+
+        for(uint64_t inputAnchorId=0; inputAnchorId<inputAnchorCount; inputAnchorId++) {
+            const mode3::Anchor a = dinaraAnchors[inputAnchorId];
+            const uint64_t coverage = a.size();
+            if(coverage < minAnchorCoverage || coverage > maxAnchorCoverage) {
+                ++skippedCoverage;
+                continue;
+            }
+            if(a.empty()) {
+                ++skippedEmpty;
+                continue;
+            }
+
+            const auto& first = a.front();
+            const shasta2::OrientedReadId orientedReadId =
+                shasta2::OrientedReadId::fromValue(first.orientedReadId.getValue());
+            const shasta2::Kmer kmer0 = markers.getKmer(orientedReadId, first.ordinal0);
+
+            if(shouldSkipKmerDueToLowComplexity(kmer0)) {
+                ++skippedLowComplexity;
+                continue;
+            }
+
+            const shasta2::Kmer kmerRc = kmer0.reverseComplement(k);
+            const shasta2::Kmer canonicalKmer = (kmer0 <= kmerRc) ? kmer0 : kmerRc;
+            const uint64_t kmerIndex = markerKmers.getGlobalIndex(canonicalKmer);
+            if(kmerIndex == shasta2::invalid<uint64_t>) {
+                ++skippedMissingKmer;
+                continue;
+            }
+            if(shouldSkipKmerDueToReadDuplicates(kmerIndex)) {
+                ++skippedDupReadIdInKmer;
+                continue;
+            }
+
+            keptInputAnchorIds.push_back(inputAnchorId);
+        }
+
+        const uint64_t anchorCount = keptInputAnchorIds.size();
+        cout << timestamp << "Shasta2 k-mer filters kept " << anchorCount << " / " << inputAnchorCount
+             << " overlap-derived anchors."
+             << " skipped: coverage=" << skippedCoverage
+             << " empty=" << skippedEmpty
+             << " lowComplexity=" << skippedLowComplexity
+             << " missingKmer=" << skippedMissingKmer
+             << " dupReadIdInKmer=" << skippedDupReadIdInKmer
+             << endl;
+        anchors.anchorMarkerInfos.beginPass1(anchorCount);
+
+        // Pass 1: count marker infos for each kept anchor (distinct ReadIds).
+        for(uint64_t newAnchorId=0; newAnchorId<anchorCount; newAnchorId++) {
+            const mode3::Anchor a = dinaraAnchors[keptInputAnchorIds[newAnchorId]];
+            ReadId prevReadId = invalid<ReadId>;
+            uint64_t uniqueReadCount = 0;
+            for(const auto& mi : a) {
+                const ReadId readId = mi.orientedReadId.getReadId();
+                if(readId != prevReadId) {
+                    ++uniqueReadCount;
+                    prevReadId = readId;
+                }
+            }
+            for(uint64_t i=0; i<uniqueReadCount; i++) {
+                anchors.anchorMarkerInfos.incrementCount(newAnchorId);
+            }
+        }
+
+        anchors.anchorMarkerInfos.beginPass2();
+        std::vector<shasta2::AnchorMarkerInfo> amis;
+        for(uint64_t newAnchorId=0; newAnchorId<anchorCount; newAnchorId++) {
+            const mode3::Anchor a = dinaraAnchors[keptInputAnchorIds[newAnchorId]];
+            amis.clear();
+            amis.reserve(a.size());
+            for(const auto& mi : a) {
+                shasta2::AnchorMarkerInfo ami;
+                ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
+                ami.ordinal = mi.ordinal0;
+                ami.positionInJourney = shasta2::invalid<uint32_t>;
+                amis.push_back(ami);
+            }
+
+            std::sort(amis.begin(), amis.end());
+            const auto last = std::unique(amis.begin(), amis.end(),
+                [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
+                    return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
+                });
+            amis.erase(last, amis.end());
+            std::reverse(amis.begin(), amis.end());
+            for(const auto& ami : amis) {
+                anchors.anchorMarkerInfos.store(newAnchorId, ami);
+            }
+        }
+        anchors.anchorMarkerInfos.endPass2();
+
+        anchors.anchorInfos.resize(anchorCount);
+        for(uint64_t i=0; i<anchorCount; i++) {
+            anchors.anchorInfos[i].kmerIndex = shasta2::invalid<uint64_t>;
+        }
+    }
+
     shasta2::Tee shastaTee;
     ofstream shastaLog;
 
@@ -324,7 +475,7 @@ namespace dinara {
         const dinara::AssemblerOptions& dinaraOptions,
         uint64_t threadCount
     ) {
-        cout << timestamp << "Creating Shasta2 Anchors from Marker Graph..." << endl;
+        cout << timestamp << "Creating Shasta2 Anchors..." << endl;
 
         const string& shastaOut = dinaraOptions.commandLineOnlyOptions.shasta2OutputDirectory;
         
@@ -756,15 +907,41 @@ namespace dinara {
                 maxAnchorCoverageDinara,
                 threadCount);
             populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+        } else if(anchorMethod == "FromOverlapsBestPerOverlapInterval") {
+            cout << timestamp << "Populating Shasta2 anchors using Dinara overlap-only BestPerOverlapInterval anchors..." << endl;
+            const auto dinaraAnchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
+                minAnchorCoverageDinara,
+                maxAnchorCoverageDinara,
+                threadCount);
+            // Use exactly Dinara's overlap-derived anchors as-is.
+            // Dinara already applies overlap-based filtering/selection; additional Shasta2 k-mer filters
+            // would change the anchor set and make downstream comparisons confusing.
+            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
         } else {
             // Default: treat marker graph vertices as anchors.
+            if((not assembler.markerGraph.verticesPointer) or
+                (not assembler.markerGraph.verticesPointer->isOpen())) {
+                throw runtime_error(
+                    "createShasta2Anchors: anchorCreationMethod=" + anchorMethod +
+                    " requires marker graph vertices, but markerGraph is not open/initialized. "
+                    "Use --Assembly.mode3.anchorCreationMethod FromMarkerGraphVertices... or "
+                    "FromOverlapsBestPerOverlapInterval.");
+            }
             populateAnchors(assembler, *shastaAnchors, threadCount);
-        }
-        
-        cout << timestamp << "Shasta2 Anchors created (" << shastaAnchors->size() << " anchors)." << endl;
+	        }
+	        
+	        cout << timestamp << "Shasta2 Anchors created (" << shastaAnchors->size() << " anchors)." << endl;
 
-        
-        // 5. Downstream Assembly Pipeline (Journeys -> AnchorGraph -> AssemblyGraph).
+	        // The empty Anchors constructor creates the kmerToAnchorTable backing storage but does not size it.
+	        // Initialize it so any k-mer lookup/debugging code cannot go out of bounds.
+	        shastaAnchors->kmerToAnchorTable.resize(shastaMarkerKmers.size());
+	        std::fill(
+	            shastaAnchors->kmerToAnchorTable.begin(),
+	            shastaAnchors->kmerToAnchorTable.end(),
+	            shasta2::invalid<shasta2::AnchorId>);
+
+	        
+	        // 5. Downstream Assembly Pipeline (Journeys -> AnchorGraph -> AssemblyGraph).
         cout << timestamp << "Proceeding with Downstream Shasta2 Assembly..." << endl;
         
         // Create Journeys.

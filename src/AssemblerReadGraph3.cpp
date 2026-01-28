@@ -425,6 +425,7 @@ void Assembler::createReadGraph3(uint64_t /* maxAlignmentCount */)
 
     // Create the read graph using the alignments we selected.
     createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 }
 
 
@@ -951,4 +952,3 @@ void ReadGraph3::computeStrongComponents()
 }
 #endif
 #endif
-
