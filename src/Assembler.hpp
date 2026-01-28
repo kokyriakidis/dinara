@@ -365,6 +365,12 @@ public:
         uint64_t threadCount
     );
 
+    // Filter marker graph vertices whose marker k-mer is a short-period exact repeat
+    // (including homopolymers). This removes vertices that tend to generate unreliable
+    // anchors and artifacts in repetitive regions.
+    // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
+    void filterMarkerGraphVerticesByRepeatKmers(uint64_t threadCount);
+
     // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
     // overlap start/end events on each oriented read (using read-graph overlaps).
     // This produces fewer anchors than using all marker graph vertices, while preserving

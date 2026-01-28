@@ -639,13 +639,33 @@ void dinara::main::assemble(
             minPrimaryCoverage,                             // minVertexCoverage (from options)
             maxPrimaryCoverage,                             // maxVertexCoverage (from options)
             0,                                              // minVertexCoveragePerStrand
-            true,                                           // allowDuplicateMarkers
+            false,                                           // allowDuplicateMarkers
             std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
             invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
             threadCount);
-        
+
+        // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
+        // This reduces unreliable anchors and artifacts in repetitive regions.
+        assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+
+        // Find the reverse complement of each marker graph vertex.
         // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
         assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+        // // Clean up of duplicate markers, if requested and necessary.
+        // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
+        //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
+        //     assembler.cleanupDuplicateMarkers(
+        //         threadCount,
+        //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
+        //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
+        //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
+        //         false, false);
+        //     }
+
+        // Create edges of the marker graph.
+        assembler.createMarkerGraphEdges(threadCount);
+        assembler.findMarkerGraphReverseComplementEdges(threadCount);
     }
 
 
