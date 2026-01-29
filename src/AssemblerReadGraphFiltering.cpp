@@ -32,6 +32,7 @@ Hifiasm stage mapping (conceptual)
 #include <algorithm>
 #include <vector>
 #include <limits>
+#include <random>
 
 #include <iostream>
 
@@ -1621,4 +1622,95 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     }
 
     cout << timestamp << "Flagged " << containedReadCount << " contained reads." << endl;
+}
+
+
+
+void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadCount */)
+{
+    checkAlignmentDataAreOpen();
+    reads->checkReadFlagsAreOpen();
+
+    const uint64_t readCount = reads->readCount();
+    const uint64_t alignmentCount = alignmentData.size();
+
+    uint64_t containedReadCount = 0;
+    uint64_t containedReadsWithKeptOverlap = 0;
+    uint64_t containedReadsWithNoKeptOverlap = 0;
+    uint64_t overlapsPruned = 0;
+
+    // Deterministic pseudo-random tie-breaking per read.
+    // This avoids changing results depending on iteration order while still breaking ties "randomly".
+    for(ReadId r=0; r<readCount; ++r) {
+        if(!reads->getFlags(r).isContained) {
+            continue;
+        }
+        ++containedReadCount;
+
+        const OrientedReadId oid0(r, 0);
+        if(oid0.getValue() >= alignmentTable.size()) {
+            ++containedReadsWithNoKeptOverlap;
+            continue;
+        }
+
+        const span<uint32_t> table = alignmentTable[oid0.getValue()];
+        if(table.empty()) {
+            ++containedReadsWithNoKeptOverlap;
+            continue;
+        }
+
+        // Find best dpScore among active overlaps for this contained read.
+        int64_t bestScore = std::numeric_limits<int64_t>::min();
+        vector<uint32_t> bestAlignmentIds;
+        bestAlignmentIds.reserve(4);
+
+        for(const uint32_t alignmentId : table) {
+            if(alignmentId >= alignmentCount) {
+                continue;
+            }
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if(!ad.keptByBothSides()) {
+                continue;
+            }
+            const int64_t score = ad.info.hifiasmDpScoreOrApprox(0);
+            if(score > bestScore) {
+                bestScore = score;
+                bestAlignmentIds.clear();
+                bestAlignmentIds.push_back(alignmentId);
+            } else if(score == bestScore) {
+                bestAlignmentIds.push_back(alignmentId);
+            }
+        }
+
+        if(bestAlignmentIds.empty()) {
+            ++containedReadsWithNoKeptOverlap;
+            continue;
+        }
+        ++containedReadsWithKeptOverlap;
+
+        // Choose randomly among ties (deterministic per read).
+        std::mt19937_64 rng(uint64_t(r) * 0x9e3779b97f4a7c15ULL + 0xD1A2B3C4ULL);
+        std::uniform_int_distribution<size_t> dist(0, bestAlignmentIds.size() - 1);
+        const uint32_t chosenAlignmentId = bestAlignmentIds[dist(rng)];
+
+        // Prune all other overlaps incident to this contained read.
+        for(const uint32_t alignmentId : table) {
+            if(alignmentId >= alignmentCount) {
+                continue;
+            }
+            if(alignmentId == chosenAlignmentId) {
+                continue;
+            }
+
+            AlignmentData& ad = alignmentData[alignmentId];
+            ad.addDeleteReasonsFromReadPerspective(r, AlignmentData::DeleteReasonContainedPrune);
+            ++overlapsPruned;
+        }
+    }
+
+    cout << timestamp << "[DIAG] pruneContainedReadsToOneBestOverlapByDpScore:"
+         << " containedReads=" << containedReadCount
+         << " kept=" << containedReadsWithKeptOverlap
+         << " noneKept=" << containedReadsWithNoKeptOverlap
+         << " overlapsPruned=" << overlapsPruned << endl;
 }

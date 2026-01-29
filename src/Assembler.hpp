@@ -757,6 +757,7 @@ public:
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
 
@@ -861,6 +862,8 @@ public:
     void chainPafCandidates(
         double maxDriftRate,
         uint64_t maxChainLimit,
+        const OverlapCandidatesOptions& overlapCandidatesOptions,
+        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 
@@ -2117,6 +2120,8 @@ public:
     void chainAlignmentCandidates(
         double maxDriftRate,
         uint64_t maxChainLimit,
+        const OverlapCandidatesOptions& overlapCandidatesOptions,
+        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 
@@ -2124,6 +2129,8 @@ public:
     void findAlignmentCandidatesInvertedIndex(
         double maxDriftRate,
         uint64_t maxChainLimit,
+        const OverlapCandidatesOptions& overlapCandidatesOptions,
+        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 private:
@@ -2144,14 +2151,24 @@ private:
     
 
     
-    class AlignmentCandidatesInvertedIndexData {
-    public:
-         double maxDriftRate;
-         uint64_t k; // k-mer length for canonicalization
-         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
-         
-         // Phase 1: Heavy vector with Keys (for Sort/Group).
-         vector<InvertedIndexOccurrence> occurrences; 
+	    class AlignmentCandidatesInvertedIndexData {
+	    public:
+	         double maxDriftRate;
+	         uint64_t k; // k-mer length for canonicalization
+	         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
+
+             // InvertedIndex chaining configuration (see OverlapCandidatesOptions for meaning).
+             double weightExponent = 1.1;
+             double lowFreqMultiplier = 0.333;
+             double highFreqMultiplier = 1.667;
+             uint32_t rareKmerWeight = 2;
+             double chainFilterRatio = 0.80;
+             uint32_t chainFilterMinScore = 3;
+             double nonRedundantOverlapFraction = 0.5;
+             vector<uint8_t> weightLut; // size 512
+	         
+	         // Phase 1: Heavy vector with Keys (for Sort/Group).
+	         vector<InvertedIndexOccurrence> occurrences; 
          
          // Phase 2: Compact vector for Query (8 bytes/hit).
          vector<CompactOccurrence> compactOccurrences;

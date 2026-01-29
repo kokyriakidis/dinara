@@ -1486,11 +1486,18 @@ void Assembler::exploreAlignment(
 
     // Display the projection of the alignment to base space.
     if(displayProjectedAlignment and not alignment.ordinals.empty()) {
+        const auto& ao = httpServerData.assemblerOptions->alignOptions;
         ProjectedAlignment projectedAlignment(
             *this,
             {orientedReadId0, orientedReadId1},
             alignment,
-            ProjectedAlignment::Method::All);
+            ProjectedAlignment::Method::All,
+            ao.overlapDpMatchScore,
+            ao.overlapDpMismatchScore,
+            ao.overlapDpGapOpen1,
+            ao.overlapDpGapExtend1,
+            ao.overlapDpGapOpen2,
+            ao.overlapDpGapExtend2);
 
         html << "<h2>Alignment projection to base space</h2>";
 

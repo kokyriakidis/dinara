@@ -950,7 +950,13 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 *this,
                 orientedReadIds,
                 alignment,
-                ProjectedAlignment::Method::QuickRawSparse);
+                ProjectedAlignment::Method::QuickRawSparse,
+                data.alignOptions->overlapDpMatchScore,
+                data.alignOptions->overlapDpMismatchScore,
+                data.alignOptions->overlapDpGapOpen1,
+                data.alignOptions->overlapDpGapExtend1,
+                data.alignOptions->overlapDpGapOpen2,
+                data.alignOptions->overlapDpGapExtend2);
             const auto tProjEnd = steady_clock::now();
             
             alignmentInfo.errorRate = float(projectedAlignment.errorRate());
@@ -958,6 +964,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount); // Transfer gap events
+            alignmentInfo.dpScore = projectedAlignment.totalDpScore;
             
 
             data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
@@ -1522,6 +1529,15 @@ void Assembler::accessCompressedAlignments()
 // This could be made multithreaded if it becomes a bottleneck.
 void Assembler::computeAlignmentTable()
 {
+    // Avoid rebuilding if already computed in this process.
+    // Some pipelines call alignment computation routines more than once during experimentation;
+    // rebuilding the alignment table is expensive and also fails if the memory-mapped object
+    // is still open.
+    if(alignmentTable.isOpen()) {
+        performanceLog << timestamp << "Alignment table already exists - skipping recomputation." << endl;
+        return;
+    }
+
     alignmentTable.createNew(largeDataName("AlignmentTable"), largeDataPageSize);
     alignmentTable.beginPass1(ReadId(2 * reads->readCount()));
     for(const AlignmentData& ad: alignmentData) {

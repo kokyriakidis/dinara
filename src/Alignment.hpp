@@ -9,6 +9,7 @@
 #include "array.hpp"
 #include <cmath>
 #include "cstdint.hpp"
+#include <stdexcept>
 #include "utility.hpp"
 #include "vector.hpp"
 
@@ -236,12 +237,48 @@ public:
 
     uint32_t gapEventCount = invalid<uint32_t>; // Total gap EVENTS
 
+    // Base-level DP score computed from the base CIGAR using a two-piece affine model
+    // (hifiasm/minimap2 HiFi defaults). Populated when ProjectedAlignment is computed.
+    int64_t dpScore = invalid<int64_t>;
+
     // Evidence ID (APES/TASSD index)
     size_t alignmentId = invalid<size_t>;
 
     void clearFlags()
     {
         isInReadGraph = 0;
+    }
+
+    // Approximate overlap score used for hifiasm-style overlap ranking/filtering.
+    // This matches the heuristic used elsewhere in Dinara:
+    //   score ~= 2*overlapLen - 6*mismatch - 4*gapBases - 4*gapEvents
+    // If mismatch/gap metrics are not available, this falls back to 2*overlapLen.
+    int64_t hifiasmApproxScore(uint64_t overlapLen) const
+    {
+        int64_t score = 2 * int64_t(overlapLen);
+        const bool hasMetrics =
+            (mismatchCount != invalid<uint32_t>) &&
+            (gapCount != invalid<uint32_t>);
+        if(hasMetrics) {
+            score -= 6 * int64_t(mismatchCount);
+            score -= 4 * int64_t(gapCount);
+            if(gapEventCount != invalid<uint32_t>) {
+                score -= 4 * int64_t(gapEventCount);
+            }
+        }
+        return score;
+    }
+
+    // Return the stored DP score (computed from the base CIGAR using a two-piece affine model).
+    // This is required to be populated anywhere we use hifiasm-style overlap ranking.
+    int64_t hifiasmDpScoreOrApprox(uint64_t overlapLen) const
+    {
+        (void)overlapLen;
+        if(dpScore == invalid<int64_t>) {
+            throw std::runtime_error(
+                "AlignmentInfo::dpScore is not populated. Regenerate alignments with ProjectedAlignment DP scoring enabled.");
+        }
+        return dpScore;
     }
 
 
@@ -484,6 +521,7 @@ public:
     static constexpr DeleteReasonMask DeleteReasonHanging     = 1u << 6; // ma_hit_flt / hanging overlap filter
     static constexpr DeleteReasonMask DeleteReasonContained   = 1u << 7; // ma_hit_contained_advance / contained read removal
     static constexpr DeleteReasonMask DeleteReasonPalindromic = 1u << 8; // palindromic read filtering
+    static constexpr DeleteReasonMask DeleteReasonContainedPrune = 1u << 9; // keep best overlap for contained reads
 
     // The AlignmentInfo computed with the first read on strand 0.
     AlignmentInfo info;

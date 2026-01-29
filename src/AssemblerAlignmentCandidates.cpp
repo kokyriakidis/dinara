@@ -387,6 +387,11 @@ void Assembler::computeCandidateTable()
 // This could be made multithreaded if it becomes a bottleneck.
 void AlignmentCandidates::computeCandidateTable(ReadId readCount, string largeDataName, size_t largeDataPageSize)
 {
+    // Avoid rebuilding if already computed in this process.
+    if(candidateTable.isOpen()) {
+        return;
+    }
+
     candidateTable.createNew(largeDataName, largeDataPageSize);
     candidateTable.beginPass1(ReadId(2 * readCount));
     for(const OrientedReadPair& pair: candidates) {

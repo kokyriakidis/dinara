@@ -243,7 +243,13 @@ public:
     }
     
     void findCandidates() {
-        withSilencedIoInDir(testDir, [&] { assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, 1); });
+        OverlapCandidatesOptions overlapCandidatesOptions;
+        overlapCandidatesOptions.method = "InvertedIndex";
+        overlapCandidatesOptions.driftRateTolerance = 0.1;
+        overlapCandidatesOptions.minMarkerCount = 4;
+        withSilencedIoInDir(testDir, [&] {
+            assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
+        });
     }
 
     // Granular pipeline for testing
@@ -252,7 +258,13 @@ public:
     }
 
     void chainCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100) {
-        withSilencedIoInDir(testDir, [&] { assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, 1); });
+        OverlapCandidatesOptions overlapCandidatesOptions;
+        overlapCandidatesOptions.method = "InvertedIndex";
+        overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
+        overlapCandidatesOptions.minMarkerCount = 4;
+        withSilencedIoInDir(testDir, [&] {
+            assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 0, 1);
+        });
     }
     
     void computeAlignments() {
@@ -332,7 +344,13 @@ public:
     }
 
     void chainPafCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100) {
-        withSilencedIoInDir(testDir, [&] { assembler->chainPafCandidates(maxDriftRate, maxChainLimit, 1); });
+        OverlapCandidatesOptions overlapCandidatesOptions;
+        overlapCandidatesOptions.method = "InvertedIndex";
+        overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
+        overlapCandidatesOptions.minMarkerCount = 4;
+        withSilencedIoInDir(testDir, [&] {
+            assembler->chainPafCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 0, 1);
+        });
     }
 };
 

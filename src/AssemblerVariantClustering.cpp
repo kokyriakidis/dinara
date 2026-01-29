@@ -258,11 +258,24 @@ void Assembler::linkVariantClustersThreadFunction(uint64_t threadId)
             dinara::decompress(compressedAlignment, alignment);
                                 
             // Project alignment to base space
+            const AlignOptions* ao = computeAlignmentsData.alignOptions;
+            const int64_t dpMatchScore = ao ? ao->overlapDpMatchScore : 2;
+            const int64_t dpMismatchScore = ao ? ao->overlapDpMismatchScore : -4;
+            const int64_t dpGapOpen1 = ao ? ao->overlapDpGapOpen1 : 4;
+            const int64_t dpGapExtend1 = ao ? ao->overlapDpGapExtend1 : 2;
+            const int64_t dpGapOpen2 = ao ? ao->overlapDpGapOpen2 : 24;
+            const int64_t dpGapExtend2 = ao ? ao->overlapDpGapExtend2 : 1;
             const ProjectedAlignment projectedAlignment(
                 *this,
                 {currentOrientedReadId0, currentOrientedReadId1},
                 alignment,
-                ProjectedAlignment::Method::QuickRaw);
+                ProjectedAlignment::Method::QuickRaw,
+                dpMatchScore,
+                dpMismatchScore,
+                dpGapOpen1,
+                dpGapExtend1,
+                dpGapOpen2,
+                dpGapExtend2);
 
             // Process each segment to find differences
             for (const ProjectedAlignmentSegment& segment : projectedAlignment.segments) {
@@ -979,5 +992,4 @@ void Assembler::performGlobalVariantClustering(
     
     performanceLog << timestamp << "createVariantClusters ends" << endl;
 }
-
 
