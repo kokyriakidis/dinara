@@ -203,6 +203,17 @@ public:
     string method;              // "MinHash" or "InvertedIndex".
     double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
     int minMarkerCount;         // Minimum aligned marker count for candidate filtering.
+
+    // Additional knobs for the InvertedIndex chaining path (defaults match current hard-coded behavior).
+    // These exist so we can more easily match hifiasm/minimap2 behavior when needed.
+    double invertedIndexWeightExponent = 1.1;                // Exponent used in the frequency weight LUT: pow(w, exponent)
+    double invertedIndexLowFreqMultiplier = 0.333;           // lowFreq = coveragePeak * multiplier
+    double invertedIndexHighFreqMultiplier = 1.667;          // highFreq = coveragePeak * multiplier
+    uint32_t invertedIndexRareKmerWeight = 2;                // Weight used for rare/informative kmers
+    double invertedIndexChainFilterRatio = 0.80;             // filterThresh = bestScore * ratio
+    uint32_t invertedIndexChainFilterMinScore = 3;           // Minimum filterThresh
+    double invertedIndexNonRedundantOverlapFraction = 0.5;   // Reject candidates overlapping > frac of an accepted interval
+
     void write(ostream&) const;
 };
 
@@ -245,6 +256,16 @@ public:
     int sameChannelReadAlignmentSuppressDeltaThreshold;
     bool suppressContainments;
     double maxErrorRate;
+
+    // Overlap/base DP scoring parameters (used to compute AlignmentInfo::dpScore from a base-level CIGAR).
+    // These should be configured to match the scoring model used by hifiasm for overlap alignment.
+    // The gap model is 2-piece affine: gapCost(k) = min(O1 + k*E1, O2 + k*E2).
+    int64_t overlapDpMatchScore;
+    int64_t overlapDpMismatchScore;
+    int64_t overlapDpGapOpen1;
+    int64_t overlapDpGapExtend1;
+    int64_t overlapDpGapOpen2;
+    int64_t overlapDpGapExtend2;
 
     // Align4.
     uint64_t align4DeltaX;
@@ -594,4 +615,3 @@ public:
 };
 
 #endif
-

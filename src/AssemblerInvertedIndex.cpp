@@ -198,6 +198,7 @@ public:
         MemoryMapped::Vector<OrientedReadPair>& candidates,
         MemoryMapped::Vector<Alignment>& precomputedAlignments,
         uint64_t maxChainLimit,
+        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     ) : 
         MultithreadedObject(*this),
@@ -208,6 +209,7 @@ public:
         candidates(candidates),
         precomputedAlignments(precomputedAlignments),
         maxChainLimit(maxChainLimit),
+        minChainedMarkerCount(minChainedMarkerCount),
         threadCount(threadCount)
     {
         // 1. Setup per-thread accumulation buffers and scratchpads
@@ -255,6 +257,7 @@ private:
     MemoryMapped::Vector<OrientedReadPair>& candidates;
     MemoryMapped::Vector<Alignment>& precomputedAlignments;
     uint64_t maxChainLimit;
+    uint32_t minChainedMarkerCount;
     uint64_t threadCount;
 
     vector<vector<OrientedReadPair>> threadCandidates;
@@ -271,6 +274,14 @@ private:
         const uint64_t kmerLen = invertedIndexData.k;
         const double maxDriftRate = invertedIndexData.maxDriftRate;
         const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+        const uint8_t* weightLUT = invertedIndexData.weightLut.data();
+        const double weightExponent = invertedIndexData.weightExponent;
+        const double lowFreqMultiplier = invertedIndexData.lowFreqMultiplier;
+        const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
+        const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
+        const double chainFilterRatio = invertedIndexData.chainFilterRatio;
+        const uint32_t chainFilterMinScore = invertedIndexData.chainFilterMinScore;
+        const double nonRedundantOverlapFraction = invertedIndexData.nonRedundantOverlapFraction;
 
 
         uint64_t startBatch, endBatch;
@@ -303,24 +314,20 @@ private:
                              
                             // Early Weighting: Constant weight for all hits of this k-mer.
                             // Frequent/Repetitive k-mers are penalized using a pre-computed LUT.
-                            // The LUT is generated once at startup using pow(w, 1.1) for Hifiasm compatibility.
-                            static const uint8_t* weightLUT = []() -> uint8_t* {
-                                static uint8_t lut[512];
-                                for (int i = 0; i < 512; ++i) {
-                                    lut[i] = (uint8_t)std::min(255.0, std::pow((double)i, 1.1));
-                                }
-                                return lut;
-                            }();
-                            
+                            // The LUT is generated once at startup using pow(w, exponent) for Hifiasm compatibility.
                             uint8_t hitWeight = 1;
-                            const uint64_t lowFreq = (uint64_t)(coveragePeak * 0.333);
-                            const uint64_t highFreq = (uint64_t)(coveragePeak * 1.667);
+                            const uint64_t lowFreq = (uint64_t)(double(coveragePeak) * lowFreqMultiplier);
+                            const uint64_t highFreq = (uint64_t)(double(coveragePeak) * highFreqMultiplier);
                             
                             if (count <= std::max(2UL, lowFreq)) {
-                                hitWeight = 2; // Rare/Informative k-mer (High value)
+                                hitWeight = uint8_t(std::min<uint32_t>(255U, rareKmerWeight)); // Rare/Informative k-mer (High value)
                             } else if (count >= std::max(3UL, highFreq)) {
                                 uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
-                                hitWeight = (w < 512) ? weightLUT[w] : (uint8_t)std::min(255U, (uint32_t)pow((double)w, 1.1));
+                                if(w < 512) {
+                                    hitWeight = weightLUT[w];
+                                } else {
+                                    hitWeight = (uint8_t)std::min(255U, (uint32_t)pow((double)w, weightExponent));
+                                }
                             }
 
                             const auto* compactOccs = &invertedIndexData.compactOccurrences[startIdx];
@@ -467,7 +474,10 @@ private:
                             
                             // Case 1: Hits on the same strand
                             if(dB > 0 && dA > 0) { 
-                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA), nLn = scratch.cumLenSame[j] + dB;
+                                // Hifiasm's chaining constraint uses the query/self-axis as the length accumulator.
+                                // Here that is Read A (dA).
+                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA);
+                                uint32_t nLn = scratch.cumLenSame[j] + uint32_t(dA);
                                 if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
                                     uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
                                     int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
@@ -487,7 +497,8 @@ private:
                             // Case 2: Hits on opposite strands
                             else if (dB < 0 && dA > 0) { 
                                 int32_t aB = -dB; 
-                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA), nLn = scratch.cumLenDiff[j] + aB;
+                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA);
+                                uint32_t nLn = scratch.cumLenDiff[j] + uint32_t(dA);
                                 if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
                                     uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
                                     int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
@@ -526,7 +537,9 @@ private:
                     // --- Step 3: Filtering and Candidate Generation ---
                     uint32_t bestScPair = std::max(maxScSame, maxScDiff);
                     if (bestScPair < 2) continue;
-                    uint32_t filterThresh = std::max(3U, (uint32_t)(bestScPair * 0.80));
+                    uint32_t filterThresh = std::max<uint32_t>(
+                        chainFilterMinScore,
+                        uint32_t(double(bestScPair) * chainFilterRatio));
 
                     scratch.chainCandidates.clear();
                     for (size_t k = 0; k < numHits; ++k) {
@@ -574,12 +587,24 @@ private:
                          uint32_t len = qe - qs + 1;
                          for (const auto& iv : accepted) {
                              uint32_t oS = std::max(qs, iv.qs), oE = std::min(qe, iv.qe);
-                             if (oE >= oS && (oE - oS + 1) > (uint32_t)(0.5 * len)) return true;
+                             if (oE >= oS && (oE - oS + 1) > (uint32_t)(nonRedundantOverlapFraction * double(len))) return true;
                          }
                          return false;
                     };
 
                     for (const auto& cand : scratch.chainCandidates) {
+                        // Filter low-support candidates before doing any backtracking/extraction.
+                        // We keep only candidates with strictly more than minChainedMarkerCount marker hits
+                        // so the candidate table (and downstream work) stays high-confidence.
+                        if(minChainedMarkerCount > 0) {
+                            const uint32_t occ = cand.isDiff ?
+                                scratch.chainOccurrencesDiff[cand.endK] :
+                                scratch.chainOccurrencesSame[cand.endK];
+                            if(occ <= minChainedMarkerCount) {
+                                continue;
+                            }
+                        }
+
                         int32_t currK = cand.endK;
                         const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
                         scratch.currentChainPath.clear();
@@ -915,6 +940,8 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
 void Assembler::chainAlignmentCandidates(
     double maxDriftRate,
     uint64_t maxChainLimit,
+    const OverlapCandidatesOptions& overlapCandidatesOptions,
+    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     if(threadCount == 0) {
@@ -951,6 +978,17 @@ void Assembler::chainAlignmentCandidates(
 
     invertedIndexData.maxDriftRate = maxDriftRate;
     invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
+    invertedIndexData.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
+    invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
+    invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
+    invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
+    invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
+    invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
+    invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
+    invertedIndexData.weightLut.resize(512);
+    for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
+        invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
+    }
 
     // Launch the finder across all threads
     InvertedIndexFinder finder(
@@ -961,6 +999,7 @@ void Assembler::chainAlignmentCandidates(
         alignmentCandidates.candidates,
         alignmentCandidatesAlignmentsData.alignments,
         maxChainLimit,
+        minChainedMarkerCount,
         threadCount
     );
 
@@ -984,10 +1023,12 @@ void Assembler::chainAlignmentCandidates(
 void Assembler::findAlignmentCandidatesInvertedIndex(
     double maxDriftRate,
     uint64_t maxChainLimit,
+    const OverlapCandidatesOptions& overlapCandidatesOptions,
+    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     buildInvertedIndex(threadCount);
-    chainAlignmentCandidates(maxDriftRate, maxChainLimit, threadCount);
+    chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, minChainedMarkerCount, threadCount);
 }
 
 // =============================================================================
@@ -998,6 +1039,8 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
 void Assembler::chainPafCandidates(
     double maxDriftRate,
     uint64_t maxChainLimit,
+    const OverlapCandidatesOptions& overlapCandidatesOptions,
+    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     if(threadCount == 0) {
@@ -1022,6 +1065,17 @@ void Assembler::chainPafCandidates(
     // Store parameters for chaining
     invertedIndexData.maxDriftRate = maxDriftRate;
     invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
+    invertedIndexData.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
+    invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
+    invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
+    invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
+    invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
+    invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
+    invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
+    invertedIndexData.weightLut.resize(512);
+    for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
+        invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
+    }
 
     // Create output storage for chained alignments
     alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize);
@@ -1109,24 +1163,17 @@ void Assembler::chainPafCandidates(
                                 const uint64_t startIdx = hashTablePtr[slotIdx].start;
                                 const uint32_t count = hashTablePtr[slotIdx].count;
                                 
-                                // Compute weight
-                                static const uint8_t* weightLUT = []() -> uint8_t* {
-                                    static uint8_t lut[512];
-                                    for (int i = 0; i < 512; ++i) {
-                                        lut[i] = (uint8_t)std::min(255.0, std::pow((double)i, 1.1));
-                                    }
-                                    return lut;
-                                }();
-                                
                                 uint8_t hitWeight = 1;
-                                const uint64_t lowFreq = (uint64_t)(coveragePeak * 0.333);
-                                const uint64_t highFreq = (uint64_t)(coveragePeak * 1.667);
+                                const uint64_t lowFreq = (uint64_t)(double(coveragePeak) * invertedIndexData.lowFreqMultiplier);
+                                const uint64_t highFreq = (uint64_t)(double(coveragePeak) * invertedIndexData.highFreqMultiplier);
                                 
                                 if (count <= std::max(2UL, lowFreq)) {
-                                    hitWeight = 2;
+                                    hitWeight = uint8_t(std::min<uint32_t>(255U, invertedIndexData.rareKmerWeight));
                                 } else if (count >= std::max(3UL, highFreq)) {
                                     uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
-                                    hitWeight = (w < 512) ? weightLUT[w] : (uint8_t)std::min(255U, (uint32_t)pow((double)w, 1.1));
+                                    hitWeight = (w < 512) ?
+                                        invertedIndexData.weightLut[w] :
+                                        (uint8_t)std::min(255U, (uint32_t)pow((double)w, invertedIndexData.weightExponent));
                                 }
 
                                 // Find occurrences in read B only
@@ -1143,9 +1190,8 @@ void Assembler::chainPafCandidates(
                     }
 
                     if(scratch.flatHits.empty()) {
-                        // No shared k-mers found, keep original candidate without chained alignment
-                        localCandidates.push_back(pair);
-                        localAlignments.push_back(Alignment());
+                        // No shared marker k-mers found, so there is no chain to score.
+                        // Do not emit a candidate with an empty chain.
                         continue;
                     }
 
@@ -1194,7 +1240,7 @@ void Assembler::chainPafCandidates(
                             // Same strand case
                             if(dB > 0 && dA > 0) {
                                 uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA);
-                                uint32_t nLn = scratch.cumLenSame[j] + dB;
+                                uint32_t nLn = scratch.cumLenSame[j] + uint32_t(dA);
                                 if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
                                     uint32_t wS = std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
                                     int32_t sc = (int32_t)scratch.dpSame[j] + (int32_t)wS;
@@ -1210,7 +1256,7 @@ void Assembler::chainPafCandidates(
                             else if(dB < 0 && dA > 0) {
                                 int32_t aB = -dB;
                                 uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA);
-                                uint32_t nLn = scratch.cumDriftDiff[j] + aB;
+                                uint32_t nLn = scratch.cumLenDiff[j] + uint32_t(dA);
                                 if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
                                     uint32_t wS = std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
                                     int32_t sc = (int32_t)scratch.dpDiff[j] + (int32_t)wS;
@@ -1234,8 +1280,6 @@ void Assembler::chainPafCandidates(
                     const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
 
                     if(bestEndIdx < 0) {
-                        localCandidates.push_back(pair);
-                        localAlignments.push_back(Alignment());
                         continue;
                     }
 
@@ -1247,6 +1291,11 @@ void Assembler::chainPafCandidates(
                         currK = parentArr[currK];
                     }
                     std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
+
+                    if(minChainedMarkerCount > 0 &&
+                        scratch.currentChainPath.size() <= size_t(minChainedMarkerCount)) {
+                        continue;
+                    }
 
                     // Build alignment
                     Alignment al;
@@ -1284,9 +1333,6 @@ void Assembler::chainPafCandidates(
 
                         localCandidates.push_back(OrientedReadPair(readIdA, readIdB, useSameStrand));
                         localAlignments.push_back(std::move(al));
-                    } else {
-                        localCandidates.push_back(pair);
-                        localAlignments.push_back(Alignment());
                     }
                 }
             }

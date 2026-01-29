@@ -563,31 +563,35 @@ void dinara::main::assemble(
     assembler.buildInvertedIndex(threadCount);
 
     // Find and chain alignment candidates.
-    if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
+if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
         // PAF path: Import candidate pairs from PAF, then chain them using the inverted index.
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
-        assembler.chainPafCandidates(
-            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-            maxChainLimit,
-            threadCount
-        );
-    } else {
+    assembler.chainPafCandidates(
+        assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+        maxChainLimit,
+        assemblerOptions.overlapCandidatesOptions,
+        uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+        threadCount
+    );
+} else {
         // Inverted Index path: Discover candidate pairs via k-mer matches and chain them.
-        assembler.chainAlignmentCandidates(
-            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-            maxChainLimit,
-            threadCount
-        );
-    }
-
-    // For http server and debugging/development purposes, generate an exhaustive table of candidates
-    assembler.computeCandidateTable();
-
+    assembler.chainAlignmentCandidates(
+        assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+        maxChainLimit,
+        assemblerOptions.overlapCandidatesOptions,
+        uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+        threadCount
+    );
+}
 
     // Compute alignments with variant evidence storage.
     assembler.computeAlignmentsWithEvidence(
         assemblerOptions.alignOptions,
         threadCount);
+
+    // For http server and debugging/development purposes, generate an exhaustive table of candidates.
+    // This can be done after alignment computation (it depends only on the candidate list).
+    assembler.computeCandidateTable();
 
     // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
     assembler.filterSecondaryAlignmentsPerReadPair(threadCount);

@@ -498,6 +498,41 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(4),
         "Minimum aligned marker count for a candidate overlap to be kept.")
 
+        ("OverlapCandidates.invertedIndexWeightExponent",
+        value<double>(&overlapCandidatesOptions.invertedIndexWeightExponent)->
+        default_value(1.1),
+        "InvertedIndex chaining: exponent used in the frequency weight LUT (pow(w, exponent)).")
+
+        ("OverlapCandidates.invertedIndexLowFreqMultiplier",
+        value<double>(&overlapCandidatesOptions.invertedIndexLowFreqMultiplier)->
+        default_value(0.333),
+        "InvertedIndex chaining: low-frequency threshold multiplier (lowFreq = coveragePeak * multiplier).")
+
+        ("OverlapCandidates.invertedIndexHighFreqMultiplier",
+        value<double>(&overlapCandidatesOptions.invertedIndexHighFreqMultiplier)->
+        default_value(1.667),
+        "InvertedIndex chaining: high-frequency threshold multiplier (highFreq = coveragePeak * multiplier).")
+
+        ("OverlapCandidates.invertedIndexRareKmerWeight",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexRareKmerWeight)->
+        default_value(2),
+        "InvertedIndex chaining: weight assigned to rare/informative kmers.")
+
+        ("OverlapCandidates.invertedIndexChainFilterRatio",
+        value<double>(&overlapCandidatesOptions.invertedIndexChainFilterRatio)->
+        default_value(0.80),
+        "InvertedIndex chaining: keep chain ends with score >= bestScore * ratio.")
+
+        ("OverlapCandidates.invertedIndexChainFilterMinScore",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexChainFilterMinScore)->
+        default_value(3),
+        "InvertedIndex chaining: minimum score threshold for candidate chain ends.")
+
+        ("OverlapCandidates.invertedIndexNonRedundantOverlapFraction",
+        value<double>(&overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction)->
+        default_value(0.5),
+        "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction.")
+
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
         default_value(3),
@@ -541,6 +576,36 @@ void AssemblerOptions::addConfigurableOptions()
         value<double>(&alignOptions.maxErrorRate)->
         default_value(0.07),
         "The maximum error rate (mismatches + gaps / length) for an alignment to be used.")
+
+        ("Align.overlapDp.matchScore",
+        value<int64_t>(&alignOptions.overlapDpMatchScore)->
+        default_value(2),
+        "Base-level match score used to compute AlignmentInfo::dpScore from overlap CIGARs.")
+
+        ("Align.overlapDp.mismatchScore",
+        value<int64_t>(&alignOptions.overlapDpMismatchScore)->
+        default_value(-4),
+        "Base-level mismatch score used to compute AlignmentInfo::dpScore from overlap CIGARs.")
+
+        ("Align.overlapDp.gapOpen1",
+        value<int64_t>(&alignOptions.overlapDpGapOpen1)->
+        default_value(4),
+        "First gap-open penalty O1 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+
+        ("Align.overlapDp.gapExtend1",
+        value<int64_t>(&alignOptions.overlapDpGapExtend1)->
+        default_value(2),
+        "First gap-extend penalty E1 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+
+        ("Align.overlapDp.gapOpen2",
+        value<int64_t>(&alignOptions.overlapDpGapOpen2)->
+        default_value(24),
+        "Second gap-open penalty O2 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+
+        ("Align.overlapDp.gapExtend2",
+        value<int64_t>(&alignOptions.overlapDpGapExtend2)->
+        default_value(1),
+        "Second gap-extend penalty E2 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
 
         ("Align.matchScore",
         value<int>(&alignOptions.matchScore)->
@@ -1434,6 +1499,13 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "method = " << method << "\n";
     s << "driftRateTolerance = " << driftRateTolerance << "\n";
     s << "minMarkerCount = " << minMarkerCount << "\n";
+    s << "invertedIndexWeightExponent = " << invertedIndexWeightExponent << "\n";
+    s << "invertedIndexLowFreqMultiplier = " << invertedIndexLowFreqMultiplier << "\n";
+    s << "invertedIndexHighFreqMultiplier = " << invertedIndexHighFreqMultiplier << "\n";
+    s << "invertedIndexRareKmerWeight = " << invertedIndexRareKmerWeight << "\n";
+    s << "invertedIndexChainFilterRatio = " << invertedIndexChainFilterRatio << "\n";
+    s << "invertedIndexChainFilterMinScore = " << invertedIndexChainFilterMinScore << "\n";
+    s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
 }
 
 
@@ -1448,6 +1520,13 @@ void AlignOptions::write(ostream& s) const
     s << "maxMarkerFrequency = " << maxMarkerFrequency << "\n";
     s << "minAlignedMarkerCount = " << minAlignedMarkerCount << "\n";
     s << "minAlignedFraction = " << minAlignedFraction << "\n";
+    s << "maxErrorRate = " << maxErrorRate << "\n";
+    s << "overlapDp.matchScore = " << overlapDpMatchScore << "\n";
+    s << "overlapDp.mismatchScore = " << overlapDpMismatchScore << "\n";
+    s << "overlapDp.gapOpen1 = " << overlapDpGapOpen1 << "\n";
+    s << "overlapDp.gapExtend1 = " << overlapDpGapExtend1 << "\n";
+    s << "overlapDp.gapOpen2 = " << overlapDpGapOpen2 << "\n";
+    s << "overlapDp.gapExtend2 = " << overlapDpGapExtend2 << "\n";
     s << "matchScore = " << matchScore << "\n";
     s << "mismatchScore = " << mismatchScore << "\n";
     s << "gapScore = " << gapScore << "\n";

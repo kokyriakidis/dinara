@@ -229,6 +229,13 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             if(alignment.ordinals.empty()) {
                 continue;
             }
+            // Skip low-support candidates early.
+            // This avoids spending time in projected alignment construction for pairs
+            // that cannot possibly meet Align.minAlignedMarkerCount.
+            if(alignOptions.minAlignedMarkerCount > 0 &&
+                alignment.ordinals.size() < size_t(alignOptions.minAlignedMarkerCount)) {
+                continue;
+            }
             array<OrientedReadId, 2> orientedReadIds = {
                 OrientedReadId(candidate.readIds[0], 0),
                 OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1)
@@ -240,7 +247,13 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
                 *this,
                 orientedReadIds,
                 alignment,
-                ProjectedAlignment::Method::QuickRawSparse);
+                ProjectedAlignment::Method::QuickRawSparse,
+                alignOptions.overlapDpMatchScore,
+                alignOptions.overlapDpMismatchScore,
+                alignOptions.overlapDpGapOpen1,
+                alignOptions.overlapDpGapExtend1,
+                alignOptions.overlapDpGapOpen2,
+                alignOptions.overlapDpGapExtend2);
             const auto tProjEnd = steady_clock::now();
             data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
             
@@ -261,6 +274,7 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount);
+            alignmentInfo.dpScore = projectedAlignment.totalDpScore;
 
             AlignmentData thisAlignmentData(candidate, alignmentInfo);
             
@@ -526,23 +540,7 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                 // Overlap length on r0.
                 const uint64_t overlapLenOnR0 = uint64_t(ad.qe) - uint64_t(ad.qs);
 
-                // Hifiasm affine score approximation if metrics are available.
-                const bool hasMetrics =
-                    (info.mismatchCount != invalid<uint32_t>) &&
-                    (info.gapCount != invalid<uint32_t>);
-
-                int64_t score;
-                if(hasMetrics) {
-                    // Score ~= 2*Len - 6*Mis - 4*GapBases - 4*GapEvents
-                    score = 2 * int64_t(overlapLenOnR0)
-                          - 6 * int64_t(info.mismatchCount)
-                          - 4 * int64_t(info.gapCount);
-                    if(info.gapEventCount != invalid<uint32_t>) {
-                        score -= 4 * int64_t(info.gapEventCount);
-                    }
-                } else {
-                    score = 2 * int64_t(overlapLenOnR0);
-                }
+                const int64_t score = info.hifiasmDpScoreOrApprox(overlapLenOnR0);
 
                 // Overlap interval on r0 (forward coordinates).
                 const uint64_t qs = ad.qs;

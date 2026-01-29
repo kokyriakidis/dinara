@@ -17,7 +17,13 @@ ProjectedAlignment::ProjectedAlignment(
     const Assembler& assembler,
     const array<OrientedReadId, 2>& orientedReadIds,
     const Alignment& alignment,
-    Method method) :
+    Method method,
+    int64_t dpMatchScore,
+    int64_t dpMismatchScore,
+    int64_t dpGapOpen1,
+    int64_t dpGapExtend1,
+    int64_t dpGapOpen2,
+    int64_t dpGapExtend2) :
 
     ProjectedAlignment(
         uint32_t(assembler.assemblerInfo->k),
@@ -31,7 +37,13 @@ ProjectedAlignment::ProjectedAlignment(
             (*assembler.markers)[orientedReadIds[0].getValue()],
             (*assembler.markers)[orientedReadIds[1].getValue()]
         },
-        method)
+        method,
+        dpMatchScore,
+        dpMismatchScore,
+        dpGapOpen1,
+        dpGapExtend1,
+        dpGapOpen2,
+        dpGapExtend2)
 {
 }
 
@@ -43,13 +55,25 @@ ProjectedAlignment::ProjectedAlignment(
     const array<LongBaseSequenceView, 2>& sequences,
     const Alignment& alignment,
     const array< span<const CompressedMarker>, 2>& markers,
-    Method method) :
+    Method method,
+    int64_t dpMatchScore,
+    int64_t dpMismatchScore,
+    int64_t dpGapOpen1,
+    int64_t dpGapExtend1,
+    int64_t dpGapOpen2,
+    int64_t dpGapExtend2) :
     k(k),
     kHalf(k / 2),
     orientedReadIds(orientedReadIds),
     sequences(sequences),
     alignment(alignment),
-    markers(markers)
+    markers(markers),
+    dpMatchScore(dpMatchScore),
+    dpMismatchScore(dpMismatchScore),
+    dpGapOpen1(dpGapOpen1),
+    dpGapExtend1(dpGapExtend1),
+    dpGapOpen2(dpGapOpen2),
+    dpGapExtend2(dpGapExtend2)
 {
     DINARA_ASSERT((k % 2) == 0);
 
@@ -96,7 +120,10 @@ void ProjectedAlignment::constructAll()
         fillSequences(segment);
 
         // Align them.
-        segment.computeAlignment(matchScore, mismatchScore, gapScore);
+        segment.computeAlignment(
+            matchScore, mismatchScore, gapScore,
+            dpMatchScore, dpMismatchScore,
+            dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
 
         // Same, in RLE.
         segment.fillRleSequences();
@@ -184,8 +211,13 @@ void ProjectedAlignment::constructQuickRaw()
     mismatchCount = 0;
     totalDeletionCount = 0;
     totalGapEventCount = 0;
+    totalDpScore = 0;
     hasLargeIndel = false;
     maxIndelSize = 0;
+
+    // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults).
+    // For identical segments we only need the match reward.
+    const int64_t dpMatch = dpMatchScore;
 
     // Loop over pairs of consecutive aligned markers (A, B).
     // Prepend the initial kHalf match (Left Tail)
@@ -215,17 +247,22 @@ void ProjectedAlignment::constructQuickRaw()
 
         // If the raw sequences are the same, don't store the segment.
         if(segment.sequences[0] == segment.sequences[1]) {
+            totalDpScore += dpMatch * int64_t(segment.sequences[0].size());
             continue;
         }
 
         // Align them.
-        segment.computeAlignment(matchScore, mismatchScore, gapScore);
+        segment.computeAlignment(
+            matchScore, mismatchScore, gapScore,
+            dpMatchScore, dpMismatchScore,
+            dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
 
         // Accumulate statistics
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
         totalDeletionCount += segment.deletionCount;
         totalGapEventCount += segment.gapEventCount;
+        totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
         if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
 
@@ -256,8 +293,13 @@ void ProjectedAlignment::constructQuickRawSparse()
     mismatchCount = 0;
     totalDeletionCount = 0;
     totalGapEventCount = 0;
+    totalDpScore = 0;
     hasLargeIndel = false;
     maxIndelSize = 0;
+
+    // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults).
+    // For identical segments we only need the match reward.
+    const int64_t dpMatch = dpMatchScore;
 
     // Thread-local buffers to avoid repeated allocations/conversions.
     // We fill these directly from the oriented read views (via getBase),
@@ -319,6 +361,7 @@ void ProjectedAlignment::constructQuickRawSparse()
 
         // If the raw sequences are the same, there is no contribution.
         if(asciiSequence0 == asciiSequence1) {
+            totalDpScore += dpMatch * int64_t(len0);
             continue;
         }
 
@@ -334,8 +377,26 @@ void ProjectedAlignment::constructQuickRawSparse()
         uint64_t segMismatchCount = 0;
         uint64_t segDeletionCount = 0;
         uint64_t segGapEventCount = 0;
+        int64_t segDpScore = 0;
         bool segHasLargeIndel = false;
         uint32_t segMaxIndelSize = 0;
+
+        // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults):
+        // match=+2, mismatch=-4, gapCost(L)=min(O1+E1*L, O2+E2*L) with (O1,E1)=(4,2), (O2,E2)=(24,1).
+        const int64_t match = dpMatchScore;
+        const int64_t mismatch = dpMismatchScore;
+        const int64_t gapOpen1 = dpGapOpen1;
+        const int64_t gapExtend1 = dpGapExtend1;
+        const int64_t gapOpen2 = dpGapOpen2;
+        const int64_t gapExtend2 = dpGapExtend2;
+        auto gapPenalty = [&](uint64_t length) -> int64_t {
+            const int64_t l = int64_t(length);
+            DINARA_ASSERT(l >= 1);
+            // Minimap2/ksw2 convention: a gap of length k costs O + k*E.
+            const int64_t c1 = gapOpen1 + gapExtend1 * l;
+            const int64_t c2 = gapOpen2 + gapExtend2 * l;
+            return std::min(c1, c2);
+        };
 
         // Parse CIGAR and collect sparse differences.
         uint64_t position0 = 0;
@@ -354,6 +415,7 @@ void ProjectedAlignment::constructQuickRawSparse()
 
             if(c == 'M' || c == '=' || c == 'X') {
                 // Match/mismatch block: record mismatches.
+                uint64_t mismatchHere = 0;
                 for(size_t k=0; k<currentVal; ++k) {
                     const uint8_t a0 = asciiSequence0[position0 + k];
                     const uint8_t a1 = asciiSequence1[position1 + k];
@@ -365,8 +427,11 @@ void ProjectedAlignment::constructQuickRawSparse()
                             asciiToBase[a1]
                         });
                         ++segMismatchCount;
+                        ++mismatchHere;
                     }
                 }
+                const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
+                segDpScore += match * int64_t(matchHere) + mismatch * int64_t(mismatchHere);
                 position0 += currentVal;
                 position1 += currentVal;
 
@@ -381,6 +446,7 @@ void ProjectedAlignment::constructQuickRawSparse()
                 position0 += currentVal;
                 segDeletionCount += currentVal;
                 ++segGapEventCount;
+                segDpScore -= gapPenalty(uint64_t(currentVal));
                 if(currentVal >= 6) {
                     segHasLargeIndel = true;
                 }
@@ -399,6 +465,7 @@ void ProjectedAlignment::constructQuickRawSparse()
                 position1 += currentVal;
                 segDeletionCount += currentVal;
                 ++segGapEventCount;
+                segDpScore -= gapPenalty(uint64_t(currentVal));
                 if(currentVal >= 6) {
                     segHasLargeIndel = true;
                 }
@@ -427,6 +494,7 @@ void ProjectedAlignment::constructQuickRawSparse()
         mismatchCount += segMismatchCount;
         totalDeletionCount += segDeletionCount;
         totalGapEventCount += segGapEventCount;
+        totalDpScore += segDpScore;
         if(segHasLargeIndel) {
             hasLargeIndel = true;
         }
@@ -457,7 +525,13 @@ ProjectedAlignmentSegment::ProjectedAlignmentSegment(
 void ProjectedAlignmentSegment::computeAlignment(
     int64_t /* matchScore */,
     int64_t /* mismatchScore */,
-    int64_t /* gapScore */)
+    int64_t /* gapScore */,
+    int64_t dpMatchScore,
+    int64_t dpMismatchScore,
+    int64_t dpGapOpen1,
+    int64_t dpGapExtend1,
+    int64_t dpGapOpen2,
+    int64_t dpGapExtend2)
 {
     const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(sequences[0]);
     const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(sequences[1]);
@@ -468,6 +542,11 @@ void ProjectedAlignmentSegment::computeAlignment(
         fill(alignment.begin(), alignment.end(), make_pair(true, true));
         mismatchCount = 0;
         deletionCount = 0;
+        gapEventCount = 0;
+        // Hifiasm/minimap2-style match reward (HiFi defaults).
+        dpScore = dpMatchScore * int64_t(sequence0.size());
+        hasLargeIndel = false;
+        maxIndelSize = 0;
 
     } else {
         // Convert sequences to ASCII for A*PA2
@@ -531,8 +610,24 @@ void ProjectedAlignmentSegment::computeAlignment(
         mismatchCount = 0;
         deletionCount = 0;
         gapEventCount = 0;
+        dpScore = 0;
         hasLargeIndel = false;
         maxIndelSize = 0;
+
+        const int64_t match = dpMatchScore;
+        const int64_t mismatch = dpMismatchScore;
+        const int64_t gapOpen1 = dpGapOpen1;
+        const int64_t gapExtend1 = dpGapExtend1;
+        const int64_t gapOpen2 = dpGapOpen2;
+        const int64_t gapExtend2 = dpGapExtend2;
+        auto gapPenalty = [&](uint64_t length) -> int64_t {
+            const int64_t l = int64_t(length);
+            DINARA_ASSERT(l >= 1);
+            // Minimap2/ksw2 convention: a gap of length k costs O + k*E.
+            const int64_t c1 = gapOpen1 + gapExtend1 * l;
+            const int64_t c2 = gapOpen2 + gapExtend2 * l;
+            return std::min(c1, c2);
+        };
 
         for(size_t i=0; i<cigarLen; i++) {
             char c = cigar[i];
@@ -559,23 +654,29 @@ void ProjectedAlignmentSegment::computeAlignment(
 
                     // Update mismatchCount and positions
                     if (op.first && op.second) { // M, =, X
+                        uint64_t mismatchHere = 0;
                         for(size_t k=0; k<currentVal; ++k) {
                             if (sequence0[position0 + k] != sequence1[position1 + k]) {
                                 mismatchCount++;
+                                mismatchHere++;
                             }
                         }
+                        const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
+                        dpScore += match * int64_t(matchHere) + mismatch * int64_t(mismatchHere);
                         position0 += currentVal;
                         position1 += currentVal;
                     } else if (op.first) { // D
                         position0 += currentVal;
                         deletionCount += currentVal;
                         gapEventCount++;
+                        dpScore -= gapPenalty(uint64_t(currentVal));
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     } else if (op.second) { // I
                         position1 += currentVal;
                         deletionCount += currentVal;
                         gapEventCount++; // ONE gap event
+                        dpScore -= gapPenalty(uint64_t(currentVal));
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     }
@@ -598,6 +699,12 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
     int64_t /* matchScore */,
     int64_t /* mismatchScore */,
     int64_t /* gapScore */,
+    int64_t dpMatchScore,
+    int64_t dpMismatchScore,
+    int64_t dpGapOpen1,
+    int64_t dpGapExtend1,
+    int64_t dpGapOpen2,
+    int64_t dpGapExtend2,
     vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
     vector<ProjectedAlignmentSparseIndel>& sparseIndels)
 {
@@ -639,8 +746,24 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
     mismatchCount = 0;
     deletionCount = 0;
     gapEventCount = 0;
+    dpScore = 0;
     hasLargeIndel = false;
     maxIndelSize = 0;
+
+    const int64_t match = dpMatchScore;
+    const int64_t mismatch = dpMismatchScore;
+    const int64_t gapOpen1 = dpGapOpen1;
+    const int64_t gapExtend1 = dpGapExtend1;
+    const int64_t gapOpen2 = dpGapOpen2;
+    const int64_t gapExtend2 = dpGapExtend2;
+    auto gapPenalty = [&](uint64_t length) -> int64_t {
+        const int64_t l = int64_t(length);
+        DINARA_ASSERT(l >= 1);
+        // Minimap2/ksw2 convention: a gap of length k costs O + k*E.
+        const int64_t c1 = gapOpen1 + gapExtend1 * l;
+        const int64_t c2 = gapOpen2 + gapExtend2 * l;
+        return std::min(c1, c2);
+    };
 
     size_t currentVal = 0;
     for(size_t i=0; i<cigarLen; i++) {
@@ -656,6 +779,7 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
 
         if(c == 'M' || c == '=' || c == 'X') {
             // Match/mismatch block: record mismatches.
+            uint64_t mismatchHere = 0;
             for(size_t k=0; k<currentVal; ++k) {
                 const uint8_t b0 = sequence0[position0 + k];
                 const uint8_t b1 = sequence1[position1 + k];
@@ -667,8 +791,11 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
                         b1
                     });
                     ++mismatchCount;
+                    ++mismatchHere;
                 }
             }
+            const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
+            dpScore += match * int64_t(matchHere) + mismatch * int64_t(mismatchHere);
             position0 += currentVal;
             position1 += currentVal;
 
@@ -683,6 +810,7 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
             position0 += currentVal;
             deletionCount += currentVal;
             ++gapEventCount;
+            dpScore -= gapPenalty(uint64_t(currentVal));
             if(currentVal >= 6) {
                 hasLargeIndel = true;
             }
@@ -701,6 +829,7 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
             position1 += currentVal;
             deletionCount += currentVal;
             ++gapEventCount;
+            dpScore -= gapPenalty(uint64_t(currentVal));
             if(currentVal >= 6) {
                 hasLargeIndel = true;
             }
@@ -1110,7 +1239,10 @@ void ProjectedAlignment::computeStatistics()
     // Compute total edit distances.
     totalEditDistance = 0;
     totalEditDistanceRle = 0;
+    mismatchCount = 0;
+    totalDeletionCount = 0;
     totalGapEventCount = 0; // Init
+    totalDpScore = 0;
     hasLargeIndel = false;
     maxIndelSize = 0;
     for(const ProjectedAlignmentSegment& segment: segments) {
@@ -1119,6 +1251,7 @@ void ProjectedAlignment::computeStatistics()
         totalDeletionCount += segment.deletionCount;
         totalGapEventCount += segment.gapEventCount; // Sum
         mismatchCount += segment.mismatchCount;
+        totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
         if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
     }

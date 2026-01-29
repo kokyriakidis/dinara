@@ -82,11 +82,23 @@ public:
     void computeAlignment(
         int64_t matchScore,
         int64_t mismatchScore,
-        int64_t gapScore);
+        int64_t gapScore,
+        int64_t dpMatchScore,
+        int64_t dpMismatchScore,
+        int64_t dpGapOpen1,
+        int64_t dpGapExtend1,
+        int64_t dpGapOpen2,
+        int64_t dpGapExtend2);
     void computeAlignmentSparse(
         int64_t matchScore,
         int64_t mismatchScore,
         int64_t gapScore,
+        int64_t dpMatchScore,
+        int64_t dpMismatchScore,
+        int64_t dpGapOpen1,
+        int64_t dpGapExtend1,
+        int64_t dpGapOpen2,
+        int64_t dpGapExtend2,
         vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
         vector<ProjectedAlignmentSparseIndel>& sparseIndels);
 
@@ -114,6 +126,10 @@ public:
 
     // The number of gap events (indels).
     uint64_t gapEventCount = invalid<uint64_t>;
+
+    // Base-level DP alignment score computed from the CIGAR using a two-piece affine model.
+    // Parameters are chosen to match hifiasm/minimap2 defaults for HiFi overlaps.
+    int64_t dpScore = invalid<int64_t>;
 
     // Flag for large indel (>= 6 bases)
     bool hasLargeIndel = false;
@@ -150,7 +166,13 @@ public:
         const Assembler&,
         const array<OrientedReadId, 2>&,
         const Alignment&,
-        Method method);
+        Method method,
+        int64_t dpMatchScore,
+        int64_t dpMismatchScore,
+        int64_t dpGapOpen1,
+        int64_t dpGapExtend1,
+        int64_t dpGapOpen2,
+        int64_t dpGapExtend2);
 
     ProjectedAlignment(
         uint32_t k,
@@ -158,7 +180,13 @@ public:
         const array<LongBaseSequenceView, 2>&,
         const Alignment&,
         const array< span<const CompressedMarker>, 2>& markers,
-        Method method);
+        Method method,
+        int64_t dpMatchScore,
+        int64_t dpMismatchScore,
+        int64_t dpGapOpen1,
+        int64_t dpGapExtend1,
+        int64_t dpGapOpen2,
+        int64_t dpGapExtend2);
 
     void constructAll();
     void constructQuickRle();
@@ -178,6 +206,14 @@ public:
     const int64_t matchScore = 0;
     const int64_t mismatchScore = -1;
     const int64_t gapScore = -1;
+
+    // Scoring scheme for overlap DP score (2-piece affine).
+    const int64_t dpMatchScore;
+    const int64_t dpMismatchScore;
+    const int64_t dpGapOpen1;
+    const int64_t dpGapExtend1;
+    const int64_t dpGapOpen2;
+    const int64_t dpGapExtend2;
 
     // The two OrientedReadIds in this alignment.
     const array<OrientedReadId, 2>& orientedReadIds;
@@ -221,6 +257,9 @@ public:
 
     // The number of gap events (indels) in the raw alignment.
     uint64_t totalGapEventCount;
+
+    // Base-level DP score for the entire projected alignment (sum of segment scores).
+    int64_t totalDpScore = invalid<int64_t>;
 
     // Flag for large indel (>= 6 bases)
     bool hasLargeIndel = false;
