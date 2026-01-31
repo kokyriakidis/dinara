@@ -494,6 +494,28 @@ void Anchors::constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId)
                  currentAnchorMarkers.push_back(interval);
             }
 
+            // Sort and deduplicate by oriented read.
+            // Many downstream routines (for example analyzeAnchorPair/countCommon) assume
+            // anchor marker intervals are sorted by OrientedReadId and contain no duplicates.
+            std::sort(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                    if(a.orientedReadId != b.orientedReadId) {
+                        return a.orientedReadId < b.orientedReadId;
+                    }
+                    return a.ordinal0 < b.ordinal0;
+                });
+            currentAnchorMarkers.erase(
+                std::unique(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                    [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                        return a.orientedReadId == b.orientedReadId;
+                    }),
+                currentAnchorMarkers.end());
+
+            // Re-check coverage after deduplication.
+            if(currentAnchorMarkers.size() < minPrimaryCoverage || currentAnchorMarkers.size() > maxPrimaryCoverage) {
+                continue;
+            }
+
             // Check if the "representative" marker is Strand 1?
             // Existing edge-based logic: "if (front.strand == 1) continue".
             // If vertexId < rcVertexId, usually this corresponds to Strand 0.
@@ -515,8 +537,6 @@ void Anchors::constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId)
             sequences.appendVector(vector<Base>()); // Empty sequence
 
             // Store Reverse Complement Anchor.
-            // Reverse order of intervals.
-            std::reverse(currentAnchorMarkers.begin(), currentAnchorMarkers.end());
             for(auto& interval : currentAnchorMarkers) {
                 // Flip strand.
                 interval.orientedReadId.flipStrand();
@@ -527,6 +547,19 @@ void Anchors::constructFromMarkerGraphVerticesThreadFunction(uint64_t threadId)
                 const uint64_t markerCount = markers.size(interval.orientedReadId.getValue());
                 interval.ordinal0 = uint32_t(markerCount) - 1 - interval.ordinal0;
             }
+            std::sort(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                    if(a.orientedReadId != b.orientedReadId) {
+                        return a.orientedReadId < b.orientedReadId;
+                    }
+                    return a.ordinal0 < b.ordinal0;
+                });
+            currentAnchorMarkers.erase(
+                std::unique(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                    [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                        return a.orientedReadId == b.orientedReadId;
+                    }),
+                currentAnchorMarkers.end());
             markerIntervals.appendVector(currentAnchorMarkers);
             sequences.appendVector(vector<Base>()); // Empty sequence
         }
@@ -584,23 +617,30 @@ void Anchors::constructFromSelectedMarkerGraphVerticesThreadFunction(uint64_t th
 
             currentAnchorMarkers.clear();
             currentAnchorMarkers.reserve(vertexMarkerIds.size());
-            // Allow both strands of the same read (duplicate ReadId) when such a vertex is selected.
-            // Still ensure there are no duplicate oriented reads in the anchor.
-            ReadId lastOrientedReadValue = invalidReadId;
             for(const MarkerId markerId: vertexMarkerIds) {
                 OrientedReadId orientedReadId;
                 uint32_t ordinal0;
                 tie(orientedReadId, ordinal0) = dinara::findMarkerId(markerId, markers);
-                const ReadId orientedReadValue = orientedReadId.getValue();
-                if(orientedReadValue == lastOrientedReadValue) {
-                    continue;
-                }
-                lastOrientedReadValue = orientedReadValue;
                 ThreadMarkerInterval interval;
                 interval.orientedReadId = orientedReadId;
                 interval.ordinal0 = ordinal0;
                 currentAnchorMarkers.push_back(interval);
             }
+
+            // Sort and deduplicate by oriented read.
+            std::sort(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                    if(a.orientedReadId != b.orientedReadId) {
+                        return a.orientedReadId < b.orientedReadId;
+                    }
+                    return a.ordinal0 < b.ordinal0;
+                });
+            currentAnchorMarkers.erase(
+                std::unique(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                    [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                        return a.orientedReadId == b.orientedReadId;
+                    }),
+                currentAnchorMarkers.end());
 
             if(currentAnchorMarkers.size() < minPrimaryCoverage || currentAnchorMarkers.size() > maxPrimaryCoverage) {
                 continue;
@@ -617,8 +657,17 @@ void Anchors::constructFromSelectedMarkerGraphVerticesThreadFunction(uint64_t th
             }
             std::sort(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
                 [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
-                    return a.orientedReadId < b.orientedReadId;
+                    if(a.orientedReadId != b.orientedReadId) {
+                        return a.orientedReadId < b.orientedReadId;
+                    }
+                    return a.ordinal0 < b.ordinal0;
                 });
+            currentAnchorMarkers.erase(
+                std::unique(currentAnchorMarkers.begin(), currentAnchorMarkers.end(),
+                    [](const ThreadMarkerInterval& a, const ThreadMarkerInterval& b) {
+                        return a.orientedReadId == b.orientedReadId;
+                    }),
+                currentAnchorMarkers.end());
             markerIntervals.appendVector(currentAnchorMarkers);
             sequences.appendVector(vector<Base>());
         }

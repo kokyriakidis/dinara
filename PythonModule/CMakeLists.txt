@@ -34,8 +34,21 @@ endif(BUILD_NATIVE)
 # This makes sure the code in PythonModule.cpp is compiled.
 add_definitions(-DDINARA_PYTHON_API)
 
+# Variant clustering / ClusterGraph / het-site anchors.
+if(DINARA_ENABLE_VARIANT_CLUSTERING)
+    add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=1)
+else()
+    add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
+endif()
+
 # Sources files.
 file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp)
+if(NOT DINARA_ENABLE_VARIANT_CLUSTERING)
+    list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
+endif()
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)

@@ -51,10 +51,10 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << initDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
-    // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
-    // DeleteReasonChemical so later steps can avoid them.
-    applyOntChemicalArcMask(threadCount);
+    // // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
+    // // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
+    // // DeleteReasonChemical so later steps can avoid them.
+    // applyOntChemicalArcMask(threadCount);
 
     // Hifiasm parity: Full pre-graph filtering pipeline
     // Order matches Hifiasm's clean_graph / gen_init_sg flow
@@ -62,15 +62,15 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // Step 1: Rescue phased overlaps with directional conflicts (try_rescue_overlaps equivalent)
     rescuePhasedOverlaps(4, threadCount);
     auto [afterRescueDel0, afterRescueDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After rescuePhasedOverlaps: isDeleted0=" << afterRescueDel0 
-         << ", isDeleted1=" << afterRescueDel1 
+    cout << timestamp << "[DIAG] After rescuePhasedOverlaps: isDeleted0=" << afterRescueDel0
+         << ", isDeleted1=" << afterRescueDel1
          << ", active=" << countActiveAlignments() << endl;
     
     // Step 2: Find valid read segments (ma_hit_sub equivalent)
     // Hifiasm default min_dp is asm_opt.min_overlap_coverage (default 0).
     const uint64_t minCoverage = 0;
     filterLocalSegments(minCoverage, threadCount);
-    
+
     // Count deleted reads
     uint64_t deletedReads = 0;
     for(uint64_t r = 0; r < validReadIntervals.size(); r++) {
@@ -78,7 +78,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     }
     cout << timestamp << "[DIAG] After filterLocalSegments: " << deletedReads << "/" << reads->readCount() << " reads marked deleted" << endl;
     cout << timestamp << "[DIAG] After filterLocalSegments: active alignments=" << countActiveAlignments() << endl;
-    
+
     // Step 3: Detect chimeric reads (detect_chimeric_reads)
     // Runs after ma_hit_sub and before ma_hit_cut in hifiasm.
     detectChimericReads(threadCount);
@@ -92,20 +92,20 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     const uint64_t minOverlapLength = 50;  // Hifiasm default mini_overlap_length
     applyCoverageCuts(minOverlapLength, threadCount);
     auto [afterCutDel0, afterCutDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After applyCoverageCuts: isDeleted0=" << afterCutDel0 
-         << ", isDeleted1=" << afterCutDel1 
+    cout << timestamp << "[DIAG] After applyCoverageCuts: isDeleted0=" << afterCutDel0
+         << ", isDeleted1=" << afterCutDel1
          << ", active=" << countActiveAlignments() << endl;
-    
+
     // Step 5: Filter hanging overlaps (ma_hit_flt equivalent)
     // Removes overlaps with excessive overhangs
     const uint64_t maxHang = 1000;
     const double maxHangRate = 0.8;
     filterHangingOverlaps(maxHang, maxHangRate, minOverlapLength, threadCount);
     auto [afterHangDel0, afterHangDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After filterHangingOverlaps: isDeleted0=" << afterHangDel0 
-         << ", isDeleted1=" << afterHangDel1 
+    cout << timestamp << "[DIAG] After filterHangingOverlaps: isDeleted0=" << afterHangDel0
+         << ", isDeleted1=" << afterHangDel1
          << ", active=" << countActiveAlignments() << endl;
-    
+
     // // Step 6: Remove contained reads (ma_hit_contained_advance equivalent)
     // // Marks fully contained reads and removes their overlaps
     // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
@@ -125,9 +125,9 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     }
     cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
 
-    // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
-    // This is a diagnostic/experimental alternative to removing contained reads entirely.
-    pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
+    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
+    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
+    // pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
 
 
 
@@ -235,9 +235,10 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     cout << timestamp << "Chimeric filter removed " << chimericCount << " alignments." << endl;
     cout << timestamp << "Kept " << keptCount << " / " << alignmentCount << " alignments." << endl;
 
-    // Step 8: Create read graph from kept alignments
-    createReadGraphUsingSelectedAlignments(keepAlignment);
-    // createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
+    // Step 8: Create read graph from kept alignments.
+    // Directed read graph is optional for createReadGraph6 (it is expensive and not
+    // required by all pipelines). Enable if needed.
+    rebuildReadGraphUsingSelectedAlignments(keepAlignment, /*rebuildDirectedReadGraph*/false);
 
     // // Step 9: Create directed string graph arcs (hifiasm-style suffix->prefix)
     // createStringGraphUsingSelectedAlignments(keepAlignment);
@@ -321,7 +322,6 @@ void Assembler::createReadGraphFromFilteredAlignments()
     for (uint64_t i = 0; i < alignmentCount; ++i) {
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
-    createReadGraphUsingSelectedAlignments(keepAlignment);
-    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
+    rebuildReadGraphUsingSelectedAlignments(keepAlignment, /*rebuildDirectedReadGraph*/true);
     cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
 }

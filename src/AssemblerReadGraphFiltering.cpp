@@ -1153,7 +1153,8 @@ void Assembler::rescueChimericReadsThreadFunction(size_t threadId)
 /*
 try_rescue_overlaps (hifiasm) parity: resolve directional phasing conflicts.
 
-If `isDeleted0 != isDeleted1`, one read rejected the overlap while the other kept it.
+If `DeleteReasonPhase` is set on exactly one side, one read rejected the overlap due to phasing
+while the other side did not.
 For each read, we collect its conflict overlaps where that read deleted the overlap, find a
 maximum-depth consensus interval, and rescue conflicts spanning that interval by clearing the
 phase deletion bit only from that read's perspective.
@@ -1233,11 +1234,14 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t threadId)
                 const uint64_t alignmentId = alignmentTable[orientedReadId.getValue()][i];
                 const AlignmentData& ad = alignmentData[alignmentId];
                 
-                bool hasConflict = (ad.isDeleted0() != ad.isDeleted1());
-                if (!hasConflict) continue;
+                // Only consider directional *phasing* conflicts (hifiasm try_rescue_overlaps):
+                // exactly one side has DeleteReasonPhase set.
+                const bool phase0 = (ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) != 0;
+                const bool phase1 = (ad.deleteReasons1 & AlignmentData::DeleteReasonPhase) != 0;
+                if (phase0 == phase1) continue;
                 
                 uint32_t qs, qe;
-                bool thisReadDeleted;
+                bool thisReadPhaseDeleted;
 
                 uint32_t qs0 = ad.qs, qe0 = ad.qe, ts0 = ad.ts, te0 = ad.te;
                 (void)getRawBoundsIfAvailable(ad, qs0, qe0, ts0, te0);
@@ -1245,14 +1249,14 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t threadId)
                 if (ad.readIds[0] == readId) {
                     qs = qs0;
                     qe = qe0;
-                    thisReadDeleted = ad.isDeleted0();
+                    thisReadPhaseDeleted = phase0;
                 } else {
                     qs = ts0;
                     qe = te0;
-                    thisReadDeleted = ad.isDeleted1();
+                    thisReadPhaseDeleted = phase1;
                 }
                 
-                if (thisReadDeleted) {
+                if (thisReadPhaseDeleted) {
                     conflictAlignments.push_back((uint32_t)alignmentId);
                     conflictIntervals.push_back({qs, qe});
                 }
@@ -1522,10 +1526,21 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     }
 
     // We will write into read flags.
+    reads->checkReadsAreOpen();
     reads->checkReadFlagsAreOpenForWriting();
 
+    // Historically this diagnostic expected `validReadIntervals` to be available (ma_hit_sub / ma_hit_cut).
+    // For quick experimentation we allow running without it by treating the entire read as valid.
+    // In that mode we operate on raw overlap coordinates (`ad.qs/qe/ts/te`) and full read lengths.
     if(validReadIntervals.empty()) {
-        throw runtime_error("flagContainedReads requires validReadIntervals (run filterLocalSegments/applyCoverageCuts first).");
+        cout << timestamp
+             << "[DIAG] flagContainedReads: validReadIntervals not set; using full read lengths and raw overlap coordinates."
+             << endl;
+        validReadIntervals.resize(reads->readCount());
+        for(ReadId r=0; r<reads->readCount(); ++r) {
+            const uint64_t len = reads->getReadRawSequenceLength(r);
+            validReadIntervals[r] = {0, uint32_t(len), false};
+        }
     }
 
     if(!containmentParent->isOpen) {
@@ -1634,10 +1649,30 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
     const uint64_t readCount = reads->readCount();
     const uint64_t alignmentCount = alignmentData.size();
 
+    // If a read graph has already been built in this process, prefer pruning only within
+    // the current read-graph overlap set. This avoids selecting an overlap that was not
+    // part of the broad read graph used to build the marker graph, which could otherwise
+    // disconnect a contained read after pruning.
+    bool restrictToCurrentReadGraph = false;
+    for (uint64_t alignmentId = 0; alignmentId < alignmentCount; ++alignmentId) {
+        if (alignmentData[alignmentId].info.isInReadGraph != 0) {
+            restrictToCurrentReadGraph = true;
+            break;
+        }
+    }
+
     uint64_t containedReadCount = 0;
     uint64_t containedReadsWithKeptOverlap = 0;
     uint64_t containedReadsWithNoKeptOverlap = 0;
+    uint64_t containedReadsKeptToContainmentParent = 0;
+    uint64_t containedReadsFellBackToAnyPartner = 0;
+    uint64_t containedReadsMissingContainmentParent = 0;
     uint64_t overlapsPruned = 0;
+
+    const bool hasContainmentParent =
+        containmentParent &&
+        containmentParent->isOpen &&
+        containmentParent->size() >= readCount;
 
     // Deterministic pseudo-random tie-breaking per read.
     // This avoids changing results depending on iteration order while still breaking ties "randomly".
@@ -1646,6 +1681,12 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
             continue;
         }
         ++containedReadCount;
+
+        const ReadId containmentRoot =
+            hasContainmentParent ? (*containmentParent)[r] : ReadId(invalidReadId);
+        if (!hasContainmentParent) {
+            ++containedReadsMissingContainmentParent;
+        }
 
         const OrientedReadId oid0(r, 0);
         if(oid0.getValue() >= alignmentTable.size()) {
@@ -1659,39 +1700,71 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
             continue;
         }
 
-        // Find best dpScore among active overlaps for this contained read.
-        int64_t bestScore = std::numeric_limits<int64_t>::min();
-        vector<uint32_t> bestAlignmentIds;
-        bestAlignmentIds.reserve(4);
+        // Prefer an active overlap to the containment parent/root if available.
+        int64_t bestScoreToParent = std::numeric_limits<int64_t>::min();
+        vector<uint32_t> bestAlignmentIdsToParent;
+        bestAlignmentIdsToParent.reserve(2);
+
+        // Fallback: best dpScore among all active overlaps for this contained read.
+        int64_t bestScoreAny = std::numeric_limits<int64_t>::min();
+        vector<uint32_t> bestAlignmentIdsAny;
+        bestAlignmentIdsAny.reserve(4);
 
         for(const uint32_t alignmentId : table) {
             if(alignmentId >= alignmentCount) {
                 continue;
             }
             const AlignmentData& ad = alignmentData[alignmentId];
+            if (restrictToCurrentReadGraph && (ad.info.isInReadGraph == 0)) {
+                continue;
+            }
             if(!ad.keptByBothSides()) {
                 continue;
             }
             const int64_t score = ad.info.hifiasmDpScoreOrApprox(0);
-            if(score > bestScore) {
-                bestScore = score;
-                bestAlignmentIds.clear();
-                bestAlignmentIds.push_back(alignmentId);
-            } else if(score == bestScore) {
-                bestAlignmentIds.push_back(alignmentId);
+
+            // Update best-overlap-to-parent (if applicable).
+            if (containmentRoot != ReadId(invalidReadId)) {
+                const ReadId other = (ad.readIds[0] == r) ? ad.readIds[1] : ad.readIds[0];
+                if (other == containmentRoot) {
+                    if(score > bestScoreToParent) {
+                        bestScoreToParent = score;
+                        bestAlignmentIdsToParent.clear();
+                        bestAlignmentIdsToParent.push_back(alignmentId);
+                    } else if(score == bestScoreToParent) {
+                        bestAlignmentIdsToParent.push_back(alignmentId);
+                    }
+                }
+            }
+
+            // Update best-overlap-to-any partner.
+            if(score > bestScoreAny) {
+                bestScoreAny = score;
+                bestAlignmentIdsAny.clear();
+                bestAlignmentIdsAny.push_back(alignmentId);
+            } else if(score == bestScoreAny) {
+                bestAlignmentIdsAny.push_back(alignmentId);
             }
         }
 
-        if(bestAlignmentIds.empty()) {
+        const vector<uint32_t>& candidateBest =
+            bestAlignmentIdsToParent.empty() ? bestAlignmentIdsAny : bestAlignmentIdsToParent;
+
+        if(candidateBest.empty()) {
             ++containedReadsWithNoKeptOverlap;
             continue;
         }
         ++containedReadsWithKeptOverlap;
+        if (!bestAlignmentIdsToParent.empty()) {
+            ++containedReadsKeptToContainmentParent;
+        } else if (containmentRoot != ReadId(invalidReadId)) {
+            ++containedReadsFellBackToAnyPartner;
+        }
 
         // Choose randomly among ties (deterministic per read).
         std::mt19937_64 rng(uint64_t(r) * 0x9e3779b97f4a7c15ULL + 0xD1A2B3C4ULL);
-        std::uniform_int_distribution<size_t> dist(0, bestAlignmentIds.size() - 1);
-        const uint32_t chosenAlignmentId = bestAlignmentIds[dist(rng)];
+        std::uniform_int_distribution<size_t> dist(0, candidateBest.size() - 1);
+        const uint32_t chosenAlignmentId = candidateBest[dist(rng)];
 
         // Prune all other overlaps incident to this contained read.
         for(const uint32_t alignmentId : table) {
@@ -1703,6 +1776,9 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
             }
 
             AlignmentData& ad = alignmentData[alignmentId];
+            if (restrictToCurrentReadGraph && (ad.info.isInReadGraph == 0)) {
+                continue;
+            }
             ad.addDeleteReasonsFromReadPerspective(r, AlignmentData::DeleteReasonContainedPrune);
             ++overlapsPruned;
         }
@@ -1712,5 +1788,8 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
          << " containedReads=" << containedReadCount
          << " kept=" << containedReadsWithKeptOverlap
          << " noneKept=" << containedReadsWithNoKeptOverlap
+         << " keptToContainmentParent=" << containedReadsKeptToContainmentParent
+         << " fellBackToAnyPartner=" << containedReadsFellBackToAnyPartner
+         << " missingContainmentParent=" << containedReadsMissingContainmentParent
          << " overlapsPruned=" << overlapsPruned << endl;
 }

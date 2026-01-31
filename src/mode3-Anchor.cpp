@@ -14,7 +14,7 @@ using namespace mode3;
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
 namespace dinara {
-template class MultithreadedObject<Anchors>;
+    template class MultithreadedObject<mode3::Anchors>;
 }
 
 
@@ -40,47 +40,57 @@ Anchors::Anchors(
     journeys.accessExistingReadOnly(largeDataName("Journeys"));
 }
 
-// Create Anchors from explicit AnchorMarkerIntervals.
-// This is used by anchor-generation methods that build anchors outside the marker graph
-// (or that want to split/validate marker graph vertices into multiple anchors).
+
+
+// This constructor creates the Anchors from explicitly provided marker intervals.
 Anchors::Anchors(
     const MappedMemoryOwner& mappedMemoryOwner,
     const Reads& reads,
     uint64_t k,
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
-    const vector<vector<AnchorMarkerInterval>>& anchors,
+    const vector<vector<AnchorMarkerInterval>>& anchorsExplicit,
     uint32_t ordinalOffset,
-    uint64_t /*threadCount*/) :
+    uint64_t /* threadCount */) :
     MultithreadedObject<Anchors>(*this),
     MappedMemoryOwner(mappedMemoryOwner),
     reads(reads),
     k(k),
     markers(markers)
 {
-    DINARA_ASSERT((k %2) == 0);
+    performanceLog << timestamp << "Anchor creation from explicit marker intervals begins." << endl;
+
+    DINARA_ASSERT((k % 2) == 0);
     kHalf = k / 2;
+    DINARA_ASSERT(reads.representation == 0);
+    DINARA_ASSERT(markers.isOpen());
 
-    anchorMarkerIntervals.createNew(largeDataName("AnchorMarkerIntervals"), largeDataPageSize);
-    anchorSequences.createNew(largeDataName("AnchorSequences"), largeDataPageSize);
+    anchorMarkerIntervals.createNew(
+        largeDataName("AnchorMarkerIntervals"),
+        largeDataPageSize);
+    anchorSequences.createNew(
+        largeDataName("AnchorSequences"),
+        largeDataPageSize);
+    anchorInfos.createNew(
+        largeDataName("AnchorInfos"),
+        largeDataPageSize);
 
-    // Store anchors.
-    for(const auto& anchor : anchors) {
+    for(const auto& anchor : anchorsExplicit) {
         anchorMarkerIntervals.appendVector();
         for(const auto& interval : anchor) {
             anchorMarkerIntervals.append(interval);
         }
-        // Vertex-style anchor: store an empty sequence.
-        anchorSequences.appendVector(vector<Base>());
+        // No explicit sequence for this anchor.
+        anchorSequences.appendVector();
     }
 
-    // Initialize the AnchorInfos with the provided ordinalOffset.
-    anchorInfos.createNew(largeDataName("AnchorInfos"), largeDataPageSize);
     anchorInfos.resize(anchorMarkerIntervals.size());
-    for(AnchorInfo& anchorInfo : anchorInfos) {
-        anchorInfo.ordinalOffset = ordinalOffset;
-        anchorInfo.componentId = invalid<uint32_t>;
-        anchorInfo.localAnchorIdInComponent = invalid<uint64_t>;
+    for(AnchorId anchorId=0; anchorId<anchorInfos.size(); ++anchorId) {
+        anchorInfos[anchorId].ordinalOffset = ordinalOffset;
+        anchorInfos[anchorId].componentId = invalid<uint32_t>;
+        anchorInfos[anchorId].localAnchorIdInComponent = invalid<uint64_t>;
     }
+
+    performanceLog << timestamp << "Anchor creation from explicit marker intervals ends (" << anchorInfos.size() << " anchors)." << endl;
 }
 
 
@@ -160,7 +170,7 @@ void Anchor::check() const
     const Anchor& anchor = *this;
 
     for(uint64_t i=1; i<size(); i++) {
-        DINARA_ASSERT(anchor[i-1].orientedReadId < anchor[i].orientedReadId);
+        DINARA_ASSERT(anchor[i-1].orientedReadId.getReadId() < anchor[i].orientedReadId.getReadId());
     }
 }
 
@@ -720,18 +730,6 @@ void Anchors::computeJourneys(uint64_t threadCount)
 {
     performanceLog << timestamp << "Anchors::computeJourneys begins." << endl;
 
-    // Make this idempotent: if journeys already exist, do nothing.
-    // This prevents accidental double computation when anchors are used by multiple pipelines
-    // (for example, visualization + downstream assembly).
-    if(journeys.isOpen()) {
-        performanceLog << timestamp << "Anchors::computeJourneys: Journeys already present. Skipping." << endl;
-        return;
-    }
-    if(journeysWithOrdinals.isOpen()) {
-        // Left over from an interrupted run.
-        journeysWithOrdinals.remove();
-    }
-
     const uint64_t orientedReadCount = 2 * reads.readCount();
 
     // Pass1: make space for the journeysWithOrdinals.
@@ -903,9 +901,6 @@ void Anchors::findChildren(
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
         const auto journey = journeys[orientedReadId.getValue()];
         const uint64_t position = markerInterval.positionInJourney;
-        if(position == invalid<uint32_t> || position >= journey.size()) {
-            continue;
-        }
         const uint64_t nextPosition = position + 1;
         if(nextPosition < journey.size()) {
             const AnchorId nextAnchorId = journey[nextPosition];
@@ -932,12 +927,11 @@ void Anchors::findParents(
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
         const auto journey = journeys[orientedReadId.getValue()];
         const uint64_t position = markerInterval.positionInJourney;
-        if(position == invalid<uint32_t> || position == 0 || position >= journey.size()) {
-            continue;
+        if(position > 0) {
+            const uint64_t previousPosition = position - 1;
+            const AnchorId previousAnchorId = journey[previousPosition];
+            parents.push_back(previousAnchorId);
         }
-        const uint64_t previousPosition = position - 1;
-        const AnchorId previousAnchorId = journey[previousPosition];
-        parents.push_back(previousAnchorId);
     }
 
     deduplicateAndCountWithThreshold(parents, count, minCoverage);
@@ -1001,9 +995,6 @@ void Anchors::followOrientedReads(
         const OrientedReadId orientedReadId = anchorMarkerInterval.orientedReadId;
         const uint64_t position0 = anchorMarkerInterval.positionInJourney;
         const auto journey = journeys[orientedReadId.getValue()];
-        if(position0 == invalid<uint32_t> || position0 >= journey.size()) {
-            continue;
-        }
 
         // Figure out the forward or backward portion of the journey.
         uint64_t begin;
