@@ -1662,6 +1662,28 @@ void Assembler::removeReadGraphBridges(uint64_t maxDistance)
 
 
 
+void Assembler::rebuildReadGraphUsingSelectedAlignments(
+    vector<bool> keepAlignment,
+    bool rebuildDirectedReadGraph)
+{
+    // The read graph uses memory-mapped containers, so remove the existing
+    // graph data structures before recreating them.
+    if (readGraph.edges.isOpen) {
+        readGraph.edges.remove();
+    }
+    if (readGraph.connectivity.isOpen()) {
+        readGraph.connectivity.remove();
+    }
+    // Always remove the directed read graph to avoid leaving stale data around.
+    // We only recreate it if requested.
+    directedReadGraph.remove();
+
+    createReadGraphUsingSelectedAlignments(keepAlignment);
+    if (rebuildDirectedReadGraph) {
+        createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
+    }
+}
+
 void Assembler::analyzeReadGraph()
 {
     // Check that we have what we need.

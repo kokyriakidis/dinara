@@ -19,6 +19,8 @@ using namespace mode0;
 
 // Standard library.
 #include <filesystem>
+#include <sstream>
+#include <sys/wait.h>
 #include "fstream.hpp"
 
 
@@ -260,9 +262,11 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
+#if DINARA_ENABLE_VARIANT_CLUSTERING
     DINARA_ADD_TO_FUNCTION_TABLE(exploreClusterGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantCluster);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantClusters);
+#endif
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowingAssemblyGraph);
@@ -590,9 +594,11 @@ void Assembler::writeNavigation(ostream& html) const
             {"Local anchor graph", "exploreLocalAnchorGraph"},
             });
 
+#if DINARA_ENABLE_VARIANT_CLUSTERING
         writeNavigation(html, "Cluster graph", {
             {"Explore cluster graph", "exploreClusterGraph"},
             });
+#endif
 
         writeNavigation(html, "Assembly", {
             {"Local assembly", "exploreLocalAssembly"},
@@ -682,30 +688,107 @@ void Assembler::writeGnuPlotPngToHtml(
     // Create a file to contain gnuplot commands.
     const string gnuplotFileName = tmpDirectory() + to_string(boost::uuids::random_generator()());
     const string pngFileName = tmpDirectory() + to_string(boost::uuids::random_generator()());
-    {
-        ofstream gnuplotFile(gnuplotFileName);
-        gnuplotFile <<
-            "set terminal pngcairo size " << width << "," << height <<
-            " font 'Noto Serif'\n"
-            "set output '" << pngFileName << "'\n" <<
-            gnuplotCommands;
-    }
+    const string stderrFileName = tmpDirectory() + to_string(boost::uuids::random_generator()()) + ".stderr";
+
+    auto runGnuplotWithTerminalLine = [&](const string& terminalLine) -> int {
+        {
+            ofstream gnuplotFile(gnuplotFileName);
+            gnuplotFile <<
+                terminalLine << "\n"
+                "set output '" << pngFileName << "'\n" <<
+                gnuplotCommands;
+        }
+        const string command = "gnuplot '" + gnuplotFileName + "' 2> '" + stderrFileName + "'";
+        return ::system(command.c_str());
+    };
+
+    auto outputFileLooksOk = [&]() -> bool {
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(pngFileName, ec);
+        return !ec && size > 0;
+    };
 
     // Invoke gnuplot.
-    const string command = "gnuplot " + gnuplotFileName;
-    const int errorCode = ::system(command.c_str());
-    if(errorCode != 0) {
-        throw runtime_error("Error " +
-            to_string(errorCode) + " " + strerror(errorCode) +
-            "\nrunning command: " + command);
+    enum class GnuplotOutput { Png, Svg };
+    GnuplotOutput outputType = GnuplotOutput::Png;
+
+    int status = runGnuplotWithTerminalLine(
+        "set terminal pngcairo size " + to_string(width) + "," + to_string(height));
+    if(status != 0 || !outputFileLooksOk()) {
+        // Fallback for systems without pngcairo support.
+        status = runGnuplotWithTerminalLine(
+            "set terminal png size " + to_string(width) + "," + to_string(height));
+    }
+    if(status != 0 || !outputFileLooksOk()) {
+        // Fallback for systems without PNG terminals compiled into gnuplot.
+        outputType = GnuplotOutput::Svg;
+        status = runGnuplotWithTerminalLine(
+            "set terminal svg size " + to_string(width) + "," + to_string(height));
+        if(status != 0 || !outputFileLooksOk()) {
+            status = runGnuplotWithTerminalLine("set terminal svg");
+        }
     }
 
-    // Write the png file to html.
-    writePngToHtml(html, pngFileName);
+    if(status != 0 || !outputFileLooksOk()) {
+        int exitCode = -1;
+        if (WIFEXITED(status)) {
+            exitCode = WEXITSTATUS(status);
+        }
+
+        std::string stderrText;
+        {
+            ifstream err(stderrFileName);
+            if (err) {
+                std::ostringstream ss;
+                ss << err.rdbuf();
+                stderrText = ss.str();
+            }
+        }
+
+        // Keep the gnuplot script around for debugging, but clean up the stderr file.
+        std::filesystem::remove(stderrFileName);
+
+        if (stderrText.empty()) {
+            throw runtime_error(
+                "gnuplot failed (status=" + to_string(status) +
+                ", exitCode=" + to_string(exitCode) + "). "
+                "Make sure gnuplot is installed and supports PNG output.");
+        } else {
+            // Avoid dumping huge output into the browser.
+            constexpr size_t maxErr = 4000;
+            if (stderrText.size() > maxErr) {
+                stderrText.resize(maxErr);
+                stderrText += "\n... (truncated)\n";
+            }
+            throw runtime_error(
+                "gnuplot failed (status=" + to_string(status) +
+                ", exitCode=" + to_string(exitCode) + "). stderr:\n" + stderrText);
+        }
+    }
+
+    // Write the plot output to html.
+    if (outputType == GnuplotOutput::Png) {
+        writePngToHtml(html, pngFileName);
+    } else {
+        ifstream svgFile(pngFileName);
+        if (!svgFile) {
+            throw runtime_error("Could not open gnuplot SVG output " + pngFileName);
+        }
+        html << "<div style='max-width:100%;overflow:auto'>";
+        string line;
+        while (std::getline(svgFile, line)) {
+            // Browsers can be picky about XML/DOCTYPE declarations embedded in HTML.
+            if (line.rfind("<?xml", 0) == 0) continue;
+            if (line.rfind("<!DOCTYPE", 0) == 0) continue;
+            html << line << "\n";
+        }
+        html << "</div>";
+    }
 
     // Remove the files we created.
     std::filesystem::remove(gnuplotFileName);
     std::filesystem::remove(pngFileName);
+    std::filesystem::remove(stderrFileName);
 }
 
 
@@ -903,6 +986,7 @@ void Assembler::accessAllSoft()
         }
     }
 
+#if DINARA_ENABLE_VARIANT_CLUSTERING
     // Variant clustering data (for ClusterGraph).
     try {
         accessVariantClusteringData();
@@ -910,6 +994,7 @@ void Assembler::accessAllSoft()
         cout << "Variant clustering data is not accessible." << endl;
         // Don't set allDataAreAvailable = false since this is optional
     }
+#endif
 
 
     if(!allDataAreAvailable) {

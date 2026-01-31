@@ -661,21 +661,25 @@ void Assembler::computeAlignments(
         cout << "Alignments filtered by gap count (> 64): " << totalFilteredByGapCount << endl;
     }
     if (assemblerInfo->readGraphCreationMethod == 5) {
+#if DINARA_ENABLE_VARIANT_CLUSTERING
         variantClusteringProjectedAlignmentTime = estimatedProjectedWallTime;
         variantClusteringCollectionTime = estimatedCollectionWallTime;
-        
+
         cout << "\nVariant clustering collection timing (estimated wall-clock):" << endl;
         cout << "  Projected alignment: ~" << estimatedProjectedWallTime << " s" << endl;
         cout << "  Position pair collection: ~" << estimatedCollectionWallTime << " s" << endl;
         performanceLog << timestamp << "Projected alignment (estimated wall-clock): " << estimatedProjectedWallTime << " s" << endl;
         performanceLog << timestamp << "Collection (estimated wall-clock): " << estimatedCollectionWallTime << " s" << endl;
-        
+
         // Store position pairs collected by each thread
         performanceLog << timestamp << "Storing position pairs for variant clustering." << endl;
         cout << timestamp << "Storing position pairs for variant clustering." << endl;
         storeVariantClusteringPositionPairs(threadCount, data);
         performanceLog << timestamp << "Done storing position pairs for variant clustering." << endl;
         cout << timestamp << "Done storing position pairs for variant clustering." << endl;
+#else
+        throw runtime_error("readGraphCreationMethod=5 requires DINARA_ENABLE_VARIANT_CLUSTERING=ON.");
+#endif
     }
 
 

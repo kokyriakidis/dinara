@@ -1,11 +1,11 @@
 #pragma once
 
-// Dinara.
 #include "Kmer.hpp"
 #include "invalid.hpp"
 #include "MarkerInterval.hpp"
 #include "MarkerKmers.hpp"
 #include "MappedMemoryOwner.hpp"
+#include "dinaraTypes.hpp"
 #include "MemoryMappedVectorOfVectors.hpp"
 #include "MultithreadedObject.hpp"
 
@@ -14,13 +14,9 @@
 #include <boost/property_tree/ptree_fwd.hpp>
 
 // Standard library.
-#include <atomic>
 #include "cstdint.hpp"
 #include "memory.hpp"
 #include "span.hpp"
-
-// Include DisjointSets for the het sites constructor
-#include "dset64-gccAtomic.hpp"
 
 
 
@@ -31,13 +27,7 @@ namespace dinara {
     class MarkerGraph;
     class MarkerInterval;
     class Reads;
-    
-    // Context information for a variant position, storing markers before and after the variant.
-    class VariantPositionContext {
-    public:
-        MarkerKmers::MarkerInfo prevMarkerInfo;
-        MarkerKmers::MarkerInfo nextMarkerInfo;
-    };
+
 
     // The main input to mode 3 assembly is a set of anchors.
     // Each anchor consists of a span of AnchorMarkerInterval, with the following requirements:
@@ -122,7 +112,7 @@ class dinara::mode3::Anchors :
     public MappedMemoryOwner {
 public:
 
-    // This constructor creates the Anchors from marker graph edges or vertices.
+    // This constructor creates the Anchors from marker graph edges.
     Anchors(
         const MappedMemoryOwner&,
         const Reads& reads,
@@ -134,8 +124,7 @@ public:
         uint64_t threadCount,
         bool createFromVertices = false);
 
-    // This constructor creates Anchors from a selected subset of marker graph vertices.
-    // Each selected vertex generates a forward anchor and its reverse-complement anchor.
+    // This constructor creates the Anchors from a selected subset of marker graph vertices.
     Anchors(
         const MappedMemoryOwner&,
         const Reads& reads,
@@ -169,33 +158,16 @@ public:
         uint64_t maxPrimaryCoverage,
         uint64_t threadCount);
 
-    // This constructor creates Anchors from explicit AnchorMarkerIntervals.
-    // Sequences are stored empty (vertex-style anchors).
+    // This constructor creates the Anchors from explicitly provided marker intervals.
+    // This is used by experimental anchor generation code that derives anchors from overlaps
+    // rather than from the marker graph.
     Anchors(
         const MappedMemoryOwner&,
         const Reads& reads,
         uint64_t k,
         const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
-        const vector<vector<AnchorMarkerInterval>>& anchorMarkerIntervals,
+        const vector<vector<AnchorMarkerInterval>>& anchorsExplicit,
         uint32_t ordinalOffset,
-        uint64_t threadCount);
-
-    // This constructor creates the Anchors from heterozygous sites (variant clustering).
-    Anchors(
-        const MappedMemoryOwner&,
-        const Reads& reads,
-        uint64_t k,
-        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
-        const std::vector<uint64_t>& clusterRepresentatives,
-        DisjointSets& disjointSets,
-        const MemoryMapped::Vector<std::pair<OrientedReadId, uint32_t>>& positionPairs,
-        const MemoryMapped::Vector<uint8_t>& positionPairAlleles,
-        const MemoryMapped::Vector<VariantPositionContext>& positionPairContexts,
-        const MemoryMapped::Vector<uint8_t>& variantClusteringValidClustersCompatible,
-        const MemoryMapped::Vector<uint8_t>& variantClusteringMemberStatus,
-        uint64_t minClusterCoverage,
-        uint64_t minAlleleCoverage,
-        double minCommonKmerFraction,  // Minimum fraction of reads sharing a kmer (e.g., 0.8 = 80%)
         uint64_t threadCount);
 
     // This constructor access existing Anchors.
@@ -346,7 +318,7 @@ private:
     public:
         uint64_t minPrimaryCoverage;
         uint64_t maxPrimaryCoverage;
-        bool createFromVertices;
+        bool createFromVertices = false;
 
         const MarkerGraph* markerGraphPointer;
         const vector<MarkerGraphVertexId>* selectedVertexIdsPointer = nullptr;
@@ -383,43 +355,6 @@ private:
     };
     ConstructFromMarkerKmersData constructFromMarkerKmersData;
     void constructFromMarkerKmersThreadFunction(uint64_t threadId);
-
-    // Data and functions used when constructing the Anchors from het sites using variant clustering.
-    // New code that gets the Kmers from VariantClustering.
-    class ConstructFromHetSitesData {
-    public:
-        uint64_t minClusterCoverage;
-        uint64_t minAlleleCoverage;
-        double minCommonKmerFraction;  // Minimum fraction of reads that must share a kmer (e.g., 0.8 = 80%)
-        
-
-        const std::vector<uint64_t>* clusterRepresentatives = nullptr;
-        DisjointSets* disjointSets = nullptr;          // Original (Position Pairs -> Clusters)
-        std::vector< std::vector<uint64_t> > membersByRepIdx;
-
-        const MemoryMapped::Vector< std::pair<OrientedReadId, uint32_t> >* positionPairs = nullptr;
-        const MemoryMapped::Vector<uint8_t>* positionPairAlleles = nullptr;
-        const MemoryMapped::Vector<VariantPositionContext>* positionPairContexts = nullptr;
-        const MemoryMapped::Vector<uint8_t>* variantClusteringValidClustersCompatible = nullptr;
-        const MemoryMapped::Vector<uint8_t>* variantClusteringMemberStatus = nullptr;
-
-        // The MarkerInfo objects for the candidate anchors found by each thread.
-        using MarkerInfo = MarkerKmers::MarkerInfo;
-
-        // The anchors found by each thread.
-        vector< shared_ptr<MemoryMapped::VectorOfVectors<MarkerInfo, uint64_t> > > threadAnchors;
-        
-        // Global counter for anchors that couldn't be generated (no common kmer found)
-        std::atomic<uint64_t> anchorsSkippedNoCommonKmer;
-        
-        // Lock-free tracking of used markers using atomic bool array
-        // Each index corresponds to a global MarkerId
-        std::unique_ptr<std::atomic<bool>[]> markerUsed;
-        uint64_t markerCount;  // Total number of markers
-        std::atomic<uint64_t> anchorsSkippedDuplicateMarkers;
-    };
-    ConstructFromHetSitesData constructFromHetSitesData;
-    void constructFromHetSitesThreadFunction(uint64_t threadId);
 
 
 #if 0

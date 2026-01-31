@@ -1,6 +1,10 @@
 #ifndef DINARA_ASSEMBLER_HPP
 #define DINARA_ASSEMBLER_HPP
 
+#ifndef DINARA_ENABLE_VARIANT_CLUSTERING
+#define DINARA_ENABLE_VARIANT_CLUSTERING 0
+#endif
+
 // Dinara.
 #include "Alignment.hpp"
 #include "AlignmentCandidates.hpp"
@@ -1336,12 +1340,18 @@ private:
     
     // Create read graph directly from OverlapIndex (Option A: direct use, no alignmentData mapping)
     
-    // Create read graph from alignments after filterSecondaryAlignmentsPerReadPair (no phasing)
-    void createReadGraphFromFilteredAlignments();
-    
-    // Temporary or permanent member
-    uint64_t minAlleleCoverage = 5; // Threshold from main.cpp
-    void computeClusterValidityThreadFunction(uint64_t threadId);
+	    // Create read graph from alignments after filterSecondaryAlignmentsPerReadPair (no phasing)
+	    void createReadGraphFromFilteredAlignments();
+
+	    // Rebuild read graph (and optionally directed read graph) from a provided keep vector.
+	    // This removes the existing read graph data structures before recreating them.
+	    void rebuildReadGraphUsingSelectedAlignments(vector<bool> keepAlignment, bool rebuildDirectedReadGraph = false);
+
+#if DINARA_ENABLE_VARIANT_CLUSTERING
+	    // Temporary or permanent member
+	    uint64_t minAlleleCoverage = 5; // Threshold from main.cpp
+	    void computeClusterValidityThreadFunction(uint64_t threadId);
+
     // Storage for position pairs collected during alignment computation
     MemoryMapped::Vector< pair<OrientedReadId, uint32_t> > variantClusteringPositionPairs;
     void accessVariantClusteringPositionPairsReadOnly();
@@ -1376,7 +1386,6 @@ private:
     MemoryMapped::Vector<VariantPositionContext> variantClusteringPositionPairContexts;
     std::shared_ptr<DisjointSets> variantClusteringDisjointSets;
 
-    
     // Mutex to protect the global haplotype graph during parallel edge addition
     std::mutex haplotypeGraphMutex;
 
@@ -1430,6 +1439,7 @@ private:
     
     // HTTP server function to explore multiple variant clusters together.
     void exploreVariantClusters(const vector<string>& request, ostream& html);
+#endif
 
 
     // Triangle and least square analysis of the read graph

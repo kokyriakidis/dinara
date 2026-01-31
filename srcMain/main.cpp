@@ -7,7 +7,9 @@
 #include "Assembler.hpp"
 #include "AssemblerOptions.hpp"
 #include "buildId.hpp"
+#if DINARA_ENABLE_VARIANT_CLUSTERING
 #include "ClusterGraph.hpp"
+#endif
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
 #include "performanceLog.hpp"
@@ -606,11 +608,144 @@ if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
 
+    // Snapshot the broad keep-set used for marker-graph collapse.
+    std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
+    for (uint64_t i = 0; i < keepForMarkerGraph.size(); ++i) {
+        keepForMarkerGraph[i] = (assembler.alignmentData[i].info.isInReadGraph != 0);
+    }
+
     // Mode 3 assembly requires reads in raw representation (not RLE).
     DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
 
     // The marker length must be even.
     DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
+
+
+
+
+    // To create a complete marker graph, generate all vertices
+    // regardless of coverage, and allow duplicate markers on vertices.
+    assembler.createMarkerGraphVertices(
+        1,                                              // minVertexCoverage
+        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+        0,                                              // minVertexCoveragePerStrand
+        false,                                           // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
+        threadCount);
+
+    // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
+    // This reduces unreliable anchors and artifacts in repetitive regions.
+    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+
+    // Find the reverse complement of each marker graph vertex.
+    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+    // // Clean up of duplicate markers, if requested and necessary.
+    // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
+    //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
+    //     assembler.cleanupDuplicateMarkers(
+    //         threadCount,
+    //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
+    //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
+    //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
+    //         true, true);
+    //     }
+
+    // Create edges of the marker graph.
+    assembler.createMarkerGraphEdges(threadCount);
+    assembler.findMarkerGraphReverseComplementEdges(threadCount);
+
+    // Now that the marker graph is built from the broad read-graph overlap set,
+    // we can tighten the overlap set by pruning overlaps for contained reads.
+    // This changes the read graph (rebuilt below) but keeps the marker graph intact.
+    const uint64_t minOverlapLengthForContainment = 50;
+    const uint64_t maxHangForContainment = 1000;
+    const double maxHangRateForContainment = 0.8;
+    assembler.flagContainedReads(
+        maxHangForContainment,
+        maxHangRateForContainment,
+        minOverlapLengthForContainment,
+        threadCount);
+    {
+        uint64_t containedFlagCount = 0;
+        for (ReadId r = 0; r < assembler.getReads().readCount(); ++r) {
+            if (assembler.getReads().getFlags(r).isContained) {
+                ++containedFlagCount;
+            }
+        }
+        cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
+    }
+
+    // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
+    // This is a diagnostic/experimental alternative to removing contained reads entirely.
+    assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
+
+
+    std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
+    for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
+        if (!keepForMarkerGraph[i]) continue;
+
+        const auto& ad = assembler.alignmentData[i];
+
+        // Strict rule: only keep if both sides still keep it after your extra filtering.
+        if (!ad.keptByBothSides()) continue;
+
+        keepForReadGraph[i] = true;
+    }
+
+    // Rebuild the read graph using the tightened keep-set.
+    assembler.rebuildReadGraphUsingSelectedAlignments(
+        std::move(keepForReadGraph),
+        /*rebuildDirectedReadGraph*/false);
+
+
+
+
+
+
+
+    // const bool anchorsNeedMarkerGraphVertices =
+    //     assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromOverlapsBestPerOverlapInterval";
+    //
+    // if(anchorsNeedMarkerGraphVertices) {
+    //     // Create marker graph vertices with coverage filtering.
+    //     assembler.createMarkerGraphVertices(
+    //         minPrimaryCoverage,                             // minVertexCoverage (from options)
+    //         maxPrimaryCoverage,                             // maxVertexCoverage (from options)
+    //         0,                                              // minVertexCoveragePerStrand
+    //         false,                                           // allowDuplicateMarkers
+    //         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
+    //         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
+    //         threadCount);
+    //
+    //     // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
+    //     // This reduces unreliable anchors and artifacts in repetitive regions.
+    //     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    //
+    //     // Find the reverse complement of each marker graph vertex.
+    //     // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
+    //     assembler.findMarkerGraphReverseComplementVertices(threadCount);
+    //
+    //     // // Clean up of duplicate markers, if requested and necessary.
+    //     // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
+    //     //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
+    //     //     assembler.cleanupDuplicateMarkers(
+    //     //         threadCount,
+    //     //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
+    //     //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
+    //     //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
+    //     //         false, false);
+    //     //     }
+    //
+    //     // Create edges of the marker graph.
+    //     assembler.createMarkerGraphEdges(threadCount);
+    //     assembler.findMarkerGraphReverseComplementEdges(threadCount);
+    // }
+
+
+
 
     // Declare anchors pointer here to avoid scope issues
     shared_ptr<mode3::Anchors> anchors;
@@ -634,67 +769,8 @@ if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
             ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
     }
 
-    const bool anchorsNeedMarkerGraphVertices =
-        assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromOverlapsBestPerOverlapInterval";
 
-    if(anchorsNeedMarkerGraphVertices) {
-        // Create marker graph vertices with coverage filtering.
-        assembler.createMarkerGraphVertices(
-            minPrimaryCoverage,                             // minVertexCoverage (from options)
-            maxPrimaryCoverage,                             // maxVertexCoverage (from options)
-            0,                                              // minVertexCoveragePerStrand
-            false,                                           // allowDuplicateMarkers
-            std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-            invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-            threadCount);
-
-        // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
-        // This reduces unreliable anchors and artifacts in repetitive regions.
-        assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-
-        // Find the reverse complement of each marker graph vertex.
-        // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-        assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-        // // Clean up of duplicate markers, if requested and necessary.
-        // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
-        //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
-        //     assembler.cleanupDuplicateMarkers(
-        //         threadCount,
-        //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
-        //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-        //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
-        //         false, false);
-        //     }
-
-        // Create edges of the marker graph.
-        assembler.createMarkerGraphEdges(threadCount);
-        assembler.findMarkerGraphReverseComplementEdges(threadCount);
-    }
-
-
-    // Construct the mode3::Anchors (for HTTP server visualization).
-    // This must be done BEFORE createShasta2Anchors.
-    if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-        "FromMarkerGraphVerticesAtOverlapEvents") {
-        anchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount);
-    } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-        "FromMarkerGraphVerticesBestPerOverlapInterval") {
-        anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount);
-    } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-        "FromOverlapsBestPerOverlapInterval") {
-        anchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount);
-    } else {
-        anchors =
+    anchors =
             make_shared<mode3::Anchors>(
                 MappedMemoryOwner(assembler),
                 assembler.getReads(),
@@ -705,7 +781,41 @@ if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
                 maxPrimaryCoverage,
                 threadCount,
                 true); // createFromVertices
-    }
+
+
+    // // Construct the mode3::Anchors (for HTTP server visualization).
+    // // This must be done BEFORE createShasta2Anchors.
+    // if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+    //     "FromMarkerGraphVerticesAtOverlapEvents") {
+    //     anchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
+    //         minPrimaryCoverage,
+    //         maxPrimaryCoverage,
+    //         threadCount);
+    // } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+    //     "FromMarkerGraphVerticesBestPerOverlapInterval") {
+    //     anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+    //         minPrimaryCoverage,
+    //         maxPrimaryCoverage,
+    //         threadCount);
+    // } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
+    //     "FromOverlapsBestPerOverlapInterval") {
+    //     anchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
+    //         minPrimaryCoverage,
+    //         maxPrimaryCoverage,
+    //         threadCount);
+    // } else {
+    //     anchors =
+    //         make_shared<mode3::Anchors>(
+    //             MappedMemoryOwner(assembler),
+    //             assembler.getReads(),
+    //             assembler.assemblerInfo->k,
+    //             *assembler.markers,
+    //             assembler.markerGraph,
+    //             minPrimaryCoverage,
+    //             maxPrimaryCoverage,
+    //             threadCount,
+    //             true); // createFromVertices
+    // }
     
 
     // Compute oriented read journeys.
