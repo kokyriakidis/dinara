@@ -48,6 +48,7 @@ using namespace std;
 
 #include "MultithreadedObject.tpp"
 #include "Alignment.hpp"
+#include "AlignmentCanonicalization.hpp"
 
 namespace dinara {
 
@@ -652,19 +653,32 @@ private:
                              if (remQ <= remT) { fQe = (uint32_t)readLenA; fTe += (uint32_t)remQ; } else { fTe = (uint32_t)readLenB; fQe += (uint32_t)remT; } 
 
                              al.qs = fQs; al.qe = fQe;
+                             const uint32_t markerCountA = uint32_t(markersA.size());
+                             const uint32_t markerCountB = uint32_t(mB.size());
+
+                             bool isSameStrand = true;
                              if (cand.isDiff) {
+                                 isSameStrand = false;
                                  const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), fTs, fTe);
                                  al.ts = p.first;
                                  al.te = p.second;
-                                 uint32_t numMB = (uint32_t)mB.size();
-                                 for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
+                                 const uint32_t numMB = markerCountB;
+                                 for(auto& p : al.ordinals) {
+                                     p[1] = numMB - 1 - p[1];
+                                 }
                                  scratch.acceptedIntervalsDiff.push_back({qOrdS, qOrdE});
-                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, false));
                              } else {
-                                 al.ts = fTs; al.te = fTe;
+                                 isSameStrand = true;
+                                 al.ts = fTs;
+                                 al.te = fTe;
                                  scratch.acceptedIntervalsSame.push_back({qOrdS, qOrdE});
-                                 localCandidates.push_back(OrientedReadPair(readIdA, readIdB, true));
                              }
+
+                             // Canonicalize candidate so readIds[0] < readIds[1], and keep alignment consistent.
+                             ReadId cand0 = readIdA;
+                             ReadId cand1 = readIdB;
+                             canonicalizeCandidateAndAlignment(cand0, cand1, isSameStrand, al, markerCountA, markerCountB);
+                             localCandidates.push_back(OrientedReadPair(cand0, cand1, isSameStrand));
                              localAlignments.push_back(std::move(al));
                         }
                     }
@@ -1314,7 +1328,8 @@ void Assembler::chainPafCandidates(
                     }
 
                     if(validChain && !al.ordinals.empty()) {
-                        // Set alignment coordinates
+                        // Set alignment coordinates.
+                        // Note: Alignment stores ts/te in forward-read coordinates, even for reverse overlaps.
                         uint32_t qPstart = markersA[al.ordinals.front()[0]].position;
                         uint32_t qPend = markersA[al.ordinals.back()[0]].position + (uint32_t)kmerLen;
                         uint32_t tPstart = markersB[al.ordinals.front()[1]].position;
@@ -1322,8 +1337,20 @@ void Assembler::chainPafCandidates(
 
                         al.qs = qPstart;
                         al.qe = qPend;
-                        al.ts = tPstart;
-                        al.te = tPend;
+                        if(useSameStrand) {
+                            al.ts = tPstart;
+                            al.te = tPend;
+                        } else {
+                            // In the diff-strand chain, the target marker positions are decreasing.
+                            // Convert the (strand-0) forward interval to the canonical forward interval.
+                            const uint32_t minB = std::min(tPstart, tPend >= uint32_t(kmerLen) ? (tPend - uint32_t(kmerLen)) : tPend);
+                            const uint32_t maxB = std::max(tPstart, tPend >= uint32_t(kmerLen) ? (tPend - uint32_t(kmerLen)) : tPend) + uint32_t(kmerLen);
+                            const uint32_t tsExt = uint32_t(readLenB) - maxB;
+                            const uint32_t teExt = uint32_t(readLenB) - minB;
+                            const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), tsExt, teExt);
+                            al.ts = p.first;
+                            al.te = p.second;
+                        }
 
                         // Flip ordinals for opposite strand
                         if(!useSameStrand) {
@@ -1331,7 +1358,15 @@ void Assembler::chainPafCandidates(
                             for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
                         }
 
-                        localCandidates.push_back(OrientedReadPair(readIdA, readIdB, useSameStrand));
+                        // Canonicalize candidate so readIds[0] < readIds[1], and keep alignment consistent.
+                        const uint32_t markerCountA = uint32_t(markersA.size());
+                        const uint32_t markerCountB = uint32_t(markersB.size());
+                        ReadId cand0 = readIdA;
+                        ReadId cand1 = readIdB;
+                        bool isSameStrand = useSameStrand;
+                        canonicalizeCandidateAndAlignment(cand0, cand1, isSameStrand, al, markerCountA, markerCountB);
+
+                        localCandidates.push_back(OrientedReadPair(cand0, cand1, isSameStrand));
                         localAlignments.push_back(std::move(al));
                     }
                 }

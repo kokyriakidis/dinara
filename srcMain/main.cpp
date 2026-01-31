@@ -565,26 +565,26 @@ void dinara::main::assemble(
     assembler.buildInvertedIndex(threadCount);
 
     // Find and chain alignment candidates.
-if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
+    if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
         // PAF path: Import candidate pairs from PAF, then chain them using the inverted index.
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
-    assembler.chainPafCandidates(
-        assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-        maxChainLimit,
-        assemblerOptions.overlapCandidatesOptions,
-        uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
-        threadCount
-    );
-} else {
+        assembler.chainPafCandidates(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
+            assemblerOptions.overlapCandidatesOptions,
+            uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+            threadCount
+        );
+    } else {
         // Inverted Index path: Discover candidate pairs via k-mer matches and chain them.
-    assembler.chainAlignmentCandidates(
-        assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-        maxChainLimit,
-        assemblerOptions.overlapCandidatesOptions,
-        uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
-        threadCount
-    );
-}
+        assembler.chainAlignmentCandidates(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
+            assemblerOptions.overlapCandidatesOptions,
+            uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+            threadCount
+        );
+    }
 
     // Compute alignments with variant evidence storage.
     assembler.computeAlignmentsWithEvidence(

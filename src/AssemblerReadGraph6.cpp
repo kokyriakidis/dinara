@@ -66,45 +66,45 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterRescueDel1
          << ", active=" << countActiveAlignments() << endl;
     
-    // Step 2: Find valid read segments (ma_hit_sub equivalent)
-    // Hifiasm default min_dp is asm_opt.min_overlap_coverage (default 0).
-    const uint64_t minCoverage = 0;
-    filterLocalSegments(minCoverage, threadCount);
-
-    // Count deleted reads
-    uint64_t deletedReads = 0;
-    for(uint64_t r = 0; r < validReadIntervals.size(); r++) {
-        if(validReadIntervals[r].isDeleted) deletedReads++;
-    }
-    cout << timestamp << "[DIAG] After filterLocalSegments: " << deletedReads << "/" << reads->readCount() << " reads marked deleted" << endl;
-    cout << timestamp << "[DIAG] After filterLocalSegments: active alignments=" << countActiveAlignments() << endl;
-
-    // Step 3: Detect chimeric reads (detect_chimeric_reads)
-    // Runs after ma_hit_sub and before ma_hit_cut in hifiasm.
-    detectChimericReads(threadCount);
-    auto [afterChimericDel0, afterChimericDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After detectChimericReads: isDeleted0=" << afterChimericDel0
-         << ", isDeleted1=" << afterChimericDel1
-         << ", active=" << countActiveAlignments() << endl;
-
-    // Step 4: Clip overlaps to valid regions (ma_hit_cut equivalent)
-    // Also normalizes coordinates to 0-based relative to valid region.
-    const uint64_t minOverlapLength = 50;  // Hifiasm default mini_overlap_length
-    applyCoverageCuts(minOverlapLength, threadCount);
-    auto [afterCutDel0, afterCutDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After applyCoverageCuts: isDeleted0=" << afterCutDel0
-         << ", isDeleted1=" << afterCutDel1
-         << ", active=" << countActiveAlignments() << endl;
-
-    // Step 5: Filter hanging overlaps (ma_hit_flt equivalent)
-    // Removes overlaps with excessive overhangs
-    const uint64_t maxHang = 1000;
-    const double maxHangRate = 0.8;
-    filterHangingOverlaps(maxHang, maxHangRate, minOverlapLength, threadCount);
-    auto [afterHangDel0, afterHangDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After filterHangingOverlaps: isDeleted0=" << afterHangDel0
-         << ", isDeleted1=" << afterHangDel1
-         << ", active=" << countActiveAlignments() << endl;
+    // // Step 2: Find valid read segments (ma_hit_sub equivalent)
+    // // Hifiasm default min_dp is asm_opt.min_overlap_coverage (default 0).
+    // const uint64_t minCoverage = 0;
+    // filterLocalSegments(minCoverage, threadCount);
+    //
+    // // Count deleted reads
+    // uint64_t deletedReads = 0;
+    // for(uint64_t r = 0; r < validReadIntervals.size(); r++) {
+    //     if(validReadIntervals[r].isDeleted) deletedReads++;
+    // }
+    // cout << timestamp << "[DIAG] After filterLocalSegments: " << deletedReads << "/" << reads->readCount() << " reads marked deleted" << endl;
+    // cout << timestamp << "[DIAG] After filterLocalSegments: active alignments=" << countActiveAlignments() << endl;
+    //
+    // // Step 3: Detect chimeric reads (detect_chimeric_reads)
+    // // Runs after ma_hit_sub and before ma_hit_cut in hifiasm.
+    // detectChimericReads(threadCount);
+    // auto [afterChimericDel0, afterChimericDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After detectChimericReads: isDeleted0=" << afterChimericDel0
+    //      << ", isDeleted1=" << afterChimericDel1
+    //      << ", active=" << countActiveAlignments() << endl;
+    //
+    // // Step 4: Clip overlaps to valid regions (ma_hit_cut equivalent)
+    // // Also normalizes coordinates to 0-based relative to valid region.
+    // const uint64_t minOverlapLength = 50;  // Hifiasm default mini_overlap_length
+    // applyCoverageCuts(minOverlapLength, threadCount);
+    // auto [afterCutDel0, afterCutDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After applyCoverageCuts: isDeleted0=" << afterCutDel0
+    //      << ", isDeleted1=" << afterCutDel1
+    //      << ", active=" << countActiveAlignments() << endl;
+    //
+    // // Step 5: Filter hanging overlaps (ma_hit_flt equivalent)
+    // // Removes overlaps with excessive overhangs
+    // const uint64_t maxHang = 1000;
+    // const double maxHangRate = 0.8;
+    // filterHangingOverlaps(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // auto [afterHangDel0, afterHangDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After filterHangingOverlaps: isDeleted0=" << afterHangDel0
+    //      << ", isDeleted1=" << afterHangDel1
+    //      << ", active=" << countActiveAlignments() << endl;
 
     // // Step 6: Remove contained reads (ma_hit_contained_advance equivalent)
     // // Marks fully contained reads and removes their overlaps
@@ -116,6 +116,9 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 
     // Step 6b: Diagnostic-only contained read detection (does not remove overlaps).
     // Useful when experimenting with phasing/anchors without changing the overlap set.
+    const uint64_t minOverlapLength = 50;
+    const uint64_t maxHang = 1000;
+    const double maxHangRate = 0.8;
     flagContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
     uint64_t containedFlagCount = 0;
     for (ReadId r = 0; r < reads->readCount(); ++r) {
@@ -166,8 +169,9 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
         
-        // 1. Conservative AND: keep an overlap only if BOTH reads keep it.
-        if(!ad.keptByBothSides()) {
+        // 1. OR semantics: keep an overlap if at least one side keeps it.
+        // Only drop it if BOTH sides have deletion reasons.
+        if(ad.isDeleted()) {
             keepAlignment[i] = false;
             ad.info.isInReadGraph = 0;
             phasedOutCount++;
