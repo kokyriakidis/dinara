@@ -498,6 +498,25 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(4),
         "Minimum aligned marker count for a candidate overlap to be kept.")
 
+        ("OverlapCandidates.minOverlapLength",
+        value<uint32_t>(&overlapCandidatesOptions.minOverlapLength)->
+        default_value(500),
+        "Minimum overlap span in bases for a candidate to be kept. "
+        "Implemented as min(qSpan, tSpan) >= threshold, where spans are measured on the "
+        "pre-extension marker-derived (or PAF-derived) intervals.")
+
+        ("OverlapCandidates.maxEndFuzz",
+        value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz)->
+        default_value(0),
+        "If non-zero, discard a candidate if making it hifiasm-parity (extending to read ends) "
+        "would require extending by more than this many bases on the left or right side. "
+        "This is a heuristic to reject internal overlaps that are likely spurious.")
+
+        // Backward compatible alias (deprecated).
+        ("OverlapCandidates.maxEndExtension",
+        value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
+        "Deprecated alias for OverlapCandidates.maxEndFuzz.")
+
         ("OverlapCandidates.invertedIndexWeightExponent",
         value<double>(&overlapCandidatesOptions.invertedIndexWeightExponent)->
         default_value(1.1),
@@ -1499,6 +1518,8 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "method = " << method << "\n";
     s << "driftRateTolerance = " << driftRateTolerance << "\n";
     s << "minMarkerCount = " << minMarkerCount << "\n";
+    s << "minOverlapLength = " << minOverlapLength << "\n";
+    s << "maxEndFuzz = " << maxEndFuzz << "\n";
     s << "invertedIndexWeightExponent = " << invertedIndexWeightExponent << "\n";
     s << "invertedIndexLowFreqMultiplier = " << invertedIndexLowFreqMultiplier << "\n";
     s << "invertedIndexHighFreqMultiplier = " << invertedIndexHighFreqMultiplier << "\n";

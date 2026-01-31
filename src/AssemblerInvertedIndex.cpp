@@ -647,6 +647,26 @@ private:
                                  tS = bPfirst; tE = bPlast + (uint32_t)kmerLen;
                              }
 
+                             // Optional: minimum overlap length in bases (pre-extension span).
+                             if(invertedIndexData.minOverlapLength > 0) {
+                                 const uint64_t qSpan = uint64_t(qPend) - uint64_t(qPstart);
+                                 const uint64_t tSpan = uint64_t(tE) - uint64_t(tS);
+                                 if(std::min(qSpan, tSpan) < uint64_t(invertedIndexData.minOverlapLength)) {
+                                     continue;
+                                 }
+                             }
+
+                             // Optional: discard internal overlaps that would require large end extension.
+                             if(invertedIndexData.maxEndFuzz > 0) {
+                                 const uint32_t leftNeed = std::min(qPstart, tS);
+                                 const int64_t qRight = int64_t(readLenA) - int64_t(qPend);
+                                 const int64_t tRight = int64_t(readLenB) - int64_t(tE);
+                                 const uint32_t rightNeed = uint32_t(std::min<int64_t>(std::max<int64_t>(qRight, 0), std::max<int64_t>(tRight, 0)));
+                                 if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
+                                     continue;
+                                 }
+                             }
+
                              uint32_t fQs = qPstart, fQe = qPend, fTs = tS, fTe = tE;
                              if (fQs <= fTs) { fTs -= fQs; fQs = 0; } else { fQs -= fTs; fTs = 0; }
                              int64_t remQ = (int64_t)readLenA - fQe, remT = (int64_t)readLenB - fTe;
@@ -999,6 +1019,8 @@ void Assembler::chainAlignmentCandidates(
     invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
     invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
     invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
+    invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
+    invertedIndexData.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
     invertedIndexData.weightLut.resize(512);
     for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
         invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
@@ -1086,6 +1108,8 @@ void Assembler::chainPafCandidates(
     invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
     invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
     invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
+    invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
+    invertedIndexData.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
     invertedIndexData.weightLut.resize(512);
     for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
         invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
@@ -1289,7 +1313,10 @@ void Assembler::chainPafCandidates(
                     }
 
                     // Extract best chain based on PAF strand info
-                    bool useSameStrand = pafSameStrand ? (maxScSame >= maxScDiff) : (maxScDiff > maxScSame);
+                    // Enforce the orientation given by the PAF record.
+                    // This avoids ambiguous cases where the same/diff DP scores are similar due to
+                    // canonical k-mer matching (which does not encode strand).
+                    bool useSameStrand = pafSameStrand;
                     int32_t bestEndIdx = useSameStrand ? bestEndIdxSame : bestEndIdxDiff;
                     const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
 
@@ -1350,6 +1377,42 @@ void Assembler::chainPafCandidates(
                             const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), tsExt, teExt);
                             al.ts = p.first;
                             al.te = p.second;
+                        }
+
+                        // Optional: minimum overlap length in bases (pre-extension span).
+                        if(invertedIndexData.minOverlapLength > 0) {
+                            const uint64_t qSpan = uint64_t(al.qe) - uint64_t(al.qs);
+                            const uint64_t tSpan = uint64_t(al.te) - uint64_t(al.ts);
+                            if(std::min(qSpan, tSpan) < uint64_t(invertedIndexData.minOverlapLength)) {
+                                continue;
+                            }
+                        }
+
+                        // Optional: discard internal overlaps that would require large end extension.
+                        if(invertedIndexData.maxEndFuzz > 0) {
+                            // For reverse overlaps, Alignment stores ts/te in forward coordinates (ts < te),
+                            // but the "end extension" heuristic must be computed in the overlap orientation.
+                            // In the reverse-complement coordinate system, the target interval becomes:
+                            // [lenB - te, lenB - ts], so the left overhang is (lenB - te) and the right overhang is ts.
+                            const int64_t qRight = int64_t(readLenA) - int64_t(al.qe);
+                            const uint32_t qRightNeed = uint32_t(std::max<int64_t>(qRight, 0));
+
+                            uint32_t tLeftNeed = 0;
+                            uint32_t tRightNeed = 0;
+                            if(useSameStrand) {
+                                tLeftNeed = al.ts;
+                                const int64_t tRight = int64_t(readLenB) - int64_t(al.te);
+                                tRightNeed = uint32_t(std::max<int64_t>(tRight, 0));
+                            } else {
+                                tLeftNeed = uint32_t(readLenB) - al.te;
+                                tRightNeed = al.ts;
+                            }
+
+                            const uint32_t leftNeed = std::min(al.qs, tLeftNeed);
+                            const uint32_t rightNeed = std::min(qRightNeed, tRightNeed);
+                            if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
+                                continue;
+                            }
                         }
 
                         // Flip ordinals for opposite strand

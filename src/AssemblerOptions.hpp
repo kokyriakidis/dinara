@@ -203,6 +203,8 @@ public:
     string method;              // "MinHash" or "InvertedIndex".
     double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
     int minMarkerCount;         // Minimum aligned marker count for candidate filtering.
+    uint32_t minOverlapLength = 500; // Minimum overlap span (bases) for a candidate to be kept (applies to pre-extension span).
+    uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension (bases) to reach read ends.
 
     // Additional knobs for the InvertedIndex chaining path (defaults match current hard-coded behavior).
     // These exist so we can more easily match hifiasm/minimap2 behavior when needed.

@@ -2166,6 +2166,8 @@ private:
 	         double maxDriftRate;
 	         uint64_t k; // k-mer length for canonicalization
 	         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
+             uint32_t minOverlapLength = 500; // Minimum overlap span (bases) to keep a candidate (min of query/target spans).
+             uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension to read ends.
 
              // InvertedIndex chaining configuration (see OverlapCandidatesOptions for meaning).
              double weightExponent = 1.1;
