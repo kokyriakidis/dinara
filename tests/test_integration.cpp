@@ -18,6 +18,7 @@
 #include "../src/ProjectedAlignment.hpp"
 #include "../src/DINARA_ASSERT.hpp"
 #include "../src/markerAccessFunctions.hpp"
+#include "../src/AlignmentCanonicalization.hpp"
 
 // Standard library
 #include <algorithm>
@@ -163,6 +164,70 @@ const AlignmentData* findAlignmentDataPtr(
     return nullptr;
 }
 } // namespace
+
+TEST_CASE("Candidate canonicalization keeps alignment consistent", "[candidates][canonical]")
+{
+    SECTION("Same-strand swap")
+    {
+        ReadId readId0 = ReadId(5);
+        ReadId readId1 = ReadId(3);
+        bool isSameStrand = true;
+
+        Alignment al;
+        al.ordinals = {{1, 10}, {2, 11}, {3, 12}};
+        al.qs = 100; al.qe = 200;
+        al.ts = 300; al.te = 400;
+
+        canonicalizeCandidateAndAlignment(readId0, readId1, isSameStrand, al, 1000, 900);
+
+        REQUIRE(readId0 == ReadId(3));
+        REQUIRE(readId1 == ReadId(5));
+        REQUIRE(isSameStrand == true);
+        REQUIRE(al.ordinals.size() == 3);
+        CHECK(al.ordinals[0][0] == 10);
+        CHECK(al.ordinals[0][1] == 1);
+        CHECK(al.ordinals[2][0] == 12);
+        CHECK(al.ordinals[2][1] == 3);
+        CHECK(al.qs == 300);
+        CHECK(al.qe == 400);
+        CHECK(al.ts == 100);
+        CHECK(al.te == 200);
+        al.checkStrictlyIncreasing();
+    }
+
+    SECTION("Diff-strand swap")
+    {
+        ReadId readId0 = ReadId(5);
+        ReadId readId1 = ReadId(3);
+        bool isSameStrand = false; // (A0,B1)
+
+        Alignment al;
+        al.ordinals = {{2, 10}, {3, 11}, {4, 12}};
+        al.qs = 100; al.qe = 200;
+        al.ts = 300; al.te = 400;
+
+        const uint32_t markerCountA = 100;
+        const uint32_t markerCountB = 80;
+        canonicalizeCandidateAndAlignment(readId0, readId1, isSameStrand, al, markerCountA, markerCountB);
+
+        REQUIRE(readId0 == ReadId(3));
+        REQUIRE(readId1 == ReadId(5));
+        REQUIRE(isSameStrand == false);
+        REQUIRE(al.ordinals.size() == 3);
+
+        // Expected: reverseComplement(100,80) then swap columns.
+        CHECK(al.ordinals[0][0] == (markerCountB - 1 - 12)); // 67
+        CHECK(al.ordinals[0][1] == (markerCountA - 1 - 4));  // 95
+        CHECK(al.ordinals[2][0] == (markerCountB - 1 - 10)); // 69
+        CHECK(al.ordinals[2][1] == (markerCountA - 1 - 2));  // 97
+
+        CHECK(al.qs == 300);
+        CHECK(al.qe == 400);
+        CHECK(al.ts == 100);
+        CHECK(al.te == 200);
+        al.checkStrictlyIncreasing();
+    }
+}
 
 // =============================================================================
 // HELPER: Generate random DNA sequence
@@ -609,6 +674,20 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     // --- SNP (read_0 vs read_1, same strand) ---
     const AlignmentData* ad01 = findAlignmentDataPtr(alignmentData, ReadId(0), ReadId(1), true);
     REQUIRE(ad01 != nullptr);
+    // Canonical storage invariant: readIds[0] < readIds[1], and qs/qe refer to readIds[0].
+    REQUIRE(ad01->readIds[0] == ReadId(0));
+    REQUIRE(ad01->readIds[1] == ReadId(1));
+    REQUIRE(ad01->qs < ad01->qe);
+    REQUIRE(ad01->ts < ad01->te);
+    const uint32_t len01_q = uint32_t(reads.getReadRawSequenceLength(ad01->readIds[0]));
+    const uint32_t len01_t = uint32_t(reads.getReadRawSequenceLength(ad01->readIds[1]));
+    CHECK(ad01->qe <= len01_q);
+    CHECK(ad01->te <= len01_t);
+    // The variant site must lie inside the stored overlap windows.
+    CHECK(ad01->qs <= 1500U);
+    CHECK(ad01->qe > 1500U);
+    CHECK(ad01->ts <= 1500U);
+    CHECK(ad01->te > 1500U);
     const uint32_t ev01 = uint32_t(ad01->info.alignmentId);
     const OrientedReadId q01(ad01->readIds[0], 0);
     const OrientedReadId t01(ad01->readIds[1], ad01->isSameStrand ? 0 : 1);
@@ -653,6 +732,11 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
         ad03 = findAlignmentDataPtr(alignmentData, ReadId(0), ReadId(3), false);
     }
     REQUIRE(ad03 != nullptr);
+    // Canonical storage invariant.
+    REQUIRE(ad03->readIds[0] == ReadId(0));
+    REQUIRE(ad03->readIds[1] == ReadId(3));
+    REQUIRE(ad03->qs < ad03->qe);
+    REQUIRE(ad03->ts < ad03->te);
     CHECK(ad03->isSameStrand == false);
     const uint32_t ev03 = uint32_t(ad03->info.alignmentId);
     const OrientedReadId q03(ad03->readIds[0], 0);
@@ -662,6 +746,13 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     static const uint8_t complementBase[4] = {3, 2, 1, 0};
     const uint32_t tRawLen03 = uint32_t(reads.getReadRawSequenceLength(ad03->readIds[1]));
     const uint32_t expectedS0Pos03 = tRawLen03 - 1U - 1500U;
+    const uint32_t len03_q = uint32_t(reads.getReadRawSequenceLength(ad03->readIds[0]));
+    CHECK(ad03->qe <= len03_q);
+    CHECK(ad03->te <= tRawLen03);
+    CHECK(ad03->qs <= 1500U);
+    CHECK(ad03->qe > 1500U);
+    CHECK(ad03->ts <= expectedS0Pos03);
+    CHECK(ad03->te > expectedS0Pos03);
 
     std::vector<std::pair<uint32_t, uint8_t>> s0_03;
     store.forEachSnp0InRange(ev03, 1490, 1510, [&](uint32_t pos, uint8_t base) { s0_03.push_back({pos, base}); });
