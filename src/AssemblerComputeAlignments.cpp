@@ -382,18 +382,23 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
 
 
 
-void Assembler::filterSecondaryAlignmentsPerReadPair(uint64_t threadCount)
+void Assembler::filterSecondaryAlignmentsPerReadPair(
+    uint64_t threadCount,
+    bool requireNonRedundantOnBothReads)
 {
     // --- Hifiasm-style per-read-pair redundancy filtering ---
     // For each read r0, consider all overlaps to a given partner read (r1).
     // Keep the strongest chains and delete redundant/secondary ones:
     // - score ratio filter (hifiasm -p 0.8)
     // - overlap-on-r0 filter (hifiasm -M 0.5)
+    // Optionally also require non-redundancy on the partner read interval (ts/te).
 
     const auto tBegin = steady_clock::now();
     cout << timestamp << "Filtering secondary alignments per read pair begins." << endl;
 
     removedSecondaryAlignmentCount = 0;
+    removedSecondaryAlignmentBySymmetryOnlyCount = 0;
+    filterSecondaryRequireNonRedundantOnBothReads = requireNonRedundantOnBothReads;
 
     // Run threads.
     const uint64_t readCount = reads->readCount();
@@ -403,7 +408,11 @@ void Assembler::filterSecondaryAlignmentsPerReadPair(uint64_t threadCount)
     const auto tEnd = steady_clock::now();
     const double tSeconds = seconds(tEnd - tBegin);
     cout << timestamp << "Filtering secondary alignments per read pair ends in " << tSeconds << " s." << endl;
-    cout << timestamp << "Removed " << removedSecondaryAlignmentCount << " redundant alignments (marked isDeleted)." << endl;
+    cout << timestamp << "Removed " << removedSecondaryAlignmentCount << " redundant alignments (marked isDeleted).";
+    if(filterSecondaryRequireNonRedundantOnBothReads) {
+        cout << " symmetryOnlyRemoved=" << removedSecondaryAlignmentBySymmetryOnlyCount;
+    }
+    cout << endl;
 }
 
 
@@ -412,6 +421,7 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
 {
     uint64_t begin, end;
     uint64_t localRemovedCount = 0;
+    uint64_t localSymmetryOnlyRemovedCount = 0;
 
     // Reuse buffers across reads to avoid repeated allocations.
     struct CandidateInfo {
@@ -419,6 +429,10 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
         int64_t score;
         uint64_t qs;
         uint64_t qe;
+        uint64_t ts;
+        uint64_t te;
+        bool keptOld = false; // kept by legacy (r0-only) logic
+        bool keptNew = false; // kept by current logic (with optional symmetry)
     };
     vector<CandidateInfo> group;
     vector<CandidateInfo> kept;
@@ -453,38 +467,111 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                     return a.score > b.score;
                 });
 
-                kept.clear();
                 const int64_t bestScore = group[0].score;
-
-                for(const auto& cand : group) {
-                    bool drop = false;
-
+                auto failsScoreRatio = [&](const CandidateInfo& cand) -> bool {
                     // 1) Score ratio filter (hifiasm -p 0.8), done with integer math:
                     // cand.score < bestScore * 0.8  <=>  cand.score * 5 < bestScore * 4
-                    if(cand.score * 5 < bestScore * 4) {
-                        drop = true;
-                    } else {
-                        // 2) Overlap filter on r0 (hifiasm -M 0.5), integer math:
-                        // oLen > 0.5 * len  <=>  2*oLen > len
-                        const uint64_t len = cand.qe - cand.qs;
-                        for(const auto& existing : kept) {
-                            const uint64_t oStart = max(cand.qs, existing.qs);
-                            const uint64_t oEnd = min(cand.qe, existing.qe);
-                            if(oEnd > oStart) {
-                                const uint64_t oLen = oEnd - oStart;
-                                if(oLen * 2 > len) {
-                                    drop = true;
-                                    break;
-                                }
-                            }
+                    return cand.score * 5 < bestScore * 4;
+                };
+                auto overlapsMoreThanHalf = [&](uint64_t s0, uint64_t e0, uint64_t s1, uint64_t e1, uint64_t len) -> bool {
+                    if(len == 0) {
+                        return false;
+                    }
+                    const uint64_t oStart = std::max(s0, s1);
+                    const uint64_t oEnd = std::min(e0, e1);
+                    if(oEnd <= oStart) {
+                        return false;
+                    }
+                    const uint64_t oLen = oEnd - oStart;
+                    return oLen * 2 > len;
+                };
+                auto overlapsKeptOnR0 = [&](const CandidateInfo& cand, const vector<CandidateInfo>& keptIntervals) -> bool {
+                    const uint64_t len = cand.qe - cand.qs;
+                    for(const auto& existing : keptIntervals) {
+                        if(overlapsMoreThanHalf(cand.qs, cand.qe, existing.qs, existing.qe, len)) {
+                            return true;
                         }
                     }
+                    return false;
+                };
+                auto overlapsKeptOnR1 = [&](const CandidateInfo& cand, const vector<CandidateInfo>& keptIntervals) -> bool {
+                    const uint64_t len = cand.te - cand.ts;
+                    for(const auto& existing : keptIntervals) {
+                        if(overlapsMoreThanHalf(cand.ts, cand.te, existing.ts, existing.te, len)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
 
-                    if(drop) {
+                // Fast path: legacy behavior (r0-only redundancy).
+                if(!filterSecondaryRequireNonRedundantOnBothReads) {
+                    for(auto& cand : group) {
+                        cand.keptNew = false;
+                    }
+                    kept.clear();
+                    for(auto& cand : group) {
+                        if(failsScoreRatio(cand)) {
+                            continue;
+                        }
+                        if(overlapsKeptOnR0(cand, kept)) {
+                            continue;
+                        }
+                        cand.keptNew = true;
+                        kept.push_back(cand);
+                    }
+                    for(const auto& cand : group) {
+                        if(!cand.keptNew) {
+                            alignmentData[cand.alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
+                            localRemovedCount++;
+                        }
+                    }
+                    return;
+                }
+
+                // First pass: legacy behavior (r0-only redundancy).
+                for(auto& cand : group) {
+                    cand.keptOld = false;
+                }
+                kept.clear();
+                for(auto& cand : group) {
+                    if(failsScoreRatio(cand)) {
+                        continue;
+                    }
+                    if(overlapsKeptOnR0(cand, kept)) {
+                        continue;
+                    }
+                    cand.keptOld = true;
+                    kept.push_back(cand);
+                }
+
+                // Second pass: actual behavior (optionally symmetric).
+                for(auto& cand : group) {
+                    cand.keptNew = false;
+                }
+                kept.clear();
+                for(auto& cand : group) {
+                    if(failsScoreRatio(cand)) {
+                        continue;
+                    }
+                    if(overlapsKeptOnR0(cand, kept)) {
+                        continue;
+                    }
+                    if(filterSecondaryRequireNonRedundantOnBothReads && overlapsKeptOnR1(cand, kept)) {
+                        continue;
+                    }
+                    cand.keptNew = true;
+                    kept.push_back(cand);
+                }
+
+                // Mark deletions and count symmetry-only removals.
+                for(const auto& cand : group) {
+                    if(!cand.keptNew) {
                         alignmentData[cand.alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
                         localRemovedCount++;
-                    } else {
-                        kept.push_back(cand);
+                        if(cand.keptOld) {
+                            localSymmetryOnlyRemovedCount++;
+                        }
                     }
                 }
             };
@@ -545,8 +632,10 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                 // Overlap interval on r0 (forward coordinates).
                 const uint64_t qs = ad.qs;
                 const uint64_t qe = ad.qe;
+                const uint64_t ts = ad.ts;
+                const uint64_t te = ad.te;
 
-                group.push_back(CandidateInfo{alignmentId, score, qs, qe});
+                group.push_back(CandidateInfo{alignmentId, score, qs, qe, ts, te});
             }
 
             flushGroup();
@@ -554,4 +643,5 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
     }
 
     removedSecondaryAlignmentCount += localRemovedCount;
+    removedSecondaryAlignmentBySymmetryOnlyCount += localSymmetryOnlyRemovedCount;
 }

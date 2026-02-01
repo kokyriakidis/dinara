@@ -839,6 +839,14 @@ void AssemblerOptions::addConfigurableOptions()
         "Least square max distance for flagging inconsistent alignments. "
         "Only used if --ReadGraph.flagInconsistentAlignments is set. Experimental.")
 
+        ("ReadGraph.filterSecondaryRequireNonRedundantOnBothReads",
+        value<bool>(&readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads)->
+        default_value(true)->
+        implicit_value(true),
+        "When filtering secondary/redundant overlaps per read pair, require non-redundancy on both reads "
+        "(check both [qs,qe) and [ts,te) overlap). "
+        "Set to 0/false to disable.")
+
         //* New readGraph4withStrandSeparation options
 
         ("ReadGraph.epsilon",
@@ -1617,6 +1625,8 @@ void ReadGraphOptions::write(ostream& s) const
     s << "clusterGraphMinEdgeCoverage = " << clusterGraphMinEdgeCoverage << "\n";
     s << "minMultiNodeChainSupport = " << minMultiNodeChainSupport << "\n";
     s << "minIsolatedSiteSupport = " << minIsolatedSiteSupport << "\n";
+    s << "filterSecondaryRequireNonRedundantOnBothReads = " <<
+        convertBoolToPythonString(filterSecondaryRequireNonRedundantOnBothReads) << "\n";
 }
 
 

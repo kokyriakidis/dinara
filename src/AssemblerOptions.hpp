@@ -321,6 +321,10 @@ public:
     int minMultiNodeChainSupport;
     int minIsolatedSiteSupport;
 
+    // If set, hifiasm-style "secondary overlap" filtering requires non-redundancy
+    // on both reads (query and target), not just on the query read.
+    bool filterSecondaryRequireNonRedundantOnBothReads = true;
+
     void write(ostream& ) const;
 };
 

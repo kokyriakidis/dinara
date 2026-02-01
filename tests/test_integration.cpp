@@ -602,6 +602,55 @@ TEST_CASE("OverlapCandidates.minOverlapLength filters short candidates", "[integ
     }
 }
 
+TEST_CASE("ReadGraph.filterSecondaryRequireNonRedundantOnBothReads removes symmetric-only overlaps",
+    "[integration][readgraph][secondary][symmetry]")
+{
+    AssemblerIntegrationFixture fixture;
+
+    const std::string r0 = randomSequence(3000, 9301);
+    const std::string r1 = randomSequence(3000, 9302);
+    fixture.createFastq({r0, r1});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    fixture.assembler->alignmentData.createNew("", 4096);
+
+    AlignmentInfo infoA;
+    infoA.dpScore = 1000;
+    infoA.mismatchCount = 0;
+    infoA.gapCount = 0;
+    infoA.gapEventCount = 0;
+    AlignmentData adA(array<ReadId, 2>{ReadId(0), ReadId(1)}, true, infoA);
+    adA.qs = 0;
+    adA.qe = 1000;
+    adA.ts = 500;
+    adA.te = 1500;
+    fixture.assembler->alignmentData.push_back(adA);
+
+    AlignmentInfo infoB = infoA;
+    infoB.dpScore = 900; // within 80% of best
+    AlignmentData adB(array<ReadId, 2>{ReadId(0), ReadId(1)}, true, infoB);
+    adB.qs = 1600;
+    adB.qe = 2600;
+    // Highly redundant on the partner read interval, but non-overlapping on r0.
+    adB.ts = 520;
+    adB.te = 1520;
+    fixture.assembler->alignmentData.push_back(adB);
+
+    fixture.assembler->computeAlignmentTableForTesting();
+
+    // Legacy behavior (r0-only redundancy): both are kept.
+    fixture.assembler->filterSecondaryAlignmentsPerReadPair(1, false);
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted0());
+    CHECK_FALSE(fixture.assembler->alignmentData[1].isDeleted0());
+
+    // Symmetric behavior: second overlap is removed due to partner-read redundancy only.
+    fixture.assembler->filterSecondaryAlignmentsPerReadPair(1, true);
+    CHECK_FALSE(fixture.assembler->alignmentData[0].isDeleted0());
+    CHECK(fixture.assembler->alignmentData[1].isDeleted0());
+    CHECK(fixture.assembler->getRemovedSecondaryAlignmentBySymmetryOnlyCountForTesting() == 1);
+}
+
 // =============================================================================
 // HELPER: Reverse complement sequence
 // =============================================================================
