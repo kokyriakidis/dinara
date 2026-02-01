@@ -752,8 +752,12 @@ private:
     // Filter secondary/redundant alignments per read pair (hifiasm-style).
     void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
     std::atomic<uint64_t> removedSecondaryAlignmentCount;
+    std::atomic<uint64_t> removedSecondaryAlignmentBySymmetryOnlyCount;
+    bool filterSecondaryRequireNonRedundantOnBothReads = false;
 public:
-    void filterSecondaryAlignmentsPerReadPair(uint64_t threadCount);
+    void filterSecondaryAlignmentsPerReadPair(
+        uint64_t threadCount,
+        bool requireNonRedundantOnBothReads = false);
 public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
@@ -1153,6 +1157,11 @@ public:
     void computeAlignmentTableForTesting()
     {
         computeAlignmentTable();
+    }
+
+    uint64_t getRemovedSecondaryAlignmentBySymmetryOnlyCountForTesting() const
+    {
+        return removedSecondaryAlignmentBySymmetryOnlyCount.load();
     }
 
     struct ValidReadIntervalForTesting {

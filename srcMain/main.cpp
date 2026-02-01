@@ -596,7 +596,9 @@ void dinara::main::assemble(
     assembler.computeCandidateTable();
 
     // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
-    assembler.filterSecondaryAlignmentsPerReadPair(threadCount);
+    assembler.filterSecondaryAlignmentsPerReadPair(
+        threadCount,
+        assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
 
     // =========================================================================
     // Hifiasm-style Overlap Filtering + Clean ReadGraph (Parity)
