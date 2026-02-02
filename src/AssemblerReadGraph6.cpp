@@ -51,10 +51,10 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << initDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
-    // // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
-    // // DeleteReasonChemical so later steps can avoid them.
-    // applyOntChemicalArcMask(threadCount);
+    // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
+    // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
+    // DeleteReasonChemical so later steps can avoid them.
+    applyOntChemicalArcMask(threadCount);
 
     // Hifiasm parity: Full pre-graph filtering pipeline
     // Order matches Hifiasm's clean_graph / gen_init_sg flow

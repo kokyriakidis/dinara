@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -105,6 +106,82 @@ def checkRustLibrariesConsistency():
 def runCommand(command):
     if(os.system(command)):
         raise Exception("Error running command: " + command)
+
+
+def patchRustPortableSimdLaneCountRemoval(cratePath):
+    """Patch Rust sources that still use the old portable_simd LaneCount API.
+
+    Newer nightlies expose `std::simd::Simd<T, LANES>` directly and removed
+    `std::simd::{LaneCount, SupportedLaneCount}`. Some dependencies in the
+    astar-pairwise-aligner workspace still import these names, which breaks
+    compilation on recent toolchains.
+    """
+    if not os.path.isdir(cratePath):
+        return 0
+
+    patchedFiles = 0
+    for root, _, files in os.walk(cratePath):
+        for name in files:
+            if not name.endswith(".rs"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception:
+                continue
+
+            original = text
+
+            # Remove direct imports like: use std::simd::{LaneCount, SupportedLaneCount};
+            text = re.sub(
+                r"(?m)^\s*use\s+std::simd::\{\s*LaneCount\s*,\s*SupportedLaneCount\s*\};\s*\n",
+                "",
+                text,
+            )
+            text = re.sub(
+                r"(?m)^\s*use\s+std::simd::\{\s*SupportedLaneCount\s*,\s*LaneCount\s*\};\s*\n",
+                "",
+                text,
+            )
+
+            # Remove nested imports like: simd::{LaneCount, SupportedLaneCount},
+            text = re.sub(
+                r"\bsimd::\{\s*LaneCount\s*,\s*SupportedLaneCount\s*\}\s*,\s*",
+                "",
+                text,
+            )
+            text = re.sub(
+                r"\bsimd::\{\s*SupportedLaneCount\s*,\s*LaneCount\s*\}\s*,\s*",
+                "",
+                text,
+            )
+
+            # Remove bounds like: LaneCount<LANES>: SupportedLaneCount,
+            text = re.sub(
+                r"(?m)^\s*LaneCount\s*<\s*[^>]+\s*>\s*:\s*SupportedLaneCount\s*,?\s*\n",
+                "",
+                text,
+            )
+            text = re.sub(
+                r"\bLaneCount\s*<\s*[^>]+\s*>\s*:\s*SupportedLaneCount\s*,?\s*",
+                "",
+                text,
+            )
+
+            # Clean up empty `where` clauses left behind (common formatting patterns).
+            text = re.sub(r"(?m)^\s*where\s*\n\s*\{", "{", text)
+            text = re.sub(r"\bwhere\s*\{", "{", text)
+
+            # Remove now-empty simd import blocks if they occur.
+            text = re.sub(r"(?m)^\s*use\s+std::simd::\{\s*\};\s*\n", "", text)
+
+            if text != original:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                patchedFiles += 1
+
+    return patchedFiles
         
 def installPackage(package):
     runCommand("sudo apt-get install --assume-yes " + package)
@@ -301,6 +378,13 @@ def installAstarpa():
         print("Patching astarpa-c for recent nightly Rust compatibility...")
         runCommand("sed -i 's/#\\[no_mangle\\]/#\\[unsafe(no_mangle)\\]/g' src/lib.rs")
         runCommand("sed -i '1i #![allow(unsafe_op_in_unsafe_fn)]' src/lib.rs")
+
+        # Patch workspace crates that still use the old portable_simd LaneCount API.
+        # Recent nightlies removed `std::simd::{LaneCount, SupportedLaneCount}`.
+        workspaceRoot = os.path.abspath(os.path.join(os.getcwd(), ".."))
+        patched = patchRustPortableSimdLaneCountRemoval(os.path.join(workspaceRoot, "pa-bitpacking"))
+        if patched:
+            print(f"Patched portable_simd LaneCount API in {patched} Rust files.")
 
         # Build
         runCommand(cargoPath + " build --release")
