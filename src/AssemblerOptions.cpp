@@ -583,12 +583,12 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Align.minAlignedMarkerCount",
         value<int>(&alignOptions.minAlignedMarkerCount)->
-        default_value(100),
+        default_value(2),
         "The minimum number of aligned markers for an alignment to be used.")
 
         ("Align.minAlignedFraction",
         value<double>(&alignOptions.minAlignedFraction)->
-        default_value(0.),
+        default_value(0., "0"),
         "The minimum fraction of aligned markers for an alignment to be used.")
 
         ("Align.maxErrorRate",
