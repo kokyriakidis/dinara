@@ -9,6 +9,7 @@
 
 #include "cstdint.hpp"
 #include "memory.hpp"
+#include "vector.hpp"
 #include "Coverage.hpp"
 
 namespace dinara {
@@ -75,6 +76,19 @@ public:
     {
         return verticesPointer->size(vertexId);
     }
+
+    // Compute a histogram of marker graph vertex coverage.
+    // The returned vector is indexed by coverage, and stores the number of vertices
+    // with that coverage.
+    // If canonicalOnly is true and reverseComplementVertex is available, only count
+    // canonical vertices (one per reverse-complement pair).
+    vector<uint64_t> computeVertexCoverageHistogram(bool canonicalOnly) const;
+
+    // Write marker graph vertex coverage histogram to a CSV file with columns:
+    // coverage,count
+    void writeVertexCoverageHistogram(
+        const string& fileName,
+        bool canonicalOnly) const;
     // Return the marker ids for a given vertex.
     span<MarkerId> getVertexMarkerIds(VertexId vertexId) {
         return vertices()[vertexId];

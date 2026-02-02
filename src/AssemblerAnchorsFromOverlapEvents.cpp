@@ -10,6 +10,9 @@
 
 // Standard library.
 #include "algorithm.hpp"
+#include <atomic>
+#include <array>
+#include <cmath>
 #include <functional>
 #include <numeric>
 #include <optional>
@@ -292,6 +295,978 @@ namespace {
         return common;
     }
 
+    // Peel a quasi-clique core from a candidate group.
+    // Removes nodes that do not have enough neighbors *within the group*.
+    // This is robust against a small number of bridging/chimeric reads.
+    //
+    // tau is represented as a rational num/denom (for speed and determinism):
+    // keep node u only if deg_in_group(u) >= ceil( (num/denom) * (k-1) ),
+    // where k is the current group size.
+    vector<uint32_t> peelQuasiCliqueCore(
+        const vector<vector<uint32_t>>& adj,
+        const vector<uint32_t>& group,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint32_t tauNum,
+        uint32_t tauDen)
+    {
+        const uint32_t n = uint32_t(adj.size());
+        const uint32_t k0 = uint32_t(group.size());
+        if(k0 == 0) {
+            return {};
+        }
+        if(k0 == 1) {
+            if(minAnchorCoverage <= 1 && maxAnchorCoverage >= 1) {
+                return group;
+            } else {
+                return {};
+            }
+        }
+
+        vector<uint8_t> inGroup(n, 0);
+        for(const uint32_t u : group) {
+            DINARA_ASSERT(u < n);
+            inGroup[u] = 1;
+        }
+
+        uint32_t k = k0;
+        vector<uint32_t> deg(n, 0);
+        for(const uint32_t u : group) {
+            uint32_t d = 0;
+            for(const uint32_t v : adj[u]) {
+                if(inGroup[v]) {
+                    ++d;
+                }
+            }
+            deg[u] = d;
+        }
+
+        auto minDegForSize = [&](uint32_t kk) -> uint32_t {
+            if(kk <= 1) {
+                return 0;
+            }
+            // ceil(tau * (kk-1)) with tau = tauNum/tauDen
+            const uint32_t rhs = kk - 1;
+            return (tauNum * rhs + tauDen - 1) / tauDen;
+        };
+
+        vector<uint32_t> queue;
+        queue.reserve(k0);
+
+        uint32_t minDeg = minDegForSize(k);
+        for(const uint32_t u : group) {
+            if(inGroup[u] && deg[u] < minDeg) {
+                queue.push_back(u);
+            }
+        }
+
+        // Iteratively remove nodes with insufficient internal degree.
+        while(!queue.empty()) {
+            const uint32_t u = queue.back();
+            queue.pop_back();
+            if(!inGroup[u]) {
+                continue;
+            }
+            if(deg[u] >= minDeg) {
+                continue;
+            }
+
+            // Remove u.
+            inGroup[u] = 0;
+            --k;
+
+            if(k < minAnchorCoverage) {
+                return {};
+            }
+
+            // The threshold increases/decreases with k.
+            minDeg = minDegForSize(k);
+
+            // Update neighbors.
+            for(const uint32_t v : adj[u]) {
+                if(!inGroup[v]) {
+                    continue;
+                }
+                if(deg[v] > 0) {
+                    --deg[v];
+                }
+                if(deg[v] < minDeg) {
+                    queue.push_back(v);
+                }
+            }
+        }
+
+        vector<uint32_t> core;
+        core.reserve(k);
+        for(const uint32_t u : group) {
+            if(inGroup[u]) {
+                core.push_back(u);
+            }
+        }
+
+        if(core.size() < minAnchorCoverage || core.size() > maxAnchorCoverage) {
+            return {};
+        }
+
+        return core;
+    }
+
+    vector<vector<uint32_t>> peelGroups(
+        const vector<vector<uint32_t>>& adj,
+        const vector<vector<uint32_t>>& groups,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        // Default quasi-clique density.
+        // Use 4/5 (0.8) to allow for some missing edges after readGraph filtering.
+        constexpr uint32_t tauNum = 4;
+        constexpr uint32_t tauDen = 5;
+
+        vector<vector<uint32_t>> out;
+        out.reserve(groups.size());
+        for(const auto& g : groups) {
+            auto core = peelQuasiCliqueCore(adj, g, minAnchorCoverage, maxAnchorCoverage, tauNum, tauDen);
+            if(!core.empty()) {
+                out.push_back(std::move(core));
+            }
+        }
+        return out;
+    }
+
+    // Greedy dense-core extraction.
+    // This is used as a fallback when topology-based splitting (articulation/triangles/Jaccard)
+    // fails to separate two dense regions connected by multiple bridge reads.
+    vector<vector<uint32_t>> greedyDenseCoreSplit(
+        const vector<vector<uint32_t>>& adj,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        const uint32_t n = uint32_t(adj.size());
+        if(n < 2*minAnchorCoverage) {
+            return {};
+        }
+
+        // Precompute neighbor lists are assumed sorted/unique by callers.
+        vector<uint8_t> alive(n, 1);
+        uint32_t aliveCount = n;
+
+        // Local clustering coefficient score per node, computed as:
+        // cc(u) = (2 * edges among alive neighbors of u) / (deg(u)*(deg(u)-1)).
+        // We avoid floating point by comparing the fraction with numerator=sumCommon,
+        // denominator=deg*(deg-1), where sumCommon is Σ_{v in N(u)} |N(u)∩N(v)|.
+        auto clusteringScore = [&](uint32_t u, vector<uint32_t>& neighborsAlive) -> pair<uint64_t, uint64_t> {
+            neighborsAlive.clear();
+            for(const uint32_t v : adj[u]) {
+                if(alive[v]) {
+                    neighborsAlive.push_back(v);
+                }
+            }
+            const uint64_t deg = neighborsAlive.size();
+            if(deg < 2) {
+                return {0, 1};
+            }
+            uint64_t sumCommon = 0;
+            for(const uint32_t v : neighborsAlive) {
+                sumCommon += countCommonSortedNeighbors(neighborsAlive, adj[v]);
+            }
+            const uint64_t denom = deg * (deg - 1);
+            return {sumCommon, denom};
+        };
+
+        vector<uint32_t> remaining;
+        remaining.reserve(n);
+        for(uint32_t i=0; i<n; ++i) remaining.push_back(i);
+
+        vector<vector<uint32_t>> cores;
+        cores.reserve(4);
+
+        while(aliveCount >= minAnchorCoverage) {
+            // Pick the best seed among alive nodes: maximize clustering coefficient, then degree.
+            uint32_t best = invalid<uint32_t>;
+            uint64_t bestNum = 0;
+            uint64_t bestDen = 1;
+            uint32_t bestDeg = 0;
+            vector<uint32_t> neighborsAlive;
+            neighborsAlive.reserve(128);
+            for(uint32_t u=0; u<n; ++u) {
+                if(!alive[u]) continue;
+                // Degree among alive nodes.
+                uint32_t du = 0;
+                for(const uint32_t v : adj[u]) {
+                    if(alive[v]) ++du;
+                }
+                if(du < minAnchorCoverage - 1) continue;
+                const auto [num, den] = clusteringScore(u, neighborsAlive);
+                const bool better =
+                    (best == invalid<uint32_t>) ||
+                    (num * bestDen > bestNum * den) ||
+                    (num * bestDen == bestNum * den && du > bestDeg);
+                if(better) {
+                    best = u;
+                    bestNum = num;
+                    bestDen = den;
+                    bestDeg = du;
+                }
+            }
+            if(best == invalid<uint32_t>) {
+                break;
+            }
+
+            // Candidate = seed + its alive neighbors.
+            vector<uint32_t> cand;
+            cand.reserve(adj[best].size() + 1);
+            cand.push_back(best);
+            for(const uint32_t v : adj[best]) {
+                if(alive[v]) cand.push_back(v);
+            }
+            std::sort(cand.begin(), cand.end());
+            cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+
+            // Peel a quasi-clique core from candidate.
+            auto core = peelQuasiCliqueCore(adj, cand, minAnchorCoverage, maxAnchorCoverage, 4, 5);
+            if(core.empty()) {
+                // Seed not useful. Remove it and continue.
+                alive[best] = 0;
+                --aliveCount;
+                continue;
+            }
+
+            // Remove core nodes from alive set.
+            for(const uint32_t u : core) {
+                if(alive[u]) {
+                    alive[u] = 0;
+                    --aliveCount;
+                }
+            }
+            cores.push_back(std::move(core));
+
+            // Stop if we already have at least 2 cores and too few nodes remain to form another.
+            if(cores.size() >= 2 && aliveCount < minAnchorCoverage) {
+                break;
+            }
+        }
+
+        if(cores.size() >= 2) {
+            return cores;
+        }
+        return {};
+    }
+
+    struct MclMatrix {
+        uint32_t n = 0;
+        vector<double> a; // row-major, size n*n
+        explicit MclMatrix(uint32_t n = 0) : n(n), a(size_t(n) * size_t(n), 0.0) {}
+        inline double& operator()(uint32_t r, uint32_t c) {
+            return a[size_t(r) * size_t(n) + size_t(c)];
+        }
+        inline double operator()(uint32_t r, uint32_t c) const {
+            return a[size_t(r) * size_t(n) + size_t(c)];
+        }
+    };
+
+    vector<vector<uint32_t>> symmetrizeAdj(const vector<vector<uint32_t>>& adj)
+    {
+        const uint32_t n = uint32_t(adj.size());
+        vector<vector<uint32_t>> und(n);
+        for(uint32_t u=0; u<n; ++u) {
+            und[u].reserve(adj[u].size());
+        }
+        for(uint32_t u=0; u<n; ++u) {
+            for(const uint32_t v : adj[u]) {
+                if(v >= n || v == u) {
+                    continue;
+                }
+                und[u].push_back(v);
+                und[v].push_back(u);
+            }
+        }
+        for(uint32_t u=0; u<n; ++u) {
+            auto& nbr = und[u];
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+        return und;
+    }
+
+    double graphDensityUndirected(const vector<vector<uint32_t>>& undAdj)
+    {
+        const uint32_t n = uint32_t(undAdj.size());
+        if(n < 2) {
+            return 0.0;
+        }
+        uint64_t sumDeg = 0;
+        for(uint32_t u=0; u<n; ++u) {
+            sumDeg += undAdj[u].size();
+        }
+        const double e = double(sumDeg) / 2.0;
+        return (2.0 * e) / (double(n) * double(n - 1));
+    }
+
+    double averageLocalClusteringCoefficientUndirected(const vector<vector<uint32_t>>& undAdj)
+    {
+        const uint32_t n = uint32_t(undAdj.size());
+        if(n < 3) {
+            return 0.0;
+        }
+
+        // Build a dense boolean adjacency for triangle counting.
+        vector<uint8_t> mat(size_t(n) * size_t(n), 0);
+        auto at = [&](uint32_t r, uint32_t c) -> uint8_t& {
+            return mat[size_t(r) * size_t(n) + size_t(c)];
+        };
+        for(uint32_t u=0; u<n; ++u) {
+            for(const uint32_t v : undAdj[u]) {
+                at(u, v) = 1;
+            }
+        }
+
+        double sum = 0.0;
+        uint32_t count = 0;
+        for(uint32_t u=0; u<n; ++u) {
+            const uint32_t deg = uint32_t(undAdj[u].size());
+            if(deg < 2) {
+                continue;
+            }
+            uint64_t triEdges = 0;
+            const auto& nbr = undAdj[u];
+            for(size_t i=0; i<nbr.size(); ++i) {
+                const uint32_t v = nbr[i];
+                for(size_t j=i+1; j<nbr.size(); ++j) {
+                    const uint32_t w = nbr[j];
+                    if(at(v, w)) {
+                        ++triEdges;
+                    }
+                }
+            }
+            const double possible = double(deg) * double(deg - 1) / 2.0;
+            sum += double(triEdges) / possible;
+            ++count;
+        }
+        if(count == 0) {
+            return 0.0;
+        }
+        return sum / double(count);
+    }
+
+    void normalizeColumns(MclMatrix& m)
+    {
+        const uint32_t n = m.n;
+        for(uint32_t c=0; c<n; ++c) {
+            double s = 0.0;
+            for(uint32_t r=0; r<n; ++r) {
+                s += m(r, c);
+            }
+            if(s == 0.0) {
+                // Ensure column-stochastic.
+                for(uint32_t r=0; r<n; ++r) {
+                    m(r, c) = 0.0;
+                }
+                m(c, c) = 1.0;
+                s = 1.0;
+            }
+            const double inv = 1.0 / s;
+            for(uint32_t r=0; r<n; ++r) {
+                m(r, c) *= inv;
+            }
+        }
+    }
+
+    MclMatrix multiply(const MclMatrix& a, const MclMatrix& b)
+    {
+        DINARA_ASSERT(a.n == b.n);
+        const uint32_t n = a.n;
+        MclMatrix out(n);
+        for(uint32_t i=0; i<n; ++i) {
+            for(uint32_t k=0; k<n; ++k) {
+                const double aik = a(i, k);
+                if(aik == 0.0) {
+                    continue;
+                }
+                for(uint32_t j=0; j<n; ++j) {
+                    out(i, j) += aik * b(k, j);
+                }
+            }
+        }
+        return out;
+    }
+
+    void inflateAndPrune(MclMatrix& m, double inflation, double pruneThreshold)
+    {
+        const uint32_t n = m.n;
+        for(uint32_t c=0; c<n; ++c) {
+            for(uint32_t r=0; r<n; ++r) {
+                double x = m(r, c);
+                if(x <= 0.0) {
+                    continue;
+                }
+                x = std::pow(x, inflation);
+                if(x < pruneThreshold) {
+                    x = 0.0;
+                }
+                m(r, c) = x;
+            }
+        }
+    }
+
+    double maxAbsDiff(const MclMatrix& a, const MclMatrix& b)
+    {
+        DINARA_ASSERT(a.n == b.n);
+        double d = 0.0;
+        for(size_t i=0; i<a.a.size(); ++i) {
+            d = std::max(d, std::abs(a.a[i] - b.a[i]));
+        }
+        return d;
+    }
+
+    vector<vector<uint32_t>> mclClusterUndirected(
+        const vector<vector<uint32_t>>& undAdj,
+        double inflation,
+        uint32_t maxIterations)
+    {
+        const uint32_t n = uint32_t(undAdj.size());
+        if(n == 0) {
+            return {};
+        }
+        if(n == 1) {
+            return { {0} };
+        }
+
+        // Initialize matrix with self-loops and adjacency.
+        MclMatrix m(n);
+        for(uint32_t i=0; i<n; ++i) {
+            m(i, i) = 1.0;
+        }
+        for(uint32_t u=0; u<n; ++u) {
+            for(const uint32_t v : undAdj[u]) {
+                if(v < n) {
+                    m(v, u) = 1.0;
+                }
+            }
+        }
+        normalizeColumns(m);
+
+        constexpr double pruneThreshold = 1e-4;
+        constexpr double convergenceTol = 1e-3;
+
+        for(uint32_t it=0; it<maxIterations; ++it) {
+            MclMatrix next = multiply(m, m);          // expansion (power 2)
+            inflateAndPrune(next, inflation, pruneThreshold);
+            normalizeColumns(next);
+            const double delta = maxAbsDiff(m, next);
+            m = std::move(next);
+            if(delta < convergenceTol) {
+                break;
+            }
+        }
+
+        // Extract clusters by following the strongest attractor per node until convergence.
+        vector<uint32_t> argmax(n, 0);
+        for(uint32_t c=0; c<n; ++c) {
+            uint32_t best = 0;
+            double bestVal = m(0, c);
+            for(uint32_t r=1; r<n; ++r) {
+                const double v = m(r, c);
+                if(v > bestVal) {
+                    bestVal = v;
+                    best = r;
+                }
+            }
+            argmax[c] = best;
+        }
+
+        auto attractor = [&](uint32_t x) -> uint32_t {
+            for(uint32_t step=0; step<n; ++step) {
+                const uint32_t y = argmax[x];
+                if(y == x) {
+                    return x;
+                }
+                x = y;
+            }
+            return x;
+        };
+
+        unordered_map<uint32_t, vector<uint32_t>> groups;
+        groups.reserve(n);
+        for(uint32_t i=0; i<n; ++i) {
+            groups[attractor(i)].push_back(i);
+        }
+
+        vector<vector<uint32_t>> out;
+        out.reserve(groups.size());
+        for(auto& kv : groups) {
+            auto& g = kv.second;
+            std::sort(g.begin(), g.end());
+            out.push_back(std::move(g));
+        }
+
+        // Deterministic order.
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+            if(a.size() != b.size()) return a.size() > b.size();
+            return a < b;
+        });
+
+        return out;
+    }
+
+    struct SmallBitset {
+        static constexpr uint32_t MaxWords = 4; // 256 bits
+        uint32_t wordCount = 0;
+        std::array<uint64_t, MaxWords> w{};
+
+        SmallBitset() = default;
+        explicit SmallBitset(uint32_t bits) { reset(bits); }
+
+        void reset(uint32_t bits)
+        {
+            wordCount = (bits + 63U) / 64U;
+            for(uint32_t i=0; i<MaxWords; ++i) w[i] = 0;
+        }
+
+        inline bool empty() const
+        {
+            for(uint32_t i=0; i<wordCount; ++i) {
+                if(w[i]) return false;
+            }
+            return true;
+        }
+
+        inline void set(uint32_t i)
+        {
+            w[i >> 6] |= (1ULL << (i & 63U));
+        }
+
+        inline void clear(uint32_t i)
+        {
+            w[i >> 6] &= ~(1ULL << (i & 63U));
+        }
+
+        inline bool test(uint32_t i) const
+        {
+            return (w[i >> 6] >> (i & 63U)) & 1ULL;
+        }
+
+        inline uint32_t popcount() const
+        {
+            uint32_t c = 0;
+            for(uint32_t i=0; i<wordCount; ++i) {
+                c += uint32_t(__builtin_popcountll(w[i]));
+            }
+            return c;
+        }
+
+        inline SmallBitset operator&(const SmallBitset& other) const
+        {
+            SmallBitset out;
+            out.wordCount = wordCount;
+            for(uint32_t i=0; i<wordCount; ++i) {
+                out.w[i] = w[i] & other.w[i];
+            }
+            return out;
+        }
+
+        inline SmallBitset operator|(const SmallBitset& other) const
+        {
+            SmallBitset out;
+            out.wordCount = wordCount;
+            for(uint32_t i=0; i<wordCount; ++i) {
+                out.w[i] = w[i] | other.w[i];
+            }
+            return out;
+        }
+
+        inline SmallBitset operator-(const SmallBitset& other) const
+        {
+            SmallBitset out;
+            out.wordCount = wordCount;
+            for(uint32_t i=0; i<wordCount; ++i) {
+                out.w[i] = w[i] & ~other.w[i];
+            }
+            return out;
+        }
+
+        inline void operator|=(const SmallBitset& other)
+        {
+            for(uint32_t i=0; i<wordCount; ++i) {
+                w[i] |= other.w[i];
+            }
+        }
+    };
+
+    template<class F>
+    inline void forEachSetBit(const SmallBitset& s, F&& f)
+    {
+        for(uint32_t wi=0; wi<s.wordCount; ++wi) {
+            uint64_t x = s.w[wi];
+            while(x) {
+                const uint32_t b = uint32_t(__builtin_ctzll(x));
+                const uint32_t idx = wi * 64U + b;
+                f(idx);
+                x &= x - 1;
+            }
+        }
+    }
+
+    vector<SmallBitset> enumerateMaximalCliques(
+        const vector<SmallBitset>& nbr,
+        uint32_t nodeCount,
+        uint32_t maxCliques,
+        bool& exceeded)
+    {
+        exceeded = false;
+        vector<SmallBitset> cliques;
+        cliques.reserve(32);
+
+        SmallBitset R(nodeCount), P(nodeCount), X(nodeCount);
+        for(uint32_t i=0; i<nodeCount; ++i) {
+            P.set(i);
+        }
+
+        std::function<void(const SmallBitset&, SmallBitset&, SmallBitset&)> rec =
+            [&](const SmallBitset& Rcur, SmallBitset& Pcur, SmallBitset& Xcur) {
+                if(exceeded) return;
+                if(Pcur.empty() && Xcur.empty()) {
+                    cliques.push_back(Rcur);
+                    if(cliques.size() >= maxCliques) {
+                        exceeded = true;
+                    }
+                    return;
+                }
+
+                // Choose pivot u from P ∪ X to maximize |P ∩ N(u)|.
+                SmallBitset unionPX = Pcur | Xcur;
+                uint32_t pivot = invalid<uint32_t>;
+                uint32_t best = 0;
+                forEachSetBit(unionPX, [&](uint32_t u) {
+                    const uint32_t c = (Pcur & nbr[u]).popcount();
+                    if(c > best) {
+                        best = c;
+                        pivot = u;
+                    }
+                });
+                if(pivot == invalid<uint32_t>) {
+                    pivot = 0;
+                }
+
+                SmallBitset candidates = Pcur - nbr[pivot];
+                vector<uint32_t> candList;
+                candList.reserve(candidates.popcount());
+                forEachSetBit(candidates, [&](uint32_t v) { candList.push_back(v); });
+
+                for(const uint32_t v : candList) {
+                    if(exceeded) return;
+                    if(!Pcur.test(v)) {
+                        continue;
+                    }
+                    SmallBitset Rnext = Rcur;
+                    Rnext.set(v);
+                    SmallBitset Pnext = Pcur & nbr[v];
+                    SmallBitset Xnext = Xcur & nbr[v];
+                    rec(Rnext, Pnext, Xnext);
+                    Pcur.clear(v);
+                    Xcur.set(v);
+                }
+            };
+
+        rec(R, P, X);
+        return cliques;
+    }
+
+    vector<vector<uint32_t>> splitVertexByCliqueCover(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        bool& exploded)
+    {
+        exploded = false;
+        const uint32_t n = uint32_t(adjAll.size());
+        if(n == 0) {
+            return {};
+        }
+
+        const auto& baseAdj = hasAnyCisEdge ? adjCis : adjAll;
+        vector<vector<uint32_t>> und = symmetrizeAdj(baseAdj);
+
+        vector<uint32_t> coreNodes;
+        coreNodes.reserve(n);
+        for(uint32_t u=0; u<n; ++u) {
+            if(u < isCore.size() && isCore[u]) {
+                coreNodes.push_back(u);
+            }
+        }
+        if(coreNodes.size() < 2) {
+            coreNodes.clear();
+            for(uint32_t u=0; u<n; ++u) {
+                coreNodes.push_back(u);
+            }
+        }
+
+        const uint32_t cn = uint32_t(coreNodes.size());
+        if(cn < 2 || cn > 256) {
+            return {};
+        }
+
+        vector<int32_t> toCore(n, -1);
+        for(uint32_t i=0; i<cn; ++i) {
+            toCore[coreNodes[i]] = int32_t(i);
+        }
+
+        vector<SmallBitset> nbr(cn);
+        for(uint32_t i=0; i<cn; ++i) {
+            nbr[i].reset(cn);
+        }
+
+        uint64_t sumDeg = 0;
+        for(uint32_t i=0; i<cn; ++i) {
+            const uint32_t u = coreNodes[i];
+            for(const uint32_t v : und[u]) {
+                const int32_t j = (v < n) ? toCore[v] : -1;
+                if(j >= 0 && uint32_t(j) != i) {
+                    nbr[i].set(uint32_t(j));
+                }
+            }
+            sumDeg += nbr[i].popcount();
+        }
+
+        // If the core is almost a clique, just keep it (will be peelled later if needed).
+        {
+            const double e = double(sumDeg) / 2.0;
+            const double density = (2.0 * e) / (double(cn) * double(cn - 1));
+            if(density >= 0.97) {
+                vector<uint32_t> all;
+                all.reserve(n);
+                for(uint32_t u=0; u<n; ++u) all.push_back(u);
+                if(all.size() >= minAnchorCoverage && all.size() <= maxAnchorCoverage) {
+                    return {all};
+                }
+            }
+        }
+
+        // Fast path: if the core graph has multiple connected components and each component
+        // is a clique, we can use those components directly as disjoint core cliques.
+        vector<SmallBitset> bigCliques;
+        {
+            vector<uint8_t> visited(cn, 0);
+            vector<uint32_t> stack;
+            stack.reserve(cn);
+            for(uint32_t start=0; start<cn; ++start) {
+                if(visited[start]) continue;
+                visited[start] = 1;
+                stack.clear();
+                stack.push_back(start);
+                vector<uint32_t> comp;
+                while(!stack.empty()) {
+                    const uint32_t u = stack.back();
+                    stack.pop_back();
+                    comp.push_back(u);
+                    forEachSetBit(nbr[u], [&](uint32_t v) {
+                        if(v >= cn) return;
+                        if(!visited[v]) {
+                            visited[v] = 1;
+                            stack.push_back(v);
+                        }
+                    });
+                }
+                if(comp.size() < 2) {
+                    continue;
+                }
+                SmallBitset compSet(cn);
+                for(const uint32_t u : comp) compSet.set(u);
+                bool isClique = true;
+                const uint32_t k = uint32_t(comp.size());
+                for(const uint32_t u : comp) {
+                    const uint32_t d = (nbr[u] & compSet).popcount();
+                    if(d != k - 1) {
+                        isClique = false;
+                        break;
+                    }
+                }
+                if(isClique) {
+                    bigCliques.push_back(compSet);
+                }
+            }
+        }
+
+        if(bigCliques.empty()) {
+            constexpr uint32_t maxCliques = 256;
+            bool exceeded = false;
+            auto cliques = enumerateMaximalCliques(nbr, cn, maxCliques, exceeded);
+            if(exceeded) {
+                exploded = true;
+                return {};
+            }
+            bigCliques.reserve(cliques.size());
+            for(const auto& c : cliques) {
+                if(c.popcount() >= 2) {
+                    bigCliques.push_back(c);
+                }
+            }
+        }
+        if(bigCliques.empty()) {
+            return {};
+        }
+
+        std::sort(bigCliques.begin(), bigCliques.end(),
+            [&](const SmallBitset& a, const SmallBitset& b) {
+                const uint32_t sa = a.popcount();
+                const uint32_t sb = b.popcount();
+                if(sa != sb) return sa > sb;
+                uint32_t fa = invalid<uint32_t>;
+                uint32_t fb = invalid<uint32_t>;
+                forEachSetBit(a, [&](uint32_t i) { if(fa == invalid<uint32_t>) fa = i; });
+                forEachSetBit(b, [&](uint32_t i) { if(fb == invalid<uint32_t>) fb = i; });
+                return fa < fb;
+            });
+
+        SmallBitset used(cn);
+        used.reset(cn);
+        vector<SmallBitset> chosen;
+        chosen.reserve(8);
+        for(const auto& c : bigCliques) {
+            if((c & used).empty()) {
+                chosen.push_back(c);
+                used |= c;
+            }
+        }
+        if(chosen.empty()) {
+            return {};
+        }
+        // If we could only pick one disjoint clique and it does not cover all core nodes,
+        // don't proceed: we'd risk dropping an entire alternate region/haplotype.
+        // Let the more robust fallback splitter handle these cases.
+        if(chosen.size() == 1 && used.popcount() < cn) {
+            return {};
+        }
+
+        const uint32_t gCount = uint32_t(chosen.size());
+        vector<vector<uint32_t>> groups(gCount);
+        vector<int32_t> groupOfNode(n, -1);
+        vector<uint32_t> coreSize(gCount, 0);
+        for(uint32_t gi=0; gi<gCount; ++gi) {
+            forEachSetBit(chosen[gi], [&](uint32_t ci) {
+                const uint32_t u = coreNodes[ci];
+                groupOfNode[u] = int32_t(gi);
+                groups[gi].push_back(u);
+                ++coreSize[gi];
+            });
+        }
+
+        // Attach remaining core nodes based on core-core support.
+        constexpr double coreAttachFrac = 0.90;
+        vector<uint32_t> counts(gCount);
+        for(uint32_t ci=0; ci<cn; ++ci) {
+            const uint32_t u = coreNodes[ci];
+            if(groupOfNode[u] != -1) continue;
+            std::fill(counts.begin(), counts.end(), 0);
+            for(const uint32_t v : und[u]) {
+                if(v >= n) continue;
+                if(!(v < isCore.size() && isCore[v])) continue;
+                const int32_t gi = groupOfNode[v];
+                if(gi >= 0) ++counts[uint32_t(gi)];
+            }
+            uint32_t bestGi = std::numeric_limits<uint32_t>::max();
+            uint32_t bestCount = 0;
+            uint32_t secondCount = 0;
+            for(uint32_t gi=0; gi<gCount; ++gi) {
+                const uint32_t c = counts[gi];
+                if(c > bestCount) {
+                    secondCount = bestCount;
+                    bestCount = c;
+                    bestGi = gi;
+                } else if(c == bestCount && c != 0) {
+                    secondCount = bestCount;
+                } else if(c > secondCount) {
+                    secondCount = c;
+                }
+            }
+            if(bestGi == std::numeric_limits<uint32_t>::max()) continue;
+            if(secondCount == bestCount) continue;
+            uint32_t required = attachMinSupport;
+            if(coreSize[bestGi] >= 4) {
+                required = std::max(required, uint32_t(std::ceil(coreAttachFrac * double(coreSize[bestGi]))));
+            }
+            if(bestCount < required) continue;
+            if(groups[bestGi].size() >= maxAnchorCoverage) continue;
+            groupOfNode[u] = int32_t(bestGi);
+            groups[bestGi].push_back(u);
+            ++coreSize[bestGi];
+        }
+
+        // Attach non-core nodes (typically contained reads) using support to core nodes only.
+        constexpr double nonCoreAttachFrac = 0.80;
+        for(uint32_t u=0; u<n; ++u) {
+            if(u < isCore.size() && isCore[u]) continue;
+            if(groupOfNode[u] != -1) continue;
+
+            std::fill(counts.begin(), counts.end(), 0);
+            uint32_t degToCores = 0;
+            for(const uint32_t v : und[u]) {
+                if(v >= n) continue;
+                if(!(v < isCore.size() && isCore[v])) continue;
+                const int32_t gi = groupOfNode[v];
+                if(gi >= 0) {
+                    ++counts[uint32_t(gi)];
+                    ++degToCores;
+                }
+            }
+
+            uint32_t bestGi = std::numeric_limits<uint32_t>::max();
+            uint32_t bestCount = 0;
+            uint32_t secondCount = 0;
+            for(uint32_t gi=0; gi<gCount; ++gi) {
+                const uint32_t c = counts[gi];
+                if(c > bestCount) {
+                    secondCount = bestCount;
+                    bestCount = c;
+                    bestGi = gi;
+                } else if(c == bestCount && c != 0) {
+                    secondCount = bestCount;
+                } else if(c > secondCount) {
+                    secondCount = c;
+                }
+            }
+            if(bestGi == std::numeric_limits<uint32_t>::max()) continue;
+            if(secondCount == bestCount) continue;
+            // Ambiguity/bridge check: if support is close for multiple clusters, do not attach.
+            // Integer math for bestCount/secondCount <= 1.25  <=>  bestCount*4 <= secondCount*5.
+            if(secondCount != 0 && bestCount * 4 <= secondCount * 5) {
+                continue;
+            }
+
+            uint32_t required = attachMinSupport;
+            if(coreSize[bestGi] >= 6) {
+                required = std::max(required, uint32_t(std::ceil(nonCoreAttachFrac * double(coreSize[bestGi]))));
+            }
+            if(degToCores >= 6) {
+                required = std::max(required, uint32_t((degToCores + 3) / 4));
+                required = std::min(required, uint32_t(4));
+            }
+
+            if(bestCount < required) continue;
+            if(groups[bestGi].size() >= maxAnchorCoverage) continue;
+            groupOfNode[u] = int32_t(bestGi);
+            groups[bestGi].push_back(u);
+        }
+
+        vector<vector<uint32_t>> kept;
+        kept.reserve(groups.size());
+        for(auto& g : groups) {
+            std::sort(g.begin(), g.end());
+            g.erase(std::unique(g.begin(), g.end()), g.end());
+            if(g.size() >= minAnchorCoverage && g.size() <= maxAnchorCoverage) {
+                kept.push_back(std::move(g));
+            }
+        }
+        if(kept.empty()) {
+            return {};
+        }
+
+        return peelGroups(und, kept, minAnchorCoverage, maxAnchorCoverage);
+    }
+
     vector<vector<uint32_t>> splitVertexByOverlapSupport(
         const vector<vector<uint32_t>>& adj,
         uint64_t minAnchorCoverage,
@@ -343,7 +1318,10 @@ namespace {
                     }
                 }
                 if(!kept.empty()) {
-                    return kept;
+                    auto peeled = peelGroups(adj, kept, minAnchorCoverage, maxAnchorCoverage);
+                    if(!peeled.empty()) {
+                        return peeled;
+                    }
                 }
             }
         }
@@ -358,8 +1336,11 @@ namespace {
                 keptNoArt.push_back(comp);
             }
         }
-        if(keptNoArt.size() >= 2) {
-            return keptNoArt;
+        if(!keptNoArt.empty()) {
+            auto peeled = peelGroups(adj, keptNoArt, minAnchorCoverage, maxAnchorCoverage);
+            if(peeled.size() >= 2) {
+                return peeled;
+            }
         }
 
         // If the vertex is held together by "weak" cross-edges with divergent neighbor sets,
@@ -396,8 +1377,91 @@ namespace {
                     keptStrong.push_back(comp);
                 }
             }
-            if(keptStrong.size() >= 2) {
-                return keptStrong;
+            if(!keptStrong.empty()) {
+                auto peeled = peelGroups(strongAdj, keptStrong, minAnchorCoverage, maxAnchorCoverage);
+                if(peeled.size() >= 2) {
+                    return peeled;
+                }
+            }
+        }
+
+        // If we still have a single component, try a stricter edge filter based on neighbor-set similarity.
+        // This targets cases where 2+ bridge/chimeric reads connect two dense groups:
+        // triangle support alone can keep those bridge edges, but the Jaccard similarity of neighbor sets
+        // is typically low for bridge edges.
+        {
+            // Heuristic guard: Jaccard is not meaningful for tiny graphs.
+            if(n >= 6) {
+                vector<vector<uint32_t>> jaccAdj(n);
+                for(uint32_t u=0; u<n; ++u) {
+                    jaccAdj[u].reserve(adj[u].size());
+                }
+
+                constexpr double minJaccard = 0.6;
+                constexpr uint32_t minCommon = 2;
+
+                for(uint32_t u=0; u<n; ++u) {
+                    for(const uint32_t v : adj[u]) {
+                        if(v <= u) {
+                            continue;
+                        }
+                        const uint32_t common = countCommonSortedNeighbors(adj[u], adj[v]);
+                        const uint32_t du = uint32_t(adj[u].size());
+                        const uint32_t dv = uint32_t(adj[v].size());
+                        const uint32_t uni = du + dv - common;
+                        if(uni == 0) {
+                            continue;
+                        }
+                        const double j = double(common) / double(uni);
+                        if(common >= minCommon || j >= minJaccard) {
+                            jaccAdj[u].push_back(v);
+                            jaccAdj[v].push_back(u);
+                        }
+                    }
+                }
+                for(uint32_t u=0; u<n; ++u) {
+                    auto& nbr = jaccAdj[u];
+                    std::sort(nbr.begin(), nbr.end());
+                    nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+                }
+
+                vector<uint8_t> none(n, 0);
+                const auto compsJ = connectedComponents(jaccAdj, none);
+                vector<vector<uint32_t>> keptJ;
+                for(const auto& comp : compsJ) {
+                    if(comp.size() >= minAnchorCoverage && comp.size() <= maxAnchorCoverage) {
+                        keptJ.push_back(comp);
+                    }
+                }
+                if(!keptJ.empty()) {
+                    auto peeled = peelGroups(jaccAdj, keptJ, minAnchorCoverage, maxAnchorCoverage);
+                    if(peeled.size() >= 2) {
+                        return peeled;
+                    }
+                }
+            }
+        }
+
+        // Greedy attempt to extract 2+ dense cores even when the topology-based split did not.
+        // This is robust to multiple bridge reads.
+        {
+            const auto cores = greedyDenseCoreSplit(adj, minAnchorCoverage, maxAnchorCoverage);
+            if(cores.size() >= 2) {
+                return cores;
+            }
+        }
+
+        // As a last attempt, peel a dense core from the full vertex.
+        // This can drop bridge reads even when we cannot confidently split into 2+ anchors.
+        {
+            vector<uint32_t> all;
+            all.reserve(n);
+            for(uint32_t i=0; i<n; ++i) {
+                all.push_back(i);
+            }
+            auto core = peelQuasiCliqueCore(adj, all, minAnchorCoverage, maxAnchorCoverage, 4, 5);
+            if(!core.empty() && core.size() < all.size()) {
+                return {std::move(core)};
             }
         }
 
@@ -507,12 +1571,394 @@ namespace {
             }
         }
         if(kept.size() >= 2) {
-            return kept;
+            // Peel within each returned group to drop weakly supported members.
+            return peelGroups(adjAll, kept, minAnchorCoverage, maxAnchorCoverage);
         }
 
         return splitVertexByOverlapSupport(adjAll, minAnchorCoverage, maxAnchorCoverage);
     }
+
+    // Split using a designated set of "core" nodes (typically non-contained reads).
+    // We first split the induced subgraph on the core nodes, then attach non-core nodes
+    // to exactly one core cluster based on overlap-support edges. Ambiguous non-core nodes
+    // (ties or insufficient support) are dropped.
+    vector<vector<uint32_t>> splitVertexByOverlapSupportWithCoreMask(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        const uint32_t n = uint32_t(adjAll.size());
+        if(n == 0 || isCore.size() != n) {
+            return splitVertexByOverlapSupportWithPhasing(
+                adjAll, adjCis, hasAnyCisEdge, minAnchorCoverage, maxAnchorCoverage);
+        }
+
+        vector<uint32_t> coreNodes;
+        coreNodes.reserve(n);
+        for(uint32_t i=0; i<n; ++i) {
+            if(isCore[i]) {
+                coreNodes.push_back(i);
+            }
+        }
+
+        // Self-tuning: core splitting can be useful even when the number of non-contained reads
+        // is small. We only require at least 2 core nodes (and at least one non-core node),
+        // and let the final minAnchorCoverage decide whether the split is kept.
+        if(coreNodes.size() < std::max<uint32_t>(2, coreMinSize) || coreNodes.size() >= n) {
+            return splitVertexByOverlapSupportWithPhasing(
+                adjAll, adjCis, hasAnyCisEdge, minAnchorCoverage, maxAnchorCoverage);
+        }
+
+        vector<int32_t> oldToCore(n, -1);
+        for(uint32_t i=0; i<uint32_t(coreNodes.size()); ++i) {
+            oldToCore[coreNodes[i]] = int32_t(i);
+        }
+
+        const uint32_t cn = uint32_t(coreNodes.size());
+        vector<vector<uint32_t>> coreAdjAll(cn);
+        vector<vector<uint32_t>> coreAdjCis(cn);
+        bool coreHasAnyCisEdge = false;
+
+        for(uint32_t ii=0; ii<cn; ++ii) {
+            const uint32_t u = coreNodes[ii];
+            auto& outAll = coreAdjAll[ii];
+            for(const uint32_t v : adjAll[u]) {
+                const int32_t jj = oldToCore[v];
+                if(jj >= 0) {
+                    outAll.push_back(uint32_t(jj));
+                }
+            }
+
+            if(hasAnyCisEdge) {
+                auto& outCis = coreAdjCis[ii];
+                for(const uint32_t v : adjCis[u]) {
+                    const int32_t jj = oldToCore[v];
+                    if(jj >= 0) {
+                        outCis.push_back(uint32_t(jj));
+                        coreHasAnyCisEdge = true;
+                    }
+                }
+            }
+        }
+
+        for(uint32_t i=0; i<cn; ++i) {
+            auto& nbr = coreAdjAll[i];
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+            auto& nbrC = coreAdjCis[i];
+            std::sort(nbrC.begin(), nbrC.end());
+            nbrC.erase(std::unique(nbrC.begin(), nbrC.end()), nbrC.end());
+        }
+
+        // Split only the core graph. Use a very permissive minimum coverage (1) so that
+        // 2+ small core clusters (even singletons) can be proposed; contained reads will
+        // then be attached, and the final minAnchorCoverage filter will decide.
+        const uint64_t minCoreCoverage = 1;
+        auto coreGroups = splitVertexByOverlapSupportWithPhasing(
+            coreAdjAll,
+            coreAdjCis,
+            coreHasAnyCisEdge,
+            minCoreCoverage,
+            maxAnchorCoverage);
+        if(coreGroups.size() < 2) {
+            return splitVertexByOverlapSupportWithPhasing(
+                adjAll, adjCis, hasAnyCisEdge, minAnchorCoverage, maxAnchorCoverage);
+        }
+
+        // Map core groups back to original indices and build an assignment array.
+        vector<int32_t> groupOfNode(n, -1);
+        vector<vector<uint32_t>> groups;
+        groups.reserve(coreGroups.size());
+        for(uint32_t gi=0; gi<uint32_t(coreGroups.size()); ++gi) {
+            vector<uint32_t> g;
+            g.reserve(coreGroups[gi].size());
+            for(const uint32_t coreIdx : coreGroups[gi]) {
+                const uint32_t u = coreNodes[coreIdx];
+                g.push_back(u);
+                groupOfNode[u] = int32_t(gi);
+            }
+            groups.push_back(std::move(g));
+        }
+
+        // Attach non-core nodes to exactly one core cluster using overlap support.
+        // Use adjAll to avoid relying on phasing for contained reads.
+        vector<uint32_t> counts(groups.size());
+        for(uint32_t u=0; u<n; ++u) {
+            if(isCore[u]) {
+                continue;
+            }
+            std::fill(counts.begin(), counts.end(), 0);
+            for(const uint32_t v : adjAll[u]) {
+                const int32_t gi = (v < n) ? groupOfNode[v] : -1;
+                if(gi >= 0) {
+                    ++counts[uint32_t(gi)];
+                }
+            }
+
+            uint32_t degToCore = 0;
+            for(uint32_t gi=0; gi<counts.size(); ++gi) {
+                degToCore += counts[gi];
+            }
+
+            uint32_t bestGi = std::numeric_limits<uint32_t>::max();
+            uint32_t bestCount = 0;
+            uint32_t secondCount = 0;
+            for(uint32_t gi=0; gi<counts.size(); ++gi) {
+                const uint32_t c = counts[gi];
+                if(c > bestCount) {
+                    secondCount = bestCount;
+                    bestCount = c;
+                    bestGi = gi;
+                } else if(c == bestCount && c != 0) {
+                    secondCount = bestCount; // tie
+                } else if(c > secondCount) {
+                    secondCount = c;
+                }
+            }
+
+            // Self-tuning attachment threshold: for high-degree bridge candidates, require more support
+            // to avoid attaching broadly connected contained reads.
+            uint32_t dynamicMinSupport = attachMinSupport;
+            if(degToCore >= 4) {
+                // ceil(degToCore/4), capped.
+                dynamicMinSupport = std::max(dynamicMinSupport, uint32_t((degToCore + 3) / 4));
+                dynamicMinSupport = std::min(dynamicMinSupport, uint32_t(3));
+            }
+            if(bestCount < dynamicMinSupport) {
+                continue;
+            }
+            if(secondCount == bestCount) {
+                continue; // ambiguous bridge: connects similarly to multiple clusters
+            }
+            if(bestGi == std::numeric_limits<uint32_t>::max()) {
+                continue;
+            }
+            if(groups[bestGi].size() >= maxAnchorCoverage) {
+                continue;
+            }
+            groupOfNode[u] = int32_t(bestGi);
+            groups[bestGi].push_back(u);
+        }
+
+        // Keep only valid anchors and peel within each group.
+        vector<vector<uint32_t>> kept;
+        kept.reserve(groups.size());
+        for(auto& g : groups) {
+            std::sort(g.begin(), g.end());
+            g.erase(std::unique(g.begin(), g.end()), g.end());
+            if(g.size() >= minAnchorCoverage && g.size() <= maxAnchorCoverage) {
+                kept.push_back(std::move(g));
+            }
+        }
+        if(kept.size() >= 2) {
+            return peelGroups(adjAll, kept, minAnchorCoverage, maxAnchorCoverage);
+        }
+
+        return splitVertexByOverlapSupportWithPhasing(
+            adjAll, adjCis, hasAnyCisEdge, minAnchorCoverage, maxAnchorCoverage);
+    }
 }
+
+#if DINARA_TESTING
+namespace dinara::testing {
+    vector<vector<uint32_t>> splitVertexByOverlapSupportForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        return splitVertexByOverlapSupportWithPhasing(
+            adjAll, adjCis, hasAnyCisEdge, minAnchorCoverage, maxAnchorCoverage);
+    }
+
+    vector<vector<uint32_t>> mclClusterForTesting(
+        const vector<vector<uint32_t>>& adj,
+        double inflation,
+        uint32_t maxIterations)
+    {
+        const auto und = symmetrizeAdj(adj);
+        return mclClusterUndirected(und, inflation, maxIterations);
+    }
+
+    vector<vector<uint32_t>> splitVertexByOverlapSupportWithCoreMaskForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        return splitVertexByOverlapSupportWithCoreMask(
+            adjAll,
+            adjCis,
+            hasAnyCisEdge,
+            isCore,
+            coreMinSize,
+            attachMinSupport,
+            minAnchorCoverage,
+            maxAnchorCoverage);
+    }
+
+    vector<vector<uint32_t>> autoSplitVertexForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        bool useNonContainedCores,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        bool useMclSecondary,
+        uint32_t mclMinVertexSize,
+        double mclInflation,
+        uint32_t mclMaxIterations,
+        double suspiciousMaxDensity,
+        double suspiciousMaxAverageClustering,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        const uint32_t n = uint32_t(adjAll.size());
+        vector<vector<uint32_t>> groups;
+
+        if(useNonContainedCores) {
+            groups = splitVertexByOverlapSupportWithCoreMask(
+                adjAll,
+                adjCis,
+                hasAnyCisEdge,
+                isCore,
+                coreMinSize,
+                attachMinSupport,
+                minAnchorCoverage,
+                maxAnchorCoverage);
+        } else {
+            groups = splitVertexByOverlapSupportWithPhasing(
+                adjAll,
+                adjCis,
+                hasAnyCisEdge,
+                minAnchorCoverage,
+                maxAnchorCoverage);
+        }
+
+        if(groups.size() < 2 && useMclSecondary && n >= mclMinVertexSize) {
+            const auto& baseAdj = hasAnyCisEdge ? adjCis : adjAll;
+            const auto undAdj = symmetrizeAdj(baseAdj);
+            const double density = graphDensityUndirected(undAdj);
+            const double avgClustering = averageLocalClusteringCoefficientUndirected(undAdj);
+            if(density <= suspiciousMaxDensity && avgClustering <= suspiciousMaxAverageClustering) {
+                auto clusters = mclClusterUndirected(undAdj, mclInflation, mclMaxIterations);
+                vector<vector<uint32_t>> kept;
+                kept.reserve(clusters.size());
+                for(auto& c : clusters) {
+                    if(c.size() >= minAnchorCoverage && c.size() <= maxAnchorCoverage) {
+                        kept.push_back(std::move(c));
+                    }
+                }
+                if(kept.size() >= 2) {
+                    auto peeled = peelGroups(adjAll, kept, minAnchorCoverage, maxAnchorCoverage);
+                    if(peeled.size() >= 2) {
+                        groups = std::move(peeled);
+                    }
+                }
+            }
+        }
+
+        return groups;
+    }
+
+    std::pair<vector<vector<uint32_t>>, bool> autoSplitVertexWithMclTriedFlagForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        bool useNonContainedCores,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        bool useMclSecondary,
+        uint32_t mclMinVertexSize,
+        double mclInflation,
+        uint32_t mclMaxIterations,
+        double suspiciousMaxDensity,
+        double suspiciousMaxAverageClustering,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        const uint32_t n = uint32_t(adjAll.size());
+        vector<vector<uint32_t>> groups;
+        bool mclTried = false;
+
+        if(useNonContainedCores) {
+            groups = splitVertexByOverlapSupportWithCoreMask(
+                adjAll,
+                adjCis,
+                hasAnyCisEdge,
+                isCore,
+                coreMinSize,
+                attachMinSupport,
+                minAnchorCoverage,
+                maxAnchorCoverage);
+        } else {
+            groups = splitVertexByOverlapSupportWithPhasing(
+                adjAll,
+                adjCis,
+                hasAnyCisEdge,
+                minAnchorCoverage,
+                maxAnchorCoverage);
+        }
+
+        if(groups.size() < 2 && useMclSecondary && n >= mclMinVertexSize) {
+            const auto& baseAdj = hasAnyCisEdge ? adjCis : adjAll;
+            const auto undAdj = symmetrizeAdj(baseAdj);
+            const double density = graphDensityUndirected(undAdj);
+            const double avgClustering = averageLocalClusteringCoefficientUndirected(undAdj);
+            if(density <= suspiciousMaxDensity && avgClustering <= suspiciousMaxAverageClustering) {
+                mclTried = true;
+                auto clusters = mclClusterUndirected(undAdj, mclInflation, mclMaxIterations);
+                vector<vector<uint32_t>> kept;
+                kept.reserve(clusters.size());
+                for(auto& c : clusters) {
+                    if(c.size() >= minAnchorCoverage && c.size() <= maxAnchorCoverage) {
+                        kept.push_back(std::move(c));
+                    }
+                }
+                if(kept.size() >= 2) {
+                    auto peeled = peelGroups(adjAll, kept, minAnchorCoverage, maxAnchorCoverage);
+                    if(peeled.size() >= 2) {
+                        groups = std::move(peeled);
+                    }
+                }
+            }
+        }
+
+        return {groups, mclTried};
+    }
+
+    vector<vector<uint32_t>> splitVertexByCliqueCoverForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage)
+    {
+        bool exploded = false;
+        auto groups = splitVertexByCliqueCover(
+            adjAll, adjCis, hasAnyCisEdge, isCore, attachMinSupport, minAnchorCoverage, maxAnchorCoverage, exploded);
+        // For tests, treat "exploded" as no split.
+        if(exploded) {
+            return {};
+        }
+        return groups;
+    }
+}
+#endif
 
 
 
@@ -1273,6 +2719,330 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
 
     cout << timestamp << "Constructed " << anchorsExplicit.size()
          << " explicit anchors (including reverse complements) after decomposition." << endl;
+
+    return make_shared<mode3::Anchors>(
+        MappedMemoryOwner(*this),
+        getReads(),
+        assemblerInfo->k,
+        *markers,
+        anchorsExplicit,
+        /*ordinalOffset*/ 0,
+        threadCount);
+}
+
+
+
+shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
+    uint64_t minAnchorCoverage,
+    uint64_t maxAnchorCoverage,
+    const Mode3AssemblyOptions& mode3Options,
+    uint64_t threadCount)
+{
+    reads->checkReadsAreOpen();
+    checkMarkersAreOpen();
+    checkReadGraphIsOpen();
+    if(!alignmentData.isOpen) {
+        throw runtime_error("Alignment data are not accessible.");
+    }
+    checkMarkerGraphVerticesAreAvailable();
+    DINARA_ASSERT(markerGraph.reverseComplementVertex.isOpen);
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const auto& mgVertices = markerGraph.vertices();
+    const uint64_t vertexCount = mgVertices.size();
+
+    vector<vector<vector<Interval>>> threadAnchors(threadCount);
+
+    std::atomic<uint64_t> canonicalVertices{0};
+    std::atomic<uint64_t> candidateVertices{0};
+    std::atomic<uint64_t> splitVertices{0};
+    std::atomic<uint64_t> cliqueTriedVertices{0};
+    std::atomic<uint64_t> cliqueUsedVertices{0};
+    std::atomic<uint64_t> cliqueSplitVertices{0};
+    std::atomic<uint64_t> cliqueExplodedVertices{0};
+    std::atomic<uint64_t> mclTriedVertices{0};
+    std::atomic<uint64_t> mclSplitVertices{0};
+    std::atomic<uint64_t> emittedAnchors{0};
+
+    uint64_t chunk = vertexCount / threadCount;
+    if(chunk == 0) chunk = 1;
+
+    vector<thread> threads;
+    threads.reserve(threadCount);
+    for(uint64_t t=0; t<threadCount; t++) {
+        threads.emplace_back([&, t]() {
+            const uint64_t begin = t * chunk;
+            const uint64_t end = (t == threadCount - 1) ? vertexCount : min(vertexCount, (t+1) * chunk);
+            auto& outAnchors = threadAnchors[t];
+            outAnchors.reserve((end - begin) / 8);
+
+            vector<Interval> vertexIntervals;
+            vertexIntervals.reserve(64);
+
+            vector<vector<uint32_t>> adjAll;
+            vector<vector<uint32_t>> adjCis;
+            unordered_map<uint32_t, uint32_t> index;
+            index.reserve(128);
+
+            for(MarkerGraphVertexId vertexId=begin; vertexId<end; ++vertexId) {
+                const MarkerGraphVertexId rcVertexId = markerGraph.reverseComplementVertex[vertexId];
+                if(vertexId > rcVertexId) {
+                    continue;
+                }
+                ++canonicalVertices;
+
+                const auto vertexMarkerIds = mgVertices[vertexId];
+                if(vertexMarkerIds.size() < minAnchorCoverage) {
+                    continue;
+                }
+                if(vertexMarkerIds.size() > maxAnchorCoverage) {
+                    // Fast reject: if marker count already exceeds max anchor coverage,
+                    // the deduplicated read coverage can still be <= max, but this saves work
+                    // for very large vertices that will almost always be excluded.
+                    // Keep a small slack to avoid rejecting legitimate cases.
+                    if(vertexMarkerIds.size() > maxAnchorCoverage * 3) {
+                        continue;
+                    }
+                }
+                if(markerGraph.vertexHasDuplicateReadIds(vertexId, *markers)) {
+                    continue;
+                }
+
+                vertexIntervals.clear();
+                for(const MarkerId markerId : vertexMarkerIds) {
+                    OrientedReadId orientedReadId;
+                    uint32_t ordinal0;
+                    tie(orientedReadId, ordinal0) = dinara::findMarkerId(markerId, *markers);
+                    vertexIntervals.push_back(Interval{orientedReadId, ordinal0});
+                }
+
+                std::sort(vertexIntervals.begin(), vertexIntervals.end(),
+                    [](const Interval& a, const Interval& b) {
+                        if(a.orientedReadId != b.orientedReadId) {
+                            return a.orientedReadId < b.orientedReadId;
+                        }
+                        return a.ordinal0 < b.ordinal0;
+                    });
+                vertexIntervals.erase(
+                    std::unique(vertexIntervals.begin(), vertexIntervals.end(),
+                        [](const Interval& a, const Interval& b) {
+                            return a.orientedReadId == b.orientedReadId;
+                        }),
+                    vertexIntervals.end());
+
+                const uint32_t n = uint32_t(vertexIntervals.size());
+                if(n < minAnchorCoverage || n > maxAnchorCoverage) {
+                    continue;
+                }
+                ++candidateVertices;
+
+                index.clear();
+                index.reserve(n * 2);
+                for(uint32_t i=0; i<n; ++i) {
+                    index[vertexIntervals[i].orientedReadId.getValue()] = i;
+                }
+
+                adjAll.assign(n, {});
+                adjCis.assign(n, {});
+                bool hasAnyCisEdge = false;
+
+                for(uint32_t u=0; u<n; ++u) {
+                    const OrientedReadId orientedReadId = vertexIntervals[u].orientedReadId;
+                    for(const uint32_t edgeId : readGraph.connectivity[orientedReadId.getValue()]) {
+                        const ReadGraphEdge& edge = readGraph.edges[edgeId];
+                        if(edge.crossesStrands || edge.hasInconsistentAlignment) {
+                            continue;
+                        }
+                        const uint64_t alignmentId = edge.alignmentId;
+                        const AlignmentData& ad = alignmentData[alignmentId];
+                        if(!ad.info.isInReadGraph) {
+                            continue;
+                        }
+                        const OrientedReadId other = edge.getOther(orientedReadId);
+                        const auto it = index.find(other.getValue());
+                        if(it == index.end()) {
+                            continue;
+                        }
+                        const uint32_t vIdx = it->second;
+                        if(vIdx == u) {
+                            continue;
+                        }
+
+                        // Only use overlaps that cover both marker ordinals.
+                        const uint32_t ordinalU = vertexIntervals[u].ordinal0;
+                        const uint32_t ordinalV = vertexIntervals[vIdx].ordinal0;
+                        const AlignmentInfo info = ad.orient(orientedReadId, other);
+                        if(ordinalU < info.data[0].firstOrdinal || ordinalU > info.data[0].lastOrdinal) {
+                            continue;
+                        }
+                        if(ordinalV < info.data[1].firstOrdinal || ordinalV > info.data[1].lastOrdinal) {
+                            continue;
+                        }
+
+                        adjAll[u].push_back(vIdx);
+                        if(ad.cisTransStatus == CisTransStatus::Cis) {
+                            adjCis[u].push_back(vIdx);
+                            hasAnyCisEdge = true;
+                        }
+                    }
+                }
+
+                for(uint32_t u=0; u<n; ++u) {
+                    auto& nbr = adjAll[u];
+                    std::sort(nbr.begin(), nbr.end());
+                    nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+                }
+                for(uint32_t u=0; u<n; ++u) {
+                    auto& nbr = adjCis[u];
+                    std::sort(nbr.begin(), nbr.end());
+                    nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+                }
+
+                auto groups = [&]() -> vector<vector<uint32_t>> {
+                    const auto& opt = mode3Options.vertexSplitOptions;
+
+                    // Core mask: non-contained reads are treated as core evidence by default.
+                    vector<uint8_t> isCore(n, 1);
+                    if(opt.useNonContainedCores) {
+                        for(uint32_t u=0; u<n; ++u) {
+                            const ReadId rid = vertexIntervals[u].orientedReadId.getReadId();
+                            if(reads->getFlags(rid).isContained) {
+                                isCore[u] = 0;
+                            }
+                        }
+                    }
+
+                    // First try a clique-cover splitter on the overlap-support graph.
+                    ++cliqueTriedVertices;
+                    bool exploded = false;
+                    auto cliqueGroups = splitVertexByCliqueCover(
+                        adjAll,
+                        adjCis,
+                        hasAnyCisEdge,
+                        isCore,
+                        opt.attachMinSupport,
+                        minAnchorCoverage,
+                        maxAnchorCoverage,
+                        exploded);
+                    if(exploded) {
+                        ++cliqueExplodedVertices;
+                    }
+                    if(!cliqueGroups.empty()) {
+                        ++cliqueUsedVertices;
+                        if(cliqueGroups.size() >= 2) {
+                            ++cliqueSplitVertices;
+                        }
+                        return cliqueGroups;
+                    }
+
+                    // Fall back to the existing robust splitter.
+                    if(opt.useNonContainedCores) {
+                        return splitVertexByOverlapSupportWithCoreMask(
+                            adjAll,
+                            adjCis,
+                            hasAnyCisEdge,
+                            isCore,
+                            opt.coreMinSize,
+                            opt.attachMinSupport,
+                            minAnchorCoverage,
+                            maxAnchorCoverage);
+                    } else {
+                        return splitVertexByOverlapSupportWithPhasing(
+                            adjAll,
+                            adjCis,
+                            hasAnyCisEdge,
+                            minAnchorCoverage,
+                            maxAnchorCoverage);
+                    }
+                }();
+
+                // Optional secondary splitter: Markov Clustering (MCL) for suspicious vertices that
+                // remain a single cluster after the default bridge-removal + peeling logic.
+                if(groups.size() < 2 && mode3Options.vertexSplitOptions.useMclSecondary) {
+                    const auto& opt = mode3Options.vertexSplitOptions;
+                    if(n >= opt.mclMinVertexSize) {
+                        const auto& baseAdj = hasAnyCisEdge ? adjCis : adjAll;
+                        const auto undAdj = symmetrizeAdj(baseAdj);
+                        const double density = graphDensityUndirected(undAdj);
+                        const double avgClustering = averageLocalClusteringCoefficientUndirected(undAdj);
+                        if(density <= opt.suspiciousMaxDensity &&
+                            avgClustering <= opt.suspiciousMaxAverageClustering) {
+
+                            ++mclTriedVertices;
+                            auto clusters = mclClusterUndirected(
+                                undAdj,
+                                opt.mclInflation,
+                                opt.mclMaxIterations);
+
+                            vector<vector<uint32_t>> kept;
+                            kept.reserve(clusters.size());
+                            for(auto& c : clusters) {
+                                if(c.size() >= minAnchorCoverage && c.size() <= maxAnchorCoverage) {
+                                    kept.push_back(std::move(c));
+                                }
+                            }
+
+                            if(kept.size() >= 2) {
+                                auto peeled = peelGroups(adjAll, kept, minAnchorCoverage, maxAnchorCoverage);
+                                if(peeled.size() >= 2) {
+                                    groups = std::move(peeled);
+                                    ++mclSplitVertices;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if(groups.size() >= 2) {
+                    ++splitVertices;
+                }
+
+                for(const auto& group : groups) {
+                    vector<Interval> anchor;
+                    anchor.reserve(group.size());
+                    for(const uint32_t idxInVertex : group) {
+                        anchor.push_back(vertexIntervals[idxInVertex]);
+                    }
+                    std::sort(anchor.begin(), anchor.end(), [](const Interval& a, const Interval& b) {
+                        return a.orientedReadId < b.orientedReadId;
+                    });
+                    if(anchor.size() < minAnchorCoverage || anchor.size() > maxAnchorCoverage) {
+                        continue;
+                    }
+                    outAnchors.push_back(anchor);
+                    outAnchors.push_back(reverseComplementAnchor(anchor, *markers));
+                    emittedAnchors += 2;
+                }
+            }
+        });
+    }
+    for(auto& th : threads) {
+        th.join();
+    }
+
+    vector<vector<Interval>> anchorsExplicit;
+    {
+        size_t total = 0;
+        for(const auto& v : threadAnchors) total += v.size();
+        anchorsExplicit.reserve(total);
+        for(auto& v : threadAnchors) {
+            anchorsExplicit.insert(anchorsExplicit.end(), v.begin(), v.end());
+        }
+    }
+
+    cout << timestamp << "Vertex-split anchors: canonicalVertices=" << canonicalVertices.load() <<
+        ", candidates=" << candidateVertices.load() <<
+        ", splitVertices=" << splitVertices.load() <<
+        ", cliqueTriedVertices=" << cliqueTriedVertices.load() <<
+        ", cliqueUsedVertices=" << cliqueUsedVertices.load() <<
+        ", cliqueSplitVertices=" << cliqueSplitVertices.load() <<
+        ", cliqueExplodedVertices=" << cliqueExplodedVertices.load() <<
+        ", mclTriedVertices=" << mclTriedVertices.load() <<
+        ", mclSplitVertices=" << mclSplitVertices.load() <<
+        ", anchorsEmitted=" << anchorsExplicit.size() << " (including reverse complements)." << endl;
 
     return make_shared<mode3::Anchors>(
         MappedMemoryOwner(*this),

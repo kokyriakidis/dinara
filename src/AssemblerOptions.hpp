@@ -355,6 +355,11 @@ public:
     uint64_t peakFinderAreaStartIndex;
     bool alwaysSave;
 
+    // Optional diagnostics.
+    bool writeVertexCoverageHistogram;
+    string vertexCoverageHistogramFileName;
+    bool vertexCoverageHistogramCanonicalOnly;
+
     // Options that control secondary edges (assembly mode 2 only).
     uint64_t secondaryEdgesMaxSkip;
     double secondaryEdgesSplitErrorRateThreshold;
@@ -432,6 +437,45 @@ public:
     uint64_t maxAnchorCoverage;
     double minAnchorCoverageMultiplier;
     double maxAnchorCoverageMultiplier;
+
+    // Options used by anchor creation methods that split marker graph vertices
+    // using readGraph overlap support (for example: FromMarkerGraphVerticesSplitUsingReadGraph).
+    class VertexSplitOptions {
+    public:
+        // If true, run Markov Clustering (MCL) as a secondary splitter for "suspicious"
+        // vertices that remain a single cluster after the default bridge-removal + peeling logic.
+        bool useMclSecondary;
+
+        // Only consider MCL for vertices with at least this many oriented reads.
+        uint32_t mclMinVertexSize;
+
+        // MCL inflation parameter (controls cluster granularity). Typical values: 1.4-2.5.
+        double mclInflation;
+
+        // Maximum MCL iterations.
+        uint32_t mclMaxIterations;
+
+        // Trigger MCL only when the overlap-support graph looks "non-clique-like".
+        // MCL is attempted only if both conditions hold:
+        // - density <= suspiciousMaxDensity
+        // - averageClustering <= suspiciousMaxAverageClustering
+        double suspiciousMaxDensity;
+        double suspiciousMaxAverageClustering;
+
+        // If true, attempt to split vertices using only non-contained reads
+        // as "core" evidence, then attach contained reads to exactly one core cluster.
+        // This helps when contained reads act as bridges between unrelated regions/strands.
+        bool useNonContainedCores;
+
+        // Minimum number of core (non-contained) oriented reads required to attempt core-based splitting.
+        uint32_t coreMinSize;
+
+        // Minimum number of edges required to attach a non-core (typically contained) read to a cluster.
+        uint32_t attachMinSupport;
+
+        void write(ostream&) const;
+    };
+    VertexSplitOptions vertexSplitOptions;
 
     // Options used to clean up the PrimaryGraph.
     class PrimaryGraphOptions {
