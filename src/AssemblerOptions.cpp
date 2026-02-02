@@ -1010,6 +1010,23 @@ void AssemblerOptions::addConfigurableOptions()
         "Always save the marker graph (only effective if --memoryMode filesystem is also used)."
         "If this is not set, the marker graph is only saved for assembly modes 0 and 2.")
 
+        ("MarkerGraph.writeVertexCoverageHistogram",
+        bool_switch(&markerGraphOptions.writeVertexCoverageHistogram)->
+        default_value(true),
+        "Write a CSV histogram of marker graph vertex coverage (coverage,count).")
+
+        ("MarkerGraph.vertexCoverageHistogramFileName",
+        value<string>(&markerGraphOptions.vertexCoverageHistogramFileName)->
+        default_value("MarkerGraphVertexCoverageHistogram.csv"),
+        "File name for the marker graph vertex coverage histogram CSV.")
+
+        ("MarkerGraph.vertexCoverageHistogramCanonicalOnly",
+        value<bool>(&markerGraphOptions.vertexCoverageHistogramCanonicalOnly)->
+        default_value(true)->
+        implicit_value(true),
+        "If true, count only canonical marker graph vertices (one per reverse-complement pair) "
+        "when generating the vertex coverage histogram.")
+
         ("MarkerGraph.secondaryEdges.maxSkip",
         value<uint64_t>(&markerGraphOptions.secondaryEdgesMaxSkip)->
         default_value(1000000),
@@ -1255,7 +1272,10 @@ void AssemblerOptions::addConfigurableOptions()
         default_value("FromMarkerGraphEdges"),
         "Selects the method used to create anchors for mode 3 assembly. "
         "Can be: FromMarkerGraphEdges, FromMarkerGraphVerticesAtOverlapEvents, "
-        "FromMarkerGraphVerticesBestPerOverlapInterval, FromMarkerKmers, FromJson.")
+        "FromMarkerGraphVerticesBestPerOverlapInterval, "
+        "FromMarkerGraphVerticesBestPerOverlapIntervalDecomposed, "
+        "FromMarkerGraphVerticesSplitUsingReadGraph, "
+        "FromMarkerKmers, FromJson.")
 
         ("Assembly.mode3.minAnchorCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.minAnchorCoverage)->
@@ -1286,6 +1306,59 @@ void AssemblerOptions::addConfigurableOptions()
         "Multiplier applied to heuristically determined maximum anchor coverage "
         "if minAnchorCoverage and maxAnchorCoverage are both 0. "
         "Only used with --Assembly.mode 3.")
+
+        ("Assembly.mode3.vertexSplit.useMclSecondary",
+        bool_switch(&assemblyOptions.mode3Options.vertexSplitOptions.useMclSecondary)->
+        default_value(true),
+        "Experimental: If enabled, run MCL as a secondary splitter for suspicious marker-graph vertices "
+        "when using vertex-based anchor creation methods.")
+
+        ("Assembly.mode3.vertexSplit.mclMinVertexSize",
+        value<uint32_t>(&assemblyOptions.mode3Options.vertexSplitOptions.mclMinVertexSize)->
+        default_value(30),
+        "Minimum marker-vertex membership (oriented reads) required to attempt MCL secondary splitting.")
+
+        ("Assembly.mode3.vertexSplit.mclInflation",
+        value<double>(&assemblyOptions.mode3Options.vertexSplitOptions.mclInflation)->
+        default_value(1.8),
+        "MCL inflation parameter (larger -> more/smaller clusters). Only used if "
+        "--Assembly.mode3.vertexSplit.useMclSecondary is set.")
+
+        ("Assembly.mode3.vertexSplit.mclMaxIterations",
+        value<uint32_t>(&assemblyOptions.mode3Options.vertexSplitOptions.mclMaxIterations)->
+        default_value(50),
+        "Maximum number of MCL iterations. Only used if "
+        "--Assembly.mode3.vertexSplit.useMclSecondary is set.")
+
+        ("Assembly.mode3.vertexSplit.suspiciousMaxDensity",
+        value<double>(&assemblyOptions.mode3Options.vertexSplitOptions.suspiciousMaxDensity)->
+        default_value(0.85),
+        "Only attempt MCL if the overlap-support graph density is <= this threshold. "
+        "Only used if --Assembly.mode3.vertexSplit.useMclSecondary is set.")
+
+        ("Assembly.mode3.vertexSplit.suspiciousMaxAverageClustering",
+        value<double>(&assemblyOptions.mode3Options.vertexSplitOptions.suspiciousMaxAverageClustering)->
+        default_value(0.70),
+        "Only attempt MCL if the average local clustering coefficient is <= this threshold. "
+        "Only used if --Assembly.mode3.vertexSplit.useMclSecondary is set.")
+
+        ("Assembly.mode3.vertexSplit.useNonContainedCores",
+        bool_switch(&assemblyOptions.mode3Options.vertexSplitOptions.useNonContainedCores)->
+        default_value(true),
+        "If enabled, use non-contained reads as the core evidence to split marker-graph vertices, "
+        "then attach contained reads to exactly one core cluster when possible. "
+        "Useful when contained reads act as bridges between unrelated regions.")
+
+        ("Assembly.mode3.vertexSplit.coreMinSize",
+        value<uint32_t>(&assemblyOptions.mode3Options.vertexSplitOptions.coreMinSize)->
+        default_value(2),
+        "Minimum number of core (non-contained) oriented reads required to attempt core-based splitting.")
+
+        ("Assembly.mode3.vertexSplit.attachMinSupport",
+        value<uint32_t>(&assemblyOptions.mode3Options.vertexSplitOptions.attachMinSupport)->
+        default_value(1),
+        "Minimum number of overlap-support edges required to attach a contained (non-core) read "
+        "to a core cluster. Reads that do not meet this or are ambiguous are dropped from the anchor.")
 
         ("Assembly.mode3.primaryGraph.maxLoss",
         value<double>(&assemblyOptions.mode3Options.primaryGraphOptions.maxLoss)->
@@ -1656,6 +1729,12 @@ void MarkerGraphOptions::write(ostream& s) const
     s << "alwaysSave = " <<
         convertBoolToPythonString(alwaysSave) << "\n";
 
+    s << "writeVertexCoverageHistogram = " <<
+        convertBoolToPythonString(writeVertexCoverageHistogram) << "\n";
+    s << "vertexCoverageHistogramFileName = " << vertexCoverageHistogramFileName << "\n";
+    s << "vertexCoverageHistogramCanonicalOnly = " <<
+        convertBoolToPythonString(vertexCoverageHistogramCanonicalOnly) << "\n";
+
     s << "secondaryEdges.maxSkip = " << secondaryEdgesMaxSkip << "\n";
     s << "secondaryEdges.split.errorRateThreshold = " << secondaryEdgesSplitErrorRateThreshold << "\n";
     s << "secondaryEdges.split.minCoverage = " << secondaryEdgesSplitMinCoverage << "\n";
@@ -1733,9 +1812,23 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.maxAnchorCoverage = " << maxAnchorCoverage << "\n";
     s << "mode3.minAnchorCoverageMultiplier = " << minAnchorCoverageMultiplier << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
+    vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);
     localAssemblyOptions.write(s);
+}
+
+void Mode3AssemblyOptions::VertexSplitOptions::write(ostream& s) const
+{
+    s << "mode3.vertexSplit.useMclSecondary = " << convertBoolToPythonString(useMclSecondary) << "\n";
+    s << "mode3.vertexSplit.mclMinVertexSize = " << mclMinVertexSize << "\n";
+    s << "mode3.vertexSplit.mclInflation = " << mclInflation << "\n";
+    s << "mode3.vertexSplit.mclMaxIterations = " << mclMaxIterations << "\n";
+    s << "mode3.vertexSplit.suspiciousMaxDensity = " << suspiciousMaxDensity << "\n";
+    s << "mode3.vertexSplit.suspiciousMaxAverageClustering = " << suspiciousMaxAverageClustering << "\n";
+    s << "mode3.vertexSplit.useNonContainedCores = " << convertBoolToPythonString(useNonContainedCores) << "\n";
+    s << "mode3.vertexSplit.coreMinSize = " << coreMinSize << "\n";
+    s << "mode3.vertexSplit.attachMinSupport = " << attachMinSupport << "\n";
 }
 
 

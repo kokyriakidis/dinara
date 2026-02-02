@@ -19,6 +19,7 @@
 #include "../src/DINARA_ASSERT.hpp"
 #include "../src/markerAccessFunctions.hpp"
 #include "../src/AlignmentCanonicalization.hpp"
+#include "../src/MarkerGraph.hpp"
 
 // Standard library
 #include <algorithm>
@@ -227,6 +228,591 @@ TEST_CASE("Candidate canonicalization keeps alignment consistent", "[candidates]
         CHECK(al.te == 200);
         al.checkStrictlyIncreasing();
     }
+}
+
+TEST_CASE("Marker-vertex overlap splitting removes bridge reads and peels dense cores", "[anchors][vertexSplit]")
+{
+    using dinara::testing::splitVertexByOverlapSupportForTesting;
+
+    // Build an undirected adjacency list with sorted unique neighbors.
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    const uint64_t minCov = 3;
+    const uint64_t maxCov = 100;
+
+    SECTION("Single bridge read (articulation) is dropped and vertex splits into two anchors")
+    {
+        // Clique1: 0..4, Clique2: 5..8, bridge: 9 connects to everyone.
+        auto adj = makeAdj(10);
+        for(uint32_t i=0; i<5; ++i) {
+            for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=5; i<9; ++i) {
+            for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=0; i<9; ++i) addEdge(adj, i, 9);
+        normalize(adj);
+
+        const auto groups = splitVertexByOverlapSupportForTesting(adj, {}, false, minCov, maxCov);
+        REQUIRE(groups.size() == 2);
+        std::vector<uint32_t> sizes;
+        for(const auto& g : groups) sizes.push_back(uint32_t(g.size()));
+        std::sort(sizes.begin(), sizes.end());
+        CHECK(sizes[0] == 4);
+        CHECK(sizes[1] == 5);
+        // Bridge read 9 should not be present.
+        for(const auto& g : groups) {
+            CHECK(std::find(g.begin(), g.end(), 9) == g.end());
+        }
+    }
+
+    SECTION("Two bridge reads (no articulation) are handled by greedy dense-core split + peeling")
+    {
+        // Clique1: 0..4, Clique2: 5..8, bridges: 9 and 10 connect to everyone and to each other.
+        auto adj = makeAdj(11);
+        for(uint32_t i=0; i<5; ++i) {
+            for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=5; i<9; ++i) {
+            for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=0; i<9; ++i) {
+            addEdge(adj, i, 9);
+            addEdge(adj, i, 10);
+        }
+        addEdge(adj, 9, 10);
+        normalize(adj);
+
+        const auto groups = splitVertexByOverlapSupportForTesting(adj, {}, false, minCov, maxCov);
+        REQUIRE(groups.size() >= 2);
+
+        // Expect at least the two cliques to be extracted as dense cores.
+        // Bridge reads may be peeled away or attached to one group; ensure cliques are present.
+        auto containsAll = [](const std::vector<uint32_t>& g, uint32_t lo, uint32_t hiExclusive) {
+            for(uint32_t x=lo; x<hiExclusive; ++x) {
+                if(std::find(g.begin(), g.end(), x) == g.end()) return false;
+            }
+            return true;
+        };
+        bool foundClique1 = false;
+        bool foundClique2 = false;
+        for(const auto& g : groups) {
+            if(containsAll(g, 0, 5)) foundClique1 = true;
+            if(containsAll(g, 5, 9)) foundClique2 = true;
+        }
+        CHECK(foundClique1);
+        CHECK(foundClique2);
+    }
+}
+
+TEST_CASE("Vertex splitting can use non-contained cores and drop contained bridges", "[anchors][vertexSplit][contained]")
+{
+    using dinara::testing::splitVertexByOverlapSupportWithCoreMaskForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    const uint64_t minCov = 3;
+    const uint64_t maxCov = 100;
+
+    // Two equal cliques connected only via "contained" bridge nodes.
+    // Core cliques: 0..4 and 5..9. Bridges (contained): 10 and 11 connect to everyone in both cliques.
+    auto adj = makeAdj(12);
+    for(uint32_t i=0; i<5; ++i) {
+        for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+    }
+    for(uint32_t i=5; i<10; ++i) {
+        for(uint32_t j=i+1; j<10; ++j) addEdge(adj, i, j);
+    }
+    for(uint32_t b=10; b<12; ++b) {
+        for(uint32_t i=0; i<10; ++i) addEdge(adj, b, i);
+    }
+    normalize(adj);
+
+    std::vector<uint8_t> isCore(12, 1);
+    isCore[10] = 0;
+    isCore[11] = 0;
+
+    const auto groups = splitVertexByOverlapSupportWithCoreMaskForTesting(
+        adj, {}, false, isCore,
+        /*coreMinSize*/ 3,
+        /*attachMinSupport*/ 1,
+        minCov, maxCov);
+
+    REQUIRE(groups.size() == 2);
+    for(const auto& g : groups) {
+        CHECK(std::find(g.begin(), g.end(), 10) == g.end());
+        CHECK(std::find(g.begin(), g.end(), 11) == g.end());
+    }
+}
+
+TEST_CASE("Vertex splitting with non-contained cores: additional edge cases", "[anchors][vertexSplit][contained][core]")
+{
+    using dinara::testing::splitVertexByOverlapSupportForTesting;
+    using dinara::testing::splitVertexByOverlapSupportWithCoreMaskForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    const uint64_t minCov = 3;
+    const uint64_t maxCov = 100;
+
+    SECTION("Small core (2 nodes) can still drive a split after attaching contained reads")
+    {
+        // Core singletons: 0 and 5 (no edge). Contained nodes 1..4 attach to 0; 6..9 attach to 5.
+        auto adj = makeAdj(10);
+        for(uint32_t u=1; u<=4; ++u) addEdge(adj, 0, u);
+        for(uint32_t u=6; u<=9; ++u) addEdge(adj, 5, u);
+        // Add internal support among contained nodes in each side (to avoid being isolated after attach).
+        for(uint32_t i=1; i<=4; ++i) {
+            for(uint32_t j=i+1; j<=4; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=6; i<=9; ++i) {
+            for(uint32_t j=i+1; j<=9; ++j) addEdge(adj, i, j);
+        }
+        normalize(adj);
+
+        std::vector<uint8_t> isCore(10, 0);
+        isCore[0] = 1;
+        isCore[5] = 1;
+
+        const auto groups = splitVertexByOverlapSupportWithCoreMaskForTesting(
+            adj, {}, false, isCore,
+            /*coreMinSize*/ 2,
+            /*attachMinSupport*/ 1,
+            minCov, maxCov);
+
+        REQUIRE(groups.size() == 2);
+        std::vector<uint32_t> sizes;
+        for(const auto& g : groups) sizes.push_back(uint32_t(g.size()));
+        std::sort(sizes.begin(), sizes.end());
+        CHECK(sizes[0] >= 5);
+        CHECK(sizes[1] >= 5);
+        // Each core should remain present.
+        bool has0 = false;
+        bool has5 = false;
+        for(const auto& g : groups) {
+            if(std::find(g.begin(), g.end(), 0) != g.end()) has0 = true;
+            if(std::find(g.begin(), g.end(), 5) != g.end()) has5 = true;
+        }
+        CHECK(has0);
+        CHECK(has5);
+    }
+
+    SECTION("Ambiguous contained bridge (ties) is dropped instead of gluing clusters")
+    {
+        // Core cliques: 0..2 and 3..5. Contained bridge: 6 connects equally to both cliques.
+        auto adj = makeAdj(7);
+        for(uint32_t i=0; i<3; ++i) {
+            for(uint32_t j=i+1; j<3; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=3; i<6; ++i) {
+            for(uint32_t j=i+1; j<6; ++j) addEdge(adj, i, j);
+        }
+        // Bridge edges: 6 connects to one node in each clique (tie support 1 vs 1).
+        addEdge(adj, 6, 0);
+        addEdge(adj, 6, 3);
+        normalize(adj);
+
+        std::vector<uint8_t> isCore(7, 1);
+        isCore[6] = 0;
+
+        const auto groups = splitVertexByOverlapSupportWithCoreMaskForTesting(
+            adj, {}, false, isCore,
+            /*coreMinSize*/ 2,
+            /*attachMinSupport*/ 1,
+            /*minAnchorCoverage*/ 2,
+            maxCov);
+
+        REQUIRE(groups.size() == 2);
+        for(const auto& g : groups) {
+            CHECK(std::find(g.begin(), g.end(), 6) == g.end());
+        }
+    }
+
+    SECTION("When all reads are core (no contained), core-mode falls back to normal splitting")
+    {
+        // Two cliques connected by a single bridge node (articulation).
+        auto adj = makeAdj(10);
+        for(uint32_t i=0; i<5; ++i) {
+            for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=5; i<9; ++i) {
+            for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=0; i<9; ++i) addEdge(adj, i, 9);
+        normalize(adj);
+
+        // All core.
+        std::vector<uint8_t> isCore(10, 1);
+
+        const auto groupsCoreMode = splitVertexByOverlapSupportWithCoreMaskForTesting(
+            adj, {}, false, isCore,
+            /*coreMinSize*/ 2,
+            /*attachMinSupport*/ 1,
+            /*minAnchorCoverage*/ 3,
+            maxCov);
+
+        const auto groupsBaseline = splitVertexByOverlapSupportForTesting(
+            adj, {}, false, /*minAnchorCoverage*/ 3, maxCov);
+
+        // Both paths should agree on producing a split (2 groups) and dropping the bridge.
+        REQUIRE(groupsCoreMode.size() == 2);
+        REQUIRE(groupsBaseline.size() == 2);
+        for(const auto& g : groupsCoreMode) {
+            CHECK(std::find(g.begin(), g.end(), 9) == g.end());
+        }
+    }
+}
+
+TEST_CASE("Vertex splitting: dynamic attachment threshold blocks high-degree weak assignments", "[anchors][vertexSplit][contained][core][dynamic]")
+{
+    using dinara::testing::splitVertexByOverlapSupportWithCoreMaskForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    // Core: nodes 0..11, with a small core cluster {0,1} and 10 isolated core nodes.
+    // Non-core (contained): node 12 connects to both 0 and 1 (bestCount=2) and to each isolated core (secondCount=1).
+    // degToCore=12 triggers dynamicMinSupport=3, so node 12 should NOT attach anywhere.
+    auto adj = makeAdj(13);
+    addEdge(adj, 0, 1);
+    for(uint32_t u=2; u<=11; ++u) {
+        addEdge(adj, 12, u);
+    }
+    addEdge(adj, 12, 0);
+    addEdge(adj, 12, 1);
+    normalize(adj);
+
+    std::vector<uint8_t> isCore(13, 1);
+    isCore[12] = 0;
+
+    const auto groups = splitVertexByOverlapSupportWithCoreMaskForTesting(
+        adj, {}, false, isCore,
+        /*coreMinSize*/ 2,
+        /*attachMinSupport*/ 1,
+        /*minAnchorCoverage*/ 1,
+        /*maxAnchorCoverage*/ 1000);
+
+    // All core groups are kept at minCov=1; ensure node 12 is not present.
+    REQUIRE(!groups.empty());
+    for(const auto& g : groups) {
+        CHECK(std::find(g.begin(), g.end(), 12) == g.end());
+    }
+}
+
+TEST_CASE("Vertex splitting: core split fallback preserves baseline splits when core cannot split", "[anchors][vertexSplit][contained][core][fallback]")
+{
+    using dinara::testing::splitVertexByOverlapSupportForTesting;
+    using dinara::testing::splitVertexByOverlapSupportWithCoreMaskForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    // Core nodes 0..3 form one clique (so core split cannot produce 2+ groups).
+    // Non-core nodes 4..5 attach to core; non-core nodes 6..8 form a separate clique disconnected from core.
+    // Baseline splitter should return 2 components; core-mode should fall back and do the same.
+    auto adj = makeAdj(9);
+    for(uint32_t i=0; i<4; ++i) {
+        for(uint32_t j=i+1; j<4; ++j) addEdge(adj, i, j);
+    }
+    addEdge(adj, 0, 4);
+    addEdge(adj, 1, 5);
+    addEdge(adj, 4, 5);
+    for(uint32_t i=6; i<9; ++i) {
+        for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+    }
+    normalize(adj);
+
+    std::vector<uint8_t> isCore(9, 0);
+    for(uint32_t i=0; i<4; ++i) isCore[i] = 1;
+
+    const auto baseline = splitVertexByOverlapSupportForTesting(adj, {}, false, /*minCov*/ 2, /*max*/ 1000);
+    const auto coreMode = splitVertexByOverlapSupportWithCoreMaskForTesting(
+        adj, {}, false, isCore,
+        /*coreMinSize*/ 2,
+        /*attachMinSupport*/ 1,
+        /*minCov*/ 2,
+        /*max*/ 1000);
+
+    REQUIRE(baseline.size() == 2);
+    REQUIRE(coreMode.size() == 2);
+
+    // Ensure the disconnected clique {6,7,8} is preserved in coreMode.
+    auto containsAll = [](const std::vector<uint32_t>& g, std::initializer_list<uint32_t> nodes) {
+        for(uint32_t x : nodes) {
+            if(std::find(g.begin(), g.end(), x) == g.end()) return false;
+        }
+        return true;
+    };
+    bool found = false;
+    for(const auto& g : coreMode) {
+        if(containsAll(g, {6,7,8})) found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("Clique-cover vertex splitter: splits disjoint core cliques and drops ambiguous bridges", "[anchors][vertexSplit][cliqueCover]")
+{
+    using dinara::testing::splitVertexByCliqueCoverForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    const uint64_t minCov = 3;
+    const uint64_t maxCov = 100;
+
+    SECTION("Contained bridge excluded from core -> two core cliques split")
+    {
+        // Core clique A: 0..4, core clique B: 5..8, contained bridge: 9 connects to all.
+        auto adj = makeAdj(10);
+        for(uint32_t i=0; i<5; ++i) {
+            for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=5; i<9; ++i) {
+            for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=0; i<9; ++i) addEdge(adj, i, 9);
+        normalize(adj);
+
+        std::vector<uint8_t> isCore(10, 1);
+        isCore[9] = 0;
+
+        const auto groups = splitVertexByCliqueCoverForTesting(adj, {}, false, isCore, /*attachMinSupport*/ 1, minCov, maxCov);
+        REQUIRE(groups.size() == 2);
+        for(const auto& g : groups) {
+            CHECK(std::find(g.begin(), g.end(), 9) == g.end());
+        }
+    }
+
+    SECTION("If a bridge is treated as core, clique-cover returns empty (forces fallback in pipeline)")
+    {
+        auto adj = makeAdj(10);
+        for(uint32_t i=0; i<5; ++i) {
+            for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=5; i<9; ++i) {
+            for(uint32_t j=i+1; j<9; ++j) addEdge(adj, i, j);
+        }
+        for(uint32_t i=0; i<9; ++i) addEdge(adj, i, 9);
+        normalize(adj);
+
+        std::vector<uint8_t> isCore(10, 1); // bridge is core too
+
+        const auto groups = splitVertexByCliqueCoverForTesting(adj, {}, false, isCore, /*attachMinSupport*/ 1, minCov, maxCov);
+        CHECK(groups.empty());
+    }
+}
+
+TEST_CASE("Vertex splitting: MCL branch is attempted when enabled and suspicious", "[anchors][vertexSplit][mcl][auto]")
+{
+    using dinara::testing::autoSplitVertexWithMclTriedFlagForTesting;
+
+    auto addClique = [](std::vector<std::vector<uint32_t>>& adj, uint32_t lo, uint32_t hiExclusive) {
+        for(uint32_t i=lo; i<hiExclusive; ++i) {
+            for(uint32_t j=i+1; j<hiExclusive; ++j) {
+                adj[i].push_back(j);
+                adj[j].push_back(i);
+            }
+        }
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    // Use a clique so the baseline splitter returns a single group.
+    std::vector<std::vector<uint32_t>> adj(6);
+    addClique(adj, 0, 6);
+    normalize(adj);
+
+    std::vector<uint8_t> isCore(6, 1);
+    const uint64_t minCov = 2;
+    const uint64_t maxCov = 1000;
+
+    const auto [noMclGroups, noMclTried] = autoSplitVertexWithMclTriedFlagForTesting(
+        adj, {}, false, isCore,
+        /*useNonContainedCores*/ false,
+        /*coreMinSize*/ 2,
+        /*attachMinSupport*/ 1,
+        /*useMclSecondary*/ false,
+        /*mclMinVertexSize*/ 0,
+        /*mclInflation*/ 2.2,
+        /*mclMaxIterations*/ 80,
+        /*suspiciousMaxDensity*/ 1.0,
+        /*suspiciousMaxAverageClustering*/ 1.0,
+        /*minCov*/ minCov,
+        /*max*/ maxCov);
+    REQUIRE(noMclGroups.size() == 1);
+    REQUIRE(noMclTried == false);
+
+    const auto [withMclGroups, withMclTried] = autoSplitVertexWithMclTriedFlagForTesting(
+        adj, {}, false, isCore,
+        /*useNonContainedCores*/ false,
+        /*coreMinSize*/ 2,
+        /*attachMinSupport*/ 1,
+        /*useMclSecondary*/ true,
+        /*mclMinVertexSize*/ 0,
+        /*mclInflation*/ 2.2,
+        /*mclMaxIterations*/ 80,
+        /*suspiciousMaxDensity*/ 1.0,
+        /*suspiciousMaxAverageClustering*/ 1.0,
+        /*minCov*/ minCov,
+        /*max*/ maxCov);
+    REQUIRE(withMclGroups.size() == 1);
+    REQUIRE(withMclTried == true);
+}
+
+TEST_CASE("MCL secondary clustering can separate weakly-connected communities", "[anchors][mcl]")
+{
+    using dinara::testing::mclClusterForTesting;
+
+    auto makeAdj = [](uint32_t n) {
+        return std::vector<std::vector<uint32_t>>(n);
+    };
+    auto addEdge = [](std::vector<std::vector<uint32_t>>& adj, uint32_t u, uint32_t v) {
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    };
+    auto normalize = [](std::vector<std::vector<uint32_t>>& adj) {
+        for(auto& nbr : adj) {
+            std::sort(nbr.begin(), nbr.end());
+            nbr.erase(std::unique(nbr.begin(), nbr.end()), nbr.end());
+        }
+    };
+
+    // Two cliques connected by two weak cross edges.
+    // Clique1: 0..4, Clique2: 5..9, cross edges: (0,5) and (1,6).
+    auto adj = makeAdj(10);
+    for(uint32_t i=0; i<5; ++i) {
+        for(uint32_t j=i+1; j<5; ++j) addEdge(adj, i, j);
+    }
+    for(uint32_t i=5; i<10; ++i) {
+        for(uint32_t j=i+1; j<10; ++j) addEdge(adj, i, j);
+    }
+    addEdge(adj, 0, 5);
+    addEdge(adj, 1, 6);
+    normalize(adj);
+
+    const auto groups = mclClusterForTesting(adj, /*inflation*/ 1.8, /*maxIterations*/ 50);
+    REQUIRE(groups.size() >= 2);
+
+    auto containsAll = [](const std::vector<uint32_t>& g, uint32_t lo, uint32_t hiExclusive) {
+        for(uint32_t x=lo; x<hiExclusive; ++x) {
+            if(std::find(g.begin(), g.end(), x) == g.end()) return false;
+        }
+        return true;
+    };
+    bool foundClique1 = false;
+    bool foundClique2 = false;
+    for(const auto& g : groups) {
+        if(containsAll(g, 0, 5)) foundClique1 = true;
+        if(containsAll(g, 5, 10)) foundClique2 = true;
+    }
+    CHECK(foundClique1);
+    CHECK(foundClique2);
+}
+
+TEST_CASE("MarkerGraph vertex coverage histogram counts canonical vertices", "[markerGraph][histogram]")
+{
+    MarkerGraph markerGraph;
+    markerGraph.constructVertices();
+    markerGraph.vertices().createNew("", 4096);
+
+    // Create 4 vertices with coverages: [3,3,1,2].
+    markerGraph.vertices().appendVector(3);
+    markerGraph.vertices().appendVector(3);
+    markerGraph.vertices().appendVector(1);
+    markerGraph.vertices().appendVector(2);
+
+    // Reverse-complement pairs: (0,1) and (2,3).
+    markerGraph.reverseComplementVertex.createNew("", 4096);
+    markerGraph.reverseComplementVertex.resize(4);
+    markerGraph.reverseComplementVertex[0] = 1;
+    markerGraph.reverseComplementVertex[1] = 0;
+    markerGraph.reverseComplementVertex[2] = 3;
+    markerGraph.reverseComplementVertex[3] = 2;
+
+    const auto all = markerGraph.computeVertexCoverageHistogram(false);
+    REQUIRE(all.size() >= 4);
+    CHECK(all[1] == 1);
+    CHECK(all[2] == 1);
+    CHECK(all[3] == 2);
+
+    const auto canonical = markerGraph.computeVertexCoverageHistogram(true);
+    REQUIRE(canonical.size() >= 4);
+    CHECK(canonical[1] == 1); // vertex 2
+    CHECK(canonical[2] == 0);
+    CHECK(canonical[3] == 1); // vertex 0
 }
 
 // =============================================================================

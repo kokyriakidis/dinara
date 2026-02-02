@@ -847,6 +847,55 @@ bool MarkerGraph::vertexHasDuplicateReadIds(
 
 
 
+vector<uint64_t> MarkerGraph::computeVertexCoverageHistogram(bool canonicalOnly) const
+{
+    if(canonicalOnly && !reverseComplementVertex.isOpen) {
+        canonicalOnly = false;
+    }
+
+    vector<uint64_t> histogram;
+    histogram.reserve(256);
+
+    const uint64_t n = vertexCount();
+    for(VertexId v=0; v<n; ++v) {
+        if(canonicalOnly) {
+            const VertexId vRc = reverseComplementVertex[v];
+            if(vRc < v) {
+                continue;
+            }
+        }
+
+        const uint64_t coverage = vertexCoverage(v);
+        if(coverage >= histogram.size()) {
+            histogram.resize(coverage + 1, 0);
+        }
+        ++histogram[coverage];
+    }
+
+    return histogram;
+}
+
+
+
+void MarkerGraph::writeVertexCoverageHistogram(
+    const string& fileName,
+    bool canonicalOnly) const
+{
+    const vector<uint64_t> histogram = computeVertexCoverageHistogram(canonicalOnly);
+
+    ofstream csv(fileName);
+    csv << "coverage,count\n";
+    for(size_t coverage=0; coverage<histogram.size(); ++coverage) {
+        const uint64_t count = histogram[coverage];
+        if(count == 0) {
+            continue;
+        }
+        csv << coverage << "," << count << "\n";
+    }
+}
+
+
+
 #if 0
 // WE NOW ONLY GENERATE PRIMARY MARKER GRAPH EDGES.
 // Flag primary edges (only used for Mode 3 assembly).

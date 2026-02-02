@@ -402,6 +402,16 @@ public:
         uint64_t maxAnchorCoverage,
         uint64_t threadCount);
 
+    // Create mode3 anchors from *all* marker graph vertices, but split each marker graph vertex
+    // into multiple anchors if the oriented reads inside the vertex fall into multiple clusters
+    // based on surviving readGraph overlaps. This mitigates DSU transitive-collapse caused by
+    // chimeric/bridging reads.
+    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        const Mode3AssemblyOptions& mode3Options,
+        uint64_t threadCount);
+
     // Create mode3 anchors directly from filtered overlaps without using markerGraph vertices.
     // For each oriented read, sweep overlap start/end events to find maximal intervals with active overlaps,
     // then select one marker ordinal per interval and gather matching marker ordinals on overlapping reads
@@ -764,6 +774,7 @@ public:
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void removeReadsFlaggedContained(uint64_t threadCount);
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t threadCount);
@@ -3138,5 +3149,85 @@ public:
 public:
     void test();
 };
+
+#if DINARA_TESTING
+namespace dinara::testing {
+    // Test-only hook: apply the same overlap-support splitting (including bridge removal
+    // and quasi-clique peeling) used by marker-vertex anchor decomposition.
+    vector<vector<uint32_t>> splitVertexByOverlapSupportForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+
+    // Test-only hook: run Markov Clustering (MCL) on an (undirected) adjacency list.
+    // The adjacency does not need to be symmetric; it is symmetrized internally.
+    vector<vector<uint32_t>> mclClusterForTesting(
+        const vector<vector<uint32_t>>& adj,
+        double inflation,
+        uint32_t maxIterations);
+
+    // Test-only hook: split using a provided core mask (see Mode3 vertexSplit.useNonContainedCores).
+    vector<vector<uint32_t>> splitVertexByOverlapSupportWithCoreMaskForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+
+    // Test-only hook: run the same "auto" logic as the vertex-based anchor splitter:
+    // - optional non-contained core splitting + attachment
+    // - optional MCL secondary splitting (with suspicious-vertex checks)
+    // - quasi-clique peeling
+    vector<vector<uint32_t>> autoSplitVertexForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        bool useNonContainedCores,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        bool useMclSecondary,
+        uint32_t mclMinVertexSize,
+        double mclInflation,
+        uint32_t mclMaxIterations,
+        double suspiciousMaxDensity,
+        double suspiciousMaxAverageClustering,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+
+    // Same as autoSplitVertexForTesting, but also returns whether the MCL branch was attempted.
+    std::pair<vector<vector<uint32_t>>, bool> autoSplitVertexWithMclTriedFlagForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        bool useNonContainedCores,
+        uint32_t coreMinSize,
+        uint32_t attachMinSupport,
+        bool useMclSecondary,
+        uint32_t mclMinVertexSize,
+        double mclInflation,
+        uint32_t mclMaxIterations,
+        double suspiciousMaxDensity,
+        double suspiciousMaxAverageClustering,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+
+    // Test-only hook: clique-cover splitter (maximal cliques on core reads + attachment + peeling).
+    vector<vector<uint32_t>> splitVertexByCliqueCoverForTesting(
+        const vector<vector<uint32_t>>& adjAll,
+        const vector<vector<uint32_t>>& adjCis,
+        bool hasAnyCisEdge,
+        const vector<uint8_t>& isCore,
+        uint32_t attachMinSupport,
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+}
+#endif
 
 #endif

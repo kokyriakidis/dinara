@@ -509,7 +509,7 @@ void dinara::main::assemble(
         
         // Retrieve peak and set thresholds.
         const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
-        const uint64_t minFreq = 2;
+        const uint64_t minFreq = 4;
         const uint64_t maxFreq = 5 * coveragePeak;
         const uint64_t distinctKmerCount = assembler.kmerCounter->kmerIdFrequencies.size();
 
@@ -628,7 +628,7 @@ void dinara::main::assemble(
     // To create a complete marker graph, generate all vertices
     // regardless of coverage, and allow duplicate markers on vertices.
     assembler.createMarkerGraphVertices(
-        1,                                              // minVertexCoverage
+        2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                           // allowDuplicateMarkers
@@ -659,93 +659,34 @@ void dinara::main::assemble(
     assembler.createMarkerGraphEdges(threadCount);
     assembler.findMarkerGraphReverseComplementEdges(threadCount);
 
-    // Now that the marker graph is built from the broad read-graph overlap set,
-    // we can tighten the overlap set by pruning overlaps for contained reads.
-    // This changes the read graph (rebuilt below) but keeps the marker graph intact.
-    const uint64_t minOverlapLengthForContainment = 50;
-    const uint64_t maxHangForContainment = 1000;
-    const double maxHangRateForContainment = 0.8;
-    assembler.flagContainedReads(
-        maxHangForContainment,
-        maxHangRateForContainment,
-        minOverlapLengthForContainment,
-        threadCount);
-    {
-        uint64_t containedFlagCount = 0;
-        for (ReadId r = 0; r < assembler.getReads().readCount(); ++r) {
-            if (assembler.getReads().getFlags(r).isContained) {
-                ++containedFlagCount;
-            }
-        }
-        cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
+    if(assemblerOptions.markerGraphOptions.writeVertexCoverageHistogram) {
+        cout << timestamp << "Writing marker graph vertex coverage histogram to " <<
+            assemblerOptions.markerGraphOptions.vertexCoverageHistogramFileName << "." << endl;
+        assembler.markerGraph.writeVertexCoverageHistogram(
+            assemblerOptions.markerGraphOptions.vertexCoverageHistogramFileName,
+            assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
-    // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
-    // This is a diagnostic/experimental alternative to removing contained reads entirely.
-    assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
-
-
-    std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
-    for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
-        if (!keepForMarkerGraph[i]) continue;
-
-        const auto& ad = assembler.alignmentData[i];
-
-        // Strict rule: only keep if both sides still keep it after your extra filtering.
-        if (!ad.keptByBothSides()) continue;
-
-        keepForReadGraph[i] = true;
-    }
-
-    // Rebuild the read graph using the tightened keep-set.
-    assembler.rebuildReadGraphUsingSelectedAlignments(
-        std::move(keepForReadGraph),
-        /*rebuildDirectedReadGraph*/false);
-
-
-
-
-
-
-
-    // const bool anchorsNeedMarkerGraphVertices =
-    //     assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod != "FromOverlapsBestPerOverlapInterval";
-    //
-    // if(anchorsNeedMarkerGraphVertices) {
-    //     // Create marker graph vertices with coverage filtering.
-    //     assembler.createMarkerGraphVertices(
-    //         minPrimaryCoverage,                             // minVertexCoverage (from options)
-    //         maxPrimaryCoverage,                             // maxVertexCoverage (from options)
-    //         0,                                              // minVertexCoveragePerStrand
-    //         false,                                           // allowDuplicateMarkers
-    //         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-    //         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-    //         threadCount);
-    //
-    //     // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
-    //     // This reduces unreliable anchors and artifacts in repetitive regions.
-    //     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    //
-    //     // Find the reverse complement of each marker graph vertex.
-    //     // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    //     assembler.findMarkerGraphReverseComplementVertices(threadCount);
-    //
-    //     // // Clean up of duplicate markers, if requested and necessary.
-    //     // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
-    //     //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
-    //     //     assembler.cleanupDuplicateMarkers(
-    //     //         threadCount,
-    //     //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
-    //     //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-    //     //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
-    //     //         false, false);
-    //     //     }
-    //
-    //     // Create edges of the marker graph.
-    //     assembler.createMarkerGraphEdges(threadCount);
-    //     assembler.findMarkerGraphReverseComplementEdges(threadCount);
+    // // Now that the marker graph is built from the broad read-graph overlap set,
+    // // we can tighten the overlap set by pruning overlaps for contained reads.
+    // // This changes the read graph (rebuilt below) but keeps the marker graph intact.
+    // const uint64_t minOverlapLengthForContainment = 50;
+    // const uint64_t maxHangForContainment = 1000;
+    // const double maxHangRateForContainment = 0.8;
+    // assembler.flagContainedReads(
+    //     maxHangForContainment,
+    //     maxHangRateForContainment,
+    //     minOverlapLengthForContainment,
+    //     threadCount);
+    // {
+    //     uint64_t containedFlagCount = 0;
+    //     for (ReadId r = 0; r < assembler.getReads().readCount(); ++r) {
+    //         if (assembler.getReads().getFlags(r).isContained) {
+    //             ++containedFlagCount;
+    //         }
+    //     }
+    //     cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
     // }
-
 
 
 
@@ -771,18 +712,76 @@ void dinara::main::assemble(
             ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
     }
 
+    // Robust vertex-based anchors: split marker graph vertices using surviving readGraph overlaps
+    // (bridge removal + quasi-clique peeling), then emit per-cluster anchors (+ RC anchors).
+    anchors = assembler.createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
+        minPrimaryCoverage, maxPrimaryCoverage, assemblerOptions.assemblyOptions.mode3Options, threadCount);
 
-    anchors =
-            make_shared<mode3::Anchors>(
-                MappedMemoryOwner(assembler),
-                assembler.getReads(),
-                assembler.assemblerInfo->k,
-                *assembler.markers,
-                assembler.markerGraph,
-                minPrimaryCoverage,
-                maxPrimaryCoverage,
-                threadCount,
-                true); // createFromVertices
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
+    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
+    // assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
+    //
+    //
+    // std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
+    // for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
+    //     if (!keepForMarkerGraph[i]) continue;
+    //
+    //     const auto& ad = assembler.alignmentData[i];
+    //
+    //     // Strict rule: only keep if both sides still keep it after your extra filtering.
+    //     if (!ad.keptByBothSides()) continue;
+    //
+    //     keepForReadGraph[i] = true;
+    // }
+    //
+    // // Rebuild the read graph using the tightened keep-set.
+    // assembler.rebuildReadGraphUsingSelectedAlignments(
+    //     std::move(keepForReadGraph),
+    //     /*rebuildDirectedReadGraph*/false);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // // Alternatives (disabled):
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
+    // anchors = make_shared<mode3::Anchors>(
+    //     MappedMemoryOwner(assembler),
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     *assembler.markers,
+    //     assembler.markerGraph,
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     true); // createFromVertices
 
 
     // // Construct the mode3::Anchors (for HTTP server visualization).

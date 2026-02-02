@@ -1517,6 +1517,86 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
     cout << timestamp << "Identified " << containedReadCount << " contained reads." << endl;
 }
 
+void Assembler::removeReadsFlaggedContained(uint64_t threadCount)
+{
+    cout << timestamp << "Removing reads flagged as contained..." << endl;
+
+    checkAlignmentDataAreOpen();
+    reads->checkReadsAreOpen();
+    reads->checkReadFlagsAreOpen();
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    // Ensure validReadIntervals exists. If missing, treat entire read as valid/alive.
+    if (validReadIntervals.empty()) {
+        cout << timestamp
+             << "[DIAG] removeReadsFlaggedContained: validReadIntervals not set; using full read lengths."
+             << endl;
+        validReadIntervals.resize(reads->readCount());
+        for (ReadId r = 0; r < reads->readCount(); ++r) {
+            const uint64_t len = reads->getReadRawSequenceLength(r);
+            validReadIntervals[r] = {0, uint32_t(len), false};
+        }
+    }
+
+    if (!containmentParent->isOpen) {
+        containmentParent->createNew(largeDataName("ContainmentParent"), largeDataPageSize);
+        containmentParent->resize(reads->readCount());
+        std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
+    }
+
+    auto deleteAllEdgesForRead = [&](ReadId r) {
+        const OrientedReadId oid(r, 0);
+        if (oid.getValue() >= alignmentTable.size()) return;
+        const auto& table = alignmentTable[oid.getValue()];
+        for (const uint32_t alignmentId : table) {
+            alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
+        }
+    };
+
+    const uint64_t readCount = reads->readCount();
+    uint64_t containedReadCount = 0;
+    for (ReadId r = 0; r < readCount; ++r) {
+        if (r >= validReadIntervals.size() || validReadIntervals[r].isDeleted) continue;
+        if (!reads->getFlags(r).isContained) continue;
+
+        validReadIntervals[r].isDeleted = true;
+        deleteAllEdgesForRead(r);
+        ++containedReadCount;
+    }
+
+    // Compress containment chains (cycle-safe).
+    for (ReadId r = 0; r < readCount; ++r) {
+        if ((*containmentParent)[r] == ReadId(invalidReadId)) continue;
+        ReadId root = r;
+        vector<ReadId> visited;
+        visited.reserve(16);
+        while (root != ReadId(invalidReadId) && (*containmentParent)[root] != ReadId(invalidReadId)) {
+            if (std::find(visited.begin(), visited.end(), root) != visited.end()) {
+                ReadId cycleRoot = root;
+                for (const ReadId x : visited) {
+                    if (x < cycleRoot) cycleRoot = x;
+                }
+                (*containmentParent)[r] = cycleRoot;
+                root = ReadId(invalidReadId);
+                break;
+            }
+            visited.push_back(root);
+            root = (*containmentParent)[root];
+        }
+        if (root != ReadId(invalidReadId)) {
+            (*containmentParent)[r] = root;
+        }
+    }
+
+    setupLoadBalancing(readCount, 1000);
+    runThreads(&Assembler::applyCoverageCutsCleanupThreadFunction, threadCount);
+
+    cout << timestamp << "Removed " << containedReadCount << " reads flagged as contained." << endl;
+}
+
 void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
     cout << timestamp << "Flagging contained reads (diagnostic-only, does not remove overlaps)..." << endl;
@@ -1524,6 +1604,8 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
+
+    checkAlignmentDataAreOpen();
 
     // We will write into read flags.
     reads->checkReadsAreOpen();
@@ -1550,6 +1632,7 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
 
     const uint64_t readCount = reads->readCount();
+    const uint64_t alignmentCount = alignmentData.size();
 
     // Clear previous flags.
     for(ReadId r=0; r<readCount; ++r) {
@@ -1558,10 +1641,20 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
 
     uint64_t containedReadCount = 0;
 
-    // Same containment test as removeContainedReads, but we only record the result.
+    // If a read graph has already been built in this process, prefer selecting the best overlap
+    // only among current read-graph overlaps. This mirrors pruneContainedReadsToOneBestOverlapByDpScore.
+    bool restrictToCurrentReadGraph = false;
+    for (uint64_t alignmentId = 0; alignmentId < alignmentCount; ++alignmentId) {
+        if (alignmentData[alignmentId].info.isInReadGraph != 0) {
+            restrictToCurrentReadGraph = true;
+            break;
+        }
+    }
+
+    // Same containment predicate as removeContainedReads, but we only flag a read as contained
+    // if it is contained in its single highest-scoring (dpScore) kept overlap.
     for(ReadId qn = 0; qn < readCount; ++qn) {
         if(qn >= validReadIntervals.size() || validReadIntervals[qn].isDeleted) continue;
-        if(reads->getFlags(qn).isContained) continue;
 
         const auto& vrQ = validReadIntervals[qn];
         const int32_t ql = int32_t(vrQ.end - vrQ.start);
@@ -1571,69 +1664,90 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
         if(oid.getValue() >= alignmentTable.size()) continue;
 
         const auto& table = alignmentTable[oid.getValue()];
-        for(uint32_t alignmentId : table) {
-            const AlignmentData& ad = alignmentData[alignmentId];
-            if(!ad.keptByBothSides()) continue;
+        if(table.empty()) continue;
 
+        int64_t bestScore = std::numeric_limits<int64_t>::min();
+        uint32_t bestAlignmentId = std::numeric_limits<uint32_t>::max();
+        for(const uint32_t alignmentId : table) {
+            if(alignmentId >= alignmentCount) continue;
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if(restrictToCurrentReadGraph && (ad.info.isInReadGraph == 0)) continue;
+            if(!ad.keptByBothSides()) continue;
             const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
             if(tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
-            if(reads->getFlags(tn).isContained) continue;
 
-            const auto& vrT = validReadIntervals[tn];
-            const int32_t tl = int32_t(vrT.end - vrT.start);
-            if(tl <= 0) continue;
-
-            const bool rev = !ad.isSameStrand;
-            int32_t qs = 0, qe = 0, ts = 0, te = 0;
-            if(ad.readIds[0] == qn) {
-                qs = int32_t(ad.qs);
-                qe = int32_t(ad.qe);
-                ts = int32_t(ad.ts);
-                te = int32_t(ad.te);
-            } else {
-                qs = int32_t(ad.ts);
-                qe = int32_t(ad.te);
-                ts = int32_t(ad.qs);
-                te = int32_t(ad.qe);
+            const int64_t score = ad.info.hifiasmDpScoreOrApprox(0);
+            if(score > bestScore || (score == bestScore && alignmentId < bestAlignmentId)) {
+                bestScore = score;
+                bestAlignmentId = alignmentId;
             }
-            if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
-            if(qs >= qe || ts >= te) continue;
-            if(qs > ql || qe > ql || ts > tl || te > tl) continue;
+        }
 
-            const int result = ma_hit2arc_containment(
-                qs, qe, ql,
-                ts, te, tl,
-                rev,
-                int32_t(maxHang),
-                maxHangRate,
-                int32_t(minOverlapLength)
-            );
+        if(bestAlignmentId == std::numeric_limits<uint32_t>::max()) continue;
+        const AlignmentData& ad = alignmentData[bestAlignmentId];
+        const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
+        if(tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
+        const auto& vrT = validReadIntervals[tn];
+        const int32_t tl = int32_t(vrT.end - vrT.start);
+        if(tl <= 0) continue;
 
-            if(result == 1) {
-                if(!reads->getFlags(qn).isContained) {
-                    reads->setContainedFlag(qn, true);
-                    (*containmentParent)[qn] = tn;
-                    ++containedReadCount;
-                }
-                break;
-            } else if(result == 2) {
-                if(!reads->getFlags(tn).isContained) {
-                    reads->setContainedFlag(tn, true);
-                    (*containmentParent)[tn] = qn;
-                    ++containedReadCount;
-                }
-            }
+        const bool rev = !ad.isSameStrand;
+        int32_t qs = 0, qe = 0, ts = 0, te = 0;
+        if(ad.readIds[0] == qn) {
+            qs = int32_t(ad.qs);
+            qe = int32_t(ad.qe);
+            ts = int32_t(ad.ts);
+            te = int32_t(ad.te);
+        } else {
+            qs = int32_t(ad.ts);
+            qe = int32_t(ad.te);
+            ts = int32_t(ad.qs);
+            te = int32_t(ad.qe);
+        }
+        if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
+        if(qs >= qe || ts >= te) continue;
+        if(qs > ql || qe > ql || ts > tl || te > tl) continue;
+
+        const int result = ma_hit2arc_containment(
+            qs, qe, ql,
+            ts, te, tl,
+            rev,
+            int32_t(maxHang),
+            maxHangRate,
+            int32_t(minOverlapLength)
+        );
+
+        if(result == 1) {
+            reads->setContainedFlag(qn, true);
+            (*containmentParent)[qn] = tn;
+            ++containedReadCount;
         }
     }
 
     // Compress containment chains.
     for(ReadId r = 0; r < readCount; ++r) {
         if((*containmentParent)[r] == ReadId(invalidReadId)) continue;
-        ReadId root = (*containmentParent)[r];
+        ReadId root = r;
+        vector<ReadId> visited;
+        visited.reserve(16);
         while(root != ReadId(invalidReadId) && (*containmentParent)[root] != ReadId(invalidReadId)) {
+            if(std::find(visited.begin(), visited.end(), root) != visited.end()) {
+                // Cycle detected (can happen for identical reads). Break deterministically by choosing
+                // the smallest read id in the cycle as the root container.
+                ReadId cycleRoot = root;
+                for(const ReadId x : visited) {
+                    if(x < cycleRoot) cycleRoot = x;
+                }
+                (*containmentParent)[r] = cycleRoot;
+                root = ReadId(invalidReadId);
+                break;
+            }
+            visited.push_back(root);
             root = (*containmentParent)[root];
         }
-        (*containmentParent)[r] = root;
+        if(root != ReadId(invalidReadId)) {
+            (*containmentParent)[r] = root;
+        }
     }
 
     cout << timestamp << "Flagged " << containedReadCount << " contained reads." << endl;
@@ -1779,7 +1893,9 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
             if (restrictToCurrentReadGraph && (ad.info.isInReadGraph == 0)) {
                 continue;
             }
-            ad.addDeleteReasonsFromReadPerspective(r, AlignmentData::DeleteReasonContainedPrune);
+            // This diagnostic pruning is intended to remove overlaps from the read graph, so
+            // we mark the overlap deleted from both sides (AND semantics).
+            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContainedPrune);
             ++overlapsPruned;
         }
     }
