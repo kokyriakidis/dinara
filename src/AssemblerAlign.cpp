@@ -1097,8 +1097,10 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Cis/Trans Status
             thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
             
-            // Alignment covers an informative het site
-            thisAlignmentData.coversHetSite = false;
+            // Alignment covers an informative het site (counted per read perspective during EC parity)
+            thisAlignmentData.informativeHetSiteCount0 = 0;
+            thisAlignmentData.informativeHetSiteCount1 = 0;
+            thisAlignmentData.informativeHetSiteScore = 0;
             
             // Alignment deletion reasons (none by default)
             thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
@@ -1680,6 +1682,143 @@ vector< pair<OrientedReadId, dinara::AlignmentInfo> >
         result.push_back(make_pair(orientedReadId1, alignmentInfo));
     }
     return result;
+}
+
+
+
+void Assembler::getAlignmentIdsSortedByInformativeSites(
+    OrientedReadId orientedReadId0,
+    vector<uint32_t>& alignmentIds,
+    bool inReadGraphOnly) const
+{
+    checkAlignmentDataAreOpen();
+    DINARA_ASSERT(alignmentTable.isOpen());
+
+    const ReadId readId0 = orientedReadId0.getReadId();
+    const span<const uint32_t> table = alignmentTable[orientedReadId0.getValue()];
+
+    alignmentIds.clear();
+    alignmentIds.reserve(table.size());
+    for(const uint32_t alignmentId : table) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        if(inReadGraphOnly && (ad.info.isInReadGraph == 0)) {
+            continue;
+        }
+        alignmentIds.push_back(alignmentId);
+    }
+
+    auto overlapLenOnRead = [&](const AlignmentData& ad) -> uint64_t {
+        if(ad.readIds[0] == readId0) {
+            return uint64_t(ad.qe) - uint64_t(ad.qs);
+        } else {
+            return uint64_t(ad.te) - uint64_t(ad.ts);
+        }
+    };
+
+    sort(
+        alignmentIds.begin(),
+        alignmentIds.end(),
+        [&](uint32_t aId, uint32_t bId) {
+            const AlignmentData& a = alignmentData[aId];
+            const AlignmentData& b = alignmentData[bId];
+            const uint32_t aCount = a.getInformativeHetSiteCountFromReadPerspective(readId0);
+            const uint32_t bCount = b.getInformativeHetSiteCountFromReadPerspective(readId0);
+            if(aCount != bCount) {
+                return aCount > bCount;
+            }
+            const uint64_t aLen = overlapLenOnRead(a);
+            const uint64_t bLen = overlapLenOnRead(b);
+            if(aLen != bLen) {
+                return aLen > bLen;
+            }
+            return aId < bId;
+        });
+}
+
+
+
+void Assembler::getCisAlignmentIdsSortedByInformativeSites(
+    OrientedReadId orientedReadId0,
+    vector<uint32_t>& alignmentIds,
+    bool keptByBothSidesOnly) const
+{
+    checkAlignmentDataAreOpen();
+    DINARA_ASSERT(alignmentTable.isOpen());
+
+    const ReadId readId0 = orientedReadId0.getReadId();
+    const span<const uint32_t> table = alignmentTable[orientedReadId0.getValue()];
+
+    alignmentIds.clear();
+    alignmentIds.reserve(table.size());
+    for(const uint32_t alignmentId : table) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        if(!ad.isCisByBothSides()) {
+            continue;
+        }
+        if(keptByBothSidesOnly && !ad.keptByBothSides()) {
+            continue;
+        }
+        alignmentIds.push_back(alignmentId);
+    }
+
+    auto overlapLenOnRead = [&](const AlignmentData& ad) -> uint64_t {
+        if(ad.readIds[0] == readId0) {
+            return uint64_t(ad.qe) - uint64_t(ad.qs);
+        } else {
+            return uint64_t(ad.te) - uint64_t(ad.ts);
+        }
+    };
+
+    sort(
+        alignmentIds.begin(),
+        alignmentIds.end(),
+        [&](uint32_t aId, uint32_t bId) {
+            const AlignmentData& a = alignmentData[aId];
+            const AlignmentData& b = alignmentData[bId];
+            if(a.informativeHetSiteScore != b.informativeHetSiteScore) {
+                return a.informativeHetSiteScore > b.informativeHetSiteScore;
+            }
+            const uint64_t aLen = overlapLenOnRead(a);
+            const uint64_t bLen = overlapLenOnRead(b);
+            if(aLen != bLen) {
+                return aLen > bLen;
+            }
+            return aId < bId;
+        });
+}
+
+void Assembler::getAllCisAlignmentIdsSortedByInformativeSites(
+    vector<uint32_t>& alignmentIds,
+    bool keptByBothSidesOnly) const
+{
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+
+    alignmentIds.clear();
+    alignmentIds.reserve(alignmentCount);
+    for(uint32_t alignmentId = 0; alignmentId < alignmentCount; ++alignmentId) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        if(!ad.isCisByBothSides()) {
+            continue;
+        }
+        if(keptByBothSidesOnly && !ad.keptByBothSides()) {
+            continue;
+        }
+        alignmentIds.push_back(alignmentId);
+    }
+
+    sort(
+        alignmentIds.begin(),
+        alignmentIds.end(),
+        [&](uint32_t aId, uint32_t bId) {
+            const AlignmentData& a = alignmentData[aId];
+            const AlignmentData& b = alignmentData[bId];
+            if(a.informativeHetSiteScore != b.informativeHetSiteScore) {
+                return a.informativeHetSiteScore > b.informativeHetSiteScore;
+            }
+            return aId < bId;
+        });
 }
 
 

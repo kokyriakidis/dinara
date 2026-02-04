@@ -18,6 +18,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace dinara;
 using namespace std;
@@ -2112,7 +2113,9 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesAtOver
 shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
     uint64_t minAnchorCoverage,
     uint64_t maxAnchorCoverage,
-    uint64_t threadCount)
+    uint64_t threadCount,
+    bool enableColinearityPeeling,
+    double minDominantFractionToPeel)
 {
     reads->checkReadsAreOpen();
     checkMarkersAreOpen();
@@ -2131,10 +2134,23 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
     const uint64_t orientedReadCount = 2 * readCount;
     const auto& mgVertices = markerGraph.vertices();
 
+    struct ChainEntry {
+        uint32_t ordinal = 0;
+        MarkerGraphVertexId vertexId = MarkerGraph::invalidVertexId;
+    };
+
     struct Event {
         uint32_t ordinal = 0;
-        int32_t delta = 0; // +1 start, -1 end (end = lastOrdinal+1)
+        int8_t delta = 0;  // +1 start, -1 end (end = lastOrdinal+1)
+        ReadId otherOrientedReadValue = invalidReadId;
     };
+
+    // Optional: per oriented read, store the chosen canonical vertex chain as (ordinal, vertexId).
+    // This is used to derive local colinearity/context signatures for vertex peeling/splitting.
+    vector<vector<ChainEntry>> chosenVertexChains;
+    if(enableColinearityPeeling) {
+        chosenVertexChains.resize(orientedReadCount);
+    }
 
     vector<vector<MarkerGraphVertexId>> threadSelected(threadCount);
 
@@ -2153,17 +2169,30 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
             vector<Event> events;
             events.reserve(512);
 
-            vector<Event> merged;
-            merged.reserve(512);
-
             std::unordered_map<MarkerGraphVertexId, bool> duplicateReadIdCache;
             duplicateReadIdCache.reserve(4096);
+
+            // Track active overlap neighbors while sweeping event ordinals.
+            std::unordered_map<ReadId, uint32_t> activeNeighborCount;
+            activeNeighborCount.reserve(256);
+            vector<pair<MarkerId, MarkerId>> neighborRanges;
+            neighborRanges.reserve(256);
+
+            // Cache per-segment "explained neighbor" counts for candidate vertices.
+            std::unordered_map<MarkerGraphVertexId, uint32_t> explainedCache;
+            explainedCache.reserve(128);
 
             for(uint64_t v=begin; v<end; ++v) {
                 const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(v));
                 const uint32_t markerCount = uint32_t(markers->size(orientedReadId.getValue()));
                 if(markerCount == 0) {
                     continue;
+                }
+
+                vector<ChainEntry>* chainPointer = nullptr;
+                if(enableColinearityPeeling) {
+                    chainPointer = &chosenVertexChains[v];
+                    chainPointer->clear();
                 }
 
                 events.clear();
@@ -2176,7 +2205,12 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                     }
                     const uint64_t alignmentId = edge.alignmentId;
                     const AlignmentData& ad = alignmentData[alignmentId];
-                    if(ad.isDeleted()) {
+                    // Prefer AND semantics: only use overlaps that both reads keep.
+                    if(!ad.keptByBothSides()) {
+                        continue;
+                    }
+                    // If cis/trans is populated, skip trans edges when defining segments.
+                    if(ad.cisTransStatus == CisTransStatus::Trans) {
                         continue;
                     }
                     if(!ad.info.isInReadGraph) {
@@ -2189,11 +2223,11 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                     const uint32_t first = info.data[0].firstOrdinal;
                     const uint32_t last = info.data[0].lastOrdinal;
                     if(first < markerCount) {
-                        events.push_back({first, +1});
+                        events.push_back({first, +1, other.getValue()});
                     }
                     const uint32_t afterLast = last + 1;
                     if(afterLast < markerCount) {
-                        events.push_back({afterLast, -1});
+                        events.push_back({afterLast, -1, other.getValue()});
                     }
                 }
 
@@ -2202,47 +2236,146 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                 }
 
                 std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
-                    return a.ordinal < b.ordinal;
+                    if(a.ordinal != b.ordinal) {
+                        return a.ordinal < b.ordinal;
+                    }
+                    // Order does not matter for correctness (we apply all events at the same ordinal),
+                    // but deterministic ordering helps reproducibility.
+                    if(a.delta != b.delta) {
+                        return a.delta > b.delta;
+                    }
+                    return a.otherOrientedReadValue < b.otherOrientedReadValue;
                 });
 
-                merged.clear();
-                for(const auto& e : events) {
-                    if(merged.empty() || merged.back().ordinal != e.ordinal) {
-                        merged.push_back(e);
-                    } else {
-                        merged.back().delta += e.delta;
-                    }
-                }
-
-                int32_t active = 0;
+                activeNeighborCount.clear();
+                int32_t activeOverlapCount = 0;
                 MarkerGraphVertexId lastSelected = MarkerGraph::invalidVertexId;
 
-                for(size_t i=0; i<merged.size(); ++i) {
-                    active += merged[i].delta;
+                // Sweep over distinct event ordinals.
+                for(size_t i=0; i<events.size(); ) {
+                    const uint32_t segmentStart = events[i].ordinal;
 
-                    const uint32_t segmentStart = merged[i].ordinal;
-                    const uint32_t segmentEnd = (i + 1 < merged.size()) ? merged[i + 1].ordinal : markerCount;
-                    if(active <= 0) {
+                    // Apply all events at this ordinal before processing the segment starting here.
+                    while(i < events.size() && events[i].ordinal == segmentStart) {
+                        const Event& e = events[i];
+                        activeOverlapCount += e.delta;
+                        const ReadId otherValue = e.otherOrientedReadValue;
+                        if(otherValue != invalidReadId) {
+                            if(e.delta > 0) {
+                                ++activeNeighborCount[otherValue];
+                            } else {
+                                auto it = activeNeighborCount.find(otherValue);
+                                if(it != activeNeighborCount.end()) {
+                                    if(it->second > 1) {
+                                        --it->second;
+                                    } else {
+                                        activeNeighborCount.erase(it);
+                                    }
+                                }
+                            }
+                        }
+                        ++i;
+                    }
+
+                    const uint32_t segmentEnd = (i < events.size()) ? events[i].ordinal : markerCount;
+                    if(activeOverlapCount <= 0) {
                         continue;
                     }
                     if(segmentEnd <= segmentStart) {
                         continue;
                     }
 
-                    // Scan all ordinals in this interval to pick the vertex with maximum coverage.
+                    // Build marker-id ranges for currently active overlap neighbors.
+                    // Each oriented read corresponds to a contiguous range of global MarkerIds.
+                    neighborRanges.clear();
+                    neighborRanges.reserve(activeNeighborCount.size());
+                    for(const auto& p : activeNeighborCount) {
+                        const ReadId otherValue = p.first;
+                        if(otherValue == orientedReadId.getValue()) {
+                            continue;
+                        }
+                        const OrientedReadId other = OrientedReadId::fromValue(otherValue);
+                        const uint32_t otherMarkerCount = uint32_t(markers->size(otherValue));
+                        if(otherMarkerCount == 0) {
+                            continue;
+                        }
+                        const MarkerId beginMarkerId = getMarkerId(other, 0);
+                        neighborRanges.push_back({beginMarkerId, beginMarkerId + otherMarkerCount});
+                    }
+                    std::sort(neighborRanges.begin(), neighborRanges.end(),
+                        [](const auto& a, const auto& b) { return a.first < b.first; });
+
+                    explainedCache.clear();
+
+                    // Scan all ordinals in this segment and select the "best" marker graph vertex.
                     // Canonicalize by RC to avoid duplicates.
+                    // In addition to coverage, score candidates by how well they explain the
+                    // currently-active overlap neighborhood of this read (read-local context).
                     const uint32_t mid = segmentStart + (segmentEnd - segmentStart) / 2;
-                    // Prefer a "clean" vertex with no duplicate ReadIds (does not contain both strands of any read).
-                    // If none exist in this interval, fall back to the best vertex regardless.
+
+                    uint32_t bestAnyExplained = 0;
                     uint64_t bestAnyCov = 0;
                     MarkerGraphVertexId bestAny = MarkerGraph::invalidVertexId;
                     uint32_t bestAnyDistanceToMid = std::numeric_limits<uint32_t>::max();
+                    uint32_t bestAnyOrdinal = std::numeric_limits<uint32_t>::max();
 
+                    uint32_t bestCleanExplained = 0;
                     uint64_t bestCleanCov = 0;
                     MarkerGraphVertexId bestClean = MarkerGraph::invalidVertexId;
                     uint32_t bestCleanDistanceToMid = std::numeric_limits<uint32_t>::max();
+                    uint32_t bestCleanOrdinal = std::numeric_limits<uint32_t>::max();
 
                     MarkerGraphVertexId previous = MarkerGraph::invalidVertexId;
+
+                    auto isBetterCandidate =
+                        [](uint32_t explained,
+                           uint64_t cov,
+                           uint32_t distanceToMid,
+                           MarkerGraphVertexId canonical,
+                           uint32_t bestExplained,
+                           uint64_t bestCov,
+                           uint32_t bestDistanceToMid,
+                           MarkerGraphVertexId bestCanonical) -> bool
+                        {
+                            if(canonical == MarkerGraph::invalidVertexId) {
+                                return false;
+                            }
+                            if(bestCanonical == MarkerGraph::invalidVertexId) {
+                                return true;
+                            }
+                            if(explained != bestExplained) {
+                                return explained > bestExplained;
+                            }
+                            if(cov != bestCov) {
+                                return cov > bestCov;
+                            }
+                            if(distanceToMid != bestDistanceToMid) {
+                                return distanceToMid < bestDistanceToMid;
+                            }
+                            return canonical < bestCanonical;
+                        };
+
+                    auto countExplainedNeighbors = [&](MarkerGraphVertexId vertexId) -> uint32_t {
+                        auto it = explainedCache.find(vertexId);
+                        if(it != explainedCache.end()) {
+                            return it->second;
+                        }
+                        uint32_t explained = 0;
+                        if(!neighborRanges.empty()) {
+                            const span<const MarkerId> vertexMarkerIds = mgVertices[vertexId];
+                            for(const auto& r : neighborRanges) {
+                                const MarkerId beginId = r.first;
+                                const MarkerId endId = r.second;
+                                auto posIt = std::lower_bound(vertexMarkerIds.begin(), vertexMarkerIds.end(), beginId);
+                                if(posIt != vertexMarkerIds.end() && *posIt < endId) {
+                                    ++explained;
+                                }
+                            }
+                        }
+                        explainedCache.insert({vertexId, explained});
+                        return explained;
+                    };
+
                     for(uint32_t ordinal = segmentStart; ordinal < segmentEnd; ++ordinal) {
                         const MarkerId markerId = getMarkerId(orientedReadId, ordinal);
                         const auto compressedVertex = markerGraph.vertexTable[markerId];
@@ -2266,19 +2399,24 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                         previous = canonical;
 
                         const uint32_t distanceToMid = (ordinal > mid) ? (ordinal - mid) : (mid - ordinal);
+
+                        const uint32_t explained = countExplainedNeighbors(vertexId);
+
                         // Update best-any (no cleanliness constraint).
-                        if(cov > bestAnyCov ||
-                           (cov == bestAnyCov && distanceToMid < bestAnyDistanceToMid) ||
-                           (cov == bestAnyCov && distanceToMid == bestAnyDistanceToMid && canonical < bestAny)) {
+                        if(isBetterCandidate(
+                               explained, cov, distanceToMid, canonical,
+                               bestAnyExplained, bestAnyCov, bestAnyDistanceToMid, bestAny)) {
+                            bestAnyExplained = explained;
                             bestAnyCov = cov;
                             bestAny = canonical;
                             bestAnyDistanceToMid = distanceToMid;
+                            bestAnyOrdinal = ordinal;
                         }
 
                         // Update best-clean only if this vertex has no duplicate ReadIds.
-                        if(cov > bestCleanCov ||
-                           (cov == bestCleanCov && distanceToMid < bestCleanDistanceToMid) ||
-                           (cov == bestCleanCov && distanceToMid == bestCleanDistanceToMid && canonical < bestClean)) {
+                        if(isBetterCandidate(
+                               explained, cov, distanceToMid, canonical,
+                               bestCleanExplained, bestCleanCov, bestCleanDistanceToMid, bestClean)) {
                             auto dupIt = duplicateReadIdCache.find(canonical);
                             bool hasDuplicateReadIds = false;
                             if(dupIt != duplicateReadIdCache.end()) {
@@ -2288,9 +2426,11 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                                 duplicateReadIdCache.insert({canonical, hasDuplicateReadIds});
                             }
                             if(!hasDuplicateReadIds) {
+                                bestCleanExplained = explained;
                                 bestCleanCov = cov;
                                 bestClean = canonical;
                                 bestCleanDistanceToMid = distanceToMid;
+                                bestCleanOrdinal = ordinal;
                                 // Only safe to early-exit if we found a clean vertex at maximum allowed coverage.
                                 if(bestCleanCov == maxAnchorCoverage) {
                                     break;
@@ -2299,8 +2439,16 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                         }
                     }
 
-                    const MarkerGraphVertexId chosen =
-                        (bestClean != MarkerGraph::invalidVertexId) ? bestClean : bestAny;
+                    // Prefer the candidate that best matches the active overlap neighborhood.
+                    // Use cleanliness (no duplicate ReadIds) as a tie-breaker, not as an absolute rule.
+                    MarkerGraphVertexId chosen = bestAny;
+                    if(bestClean != MarkerGraph::invalidVertexId) {
+                        if(bestAny == MarkerGraph::invalidVertexId ||
+                            bestCleanExplained > bestAnyExplained ||
+                            (bestCleanExplained == bestAnyExplained)) {
+                            chosen = bestClean;
+                        }
+                    }
                     if(chosen == MarkerGraph::invalidVertexId) {
                         continue;
                     }
@@ -2308,6 +2456,15 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                         continue;
                     }
                     out.push_back(chosen);
+                    if(chainPointer) {
+                        uint32_t chosenOrdinal = bestAnyOrdinal;
+                        if(chosen == bestClean) {
+                            chosenOrdinal = bestCleanOrdinal;
+                        }
+                        if(chosenOrdinal != std::numeric_limits<uint32_t>::max()) {
+                            chainPointer->push_back(ChainEntry{chosenOrdinal, chosen});
+                        }
+                    }
                     lastSelected = chosen;
                 }
             }
@@ -2333,15 +2490,298 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
     cout << timestamp << "Selected " << selected.size()
          << " marker graph vertices (best per overlap interval) for anchors." << endl;
 
+    if(!enableColinearityPeeling) {
+        return make_shared<mode3::Anchors>(
+            MappedMemoryOwner(*this),
+            getReads(),
+            assemblerInfo->k,
+            *markers,
+            markerGraph,
+            selected,
+            minAnchorCoverage,
+            maxAnchorCoverage,
+            threadCount);
+    }
+
+    if(minDominantFractionToPeel < 0.) {
+        minDominantFractionToPeel = 0.;
+    }
+    if(minDominantFractionToPeel > 1.) {
+        minDominantFractionToPeel = 1.;
+    }
+
+    struct CtxKey {
+        MarkerGraphVertexId a = MarkerGraph::invalidVertexId;
+        MarkerGraphVertexId b = MarkerGraph::invalidVertexId; // a <= b
+    };
+    struct CtxKeyHash {
+        size_t operator()(const CtxKey& k) const
+        {
+            // Hash-combine (boost-like).
+            const uint64_t x = k.a;
+            const uint64_t y = k.b;
+            uint64_t h = x + 0x9e3779b97f4a7c15ULL;
+            h ^= y + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+            return size_t(h);
+        }
+    };
+    struct CtxKeyEq {
+        bool operator()(const CtxKey& x, const CtxKey& y) const
+        {
+            return x.a == y.a && x.b == y.b;
+        }
+    };
+
+    constexpr double maxUnclassifiedFractionToAct = 0.10;
+    constexpr double minTwoClusterExplainedFractionToSplit = 0.95;
+    constexpr double minSecondFractionToSplit = 0.25;
+
+    vector<vector<vector<Interval>>> threadAnchors(threadCount);
+    vector<pair<uint64_t, uint64_t>> threadSplitPeelCounts(threadCount, {0, 0});
+
+    const uint64_t selectedCount = uint64_t(selected.size());
+    uint64_t selectedChunk = (threadCount == 0) ? selectedCount : (selectedCount / threadCount);
+    if(selectedChunk == 0) {
+        selectedChunk = 1;
+    }
+
+    threads.clear();
+    threads.reserve(threadCount);
+    for(uint64_t t=0; t<threadCount; ++t) {
+        threads.emplace_back([&, t]() {
+            const uint64_t begin = t * selectedChunk;
+            const uint64_t end =
+                (t == threadCount - 1) ? selectedCount : min(selectedCount, (t + 1) * selectedChunk);
+            auto& outAnchors = threadAnchors[t];
+            outAnchors.reserve((end - begin) * 2ULL);
+
+            uint64_t splitCount = 0;
+            uint64_t peelCount = 0;
+
+            vector<Interval> vertexIntervals;
+            vector<Interval> filteredA;
+            vector<Interval> filteredB;
+            vector<CtxKey> ctxKeys;
+            std::unordered_map<CtxKey, uint32_t, CtxKeyHash, CtxKeyEq> ctxCounts;
+            ctxCounts.reserve(64);
+
+            for(uint64_t i=begin; i<end; ++i) {
+                const MarkerGraphVertexId vertexId = selected[i];
+                const auto vertexMarkerIds = mgVertices[vertexId];
+                if(vertexMarkerIds.empty()) {
+                    continue;
+                }
+
+                vertexIntervals.clear();
+                vertexIntervals.reserve(vertexMarkerIds.size());
+                for(const MarkerId markerId : vertexMarkerIds) {
+                    OrientedReadId orientedReadId;
+                    uint32_t ordinal0;
+                    tie(orientedReadId, ordinal0) = dinara::findMarkerId(markerId, *markers);
+                    vertexIntervals.push_back(Interval{orientedReadId, ordinal0});
+                }
+
+                std::sort(vertexIntervals.begin(), vertexIntervals.end(),
+                    [](const Interval& a, const Interval& b) {
+                        if(a.orientedReadId != b.orientedReadId) {
+                            return a.orientedReadId < b.orientedReadId;
+                        }
+                        return a.ordinal0 < b.ordinal0;
+                    });
+                vertexIntervals.erase(
+                    std::unique(vertexIntervals.begin(), vertexIntervals.end(),
+                        [](const Interval& a, const Interval& b) {
+                            return a.orientedReadId == b.orientedReadId;
+                        }),
+                    vertexIntervals.end());
+
+                if(vertexIntervals.size() < minAnchorCoverage || vertexIntervals.size() > maxAnchorCoverage) {
+                    continue;
+                }
+
+                bool didSplitOrPeel = false;
+
+                // Compute per-read local context signature for this vertex using the per-read chain.
+                ctxCounts.clear();
+                ctxKeys.clear();
+                ctxKeys.reserve(vertexIntervals.size());
+                size_t classified = 0;
+                size_t unclassified = 0;
+                for(const Interval& interval : vertexIntervals) {
+                    const ReadId orientedReadValue = interval.orientedReadId.getValue();
+                    const auto& chain = chosenVertexChains[orientedReadValue];
+
+                    CtxKey key;
+                    if(!chain.empty()) {
+                        const auto it = std::lower_bound(
+                            chain.begin(), chain.end(), interval.ordinal0,
+                            [](const ChainEntry& e, uint32_t ordinal) { return e.ordinal < ordinal; });
+                        const size_t pos = size_t(it - chain.begin());
+
+                        // If this vertex appears in the chain near this ordinal, use its immediate neighbors.
+                        const bool matchAt = (pos < chain.size() && chain[pos].vertexId == vertexId);
+                        const bool matchBefore = (pos > 0 && chain[pos - 1].vertexId == vertexId);
+
+                        MarkerGraphVertexId prev = MarkerGraph::invalidVertexId;
+                        MarkerGraphVertexId next = MarkerGraph::invalidVertexId;
+                        if(matchAt && matchBefore) {
+                            // Ambiguous (two occurrences straddling ordinal). Leave unclassified.
+                        } else if(matchAt || matchBefore) {
+                            const size_t occ = matchAt ? pos : (pos - 1);
+                            if(occ > 0) {
+                                prev = chain[occ - 1].vertexId;
+                            }
+                            if(occ + 1 < chain.size()) {
+                                next = chain[occ + 1].vertexId;
+                            }
+                        } else {
+                            // Vertex not present in the chain at this location: use the surrounding chain entries.
+                            if(pos > 0) {
+                                prev = chain[pos - 1].vertexId;
+                            }
+                            if(pos < chain.size()) {
+                                next = chain[pos].vertexId;
+                            }
+                        }
+
+                        if(prev != MarkerGraph::invalidVertexId || next != MarkerGraph::invalidVertexId) {
+                            key.a = prev;
+                            key.b = next;
+                            if(key.a > key.b) {
+                                std::swap(key.a, key.b);
+                            }
+                        }
+                    }
+
+                    ctxKeys.push_back(key);
+                    if(key.a == MarkerGraph::invalidVertexId && key.b == MarkerGraph::invalidVertexId) {
+                        ++unclassified;
+                    } else {
+                        ++classified;
+                        ++ctxCounts[key];
+                    }
+                }
+
+                if(!ctxCounts.empty() && classified >= size_t(minAnchorCoverage)) {
+                    const double unclassifiedFraction = double(unclassified) / double(vertexIntervals.size());
+                    if(unclassifiedFraction <= maxUnclassifiedFractionToAct) {
+                        // Find the top two context signatures by read count.
+                        CtxKey bestKey;
+                        CtxKey secondKey;
+                        uint32_t bestCount = 0;
+                        uint32_t secondCount = 0;
+                        for(const auto& p : ctxCounts) {
+                            const uint32_t count = p.second;
+                            if(count > bestCount) {
+                                secondCount = bestCount;
+                                secondKey = bestKey;
+                                bestCount = count;
+                                bestKey = p.first;
+                            } else if(count > secondCount) {
+                                secondCount = count;
+                                secondKey = p.first;
+                            }
+                        }
+
+                        if(bestCount > 0) {
+                            const double bestFraction = double(bestCount) / double(classified);
+                            const double secondFraction = double(secondCount) / double(classified);
+                            const double twoClusterFraction = double(bestCount + secondCount) / double(classified);
+
+                            // Split when extremely clear: two dominant signatures explain almost everything.
+                            if(secondCount >= minAnchorCoverage &&
+                                secondFraction >= minSecondFractionToSplit &&
+                                twoClusterFraction >= minTwoClusterExplainedFractionToSplit) {
+
+                                filteredA.clear();
+                                filteredB.clear();
+                                filteredA.reserve(bestCount);
+                                filteredB.reserve(secondCount);
+                                for(size_t j=0; j<vertexIntervals.size(); ++j) {
+                                    const CtxKey& k = ctxKeys[j];
+                                    if(k.a == bestKey.a && k.b == bestKey.b) {
+                                        filteredA.push_back(vertexIntervals[j]);
+                                    } else if(k.a == secondKey.a && k.b == secondKey.b) {
+                                        filteredB.push_back(vertexIntervals[j]);
+                                    }
+                                }
+
+                                if(filteredA.size() >= minAnchorCoverage && filteredB.size() >= minAnchorCoverage) {
+                                    outAnchors.push_back(filteredA);
+                                    outAnchors.push_back(reverseComplementAnchor(filteredA, *markers));
+                                    outAnchors.push_back(filteredB);
+                                    outAnchors.push_back(reverseComplementAnchor(filteredB, *markers));
+                                    ++splitCount;
+                                    didSplitOrPeel = true;
+                                }
+                            }
+
+                            // If we didn't split, we can still peel to the dominant signature when clear.
+                            if(!didSplitOrPeel &&
+                                bestFraction >= minDominantFractionToPeel &&
+                                bestCount < vertexIntervals.size()) {
+                                filteredA.clear();
+                                filteredA.reserve(bestCount);
+                                for(size_t j=0; j<vertexIntervals.size(); ++j) {
+                                    const CtxKey& k = ctxKeys[j];
+                                    if(k.a == bestKey.a && k.b == bestKey.b) {
+                                        filteredA.push_back(vertexIntervals[j]);
+                                    }
+                                }
+                                if(filteredA.size() >= minAnchorCoverage) {
+                                    outAnchors.push_back(filteredA);
+                                    outAnchors.push_back(reverseComplementAnchor(filteredA, *markers));
+                                    ++peelCount;
+                                    didSplitOrPeel = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if(!didSplitOrPeel) {
+                    outAnchors.push_back(vertexIntervals);
+                    outAnchors.push_back(reverseComplementAnchor(vertexIntervals, *markers));
+                }
+            }
+
+            threadSplitPeelCounts[t] = {splitCount, peelCount};
+        });
+    }
+
+    for(auto& th : threads) {
+        th.join();
+    }
+
+    uint64_t splitTotal = 0;
+    uint64_t peelTotal = 0;
+    size_t totalExplicit = 0;
+    for(uint64_t t=0; t<threadCount; ++t) {
+        splitTotal += threadSplitPeelCounts[t].first;
+        peelTotal += threadSplitPeelCounts[t].second;
+        totalExplicit += threadAnchors[t].size();
+    }
+
+    vector<vector<Interval>> anchorsExplicit;
+    anchorsExplicit.reserve(totalExplicit);
+    for(uint64_t t=0; t<threadCount; ++t) {
+        for(auto& anchor : threadAnchors[t]) {
+            anchorsExplicit.push_back(std::move(anchor));
+        }
+    }
+
+    if(splitTotal > 0 || peelTotal > 0) {
+        cout << timestamp << "Colinearity vertex peeling: split=" << splitTotal
+             << ", peeled=" << peelTotal << endl;
+    }
+
     return make_shared<mode3::Anchors>(
         MappedMemoryOwner(*this),
         getReads(),
         assemblerInfo->k,
         *markers,
-        markerGraph,
-        selected,
-        minAnchorCoverage,
-        maxAnchorCoverage,
+        anchorsExplicit,
+        /*ordinalOffset*/ 0,
         threadCount);
 }
 
@@ -3094,7 +3534,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
         // and avoids missing directional phasing cases that were filtered out by conservative AND.
         for(uint64_t alignmentId=0; alignmentId<alignmentData.size(); ++alignmentId) {
             const AlignmentData& ad = alignmentData[alignmentId];
-            if(!ad.coversHetSite) {
+            if(!ad.coversHetSite()) {
                 continue;
             }
             restrictToInformativeHetReads = true;

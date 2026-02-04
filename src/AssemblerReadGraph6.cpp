@@ -14,6 +14,109 @@ void Assembler::createReadGraph6()
     createReadGraph6(std::thread::hardware_concurrency());
 }
 
+void Assembler::createReadGraphFromEcParityCisOverlaps()
+{
+    createReadGraphFromEcParityCisOverlaps(std::thread::hardware_concurrency(), /*rebuildDirectedReadGraph*/ false);
+}
+
+void Assembler::createReadGraphFromEcParityCisOverlaps(
+    uint64_t /*threadCount*/,
+    bool rebuildDirectedReadGraph)
+{
+    cout << timestamp << "createReadGraphFromEcParityCisOverlaps begins." << endl;
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+
+    // Avoid vector<bool> in parallel loops (it is bit-packed and can race).
+    vector<uint8_t> keepAlignmentByte(alignmentCount, 0);
+    uint64_t keptCount = 0;
+    uint64_t filteredCount = 0;
+
+    #pragma omp parallel for reduction(+:keptCount, filteredCount)
+    for(uint64_t i = 0; i < alignmentCount; i++) {
+        const AlignmentData& ad = alignmentData[i];
+        const bool cis0 = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
+        const bool cis1 = ((ad.deleteReasons1 & AlignmentData::DeleteReasonPhase) == 0);
+        const bool keep = cis0 && cis1;
+        keepAlignmentByte[i] = keep ? 1 : 0;
+        if(keep) {
+            ++keptCount;
+        } else {
+            ++filteredCount;
+        }
+    }
+
+    cout << timestamp << "Kept " << keptCount << " / " << alignmentCount
+         << " alignments (phasing cis only), filtered " << filteredCount << "." << endl;
+
+    vector<bool> keepAlignment(alignmentCount, false);
+    for(uint64_t i = 0; i < alignmentCount; ++i) {
+        keepAlignment[i] = (keepAlignmentByte[i] != 0);
+    }
+
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+
+    cout << timestamp << "createReadGraphFromEcParityCisOverlaps completed." << endl;
+}
+
+void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites()
+{
+    createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
+        std::thread::hardware_concurrency(),
+        /*rebuildDirectedReadGraph*/ false);
+}
+
+void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
+    uint64_t /*threadCount*/,
+    bool rebuildDirectedReadGraph)
+{
+    cout << timestamp << "createReadGraphFromEcParityCisOverlapsCoveringInformativeSites begins." << endl;
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+    static constexpr uint32_t minInformativeSiteCount = 2;
+
+    // Avoid vector<bool> in parallel loops (it is bit-packed and can race).
+    vector<uint8_t> keepAlignmentByte(alignmentCount, 0);
+    uint64_t keptCount = 0;
+    uint64_t filteredByPhase = 0;
+    uint64_t filteredByNoInformativeSite = 0;
+
+    #pragma omp parallel for reduction(+:keptCount, filteredByPhase, filteredByNoInformativeSite)
+    for(uint64_t i = 0; i < alignmentCount; i++) {
+        const AlignmentData& ad = alignmentData[i];
+        const bool cis0 = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
+        const bool cis1 = ((ad.deleteReasons1 & AlignmentData::DeleteReasonPhase) == 0);
+        if(!(cis0 && cis1)) {
+            keepAlignmentByte[i] = 0;
+            ++filteredByPhase;
+            continue;
+        }
+        if(!ad.coversHetSiteAtLeast(minInformativeSiteCount)) {
+            keepAlignmentByte[i] = 0;
+            ++filteredByNoInformativeSite;
+            continue;
+        }
+        keepAlignmentByte[i] = 1;
+        ++keptCount;
+    }
+
+    cout << timestamp << "Kept " << keptCount << " / " << alignmentCount
+         << " alignments (cis + covers >= " << minInformativeSiteCount << " informative sites)." << endl;
+    cout << timestamp << "Filtered: phase=" << filteredByPhase
+         << ", noInformativeSite=" << filteredByNoInformativeSite << endl;
+
+    vector<bool> keepAlignment(alignmentCount, false);
+    for(uint64_t i = 0; i < alignmentCount; ++i) {
+        keepAlignment[i] = (keepAlignmentByte[i] != 0);
+    }
+
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+
+    cout << timestamp << "createReadGraphFromEcParityCisOverlapsCoveringInformativeSites completed." << endl;
+}
+
 void Assembler::createReadGraph6(uint64_t threadCount)
 {
     cout << timestamp << "createReadGraph6 begins." << endl;
@@ -116,17 +219,17 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     }
     cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
 
-    // // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
-    // // Marks fully contained reads and removes their overlaps
-    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
-    //      << ", isDeleted1=" << afterContainDel1
-    //      << ", active=" << countActiveAlignments() << endl;
+    // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
+    // Marks fully contained reads and removes their overlaps
+    removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+         << ", isDeleted1=" << afterContainDel1
+         << ", active=" << countActiveAlignments() << endl;
 
-    // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
-    // This is a diagnostic/experimental alternative to removing contained reads entirely.
-    pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
+    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
+    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
+    // pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
 
 
 

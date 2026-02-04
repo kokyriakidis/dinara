@@ -1640,21 +1640,19 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     }
 
     uint64_t containedReadCount = 0;
-
-    // If a read graph has already been built in this process, prefer selecting the best overlap
-    // only among current read-graph overlaps. This mirrors pruneContainedReadsToOneBestOverlapByDpScore.
-    bool restrictToCurrentReadGraph = false;
-    for (uint64_t alignmentId = 0; alignmentId < alignmentCount; ++alignmentId) {
-        if (alignmentData[alignmentId].info.isInReadGraph != 0) {
-            restrictToCurrentReadGraph = true;
-            break;
+    // Simulate hifiasm ma_hit_contained_advance decisions, but without mutating overlaps.
+    // We maintain a local "deleted" mask so that once a read is deemed contained, we stop
+    // considering it and we ignore overlaps incident to it (matching the fact that hifiasm
+    // deletes all its edges immediately).
+    vector<uint8_t> deletedLocal(readCount, 0);
+    for(ReadId r = 0; r < readCount; ++r) {
+        if(r < validReadIntervals.size() && validReadIntervals[r].isDeleted) {
+            deletedLocal[r] = 1;
         }
     }
 
-    // Same containment predicate as removeContainedReads, but we only flag a read as contained
-    // if it is contained in its single highest-scoring (dpScore) kept overlap.
     for(ReadId qn = 0; qn < readCount; ++qn) {
-        if(qn >= validReadIntervals.size() || validReadIntervals[qn].isDeleted) continue;
+        if(qn >= validReadIntervals.size() || deletedLocal[qn]) continue;
 
         const auto& vrQ = validReadIntervals[qn];
         const int32_t ql = int32_t(vrQ.end - vrQ.start);
@@ -1664,63 +1662,60 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
         if(oid.getValue() >= alignmentTable.size()) continue;
 
         const auto& table = alignmentTable[oid.getValue()];
-        if(table.empty()) continue;
-
-        int64_t bestScore = std::numeric_limits<int64_t>::min();
-        uint32_t bestAlignmentId = std::numeric_limits<uint32_t>::max();
         for(const uint32_t alignmentId : table) {
             if(alignmentId >= alignmentCount) continue;
             const AlignmentData& ad = alignmentData[alignmentId];
-            if(restrictToCurrentReadGraph && (ad.info.isInReadGraph == 0)) continue;
             if(!ad.keptByBothSides()) continue;
+
             const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
-            if(tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
+            if(tn >= validReadIntervals.size() || deletedLocal[tn]) continue;
 
-            const int64_t score = ad.info.hifiasmDpScoreOrApprox(0);
-            if(score > bestScore || (score == bestScore && alignmentId < bestAlignmentId)) {
-                bestScore = score;
-                bestAlignmentId = alignmentId;
+            const auto& vrT = validReadIntervals[tn];
+            const int32_t tl = int32_t(vrT.end - vrT.start);
+            if(tl <= 0) continue;
+
+            const bool rev = !ad.isSameStrand;
+            int32_t qs = 0, qe = 0, ts = 0, te = 0;
+            if(ad.readIds[0] == qn) {
+                qs = int32_t(ad.qs);
+                qe = int32_t(ad.qe);
+                ts = int32_t(ad.ts);
+                te = int32_t(ad.te);
+            } else {
+                qs = int32_t(ad.ts);
+                qe = int32_t(ad.te);
+                ts = int32_t(ad.qs);
+                te = int32_t(ad.qe);
             }
-        }
+            if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
+            if(qs >= qe || ts >= te) continue;
+            if(qs > ql || qe > ql || ts > tl || te > tl) continue;
 
-        if(bestAlignmentId == std::numeric_limits<uint32_t>::max()) continue;
-        const AlignmentData& ad = alignmentData[bestAlignmentId];
-        const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
-        if(tn >= validReadIntervals.size() || validReadIntervals[tn].isDeleted) continue;
-        const auto& vrT = validReadIntervals[tn];
-        const int32_t tl = int32_t(vrT.end - vrT.start);
-        if(tl <= 0) continue;
+            const int result = ma_hit2arc_containment(
+                qs, qe, ql,
+                ts, te, tl,
+                rev,
+                int32_t(maxHang),
+                maxHangRate,
+                int32_t(minOverlapLength)
+            );
 
-        const bool rev = !ad.isSameStrand;
-        int32_t qs = 0, qe = 0, ts = 0, te = 0;
-        if(ad.readIds[0] == qn) {
-            qs = int32_t(ad.qs);
-            qe = int32_t(ad.qe);
-            ts = int32_t(ad.ts);
-            te = int32_t(ad.te);
-        } else {
-            qs = int32_t(ad.ts);
-            qe = int32_t(ad.te);
-            ts = int32_t(ad.qs);
-            te = int32_t(ad.qe);
-        }
-        if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
-        if(qs >= qe || ts >= te) continue;
-        if(qs > ql || qe > ql || ts > tl || te > tl) continue;
-
-        const int result = ma_hit2arc_containment(
-            qs, qe, ql,
-            ts, te, tl,
-            rev,
-            int32_t(maxHang),
-            maxHangRate,
-            int32_t(minOverlapLength)
-        );
-
-        if(result == 1) {
-            reads->setContainedFlag(qn, true);
-            (*containmentParent)[qn] = tn;
-            ++containedReadCount;
+            if(result == 1) {
+                // Query contained in target: flag and stop processing this query.
+                reads->setContainedFlag(qn, true);
+                (*containmentParent)[qn] = tn;
+                deletedLocal[qn] = 1;
+                ++containedReadCount;
+                break;
+            } else if(result == 2) {
+                // Target contained in query: flag the target and keep scanning (qn may contain multiple reads).
+                if(!deletedLocal[tn]) {
+                    reads->setContainedFlag(tn, true);
+                    (*containmentParent)[tn] = qn;
+                    deletedLocal[tn] = 1;
+                    ++containedReadCount;
+                }
+            }
         }
     }
 

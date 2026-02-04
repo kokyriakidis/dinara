@@ -4639,7 +4639,7 @@ TEST_CASE("Integration: high coveragePeak suppresses DP site retention (singleto
         const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
         if (hasP) sawAltAtP = true;
         CHECK_FALSE(deletedFromRead0);
-        CHECK_FALSE(ad.coversHetSite);
+        CHECK_FALSE(ad.coversHetSite());
     }
     REQUIRE(sawAltAtP);
 }
@@ -4721,7 +4721,7 @@ TEST_CASE("Integration: high coveragePeak suppresses DP site retention (chained 
         const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
         if (hasP1 || hasP2) sawAlt = true;
         CHECK_FALSE(deletedFromRead0);
-        CHECK_FALSE(ad.coversHetSite);
+        CHECK_FALSE(ad.coversHetSite());
     }
     REQUIRE(sawAlt);
 }
@@ -4811,7 +4811,7 @@ TEST_CASE("Integration: homopolymer context can suppress singleton DP sites (tar
         const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
         if (hasP) sawAltAtP = true;
         CHECK_FALSE(deletedFromRead0);
-        CHECK_FALSE(ad.coversHetSite);
+        CHECK_FALSE(ad.coversHetSite());
     }
     REQUIRE(sawAltAtP);
 }
@@ -4896,6 +4896,7 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
     // - 3 forward alt
     // - 3 reverse alt (stored as RC, aligned as reverse strand)
     // - 3 forward ref (one of them is "noisy ref" with a singleton mismatch at Q)
+    // - 1 short forward ref covering Q but not P (so we can verify Q does not become informative)
     // - 3 reverse ref (stored as RC)
     std::vector<std::string> seqs;
     seqs.push_back(seq0); // read_0
@@ -4924,6 +4925,8 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
     seqNoisyRef[Q] = otherBase(seqNoisyRef[Q]);
     const uint32_t noisyRefIndex = addForward(seqNoisyRef);
     refReadIndices.push_back(noisyRefIndex);
+    const uint32_t shortRefIndex = addForward(seq0.substr(0, 1200));
+    refReadIndices.push_back(shortRefIndex);
 
     // Reverse refs.
     for (int i = 0; i < 3; ++i) refReadIndices.push_back(addReverse(seq0));
@@ -4951,6 +4954,7 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
     };
     REQUIRE(countPairAlignments(ReadId(0), ReadId(altReadIndices.front())) >= 1);
     REQUIRE(countPairAlignments(ReadId(0), ReadId(noisyRefIndex)) >= 1);
+    REQUIRE(countPairAlignments(ReadId(0), ReadId(shortRefIndex)) >= 1);
 
     // Sanity-check that the evidence store actually contains the engineered SNP at P
     // for an alt overlap, and the singleton mismatch at Q for the noisy ref overlap.
@@ -5029,8 +5033,8 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
         fixture.assembler->performHifiasmECParity(1);
     });
 
-    // In this synthetic setup, the only potential informative SNP is at position P.
-    // Verify that `coversHetSite` matches that position (no off-by-one / wrong projection).
+    // In this synthetic setup, the only informative SNP should be at position P.
+    // Verify that informative-site coverage counts P (and that Q does not become informative).
     auto alignmentHasSnpAtQueryPos = [&](const AlignmentData& ad, uint32_t pos) -> bool {
         if (ad.info.alignmentId == invalid<size_t>) return false;
         const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
@@ -5055,32 +5059,69 @@ TEST_CASE("Integration: performHifiasmECParity ignores singleton mismatch eviden
         return found;
     };
 
-    bool foundAnyAltMarked = false;
+    auto informativeCountFrom = [&](const AlignmentData& ad, ReadId readId) -> uint32_t {
+        if (ad.readIds[0] == readId) return ad.informativeHetSiteCount0;
+        if (ad.readIds[1] == readId) return ad.informativeHetSiteCount1;
+        return 0;
+    };
+
+    // The (read_0, shortRef) overlap covers Q but not P. It should have zero informative-site coverage
+    // from both read perspectives if Q is correctly ignored as a singleton mismatch site.
+    {
+        bool sawShortPair = false;
+        for (const auto& ad : fixture.assembler->alignmentData) {
+            const bool isPair =
+                (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(shortRefIndex)) ||
+                (ad.readIds[0] == ReadId(shortRefIndex) && ad.readIds[1] == ReadId(0));
+            if (!isPair) continue;
+            sawShortPair = true;
+
+            const bool read0IsRead0 = (ad.readIds[0] == ReadId(0));
+            const uint32_t qs = read0IsRead0 ? ad.qs : ad.ts;
+            const uint32_t qe = read0IsRead0 ? ad.qe : ad.te;
+            const bool coversQ = (qs <= uint32_t(Q)) && (qe > uint32_t(Q));
+            const bool coversP = (qs <= uint32_t(P)) && (qe > uint32_t(P));
+            REQUIRE(coversQ);
+            CHECK_FALSE(coversP);
+
+            CHECK(informativeCountFrom(ad, ReadId(0)) == 0);
+            CHECK(informativeCountFrom(ad, ReadId(shortRefIndex)) == 0);
+            CHECK_FALSE(ad.coversHetSite());
+        }
+        REQUIRE(sawShortPair);
+    }
+
+    bool sawInformativeAtP = false;
     for (const auto& ad : fixture.assembler->alignmentData) {
         if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
-        const bool hasSnpAtP = alignmentHasSnpAtQueryPos(ad, uint32_t(P));
-        if (ad.coversHetSite) {
-            CHECK(hasSnpAtP);
-        }
-        if (hasSnpAtP && ad.coversHetSite) {
-            foundAnyAltMarked = true;
+
+        const bool read0IsRead0 = (ad.readIds[0] == ReadId(0));
+        const uint32_t qs = read0IsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = read0IsRead0 ? ad.qe : ad.te;
+        const uint32_t countFromRead0 = informativeCountFrom(ad, ReadId(0));
+
+        if (qs <= uint32_t(P) && qe > uint32_t(P)) {
+            CHECK(countFromRead0 == 1);
+            CHECK(ad.coversHetSite());
+            sawInformativeAtP = true;
+        } else {
+            CHECK(countFromRead0 == 0);
         }
     }
-    REQUIRE(foundAnyAltMarked);
+    REQUIRE(sawInformativeAtP);
 
-    // The noisy ref overlap has only a singleton mismatch at Q (pos != P), so it must not be
-    // mapped to an informative SNP row at P and must not get coversHetSite.
-    bool noisyHasCoversHetSite = false;
+    // The noisy ref overlap has a singleton mismatch at Q (pos != P). It must not create an
+    // additional informative site (coverage stays 1 due to P), but it still covers the informative site at P.
     for (const auto& ad : fixture.assembler->alignmentData) {
         const bool isPair =
             (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(noisyRefIndex)) ||
             (ad.readIds[0] == ReadId(noisyRefIndex) && ad.readIds[1] == ReadId(0));
         if (!isPair) continue;
-        noisyHasCoversHetSite |= ad.coversHetSite;
         CHECK_FALSE(alignmentHasSnpAtQueryPos(ad, uint32_t(P)));
         CHECK(alignmentHasSnpAtQueryPos(ad, uint32_t(Q)));
+        CHECK(informativeCountFrom(ad, ReadId(0)) == 1);
+        CHECK(ad.coversHetSite());
     }
-    CHECK_FALSE(noisyHasCoversHetSite);
 }
 
 TEST_CASE("Integration: performHifiasmECParity removes trans overlaps (ALT-supporting) like hifiasm", "[integration][hifiasm][ec][parity][trans]") {
@@ -5203,7 +5244,34 @@ TEST_CASE("Integration: performHifiasmECParity removes trans overlaps (ALT-suppo
 
         const bool deletedFromRead0 = (found->readIds[0] == ReadId(0)) ? found->isDeleted0() : found->isDeleted1();
         CHECK(deletedFromRead0 == shouldDelete);
-        CHECK(found->coversHetSite == shouldDelete); // only ALT-supporting overlaps should have mismatch evidence at P
+
+        // Only ALT-supporting overlaps should have a mismatch evidence entry at P (read_0 coordinate).
+        bool hasMismatchAtP = false;
+        if (found->info.alignmentId != invalid<size_t>) {
+            const uint32_t evidenceId = uint32_t(found->info.alignmentId);
+            const bool read0IsRead0 = (found->readIds[0] == ReadId(0));
+            const uint32_t qs = read0IsRead0 ? found->qs : found->ts;
+            const uint32_t qe = read0IsRead0 ? found->qe : found->te;
+            if (qs <= uint32_t(P) && qe > uint32_t(P)) {
+                if (read0IsRead0) {
+                    fixture.assembler->alignedEvidenceStore.forEachSnp1InRange(
+                        evidenceId, uint32_t(P), uint32_t(P) + 1,
+                        [&](uint32_t p, uint8_t /*b*/) { if (p == uint32_t(P)) hasMismatchAtP = true; });
+                } else {
+                    fixture.assembler->alignedEvidenceStore.forEachSnp0InRange(
+                        evidenceId, uint32_t(P), uint32_t(P) + 1,
+                        [&](uint32_t p, uint8_t /*b*/) { if (p == uint32_t(P)) hasMismatchAtP = true; });
+                }
+            }
+        }
+        CHECK(hasMismatchAtP == shouldDelete);
+
+        // Informative-site coverage is about interval coverage (not mismatch evidence): all overlaps spanning P
+        // should record at least one informative site from read_0's perspective in this synthetic setup.
+        const uint32_t informativeFromRead0 =
+            (found->readIds[0] == ReadId(0)) ? found->informativeHetSiteCount0 : found->informativeHetSiteCount1;
+        CHECK(informativeFromRead0 >= 1);
+        CHECK(found->coversHetSite());
     };
 
     expectDeletedFromRead0(ref1, false);
@@ -5270,7 +5338,7 @@ TEST_CASE("Integration: performHifiasmECParity drops adjacent SNP sites like hif
         if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
         const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
         CHECK_FALSE(deletedFromRead0);
-        CHECK_FALSE(ad.coversHetSite);
+        CHECK_FALSE(ad.coversHetSite());
     }
 }
 
@@ -5547,7 +5615,7 @@ TEST_CASE("Integration: performHifiasmECParity excludes gap overlaps from SNP-si
         if (ad.readIds[0] != ReadId(0) && ad.readIds[1] != ReadId(0)) continue;
         const bool deletedFromRead0 = (ad.readIds[0] == ReadId(0)) ? ad.isDeleted0() : ad.isDeleted1();
         CHECK_FALSE(deletedFromRead0);
-        CHECK_FALSE(ad.coversHetSite);
+        CHECK_FALSE(ad.coversHetSite());
     }
 }
 

@@ -2802,21 +2802,83 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     const bool isInformativeRead = !scratch.snpStats.empty() || !scratch.svStats.empty();
 
 	                    /*
-	                    Precompute which overlaps touch any informative site.
+	                    Precompute how many informative sites each overlap covers (query view).
 
-	                    This lets us set AlignmentData::coversHetSite in O(|evidence|) rather than an
-	                    O(|overlaps| * |sites|) nested scan.
+	                    We count unique SNP/SV site positions retained by the EC pipeline that fall
+	                    inside the overlap's [qs,qe) interval. For SNP sites we also exclude query
+	                    "hole" intervals (positions without an aligned target base) for that overlap.
 	                    */
-	                    vector<uint8_t> candCoversInfo(candidates.size(), 0);
-                    for (const auto& ev : scratch.hapEvidence) {
-                        if (ev.overlapSite != invalid<uint32_t> && ev.overlapID < candidates.size()) {
-                            candCoversInfo[ev.overlapID] = 1;
+                    vector<uint32_t> informativeSnpSites;
+                    vector<uint32_t> informativeSvSites;
+                    vector<uint32_t> candInformativeSiteCount(candidates.size(), 0);
+
+                    informativeSnpSites.clear();
+                    informativeSvSites.clear();
+                    if(!scratch.snpStats.empty()) {
+                        informativeSnpSites.reserve(scratch.snpStats.size());
+                        for(const auto& s : scratch.snpStats) {
+                            informativeSnpSites.push_back(s.site);
                         }
+                        std::sort(informativeSnpSites.begin(), informativeSnpSites.end());
+                        informativeSnpSites.erase(
+                            std::unique(informativeSnpSites.begin(), informativeSnpSites.end()),
+                            informativeSnpSites.end());
                     }
-                    for (const auto& ev : scratch.svEvidence) {
-                         if (ev.overlapID < candidates.size()) {
-                             candCoversInfo[ev.overlapID] = 1;
-                         }
+                    if(!scratch.svStats.empty()) {
+                        informativeSvSites.reserve(scratch.svStats.size());
+                        for(const auto& s : scratch.svStats) {
+                            informativeSvSites.push_back(s.site);
+                        }
+                        std::sort(informativeSvSites.begin(), informativeSvSites.end());
+                        informativeSvSites.erase(
+                            std::unique(informativeSvSites.begin(), informativeSvSites.end()),
+                            informativeSvSites.end());
+                    }
+
+                    auto countSitesInRange = [](const vector<uint32_t>& sites, uint32_t begin, uint32_t end) -> uint32_t {
+                        if(end <= begin || sites.empty()) {
+                            return 0;
+                        }
+                        auto it0 = std::lower_bound(sites.begin(), sites.end(), begin);
+                        auto it1 = std::lower_bound(sites.begin(), sites.end(), end);
+                        return uint32_t(it1 - it0);
+                    };
+
+                    const bool haveInsertionHoles =
+                        (scratch.insertionOffsets.size() == candidates.size() + 1) &&
+                        !scratch.insertionIntervals.empty();
+
+                    for(size_t c = 0; c < candidates.size(); ++c) {
+                        const auto& cand = candidates[c];
+                        const uint32_t qs = uint32_t(cand.qs);
+                        const uint32_t qe = uint32_t(cand.qe);
+                        if(qe <= qs) {
+                            continue;
+                        }
+
+                        uint32_t count = 0;
+                        // SNP sites: subtract query "holes" for this overlap.
+                        if(!informativeSnpSites.empty()) {
+                            count += countSitesInRange(informativeSnpSites, qs, qe);
+                            if(haveInsertionHoles) {
+                                const uint32_t offBegin = scratch.insertionOffsets[c];
+                                const uint32_t offEnd = scratch.insertionOffsets[c + 1];
+                                for(uint32_t ii = offBegin; ii < offEnd; ++ii) {
+                                    const auto& hole = scratch.insertionIntervals[ii];
+                                    const uint32_t a = std::max(qs, hole.begin);
+                                    const uint32_t b = std::min(qe, hole.end);
+                                    if(b > a) {
+                                        count -= countSitesInRange(informativeSnpSites, a, b);
+                                    }
+                                }
+                            }
+                        }
+                        // SV sites: count by interval only (same convention as SV marking stage).
+                        if(!informativeSvSites.empty()) {
+                            count += countSitesInRange(informativeSvSites, qs, qe);
+                        }
+
+                        candInformativeSiteCount[c] = count;
                     }
 
                     const auto tFinalizeBegin = steady_clock::now();
@@ -2847,7 +2909,13 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                        These are monotonic (only ever set), so concurrent writes are safe.
 	                        */
 	                        if (keep) ad.info.isInReadGraph = 1;
-	                        if (candCoversInfo[c]) ad.coversHetSite = true;
+	                        const ReadId queryReadId = ReadId(readId);
+	                        const uint32_t informativeCount = candInformativeSiteCount[c];
+	                        if(ad.readIds[0] == queryReadId) {
+	                            ad.informativeHetSiteCount0 = informativeCount;
+	                        } else if(ad.readIds[1] == queryReadId) {
+	                            ad.informativeHetSiteCount1 = informativeCount;
+	                        }
 	                    }
                     timing.finalizeFlags += seconds(steady_clock::now() - tFinalizeBegin);
                 }
@@ -2856,6 +2924,11 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 
 
     for(auto& th : threads) th.join();
+
+    // Finalize informative-site overlap scores now that both read perspectives have been populated.
+    for(AlignmentData& ad : alignmentData) {
+        ad.updateInformativeHetSiteScore();
+    }
 
     PhaseTiming total;
     for(const auto& t : timings) {
