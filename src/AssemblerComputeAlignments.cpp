@@ -286,7 +286,9 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
             thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
-            thisAlignmentData.coversHetSite = false;
+            thisAlignmentData.informativeHetSiteCount0 = 0;
+            thisAlignmentData.informativeHetSiteCount1 = 0;
+            thisAlignmentData.informativeHetSiteScore = 0;
             thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
             thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
 

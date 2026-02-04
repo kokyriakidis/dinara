@@ -608,7 +608,22 @@ void dinara::main::assemble(
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
     // This uses conservative AND parity semantics (both reads must keep the overlap).
-    assembler.createReadGraph6(threadCount);
+    // assembler.createReadGraph6(threadCount);
+
+
+    vector<uint32_t> ids;
+
+    // After performHifiasmECParity(...) (it sets DeleteReasonPhase + informative counts/scores).
+    assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids);
+
+    // If you also want to exclude anything with other delete reasons:
+    // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids, /*keptByBothSidesOnly=*/true);
+
+    // `ids` is now: CIS in both views (no DeleteReasonPhase on either side),
+    // sorted by `alignmentData[id].informativeHetSiteScore` descending.
+
+    // assembler.createReadGraphFromEcParityCisOverlaps(threadCount, /*rebuildDirectedReadGraph*/ false);
+    assembler.createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(threadCount,  false);
 
     // Snapshot the broad keep-set used for marker-graph collapse.
     std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
@@ -712,10 +727,34 @@ void dinara::main::assemble(
             ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
     }
 
-    // Robust vertex-based anchors: split marker graph vertices using surviving readGraph overlaps
-    // (bridge removal + quasi-clique peeling), then emit per-cluster anchors (+ RC anchors).
-    anchors = assembler.createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
-        minPrimaryCoverage, maxPrimaryCoverage, assemblerOptions.assemblyOptions.mode3Options, threadCount);
+    // // Robust vertex-based anchors: split marker graph vertices using surviving readGraph overlaps
+    // // (bridge removal + quasi-clique peeling), then emit per-cluster anchors (+ RC anchors).
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
+    //     minPrimaryCoverage, maxPrimaryCoverage, assemblerOptions.assemblyOptions.mode3Options, threadCount);
+
+
+    // anchors =
+    //         make_shared<mode3::Anchors>(
+    //             MappedMemoryOwner(assembler),
+    //             assembler.getReads(),
+    //             assembler.assemblerInfo->k,
+    //             *assembler.markers,
+    //             assembler.markerGraph,
+    //             minPrimaryCoverage,
+    //             maxPrimaryCoverage,
+    //             threadCount,
+    //             true); // createFromVertices
+
+
+    anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+        minPrimaryCoverage,
+        maxPrimaryCoverage,
+        threadCount,
+        /*enableColinearityPeeling*/ false,
+        /*minDominantFractionToPeel*/ 0.9);
+
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
 
 
 

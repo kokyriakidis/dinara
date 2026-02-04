@@ -392,7 +392,9 @@ public:
     shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
         uint64_t minAnchorCoverage,
         uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        bool enableColinearityPeeling = false,
+        double minDominantFractionToPeel = 0.9);
 
     // Like createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval, but each selected marker graph vertex
     // is validated/split using the filtered readGraph overlaps among the oriented reads present in the vertex.
@@ -1283,6 +1285,29 @@ private:
     vector< pair<OrientedReadId, AlignmentInfo> >
         findOrientedAlignments(OrientedReadId, bool inReadGraphOnly) const;
 
+public:
+    // Like findOrientedAlignments, but returns alignment ids sorted by the number of informative
+    // het/SV sites covered by the overlap (from the query read's perspective), descending.
+    // This does not change the ordering in alignmentTable (which is sorted by partner OrientedReadId).
+    void getAlignmentIdsSortedByInformativeSites(
+        OrientedReadId,
+        vector<uint32_t>& alignmentIds,
+        bool inReadGraphOnly = false) const;
+
+    // Return alignment ids involving this oriented read that are cis in both views
+    // (DeleteReasonPhase not set on either side) and sorted by informativeHetSiteScore, descending.
+    // If keptByBothSidesOnly is true, also require no deletion reasons on either side.
+    void getCisAlignmentIdsSortedByInformativeSites(
+        OrientedReadId,
+        vector<uint32_t>& alignmentIds,
+        bool keptByBothSidesOnly = false) const;
+
+    // Like getCisAlignmentIdsSortedByInformativeSites, but returns all alignments
+    // (not limited to a specific read).
+    void getAllCisAlignmentIdsSortedByInformativeSites(
+        vector<uint32_t>& alignmentIds,
+        bool keptByBothSidesOnly = false) const;
+
 
 
     // Analyze the stored alignments involving a given oriented read.
@@ -1355,6 +1380,18 @@ private:
     // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
     void createReadGraph6();
     void createReadGraph6(uint64_t threadCount);
+
+    // Create a read graph using only the cis/trans (phasing) decisions produced by
+    // performHifiasmECParity. This ignores all non-phasing deletion reasons.
+    // An overlap is kept iff neither read marked it with DeleteReasonPhase.
+    void createReadGraphFromEcParityCisOverlaps();
+    void createReadGraphFromEcParityCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
+
+    // Like createReadGraphFromEcParityCisOverlaps, but only keep cis overlaps that
+    // cover at least one informative site (as recorded by AlignmentData::coversHetSite()
+    // / informativeHetSiteCount{0,1} during performHifiasmECParity).
+    void createReadGraphFromEcParityCisOverlapsCoveringInformativeSites();
+    void createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(uint64_t threadCount, bool rebuildDirectedReadGraph);
     
     // Canonical per-Read overlap storage  // Convert alignmentData to OverlapIndex
     

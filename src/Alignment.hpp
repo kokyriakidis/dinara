@@ -530,7 +530,39 @@ public:
     CisTransStatus cisTransStatus = CisTransStatus::Unknown;
 
     // Flags
-    bool coversHetSite = false;
+    // Number of informative het/SV sites (in query coordinates) covered by this overlap,
+    // as computed by performHifiasmECParity, stored separately for each read perspective.
+    // informativeHetSiteCount0 corresponds to readIds[0]'s view, informativeHetSiteCount1 to readIds[1]'s view.
+    uint32_t informativeHetSiteCount0 = 0;
+    uint32_t informativeHetSiteCount1 = 0;
+    // Informative-site score for this overlap.
+    // This is computed as max(informativeHetSiteCount0, informativeHetSiteCount1) after both sides
+    // have been populated by performHifiasmECParity.
+    uint32_t informativeHetSiteScore = 0;
+    bool coversHetSiteAtLeast(uint32_t minCount) const
+    {
+        return informativeHetSiteCount0 >= minCount || informativeHetSiteCount1 >= minCount;
+    }
+    bool coversHetSite() const
+    {
+        return coversHetSiteAtLeast(1);
+    }
+
+    uint32_t getInformativeHetSiteCountFromReadPerspective(ReadId queryReadId) const
+    {
+        if(readIds[0] == queryReadId) {
+            return informativeHetSiteCount0;
+        } else if(readIds[1] == queryReadId) {
+            return informativeHetSiteCount1;
+        } else {
+            return 0;
+        }
+    }
+
+    void updateInformativeHetSiteScore()
+    {
+        informativeHetSiteScore = std::max(informativeHetSiteCount0, informativeHetSiteCount1);
+    }
     
     // Directional deletion reason bitmasks.
     // deleteReasons0: reasons from readIds[0]'s perspective
@@ -543,6 +575,12 @@ public:
     bool isDeleted1() const { return deleteReasons1 != DeleteReasonNone; }
     bool keptByBothSides() const { return !isDeleted0() && !isDeleted1(); }
     bool isDeleted() const { return isDeleted0() && isDeleted1(); } // fully deleted (both sides)
+    bool isCisByBothSides() const
+    {
+        return
+            ((deleteReasons0 & DeleteReasonPhase) == 0) &&
+            ((deleteReasons1 & DeleteReasonPhase) == 0);
+    }
 
     void addDeleteReasonsBoth(DeleteReasonMask reasons)
     {
