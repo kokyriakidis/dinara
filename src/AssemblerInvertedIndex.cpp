@@ -976,140 +976,163 @@ private:
 
                     // Hifiasm-style weak-chain suppression (anchor.cpp: OFL/CH_OCC/CH_SC logic).
                     // Remove weak chains only if they are strongly dominated by an overlapping strong chain.
-                    if(minChainedMarkerCount >= 2 &&
-                        !scratch.chainCandidates.empty() &&
-                        scratch.chainCandidates.size() <= 4096)
-                    {
-                        struct WeakFilterMeta {
-                            uint32_t qs = 0;
-                            uint32_t qe = 0;   // Half-open [qs, qe)
-                            uint32_t occ = 0;  // Number of anchors in the chain.
-                            int32_t score = 0;
-                        };
-
-                        const size_t candidateCount = scratch.chainCandidates.size();
-                        vector<WeakFilterMeta> metas(candidateCount);
-                        vector<size_t> weakIdx;
-                        vector<size_t> strongIdx;
-                        weakIdx.reserve(candidateCount);
-                        strongIdx.reserve(candidateCount);
-
-                        for(size_t ci = 0; ci < candidateCount; ++ci) {
-                            const auto& cand = scratch.chainCandidates[ci];
-                            const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
-                            int32_t rootK = cand.endK;
-                            while(parentArr[rootK] != -1) {
-                                rootK = parentArr[rootK];
-                            }
-
-                            uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
-                            uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + uint32_t(kmerLen);
-                            if(qe < qs) {
-                                std::swap(qs, qe);
-                            }
-
+                    if(minChainedMarkerCount >= 2 && !scratch.chainCandidates.empty()) {
+                        // Hifiasm lch-style gate: run the expensive weak-overlap suppression
+                        // only when we have a mix of weak and strong chains for this pair.
+                        bool hasWeakChain = false;
+                        bool hasStrongChain = false;
+                        for(const auto& cand : scratch.chainCandidates) {
                             const uint32_t occ = cand.isDiff ?
                                 scratch.chainOccurrencesDiff[cand.endK] :
                                 scratch.chainOccurrencesSame[cand.endK];
-                            metas[ci] = WeakFilterMeta{qs, qe, occ, cand.score};
-
                             if(occ < minChainedMarkerCount) {
-                                weakIdx.push_back(ci);
+                                hasWeakChain = true;
                             } else {
-                                strongIdx.push_back(ci);
+                                hasStrongChain = true;
+                            }
+                            if(hasWeakChain && hasStrongChain) {
+                                break;
                             }
                         }
+                        const bool runWeakSuppression = hasWeakChain && hasStrongChain;
 
-                        if(!weakIdx.empty() && !strongIdx.empty()) {
-                            // Keep this pass linear-ish in practice by scanning strong chains in interval order.
-                            std::sort(strongIdx.begin(), strongIdx.end(),
-                                [&](const size_t a, const size_t b) {
-                                    if(metas[a].qs != metas[b].qs) {
-                                        return metas[a].qs < metas[b].qs;
-                                    }
-                                    return metas[a].qe < metas[b].qe;
-                                });
+                        if(runWeakSuppression) {
+                            struct WeakFilterMeta {
+                                uint32_t qs = 0;
+                                uint32_t qe = 0;   // Half-open [qs, qe)
+                                uint32_t occ = 0;  // Number of anchors in the chain.
+                                int32_t score = 0;
+                            };
 
-                            vector<vector<uint32_t> > strongAnchorPosByCandidate(candidateCount);
-                            for(const size_t si : strongIdx) {
-                                const auto& cand = scratch.chainCandidates[si];
+                            const size_t candidateCount = scratch.chainCandidates.size();
+                            vector<WeakFilterMeta> metas(candidateCount);
+                            vector<size_t> weakIdx;
+                            vector<size_t> strongIdx;
+                            weakIdx.reserve(candidateCount);
+                            strongIdx.reserve(candidateCount);
+
+                            for(size_t ci = 0; ci < candidateCount; ++ci) {
+                                const auto& cand = scratch.chainCandidates[ci];
                                 const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
-                                vector<uint32_t> apos;
-                                apos.reserve(metas[si].occ);
-                                for(int32_t k = cand.endK; k != -1; k = parentArr[k]) {
-                                    apos.push_back(scratch.hitPosA[size_t(k)]);
+                                int32_t rootK = cand.endK;
+                                while(parentArr[rootK] != -1) {
+                                    rootK = parentArr[rootK];
                                 }
-                                std::reverse(apos.begin(), apos.end());
-                                strongAnchorPosByCandidate[si] = std::move(apos);
+
+                                uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
+                                uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + uint32_t(kmerLen);
+                                if(qe < qs) {
+                                    std::swap(qs, qe);
+                                }
+
+                                const uint32_t occ = cand.isDiff ?
+                                    scratch.chainOccurrencesDiff[cand.endK] :
+                                    scratch.chainOccurrencesSame[cand.endK];
+                                metas[ci] = WeakFilterMeta{qs, qe, occ, cand.score};
+
+                                if(occ < minChainedMarkerCount) {
+                                    weakIdx.push_back(ci);
+                                } else {
+                                    strongIdx.push_back(ci);
+                                }
                             }
 
-                            vector<uint8_t> suppress(candidateCount, uint8_t(0));
-                            for(const size_t wi : weakIdx) {
-                                const auto& w = metas[wi];
-                                const uint32_t weakSpan = (w.qe > w.qs) ? (w.qe - w.qs) : 0;
-                                const uint32_t minOverlap =
-                                    std::max<uint32_t>(16U, uint32_t(double(weakSpan) * HIFIASM_OFL));
-                                const uint64_t minStrongOcc = uint64_t(w.occ) << HIFIASM_CH_OCC;
-                                const int64_t minStrongScore = int64_t(w.score) * int64_t(HIFIASM_CH_SC);
+                            if(!weakIdx.empty() && !strongIdx.empty()) {
+                                std::sort(strongIdx.begin(), strongIdx.end(),
+                                    [&](const size_t a, const size_t b) {
+                                        if(metas[a].qs != metas[b].qs) {
+                                            return metas[a].qs < metas[b].qs;
+                                        }
+                                        return metas[a].qe < metas[b].qe;
+                                    });
 
+                                vector<vector<uint32_t> > strongAnchorStartsByCandidate(candidateCount);
                                 for(const size_t si : strongIdx) {
-                                    const auto& s = metas[si];
-                                    if(s.qe <= w.qs) {
-                                        continue;
+                                    const auto& cand = scratch.chainCandidates[si];
+                                    const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                                    vector<uint32_t> apos;
+                                    apos.reserve(metas[si].occ);
+                                    for(int32_t k = cand.endK; k != -1; k = parentArr[k]) {
+                                        apos.push_back(scratch.hitPosA[size_t(k)]);
                                     }
-                                    if(s.qs >= w.qe) {
+                                    std::reverse(apos.begin(), apos.end());
+                                    strongAnchorStartsByCandidate[si] = std::move(apos);
+                                }
+
+                                vector<uint8_t> suppress(candidateCount, uint8_t(0));
+                                for(const size_t wi : weakIdx) {
+                                    const auto& w = metas[wi];
+                                    const uint32_t weakSpan = (w.qe > w.qs) ? (w.qe - w.qs) : 0;
+                                    const uint32_t minOverlap =
+                                        std::max<uint32_t>(16U, uint32_t(double(weakSpan) * HIFIASM_OFL));
+                                    const uint64_t minStrongOcc = uint64_t(w.occ) << HIFIASM_CH_OCC; // ocn
+                                    const int64_t minStrongScore = int64_t(w.score) * int64_t(HIFIASM_CH_SC);
+
+                                    for(const size_t si : strongIdx) {
+                                        const auto& s = metas[si];
+                                        if(s.qe <= w.qs) {
+                                            continue;
+                                        }
+                                        if(s.qs >= w.qe) {
+                                            break;
+                                        }
+                                        if(uint64_t(s.occ) < minStrongOcc) {
+                                            continue;
+                                        }
+                                        if(int64_t(s.score) < minStrongScore) {
+                                            continue;
+                                        }
+
+                                        const uint32_t os = std::max(w.qs, s.qs);
+                                        const uint32_t oe = std::min(w.qe, s.qe);
+                                        if(oe <= os) {
+                                            continue;
+                                        }
+                                        const uint32_t overlap = oe - os;
+                                        if(overlap < minOverlap) {
+                                            continue;
+                                        }
+
+                                        // Hifiasm r485 guard: count strong-chain anchors whose full span
+                                        // lies within [os, oe) <=> anchor start in [os, oe-kmerLen].
+                                        const auto& apos = strongAnchorStartsByCandidate[si];
+                                        if(apos.empty() || oe < uint32_t(kmerLen)) {
+                                            continue;
+                                        }
+                                        const uint32_t maxAnchorStart = oe - uint32_t(kmerLen);
+                                        if(maxAnchorStart < os) {
+                                            continue;
+                                        }
+                                        const auto itBegin = std::lower_bound(apos.begin(), apos.end(), os);
+                                        const auto itEnd = std::upper_bound(itBegin, apos.end(), maxAnchorStart);
+                                        const uint64_t overlapAnchorCount =
+                                            uint64_t(std::distance(itBegin, itEnd));
+                                        if(overlapAnchorCount < minStrongOcc) {
+                                            continue;
+                                        }
+
+                                        suppress[wi] = uint8_t(1);
                                         break;
                                     }
-                                    if(uint64_t(s.occ) < minStrongOcc) {
-                                        continue;
-                                    }
-                                    if(int64_t(s.score) < minStrongScore) {
-                                        continue;
-                                    }
-
-                                    const uint32_t os = std::max(w.qs, s.qs);
-                                    const uint32_t oe = std::min(w.qe, s.qe);
-                                    if(oe <= os) {
-                                        continue;
-                                    }
-                                    const uint32_t overlap = oe - os;
-                                    if(overlap < minOverlap) {
-                                        continue;
-                                    }
-
-                                    // Hifiasm-like in-overlap anchor support guard.
-                                    const auto& apos = strongAnchorPosByCandidate[si];
-                                    if(apos.empty()) {
-                                        continue;
-                                    }
-                                    const auto itBegin = std::lower_bound(apos.begin(), apos.end(), os);
-                                    const auto itEnd = std::lower_bound(itBegin, apos.end(), oe);
-                                    const uint64_t overlapAnchorCount = uint64_t(std::distance(itBegin, itEnd));
-                                    if(overlapAnchorCount < minStrongOcc) {
-                                        continue;
-                                    }
-
-                                    suppress[wi] = uint8_t(1);
-                                    break;
                                 }
-                            }
 
-                            bool anySuppressed = false;
-                            for(const size_t wi : weakIdx) {
-                                if(suppress[wi]) {
-                                    anySuppressed = true;
-                                    break;
-                                }
-                            }
-                            if(anySuppressed) {
-                                scratch.filteredCandidates.clear();
-                                scratch.filteredCandidates.reserve(candidateCount);
-                                for(size_t ci = 0; ci < candidateCount; ++ci) {
-                                    if(!suppress[ci]) {
-                                        scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
+                                bool anySuppressed = false;
+                                for(const size_t wi : weakIdx) {
+                                    if(suppress[wi]) {
+                                        anySuppressed = true;
+                                        break;
                                     }
                                 }
-                                scratch.chainCandidates = std::move(scratch.filteredCandidates);
+                                if(anySuppressed) {
+                                    scratch.filteredCandidates.clear();
+                                    scratch.filteredCandidates.reserve(candidateCount);
+                                    for(size_t ci = 0; ci < candidateCount; ++ci) {
+                                        if(!suppress[ci]) {
+                                            scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
+                                        }
+                                    }
+                                    scratch.chainCandidates = std::move(scratch.filteredCandidates);
+                                }
                             }
                         }
                     }
@@ -1672,6 +1695,8 @@ void Assembler::chainPafCandidates(
         1U, invertedIndexData.highFrequencySampleDistance);
     const uint32_t maxHighFrequencyPerStreak = std::max<uint32_t>(
         1U, invertedIndexData.maxHighFrequencyPerStreak);
+    const double chainFilterRatio = invertedIndexData.chainFilterRatio;
+    const uint32_t chainFilterMinScore = invertedIndexData.chainFilterMinScore;
 
     // Thread-local results
     vector<vector<OrientedReadPair>> threadCandidates(threadCount);
@@ -2126,17 +2151,250 @@ void Assembler::chainPafCandidates(
                         }
                     }
 
-                    // Extract best chain based on PAF strand info
-                    // Enforce the orientation given by the PAF record.
-                    // This avoids ambiguous cases where the same/diff DP scores are similar due to
-                    // canonical k-mer matching (which does not encode strand).
-                    bool useSameStrand = pafSameStrand;
-                    int32_t bestEndIdx = useSameStrand ? bestEndIdxSame : bestEndIdxDiff;
-                    const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
+                    // Extract best chain based on PAF strand info.
+                    // Enforce the orientation given by the PAF record and
+                    // apply the same weak-chain cleanup used in discovery chaining.
+                    const bool useSameStrand = pafSameStrand;
+                    const bool wantDiff = !useSameStrand;
+                    const int32_t bestScPair = useSameStrand ? maxScSame : maxScDiff;
+                    if(bestScPair < 2) {
+                        continue;
+                    }
 
+                    int32_t filterThresh = std::max<int32_t>(
+                        int32_t(chainFilterMinScore),
+                        int32_t(double(bestScPair) * chainFilterRatio));
+
+                    auto getAlignmentLength = [&](uint32_t pA, uint32_t pB) -> uint64_t {
+                        uint32_t xB = pA, yB = pB;
+                        if (xB <= yB) {
+                            yB -= xB;
+                            xB = 0;
+                        } else {
+                            xB -= yB;
+                            yB = 0;
+                        }
+                        uint64_t xR = readLenA - pA - 1, yR = readLenB - pB - 1;
+                        uint32_t xE = (xR <= yR) ? (uint32_t)(readLenA - 1) : pA + (uint32_t)yR;
+                        return (uint64_t)(xE - xB + 1);
+                    };
+
+                    scratch.chainCandidates.clear();
+                    for(size_t k = 0; k < numHits; ++k) {
+                        if(useSameStrand) {
+                            if(scratch.dpSame[k] >= filterThresh) {
+                                scratch.chainCandidates.push_back({
+                                    scratch.dpSame[k],
+                                    uint64_t(0), // Filled below.
+                                    int32_t(k),
+                                    false});
+                            }
+                        } else {
+                            if(scratch.dpDiff[k] >= filterThresh) {
+                                scratch.chainCandidates.push_back({
+                                    scratch.dpDiff[k],
+                                    uint64_t(0), // Filled below.
+                                    int32_t(k),
+                                    true});
+                            }
+                        }
+                    }
+                    if(scratch.chainCandidates.empty()) {
+                        continue;
+                    }
+                    for(auto& cand : scratch.chainCandidates) {
+                        if(cand.isDiff) {
+                            cand.chainLen = getAlignmentLength(
+                                scratch.hitPosA[size_t(cand.endK)],
+                                uint32_t(readLenB - 1 - scratch.hitPosB[size_t(cand.endK)]));
+                        } else {
+                            cand.chainLen = getAlignmentLength(
+                                scratch.hitPosA[size_t(cand.endK)],
+                                scratch.hitPosB[size_t(cand.endK)]);
+                        }
+                    }
+                    std::sort(scratch.chainCandidates.begin(), scratch.chainCandidates.end());
+
+                    // Hifiasm-style weak-chain suppression (anchor.cpp: OFL/CH_OCC/CH_SC logic).
+                    if(minChainedMarkerCount >= 2 && !scratch.chainCandidates.empty()) {
+                        // Hifiasm lch-style gate: run weak suppression only when both
+                        // weak and strong chains are present for this read pair.
+                        bool hasWeakChain = false;
+                        bool hasStrongChain = false;
+                        for(const auto& cand : scratch.chainCandidates) {
+                            const uint32_t occ = cand.isDiff ?
+                                scratch.chainOccurrencesDiff[cand.endK] :
+                                scratch.chainOccurrencesSame[cand.endK];
+                            if(occ < minChainedMarkerCount) {
+                                hasWeakChain = true;
+                            } else {
+                                hasStrongChain = true;
+                            }
+                            if(hasWeakChain && hasStrongChain) {
+                                break;
+                            }
+                        }
+                        const bool runWeakSuppression = hasWeakChain && hasStrongChain;
+
+                        if(runWeakSuppression) {
+                            struct WeakFilterMeta {
+                                uint32_t qs = 0;
+                                uint32_t qe = 0;   // Half-open [qs, qe)
+                                uint32_t occ = 0;  // Number of anchors in the chain.
+                                int32_t score = 0;
+                            };
+
+                            const size_t candidateCount = scratch.chainCandidates.size();
+                            vector<WeakFilterMeta> metas(candidateCount);
+                            vector<size_t> weakIdx;
+                            vector<size_t> strongIdx;
+                            weakIdx.reserve(candidateCount);
+                            strongIdx.reserve(candidateCount);
+
+                            for(size_t ci = 0; ci < candidateCount; ++ci) {
+                                const auto& cand = scratch.chainCandidates[ci];
+                                const auto& parentArrTmp = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                                int32_t rootK = cand.endK;
+                                while(parentArrTmp[rootK] != -1) {
+                                    rootK = parentArrTmp[rootK];
+                                }
+
+                                uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
+                                uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + uint32_t(kmerLen);
+                                if(qe < qs) {
+                                    std::swap(qs, qe);
+                                }
+
+                                const uint32_t occ = cand.isDiff ?
+                                    scratch.chainOccurrencesDiff[cand.endK] :
+                                    scratch.chainOccurrencesSame[cand.endK];
+                                metas[ci] = WeakFilterMeta{qs, qe, occ, cand.score};
+
+                                if(occ < minChainedMarkerCount) {
+                                    weakIdx.push_back(ci);
+                                } else {
+                                    strongIdx.push_back(ci);
+                                }
+                            }
+
+                            if(!weakIdx.empty() && !strongIdx.empty()) {
+                                std::sort(strongIdx.begin(), strongIdx.end(),
+                                    [&](const size_t a, const size_t b) {
+                                        if(metas[a].qs != metas[b].qs) {
+                                            return metas[a].qs < metas[b].qs;
+                                        }
+                                        return metas[a].qe < metas[b].qe;
+                                    });
+
+                                vector<vector<uint32_t> > strongAnchorStartsByCandidate(candidateCount);
+                                for(const size_t si : strongIdx) {
+                                    const auto& cand = scratch.chainCandidates[si];
+                                    const auto& parentArrTmp = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                                    vector<uint32_t> apos;
+                                    apos.reserve(metas[si].occ);
+                                    for(int32_t k = cand.endK; k != -1; k = parentArrTmp[k]) {
+                                        apos.push_back(scratch.hitPosA[size_t(k)]);
+                                    }
+                                    std::reverse(apos.begin(), apos.end());
+                                    strongAnchorStartsByCandidate[si] = std::move(apos);
+                                }
+
+                                vector<uint8_t> suppress(candidateCount, uint8_t(0));
+                                for(const size_t wi : weakIdx) {
+                                    const auto& w = metas[wi];
+                                    const uint32_t weakSpan = (w.qe > w.qs) ? (w.qe - w.qs) : 0;
+                                    const uint32_t minOverlap =
+                                        std::max<uint32_t>(16U, uint32_t(double(weakSpan) * HIFIASM_OFL));
+                                    const uint64_t minStrongOcc = uint64_t(w.occ) << HIFIASM_CH_OCC; // ocn
+                                    const int64_t minStrongScore = int64_t(w.score) * int64_t(HIFIASM_CH_SC);
+
+                                    for(const size_t si : strongIdx) {
+                                        const auto& s = metas[si];
+                                        if(s.qe <= w.qs) {
+                                            continue;
+                                        }
+                                        if(s.qs >= w.qe) {
+                                            break;
+                                        }
+                                        if(uint64_t(s.occ) < minStrongOcc) {
+                                            continue;
+                                        }
+                                        if(int64_t(s.score) < minStrongScore) {
+                                            continue;
+                                        }
+
+                                        const uint32_t os = std::max(w.qs, s.qs);
+                                        const uint32_t oe = std::min(w.qe, s.qe);
+                                        if(oe <= os) {
+                                            continue;
+                                        }
+                                        const uint32_t overlap = oe - os;
+                                        if(overlap < minOverlap) {
+                                            continue;
+                                        }
+
+                                        const auto& apos = strongAnchorStartsByCandidate[si];
+                                        if(apos.empty() || oe < uint32_t(kmerLen)) {
+                                            continue;
+                                        }
+                                        const uint32_t maxAnchorStart = oe - uint32_t(kmerLen);
+                                        if(maxAnchorStart < os) {
+                                            continue;
+                                        }
+                                        const auto itBegin = std::lower_bound(apos.begin(), apos.end(), os);
+                                        const auto itEnd = std::upper_bound(itBegin, apos.end(), maxAnchorStart);
+                                        const uint64_t overlapAnchorCount =
+                                            uint64_t(std::distance(itBegin, itEnd));
+                                        if(overlapAnchorCount < minStrongOcc) {
+                                            continue;
+                                        }
+
+                                        suppress[wi] = uint8_t(1);
+                                        break;
+                                    }
+                                }
+
+                                bool anySuppressed = false;
+                                for(const size_t wi : weakIdx) {
+                                    if(suppress[wi]) {
+                                        anySuppressed = true;
+                                        break;
+                                    }
+                                }
+                                if(anySuppressed) {
+                                    scratch.filteredCandidates.clear();
+                                    scratch.filteredCandidates.reserve(candidateCount);
+                                    for(size_t ci = 0; ci < candidateCount; ++ci) {
+                                        if(!suppress[ci]) {
+                                            scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
+                                        }
+                                    }
+                                    scratch.chainCandidates = std::move(scratch.filteredCandidates);
+                                }
+                            }
+                        }
+                    }
+
+                    int32_t bestEndIdx = -1;
+                    for(const auto& cand : scratch.chainCandidates) {
+                        if(cand.isDiff != wantDiff) {
+                            continue;
+                        }
+                        if(minChainedMarkerCount > 0) {
+                            const uint32_t occ = cand.isDiff ?
+                                scratch.chainOccurrencesDiff[cand.endK] :
+                                scratch.chainOccurrencesSame[cand.endK];
+                            if(occ < minChainedMarkerCount) {
+                                continue;
+                            }
+                        }
+                        bestEndIdx = cand.endK;
+                        break;
+                    }
                     if(bestEndIdx < 0) {
                         continue;
                     }
+                    const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
 
                     // Backtrack to get chain
                     scratch.currentChainPath.clear();
