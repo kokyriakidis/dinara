@@ -2453,6 +2453,9 @@ private:
              double lowFreqMultiplier = 0.333;
              double highFreqMultiplier = 1.667;
              uint32_t rareKmerWeight = 2;
+             bool downsampleHighFrequencyMarkers = true;
+             uint32_t highFrequencySampleDistance = 500;
+             uint32_t maxHighFrequencyPerStreak = 16;
              double chainFilterRatio = 0.80;
              uint32_t chainFilterMinScore = 3;
              double nonRedundantOverlapFraction = 0.5;

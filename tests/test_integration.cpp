@@ -1029,7 +1029,12 @@ public:
         withSilencedIoInDir(testDir, [&] { assembler->importAlignmentCandidatesFromPaf(pafPath); });
     }
 
-    void chainPafCandidates(double maxDriftRate = 0.1, uint64_t maxChainLimit = 100, uint32_t maxEndFuzz = 0) {
+    void chainPafCandidates(
+        double maxDriftRate = 0.1,
+        uint64_t maxChainLimit = 100,
+        uint32_t maxEndFuzz = 0,
+        uint32_t minChainedMarkerCount = 0)
+    {
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
@@ -1038,7 +1043,12 @@ public:
         overlapCandidatesOptions.minOverlapLength = 0;
         overlapCandidatesOptions.maxEndFuzz = maxEndFuzz;
         withSilencedIoInDir(testDir, [&] {
-            assembler->chainPafCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 0, 1);
+            assembler->chainPafCandidates(
+                maxDriftRate,
+                maxChainLimit,
+                overlapCandidatesOptions,
+                minChainedMarkerCount,
+                1);
         });
     }
 };
@@ -4840,6 +4850,56 @@ TEST_CASE("Integration: PAF import and chaining", "[integration][paf][chaining]"
         const bool outside = (ev.pos() < ovBegin) || (ev.pos() >= ovEnd);
         CHECK(outside);
     }
+}
+
+TEST_CASE("Integration: PAF chain cutoff uses >= semantics", "[integration][paf][chaining][cutoff]") {
+    const std::string shared = randomSequence(900, 10001);
+    const std::string left = randomSequence(250, 10002);
+    const std::string right = randomSequence(250, 10003);
+    const std::string seq0 = left + shared;
+    const std::string seq1 = shared + right;
+    const uint32_t qStart = uint32_t(left.size());
+    const uint32_t qEnd = uint32_t(seq0.size());
+    const uint32_t tStart = 0;
+    const uint32_t tEnd = uint32_t(shared.size());
+
+    auto setupFixture = [&](AssemblerIntegrationFixture& fixture) {
+        fixture.createFastq({seq0, seq1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        const std::string pafPath = fixture.createPafFile({
+            AssemblerIntegrationFixture::PafOverlapSpec{
+                "read_0", "read_1", true, qStart, qEnd, tStart, tEnd
+            }
+        });
+        fixture.buildIndex();
+        fixture.importPafCandidates(pafPath);
+    };
+
+    AssemblerIntegrationFixture baseline;
+    setupFixture(baseline);
+    baseline.chainPafCandidates(0.1, 100, 0, 0);
+    REQUIRE(baseline.assembler->alignmentCandidates.candidates.size() > 0);
+    REQUIRE(baseline.assembler->alignmentCandidatesAlignmentsData.alignments.size() > 0);
+
+    size_t bestChainLen = 0;
+    for(const auto& al : baseline.assembler->alignmentCandidatesAlignmentsData.alignments) {
+        bestChainLen = std::max(bestChainLen, al.ordinals.size());
+    }
+    REQUIRE(bestChainLen > 0);
+
+    AssemblerIntegrationFixture equalCutoff;
+    setupFixture(equalCutoff);
+    equalCutoff.chainPafCandidates(0.1, 100, 0, uint32_t(bestChainLen));
+    CHECK(equalCutoff.assembler->alignmentCandidates.candidates.size() > 0);
+
+    AssemblerIntegrationFixture aboveCutoff;
+    setupFixture(aboveCutoff);
+    aboveCutoff.chainPafCandidates(0.1, 100, 0, uint32_t(bestChainLen + 1));
+    CHECK(aboveCutoff.assembler->alignmentCandidates.candidates.size() == 0);
 }
 
 TEST_CASE("Integration: AlignedEvidenceStore stores SNP and indel evidence", "[integration][evidence][variants]") {

@@ -212,6 +212,9 @@ public:
     double invertedIndexLowFreqMultiplier = 0.333;           // lowFreq = coveragePeak * multiplier
     double invertedIndexHighFreqMultiplier = 1.667;          // highFreq = coveragePeak * multiplier
     uint32_t invertedIndexRareKmerWeight = 2;                // Weight used for rare/informative kmers
+    bool invertedIndexDownsampleHighFrequencyMarkers = true; // If true, downsample high-frequency marker streaks before chaining.
+    uint32_t invertedIndexHighFrequencySampleDistance = 500; // Hifiasm-like sample distance used to compute how many high-frequency markers to keep per streak.
+    uint32_t invertedIndexMaxHighFrequencyPerStreak = 16;    // Hard cap on retained high-frequency markers per streak (hifiasm MAX_MAX_HIGH_OCC).
     double invertedIndexChainFilterRatio = 0.80;             // filterThresh = bestScore * ratio
     uint32_t invertedIndexChainFilterMinScore = 3;           // Minimum filterThresh
     double invertedIndexNonRedundantOverlapFraction = 0.5;   // Reject candidates overlapping > frac of an accepted interval
