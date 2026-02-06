@@ -382,10 +382,22 @@ private:
                     scratch.backtrackVisitSame.assign(numHits, -1); scratch.backtrackVisitDiff.assign(numHits, -1);
                     scratch.chainOccurrencesSame.assign(numHits, 1); scratch.chainOccurrencesDiff.assign(numHits, 1);
 
-                    uint32_t maxScSame = 0, maxScDiff = 0; 
-                    int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1; 
+                    uint32_t maxScSame = 0, maxScDiff = 0;
+                    int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1;
                     uint64_t maxExtSame = UINT64_MAX, maxExtDiff = UINT64_MAX;
-                    
+
+                    // Hifiasm lchain_dp parameters for ONT reads (Hash_Table.cpp, anchor.cpp:2278)
+                    // Using ONT-optimized parameters: div=0.1, k=51
+                    constexpr int32_t MAX_ITER = 10000;       // Max lookback window
+                    constexpr int32_t MAX_SKIP = 25;          // Max consecutive skips
+                    constexpr int32_t MAX_DIST_X = 50000;     // Max distance on query axis
+                    constexpr int32_t MAX_DIST_Y = 50000;     // Max distance on target axis
+
+                    // ONT parameters: chn_pen_gap = 0.5 * exp(-0.1 * 51) ≈ 0.091
+                    constexpr double CHN_PEN_GAP = 0.091341762;   // Gap penalty for ONT
+                    constexpr double CHN_PEN_SKIP = 0.000091342;  // Skip penalty for ONT
+                    const double BW_RATE = maxDriftRate;          // Bandwidth rate (0.05 for ONT)
+
                     const int64_t dRscaled = (int64_t)(maxDriftRate * 1024.0);
 
                     // Utility: Calculate expected coordinate extension (length) for a hit
@@ -432,105 +444,226 @@ private:
                     }
                     #endif
 
-                    // General DP Chaining with SIMD Pre-filtering
-                    for(size_t k = 0; k < numHits; ++k) {
-                        const uint32_t posAk = scratch.hitPosA[k], posBk = scratch.hitPosB[k];
-                        const uint32_t initSc = std::max(1U, scratch.hitWeights[k] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[k] : (uint32_t)kmerLen);
-                        scratch.dpSame[k] = scratch.dpDiff[k] = initSc;
-                        
-                        size_t streakS = 0, streakD = 0, gapStreakS = 0, gapStreakD = 0; 
-                        int32_t j = (int32_t)k - 1;
+                    // Hifiasm-style DP Chaining (from inter.cpp:821-866)
+                    int32_t st_same = 0, st_diff = 0;
+                    int32_t max_ii_same = -1, max_ii_diff = -1;
 
-                        for(; j >= 0; --j) {
-// [DISABLED] SIMD Pre-filter: On non-repetitive data, the overhead of loading
-// 8 predecessors into AVX2 registers often exceeds the benefit of skipping.
-// Enable via -DUSE_SIMD_DP_PREFILTER for benchmarking in repetitive regions.
-#if defined(__AVX2__) && defined(USE_SIMD_DP_PREFILTER)
-                            // SIMD Block: Quick-scan 8 predecessors for strand and drift compatibility
-                            if (j >= 7) {
-                                __m256i vPA = _mm256_loadu_si256((const __m256i*)&scratch.hitPosA[j-7]);
-                                __m256i vPB = _mm256_loadu_si256((const __m256i*)&scratch.hitPosB[j-7]);
-                                __m256i vDA = _mm256_sub_epi32(_mm256_set1_epi32(posAk), vPA);
-                                __m256i vDBS = _mm256_sub_epi32(_mm256_set1_epi32(posBk), vPB);
-                                __m256i vDBD = _mm256_sub_epi32(vPB, _mm256_set1_epi32(posBk));
+                    for(size_t i = 0; i < numHits; ++i) {
+                        const uint32_t posAi = scratch.hitPosA[i], posBi = scratch.hitPosB[i];
+                        const uint8_t spanI = (uint8_t)std::min((uint32_t)kmerLen, (uint32_t)255);
 
-                                __m256i vMdA = _mm256_cmpgt_epi32(vDA, _mm256_setzero_si256());
-                                __m256i vMS = _mm256_and_si256(vMdA, _mm256_cmpgt_epi32(vDBS, _mm256_setzero_si256()));
-                                __m256i vMD = _mm256_and_si256(vMdA, _mm256_cmpgt_epi32(vDBD, _mm256_setzero_si256()));
-                                
-                                __m256i vL = _mm256_mullo_epi32(vDA, _mm256_set1_epi32((int)dRscaled));
-                                // Note: AVX2 has no _mm256_cmplt_epi32, so we use _mm256_cmpgt_epi32 with swapped operands.
-                                __m256i vDriftValS = _mm256_slli_epi32(_mm256_abs_epi32(_mm256_sub_epi32(vDBS, vDA)), 10);
-                                __m256i vDriftValD = _mm256_slli_epi32(_mm256_abs_epi32(_mm256_sub_epi32(vDBD, vDA)), 10);
-                                __m256i vDriftS = _mm256_and_si256(vMS, _mm256_cmpgt_epi32(vL, vDriftValS));
-                                __m256i vDriftD = _mm256_and_si256(vMD, _mm256_cmpgt_epi32(vL, vDriftValD));
+                        // Initialize with self score (using CURRENT hit's weight)
+                        int32_t max_f_same = HIFIASM_NORMAL_W((int32_t)spanI, (int32_t)scratch.hitWeights[i]);
+                        int32_t max_f_diff = max_f_same;
+                        int32_t max_j_same = -1, max_j_diff = -1;
+                        int32_t n_skip_same = 0, n_skip_diff = 0;
 
-                                if (_mm256_testz_si256(vDriftS, vDriftS) && _mm256_testz_si256(vDriftD, vDriftD)) {
-                                    j -= 7; continue; 
-                                }
+                        // Update start position for same-strand (hybrid: distance + index limit)
+                        // This filters out predecessors that are too far away before DP considers them
+                        while(st_same < (int32_t)i && (scratch.hitPosA[i] > scratch.hitPosA[st_same] + MAX_DIST_X ||
+                                                        scratch.hitPosB[i] > scratch.hitPosB[st_same] + MAX_DIST_Y)) {
+                            ++st_same;
+                        }
+                        if((int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
+
+                        // Same-strand DP
+                        int32_t end_j_same = st_same;
+                        for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                            // Use CURRENT hit's weight (scratch.hitWeights[i]), not previous hit's weight!
+                            int32_t sc = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
+                                                                scratch.hitWeights[i], spanI,
+                                                                BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
+                                                                readLenA, readLenB);
+                            if(sc == INT32_MIN) continue;
+                            sc += scratch.dpSame[j];
+                            if(sc > max_f_same) {
+                                max_f_same = sc;
+                                max_j_same = j;
+                                if(n_skip_same > 0) --n_skip_same;
+                            } else if(scratch.backtrackVisitSame[j] == (int32_t)i) {
+                                if(++n_skip_same > MAX_SKIP) break;
                             }
-#endif
-                            int32_t dA = (int32_t)posAk - (int32_t)scratch.hitPosA[j];
-                            int32_t dB = (int32_t)posBk - (int32_t)scratch.hitPosB[j];
-                            
-                            // Case 1: Hits on the same strand
-                            if(dB > 0 && dA > 0) { 
-                                // Hifiasm's chaining constraint uses the query/self-axis as the length accumulator.
-                                // Here that is Read A (dA).
-                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA);
-                                uint32_t nLn = scratch.cumLenSame[j] + uint32_t(dA);
-                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
-                                    uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
-                                    int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
-                                    int32_t sc = (int32_t)scratch.dpSame[j] + (int32_t)wS - pnlty;
-                                    if(sc > (int32_t)scratch.dpSame[k]) { 
-                                        scratch.dpSame[k] = std::max(1, sc); scratch.parentSame[k] = j; 
-                                        scratch.cumDriftSame[k] = nDr; scratch.cumLenSame[k] = nLn; 
-                                        scratch.chainOccurrencesSame[k] = scratch.chainOccurrencesSame[j] + 1; 
-                                        streakS = 0; if (gapStreakS > 0) --gapStreakS; 
-                                    } else { 
-                                        if(++streakS > 25) break; 
-                                        if (scratch.backtrackVisitSame[j] == (int32_t)k && ++gapStreakS > 25) break; 
-                                    }
-                                    if (scratch.parentSame[j] >= 0) scratch.backtrackVisitSame[scratch.parentSame[j]] = (int32_t)k;
-                                }
-                            } 
-                            // Case 2: Hits on opposite strands
-                            else if (dB < 0 && dA > 0) { 
-                                int32_t aB = -dB; 
-                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA);
-                                uint32_t nLn = scratch.cumLenDiff[j] + uint32_t(dA);
-                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
-                                    uint32_t wS = scratch.hitWeights[j] > 1 ? std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen) / scratch.hitWeights[j] : std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
-                                    int32_t pnlty = (nLn > 0) ? (int32_t)(((int64_t)nDr * wS * 1024) / ((int64_t)nLn * dRscaled)) : 0;
-                                    int32_t sc = (int32_t)scratch.dpDiff[j] + (int32_t)wS - pnlty;
-                                    if(sc > (int32_t)scratch.dpDiff[k]) { 
-                                        scratch.dpDiff[k] = std::max(1, sc); scratch.parentDiff[k] = j; 
-                                        scratch.cumDriftDiff[k] = nDr; scratch.cumLenDiff[k] = nLn; 
-                                        scratch.chainOccurrencesDiff[k] = scratch.chainOccurrencesDiff[j] + 1; 
-                                        streakD = 0; if (gapStreakD > 0) --gapStreakD; 
-                                    } else { 
-                                        if(++streakD > 25) break; 
-                                        if (scratch.backtrackVisitDiff[j] == (int32_t)k && ++gapStreakD > 25) break; 
-                                    }
-                                    if (scratch.parentDiff[j] >= 0) scratch.backtrackVisitDiff[scratch.parentDiff[j]] = (int32_t)k;
+                            if(scratch.parentSame[j] >= 0) scratch.backtrackVisitSame[scratch.parentSame[j]] = (int32_t)i;
+                            end_j_same = j;
+                        }
+
+                        // Rescue mechanism for same-strand (hifiasm lines 846-860)
+                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] > (uint32_t)MAX_DIST_X)) {
+                            int32_t max_val = INT32_MIN;
+                            max_ii_same = -1;
+                            for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                                if(max_val < scratch.dpSame[j]) {
+                                    max_val = scratch.dpSame[j];
+                                    max_ii_same = j;
                                 }
                             }
                         }
-                        
-                        // Update best score and extension for current pair A-B
-                        if(scratch.dpSame[k] > maxScSame) { 
-                            maxScSame = scratch.dpSame[k]; bestEndIdxSame = (int32_t)k; maxExtSame = getAlignmentLength(posAk, posBk); 
-                        } else if (scratch.dpSame[k] == maxScSame && bestEndIdxSame >= 0) { 
-                            uint64_t ext = getAlignmentLength(posAk, posBk); 
-                            if (ext < maxExtSame) { bestEndIdxSame = (int32_t)k; maxExtSame = ext; } 
+                        if(max_ii_same >= 0 && max_ii_same < end_j_same) {
+                            int32_t tmp = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
+                                                                 scratch.hitWeights[i], spanI,
+                                                                 BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
+                                                                 readLenA, readLenB);
+                            if(tmp != INT32_MIN && max_f_same < tmp + scratch.dpSame[max_ii_same]) {
+                                max_f_same = tmp + scratch.dpSame[max_ii_same];
+                                max_j_same = max_ii_same;
+                            }
                         }
-                        
-                        if(scratch.dpDiff[k] > maxScDiff) { 
-                            maxScDiff = scratch.dpDiff[k]; bestEndIdxDiff = (int32_t)k; maxExtDiff = getAlignmentLength(posAk, (uint32_t)(readLenB - 1 - posBk)); 
-                        } else if (scratch.dpDiff[k] == maxScDiff && bestEndIdxDiff >= 0) { 
-                            uint64_t ext = getAlignmentLength(posAk, (uint32_t)(readLenB - 1 - posBk)); 
-                            if (ext < maxExtDiff) { bestEndIdxDiff = (int32_t)k; maxExtDiff = ext; } 
+
+                        // Store same-strand result
+                        scratch.dpSame[i] = max_f_same;
+                        scratch.parentSame[i] = max_j_same;
+                        if(max_j_same >= 0) {
+                            scratch.chainOccurrencesSame[i] = scratch.chainOccurrencesSame[max_j_same] + 1;
+                        }
+                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] <= (uint32_t)MAX_DIST_X &&
+                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
+                            max_ii_same = (int32_t)i;
+                        }
+
+                        // Update start position for diff-strand (sliding window for query distance)
+                        // For diff-strand, posB decreases so we only check posA distance
+                        while(st_diff < (int32_t)i && scratch.hitPosA[i] > scratch.hitPosA[st_diff] + MAX_DIST_X) {
+                            ++st_diff;
+                        }
+                        if((int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
+
+                        // Diff-strand DP
+                        int32_t end_j_diff = st_diff;
+                        for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                            // For diff-strand, check if B is decreasing
+                            if(scratch.hitPosB[j] <= posBi) continue;
+
+                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[j];
+                            int32_t dB = (int32_t)scratch.hitPosB[j] - (int32_t)posBi; // Reversed for diff-strand
+
+                            if(dA <= 0 || dA > MAX_DIST_X || dB <= 0 || dB > MAX_DIST_Y) continue;
+
+                            // Gap size and minimum distance
+                            int32_t dd = std::abs(dA - dB);
+                            int32_t dg = std::min(dA, dB);
+
+                            // Dynamic bandwidth check (only if dd > 16)
+                            if(dd > 16) {
+                                // For diff-strand, use reversed B coordinates for bandwidth calculation
+                                uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
+                                uint32_t posBj_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[j]);
+                                int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[j], posBj_fwd,
+                                                                  BW_RATE, readLenA, readLenB);
+                                if(dd > bw_diff) continue;
+                            }
+
+                            // Base score using CURRENT hit's weight (comput_sc_ch style)
+                            int32_t q_span = (int32_t)spanI;
+                            int32_t sc = (q_span < dg) ? q_span : dg;
+                            sc = HIFIASM_NORMAL_W(sc, (int32_t)scratch.hitWeights[i]);
+
+                            // Apply gap penalty (comput_sc_ch style)
+                            if(dd > 0 || (dg > q_span && dg > 0)) {
+                                double lin_pen = CHN_PEN_GAP * (double)dd;
+                                double a_pen = ((double)sc) * (((double)dd) / ((double)dg)) / BW_RATE;
+                                if(lin_pen > a_pen) lin_pen = a_pen;
+                                lin_pen += CHN_PEN_SKIP * (double)dg;
+                                sc -= (int32_t)lin_pen;
+                            }
+
+                            sc += scratch.dpDiff[j];
+                            if(sc > max_f_diff) {
+                                max_f_diff = sc;
+                                max_j_diff = j;
+                                if(n_skip_diff > 0) --n_skip_diff;
+                            } else if(scratch.backtrackVisitDiff[j] == (int32_t)i) {
+                                if(++n_skip_diff > MAX_SKIP) break;
+                            }
+                            if(scratch.parentDiff[j] >= 0) scratch.backtrackVisitDiff[scratch.parentDiff[j]] = (int32_t)i;
+                            end_j_diff = j;
+                        }
+
+                        // Rescue mechanism for diff-strand
+                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] > (uint32_t)MAX_DIST_X)) {
+                            int32_t max_val = INT32_MIN;
+                            max_ii_diff = -1;
+                            for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                                if(max_val < scratch.dpDiff[j]) {
+                                    max_val = scratch.dpDiff[j];
+                                    max_ii_diff = j;
+                                }
+                            }
+                        }
+                        if(max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
+                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[max_ii_diff];
+                            int32_t dB = (int32_t)scratch.hitPosB[max_ii_diff] - (int32_t)posBi;
+                            if(dA > 0 && dB > 0) {
+                                int32_t dd = std::abs(dA - dB);
+                                int32_t dg = std::min(dA, dB);
+
+                                // Check bandwidth (comput_sc_ch style)
+                                bool bw_ok = (dd <= 16);
+                                if(!bw_ok && dd > 16) {
+                                    uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
+                                    uint32_t posBmax_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[max_ii_diff]);
+                                    int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[max_ii_diff], posBmax_fwd,
+                                                                      BW_RATE, readLenA, readLenB);
+                                    bw_ok = (dd <= bw_diff);
+                                }
+
+                                if(bw_ok) {
+                                    // Base score using CURRENT hit's weight
+                                    int32_t q_span = (int32_t)spanI;
+                                    int32_t tmp = (q_span < dg) ? q_span : dg;
+                                    tmp = HIFIASM_NORMAL_W(tmp, (int32_t)scratch.hitWeights[i]);
+
+                                    // Apply gap penalty (comput_sc_ch style)
+                                    if(dd > 0 || (dg > q_span && dg > 0)) {
+                                        double lin_pen = CHN_PEN_GAP * (double)dd;
+                                        double a_pen = ((double)tmp) * (((double)dd) / ((double)dg)) / BW_RATE;
+                                        if(lin_pen > a_pen) lin_pen = a_pen;
+                                        lin_pen += CHN_PEN_SKIP * (double)dg;
+                                        tmp -= (int32_t)lin_pen;
+                                    }
+
+                                    tmp += scratch.dpDiff[max_ii_diff];
+                                    if(max_f_diff < tmp) {
+                                        max_f_diff = tmp;
+                                        max_j_diff = max_ii_diff;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Store diff-strand result
+                        scratch.dpDiff[i] = max_f_diff;
+                        scratch.parentDiff[i] = max_j_diff;
+                        if(max_j_diff >= 0) {
+                            scratch.chainOccurrencesDiff[i] = scratch.chainOccurrencesDiff[max_j_diff] + 1;
+                        }
+                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] <= (uint32_t)MAX_DIST_X &&
+                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
+                            max_ii_diff = (int32_t)i;
+                        }
+
+                        // Update best scores
+                        if(scratch.dpSame[i] > (int32_t)maxScSame) {
+                            maxScSame = scratch.dpSame[i];
+                            bestEndIdxSame = (int32_t)i;
+                            maxExtSame = getAlignmentLength(posAi, posBi);
+                        } else if(scratch.dpSame[i] == (int32_t)maxScSame && bestEndIdxSame >= 0) {
+                            uint64_t ext = getAlignmentLength(posAi, posBi);
+                            if(ext < maxExtSame) {
+                                bestEndIdxSame = (int32_t)i;
+                                maxExtSame = ext;
+                            }
+                        }
+
+                        if(scratch.dpDiff[i] > (int32_t)maxScDiff) {
+                            maxScDiff = scratch.dpDiff[i];
+                            bestEndIdxDiff = (int32_t)i;
+                            maxExtDiff = getAlignmentLength(posAi, (uint32_t)(readLenB - 1 - posBi));
+                        } else if(scratch.dpDiff[i] == (int32_t)maxScDiff && bestEndIdxDiff >= 0) {
+                            uint64_t ext = getAlignmentLength(posAi, (uint32_t)(readLenB - 1 - posBi));
+                            if(ext < maxExtDiff) {
+                                bestEndIdxDiff = (int32_t)i;
+                                maxExtDiff = ext;
+                            }
                         }
                     }
 
@@ -1252,63 +1385,217 @@ void Assembler::chainPafCandidates(
                         scratch.hitWeights[k] = scratch.flatHits[k].weight;
                     }
 
-                    // Run DP chaining (same-strand only if PAF says same strand, else opposite)
+                    // Hifiasm-style DP chaining for PAF candidates
                     scratch.dpSame.assign(numHits, 0);
                     scratch.dpDiff.assign(numHits, 0);
                     scratch.parentSame.assign(numHits, -1);
                     scratch.parentDiff.assign(numHits, -1);
-                    scratch.cumDriftSame.assign(numHits, 0);
-                    scratch.cumDriftDiff.assign(numHits, 0);
-                    scratch.cumLenSame.assign(numHits, 0);
-                    scratch.cumLenDiff.assign(numHits, 0);
+                    scratch.backtrackVisitSame.assign(numHits, -1);
+                    scratch.backtrackVisitDiff.assign(numHits, -1);
+
+                    // Hifiasm DP parameters for read-to-read overlaps
+                    // Hifiasm lchain_dp parameters for ONT reads (chainPafCandidates)
+                    constexpr int32_t MAX_ITER = 10000;       // Max lookback window
+                    constexpr int32_t MAX_SKIP = 25;          // Max consecutive skips
+                    constexpr int32_t MAX_DIST_X = 50000;     // Max distance on query axis
+                    constexpr int32_t MAX_DIST_Y = 50000;     // Max distance on target axis
+
+                    // ONT parameters: chn_pen_gap = 0.5 * exp(-0.1 * 51) ≈ 0.091
+                    constexpr double CHN_PEN_GAP = 0.091341762;   // Gap penalty for ONT
+                    constexpr double CHN_PEN_SKIP = 0.000091342;  // Skip penalty for ONT
+                    const double BW_RATE = maxDriftRate;          // Bandwidth rate
 
                     uint32_t maxScSame = 0, maxScDiff = 0;
                     int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1;
+                    int32_t st_same = 0, st_diff = 0;
+                    int32_t max_ii_same = -1, max_ii_diff = -1;
 
-                    for(size_t k = 0; k < numHits; k++) {
-                        const uint32_t posAk = scratch.hitPosA[k], posBk = scratch.hitPosB[k];
-                        const uint32_t initSc = std::max(1U, scratch.hitWeights[k] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[k] : (uint32_t)kmerLen);
-                        scratch.dpSame[k] = scratch.dpDiff[k] = initSc;
+                    for(size_t i = 0; i < numHits; ++i) {
+                        const uint32_t posAi = scratch.hitPosA[i], posBi = scratch.hitPosB[i];
+                        const uint8_t spanI = (uint8_t)std::min((uint32_t)kmerLen, (uint32_t)255);
 
-                        for(int32_t j = (int32_t)k - 1; j >= 0; --j) {
-                            int32_t dA = (int32_t)posAk - (int32_t)scratch.hitPosA[j];
-                            int32_t dB = (int32_t)posBk - (int32_t)scratch.hitPosB[j];
+                        // Initialize with self score (using CURRENT hit's weight)
+                        int32_t max_f_same = HIFIASM_NORMAL_W((int32_t)spanI, (int32_t)scratch.hitWeights[i]);
+                        int32_t max_f_diff = max_f_same;
+                        int32_t max_j_same = -1, max_j_diff = -1;
+                        int32_t n_skip_same = 0, n_skip_diff = 0;
 
-                            // Same strand case
-                            if(dB > 0 && dA > 0) {
-                                uint32_t nDr = scratch.cumDriftSame[j] + std::abs(dB - dA);
-                                uint32_t nLn = scratch.cumLenSame[j] + uint32_t(dA);
-                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
-                                    uint32_t wS = std::min((uint32_t)std::min(dA, dB), (uint32_t)kmerLen);
-                                    int32_t sc = (int32_t)scratch.dpSame[j] + (int32_t)wS;
-                                    if(sc > (int32_t)scratch.dpSame[k]) {
-                                        scratch.dpSame[k] = std::max(1, sc);
-                                        scratch.parentSame[k] = j;
-                                        scratch.cumDriftSame[k] = nDr;
-                                        scratch.cumLenSame[k] = nLn;
-                                    }
+                        // Update start position for same-strand (hybrid: distance + index limit)
+                        // This filters out predecessors that are too far away before DP considers them
+                        while(st_same < (int32_t)i && (scratch.hitPosA[i] > scratch.hitPosA[st_same] + MAX_DIST_X ||
+                                                        scratch.hitPosB[i] > scratch.hitPosB[st_same] + MAX_DIST_Y)) {
+                            ++st_same;
+                        }
+                        if((int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
+
+                        // Same-strand DP
+                        int32_t end_j_same = st_same;
+                        for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                            // Use CURRENT hit's weight (scratch.hitWeights[i]), not previous hit's weight!
+                            int32_t sc = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
+                                                                scratch.hitWeights[i], spanI,
+                                                                BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
+                                                                readLenA, readLenB);
+                            if(sc == INT32_MIN) continue;
+                            sc += scratch.dpSame[j];
+                            if(sc > max_f_same) {
+                                max_f_same = sc;
+                                max_j_same = j;
+                                if(n_skip_same > 0) --n_skip_same;
+                            } else if(scratch.backtrackVisitSame[j] == (int32_t)i) {
+                                if(++n_skip_same > MAX_SKIP) break;
+                            }
+                            if(scratch.parentSame[j] >= 0) scratch.backtrackVisitSame[scratch.parentSame[j]] = (int32_t)i;
+                            end_j_same = j;
+                        }
+
+                        // Rescue for same-strand
+                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] > (uint32_t)MAX_DIST_X)) {
+                            int32_t max_val = INT32_MIN;
+                            max_ii_same = -1;
+                            for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                                if(max_val < scratch.dpSame[j]) {
+                                    max_val = scratch.dpSame[j];
+                                    max_ii_same = j;
                                 }
                             }
-                            // Opposite strand case
-                            else if(dB < 0 && dA > 0) {
-                                int32_t aB = -dB;
-                                uint32_t nDr = scratch.cumDriftDiff[j] + std::abs(aB - dA);
-                                uint32_t nLn = scratch.cumLenDiff[j] + uint32_t(dA);
-                                if((int64_t)((uint64_t)nDr << 10) <= (int64_t)dRscaled * (int64_t)nLn) {
-                                    uint32_t wS = std::min((uint32_t)std::min(dA, aB), (uint32_t)kmerLen);
-                                    int32_t sc = (int32_t)scratch.dpDiff[j] + (int32_t)wS;
-                                    if(sc > (int32_t)scratch.dpDiff[k]) {
-                                        scratch.dpDiff[k] = std::max(1, sc);
-                                        scratch.parentDiff[k] = j;
-                                        scratch.cumDriftDiff[k] = nDr;
-                                        scratch.cumLenDiff[k] = nLn;
+                        }
+                        if(max_ii_same >= 0 && max_ii_same < end_j_same) {
+                            int32_t tmp = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
+                                                                 scratch.hitWeights[i], spanI,
+                                                                 BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
+                                                                 readLenA, readLenB);
+                            if(tmp != INT32_MIN && max_f_same < tmp + scratch.dpSame[max_ii_same]) {
+                                max_f_same = tmp + scratch.dpSame[max_ii_same];
+                                max_j_same = max_ii_same;
+                            }
+                        }
+
+                        scratch.dpSame[i] = max_f_same;
+                        scratch.parentSame[i] = max_j_same;
+                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] <= (uint32_t)MAX_DIST_X &&
+                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
+                            max_ii_same = (int32_t)i;
+                        }
+
+                        // Diff-strand DP (pure index-based, lchain_dp style)
+                        if((int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
+
+                        int32_t end_j_diff = st_diff;
+                        for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                            if(scratch.hitPosB[j] <= posBi) continue;
+
+                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[j];
+                            int32_t dB = (int32_t)scratch.hitPosB[j] - (int32_t)posBi;
+
+                            if(dA <= 0 || dA > MAX_DIST_X || dB <= 0 || dB > MAX_DIST_Y) continue;
+
+                            // Gap size and minimum distance
+                            int32_t dd = std::abs(dA - dB);
+                            int32_t dg = std::min(dA, dB);
+
+                            // Dynamic bandwidth check (only if dd > 16) - chainPafCandidates version
+                            if(dd > 16) {
+                                uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
+                                uint32_t posBj_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[j]);
+                                int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[j], posBj_fwd,
+                                                                  BW_RATE, readLenA, readLenB);
+                                if(dd > bw_diff) continue;
+                            }
+
+                            // Base score using CURRENT hit's weight (comput_sc_ch style)
+                            int32_t q_span = (int32_t)spanI;
+                            int32_t sc = (q_span < dg) ? q_span : dg;
+                            sc = HIFIASM_NORMAL_W(sc, (int32_t)scratch.hitWeights[i]);
+
+                            // Apply gap penalty (comput_sc_ch style)
+                            if(dd > 0 || (dg > q_span && dg > 0)) {
+                                double lin_pen = CHN_PEN_GAP * (double)dd;
+                                double a_pen = ((double)sc) * (((double)dd) / ((double)dg)) / BW_RATE;
+                                if(lin_pen > a_pen) lin_pen = a_pen;
+                                lin_pen += CHN_PEN_SKIP * (double)dg;
+                                sc -= (int32_t)lin_pen;
+                            }
+
+                            sc += scratch.dpDiff[j];
+                            if(sc > max_f_diff) {
+                                max_f_diff = sc;
+                                max_j_diff = j;
+                                if(n_skip_diff > 0) --n_skip_diff;
+                            } else if(scratch.backtrackVisitDiff[j] == (int32_t)i) {
+                                if(++n_skip_diff > MAX_SKIP) break;
+                            }
+                            if(scratch.parentDiff[j] >= 0) scratch.backtrackVisitDiff[scratch.parentDiff[j]] = (int32_t)i;
+                            end_j_diff = j;
+                        }
+
+                        // Rescue for diff-strand
+                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] > (uint32_t)MAX_DIST_X)) {
+                            int32_t max_val = INT32_MIN;
+                            max_ii_diff = -1;
+                            for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                                if(max_val < scratch.dpDiff[j]) {
+                                    max_val = scratch.dpDiff[j];
+                                    max_ii_diff = j;
+                                }
+                            }
+                        }
+                        if(max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
+                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[max_ii_diff];
+                            int32_t dB = (int32_t)scratch.hitPosB[max_ii_diff] - (int32_t)posBi;
+                            if(dA > 0 && dB > 0) {
+                                int32_t dd = std::abs(dA - dB);
+                                int32_t dg = std::min(dA, dB);
+
+                                // Check bandwidth (comput_sc_ch style)
+                                bool bw_ok = (dd <= 16);
+                                if(!bw_ok && dd > 16) {
+                                    uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
+                                    uint32_t posBmax_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[max_ii_diff]);
+                                    int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[max_ii_diff], posBmax_fwd,
+                                                                      BW_RATE, readLenA, readLenB);
+                                    bw_ok = (dd <= bw_diff);
+                                }
+
+                                if(bw_ok) {
+                                    // Base score using CURRENT hit's weight
+                                    int32_t q_span = (int32_t)spanI;
+                                    int32_t tmp = (q_span < dg) ? q_span : dg;
+                                    tmp = HIFIASM_NORMAL_W(tmp, (int32_t)scratch.hitWeights[i]);
+
+                                    // Apply gap penalty (comput_sc_ch style)
+                                    if(dd > 0 || (dg > q_span && dg > 0)) {
+                                        double lin_pen = CHN_PEN_GAP * (double)dd;
+                                        double a_pen = ((double)tmp) * (((double)dd) / ((double)dg)) / BW_RATE;
+                                        if(lin_pen > a_pen) lin_pen = a_pen;
+                                        lin_pen += CHN_PEN_SKIP * (double)dg;
+                                        tmp -= (int32_t)lin_pen;
+                                    }
+
+                                    tmp += scratch.dpDiff[max_ii_diff];
+                                    if(max_f_diff < tmp) {
+                                        max_f_diff = tmp;
+                                        max_j_diff = max_ii_diff;
                                     }
                                 }
                             }
                         }
 
-                        if(scratch.dpSame[k] > maxScSame) { maxScSame = scratch.dpSame[k]; bestEndIdxSame = (int32_t)k; }
-                        if(scratch.dpDiff[k] > maxScDiff) { maxScDiff = scratch.dpDiff[k]; bestEndIdxDiff = (int32_t)k; }
+                        scratch.dpDiff[i] = max_f_diff;
+                        scratch.parentDiff[i] = max_j_diff;
+                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] <= (uint32_t)MAX_DIST_X &&
+                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
+                            max_ii_diff = (int32_t)i;
+                        }
+
+                        if(scratch.dpSame[i] > (int32_t)maxScSame) {
+                            maxScSame = scratch.dpSame[i];
+                            bestEndIdxSame = (int32_t)i;
+                        }
+                        if(scratch.dpDiff[i] > (int32_t)maxScDiff) {
+                            maxScDiff = scratch.dpDiff[i];
+                            bestEndIdxDiff = (int32_t)i;
+                        }
                     }
 
                     // Extract best chain based on PAF strand info
