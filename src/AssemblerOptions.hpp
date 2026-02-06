@@ -218,6 +218,14 @@ public:
     double invertedIndexChainFilterRatio = 0.80;             // filterThresh = bestScore * ratio
     uint32_t invertedIndexChainFilterMinScore = 3;           // Minimum filterThresh
     double invertedIndexNonRedundantOverlapFraction = 0.5;   // Reject candidates overlapping > frac of an accepted interval
+    bool invertedIndexLchainIsAccurate = true;               // Hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp path).
+    bool invertedIndexEnableMcopyFast = true;                // Hifiasm-like multi-peak chain extraction to reduce expensive downstream work.
+    uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm-like: keep up to 3 score-competitive chains per pair.
+    double invertedIndexMcopyRate = 0.70;                    // ONT EC parity: keep chains with score >= bestScore * 0.7.
+    uint32_t invertedIndexMcopyKhitCutoff = 32;              // ONT EC parity: require >=32 anchors before enabling secondary mcopy chains.
+    uint32_t invertedIndexMcopyTriggerCandidateCount = 1;    // Legacy safety gate; 1 makes mcopy-fast active whenever other gates pass.
+    uint32_t invertedIndexMcopyOcvWindow = 3072;             // Hifiasm COV_W-style window for containing-overlap overload control.
+    double invertedIndexMcopyOcvWeakKeepRatio = 0.70;        // Keep weak containing overlaps when non-saturated window coverage fraction >= this value.
 
     void write(ostream&) const;
 };
