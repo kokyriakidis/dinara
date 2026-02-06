@@ -537,6 +537,21 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(2),
         "InvertedIndex chaining: weight assigned to rare/informative kmers.")
 
+        ("OverlapCandidates.invertedIndexDownsampleHighFrequencyMarkers",
+        value<bool>(&overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers)->
+        default_value(true),
+        "InvertedIndex chaining: if true, downsample high-frequency marker streaks before hit collection.")
+
+        ("OverlapCandidates.invertedIndexHighFrequencySampleDistance",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance)->
+        default_value(500),
+        "InvertedIndex chaining: sample distance used to derive per-streak retention count for high-frequency markers.")
+
+        ("OverlapCandidates.invertedIndexMaxHighFrequencyPerStreak",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak)->
+        default_value(16),
+        "InvertedIndex chaining: hard cap on retained high-frequency markers per streak (hifiasm MAX_MAX_HIGH_OCC equivalent).")
+
         ("OverlapCandidates.invertedIndexChainFilterRatio",
         value<double>(&overlapCandidatesOptions.invertedIndexChainFilterRatio)->
         default_value(0.80),
@@ -1605,6 +1620,9 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexLowFreqMultiplier = " << invertedIndexLowFreqMultiplier << "\n";
     s << "invertedIndexHighFreqMultiplier = " << invertedIndexHighFreqMultiplier << "\n";
     s << "invertedIndexRareKmerWeight = " << invertedIndexRareKmerWeight << "\n";
+    s << "invertedIndexDownsampleHighFrequencyMarkers = " << convertBoolToPythonString(invertedIndexDownsampleHighFrequencyMarkers) << "\n";
+    s << "invertedIndexHighFrequencySampleDistance = " << invertedIndexHighFrequencySampleDistance << "\n";
+    s << "invertedIndexMaxHighFrequencyPerStreak = " << invertedIndexMaxHighFrequencyPerStreak << "\n";
     s << "invertedIndexChainFilterRatio = " << invertedIndexChainFilterRatio << "\n";
     s << "invertedIndexChainFilterMinScore = " << invertedIndexChainFilterMinScore << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";

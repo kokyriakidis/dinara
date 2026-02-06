@@ -31,9 +31,9 @@
 #include "timestamp.hpp"
 #include "Reads.hpp"
 #include <algorithm>
-#include <map>
-#include <mutex>
 #include <cmath>
+#include <limits>
+#include <numeric>
 #include <vector>
 #include <thread>
 #include <functional>
@@ -93,6 +93,11 @@ static int getOverlapType(uint32_t start, uint32_t end, uint32_t readLen) {
     else return (start == 0) ? 0 : 1; // Left or Right overhang
 }
 
+// Hifiasm weak-overlap suppression constants (anchor.cpp).
+static constexpr double HIFIASM_OFL = 0.95;
+static constexpr uint32_t HIFIASM_CH_OCC = 4;
+static constexpr uint32_t HIFIASM_CH_SC = 16;
+
 /**
  * @brief Per-thread scratchpad for high-performance DP chaining.
  *
@@ -111,7 +116,8 @@ struct ThreadScratchpad {
     vector<InvertedIndexTempHit> flatHits;
     
     // Structure of Arrays (SoA) for cache-efficient DP scans
-    vector<uint32_t> hitPosA, hitPosB, hitOrdinalA;
+    vector<uint32_t> hitPosA, hitPosB, hitOrdinalA, hitOrdinalB;
+    vector<uint32_t> hitOrderByPosB;
     vector<uint8_t> hitWeights;
 
     // DP score and backtrack arrays (int32_t since scores can be negative)
@@ -144,7 +150,7 @@ struct ThreadScratchpad {
 
     void clear() {
         flatHits.clear();
-        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitWeights.clear();
+        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear(); hitOrderByPosB.clear(); hitWeights.clear();
         dpSame.clear(); dpDiff.clear();
         parentSame.clear(); parentDiff.clear();
         cumDriftSame.clear(); cumDriftDiff.clear();
@@ -186,6 +192,139 @@ static inline uint64_t hashKmer(KmerId k) {
     uint64_t k1 = p[0];
     uint64_t k2 = sizeof(KmerId) > 8 ? p[1] : 0; 
     return k1 ^ (k2 + 0x9e3779b9 + (k1<<6) + (k1>>2));
+}
+
+
+// Fast O(n) precheck/chain used to skip quadratic DP on trivially monotonic hit sets.
+// Returns true only if the whole hit list forms one valid contiguous chain.
+static inline bool runQuickLinearChain(
+    const bool isDiff,
+    const vector<uint32_t>& hitPosA,
+    const vector<uint32_t>& hitPosB,
+    const vector<uint8_t>& hitWeights,
+    const uint32_t kmerLen,
+    const double bwRate,
+    const double chnPenGap,
+    const double chnPenSkip,
+    const uint64_t readLenA,
+    const uint64_t readLenB,
+    vector<int32_t>& dp,
+    vector<int32_t>& parent,
+    vector<uint32_t>& chainOccurrences,
+    int32_t& maxScore,
+    int32_t& bestEnd)
+{
+    const size_t n = hitPosA.size();
+    if (n == 0) {
+        return false;
+    }
+
+    const uint8_t span0 = uint8_t(std::min<uint32_t>(kmerLen, 255));
+    dp[0] = int32_t(span0);
+    parent[0] = -1;
+    chainOccurrences[0] = 1;
+    maxScore = dp[0];
+    bestEnd = 0;
+
+    for (size_t i = 1; i < n; ++i) {
+        if (hitPosA[i] <= hitPosA[i - 1]) {
+            return false;
+        }
+
+        const uint32_t posAi = hitPosA[i];
+        const uint32_t posAj = hitPosA[i - 1];
+        uint32_t posBi = 0;
+        uint32_t posBj = 0;
+        if (!isDiff) {
+            if (hitPosB[i] <= hitPosB[i - 1]) {
+                return false;
+            }
+            posBi = hitPosB[i];
+            posBj = hitPosB[i - 1];
+        } else {
+            if (hitPosB[i] >= hitPosB[i - 1]) {
+                return false;
+            }
+            posBi = uint32_t(readLenB - 1 - uint64_t(hitPosB[i]));
+            posBj = uint32_t(readLenB - 1 - uint64_t(hitPosB[i - 1]));
+        }
+
+        const uint8_t spanI = uint8_t(std::min<uint32_t>(kmerLen, 255));
+        int32_t sc = hifiasm_comput_sc_ch(
+            posAi,
+            posBi,
+            posAj,
+            posBj,
+            hitWeights[i],
+            spanI,
+            bwRate,
+            chnPenGap,
+            chnPenSkip,
+            readLenA,
+            readLenB);
+        if (sc == INT32_MIN) {
+            return false;
+        }
+        sc += dp[i - 1];
+
+        // quick_ck_lchain requires each step to remain informative (non-self fallback).
+        if (sc < int32_t(spanI)) {
+            return false;
+        }
+
+        dp[i] = sc;
+        parent[i] = int32_t(i - 1);
+        chainOccurrences[i] = chainOccurrences[i - 1] + 1U;
+        if (sc > maxScore) {
+            maxScore = sc;
+            bestEnd = int32_t(i);
+        }
+    }
+
+    return true;
+}
+
+// Resolve hit target positions to marker ordinals in O(n log n + m) using:
+// 1) one sort of hit indices by target position, then
+// 2) one forward scan over marker positions.
+// This avoids O(n log m) repeated binary searches on the hot path.
+template<class MarkerContainer>
+static inline bool mapHitPositionsToMarkerOrdinals(
+    const vector<uint32_t>& hitPosB,
+    const MarkerContainer& markersB,
+    vector<uint32_t>& hitOrdinalB,
+    vector<uint32_t>& orderByPosB)
+{
+    const size_t n = hitPosB.size();
+    if (n == 0) {
+        return true;
+    }
+    if (markersB.empty()) {
+        return false;
+    }
+
+    orderByPosB.resize(n);
+    std::iota(orderByPosB.begin(), orderByPosB.end(), uint32_t(0));
+    std::sort(orderByPosB.begin(), orderByPosB.end(),
+        [&](const uint32_t a, const uint32_t b) {
+            if (hitPosB[a] != hitPosB[b]) {
+                return hitPosB[a] < hitPosB[b];
+            }
+            return a < b;
+        });
+
+    size_t markerIdx = 0;
+    for (const uint32_t hitIdx : orderByPosB) {
+        const uint32_t pos = hitPosB[hitIdx];
+        while (markerIdx < markersB.size() && markersB[markerIdx].position < pos) {
+            ++markerIdx;
+        }
+        if (markerIdx >= markersB.size() || markersB[markerIdx].position != pos) {
+            return false;
+        }
+        hitOrdinalB[hitIdx] = uint32_t(markerIdx);
+    }
+    return true;
 }
 
 // Private class to encapsulate parallel logic (Codebase Pattern).
@@ -280,6 +419,15 @@ private:
         const double lowFreqMultiplier = invertedIndexData.lowFreqMultiplier;
         const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
         const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
+        const uint64_t lowFreqThreshold = std::max<uint64_t>(2ULL, uint64_t(double(coveragePeak) * lowFreqMultiplier));
+        const uint64_t highFreqThreshold = std::max<uint64_t>(3ULL, uint64_t(double(coveragePeak) * highFreqMultiplier));
+        const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
+        const bool downsampleHighFrequencyMarkers =
+            invertedIndexData.downsampleHighFrequencyMarkers &&
+            invertedIndexData.highFrequencySampleDistance > 0 &&
+            invertedIndexData.maxHighFrequencyPerStreak > 0;
+        const uint32_t highFrequencySampleDistance = std::max<uint32_t>(1U, invertedIndexData.highFrequencySampleDistance);
+        const uint32_t maxHighFrequencyPerStreak = std::max<uint32_t>(1U, invertedIndexData.maxHighFrequencyPerStreak);
         const double chainFilterRatio = invertedIndexData.chainFilterRatio;
         const uint32_t chainFilterMinScore = invertedIndexData.chainFilterMinScore;
         const double nonRedundantOverlapFraction = invertedIndexData.nonRedundantOverlapFraction;
@@ -293,10 +441,69 @@ private:
                 const auto& markersA = markers[orientedReadIdA.getValue()];
                 const auto& kmerIdsA = markerKmerIds[orientedReadIdA.getValue()];
                 const size_t numMarkersA = std::min(markersA.size(), kmerIdsA.size());
+                const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
                 
                 scratch.clear();
                 scratch.flatHits.reserve(numMarkersA * 2);
-                
+
+                struct PendingHighFrequencyMarker {
+                    uint64_t startIdx = 0;
+                    uint32_t count = 0;
+                    uint32_t posA = 0;
+                    uint32_t ordinalA = 0;
+                    uint8_t weight = 1;
+                };
+                vector<PendingHighFrequencyMarker> highFrequencyStreak;
+                highFrequencyStreak.reserve(64);
+                int64_t lastNonHighBoundaryPos = -1;
+
+                auto computeHitWeight = [&](const uint32_t count) -> uint8_t {
+                    if (count <= lowFreqThreshold) {
+                        return uint8_t(std::min<uint32_t>(255U, rareKmerWeight));
+                    }
+                    if (count >= highFreqThreshold) {
+                        const uint32_t w = 1U + uint32_t((uint64_t(count) + highFreqWeightUnit - 1ULL) / highFreqWeightUnit);
+                        if (w < 512U) {
+                            return weightLUT[w];
+                        }
+                        return uint8_t(std::min<uint32_t>(255U, uint32_t(std::pow(double(w), weightExponent))));
+                    }
+                    return uint8_t(1);
+                };
+
+                auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
+                    const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
+                    for (uint32_t j = 0; j < markerInfo.count; ++j) {
+                        if (compactOccs[j].readId != readIdA) {
+                            scratch.flatHits.push_back(
+                                {compactOccs[j].readId, markerInfo.posA, compactOccs[j].position, markerInfo.ordinalA, markerInfo.weight});
+                        }
+                    }
+                };
+
+                auto flushHighFrequencyStreak = [&](const uint32_t rightBoundaryPos) {
+                    if (highFrequencyStreak.empty()) {
+                        return;
+                    }
+                    const uint32_t leftBoundaryPos = (lastNonHighBoundaryPos >= 0) ? uint32_t(lastNonHighBoundaryPos) : 0U;
+                    const uint32_t span = (rightBoundaryPos > leftBoundaryPos) ? (rightBoundaryPos - leftBoundaryPos) : 0U;
+                    uint32_t keep = uint32_t(double(span) / double(highFrequencySampleDistance) + 0.499);
+                    if (keep > maxHighFrequencyPerStreak) {
+                        keep = maxHighFrequencyPerStreak;
+                    }
+                    if (keep == 0) {
+                        highFrequencyStreak.clear();
+                        return;
+                    }
+
+                    const size_t selectedCount = std::min<size_t>(highFrequencyStreak.size(), keep);
+                    for (size_t s = 0; s < selectedCount; ++s) {
+                        const size_t idx = (uint64_t(s) * highFrequencyStreak.size()) / selectedCount;
+                        appendMarkerHits(highFrequencyStreak[idx]);
+                    }
+                    highFrequencyStreak.clear();
+                };
+
                 // --- Step 1: Hit Collection & Early Weighting ---
                 // We scan markers in Read A and find matches in the Inverted Index.
                 for(size_t i = 0; i < numMarkersA; ++i) {
@@ -304,50 +511,53 @@ private:
                     KmerId rcKId = getRcKmerId(currentKId, kmerLen);
                     KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
 
-                    uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
                     const uint32_t posA = markersA[i].position;
+                    uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
+                    uint64_t startIdx = 0;
+                    uint32_t count = 0;
+                    bool found = false;
 
                     // Search for the K-mer in the direct-addressing hash table
                     while(!hashTablePtr[slotIdx].empty) {
                         if(hashTablePtr[slotIdx].key == canonicalKId) {
-                            const uint64_t startIdx = hashTablePtr[slotIdx].start;
-                            const uint32_t count = hashTablePtr[slotIdx].count;
-                             
-                            // Early Weighting: Constant weight for all hits of this k-mer.
-                            // Frequent/Repetitive k-mers are penalized using a pre-computed LUT.
-                            // The LUT is generated once at startup using pow(w, exponent) for Hifiasm compatibility.
-                            uint8_t hitWeight = 1;
-                            const uint64_t lowFreq = (uint64_t)(double(coveragePeak) * lowFreqMultiplier);
-                            const uint64_t highFreq = (uint64_t)(double(coveragePeak) * highFreqMultiplier);
-                            
-                            if (count <= std::max(2UL, lowFreq)) {
-                                hitWeight = uint8_t(std::min<uint32_t>(255U, rareKmerWeight)); // Rare/Informative k-mer (High value)
-                            } else if (count >= std::max(3UL, highFreq)) {
-                                uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
-                                if(w < 512) {
-                                    hitWeight = weightLUT[w];
-                                } else {
-                                    hitWeight = (uint8_t)std::min(255U, (uint32_t)pow((double)w, weightExponent));
-                                }
-                            }
-
-                            const auto* compactOccs = &invertedIndexData.compactOccurrences[startIdx];
-                            for(uint32_t j = 0; j < count; ++j) {
-                                if(compactOccs[j].readId != readIdA) {
-                                    scratch.flatHits.push_back({compactOccs[j].readId, posA, compactOccs[j].position, (uint32_t)i, hitWeight}); 
-                                }
-                            }
+                            startIdx = hashTablePtr[slotIdx].start;
+                            count = hashTablePtr[slotIdx].count;
+                            found = true;
                             break;
                         }
                         slotIdx = (slotIdx + 1) & hashMask;
                     }
+
+                    if(!found) {
+                        if(downsampleHighFrequencyMarkers) {
+                            flushHighFrequencyStreak(posA);
+                            lastNonHighBoundaryPos = posA;
+                        }
+                        continue;
+                    }
+
+                    const uint8_t hitWeight = computeHitWeight(count);
+                    if(downsampleHighFrequencyMarkers && count >= highFreqThreshold) {
+                        highFrequencyStreak.push_back({startIdx, count, posA, uint32_t(i), hitWeight});
+                        continue;
+                    }
+
+                    if(downsampleHighFrequencyMarkers) {
+                        flushHighFrequencyStreak(posA);
+                    }
+                    appendMarkerHits({startIdx, count, posA, uint32_t(i), hitWeight});
+                    lastNonHighBoundaryPos = posA;
+                }
+                if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
+                    const uint32_t readLenABoundary = uint32_t(std::min<uint64_t>(
+                        readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
+                    flushHighFrequencyStreak(readLenABoundary);
                 }
                 
                 if(scratch.flatHits.empty()) continue;
                 std::sort(scratch.flatHits.begin(), scratch.flatHits.end());
 
                 // --- Step 2: DP Chaining per Read Pair ---
-                const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
                 size_t hitIter = 0;
                 while(hitIter < scratch.flatHits.size()) {
                     const ReadId readIdB = scratch.flatHits[hitIter].partnerReadId;
@@ -362,16 +572,28 @@ private:
                     while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) hitIter++;
                     const size_t numHits = hitIter - startInFlat;
                     if(numHits == 0) continue;
+                    // Hifiasm parity: chain_cutoff is a >= threshold.
+                    // A pair with exactly minChainedMarkerCount anchors is still eligible.
+                    if(minChainedMarkerCount > 0 && numHits < size_t(minChainedMarkerCount)) {
+                        continue;
+                    }
 
                     const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
+                    const OrientedReadId orientedReadB(readIdB, 0);
+                    const auto& mB = markers[orientedReadB.getValue()];
 
                     // 2.1 Struct-of-Arrays (SoA) Transfer for cache-efficient DP access
                     scratch.hitPosA.assign(numHits, 0); scratch.hitPosB.assign(numHits, 0);
-                    scratch.hitOrdinalA.assign(numHits, 0); scratch.hitWeights.assign(numHits, 0);
+                    scratch.hitOrdinalA.assign(numHits, 0); scratch.hitOrdinalB.assign(numHits, std::numeric_limits<uint32_t>::max());
+                    scratch.hitWeights.assign(numHits, 0);
                     for(size_t k = 0; k < numHits; ++k) {
                         const auto& h = scratch.flatHits[startInFlat + k];
                         scratch.hitPosA[k] = h.posA; scratch.hitPosB[k] = h.posB;
                         scratch.hitOrdinalA[k] = h.ordinalA; scratch.hitWeights[k] = h.weight;
+                    }
+                    if(!mapHitPositionsToMarkerOrdinals(
+                        scratch.hitPosB, mB, scratch.hitOrdinalB, scratch.hitOrderByPosB)) {
+                        continue;
                     }
 
                     // Pre-allocate/Reset DP work arrays
@@ -443,11 +665,50 @@ private:
                     }
                     #endif
 
-                    // Hifiasm-style DP Chaining (from inter.cpp:821-866)
+                    // Hifiasm-style DP Chaining (from inter.cpp:821-866).
+                    bool quickSame = false;
+                    bool quickDiff = false;
+                    if(numHits > 1) {
+                        quickSame = runQuickLinearChain(
+                            false,
+                            scratch.hitPosA,
+                            scratch.hitPosB,
+                            scratch.hitWeights,
+                            uint32_t(kmerLen),
+                            BW_RATE,
+                            CHN_PEN_GAP,
+                            CHN_PEN_SKIP,
+                            readLenA,
+                            readLenB,
+                            scratch.dpSame,
+                            scratch.parentSame,
+                            scratch.chainOccurrencesSame,
+                            maxScSame,
+                            bestEndIdxSame);
+                        quickDiff = runQuickLinearChain(
+                            true,
+                            scratch.hitPosA,
+                            scratch.hitPosB,
+                            scratch.hitWeights,
+                            uint32_t(kmerLen),
+                            BW_RATE,
+                            CHN_PEN_GAP,
+                            CHN_PEN_SKIP,
+                            readLenA,
+                            readLenB,
+                            scratch.dpDiff,
+                            scratch.parentDiff,
+                            scratch.chainOccurrencesDiff,
+                            maxScDiff,
+                            bestEndIdxDiff);
+                    }
+
                     int32_t st_same = 0, st_diff = 0;
                     int32_t max_ii_same = -1, max_ii_diff = -1;
-
-                    for(size_t i = 0; i < numHits; ++i) {
+                    // quick_ck_lchain-style short-circuit:
+                    // if both orientations are fully solved by the linear pass, skip quadratic DP.
+                    const bool skipFullDp = quickSame && quickDiff;
+                    for(size_t i = 0; i < numHits && !skipFullDp; ++i) {
                         const uint32_t posAi = scratch.hitPosA[i], posBi = scratch.hitPosB[i];
                         const uint8_t spanI = (uint8_t)std::min((uint32_t)kmerLen, (uint32_t)255);
 
@@ -459,11 +720,11 @@ private:
                         int32_t n_skip_same = 0, n_skip_diff = 0;
 
                         // Update start position for same-strand (pure index-based, hifiasm line 1591)
-                        if((int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
+                        if(!quickSame && (int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
 
                         // Same-strand DP
                         int32_t end_j_same = st_same;
-                        for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                        for(int32_t j = (int32_t)i - 1; !quickSame && j >= st_same; --j) {
                             // Use CURRENT hit's weight (scratch.hitWeights[i]), not previous hit's weight!
                             int32_t sc = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
                                                                 scratch.hitWeights[i], spanI,
@@ -484,7 +745,7 @@ private:
 
                         // Rescue mechanism for same-strand (hifiasm lines 846-860)
                         // Track by TARGET position (hitPosB) as hifiasm does
-                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y)) {
+                        if(!quickSame && (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y))) {
                             int32_t max_val = INT32_MIN;
                             max_ii_same = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
@@ -494,7 +755,7 @@ private:
                                 }
                             }
                         }
-                        if(max_ii_same >= 0 && max_ii_same < end_j_same) {
+                        if(!quickSame && max_ii_same >= 0 && max_ii_same < end_j_same) {
                             int32_t tmp = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
                                                                  scratch.hitWeights[i], spanI,
                                                                  BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
@@ -506,23 +767,25 @@ private:
                         }
 
                         // Store same-strand result
-                        scratch.dpSame[i] = max_f_same;
-                        scratch.parentSame[i] = max_j_same;
-                        if(max_j_same >= 0) {
-                            scratch.chainOccurrencesSame[i] = scratch.chainOccurrencesSame[max_j_same] + 1;
+                        if(!quickSame) {
+                            scratch.dpSame[i] = max_f_same;
+                            scratch.parentSame[i] = max_j_same;
+                            if(max_j_same >= 0) {
+                                scratch.chainOccurrencesSame[i] = scratch.chainOccurrencesSame[max_j_same] + 1;
+                            }
                         }
                         // Update max_ii tracker based on target position
-                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
+                        if(!quickSame && (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
+                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i]))) {
                             max_ii_same = (int32_t)i;
                         }
 
                         // Update start position for diff-strand (pure index-based)
-                        if((int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
+                        if(!quickDiff && (int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
 
                         // Diff-strand DP
                         int32_t end_j_diff = st_diff;
-                        for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                        for(int32_t j = (int32_t)i - 1; !quickDiff && j >= st_diff; --j) {
                             // For diff-strand, check if B is decreasing
                             if(scratch.hitPosB[j] <= posBi) continue;
 
@@ -573,7 +836,7 @@ private:
 
                         // Rescue mechanism for diff-strand
                         // For diff-strand, posB decreases, so check: posB[max_ii] - posB[i]
-                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y)) {
+                        if(!quickDiff && (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y))) {
                             int32_t max_val = INT32_MIN;
                             max_ii_diff = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
@@ -583,7 +846,7 @@ private:
                                 }
                             }
                         }
-                        if(max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
+                        if(!quickDiff && max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
                             int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[max_ii_diff];
                             int32_t dB = (int32_t)scratch.hitPosB[max_ii_diff] - (int32_t)posBi;
                             if(dA > 0 && dB > 0) {
@@ -625,14 +888,16 @@ private:
                         }
 
                         // Store diff-strand result
-                        scratch.dpDiff[i] = max_f_diff;
-                        scratch.parentDiff[i] = max_j_diff;
-                        if(max_j_diff >= 0) {
-                            scratch.chainOccurrencesDiff[i] = scratch.chainOccurrencesDiff[max_j_diff] + 1;
+                        if(!quickDiff) {
+                            scratch.dpDiff[i] = max_f_diff;
+                            scratch.parentDiff[i] = max_j_diff;
+                            if(max_j_diff >= 0) {
+                                scratch.chainOccurrencesDiff[i] = scratch.chainOccurrencesDiff[max_j_diff] + 1;
+                            }
                         }
                         // Update max_ii tracker for diff-strand (posB decreases)
-                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
+                        if(!quickDiff && (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
+                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i]))) {
                             max_ii_diff = (int32_t)i;
                         }
 
@@ -701,11 +966,151 @@ private:
                         if (threshByType[0] || threshByType[1] || threshByType[2] || threshByType[3]) {
                             scratch.filteredCandidates.clear();
                             for (size_t ci = 0; ci < scratch.chainCandidates.size(); ++ci) {
-                                if (scratch.chainCandidates[ci].score >= (uint32_t)threshByType[scratch.candidateTypes[ci]]) {
+                                if (scratch.chainCandidates[ci].score >= threshByType[scratch.candidateTypes[ci]]) {
                                     scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
                                 }
                             }
                             scratch.chainCandidates = std::move(scratch.filteredCandidates);
+                        }
+                    }
+
+                    // Hifiasm-style weak-chain suppression (anchor.cpp: OFL/CH_OCC/CH_SC logic).
+                    // Remove weak chains only if they are strongly dominated by an overlapping strong chain.
+                    if(minChainedMarkerCount >= 2 &&
+                        !scratch.chainCandidates.empty() &&
+                        scratch.chainCandidates.size() <= 4096)
+                    {
+                        struct WeakFilterMeta {
+                            uint32_t qs = 0;
+                            uint32_t qe = 0;   // Half-open [qs, qe)
+                            uint32_t occ = 0;  // Number of anchors in the chain.
+                            int32_t score = 0;
+                        };
+
+                        const size_t candidateCount = scratch.chainCandidates.size();
+                        vector<WeakFilterMeta> metas(candidateCount);
+                        vector<size_t> weakIdx;
+                        vector<size_t> strongIdx;
+                        weakIdx.reserve(candidateCount);
+                        strongIdx.reserve(candidateCount);
+
+                        for(size_t ci = 0; ci < candidateCount; ++ci) {
+                            const auto& cand = scratch.chainCandidates[ci];
+                            const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                            int32_t rootK = cand.endK;
+                            while(parentArr[rootK] != -1) {
+                                rootK = parentArr[rootK];
+                            }
+
+                            uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
+                            uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + uint32_t(kmerLen);
+                            if(qe < qs) {
+                                std::swap(qs, qe);
+                            }
+
+                            const uint32_t occ = cand.isDiff ?
+                                scratch.chainOccurrencesDiff[cand.endK] :
+                                scratch.chainOccurrencesSame[cand.endK];
+                            metas[ci] = WeakFilterMeta{qs, qe, occ, cand.score};
+
+                            if(occ < minChainedMarkerCount) {
+                                weakIdx.push_back(ci);
+                            } else {
+                                strongIdx.push_back(ci);
+                            }
+                        }
+
+                        if(!weakIdx.empty() && !strongIdx.empty()) {
+                            // Keep this pass linear-ish in practice by scanning strong chains in interval order.
+                            std::sort(strongIdx.begin(), strongIdx.end(),
+                                [&](const size_t a, const size_t b) {
+                                    if(metas[a].qs != metas[b].qs) {
+                                        return metas[a].qs < metas[b].qs;
+                                    }
+                                    return metas[a].qe < metas[b].qe;
+                                });
+
+                            vector<vector<uint32_t> > strongAnchorPosByCandidate(candidateCount);
+                            for(const size_t si : strongIdx) {
+                                const auto& cand = scratch.chainCandidates[si];
+                                const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
+                                vector<uint32_t> apos;
+                                apos.reserve(metas[si].occ);
+                                for(int32_t k = cand.endK; k != -1; k = parentArr[k]) {
+                                    apos.push_back(scratch.hitPosA[size_t(k)]);
+                                }
+                                std::reverse(apos.begin(), apos.end());
+                                strongAnchorPosByCandidate[si] = std::move(apos);
+                            }
+
+                            vector<uint8_t> suppress(candidateCount, uint8_t(0));
+                            for(const size_t wi : weakIdx) {
+                                const auto& w = metas[wi];
+                                const uint32_t weakSpan = (w.qe > w.qs) ? (w.qe - w.qs) : 0;
+                                const uint32_t minOverlap =
+                                    std::max<uint32_t>(16U, uint32_t(double(weakSpan) * HIFIASM_OFL));
+                                const uint64_t minStrongOcc = uint64_t(w.occ) << HIFIASM_CH_OCC;
+                                const int64_t minStrongScore = int64_t(w.score) * int64_t(HIFIASM_CH_SC);
+
+                                for(const size_t si : strongIdx) {
+                                    const auto& s = metas[si];
+                                    if(s.qe <= w.qs) {
+                                        continue;
+                                    }
+                                    if(s.qs >= w.qe) {
+                                        break;
+                                    }
+                                    if(uint64_t(s.occ) < minStrongOcc) {
+                                        continue;
+                                    }
+                                    if(int64_t(s.score) < minStrongScore) {
+                                        continue;
+                                    }
+
+                                    const uint32_t os = std::max(w.qs, s.qs);
+                                    const uint32_t oe = std::min(w.qe, s.qe);
+                                    if(oe <= os) {
+                                        continue;
+                                    }
+                                    const uint32_t overlap = oe - os;
+                                    if(overlap < minOverlap) {
+                                        continue;
+                                    }
+
+                                    // Hifiasm-like in-overlap anchor support guard.
+                                    const auto& apos = strongAnchorPosByCandidate[si];
+                                    if(apos.empty()) {
+                                        continue;
+                                    }
+                                    const auto itBegin = std::lower_bound(apos.begin(), apos.end(), os);
+                                    const auto itEnd = std::lower_bound(itBegin, apos.end(), oe);
+                                    const uint64_t overlapAnchorCount = uint64_t(std::distance(itBegin, itEnd));
+                                    if(overlapAnchorCount < minStrongOcc) {
+                                        continue;
+                                    }
+
+                                    suppress[wi] = uint8_t(1);
+                                    break;
+                                }
+                            }
+
+                            bool anySuppressed = false;
+                            for(const size_t wi : weakIdx) {
+                                if(suppress[wi]) {
+                                    anySuppressed = true;
+                                    break;
+                                }
+                            }
+                            if(anySuppressed) {
+                                scratch.filteredCandidates.clear();
+                                scratch.filteredCandidates.reserve(candidateCount);
+                                for(size_t ci = 0; ci < candidateCount; ++ci) {
+                                    if(!suppress[ci]) {
+                                        scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
+                                    }
+                                }
+                                scratch.chainCandidates = std::move(scratch.filteredCandidates);
+                            }
                         }
                     }
 
@@ -721,18 +1126,6 @@ private:
                     };
 
                     for (const auto& cand : scratch.chainCandidates) {
-                        // Filter low-support candidates before doing any backtracking/extraction.
-                        // We keep only candidates with strictly more than minChainedMarkerCount marker hits
-                        // so the candidate table (and downstream work) stays high-confidence.
-                        if(minChainedMarkerCount > 0) {
-                            const uint32_t occ = cand.isDiff ?
-                                scratch.chainOccurrencesDiff[cand.endK] :
-                                scratch.chainOccurrencesSame[cand.endK];
-                            if(occ <= minChainedMarkerCount) {
-                                continue;
-                            }
-                        }
-
                         int32_t currK = cand.endK;
                         const auto& parentArr = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
                         scratch.currentChainPath.clear();
@@ -748,19 +1141,16 @@ private:
                         // Extract alignment path
                         Alignment al; 
                         al.ordinals.reserve(scratch.currentChainPath.size());
-                        const OrientedReadId orientedReadB(readIdB, 0);
-                        const auto& mB = markers[orientedReadB.getValue()];
-                        bool validChain = true;
-
                         for(uint32_t idxK : scratch.currentChainPath) {
-                            uint32_t tPos = scratch.hitPosB[idxK];
-                            auto itB = std::lower_bound(mB.begin(), mB.end(), tPos, [](const CompressedMarker& m, uint32_t v){ return m.position < v; });
-                            if(itB != mB.end() && itB->position == tPos) {
-                                al.ordinals.push_back({scratch.hitOrdinalA[idxK], (uint32_t)(itB - mB.begin())});
-                            } else { validChain = false; break; }
+                            const uint32_t ordB = scratch.hitOrdinalB[idxK];
+                            if(ordB == std::numeric_limits<uint32_t>::max()) {
+                                al.ordinals.clear();
+                                break;
+                            }
+                            al.ordinals.push_back({scratch.hitOrdinalA[idxK], ordB});
                         }
 
-                        if(validChain) {
+                        if(!al.ordinals.empty()) {
                              uint32_t qPstart = markersA[scratch.hitOrdinalA[scratch.currentChainPath.front()]].position;
                              uint32_t qPend = markersA[scratch.hitOrdinalA[scratch.currentChainPath.back()]].position + (uint32_t)kmerLen;
                              uint32_t bPfirst = mB[al.ordinals.front()[1]].position;
@@ -1143,6 +1533,9 @@ void Assembler::chainAlignmentCandidates(
     invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
     invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
     invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
+    invertedIndexData.downsampleHighFrequencyMarkers = overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers;
+    invertedIndexData.highFrequencySampleDistance = overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance;
+    invertedIndexData.maxHighFrequencyPerStreak = overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak;
     invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
     invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
     invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
@@ -1232,6 +1625,9 @@ void Assembler::chainPafCandidates(
     invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
     invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
     invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
+    invertedIndexData.downsampleHighFrequencyMarkers = overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers;
+    invertedIndexData.highFrequencySampleDistance = overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance;
+    invertedIndexData.maxHighFrequencyPerStreak = overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak;
     invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
     invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
     invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
@@ -1263,6 +1659,19 @@ void Assembler::chainPafCandidates(
     const uint64_t kmerLen = invertedIndexData.k;
     const double maxDriftRateLocal = invertedIndexData.maxDriftRate;
     const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+    const uint64_t lowFreqThreshold = std::max<uint64_t>(
+        2ULL, uint64_t(double(coveragePeak) * invertedIndexData.lowFreqMultiplier));
+    const uint64_t highFreqThreshold = std::max<uint64_t>(
+        3ULL, uint64_t(double(coveragePeak) * invertedIndexData.highFreqMultiplier));
+    const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
+    const bool downsampleHighFrequencyMarkers =
+        invertedIndexData.downsampleHighFrequencyMarkers &&
+        invertedIndexData.highFrequencySampleDistance > 0 &&
+        invertedIndexData.maxHighFrequencyPerStreak > 0;
+    const uint32_t highFrequencySampleDistance = std::max<uint32_t>(
+        1U, invertedIndexData.highFrequencySampleDistance);
+    const uint32_t maxHighFrequencyPerStreak = std::max<uint32_t>(
+        1U, invertedIndexData.maxHighFrequencyPerStreak);
 
     // Thread-local results
     vector<vector<OrientedReadPair>> threadCandidates(threadCount);
@@ -1302,54 +1711,113 @@ void Assembler::chainPafCandidates(
                     const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
                     const uint64_t readLenB = reads->getReadRawSequenceLength(readIdB);
 
-                    // Build position lookup for read B
-                    std::map<uint32_t, uint32_t> posBToOrdinalB;
-                    for(size_t j = 0; j < numMarkersB; j++) {
-                        posBToOrdinalB[markersB[j].position] = (uint32_t)j;
-                    }
-
                     // Collect k-mer matches between the pair
                     scratch.clear();
                     scratch.flatHits.reserve(numMarkersA);
+                    struct PendingHighFrequencyMarker {
+                        uint64_t startIdx = 0;
+                        uint32_t count = 0;
+                        uint32_t posA = 0;
+                        uint32_t ordinalA = 0;
+                        uint8_t weight = 1;
+                    };
+                    vector<PendingHighFrequencyMarker> highFrequencyStreak;
+                    highFrequencyStreak.reserve(64);
+                    int64_t lastNonHighBoundaryPos = -1;
+
+                    auto computeHitWeight = [&](const uint32_t count) -> uint8_t {
+                        if (count <= lowFreqThreshold) {
+                            return uint8_t(std::min<uint32_t>(255U, invertedIndexData.rareKmerWeight));
+                        }
+                        if (count >= highFreqThreshold) {
+                            const uint32_t w = 1U + uint32_t((uint64_t(count) + highFreqWeightUnit - 1ULL) / highFreqWeightUnit);
+                            if (w < 512U) {
+                                return invertedIndexData.weightLut[w];
+                            }
+                            return uint8_t(std::min<uint32_t>(255U, uint32_t(std::pow(double(w), invertedIndexData.weightExponent))));
+                        }
+                        return uint8_t(1);
+                    };
+
+                    auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
+                        const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
+                        for (uint32_t j = 0; j < markerInfo.count; ++j) {
+                            if (compactOccs[j].readId == readIdB) {
+                                scratch.flatHits.push_back(
+                                    {readIdB, markerInfo.posA, compactOccs[j].position, markerInfo.ordinalA, markerInfo.weight});
+                            }
+                        }
+                    };
+
+                    auto flushHighFrequencyStreak = [&](const uint32_t rightBoundaryPos) {
+                        if (highFrequencyStreak.empty()) {
+                            return;
+                        }
+                        const uint32_t leftBoundaryPos = (lastNonHighBoundaryPos >= 0) ? uint32_t(lastNonHighBoundaryPos) : 0U;
+                        const uint32_t span = (rightBoundaryPos > leftBoundaryPos) ? (rightBoundaryPos - leftBoundaryPos) : 0U;
+                        uint32_t keep = uint32_t(double(span) / double(highFrequencySampleDistance) + 0.499);
+                        if (keep > maxHighFrequencyPerStreak) {
+                            keep = maxHighFrequencyPerStreak;
+                        }
+                        if (keep == 0) {
+                            highFrequencyStreak.clear();
+                            return;
+                        }
+
+                        const size_t selectedCount = std::min<size_t>(highFrequencyStreak.size(), keep);
+                        for (size_t s = 0; s < selectedCount; ++s) {
+                            const size_t idx = (uint64_t(s) * highFrequencyStreak.size()) / selectedCount;
+                            appendMarkerHits(highFrequencyStreak[idx]);
+                        }
+                        highFrequencyStreak.clear();
+                    };
 
                     for(size_t i = 0; i < numMarkersA; i++) {
                         KmerId currentKId = kmerIdsA[i];
                         KmerId rcKId = getRcKmerId(currentKId, kmerLen);
                         KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
                         
-                        uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
                         const uint32_t posA = markersA[i].position;
+                        uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
+                        uint64_t startIdx = 0;
+                        uint32_t count = 0;
+                        bool found = false;
 
                         // Search hash table for this k-mer
                         while(!hashTablePtr[slotIdx].empty) {
                             if(hashTablePtr[slotIdx].key == canonicalKId) {
-                                const uint64_t startIdx = hashTablePtr[slotIdx].start;
-                                const uint32_t count = hashTablePtr[slotIdx].count;
-                                
-                                uint8_t hitWeight = 1;
-                                const uint64_t lowFreq = (uint64_t)(double(coveragePeak) * invertedIndexData.lowFreqMultiplier);
-                                const uint64_t highFreq = (uint64_t)(double(coveragePeak) * invertedIndexData.highFreqMultiplier);
-                                
-                                if (count <= std::max(2UL, lowFreq)) {
-                                    hitWeight = uint8_t(std::min<uint32_t>(255U, invertedIndexData.rareKmerWeight));
-                                } else if (count >= std::max(3UL, highFreq)) {
-                                    uint32_t w = 1 + (uint32_t)((count + (highFreq * 2) - 1) / (highFreq * 2 == 0 ? 1 : highFreq * 2));
-                                    hitWeight = (w < 512) ?
-                                        invertedIndexData.weightLut[w] :
-                                        (uint8_t)std::min(255U, (uint32_t)pow((double)w, invertedIndexData.weightExponent));
-                                }
-
-                                // Find occurrences in read B only
-                                const auto* compactOccs = &invertedIndexData.compactOccurrences[startIdx];
-                                for(uint32_t j = 0; j < count; j++) {
-                                    if(compactOccs[j].readId == readIdB) {
-                                        scratch.flatHits.push_back({readIdB, posA, compactOccs[j].position, (uint32_t)i, hitWeight});
-                                    }
-                                }
+                                startIdx = hashTablePtr[slotIdx].start;
+                                count = hashTablePtr[slotIdx].count;
+                                found = true;
                                 break;
                             }
                             slotIdx = (slotIdx + 1) & hashMask;
                         }
+
+                        if(!found) {
+                            if(downsampleHighFrequencyMarkers) {
+                                flushHighFrequencyStreak(posA);
+                                lastNonHighBoundaryPos = posA;
+                            }
+                            continue;
+                        }
+
+                        const uint8_t hitWeight = computeHitWeight(count);
+                        if(downsampleHighFrequencyMarkers && count >= highFreqThreshold) {
+                            highFrequencyStreak.push_back({startIdx, count, posA, uint32_t(i), hitWeight});
+                            continue;
+                        }
+
+                        if(downsampleHighFrequencyMarkers) {
+                            flushHighFrequencyStreak(posA);
+                        }
+                        appendMarkerHits({startIdx, count, posA, uint32_t(i), hitWeight});
+                        lastNonHighBoundaryPos = posA;
+                    }
+                    if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
+                        const uint32_t readLenABoundary = uint32_t(std::min<uint64_t>(
+                            readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
+                        flushHighFrequencyStreak(readLenABoundary);
                     }
 
                     if(scratch.flatHits.empty()) {
@@ -1365,17 +1833,27 @@ void Assembler::chainPafCandidates(
                         });
 
                     const size_t numHits = scratch.flatHits.size();
+                    // Hifiasm parity: chain_cutoff is a >= threshold.
+                    // A pair with exactly minChainedMarkerCount anchors is still eligible.
+                    if(minChainedMarkerCount > 0 && numHits < size_t(minChainedMarkerCount)) {
+                        continue;
+                    }
 
                     // Transfer to SoA
                     scratch.hitPosA.assign(numHits, 0);
                     scratch.hitPosB.assign(numHits, 0);
                     scratch.hitOrdinalA.assign(numHits, 0);
+                    scratch.hitOrdinalB.assign(numHits, std::numeric_limits<uint32_t>::max());
                     scratch.hitWeights.assign(numHits, 0);
                     for(size_t k = 0; k < numHits; k++) {
                         scratch.hitPosA[k] = scratch.flatHits[k].posA;
                         scratch.hitPosB[k] = scratch.flatHits[k].posB;
                         scratch.hitOrdinalA[k] = scratch.flatHits[k].ordinalA;
                         scratch.hitWeights[k] = scratch.flatHits[k].weight;
+                    }
+                    if(!mapHitPositionsToMarkerOrdinals(
+                        scratch.hitPosB, markersB, scratch.hitOrdinalB, scratch.hitOrderByPosB)) {
+                        continue;
                     }
 
                     // Hifiasm-style DP chaining for PAF candidates
@@ -1385,6 +1863,8 @@ void Assembler::chainPafCandidates(
                     scratch.parentDiff.assign(numHits, -1);
                     scratch.backtrackVisitSame.assign(numHits, -1);
                     scratch.backtrackVisitDiff.assign(numHits, -1);
+                    scratch.chainOccurrencesSame.assign(numHits, 1);
+                    scratch.chainOccurrencesDiff.assign(numHits, 1);
 
                     // Hifiasm DP parameters for read-to-read overlaps
                     // Hifiasm lchain_dp parameters for ONT reads (chainPafCandidates)
@@ -1397,14 +1877,59 @@ void Assembler::chainPafCandidates(
                     // ONT parameters: chn_pen_gap = 0.5 * exp(-0.1 * 51) ≈ 0.091
                     constexpr double CHN_PEN_GAP = 0.091341762;   // Gap penalty for ONT
                     constexpr double CHN_PEN_SKIP = 0.000091342;  // Skip penalty for ONT
-                    const double BW_RATE = maxDriftRate;          // Bandwidth rate (0.05 for ONT)
+                    const double BW_RATE = maxDriftRateLocal;     // Bandwidth rate (0.05 for ONT)
 
                     int32_t maxScSame = 0, maxScDiff = 0;
                     int32_t bestEndIdxSame = -1, bestEndIdxDiff = -1;
+                    const bool runSame = pafSameStrand;
+                    const bool runDiff = !pafSameStrand;
+                    bool quickSame = false;
+                    bool quickDiff = false;
+                    if(numHits > 1) {
+                        if(runSame) {
+                            quickSame = runQuickLinearChain(
+                                false,
+                                scratch.hitPosA,
+                                scratch.hitPosB,
+                                scratch.hitWeights,
+                                uint32_t(kmerLen),
+                                BW_RATE,
+                                CHN_PEN_GAP,
+                                CHN_PEN_SKIP,
+                                readLenA,
+                                readLenB,
+                                scratch.dpSame,
+                                scratch.parentSame,
+                                scratch.chainOccurrencesSame,
+                                maxScSame,
+                                bestEndIdxSame);
+                        }
+                        if(runDiff) {
+                            quickDiff = runQuickLinearChain(
+                                true,
+                                scratch.hitPosA,
+                                scratch.hitPosB,
+                                scratch.hitWeights,
+                                uint32_t(kmerLen),
+                                BW_RATE,
+                                CHN_PEN_GAP,
+                                CHN_PEN_SKIP,
+                                readLenA,
+                                readLenB,
+                                scratch.dpDiff,
+                                scratch.parentDiff,
+                                scratch.chainOccurrencesDiff,
+                                maxScDiff,
+                                bestEndIdxDiff);
+                        }
+                    }
                     int32_t st_same = 0, st_diff = 0;
                     int32_t max_ii_same = -1, max_ii_diff = -1;
-
-                    for(size_t i = 0; i < numHits; ++i) {
+                    // quick_ck_lchain-style short-circuit for the required orientation(s).
+                    const bool skipFullDp =
+                        (!runSame || quickSame) &&
+                        (!runDiff || quickDiff);
+                    for(size_t i = 0; i < numHits && !skipFullDp; ++i) {
                         const uint32_t posAi = scratch.hitPosA[i], posBi = scratch.hitPosB[i];
                         const uint8_t spanI = (uint8_t)std::min((uint32_t)kmerLen, (uint32_t)255);
 
@@ -1416,11 +1941,11 @@ void Assembler::chainPafCandidates(
                         int32_t n_skip_same = 0, n_skip_diff = 0;
 
                         // Update start position for same-strand (pure index-based, hifiasm line 1591)
-                        if((int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
+                        if(runSame && !quickSame && (int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
 
                         // Same-strand DP
                         int32_t end_j_same = st_same;
-                        for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
+                        for(int32_t j = (int32_t)i - 1; runSame && !quickSame && j >= st_same; --j) {
                             // Use CURRENT hit's weight (scratch.hitWeights[i]), not previous hit's weight!
                             int32_t sc = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
                                                                 scratch.hitWeights[i], spanI,
@@ -1441,7 +1966,8 @@ void Assembler::chainPafCandidates(
 
                         // Rescue for same-strand
                         // Track by TARGET position (hitPosB) as hifiasm does
-                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y)) {
+                        if(runSame && !quickSame &&
+                            (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y))) {
                             int32_t max_val = INT32_MIN;
                             max_ii_same = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
@@ -1451,7 +1977,7 @@ void Assembler::chainPafCandidates(
                                 }
                             }
                         }
-                        if(max_ii_same >= 0 && max_ii_same < end_j_same) {
+                        if(runSame && !quickSame && max_ii_same >= 0 && max_ii_same < end_j_same) {
                             int32_t tmp = hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
                                                                  scratch.hitWeights[i], spanI,
                                                                  BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
@@ -1462,19 +1988,22 @@ void Assembler::chainPafCandidates(
                             }
                         }
 
-                        scratch.dpSame[i] = max_f_same;
-                        scratch.parentSame[i] = max_j_same;
+                        if(runSame && !quickSame) {
+                            scratch.dpSame[i] = max_f_same;
+                            scratch.parentSame[i] = max_j_same;
+                        }
                         // Update max_ii tracker based on target position
-                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
+                        if(runSame && !quickSame &&
+                            (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
+                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i]))) {
                             max_ii_same = (int32_t)i;
                         }
 
                         // Diff-strand DP (pure index-based, lchain_dp style)
-                        if((int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
+                        if(runDiff && !quickDiff && (int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
 
                         int32_t end_j_diff = st_diff;
-                        for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
+                        for(int32_t j = (int32_t)i - 1; runDiff && !quickDiff && j >= st_diff; --j) {
                             if(scratch.hitPosB[j] <= posBi) continue;
 
                             int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[j];
@@ -1523,7 +2052,8 @@ void Assembler::chainPafCandidates(
 
                         // Rescue for diff-strand
                         // For diff-strand, posB decreases, so check: posB[max_ii] - posB[i]
-                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y)) {
+                        if(runDiff && !quickDiff &&
+                            (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y))) {
                             int32_t max_val = INT32_MIN;
                             max_ii_diff = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
@@ -1533,7 +2063,8 @@ void Assembler::chainPafCandidates(
                                 }
                             }
                         }
-                        if(max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
+                        if(runDiff && !quickDiff &&
+                            max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
                             int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[max_ii_diff];
                             int32_t dB = (int32_t)scratch.hitPosB[max_ii_diff] - (int32_t)posBi;
                             if(dA > 0 && dB > 0) {
@@ -1574,19 +2105,22 @@ void Assembler::chainPafCandidates(
                             }
                         }
 
-                        scratch.dpDiff[i] = max_f_diff;
-                        scratch.parentDiff[i] = max_j_diff;
+                        if(runDiff && !quickDiff) {
+                            scratch.dpDiff[i] = max_f_diff;
+                            scratch.parentDiff[i] = max_j_diff;
+                        }
                         // Update max_ii tracker for diff-strand (posB decreases)
-                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
+                        if(runDiff && !quickDiff &&
+                            (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
+                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i]))) {
                             max_ii_diff = (int32_t)i;
                         }
 
-                        if(scratch.dpSame[i] > maxScSame) {
+                        if(runSame && !quickSame && scratch.dpSame[i] > maxScSame) {
                             maxScSame = scratch.dpSame[i];
                             bestEndIdxSame = (int32_t)i;
                         }
-                        if(scratch.dpDiff[i] > maxScDiff) {
+                        if(runDiff && !quickDiff && scratch.dpDiff[i] > maxScDiff) {
                             maxScDiff = scratch.dpDiff[i];
                             bestEndIdxDiff = (int32_t)i;
                         }
@@ -1613,28 +2147,26 @@ void Assembler::chainPafCandidates(
                     }
                     std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
 
+                    // Hifiasm parity: keep chains with length >= chain_cutoff.
                     if(minChainedMarkerCount > 0 &&
-                        scratch.currentChainPath.size() <= size_t(minChainedMarkerCount)) {
+                        scratch.currentChainPath.size() < size_t(minChainedMarkerCount)) {
                         continue;
                     }
 
                     // Build alignment
                     Alignment al;
                     al.ordinals.reserve(scratch.currentChainPath.size());
-                    bool validChain = true;
 
                     for(uint32_t idxK : scratch.currentChainPath) {
-                        uint32_t tPos = scratch.hitPosB[idxK];
-                        auto it = posBToOrdinalB.find(tPos);
-                        if(it != posBToOrdinalB.end()) {
-                            al.ordinals.push_back({scratch.hitOrdinalA[idxK], it->second});
-                        } else {
-                            validChain = false;
+                        const uint32_t ordB = scratch.hitOrdinalB[idxK];
+                        if(ordB == std::numeric_limits<uint32_t>::max()) {
+                            al.ordinals.clear();
                             break;
                         }
+                        al.ordinals.push_back({scratch.hitOrdinalA[idxK], ordB});
                     }
 
-                    if(validChain && !al.ordinals.empty()) {
+                    if(!al.ordinals.empty()) {
                         // Set alignment coordinates.
                         // Note: Alignment stores ts/te in forward-read coordinates, even for reverse overlaps.
                         uint32_t qPstart = markersA[al.ordinals.front()[0]].position;
