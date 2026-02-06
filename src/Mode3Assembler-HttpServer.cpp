@@ -519,7 +519,6 @@ void Mode3Assembler::exploreJourney(const vector<string>& request, ostream& html
 
     // Access the information we need.
     const OrientedReadId orientedReadId(readId, strand);
-    const span<const CompressedMarker> orientedReadMarkers = markers[orientedReadId.getValue()];
     const auto& journeys = anchors().journeys;
     DINARA_ASSERT(journeys.isOpen());
     DINARA_ASSERT(journeys.size() == 2 * reads.readCount());

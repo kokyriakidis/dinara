@@ -337,8 +337,6 @@ static uint64_t stringGraphRemoveSingleNodeBubbles(Assembler& assembler, uint32_
         if (!uniqueOutgoingTo(a, tA) || !uniqueOutgoingTo(b, tB) || tA != tB) {
             continue;
         }
-        const uint32_t t = tA;
-
         // Heuristic scoring: prefer the branch with more total overlap.
         uint32_t arcAtoT = 0;
         uint32_t arcBtoT = 0;

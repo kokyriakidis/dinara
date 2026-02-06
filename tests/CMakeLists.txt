@@ -39,7 +39,7 @@ endif()
 
 # Dinara build directory for libraries
 set(DINARA_BUILD_DIR $ENV{HOME}/.dinaraBuild)
-include_directories(${DINARA_BUILD_DIR}/include)
+include_directories(SYSTEM ${DINARA_BUILD_DIR}/include)
 link_directories(${DINARA_BUILD_DIR}/lib)
 
 # Catch2 main (provides main())
@@ -77,6 +77,9 @@ add_executable(test_integration
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )
+set_source_files_properties(
+    ${DINARA_ROOT}/src/MurmurHash2.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-implicit-fallthrough")
 
 # Some toolchains in this environment can produce non-executable output files
 # (missing +x), which makes CTest fail with "permission denied".

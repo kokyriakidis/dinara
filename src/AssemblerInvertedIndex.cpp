@@ -255,11 +255,11 @@ private:
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers;
     const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds;
     const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData;
-    MemoryMapped::Vector<OrientedReadPair>& candidates;
-    MemoryMapped::Vector<Alignment>& precomputedAlignments;
+    [[maybe_unused]] MemoryMapped::Vector<OrientedReadPair>& candidates;
+    [[maybe_unused]] MemoryMapped::Vector<Alignment>& precomputedAlignments;
     uint64_t maxChainLimit;
     uint32_t minChainedMarkerCount;
-    uint64_t threadCount;
+    [[maybe_unused]] uint64_t threadCount;
 
     vector<vector<OrientedReadPair>> threadCandidates;
     vector<vector<Alignment>> threadAlignments;
@@ -534,7 +534,6 @@ private:
                         }
                     }
 
-                    end_dp_chaining:
                     // --- Step 3: Filtering and Candidate Generation ---
                     uint32_t bestScPair = std::max(maxScSame, maxScDiff);
                     if (bestScPair < 2) continue;

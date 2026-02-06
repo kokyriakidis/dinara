@@ -377,7 +377,6 @@ void PhasingGraph::computeSpanningTree()
     }
 
     // Process edges in order of decreasing logP.
-    uint64_t treeEdgeCount = 0;
     for(const auto& p: edgeTable) {
         const PhasingGraph::edge_descriptor e = p.first;
         const PhasingGraph::vertex_descriptor v0 = source(e, phasingGraph);
@@ -385,7 +384,6 @@ void PhasingGraph::computeSpanningTree()
         if(disjointSets.find_set(v0) != disjointSets.find_set(v1)) {
             disjointSets.union_set(v0, v1);
             phasingGraph[e].isTreeEdge = true;
-            ++treeEdgeCount;
         }
     }
     // cout << "Found " << treeEdgeCount << " edges of the optimal spanning tree." << endl;
@@ -646,5 +644,4 @@ void PhasingGraph::writeGraphviz(const string& fileName) const
 
     out << "}\n";
 }
-
 

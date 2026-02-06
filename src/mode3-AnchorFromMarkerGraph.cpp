@@ -216,7 +216,8 @@ Anchors::Anchors(
     // Initialize the AnchorInfos with ordinalOffset=0 for vertex anchors.
     anchorInfos.createNew(largeDataName("AnchorInfos"), largeDataPageSize);
     anchorInfos.resize(anchorMarkerIntervals.size());
-    for(AnchorId anchorId=0; anchorId<anchorMarkerIntervals.size(); anchorId++) {
+    const AnchorId anchorCount = AnchorId(anchorInfos.size());
+    for(AnchorId anchorId=0; anchorId<anchorCount; anchorId++) {
         anchorInfos[anchorId].ordinalOffset = 0;
         anchorInfos[anchorId].componentId = invalid<uint32_t>;
         anchorInfos[anchorId].localAnchorIdInComponent = invalid<uint64_t>;

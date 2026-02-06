@@ -2355,7 +2355,7 @@ void Assembler::flagInconsistentAlignmentsThreadFunction2(size_t threadId)
                         const int32_t offsetError = offset02 + offset20;
 
                         // If the error is small, don't do anything.
-                        if(abs(offsetError) < triangleErrorThreshold) {
+                        if(uint64_t(std::abs(offsetError)) < triangleErrorThreshold) {
                             continue;
                         }
 

@@ -808,7 +808,10 @@ namespace dinara {
                  }
                  throw runtime_error("Layout Mismatch: VectorOfVectors container size mismatch.");
             }
-            std::memcpy(targetVec, sourceVec, sizeof(TargetVectorType));
+            std::memcpy(
+                static_cast<void*>(targetVec),
+                static_cast<const void*>(sourceVec),
+                sizeof(TargetVectorType));
             
         } else {
             // Standard File-Based Access: Selected symlinks are already created above.

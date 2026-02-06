@@ -259,7 +259,7 @@ bool Anchors::processCandidateAnchor(
                 cout << "Read length is " << readLength << endl;
                 throw runtime_error("Invalid begin/end.");
             }
-            intervals.push_back({orientedReadId, begin, end});
+            intervals.push_back({orientedReadId, begin, end, begin, end, 0, 0});
 
             if(debug) {
                 cout << readName << " " << orientedReadId << " " << begin << " " << end << endl;
@@ -521,4 +521,3 @@ bool Anchors::processCandidateAnchor(
 
     return true;
 }
-

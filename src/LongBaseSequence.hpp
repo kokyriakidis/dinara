@@ -218,6 +218,7 @@ public:
     }
 
     LongBaseSequence(const LongBaseSequence& that) :
+        LongBaseSequenceView(that.readOnly),
         data(that.data)
     {
         baseCount = that.baseCount;
