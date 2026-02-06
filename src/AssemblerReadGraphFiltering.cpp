@@ -805,20 +805,6 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
                 continue;
             }
 
-            int32_t tl5, tl3;
-            if (!ad.isSameStrand) {
-                tl5 = (int32_t)tl - (int32_t)te;
-                tl3 = (int32_t)ts;
-            } else {
-                tl5 = (int32_t)ts;
-                tl3 = (int32_t)tl - (int32_t)te;
-            }
-
-            int32_t ext5 = ((int32_t)qs < tl5) ? (int32_t)qs : tl5;
-            
-            int32_t q3Hang = (int32_t)ql - (int32_t)qe;
-            int32_t ext3 = (q3Hang < tl3) ? q3Hang : tl3;
-
             const int result = ma_hit2arc_containment(
                 (int32_t)qs, (int32_t)qe, (int32_t)ql,
                 (int32_t)ts, (int32_t)te, (int32_t)tl,

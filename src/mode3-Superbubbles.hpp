@@ -35,6 +35,10 @@ public:
     using vertex_descriptor = AssemblyGraphBaseClass::vertex_descriptor;
     vector<vertex_descriptor> entrances;
     vector<vertex_descriptor> exits;
+    Superbubble() = default;
+    explicit Superbubble(const vector<vertex_descriptor>& vertices) :
+        vector<vertex_descriptor>(vertices), entrances(), exits()
+    {}
 
     // Fill in the superbubble given a single entrance and exit.
     void fillInFromEntranceAndExit(const AssemblyGraph&);
@@ -105,6 +109,5 @@ public:
     // computed using only the edges with offset up to maxOffset1.
     vector<Superbubble> superbubbles;
 };
-
 
 

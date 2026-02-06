@@ -631,8 +631,8 @@ void Assembler::computeAlignments(
     // Aggregate timing statistics from all threads
     double totalProjectedAlignmentTime = 0.0;
     double totalCollectionTime = 0.0;
-    double estimatedProjectedWallTime = 0.0;
-    double estimatedCollectionWallTime = 0.0;
+    [[maybe_unused]] double estimatedProjectedWallTime = 0.0;
+    [[maybe_unused]] double estimatedCollectionWallTime = 0.0;
     
     if (assemblerInfo->readGraphCreationMethod == 5) {
         for (size_t i = 0; i < threadCount; i++) {
@@ -734,10 +734,8 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
     const double downsamplingFactor = data.alignOptions->downsamplingFactor;
     const int bandExtend = data.alignOptions->bandExtend;
     const int maxBand = data.alignOptions->maxBand;
-    const bool suppressContainments = data.alignOptions->suppressContainments;
     const double align5DriftRateTolerance = data.alignOptions->align5DriftRateTolerance;
     const uint64_t align5MinBandExtend = data.alignOptions->align5MinBandExtend;
-    const bool computeProjectedAlignmentMetrics = true;
 
 
     // Align4-specific items.
@@ -948,7 +946,6 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // If getting here, this is a good alignment.
 
             // Compute projected alignment metrics.
-            bool hasLargeIndel = false;
             const auto tProjStart = steady_clock::now();
             const ProjectedAlignment projectedAlignment(
                 *this,

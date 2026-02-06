@@ -1206,7 +1206,7 @@ void AssemblyGraph2::writeHaploid(
     const G& g = *this;
 
     vector<uint64_t> bubbleChainLengths;
-    uint64_t totalNonBubbleChainLength = 0;
+    [[maybe_unused]] uint64_t totalNonBubbleChainLength = 0;
 
     // Open the fasta file.
     ofstream fasta;
@@ -4586,7 +4586,7 @@ void AssemblyGraph2::updateMarkerGraph()
     }
 
     // Now set the flags for marker graph edges that appear anywhere in the assembly graph.
-    uint64_t n = 0;;
+    [[maybe_unused]] uint64_t n = 0;
     BGL_FORALL_EDGES(e, g, G) {
         const AssemblyGraph2Edge& edge = g[e];
         for(const AssemblyGraph2Edge::Branch& branch: edge.branches) {

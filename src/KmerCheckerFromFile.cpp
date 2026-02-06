@@ -32,7 +32,6 @@ KmerCheckerFromFile::KmerCheckerFromFile(
     markerKmers.createNew(largeDataName("KmerCheckerFromFile"), largeDataPageSize);
 
     // Read one k-mer per line.
-    uint64_t lineCount = 1;
     string line;
     while(true) {
 
@@ -66,8 +65,6 @@ KmerCheckerFromFile::KmerCheckerFromFile(
 
         // Store the lowest of the two in the table.
         markerKmers.push_back(min(kmerId, kmerIdRc));
-
-        ++lineCount;
 
     }
 

@@ -2891,7 +2891,7 @@ bool AssemblyGraph::detangleVertex(
 
         // Count the number of significant, ambiguous, and negligible elements
         // in the tangle matrix.
-        uint64_t significantCount = 0;
+        [[maybe_unused]] uint64_t significantCount = 0;
         uint64_t ambiguousCount = 0;
         uint64_t negligibleCount = 0;
         for(uint64_t i0=0; i0<inEdges.size(); i0++) {
@@ -3597,7 +3597,7 @@ bool AssemblyGraph::detangleEdge(
 
         // Count the number of significant, ambiguous, and negligible elements
         // in the tangle matrix.
-        uint64_t significantCount = 0;
+        [[maybe_unused]] uint64_t significantCount = 0;
         uint64_t ambiguousCount = 0;
         uint64_t negligibleCount = 0;
         for(uint64_t i0=0; i0<inEdges.size(); i0++) {
@@ -4439,9 +4439,9 @@ bool AssemblyGraph::detangleShortSuperbubble(
 
     // Count the number of significant, ambiguous, and negligible elements
     // in the tangle matrix.
-    uint64_t significantCount = 0;
+    [[maybe_unused]] uint64_t significantCount = 0;
     uint64_t ambiguousCount = 0;
-    uint64_t negligibleCount = 0;
+    [[maybe_unused]] uint64_t negligibleCount = 0;
     for(uint64_t i0=0; i0<inDegree; i0++) {
         for(uint64_t i1=0; i1<outDegree; i1++) {
             const uint64_t t = tangleMatrix[i0][i1];
@@ -5885,7 +5885,7 @@ void AssemblyGraph::PhasingGraph::phase1(bool debug, bool useBayesianModel)
         for(uint64_t i=0; i<vertexCount; i++) {
             disjointSets.make_set(i);
         }
-        uint64_t spanningTreeEdgeCount = 0;
+        [[maybe_unused]] uint64_t spanningTreeEdgeCount = 0;
 
         for(const edge_descriptor e: sortedEdges) {
             PhasingGraphEdge& edge = phasingGraph[e];
@@ -7877,4 +7877,3 @@ bool AssemblyGraphNoInternalAnchorsEdgePredicate::operator()(edge_descriptor e) 
     DINARA_ASSERT(chain.size() > 1);
     return chain.size() == 2;
 }
-

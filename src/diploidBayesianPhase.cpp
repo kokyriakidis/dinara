@@ -135,10 +135,9 @@ void dinara::testDiploidBayesianPhase(
     uint64_t m11
     )
 {
-    const array<array<uint64_t, 2>, 2> matrix = {m00, m01, m10, m11};
+    const array<array<uint64_t, 2>, 2> matrix = {{{m00, m01}, {m10, m11}}};
 
     double logPin, logPout;
     tie(logPin, logPout) = diploidBayesianPhase(matrix, epsilon);
     cout << logPin << " " << logPout << endl;
 }
-

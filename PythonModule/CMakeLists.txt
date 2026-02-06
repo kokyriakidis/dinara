@@ -6,7 +6,9 @@ project(dinaraPythonModule)
 add_definitions(-std=c++23)
 
 # Compilation warnings.
-add_definitions(-Wall -Wconversion -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wunused-parameter -Wno-unused-function)
+# Keep actionable warnings enabled by default, but avoid conversion-noise flooding
+# from legacy code and external dependency headers.
+add_definitions(-Wall -Wextra -Wno-unused-result -Wno-trigraphs -Wno-psabi -Wno-unused-parameter -Wno-unused-function)
 
 # Optimization and debug options.
 if(BUILD_DEBUG)
@@ -59,12 +61,15 @@ include_directories(../src)
 
 # Point to local build directory
 set(DINARA_BUILD_DIR "$ENV{HOME}/.dinaraBuild")
-include_directories(${DINARA_BUILD_DIR}/include)
+include_directories(SYSTEM ${DINARA_BUILD_DIR}/include)
 link_directories(${DINARA_BUILD_DIR}/lib)
 list(APPEND CMAKE_PREFIX_PATH "${DINARA_BUILD_DIR}")
 
 # Define our library.
 add_library(dinaraPythonModule SHARED ${SOURCES})
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MurmurHash2.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-implicit-fallthrough")
 
 # Make sure the library is named dinara.so.
 set_target_properties(dinaraPythonModule PROPERTIES OUTPUT_NAME "dinara")

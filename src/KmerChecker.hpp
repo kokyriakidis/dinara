@@ -18,6 +18,7 @@ namespace dinara {
 class dinara::KmerChecker {
 public:
     virtual bool isMarker(KmerId) const = 0;
+    virtual ~KmerChecker() = default;
 };
 
 #endif

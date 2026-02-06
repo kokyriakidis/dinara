@@ -347,7 +347,7 @@ void AlignmentGraph::createEdges(
             }
 
             // Check that the skip in the 1 direction is less than maxSkip.
-            if(abs(correctedOrdinalB1 - correctedOrdinalA1) > maxSkip) {
+            if(uint64_t(std::abs(correctedOrdinalB1 - correctedOrdinalA1)) > maxSkip) {
                 continue;
             }
 
@@ -355,7 +355,7 @@ void AlignmentGraph::createEdges(
             if(maxDrift < maxSkip) {
                 const int offsetA = correctedOrdinalA0 - correctedOrdinalA1;
                 const int offsetB = correctedOrdinalB0 - correctedOrdinalB1;
-                if(abs(offsetA - offsetB) > maxDrift) {
+                if(uint64_t(std::abs(offsetA - offsetB)) > maxDrift) {
                     continue;
                 }
             }
@@ -592,4 +592,3 @@ void AlignmentGraph::writeImage(
     // Write it out.
     image.write(fileName);
 }
-

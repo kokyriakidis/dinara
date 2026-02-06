@@ -682,7 +682,7 @@ const Aligner::Cell* Aligner::findCell(const Coordinates& iXY) const
 // We use DFS instead of BFS for better locality of memory access.
 void Aligner::forwardSearch()
 {
-    uint64_t n = 0;
+    [[maybe_unused]] uint64_t n = 0;
 
     // Initialize the stack of undiscovered iXY.
     std::stack<Coordinates> s;
@@ -736,7 +736,7 @@ void Aligner::forwardSearch()
 // We use DFS instead of BFS for better locality of memory access.
 void Aligner::backwardSearch()
 {
-    uint64_t n = 0;
+    [[maybe_unused]] uint64_t n = 0;
 
     // Initialize the stack of undiscovered iXY.
     std::stack<Coordinates> s;
@@ -1086,4 +1086,3 @@ bool Aligner::computeBandedAlignment(
     }
     return true;
 }
-

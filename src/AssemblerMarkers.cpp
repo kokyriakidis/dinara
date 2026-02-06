@@ -866,9 +866,7 @@ void Assembler::getOrientedReadAlign6MarkersStrand1(
 
     const auto read = reads->getRead(uint32_t(readId));
     const OrientedReadId orientedReadId0(readId, 0);
-    const OrientedReadId orientedReadId1(readId, 1);
     const auto orientedReadMarkers0 = (*markers)[orientedReadId0.getValue()];
-    const auto orientedReadMarkers1 = (*markers)[orientedReadId1.getValue()];
     const uint64_t readMarkerCount = orientedReadMarkers0.size();
     DINARA_ASSERT(align6Markers.size() == readMarkerCount);
 

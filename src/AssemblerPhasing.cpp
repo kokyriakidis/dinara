@@ -802,7 +802,6 @@ std::vector<uint32_t> AssemblerPhasing::generatePhasingDP(
     std::vector<int> p(n, -1);
     
     int64_t maxScoreGlobal = 0;
-    int bestEnd = -1;
     
     for(int i=0; i<n; ++i) {
         f[i] = 1; // Base score (self)
@@ -827,7 +826,6 @@ std::vector<uint32_t> AssemblerPhasing::generatePhasingDP(
         
         if(f[i] > maxScoreGlobal) {
             maxScoreGlobal = f[i];
-            bestEnd = i;
         }
     }
     

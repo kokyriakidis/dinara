@@ -594,7 +594,6 @@ void Assembler::loadAlignmentsPafFile(const string& alignmentsPafFileAbsolutePat
     bool isReverse = false;
 
     uint64_t nDelimiters = 0;
-    uint64_t nLines = 0;
     char c;
 
     while (pafFile.get(c)) {
@@ -656,7 +655,6 @@ void Assembler::loadAlignmentsPafFile(const string& alignmentsPafFileAbsolutePat
 
             token.resize(0);
             nDelimiters = 0;
-            nLines++;
         }
         else {
             token += c;

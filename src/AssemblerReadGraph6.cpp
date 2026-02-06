@@ -33,7 +33,9 @@ void Assembler::createReadGraphFromEcParityCisOverlaps(
     uint64_t keptCount = 0;
     uint64_t filteredCount = 0;
 
+#ifdef _OPENMP
     #pragma omp parallel for reduction(+:keptCount, filteredCount)
+#endif
     for(uint64_t i = 0; i < alignmentCount; i++) {
         const AlignmentData& ad = alignmentData[i];
         const bool cis0 = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
@@ -83,7 +85,9 @@ void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
     uint64_t filteredByPhase = 0;
     uint64_t filteredByNoInformativeSite = 0;
 
+#ifdef _OPENMP
     #pragma omp parallel for reduction(+:keptCount, filteredByPhase, filteredByNoInformativeSite)
+#endif
     for(uint64_t i = 0; i < alignmentCount; i++) {
         const AlignmentData& ad = alignmentData[i];
         const bool cis0 = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
@@ -264,7 +268,9 @@ void Assembler::createReadGraph6(uint64_t threadCount)
         if (reasons & AlignmentData::DeleteReasonContained) ++filteredByContained;
     };
 
+#ifdef _OPENMP
     #pragma omp parallel for reduction(+:keptCount, phasedOutCount, filteredByPhase, filteredBySecondary, filteredByChemical, filteredByLocalSegment, filteredByCoverageCut, filteredByHanging, filteredByContained, palindromicCount, chimericCount, containedCount)
+#endif
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
         
@@ -390,7 +396,9 @@ void Assembler::createReadGraphFromFilteredAlignments()
     uint64_t keptCount = 0;
     uint64_t filteredCount = 0;
 
+#ifdef _OPENMP
     #pragma omp parallel for reduction(+:keptCount, filteredCount)
+#endif
     for(uint64_t i = 0; i < alignmentCount; i++) {
         AlignmentData& ad = alignmentData[i];
         // Hifiasm-style conservative keep rule: keep an overlap only if BOTH reads keep it.

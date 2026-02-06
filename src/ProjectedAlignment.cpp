@@ -64,16 +64,16 @@ ProjectedAlignment::ProjectedAlignment(
     int64_t dpGapExtend2) :
     k(k),
     kHalf(k / 2),
-    orientedReadIds(orientedReadIds),
-    sequences(sequences),
-    alignment(alignment),
-    markers(markers),
     dpMatchScore(dpMatchScore),
     dpMismatchScore(dpMismatchScore),
     dpGapOpen1(dpGapOpen1),
     dpGapExtend1(dpGapExtend1),
     dpGapOpen2(dpGapOpen2),
-    dpGapExtend2(dpGapExtend2)
+    dpGapExtend2(dpGapExtend2),
+    orientedReadIds(orientedReadIds),
+    sequences(sequences),
+    alignment(alignment),
+    markers(markers)
 {
     DINARA_ASSERT((k % 2) == 0);
 
