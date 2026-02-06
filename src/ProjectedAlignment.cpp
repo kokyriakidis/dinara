@@ -1175,10 +1175,20 @@ void ProjectedAlignment::fillSequences(ProjectedAlignmentSegment& segment) const
     for(uint64_t i=0; i<2; i++) {
         vector<Base>& sequence = segment.sequences[i];
         sequence.clear();
-        for(uint32_t position=segment.positionsA[i]; position!=segment.positionsB[i]; position++) {
+        const uint32_t begin = segment.positionsA[i];
+        const uint32_t end = segment.positionsB[i];
+
+        // It is possible (due to degenerate marker placement or unexpected marker alignments)
+        // that two consecutive aligned marker midpoints map to the same base position, or even
+        // that begin/end are not in increasing order. In these cases, this segment contains
+        // no bases on this side; allow an empty sequence instead of asserting/crashing.
+        if (begin >= end) {
+            continue;
+        }
+
+        for(uint32_t position=begin; position!=end; position++) {
             sequence.push_back(getBase(i, position));
         }
-        DINARA_ASSERT(not sequence.empty());
     }
 }
 

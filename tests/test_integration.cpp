@@ -971,6 +971,13 @@ public:
         options.align5DriftRateTolerance = 0.02;
         options.align5MinBandExtend = 10;
         options.maxErrorRate = 0.3; // Higher for synthetic tests
+        // Base-level overlap DP scoring defaults (hifiasm/minimap2 parity).
+        options.overlapDpMatchScore = 2;
+        options.overlapDpMismatchScore = -4;
+        options.overlapDpGapOpen1 = 4;
+        options.overlapDpGapExtend1 = 2;
+        options.overlapDpGapOpen2 = 24;
+        options.overlapDpGapExtend2 = 1;
         withSilencedIoInDir(testDir, [&] { assembler->computeAlignmentsWithEvidence(options, 1); });
     }
 
@@ -1582,6 +1589,637 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     CHECK(s1_03[0].first == 1500);
     CHECK(s0_03[0].second == complementBase[expectedQ03]);
     CHECK(s1_03[0].second == expectedT03);
+}
+
+TEST_CASE("Integration: transitive global het site clustering", "[integration][evidence][hetsites][transitive]") {
+    AssemblerIntegrationFixture fixture;
+
+    // Three reads where read_1 differs by a single SNP at P, but we only provide overlaps
+    // (0,1) and (1,2) via PAF. The clustering should still connect (0,P) and (2,P) through (1,P).
+    const std::string base = randomSequence(2000, 424242);
+    const uint32_t P = 1000;
+    REQUIRE(P < base.size());
+
+    std::string read0 = base;
+    std::string read1 = base;
+    std::string read2 = base;
+    read1[P] = otherBase(read1[P]);
+
+    fixture.createFastq({read0, read1, read2});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    // Provide only the two overlaps that include read_1 as a bridge.
+    const auto pafPath = fixture.createPafFile({
+        {"read_0", "read_1", true, 0, uint32_t(read0.size()), 0, uint32_t(read1.size())},
+        {"read_1", "read_2", true, 0, uint32_t(read1.size()), 0, uint32_t(read2.size())},
+    });
+    fixture.importPafCandidates(pafPath);
+    fixture.buildIndex();
+    fixture.chainPafCandidates(0.1, 100, 0);
+
+    AlignOptions options;
+    options.alignMethod = 6;
+    options.maxSkip = 100;
+    options.maxDrift = 100;
+    options.maxTrim = 10000;
+    options.minAlignedMarkerCount = 4;
+    options.minAlignedFraction = 0.0;
+    options.maxMarkerFrequency = 1000;
+    options.matchScore = 3;
+    options.mismatchScore = -1;
+    options.gapScore = -1;
+    options.downsamplingFactor = 0.1;
+    options.bandExtend = 10;
+    options.maxBand = 1000;
+    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
+    options.suppressContainments = false;
+    options.align4DeltaX = 200;
+    options.align4DeltaY = 10;
+    options.align4MinEntryCountPerCell = 10;
+    options.align4MaxDistanceFromBoundary = 100;
+    options.align5DriftRateTolerance = 0.02;
+    options.align5MinBandExtend = 10;
+    options.maxErrorRate = 0.3;
+    options.overlapDpMatchScore = 2;
+    options.overlapDpMismatchScore = -4;
+    options.overlapDpGapOpen1 = 4;
+    options.overlapDpGapExtend1 = 2;
+    options.overlapDpGapOpen2 = 24;
+    options.overlapDpGapExtend2 = 1;
+
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+
+    const auto clusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSites(options, 1);
+
+    // Find the cluster that contains (read_0, P).
+    const uint64_t node0 = uint64_t(std::find(clusters.nodes.begin(), clusters.nodes.end(), std::make_pair(ReadId(0), P)) - clusters.nodes.begin());
+    REQUIRE(node0 < clusters.nodes.size());
+
+    bool found = false;
+    for (size_t c = 0; c + 1 < clusters.clusterMemberOffsets.size(); c++) {
+        const uint64_t begin = clusters.clusterMemberOffsets[c];
+        const uint64_t end = clusters.clusterMemberOffsets[c + 1];
+        bool contains0 = false;
+        bool contains1 = false;
+        bool contains2 = false;
+        for (uint64_t i = begin; i < end; i++) {
+            const auto& node = clusters.nodes[clusters.clusterMembers[i]];
+            if (node.first == ReadId(0) && node.second == P) contains0 = true;
+            if (node.first == ReadId(1) && node.second == P) contains1 = true;
+            if (node.first == ReadId(2) && node.second == P) contains2 = true;
+        }
+        if (contains0) {
+            found = true;
+            CHECK(contains1);
+            CHECK(contains2);
+
+            // Allele counts should show 2 reads supporting the base from read_0/read_2 and 1 supporting read_1.
+            const Reads& reads = fixture.assembler->getReads();
+            const uint8_t baseRef = reads.getOrientedReadBase(OrientedReadId(ReadId(0), 0), P).value;
+            const uint8_t baseAlt = reads.getOrientedReadBase(OrientedReadId(ReadId(1), 0), P).value;
+            REQUIRE(baseRef < 4);
+            REQUIRE(baseAlt < 4);
+            CHECK(clusters.alleleCounts[c][baseRef] == 2);
+            CHECK(clusters.alleleCounts[c][baseAlt] == 1);
+            break;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("Integration: read-reachable global het clustering excludes disconnected components",
+    "[integration][evidence][hetsites][reachable]")
+{
+    AssemblerIntegrationFixture fixture;
+
+    const uint32_t pA = 900;
+    const uint32_t pB = 750;
+
+    std::string compA0 = randomSequence(2200, 930001);
+    std::string compA1 = compA0;
+    std::string compA2 = compA0;
+    compA1[pA] = otherBase(compA1[pA]);
+
+    std::string compB0 = randomSequence(2100, 930099);
+    std::string compB1 = compB0;
+    compB1[pB] = otherBase(compB1[pB]);
+
+    fixture.createFastq({compA0, compA1, compA2, compB0, compB1});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    const auto pafPath = fixture.createPafFile({
+        {"read_0", "read_1", true, 0, uint32_t(compA0.size()), 0, uint32_t(compA1.size())},
+        {"read_1", "read_2", true, 0, uint32_t(compA1.size()), 0, uint32_t(compA2.size())},
+        {"read_3", "read_4", true, 0, uint32_t(compB0.size()), 0, uint32_t(compB1.size())},
+    });
+    fixture.importPafCandidates(pafPath);
+    fixture.buildIndex();
+    fixture.chainPafCandidates(0.1, 100, 0);
+
+    AlignOptions options;
+    options.alignMethod = 6;
+    options.maxSkip = 100;
+    options.maxDrift = 100;
+    options.maxTrim = 10000;
+    options.minAlignedMarkerCount = 4;
+    options.minAlignedFraction = 0.0;
+    options.maxMarkerFrequency = 1000;
+    options.matchScore = 3;
+    options.mismatchScore = -1;
+    options.gapScore = -1;
+    options.downsamplingFactor = 0.1;
+    options.bandExtend = 10;
+    options.maxBand = 1000;
+    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
+    options.suppressContainments = false;
+    options.align4DeltaX = 200;
+    options.align4DeltaY = 10;
+    options.align4MinEntryCountPerCell = 10;
+    options.align4MaxDistanceFromBoundary = 100;
+    options.align5DriftRateTolerance = 0.02;
+    options.align5MinBandExtend = 10;
+    options.maxErrorRate = 0.3;
+    options.overlapDpMatchScore = 2;
+    options.overlapDpMismatchScore = -4;
+    options.overlapDpGapOpen1 = 4;
+    options.overlapDpGapExtend1 = 2;
+    options.overlapDpGapOpen2 = 24;
+    options.overlapDpGapExtend2 = 1;
+
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+
+    for (auto& ad : fixture.assembler->alignmentData) {
+        ad.info.isInReadGraph = 1;
+    }
+    fixture.assembler->computeAlignmentTableForTesting();
+
+    const auto allClusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSites(
+        options,
+        1,
+        false,
+        true);
+    const auto reachableClusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
+        ReadId(0),
+        options,
+        1,
+        0,
+        0,
+        false,
+        true);
+
+    bool allHasComponentB = false;
+    for (const auto& node : allClusters.nodes) {
+        if (node.first == ReadId(3) || node.first == ReadId(4)) {
+            allHasComponentB = true;
+            break;
+        }
+    }
+    CHECK(allHasComponentB);
+
+    for (const auto& node : reachableClusters.nodes) {
+        const bool inReachableComponent =
+            (node.first == ReadId(0)) ||
+            (node.first == ReadId(1)) ||
+            (node.first == ReadId(2));
+        CHECK(inReachableComponent);
+    }
+
+    bool foundRead0Site = false;
+    for (uint32_t c = 0; c + 1 < reachableClusters.clusterMemberOffsets.size(); c++) {
+        const uint64_t begin = reachableClusters.clusterMemberOffsets[c];
+        const uint64_t end = reachableClusters.clusterMemberOffsets[c + 1];
+        bool has0 = false;
+        bool has1 = false;
+        bool has2 = false;
+        for (uint64_t i = begin; i < end; i++) {
+            const auto& node = reachableClusters.nodes[reachableClusters.clusterMembers[i]];
+            if (node.first == ReadId(0) && node.second == pA) has0 = true;
+            if (node.first == ReadId(1) && node.second == pA) has1 = true;
+            if (node.first == ReadId(2) && node.second == pA) has2 = true;
+        }
+        if (has0) {
+            foundRead0Site = true;
+            CHECK(has1);
+            CHECK(has2);
+            break;
+        }
+    }
+    CHECK(foundRead0Site);
+
+    const auto membersSeededByRead0 = fixture.assembler->computeGlobalHetSiteAlleleMembersUsingReadGraph(
+        allClusters,
+        options,
+        0,
+        false,
+        ReadId(0));
+
+    for (uint32_t sid = 0; sid < membersSeededByRead0.offsets.size(); sid++) {
+        const auto& off = membersSeededByRead0.offsets[sid];
+        for (int allele = 0; allele < 4; allele++) {
+            for (uint64_t i = off[allele]; i < off[allele + 1]; i++) {
+                const ReadId rid = membersSeededByRead0.members[i].readId;
+                const bool inReachableComponent =
+                    (rid == ReadId(0)) || (rid == ReadId(1)) || (rid == ReadId(2));
+                CHECK(inReachableComponent);
+            }
+        }
+    }
+}
+
+TEST_CASE("Integration: readGraph global het propagation keeps reverse indel-shifted coordinates exact",
+    "[integration][evidence][hetsites][readgraph][orientation]")
+{
+    AssemblerIntegrationFixture fixture;
+
+    const std::string base = randomSequence(2800, 615001);
+    const uint32_t snpPosRead0 = 1390;
+    const uint32_t insertionPos = 900;
+    REQUIRE(insertionPos < snpPosRead0);
+    REQUIRE(snpPosRead0 + 1 < base.size());
+
+    std::string read0 = base;
+    std::string read1 = base;
+    read1.insert(read1.begin() + insertionPos, 'A');
+    const uint32_t snpPosRead1 = snpPosRead0 + 1U;
+    read1[snpPosRead1] = otherBase(read1[snpPosRead1]);
+    const std::string read2 = reverseComplement(read1); // reverse-strand counterpart
+
+    fixture.createFastq({read0, read1, read2});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    const auto pafPath = fixture.createPafFile({
+        {"read_0", "read_1", true, 0, uint32_t(read0.size()), 0, uint32_t(read1.size())},
+        {"read_0", "read_2", false, 0, uint32_t(read0.size()), 0, uint32_t(read2.size())},
+        {"read_1", "read_2", false, 0, uint32_t(read1.size()), 0, uint32_t(read2.size())},
+    });
+    fixture.importPafCandidates(pafPath);
+    fixture.buildIndex();
+    fixture.chainPafCandidates(0.1, 100, 0);
+
+    AlignOptions options;
+    options.alignMethod = 6;
+    options.maxSkip = 100;
+    options.maxDrift = 100;
+    options.maxTrim = 10000;
+    options.minAlignedMarkerCount = 4;
+    options.minAlignedFraction = 0.0;
+    options.maxMarkerFrequency = 1000;
+    options.matchScore = 3;
+    options.mismatchScore = -1;
+    options.gapScore = -1;
+    options.downsamplingFactor = 0.1;
+    options.bandExtend = 10;
+    options.maxBand = 1000;
+    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
+    options.suppressContainments = false;
+    options.align4DeltaX = 200;
+    options.align4DeltaY = 10;
+    options.align4MinEntryCountPerCell = 10;
+    options.align4MaxDistanceFromBoundary = 100;
+    options.align5DriftRateTolerance = 0.02;
+    options.align5MinBandExtend = 10;
+    options.maxErrorRate = 0.3;
+    options.overlapDpMatchScore = 2;
+    options.overlapDpMismatchScore = -4;
+    options.overlapDpGapOpen1 = 4;
+    options.overlapDpGapExtend1 = 2;
+    options.overlapDpGapOpen2 = 24;
+    options.overlapDpGapExtend2 = 1;
+
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+
+    // Use all computed overlaps as read-graph edges for this focused test.
+    for (auto& ad : fixture.assembler->alignmentData) {
+        ad.info.isInReadGraph = 1;
+    }
+    fixture.assembler->computeAlignmentTableForTesting();
+
+    const auto clusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSites(
+        options,
+        1,
+        false,
+        true);
+
+    uint32_t siteId = invalid<uint32_t>;
+    for (uint32_t c = 0; c + 1 < clusters.clusterMemberOffsets.size(); c++) {
+        const uint64_t begin = clusters.clusterMemberOffsets[c];
+        const uint64_t end = clusters.clusterMemberOffsets[c + 1];
+        bool hasRead0 = false;
+        for (uint64_t i = begin; i < end; i++) {
+            const auto& node = clusters.nodes[clusters.clusterMembers[i]];
+            if (node.first == ReadId(0) && node.second == snpPosRead0) {
+                hasRead0 = true;
+                break;
+            }
+        }
+        if (hasRead0) {
+            siteId = c;
+            break;
+        }
+    }
+    REQUIRE(siteId != invalid<uint32_t>);
+
+    const auto members = fixture.assembler->computeGlobalHetSiteAlleleMembersUsingReadGraph(clusters, options);
+    REQUIRE(siteId < members.offsets.size());
+
+    // Forward-coordinate positions should include exact indel-shifted placement.
+    bool foundRead1 = false;
+    bool foundRead2 = false;
+    uint32_t mappedRead1Pos = 0;
+    uint32_t mappedRead2Pos = 0;
+    for (int allele = 0; allele < 4; allele++) {
+        const uint64_t b0 = members.offsets[siteId][allele];
+        const uint64_t b1 = members.offsets[siteId][allele + 1];
+        for (uint64_t i = b0; i < b1; i++) {
+            const auto& m = members.members[i];
+            if (m.readId == ReadId(1)) {
+                foundRead1 = true;
+                mappedRead1Pos = m.position;
+            } else if (m.readId == ReadId(2)) {
+                foundRead2 = true;
+                mappedRead2Pos = m.position;
+            }
+        }
+    }
+    REQUIRE(foundRead1);
+    REQUIRE(foundRead2);
+    CHECK(mappedRead1Pos == snpPosRead1);
+    const uint32_t expectedRead2Forward = uint32_t(read2.size()) - 1U - snpPosRead1;
+    CHECK(mappedRead2Pos == expectedRead2Forward);
+
+    uint64_t strandConflicts = 0;
+    const auto strandByRead =
+        fixture.assembler->computeReadGraphStrandsFromSeed(ReadId(0), strandConflicts, false);
+    REQUIRE(uint64_t(ReadId(2)) < strandByRead.size());
+    CHECK(strandByRead[uint64_t(ReadId(2))] == 1);
+
+    const auto oriented = fixture.assembler->orientGlobalHetSiteAlleleMembers(members, strandByRead);
+    REQUIRE(siteId < oriented.offsets.size());
+
+    bool foundRead2Oriented = false;
+    uint32_t mappedRead2OrientedPos = 0;
+    uint8_t mappedRead2Allele = 255;
+    for (int allele = 0; allele < 4; allele++) {
+        const uint64_t b0 = oriented.offsets[siteId][allele];
+        const uint64_t b1 = oriented.offsets[siteId][allele + 1];
+        for (uint64_t i = b0; i < b1; i++) {
+            const auto& m = oriented.members[i];
+            if (m.orientedReadId.getReadId() == ReadId(2)) {
+                foundRead2Oriented = true;
+                mappedRead2OrientedPos = m.position;
+                mappedRead2Allele = uint8_t(allele);
+                CHECK(m.orientedReadId.getStrand() == 1);
+            }
+        }
+    }
+    REQUIRE(foundRead2Oriented);
+    CHECK(mappedRead2OrientedPos == snpPosRead1);
+
+    const uint8_t observedOrientedBase = fixture.assembler->getReads().getOrientedReadBase(
+        OrientedReadId(ReadId(2), 1), mappedRead2OrientedPos).value;
+    REQUIRE(observedOrientedBase < 4);
+    CHECK(observedOrientedBase == mappedRead2Allele);
+
+    // Export conversion should round-trip exactly for reverse members.
+    const uint32_t posOriented0 = mappedRead2OrientedPos;
+    const uint32_t posOriented1 = posOriented0 + 1U;
+    const uint32_t len2 = uint32_t(read2.size());
+    const uint32_t posForward0 = len2 - posOriented1;
+    const uint32_t posForward1 = len2 - posOriented0;
+    CHECK(posForward1 == posForward0 + 1U);
+    CHECK(posForward0 == mappedRead2Pos);
+}
+
+TEST_CASE("Integration: readGraph global het propagation drops members with gap at site",
+    "[integration][evidence][hetsites][readgraph][gap]")
+{
+    AssemblerIntegrationFixture fixture;
+
+    const uint32_t p = 1300;
+    const uint32_t delLen = 15;
+    std::string read0 = randomSequence(3200, 615201);
+    REQUIRE(p + delLen + 2 < read0.size());
+    std::string read1 = read0;
+    read1[p] = otherBase(read1[p]);
+    std::string read2 = read0;
+    read2.erase(p, delLen);
+
+    fixture.createFastq({read0, read1, read2});
+    fixture.initAssembler();
+    fixture.loadReads();
+    fixture.generateMarkers(16, 5);
+    fixture.countKmers();
+    fixture.applyFilter(1, 1000);
+
+    const auto pafPath = fixture.createPafFile({
+        {"read_0", "read_1", true, 0, uint32_t(read0.size()), 0, uint32_t(read1.size())},
+        {"read_0", "read_2", true, 0, uint32_t(read0.size()), 0, uint32_t(read2.size())},
+        {"read_1", "read_2", true, 0, uint32_t(read1.size()), 0, uint32_t(read2.size())},
+    });
+    fixture.importPafCandidates(pafPath);
+    fixture.buildIndex();
+    fixture.chainPafCandidates(0.1, 100, 0);
+
+    AlignOptions options;
+    options.alignMethod = 6;
+    options.maxSkip = 100;
+    options.maxDrift = 100;
+    options.maxTrim = 10000;
+    options.minAlignedMarkerCount = 4;
+    options.minAlignedFraction = 0.0;
+    options.maxMarkerFrequency = 1000;
+    options.matchScore = 3;
+    options.mismatchScore = -1;
+    options.gapScore = -1;
+    options.downsamplingFactor = 0.1;
+    options.bandExtend = 10;
+    options.maxBand = 1000;
+    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
+    options.suppressContainments = false;
+    options.align4DeltaX = 200;
+    options.align4DeltaY = 10;
+    options.align4MinEntryCountPerCell = 10;
+    options.align4MaxDistanceFromBoundary = 100;
+    options.align5DriftRateTolerance = 0.02;
+    options.align5MinBandExtend = 10;
+    options.maxErrorRate = 0.3;
+    options.overlapDpMatchScore = 2;
+    options.overlapDpMismatchScore = -4;
+    options.overlapDpGapOpen1 = 4;
+    options.overlapDpGapExtend1 = 2;
+    options.overlapDpGapOpen2 = 24;
+    options.overlapDpGapExtend2 = 1;
+
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+
+    const AlignmentData* gapAd = nullptr;
+    for (const auto& ad : fixture.assembler->alignmentData) {
+        const bool matchesPair =
+            (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(2)) ||
+            (ad.readIds[0] == ReadId(2) && ad.readIds[1] == ReadId(0));
+        if (!matchesPair) continue;
+        gapAd = &ad;
+        break;
+    }
+    REQUIRE(gapAd != nullptr);
+    REQUIRE(gapAd->info.alignmentId != invalid<size_t>);
+    {
+        const auto& store = fixture.assembler->alignedEvidenceStore;
+        const uint32_t evidenceId = uint32_t(gapAd->info.alignmentId);
+        span<const IndelEvidence> gapIndels =
+            (gapAd->readIds[0] == ReadId(0)) ? store.getIndels1(evidenceId) : store.getIndels0(evidenceId);
+        uint32_t deletionLenNearP = 0;
+        for (const auto& e : gapIndels) {
+            if (!e.isDeletion()) continue;
+            if (e.pos() + 100 < p) continue;
+            if (e.pos() > p + 100) continue;
+            deletionLenNearP += e.len();
+            if (deletionLenNearP >= delLen) {
+                break;
+            }
+        }
+        REQUIRE(deletionLenNearP >= delLen);
+    }
+
+    for (auto& ad : fixture.assembler->alignmentData) {
+        ad.info.isInReadGraph = 1;
+    }
+    fixture.assembler->computeAlignmentTableForTesting();
+
+    const auto clusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSites(
+        options,
+        1,
+        false,
+        true);
+
+    uint32_t siteId = invalid<uint32_t>;
+    for (uint32_t c = 0; c + 1 < clusters.clusterMemberOffsets.size(); c++) {
+        const uint64_t begin = clusters.clusterMemberOffsets[c];
+        const uint64_t end = clusters.clusterMemberOffsets[c + 1];
+        bool hasRead0 = false;
+        bool hasRead1 = false;
+        for (uint64_t i = begin; i < end; i++) {
+            const auto& node = clusters.nodes[clusters.clusterMembers[i]];
+            if (node.first == ReadId(0) && node.second == p) {
+                hasRead0 = true;
+            }
+            if (node.first == ReadId(1)) {
+                hasRead1 = true;
+            }
+        }
+        if (hasRead0 && hasRead1) {
+            siteId = c;
+            break;
+        }
+    }
+    REQUIRE(siteId != invalid<uint32_t>);
+
+    const auto members = fixture.assembler->computeGlobalHetSiteAlleleMembersUsingReadGraph(
+        clusters,
+        options,
+        0,
+        false,
+        ReadId(0));
+    REQUIRE(siteId < members.offsets.size());
+
+    bool foundRead2 = false;
+    for (int allele = 0; allele < 4; allele++) {
+        const uint64_t b0 = members.offsets[siteId][allele];
+        const uint64_t b1 = members.offsets[siteId][allele + 1];
+        for (uint64_t i = b0; i < b1; i++) {
+            const auto& m = members.members[i];
+            if (m.readId == ReadId(2)) {
+                foundRead2 = true;
+            }
+        }
+    }
+    // With strict per-read consistency filtering, some non-gap reads can be dropped as ambiguous.
+    // The critical requirement is that the read carrying a gap at this site is not emitted.
+    CHECK_FALSE(foundRead2);
+}
+
+TEST_CASE("Integration: filtered global het read index keeps only robust per-read-consistent sites",
+    "[integration][evidence][hetsites][readindex]")
+{
+    AssemblerIntegrationFixture fixture;
+    fixture.createFastq({
+        randomSequence(120, 901),
+        randomSequence(120, 902),
+        randomSequence(120, 903),
+        randomSequence(120, 904)
+    });
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    Assembler::GlobalHetSiteAlleleMembers members;
+    members.offsets = {
+        array<uint64_t, 5>{0, 2, 2, 4, 4},    // site0: A2,G2 (passes)
+        array<uint64_t, 5>{4, 8, 8, 8, 8},    // site1: A4 only (fails)
+        array<uint64_t, 5>{8, 8, 11, 11, 13}  // site2: C3,T2 (passes)
+    };
+    members.members = {
+        {ReadId(0), 20}, {ReadId(1), 30},                 // site0 A
+        {ReadId(2), 40}, {ReadId(3), 50},                 // site0 G
+
+        {ReadId(0), 21}, {ReadId(1), 31}, {ReadId(2), 41}, {ReadId(3), 51}, // site1 A
+
+        {ReadId(1), 60}, {ReadId(2), 70}, {ReadId(2), 70}, // site2 C (duplicate on read2)
+        {ReadId(1), 61}, {ReadId(3), 80}                   // site2 T (read1 ambiguous)
+    };
+
+    const auto index = fixture.assembler->buildFilteredGlobalHetSiteReadIndex(
+        members,
+        2, // minAlleleSupport
+        2  // minAllelesWithMinSupport
+    );
+
+    REQUIRE(index.sitePassesFilter.size() == 3);
+    CHECK(index.sitePassesFilter[0] == 1);
+    CHECK(index.sitePassesFilter[1] == 0);
+    CHECK(index.sitePassesFilter[2] == 1);
+    CHECK(index.keptSiteCount == 2);
+    CHECK(index.droppedAmbiguousReadSiteCount == 1);
+    CHECK(index.droppedInvalidReadSiteCount == 0);
+
+    REQUIRE(index.sitesByRead.size() == 4);
+
+    REQUIRE(index.sitesByRead[0].size() == 1);
+    CHECK(index.sitesByRead[0][0].siteId == 0);
+    CHECK(index.sitesByRead[0][0].readPosition == 20);
+    CHECK(index.sitesByRead[0][0].allele == 0);
+
+    REQUIRE(index.sitesByRead[1].size() == 1);
+    CHECK(index.sitesByRead[1][0].siteId == 0);
+    CHECK(index.sitesByRead[1][0].readPosition == 30);
+    CHECK(index.sitesByRead[1][0].allele == 0);
+
+    REQUIRE(index.sitesByRead[2].size() == 2);
+    CHECK(index.sitesByRead[2][0].siteId == 0);
+    CHECK(index.sitesByRead[2][0].readPosition == 40);
+    CHECK(index.sitesByRead[2][0].allele == 2);
+    CHECK(index.sitesByRead[2][1].siteId == 2);
+    CHECK(index.sitesByRead[2][1].readPosition == 70);
+    CHECK(index.sitesByRead[2][1].allele == 1);
+
+    REQUIRE(index.sitesByRead[3].size() == 2);
+    CHECK(index.sitesByRead[3][0].siteId == 0);
+    CHECK(index.sitesByRead[3][0].readPosition == 50);
+    CHECK(index.sitesByRead[3][0].allele == 2);
+    CHECK(index.sitesByRead[3][1].siteId == 2);
+    CHECK(index.sitesByRead[3][1].readPosition == 80);
+    CHECK(index.sitesByRead[3][1].allele == 3);
 }
 
 TEST_CASE("Integration: Overlap-event anchors select vertices uniquely", "[integration][anchors][events]") {

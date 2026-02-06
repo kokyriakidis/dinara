@@ -1030,8 +1030,8 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 uint32_t te_marker = markers1[alignmentInfo.data[1].lastOrdinal].position + uint32_t(assemblerInfo->k);
     
                 // Read lengths for coordinate extension
-                const uint64_t len0 = reads->getReadRawSequenceLength(orientedReadIds[0].getReadId());
-                const uint64_t len1 = reads->getReadRawSequenceLength(orientedReadIds[1].getReadId());
+                const uint64_t len0 = reads->getRead(orientedReadIds[0].getReadId()).baseCount;
+                const uint64_t len1 = reads->getRead(orientedReadIds[1].getReadId()).baseCount;
                 
                 // --- Hifiasm Parity: Extend coordinates to read boundaries ---
                 // This matches append_inexact_overlap_region_alloc in Hash_Table.cpp:374-398
@@ -1110,12 +1110,12 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Store sparse mismatch/indel evidence (no per-base trace scanning).
             {
                 AlignedEvidenceStore& store = data.threadEvidenceStores[threadId];
-                thisAlignmentData.info.alignmentId = store.beginAlignment();
-
                 const LongBaseSequenceView tView = reads->getRead(orientedReadIds[1].getReadId());
                 const bool tRev = orientedReadIds[1].getStrand();
                 DINARA_ASSERT(tView.baseCount <= uint64_t(SnpEvidence::POS_MASK) + 1ULL);
                 const uint32_t tRawLen = uint32_t(tView.baseCount);
+
+                thisAlignmentData.info.alignmentId = store.beginAlignment();
 
                 static const uint8_t complementBase[4] = {3, 2, 1, 0};
 
@@ -1164,12 +1164,19 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                         it != projectedAlignment.sparseIndels.rend(); ++it) {
 
                         const uint32_t posOriented = it->position1;
-                        DINARA_ASSERT(posOriented < tRawLen);
                         if(it->op == 'I') {
+                            // Gap in sequence0 => insertion in sequence1 (read1).
+                            // In reverse orientation, an oriented base interval [o, o+L)
+                            // maps to forward [len-(o+L), len-o).
+                            DINARA_ASSERT(uint64_t(posOriented) + uint64_t(it->length) <= uint64_t(tRawLen));
                             const uint32_t pos = tRawLen - (posOriented + it->length);
                             store.addIndel0(pos, it->length, 1);
                         } else if(it->op == 'D') {
-                            const uint32_t pos = (tRawLen - 1U) - posOriented;
+                            // Gap in sequence1 => insertion in sequence0 (read0), so from the read1 view
+                            // this is an insertion in the *target* (read0) at a boundary on read1.
+                            // Oriented boundary b maps to forward boundary len-b.
+                            DINARA_ASSERT(posOriented <= tRawLen);
+                            const uint32_t pos = tRawLen - posOriented;
                             store.addIndel0(pos, it->length, 0);
                         } else {
                             DINARA_ASSERT(0);

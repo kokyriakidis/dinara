@@ -295,12 +295,12 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             // --- Populate AlignedEvidenceStore (APES/TASSD) ---
             // Evidence is stored in dual streams (Target-View and Query-View)
             // ensuring Canonical Coordinate Monotonicity.
-            thisAlignmentData.info.alignmentId = store.beginAlignment();
-
             const LongBaseSequenceView tView = reads->getRead(orientedReadIds[1].getReadId());
             const bool tRev = orientedReadIds[1].getStrand();
             DINARA_ASSERT(tView.baseCount <= uint64_t(SnpEvidence::POS_MASK) + 1ULL);
             const uint32_t tRawLen = uint32_t(tView.baseCount);
+
+            thisAlignmentData.info.alignmentId = store.beginAlignment();
 
             static const uint8_t complementBase[4] = {3, 2, 1, 0};
 
@@ -355,12 +355,15 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
                         it != projectedAlignment.sparseIndels.rend(); ++it) {
 
                         const uint32_t posOriented = it->position1;
-                        DINARA_ASSERT(posOriented < tRawLen);
                         if(it->op == 'I') {
                             const uint32_t pos = tRawLen - (posOriented + it->length);
                             store.addIndel0(pos, it->length, 1);
                         } else if(it->op == 'D') {
-                            const uint32_t pos = (tRawLen - 1U) - posOriented;
+                            // Gap in sequence1 (read1): sparseIndel.position1 is a boundary
+                            // in read1 oriented coordinates. Convert boundary b -> len-b in
+                            // read1 forward coordinates.
+                            DINARA_ASSERT(posOriented <= tRawLen);
+                            const uint32_t pos = tRawLen - posOriented;
                             store.addIndel0(pos, it->length, 0);
                         } else {
                             DINARA_ASSERT(0);

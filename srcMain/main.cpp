@@ -595,35 +595,417 @@ void dinara::main::assemble(
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
 
-    // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
-    assembler.filterSecondaryAlignmentsPerReadPair(
-        threadCount,
-        assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
+    // // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
+    // assembler.filterSecondaryAlignmentsPerReadPair(
+    //     threadCount,
+    //     assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
 
-    // =========================================================================
-    // Hifiasm-style Overlap Filtering + Clean ReadGraph (Parity)
-    // =========================================================================
-    // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
-    assembler.performHifiasmECParity(threadCount);
+    // // =========================================================================
+    // // Hifiasm-style Overlap Filtering + Clean ReadGraph (Parity)
+    // // =========================================================================
+    // // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
+    // assembler.performHifiasmECParity(threadCount);
+
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
     // This uses conservative AND parity semantics (both reads must keep the overlap).
-    // assembler.createReadGraph6(threadCount);
+    assembler.createReadGraph6(threadCount);
+
+    // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
+    // This is the fastest way to approximate "pileup across all reads" without a reference.
+    {
+        const ReadId focalReadId = ReadId(3);
+
+        const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
+            focalReadId,
+            assemblerOptions.alignOptions,
+            threadCount,
+            0,      // maxReadsToProcess
+            0,      // maxAlignmentsToProcess
+            false,  // includeDeletedAlignments
+            true    // readGraphOnly
+        );
+
+        static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
+
+        // Collect mismatch-defined sites that explicitly involve focalReadId (it has a mismatch at that site).
+        struct FocalMismatchSite {
+            uint32_t focalPos = 0;
+            uint32_t siteId = 0;
+        };
+        vector<FocalMismatchSite> focalMismatchSites;
+        focalMismatchSites.reserve(4096);
+        for (size_t siteId = 0; siteId + 1 < clusters.clusterMemberOffsets.size(); siteId++) {
+            const uint64_t begin = clusters.clusterMemberOffsets[siteId];
+            const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
+            uint32_t bestPos = std::numeric_limits<uint32_t>::max();
+            for (uint64_t i = begin; i < end; i++) {
+                const auto& node = clusters.nodes[clusters.clusterMembers[i]];
+                if (node.first == focalReadId) {
+                    bestPos = std::min(bestPos, node.second);
+                }
+            }
+            if (bestPos != std::numeric_limits<uint32_t>::max()) {
+                focalMismatchSites.push_back(FocalMismatchSite{bestPos, uint32_t(siteId)});
+            }
+        }
+        sort(focalMismatchSites.begin(), focalMismatchSites.end(),
+            [](const FocalMismatchSite& a, const FocalMismatchSite& b) {
+                if (a.focalPos != b.focalPos) {
+                    return a.focalPos < b.focalPos;
+                }
+                return a.siteId < b.siteId;
+            });
+        cout << timestamp << "Read" << focalReadId
+             << " mismatch sites (readGraph clusters): " << focalMismatchSites.size() << endl;
+
+        const auto propagationStart = std::chrono::steady_clock::now();
+        cout << timestamp << "GlobalHetSite member propagation (readGraph): starting..." << endl;
+        const auto members = assembler.computeGlobalHetSiteAlleleMembersUsingReadGraph(
+            clusters,
+            assemblerOptions.alignOptions,
+            0,      // maxPendingTasks
+            false,  // includeDeletedAlignments
+            focalReadId
+        );
+        const auto propagationSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - propagationStart).count();
+
+        cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << (clusters.clusterMemberOffsets.size() ? clusters.clusterMemberOffsets.size() - 1 : 0)
+             << " propagatedAssignments=" << members.propagatedAssignments
+             << " mappingHoles=" << members.mappingHoles
+             << " mappingConflicts=" << members.mappingConflicts
+             << " elapsedSec=" << propagationSeconds
+             << endl;
+
+        // Compute a consistent strand assignment for reads reachable from the focal read in the read graph.
+        // This lets us export member positions (and alleles) in a single, focal-oriented coordinate frame.
+        uint64_t strandConflicts = 0;
+        vector<int8_t> strandByRead = assembler.computeReadGraphStrandsFromSeed(
+            focalReadId,
+            strandConflicts,
+            false // includeDeletedAlignments
+        );
+        {
+            uint64_t assigned = 0;
+            for (const int8_t v : strandByRead) {
+                if (v != -1) {
+                    assigned++;
+                }
+            }
+            cout << timestamp << "ReadGraph strand assignment: assigned=" << assigned
+                 << " conflicts=" << strandConflicts << endl;
+        }
+
+        static const uint8_t complementBase[4] = {3, 2, 1, 0};
+        const auto orientedMembers = assembler.orientGlobalHetSiteAlleleMembers(members, strandByRead);
+
+        // Spot-check: verify that a few sites involving the focal read have self-consistent positions
+        // under a readGraph-only multi-source traversal seeded from the mismatch members.
+        {
+            const size_t checkCount = std::min<size_t>(3, focalMismatchSites.size());
+            for (size_t i = 0; i < checkCount; i++) {
+                const uint32_t siteId = focalMismatchSites[i].siteId;
+                const auto stats = assembler.debugVerifyGlobalHetSitePositionsUsingReadGraph(
+                    clusters,
+                    members,
+                    siteId,
+                    assemblerOptions.alignOptions,
+                    20000,   // maxNodesToVisit
+                    200000,  // maxAlignmentsToScan
+                    false    // includeDeletedAlignments
+                );
+                cout << timestamp << "GlobalHetSite verify: siteId=" << siteId
+                     << " expected=" << stats.expectedMembers
+                     << " reached=" << stats.reachedMembers
+                     << " checked=" << stats.checkedMappings
+                     << " mismatched=" << stats.mismatchedPositions
+                     << " holes=" << stats.mappingHoles
+                     << " fails=" << stats.mappingFailures
+                     << " hitNodeLimit=" << stats.hitNodeLimit
+                     << " hitAlignmentLimit=" << stats.hitAlignmentLimit
+                     << endl;
+            }
+        }
+
+        const uint32_t siteCount = uint32_t(members.offsets.size());
+
+        // Precompute mismatch-member counts and per-allele mismatch counts once per site.
+        vector<array<uint32_t, 4> > mismatchCountsForward(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
+        vector<array<uint32_t, 4> > mismatchCountsOriented(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
+        vector<uint64_t> mismatchMembersBySite(siteCount, 0);
+        for (uint32_t siteId = 0; siteId < siteCount && (siteId + 1) < clusters.clusterMemberOffsets.size(); siteId++) {
+            const uint64_t begin = clusters.clusterMemberOffsets[siteId];
+            const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
+            mismatchMembersBySite[siteId] = end - begin;
+            for (uint64_t j = begin; j < end; j++) {
+                const auto& node = clusters.nodes[clusters.clusterMembers[j]];
+                uint8_t b = assembler.getReads().getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
+                if (b >= 4) {
+                    continue;
+                }
+                mismatchCountsForward[siteId][b]++;
+                const int8_t s = (uint64_t(node.first) < strandByRead.size()) ? strandByRead[uint64_t(node.first)] : int8_t(-1);
+                if (s == 1) {
+                    b = complementBase[b];
+                }
+                mismatchCountsOriented[siteId][b]++;
+            }
+        }
+
+        // Keep only robust multiallelic sites: at least 2 alleles with support >= 3.
+        static constexpr uint32_t minAlleleSupportForExport = 3;
+        static constexpr uint32_t minAlleleCountForExport = 2;
+        const auto readIndex = assembler.buildFilteredGlobalHetSiteReadIndex(
+            members,
+            minAlleleSupportForExport,
+            minAlleleCountForExport
+        );
+        const uint32_t invalidPos = std::numeric_limits<uint32_t>::max();
+        const vector<Assembler::GlobalHetSiteReadIndex::ReadSite> emptyFocalReadSites;
+        const auto& focalReadSites =
+            (uint64_t(focalReadId) < readIndex.sitesByRead.size()) ?
+            readIndex.sitesByRead[uint64_t(focalReadId)] :
+            emptyFocalReadSites;
+        vector<uint32_t> focalReadPosBySite(siteCount, invalidPos);
+        vector<char> focalReadAlleleBySite(siteCount, '?');
+        for (const auto& s : focalReadSites) {
+            if (s.siteId < siteCount) {
+                focalReadPosBySite[s.siteId] = s.readPosition;
+                focalReadAlleleBySite[s.siteId] = baseToAscii[s.allele];
+            }
+        }
+
+        const auto getOrientedSiteCounts = [&](uint32_t siteId) {
+            std::array<uint64_t, 4> siteCounts{0, 0, 0, 0};
+            if (siteId < orientedMembers.offsets.size()) {
+                const auto& off = orientedMembers.offsets[siteId];
+                for (int allele = 0; allele < 4; allele++) {
+                    siteCounts[allele] = off[allele + 1] - off[allele];
+                }
+            }
+            return siteCounts;
+        };
+        const auto passesMultiallelicFilter = [&](uint32_t siteId) {
+            const auto siteCounts = getOrientedSiteCounts(siteId);
+            uint32_t supportedAlleles = 0;
+            for (int allele = 0; allele < 4; allele++) {
+                if (siteCounts[allele] >= minAlleleSupportForExport) {
+                    supportedAlleles++;
+                }
+            }
+            return supportedAlleles >= minAlleleCountForExport;
+        };
+        vector<Assembler::GlobalHetSiteReadIndex::ReadSite> filteredFocalReadSites;
+        filteredFocalReadSites.reserve(focalReadSites.size());
+        for (const auto& s : focalReadSites) {
+            if (passesMultiallelicFilter(s.siteId)) {
+                filteredFocalReadSites.push_back(s);
+            }
+        }
+
+        cout << timestamp << "Read" << focalReadId
+             << " projected global het sites after multiallelic filter: "
+             << filteredFocalReadSites.size() << " / " << focalReadSites.size()
+             << " (need >= " << minAlleleCountForExport << " alleles with support >= "
+             << minAlleleSupportForExport << ")" << endl;
+
+        // Print 10 sites involving focalReadId.
+        const size_t toPrint = std::min<size_t>(10, filteredFocalReadSites.size());
+        for (size_t i = 0; i < toPrint; i++) {
+            const uint32_t siteId = filteredFocalReadSites[i].siteId;
+            const uint32_t focalPos = filteredFocalReadSites[i].readPosition;
+            const uint64_t mismatchMembers =
+                (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
+            const auto mismatchCounts =
+                (siteId < mismatchCountsForward.size()) ?
+                mismatchCountsForward[siteId] :
+                std::array<uint32_t, 4>{0, 0, 0, 0};
+            const auto siteCounts = getOrientedSiteCounts(siteId);
+            const uint64_t siteMembers = siteCounts[0] + siteCounts[1] + siteCounts[2] + siteCounts[3];
+
+            cout << timestamp
+                 << "GlobalHetSite[" << i << "]"
+                 << " read" << focalReadId << "Pos=" << focalPos
+                 << " read" << focalReadId << "Allele=" << baseToAscii[filteredFocalReadSites[i].allele]
+                 << " mismatchMembers=" << mismatchMembers
+                 << " mismatchCounts(A,C,G,T)=(" << mismatchCounts[0] << "," << mismatchCounts[1] << "," << mismatchCounts[2] << "," << mismatchCounts[3] << ")"
+                 << " siteMembers=" << siteMembers
+                 << " siteCounts(A,C,G,T)=(" << siteCounts[0] << "," << siteCounts[1] << "," << siteCounts[2] << "," << siteCounts[3] << ")"
+                 << " members={";
+
+            // Show up to 8 members per allele.
+            for (int allele = 0; allele < 4; allele++) {
+                const uint64_t b0 = orientedMembers.offsets[siteId][allele];
+                const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
+                const uint64_t show = std::min<uint64_t>(b1 - b0, 8);
+                if (show == 0) {
+                    continue;
+                }
+                cout << baseToAscii[allele] << ":{";
+                for (uint64_t k = 0; k < show; k++) {
+                    const auto& m = orientedMembers.members[b0 + k];
+                    cout << m.orientedReadId.getReadId()
+                         << (m.orientedReadId.getStrand() == 1 ? "rc" : "fw")
+                         << "-" << m.position;
+                    if (k + 1 < show) {
+                        cout << ",";
+                    }
+                }
+                if ((b1 - b0) > show) {
+                    cout << ",...";
+                }
+                cout << "}";
+            }
+            cout << "}" << endl;
+        }
+
+        // Export all SNP sites involving read 0 (summary + full per-allele member list).
+        {
+            const string summaryFileName = "Read" + to_string(focalReadId) + "GlobalHetSitesSummary.tsv";
+            const string membersFileName = "Read" + to_string(focalReadId) + "GlobalHetSitesMembers.tsv";
+            std::ofstream summary(summaryFileName);
+            std::ofstream membersOut(membersFileName);
+            if (!summary || !membersOut) {
+                cout << timestamp << "Failed to open export files for read " << focalReadId << "." << endl;
+            } else {
+                summary << "siteId\treadPos\tmismatchMembers\tmismatchA\tmismatchC\tmismatchG\tmismatchT"
+                        << "\tsiteMembers\tsiteA\tsiteC\tsiteG\tsiteT\treadAllele\n";
+                membersOut << "siteId\treadPos0\treadAllele\treadId\treadStrand\tposition0\tpositionForward0\treadLength\n";
+
+                // Prefer the mismatch-defined sites for "SNP sites of read0".
+                // If there are none, fall back to the propagated membership list.
+                const bool useMismatchSites = !focalMismatchSites.empty();
+                const size_t exportCount = useMismatchSites ? focalMismatchSites.size() : filteredFocalReadSites.size();
+                vector<uint32_t> readLengths(assembler.getReads().readCount(), 0);
+                for (uint64_t iRead = 0; iRead < assembler.getReads().readCount(); iRead++) {
+                    const ReadId rid = ReadId(iRead);
+                    readLengths[iRead] = uint32_t(assembler.getReads().getRead(rid).baseCount);
+                }
+                size_t exportedCount = 0;
+                size_t filteredOutCount = 0;
+                for (size_t idx = 0; idx < exportCount; idx++) {
+                    const uint32_t siteId = useMismatchSites ? focalMismatchSites[idx].siteId : filteredFocalReadSites[idx].siteId;
+                    if (siteId >= readIndex.sitePassesFilter.size() || readIndex.sitePassesFilter[siteId] == 0) {
+                        filteredOutCount++;
+                        continue;
+                    }
+                    if (!passesMultiallelicFilter(siteId)) {
+                        filteredOutCount++;
+                        continue;
+                    }
+                    if (siteId >= focalReadPosBySite.size() || focalReadPosBySite[siteId] == invalidPos) {
+                        // Keep per-read-consistency filtering strict for DP-ready exports.
+                        filteredOutCount++;
+                        continue;
+                    }
+                    const uint32_t readPos = focalReadPosBySite[siteId];
+                    const char readAllele = focalReadAlleleBySite[siteId];
+
+                    const uint64_t mismatchMembers =
+                        (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
+                    const auto mismatchCounts =
+                        (siteId < mismatchCountsOriented.size()) ?
+                        mismatchCountsOriented[siteId] :
+                        std::array<uint32_t, 4>{0, 0, 0, 0};
+                    const auto siteCounts = getOrientedSiteCounts(siteId);
+
+                    // Export members using the focal-oriented coordinate frame (strandByRead),
+                    // plus the original forward coordinates for debugging.
+                    const uint32_t readPos0 = readPos;
+                    // Export members in oriented coordinates (position0/1) consistent with readStrand,
+                    // plus forward positions for debugging.
+                    for (int allele = 0; allele < 4; allele++) {
+                        const uint64_t b0 = orientedMembers.offsets[siteId][allele];
+                        const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
+                        for (uint64_t k = b0; k < b1; k++) {
+                            const auto& om = orientedMembers.members[k];
+                            const ReadId rid = om.orientedReadId.getReadId();
+                            const Strand strand = om.orientedReadId.getStrand();
+                            const uint32_t posOriented0 = om.position;
+                            const uint32_t len = (uint64_t(rid) < readLengths.size()) ? readLengths[uint64_t(rid)] : 0;
+                            if (len == 0 || posOriented0 >= len) {
+                                continue;
+                            }
+                            const uint32_t posFwd0 = (strand == 1) ? ((len - 1U) - posOriented0) : posOriented0;
+
+                            // Allele char is already in oriented frame by construction (bucketed by allele).
+                            const char alleleChar = baseToAscii[allele];
+
+                            membersOut << siteId << "\t" << readPos0
+                                       << "\t" << alleleChar
+                                       << "\t" << rid
+                                       << "\t" << int(strand)
+                                       << "\t" << posOriented0
+                                       << "\t" << posFwd0
+                                       << "\t" << len
+                                       << "\n";
+                        }
+                    }
+
+                    const uint64_t siteMembers = uint64_t(siteCounts[0]) + uint64_t(siteCounts[1]) + uint64_t(siteCounts[2]) + uint64_t(siteCounts[3]);
+                    summary << siteId << "\t" << readPos
+                            << "\t" << mismatchMembers
+                            << "\t" << mismatchCounts[0] << "\t" << mismatchCounts[1] << "\t" << mismatchCounts[2] << "\t" << mismatchCounts[3]
+                            << "\t" << siteMembers
+                            << "\t" << siteCounts[0] << "\t" << siteCounts[1] << "\t" << siteCounts[2] << "\t" << siteCounts[3]
+                            << "\t" << readAllele
+                            << "\n";
+                    exportedCount++;
+                }
+
+                cout << timestamp << "Wrote read" << focalReadId << " global het sites to " << summaryFileName
+                     << " and " << membersFileName
+                     << " (sites=" << exportedCount
+                     << ", filteredOut=" << filteredOutCount
+                     << ", criteria: >= " << minAlleleCountForExport
+                     << " alleles with support >= " << minAlleleSupportForExport
+                     << ")." << endl;
+            }
+        }
+    }
+
+    return;
 
 
-    vector<uint32_t> ids;
-
-    // After performHifiasmECParity(...) (it sets DeleteReasonPhase + informative counts/scores).
-    assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids);
-
-    // If you also want to exclude anything with other delete reasons:
-    // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids, /*keptByBothSidesOnly=*/true);
-
-    // `ids` is now: CIS in both views (no DeleteReasonPhase on either side),
-    // sorted by `alignmentData[id].informativeHetSiteScore` descending.
-
-    // assembler.createReadGraphFromEcParityCisOverlaps(threadCount, /*rebuildDirectedReadGraph*/ false);
-    assembler.createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(threadCount,  false);
+    // vector<uint32_t> ids;
+    //
+    // // After performHifiasmECParity(...) (it sets DeleteReasonPhase + informative counts/scores).
+    // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids);
+    //
+    // // Print the 10 first sorted alignmentId and the informative sites they share
+    // const size_t n = std::min<size_t>(10, ids.size());
+    // for(size_t i = 0; i < n; ++i) {
+    //     const uint32_t alignmentId = ids[i];
+    //     const auto& ad = assembler.alignmentData[alignmentId];
+    //
+    //     // NOTE: we do NOT currently compute the exact "shared" informative-site intersection.
+    //     // We have per-side counts and an overlap score:
+    //     //   ad.informativeHetSiteCount0, ad.informativeHetSiteCount1
+    //     //   ad.informativeHetSiteScore = max(count0,count1)
+    //     const uint32_t sharedLowerBound = std::min(ad.informativeHetSiteCount0, ad.informativeHetSiteCount1);
+    //
+    //     cout << "rank=" << i
+    //          << " alignmentId=" << alignmentId
+    //          << " reads=(" << ad.readIds[0] << "," << ad.readIds[1] << ")"
+    //          << " informative0=" << ad.informativeHetSiteCount0
+    //          << " informative1=" << ad.informativeHetSiteCount1
+    //          << " score=" << ad.informativeHetSiteScore
+    //          << " sharedLB=" << sharedLowerBound
+    //          << "\n";
+    // }
+    //
+    //
+    //
+    //
+    // // If you also want to exclude anything with other delete reasons:
+    // // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids, /*keptByBothSidesOnly=*/true);
+    //
+    // // `ids` is now: CIS in both views (no DeleteReasonPhase on either side),
+    // // sorted by `alignmentData[id].informativeHetSiteScore` descending.
+    //
+    // // assembler.createReadGraphFromEcParityCisOverlaps(threadCount, /*rebuildDirectedReadGraph*/ false);
+    // assembler.createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(threadCount,  false);
 
     // Snapshot the broad keep-set used for marker-graph collapse.
     std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
