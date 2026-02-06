@@ -2459,6 +2459,14 @@ private:
              double chainFilterRatio = 0.80;
              uint32_t chainFilterMinScore = 3;
              double nonRedundantOverlapFraction = 0.5;
+             bool lchainIsAccurate = true;
+             bool enableMcopyFast = true;
+             uint32_t mcopyNum = 3;
+             double mcopyRate = 0.70;
+             uint32_t mcopyKhitCutoff = 32;
+             uint32_t mcopyTriggerCandidateCount = 1;
+             uint32_t mcopyOcvWindow = 3072;
+             double mcopyOcvWeakKeepRatio = 0.70;
              vector<uint8_t> weightLut; // size 512
 	         
 	         // Phase 1: Heavy vector with Keys (for Sort/Group).

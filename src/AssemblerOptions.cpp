@@ -567,6 +567,46 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(0.5),
         "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction.")
 
+        ("OverlapCandidates.invertedIndexLchainIsAccurate",
+        value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
+        default_value(true),
+        "InvertedIndex chaining: hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp defaults).")
+
+        ("OverlapCandidates.invertedIndexEnableMcopyFast",
+        value<bool>(&overlapCandidatesOptions.invertedIndexEnableMcopyFast)->
+        default_value(true),
+        "InvertedIndex chaining: enable hifiasm-like mcopy-fast chain endpoint selection (keeps multiple score-competitive peaks).")
+
+        ("OverlapCandidates.invertedIndexMcopyNum",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyNum)->
+        default_value(3),
+        "InvertedIndex chaining: maximum number of score-competitive chain peaks retained per read pair.")
+
+        ("OverlapCandidates.invertedIndexMcopyRate",
+        value<double>(&overlapCandidatesOptions.invertedIndexMcopyRate)->
+        default_value(0.70),
+        "InvertedIndex chaining: retain chains with score >= bestScore * rate in mcopy-fast selection.")
+
+        ("OverlapCandidates.invertedIndexMcopyKhitCutoff",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyKhitCutoff)->
+        default_value(32),
+        "InvertedIndex chaining: minimum chain occurrence count required for secondary mcopy-fast chains.")
+
+        ("OverlapCandidates.invertedIndexMcopyTriggerCandidateCount",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyTriggerCandidateCount)->
+        default_value(1),
+        "InvertedIndex chaining: legacy safety gate for mcopy-fast (default 1 keeps behavior parity-like).")
+
+        ("OverlapCandidates.invertedIndexMcopyOcvWindow",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyOcvWindow)->
+        default_value(3072),
+        "InvertedIndex chaining: COV_W-like window size for containing-overlap overload control.")
+
+        ("OverlapCandidates.invertedIndexMcopyOcvWeakKeepRatio",
+        value<double>(&overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio)->
+        default_value(0.70),
+        "InvertedIndex chaining: keep weak containing overlaps only if the non-saturated window-overlap fraction is >= this value.")
+
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
         default_value(3),
@@ -1626,6 +1666,14 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexChainFilterRatio = " << invertedIndexChainFilterRatio << "\n";
     s << "invertedIndexChainFilterMinScore = " << invertedIndexChainFilterMinScore << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
+    s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
+    s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";
+    s << "invertedIndexMcopyNum = " << invertedIndexMcopyNum << "\n";
+    s << "invertedIndexMcopyRate = " << invertedIndexMcopyRate << "\n";
+    s << "invertedIndexMcopyKhitCutoff = " << invertedIndexMcopyKhitCutoff << "\n";
+    s << "invertedIndexMcopyTriggerCandidateCount = " << invertedIndexMcopyTriggerCandidateCount << "\n";
+    s << "invertedIndexMcopyOcvWindow = " << invertedIndexMcopyOcvWindow << "\n";
+    s << "invertedIndexMcopyOcvWeakKeepRatio = " << invertedIndexMcopyOcvWeakKeepRatio << "\n";
 }
 
 
