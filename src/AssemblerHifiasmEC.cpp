@@ -71,6 +71,7 @@ Testing:
 #include "timestamp.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <iostream>
@@ -2566,7 +2567,84 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
     const uint64_t readCount = reads->readCount();
     const auto tBeginAll = steady_clock::now();
 
-    static std::mutex svFlipPrintMutex;
+    // Single mutex for all cout output emitted by this EC function.
+    // This prevents interleaving between [SV] and [EC-DBG] messages across threads.
+    static std::mutex ecCoutMutex;
+
+    struct EcDebugReadSummary {
+        bool present = false;
+        ReadId readId = invalid<ReadId>;
+        uint32_t readLength = 0;
+        uint32_t candidateCount = 0;
+        vector<ReadId> targetReads; // unique, sorted
+    };
+    struct EcDebugPairOverlapSummary {
+        bool present = false;
+        ReadId readId = invalid<ReadId>;
+        uint32_t qs = 0;
+        uint32_t qe = 0;
+        vector<uint32_t> informativeSnpSitesInOverlap; // unique, sorted, after hole subtraction
+    };
+
+    // Optional debug hook: set DINARA_EC_DEBUG_ALIGNMENT_ID to an alignmentId (uint32)
+    // to print detailed accounting of informative-site counts for that overlap from each read's view.
+    uint32_t ecDebugAlignmentId = invalid<uint32_t>;
+    array<ReadId, 2> ecDebugReadIds{invalid<ReadId>, invalid<ReadId>};
+    bool ecDebugByReadPair = false;
+    array<ReadId, 2> ecDebugReadPair{invalid<ReadId>, invalid<ReadId>};
+    array<EcDebugReadSummary, 2> ecDebugReadSummaries;
+    array<EcDebugPairOverlapSummary, 2> ecDebugPairOverlapSummaries;
+    bool ecDebugPairIsSameStrand = true;
+    {
+        auto parseEnvU32 = [](const char* name, uint32_t& out) -> bool {
+            const char* s = std::getenv(name);
+            if(!s || !*s) return false;
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(s, &end, 10);
+            if(!(end && end != s && *end == 0 && v <= std::numeric_limits<uint32_t>::max())) {
+                return false;
+            }
+            out = uint32_t(v);
+            return true;
+        };
+
+        // Optional: debug by read pair (matches any alignmentId for those two reads).
+        // Set DINARA_EC_DEBUG_READ0 and DINARA_EC_DEBUG_READ1 (uint32).
+        uint32_t d0 = invalid<uint32_t>;
+        uint32_t d1 = invalid<uint32_t>;
+        if(parseEnvU32("DINARA_EC_DEBUG_READ0", d0) && parseEnvU32("DINARA_EC_DEBUG_READ1", d1)) {
+            const ReadId r0 = ReadId(std::min(d0, d1));
+            const ReadId r1 = ReadId(std::max(d0, d1));
+            ecDebugByReadPair = true;
+            ecDebugReadPair = {r0, r1};
+            ecDebugReadSummaries[0].readId = r0;
+            ecDebugReadSummaries[1].readId = r1;
+            ecDebugPairOverlapSummaries[0].readId = r0;
+            ecDebugPairOverlapSummaries[1].readId = r1;
+            std::lock_guard<std::mutex> lock(ecCoutMutex);
+            cout << timestamp << "[EC-DBG] Enabled for readPair=(" << r0 << "," << r1 << ")" << endl;
+        }
+
+        const char* s = std::getenv("DINARA_EC_DEBUG_ALIGNMENT_ID");
+        if(s && *s) {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(s, &end, 10);
+            if(end && end != s && *end == 0 && v <= std::numeric_limits<uint32_t>::max()) {
+                ecDebugAlignmentId = uint32_t(v);
+                if(ecDebugAlignmentId < alignmentData.size()) {
+                    ecDebugReadIds = alignmentData[ecDebugAlignmentId].readIds;
+                    std::lock_guard<std::mutex> lock(ecCoutMutex);
+                    cout << timestamp << "[EC-DBG] Enabled for alignmentId=" << ecDebugAlignmentId
+                         << " reads=(" << ecDebugReadIds[0] << "," << ecDebugReadIds[1] << ")" << endl;
+                } else {
+                    std::lock_guard<std::mutex> lock(ecCoutMutex);
+                    cout << timestamp << "[EC-DBG] Requested alignmentId=" << ecDebugAlignmentId
+                         << " but alignmentData.size()=" << alignmentData.size() << " (ignoring)" << endl;
+                    ecDebugAlignmentId = invalid<uint32_t>;
+                }
+            }
+        }
+    }
         
     /*
     Byte-addressable keep vector (thread-safe for independent writes).
@@ -2665,10 +2743,13 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         DINARA_ASSERT(o0 == queryOriented);
 
 	                        /* Compute aligned marker bounds in query-forward coordinates. */
-                        uint32_t qsCore = thisAlignmentData.qs;
-                        uint32_t qeCore = thisAlignmentData.qe;
-                        uint32_t tsCoreOriented = thisAlignmentData.ts;
-                        uint32_t teCoreOriented = thisAlignmentData.te;
+                        uint32_t qsCore = 0;
+                        uint32_t qeCore = 0;
+                        uint32_t tsCoreOriented = 0;
+                        uint32_t teCoreOriented = 0;
+                        bool coordinatesFromMarkers = false;
+                        const ReadId queryReadId = ReadId(readId);
+
                         const uint32_t kmerLen = assemblerInfo.isOpen ? uint32_t(assemblerInfo->k) : 0U;
                         if (markers && assemblerInfo.isOpen) {
                             const auto m0 = (*markers)[o0.getValue()];
@@ -2678,6 +2759,24 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                                 qeCore = m0[orientedInfo.data[0].lastOrdinal].position + kmerLen;
                                 tsCoreOriented = m1[orientedInfo.data[1].firstOrdinal].position;
                                 teCoreOriented = m1[orientedInfo.data[1].lastOrdinal].position + kmerLen;
+                                coordinatesFromMarkers = true;
+                            }
+                        }
+                        if(!coordinatesFromMarkers) {
+                            // AlignmentData stores base coordinates in forward read coordinates:
+                            //   - qs/qe for readIds[0]
+                            //   - ts/te for readIds[1] (already converted to forward, even for reverse overlaps).
+                            // When the query read is readIds[1], we must swap accordingly.
+                            if(thisAlignmentData.readIds[0] == queryReadId) {
+                                qsCore = thisAlignmentData.qs;
+                                qeCore = thisAlignmentData.qe;
+                                tsCoreOriented = thisAlignmentData.ts;
+                                teCoreOriented = thisAlignmentData.te;
+                            } else {
+                                qsCore = thisAlignmentData.ts;
+                                qeCore = thisAlignmentData.te;
+                                tsCoreOriented = thisAlignmentData.qs;
+                                teCoreOriented = thisAlignmentData.qe;
                             }
                         }
 
@@ -2690,7 +2789,10 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         const uint32_t tLen = uint32_t(reads->getRead(o1.getReadId()).baseCount);
                         uint32_t tsFwd = tsCoreOriented;
                         uint32_t teFwd = teCoreOriented;
-                        if (o1.getStrand() != 0) {
+                        // Marker positions for strand 1 are in reverse-complement coordinates and must be
+                        // converted back to forward read coordinates. Base coordinates stored in AlignmentData
+                        // are already in forward read coordinates and must NOT be converted again.
+                        if (coordinatesFromMarkers && o1.getStrand() != 0) {
                             tsFwd = tLen - teCoreOriented;
                             teFwd = tLen - tsCoreOriented;
                         }
@@ -2710,6 +2812,35 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 
                     if(candidates.empty()) continue;
                     timing.readsWithCandidates++;
+
+                    // Debug: capture per-read overlap neighborhood for the requested read pair.
+                    if(ecDebugByReadPair) {
+                        const ReadId queryReadId = ReadId(readId);
+                        int idx = -1;
+                        if(queryReadId == ecDebugReadPair[0]) {
+                            idx = 0;
+                        } else if(queryReadId == ecDebugReadPair[1]) {
+                            idx = 1;
+                        }
+                        if(idx >= 0) {
+                            vector<ReadId> targets;
+                            targets.reserve(candidates.size());
+                            for(const auto& cand : candidates) {
+                                targets.push_back(ReadId(cand.targetId));
+                            }
+                            std::sort(targets.begin(), targets.end());
+                            targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+                            const uint32_t qLen = uint32_t(reads->getRead(queryReadId).baseCount);
+
+                            std::lock_guard<std::mutex> lock(ecCoutMutex);
+                            if(!ecDebugReadSummaries[idx].present) {
+                                ecDebugReadSummaries[idx].present = true;
+                                ecDebugReadSummaries[idx].readLength = qLen;
+                                ecDebugReadSummaries[idx].candidateCount = uint32_t(candidates.size());
+                                ecDebugReadSummaries[idx].targetReads = std::move(targets);
+                            }
+                        }
+                    }
 
                     /*
                     Stage 1: SNP site detection on the query coordinate space.
@@ -2763,34 +2894,34 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     generate_haplotypes_sv(*this, scratch);
                     timing.validateSv += seconds(steady_clock::now() - tValidateSvBegin);
 
-                    /*
-                    Report overlaps newly flipped to trans due to SV evidence.
-
-                    This is intentionally independent of SNP filtering: the message shows only
-                    overlaps whose is_match changed from 1->2 in generate_haplotypes_sv.
-                    */
-                    size_t svFlipCount = 0;
-                    for (size_t c = 0; c < candidates.size(); ++c) {
-                        if (candidates[c].is_match == 2 && !wasTransBeforeSv[c]) ++svFlipCount;
-                    }
-                    if (svFlipCount) {
-                        std::lock_guard<std::mutex> lock(svFlipPrintMutex);
-                        cout << timestamp << "[SV] read " << readId << " flipped " << svFlipCount
-                             << " overlaps to trans" << endl;
-                        size_t printed = 0;
-                        constexpr size_t maxToPrint = 32;
-                        for (size_t c = 0; c < candidates.size() && printed < maxToPrint; ++c) {
-                            if (candidates[c].is_match != 2 || wasTransBeforeSv[c]) continue;
-                            const auto& cand = candidates[c];
-                            cout << timestamp << "  target " << cand.targetId
-                                 << " strand " << (cand.isRev ? 'R' : 'F')
-                                 << " alignmentId " << cand.alignmentId << endl;
-                            ++printed;
-                        }
-                        if (svFlipCount > printed) {
-                            cout << timestamp << "  ... " << (svFlipCount - printed) << " more" << endl;
-                        }
-                    }
+//                     /*
+//                     Report overlaps newly flipped to trans due to SV evidence.
+//
+//                     This is intentionally independent of SNP filtering: the message shows only
+//                     overlaps whose is_match changed from 1->2 in generate_haplotypes_sv.
+//                     */
+//                     size_t svFlipCount = 0;
+//                     for (size_t c = 0; c < candidates.size(); ++c) {
+//                         if (candidates[c].is_match == 2 && !wasTransBeforeSv[c]) ++svFlipCount;
+//                     }
+//                     if (svFlipCount) {
+//                         std::lock_guard<std::mutex> lock(ecCoutMutex);
+//                         cout << timestamp << "[SV] read " << readId << " flipped " << svFlipCount
+//                              << " overlaps to trans" << endl;
+//                         size_t printed = 0;
+//                         constexpr size_t maxToPrint = 32;
+//                         for (size_t c = 0; c < candidates.size() && printed < maxToPrint; ++c) {
+//                             if (candidates[c].is_match != 2 || wasTransBeforeSv[c]) continue;
+//                             const auto& cand = candidates[c];
+//                             cout << timestamp << "  target " << cand.targetId
+//                                  << " strand " << (cand.isRev ? 'R' : 'F')
+//                                  << " alignmentId " << cand.alignmentId << endl;
+//                             ++printed;
+//                         }
+//                         if (svFlipCount > printed) {
+//                             cout << timestamp << "  ... " << (svFlipCount - printed) << " more" << endl;
+//                         }
+//                     }
 
                     /*
                     Informative read heuristic (matches hifiasm intent).
@@ -2808,32 +2939,23 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                    inside the overlap's [qs,qe) interval. For SNP sites we also exclude query
 	                    "hole" intervals (positions without an aligned target base) for that overlap.
 	                    */
-                    vector<uint32_t> informativeSnpSites;
-                    vector<uint32_t> informativeSvSites;
-                    vector<uint32_t> candInformativeSiteCount(candidates.size(), 0);
+	                    vector<uint32_t> informativeSnpSites;
+	                    vector<uint32_t> candInformativeSiteCount(candidates.size(), 0);
 
-                    informativeSnpSites.clear();
-                    informativeSvSites.clear();
-                    if(!scratch.snpStats.empty()) {
-                        informativeSnpSites.reserve(scratch.snpStats.size());
-                        for(const auto& s : scratch.snpStats) {
-                            informativeSnpSites.push_back(s.site);
-                        }
+	                    informativeSnpSites.clear();
+	                    if(!scratch.snpStats.empty()) {
+	                        informativeSnpSites.reserve(scratch.snpStats.size());
+	                        for(const auto& s : scratch.snpStats) {
+	                            informativeSnpSites.push_back(s.site);
+	                        }
                         std::sort(informativeSnpSites.begin(), informativeSnpSites.end());
                         informativeSnpSites.erase(
                             std::unique(informativeSnpSites.begin(), informativeSnpSites.end()),
                             informativeSnpSites.end());
                     }
-                    if(!scratch.svStats.empty()) {
-                        informativeSvSites.reserve(scratch.svStats.size());
-                        for(const auto& s : scratch.svStats) {
-                            informativeSvSites.push_back(s.site);
-                        }
-                        std::sort(informativeSvSites.begin(), informativeSvSites.end());
-                        informativeSvSites.erase(
-                            std::unique(informativeSvSites.begin(), informativeSvSites.end()),
-                            informativeSvSites.end());
-                    }
+	                    // Note: informativeHetSiteCount{0,1} are currently computed using SNP sites only.
+	                    // SV sites (large indels) are still used for cis/trans decisions, but are not used
+	                    // for overlap ranking, because SNP sites are easier to interpret and compare across reads.
 
                     auto countSitesInRange = [](const vector<uint32_t>& sites, uint32_t begin, uint32_t end) -> uint32_t {
                         if(end <= begin || sites.empty()) {
@@ -2848,38 +2970,160 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                         (scratch.insertionOffsets.size() == candidates.size() + 1) &&
                         !scratch.insertionIntervals.empty();
 
-                    for(size_t c = 0; c < candidates.size(); ++c) {
-                        const auto& cand = candidates[c];
-                        const uint32_t qs = uint32_t(cand.qs);
-                        const uint32_t qe = uint32_t(cand.qe);
-                        if(qe <= qs) {
-                            continue;
-                        }
+	                    for(size_t c = 0; c < candidates.size(); ++c) {
+	                        const auto& cand = candidates[c];
+	                        const uint32_t qs = uint32_t(cand.qs);
+	                        const uint32_t qe = uint32_t(cand.qe);
+	                        if(qe <= qs) {
+	                            continue;
+	                        }
 
-                        uint32_t count = 0;
-                        // SNP sites: subtract query "holes" for this overlap.
-                        if(!informativeSnpSites.empty()) {
-                            count += countSitesInRange(informativeSnpSites, qs, qe);
-                            if(haveInsertionHoles) {
-                                const uint32_t offBegin = scratch.insertionOffsets[c];
-                                const uint32_t offEnd = scratch.insertionOffsets[c + 1];
-                                for(uint32_t ii = offBegin; ii < offEnd; ++ii) {
-                                    const auto& hole = scratch.insertionIntervals[ii];
-                                    const uint32_t a = std::max(qs, hole.begin);
-                                    const uint32_t b = std::min(qe, hole.end);
-                                    if(b > a) {
-                                        count -= countSitesInRange(informativeSnpSites, a, b);
+	                        uint32_t count = 0;
+	                        uint32_t snpCountInRange = 0;
+	                        uint32_t snpCountSubtracted = 0;
+	                        // SNP sites: subtract query "holes" for this overlap.
+	                        if(!informativeSnpSites.empty()) {
+	                            snpCountInRange = countSitesInRange(informativeSnpSites, qs, qe);
+	                            count += snpCountInRange;
+	                            if(haveInsertionHoles) {
+	                                const uint32_t offBegin = scratch.insertionOffsets[c];
+	                                const uint32_t offEnd = scratch.insertionOffsets[c + 1];
+	                                for(uint32_t ii = offBegin; ii < offEnd; ++ii) {
+	                                    const auto& hole = scratch.insertionIntervals[ii];
+	                                    const uint32_t a = std::max(qs, hole.begin);
+	                                    const uint32_t b = std::min(qe, hole.end);
+	                                    if(b > a) {
+	                                        const uint32_t sub = countSitesInRange(informativeSnpSites, a, b);
+	                                        snpCountSubtracted += sub;
+	                                        count -= sub;
+	                                    }
+	                                }
+	                            }
+	                        }
+
+	                        candInformativeSiteCount[c] = count;
+
+                            // Debug: for the requested read pair, capture the exact SNP sites that contribute
+                            // to the informative count for the overlap between the two reads (query view).
+                            if(ecDebugByReadPair) {
+                                const ReadId queryReadId = ReadId(readId);
+                                int idx = -1;
+                                if(queryReadId == ecDebugReadPair[0]) {
+                                    idx = 0;
+                                } else if(queryReadId == ecDebugReadPair[1]) {
+                                    idx = 1;
+                                }
+                                if(idx >= 0 && cand.targetId == uint32_t(ecDebugReadPair[1 - idx])) {
+                                    std::lock_guard<std::mutex> lock(ecCoutMutex);
+                                    if(!ecDebugPairOverlapSummaries[idx].present) {
+                                        vector<uint32_t> sitesInOverlap;
+                                        if(!informativeSnpSites.empty() && qe > qs) {
+                                            auto it0 = std::lower_bound(informativeSnpSites.begin(), informativeSnpSites.end(), qs);
+                                            auto it1 = std::lower_bound(informativeSnpSites.begin(), informativeSnpSites.end(), qe);
+                                            sitesInOverlap.assign(it0, it1);
+
+                                            // Subtract query holes for this overlap (same as the counter).
+                                            if(haveInsertionHoles) {
+                                                const uint32_t offBegin = scratch.insertionOffsets[c];
+                                                const uint32_t offEnd = scratch.insertionOffsets[c + 1];
+                                                if(offBegin < offEnd && !sitesInOverlap.empty()) {
+                                                    vector<uint8_t> keepMask(sitesInOverlap.size(), 1);
+                                                    for(uint32_t ii = offBegin; ii < offEnd; ++ii) {
+                                                        const auto& hole = scratch.insertionIntervals[ii];
+                                                        const uint32_t a = std::max(qs, hole.begin);
+                                                        const uint32_t b = std::min(qe, hole.end);
+                                                        if(b <= a) continue;
+                                                        auto h0 = std::lower_bound(sitesInOverlap.begin(), sitesInOverlap.end(), a);
+                                                        auto h1 = std::lower_bound(sitesInOverlap.begin(), sitesInOverlap.end(), b);
+                                                        for(auto it = h0; it != h1; ++it) {
+                                                            keepMask[size_t(it - sitesInOverlap.begin())] = 0;
+                                                        }
+                                                    }
+                                                    size_t write = 0;
+                                                    for(size_t i = 0; i < sitesInOverlap.size(); ++i) {
+                                                        if(keepMask[i]) sitesInOverlap[write++] = sitesInOverlap[i];
+                                                    }
+                                                    sitesInOverlap.resize(write);
+                                                }
+                                            }
+                                        }
+
+                                        ecDebugPairOverlapSummaries[idx].present = true;
+                                        ecDebugPairOverlapSummaries[idx].qs = qs;
+                                        ecDebugPairOverlapSummaries[idx].qe = qe;
+                                        ecDebugPairOverlapSummaries[idx].informativeSnpSitesInOverlap = std::move(sitesInOverlap);
+                                        ecDebugPairIsSameStrand = alignmentData[cand.alignmentId].isSameStrand;
                                     }
                                 }
                             }
-                        }
-                        // SV sites: count by interval only (same convention as SV marking stage).
-                        if(!informativeSvSites.empty()) {
-                            count += countSitesInRange(informativeSvSites, qs, qe);
-                        }
 
-                        candInformativeSiteCount[c] = count;
-                    }
+	                        // Debug: print exact accounting for a specific overlap alignmentId.
+	                        const bool debugThisOverlap =
+	                            (ecDebugAlignmentId != invalid<uint32_t> && cand.alignmentId == ecDebugAlignmentId) ||
+	                            (ecDebugByReadPair &&
+	                             alignmentData[cand.alignmentId].readIds[0] == ecDebugReadPair[0] &&
+	                             alignmentData[cand.alignmentId].readIds[1] == ecDebugReadPair[1]);
+	                        if(debugThisOverlap) {
+	                            std::lock_guard<std::mutex> lock(ecCoutMutex);
+	                            const ReadId queryReadId = ReadId(readId);
+	                            const AlignmentData& adDbg = alignmentData[cand.alignmentId];
+	                            const uint32_t qLen = uint32_t(reads->getRead(queryReadId).baseCount);
+	                            cout << timestamp << "[EC-DBG] QueryRead=" << queryReadId
+	                                 << " qLen=" << qLen
+	                                 << " candidates=" << candidates.size()
+	                                 << " overlapReads=(" << adDbg.readIds[0] << "," << adDbg.readIds[1] << ")"
+	                                 << " qs=" << qs << " qe=" << qe << " span=" << (qe - qs)
+	                                 << " isInformativeRead=" << (isInformativeRead ? 1 : 0)
+	                                 << " cand.is_match=" << int(cand.is_match)
+	                                 << " keep=" << ((!isInformativeRead || cand.is_match == 1) ? 1 : 0)
+	                                 << endl;
+	                            cout << timestamp << "[EC-DBG] SNP rows=" << scratch.snpStats.size()
+	                                 << " SNP uniqueSites=" << informativeSnpSites.size()
+	                                 << " SV rows=" << scratch.svStats.size()
+	                                 << endl;
+	                            cout << timestamp << "[EC-DBG] Count: snpInRange=" << snpCountInRange
+	                                 << " snpSubtracted=" << snpCountSubtracted
+	                                 << " snpFinal=" << (snpCountInRange - snpCountSubtracted)
+	                                 << " total=" << count
+	                                 << endl;
+
+	                            // Print a few SNP site positions in-range (after DP+multi_check+compact+unique).
+	                            if(!informativeSnpSites.empty()) {
+	                                auto it0 = std::lower_bound(informativeSnpSites.begin(), informativeSnpSites.end(), qs);
+	                                auto it1 = std::lower_bound(informativeSnpSites.begin(), informativeSnpSites.end(), qe);
+	                                const size_t inRange = size_t(it1 - it0);
+	                                cout << timestamp << "[EC-DBG] SNP sites in-range=" << inRange << " first=";
+	                                size_t printed = 0;
+	                                for(auto it = it0; it != it1 && printed < 20; ++it, ++printed) {
+	                                    if(printed) cout << ",";
+	                                    cout << *it;
+	                                }
+	                                if(inRange > printed) cout << ",...";
+	                                cout << endl;
+	                            }
+
+	                            // Print hole intervals for this overlap and how many SNP sites each subtracts.
+	                            if(haveInsertionHoles) {
+	                                const uint32_t offBegin = scratch.insertionOffsets[c];
+	                                const uint32_t offEnd = scratch.insertionOffsets[c + 1];
+	                                cout << timestamp << "[EC-DBG] HoleIntervals count=" << (offEnd - offBegin) << " ";
+	                                uint32_t sumSub = 0;
+	                                for(uint32_t ii = offBegin; ii < offEnd; ++ii) {
+	                                    const auto& hole = scratch.insertionIntervals[ii];
+	                                    const uint32_t a = std::max(qs, hole.begin);
+	                                    const uint32_t b = std::min(qe, hole.end);
+	                                    if(b <= a) continue;
+	                                    const uint32_t sub = informativeSnpSites.empty() ? 0 : countSitesInRange(informativeSnpSites, a, b);
+	                                    sumSub += sub;
+	                                    cout << "[" << a << "," << b << ")->" << sub << " ";
+	                                }
+	                                cout << "sumSub=" << sumSub << endl;
+	                            }
+
+	                            // Sanity check: debug recomputation must match the stored candidate count.
+	                            DINARA_ASSERT(count == candInformativeSiteCount[c]);
+	                        }
+	                    }
 
                     const auto tFinalizeBegin = steady_clock::now();
                     for(size_t c = 0; c < candidates.size(); ++c) {
@@ -2908,7 +3152,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 
 	                        These are monotonic (only ever set), so concurrent writes are safe.
 	                        */
-	                        if (keep) ad.info.isInReadGraph = 1;
+                        if (keep) ad.info.isInReadGraph = 1;
 	                        const ReadId queryReadId = ReadId(readId);
 	                        const uint32_t informativeCount = candInformativeSiteCount[c];
 	                        if(ad.readIds[0] == queryReadId) {
@@ -2916,7 +3160,27 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                        } else if(ad.readIds[1] == queryReadId) {
 	                            ad.informativeHetSiteCount1 = informativeCount;
 	                        }
-	                    }
+
+	                        const bool debugThisOverlap =
+	                            (ecDebugAlignmentId != invalid<uint32_t> && cand.alignmentId == ecDebugAlignmentId) ||
+	                            (ecDebugByReadPair &&
+	                             ad.readIds[0] == ecDebugReadPair[0] &&
+	                             ad.readIds[1] == ecDebugReadPair[1]);
+	                        if(debugThisOverlap) {
+	                            std::lock_guard<std::mutex> lock(ecCoutMutex);
+	                            const uint32_t informativeCount = candInformativeSiteCount[c];
+	                            const int side =
+	                                (ad.readIds[0] == queryReadId) ? 0 :
+	                                (ad.readIds[1] == queryReadId) ? 1 : -1;
+	                            cout << timestamp << "[EC-DBG] Stored for queryRead=" << queryReadId
+	                                 << " alignmentId=" << cand.alignmentId
+	                                 << " side=" << side
+	                                 << " informativeCount=" << informativeCount
+	                                 << " informative0=" << ad.informativeHetSiteCount0
+	                                 << " informative1=" << ad.informativeHetSiteCount1
+	                                 << endl;
+	                        }
+                    }
                     timing.finalizeFlags += seconds(steady_clock::now() - tFinalizeBegin);
                 }
         });
@@ -2928,6 +3192,123 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
     // Finalize informative-site overlap scores now that both read perspectives have been populated.
     for(AlignmentData& ad : alignmentData) {
         ad.updateInformativeHetSiteScore();
+    }
+
+    // If EC debugging is enabled, print the final counters for the requested overlap now that
+    // both read views have (typically) been processed.
+    if(ecDebugAlignmentId != invalid<uint32_t>) {
+        std::lock_guard<std::mutex> lock(ecCoutMutex);
+        const AlignmentData& ad = alignmentData[ecDebugAlignmentId];
+        cout << timestamp << "[EC-DBG] Final alignmentId=" << ecDebugAlignmentId
+             << " reads=(" << ad.readIds[0] << "," << ad.readIds[1] << ")"
+             << " informative0=" << ad.informativeHetSiteCount0
+             << " informative1=" << ad.informativeHetSiteCount1
+             << " score=" << ad.informativeHetSiteScore
+             << " cisByBoth=" << (ad.isCisByBothSides() ? 1 : 0)
+             << " keptByBoth=" << (ad.keptByBothSides() ? 1 : 0)
+             << " deleteReasons0=0x" << std::hex << ad.deleteReasons0
+             << " deleteReasons1=0x" << std::hex << ad.deleteReasons1
+             << std::dec
+             << endl;
+    }
+    if(ecDebugByReadPair) {
+        std::lock_guard<std::mutex> lock(ecCoutMutex);
+        for(uint32_t alignmentId = 0; alignmentId < alignmentData.size(); ++alignmentId) {
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if(ad.readIds[0] != ecDebugReadPair[0] || ad.readIds[1] != ecDebugReadPair[1]) continue;
+            cout << timestamp << "[EC-DBG] Final alignmentId=" << alignmentId
+                 << " reads=(" << ad.readIds[0] << "," << ad.readIds[1] << ")"
+                 << " informative0=" << ad.informativeHetSiteCount0
+                 << " informative1=" << ad.informativeHetSiteCount1
+                 << " score=" << ad.informativeHetSiteScore
+                 << " cisByBoth=" << (ad.isCisByBothSides() ? 1 : 0)
+                 << " keptByBoth=" << (ad.keptByBothSides() ? 1 : 0)
+                 << " deleteReasons0=0x" << std::hex << ad.deleteReasons0
+                 << " deleteReasons1=0x" << std::hex << ad.deleteReasons1
+                 << std::dec
+                 << endl;
+        }
+
+        auto printReadSummary = [&](const EcDebugReadSummary& s) {
+            if(!s.present) {
+                cout << timestamp << "[EC-DBG] ReadSummary read=" << s.readId << " missing" << endl;
+                return;
+            }
+            cout << timestamp << "[EC-DBG] ReadSummary read=" << s.readId
+                 << " len=" << s.readLength
+                 << " candidates=" << s.candidateCount
+                 << " uniqueTargets=" << s.targetReads.size()
+                 << endl;
+        };
+        printReadSummary(ecDebugReadSummaries[0]);
+        printReadSummary(ecDebugReadSummaries[1]);
+
+        if(ecDebugReadSummaries[0].present && ecDebugReadSummaries[1].present) {
+            const auto& a = ecDebugReadSummaries[0].targetReads;
+            const auto& b = ecDebugReadSummaries[1].targetReads;
+            size_t i = 0, j = 0, inter = 0;
+            while(i < a.size() && j < b.size()) {
+                if(a[i] == b[j]) { ++inter; ++i; ++j; }
+                else if(a[i] < b[j]) { ++i; }
+                else { ++j; }
+            }
+            const size_t uni = a.size() + b.size() - inter;
+            const double jaccard = uni ? double(inter) / double(uni) : 0.0;
+            cout << timestamp << "[EC-DBG] NeighborIntersection sharedTargets=" << inter
+                 << " unionTargets=" << uni
+                 << " jaccard=" << jaccard
+                 << endl;
+        }
+
+        const auto& o0 = ecDebugPairOverlapSummaries[0];
+        const auto& o1 = ecDebugPairOverlapSummaries[1];
+        if(o0.present && o1.present) {
+            cout << timestamp << "[EC-DBG] PairOverlap read=" << o0.readId
+                 << " qs=" << o0.qs << " qe=" << o0.qe
+                 << " informativeSnpSites=" << o0.informativeSnpSitesInOverlap.size()
+                 << endl;
+            cout << timestamp << "[EC-DBG] PairOverlap read=" << o1.readId
+                 << " qs=" << o1.qs << " qe=" << o1.qe
+                 << " informativeSnpSites=" << o1.informativeSnpSitesInOverlap.size()
+                 << endl;
+
+            const uint32_t span0 = (o0.qe > o0.qs) ? (o0.qe - o0.qs) : 0;
+            const uint32_t span1 = (o1.qe > o1.qs) ? (o1.qe - o1.qs) : 0;
+            if(span0 && span1) {
+                auto countApproxMappedMatches = [&](const EcDebugPairOverlapSummary& from,
+                                                    const EcDebugPairOverlapSummary& to,
+                                                    bool sameStrand,
+                                                    uint32_t toSpan) -> size_t {
+                    constexpr uint32_t window = 5;
+                    size_t matches = 0;
+                    if(from.informativeSnpSitesInOverlap.empty() || to.informativeSnpSitesInOverlap.empty()) return 0;
+                    const auto& toSites = to.informativeSnpSitesInOverlap;
+                    for(const uint32_t p : from.informativeSnpSitesInOverlap) {
+                        if(p < from.qs || p >= from.qe) continue;
+                        const double t = double(p - from.qs) / double(from.qe - from.qs);
+                        const double t2 = sameStrand ? t : (1.0 - t);
+                        const uint32_t mapped = to.qs + uint32_t(t2 * double(toSpan) + 0.5);
+                        const uint32_t lo = (mapped > window) ? (mapped - window) : 0;
+                        const uint32_t hi = mapped + window + 1;
+                        auto it0 = std::lower_bound(toSites.begin(), toSites.end(), lo);
+                        if(it0 != toSites.end() && *it0 < hi) {
+                            ++matches;
+                        }
+                    }
+                    return matches;
+                };
+
+                const size_t m01 = countApproxMappedMatches(o0, o1, ecDebugPairIsSameStrand, span1);
+                const size_t m10 = countApproxMappedMatches(o1, o0, ecDebugPairIsSameStrand, span0);
+                cout << timestamp << "[EC-DBG] PairOverlapApproxShared sameStrand=" << (ecDebugPairIsSameStrand ? 1 : 0)
+                     << " mappedMatches0to1=" << m01
+                     << " mappedMatches1to0=" << m10
+                     << endl;
+            }
+        } else {
+            cout << timestamp << "[EC-DBG] PairOverlap missing: present0=" << (o0.present ? 1 : 0)
+                 << " present1=" << (o1.present ? 1 : 0) << endl;
+        }
     }
 
     PhaseTiming total;

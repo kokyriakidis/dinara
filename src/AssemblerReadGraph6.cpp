@@ -219,13 +219,13 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     }
     cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
 
-    // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
-    // Marks fully contained reads and removes their overlaps
-    removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
-         << ", isDeleted1=" << afterContainDel1
-         << ", active=" << countActiveAlignments() << endl;
+    // // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
+    // // Marks fully contained reads and removes their overlaps
+    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+    //      << ", isDeleted1=" << afterContainDel1
+    //      << ", active=" << countActiveAlignments() << endl;
 
     // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
     // // This is a diagnostic/experimental alternative to removing contained reads entirely.
