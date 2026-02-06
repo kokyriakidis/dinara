@@ -488,7 +488,8 @@ private:
                         }
 
                         // Rescue mechanism for same-strand (hifiasm lines 846-860)
-                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] > (uint32_t)MAX_DIST_X)) {
+                        // Track by TARGET position (hitPosB) as hifiasm does
+                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y)) {
                             int32_t max_val = INT32_MIN;
                             max_ii_same = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
@@ -515,7 +516,8 @@ private:
                         if(max_j_same >= 0) {
                             scratch.chainOccurrencesSame[i] = scratch.chainOccurrencesSame[max_j_same] + 1;
                         }
-                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] <= (uint32_t)MAX_DIST_X &&
+                        // Update max_ii tracker based on target position
+                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
                                                  scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
                             max_ii_same = (int32_t)i;
                         }
@@ -579,7 +581,8 @@ private:
                         }
 
                         // Rescue mechanism for diff-strand
-                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] > (uint32_t)MAX_DIST_X)) {
+                        // For diff-strand, posB decreases, so check: posB[max_ii] - posB[i]
+                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y)) {
                             int32_t max_val = INT32_MIN;
                             max_ii_diff = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
@@ -636,7 +639,8 @@ private:
                         if(max_j_diff >= 0) {
                             scratch.chainOccurrencesDiff[i] = scratch.chainOccurrencesDiff[max_j_diff] + 1;
                         }
-                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] <= (uint32_t)MAX_DIST_X &&
+                        // Update max_ii tracker for diff-strand (posB decreases)
+                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
                                                  scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
                             max_ii_diff = (int32_t)i;
                         }
@@ -1450,7 +1454,8 @@ void Assembler::chainPafCandidates(
                         }
 
                         // Rescue for same-strand
-                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] > (uint32_t)MAX_DIST_X)) {
+                        // Track by TARGET position (hitPosB) as hifiasm does
+                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y)) {
                             int32_t max_val = INT32_MIN;
                             max_ii_same = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
@@ -1473,7 +1478,8 @@ void Assembler::chainPafCandidates(
 
                         scratch.dpSame[i] = max_f_same;
                         scratch.parentSame[i] = max_j_same;
-                        if(max_ii_same < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_same] <= (uint32_t)MAX_DIST_X &&
+                        // Update max_ii tracker based on target position
+                        if(max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
                                                  scratch.dpSame[max_ii_same] < scratch.dpSame[i])) {
                             max_ii_same = (int32_t)i;
                         }
@@ -1530,7 +1536,8 @@ void Assembler::chainPafCandidates(
                         }
 
                         // Rescue for diff-strand
-                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] > (uint32_t)MAX_DIST_X)) {
+                        // For diff-strand, posB decreases, so check: posB[max_ii] - posB[i]
+                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y)) {
                             int32_t max_val = INT32_MIN;
                             max_ii_diff = -1;
                             for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
@@ -1583,7 +1590,8 @@ void Assembler::chainPafCandidates(
 
                         scratch.dpDiff[i] = max_f_diff;
                         scratch.parentDiff[i] = max_j_diff;
-                        if(max_ii_diff < 0 || (scratch.hitPosA[i] - scratch.hitPosA[max_ii_diff] <= (uint32_t)MAX_DIST_X &&
+                        // Update max_ii tracker for diff-strand (posB decreases)
+                        if(max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
                                                  scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i])) {
                             max_ii_diff = (int32_t)i;
                         }
