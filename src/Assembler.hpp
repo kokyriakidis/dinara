@@ -2464,7 +2464,6 @@ private:
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;
              uint32_t mcopyKhitCutoff = 32;
-             uint32_t mcopyTriggerCandidateCount = 1;
              uint32_t mcopyOcvWindow = 3072;
              double mcopyOcvWeakKeepRatio = 0.70;
              vector<uint8_t> weightLut; // size 512
@@ -2475,6 +2474,11 @@ private:
          // Phase 2: Compact vector for Query (8 bytes/hit).
          vector<CompactOccurrence> compactOccurrences;
 
+         // Canonical k-mer ids for strand-0 markers, laid out read-contiguously.
+         // offsets[r]..offsets[r+1]-1 corresponds to read r strand 0.
+         // This cache lets chaining avoid per-marker reverse-complement work.
+         vector<uint64_t> strand0CanonicalOffsets;
+         vector<KmerId> strand0CanonicalKmerIds;
 
 
          // Open Addressing Hash Table (Linear Probing).

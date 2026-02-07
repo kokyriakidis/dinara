@@ -31,6 +31,8 @@
 #include "timestamp.hpp"
 #include "Reads.hpp"
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -377,6 +379,28 @@ static inline bool mapHitPositionsToMarkerOrdinals(
     return true;
 }
 
+static inline uint8_t computeInvertedIndexHitWeight(
+    const uint32_t count,
+    const uint64_t lowFreqThreshold,
+    const uint64_t highFreqThreshold,
+    const uint64_t highFreqWeightUnit,
+    const uint32_t rareKmerWeight,
+    const vector<uint8_t>& weightLut,
+    const double weightExponent)
+{
+    if (count <= lowFreqThreshold) {
+        return uint8_t(std::min<uint32_t>(255U, rareKmerWeight));
+    }
+    if (count >= highFreqThreshold) {
+        const uint32_t w = 1U + uint32_t((uint64_t(count) + highFreqWeightUnit - 1ULL) / highFreqWeightUnit);
+        if (w < 512U) {
+            return weightLut[w];
+        }
+        return uint8_t(std::min<uint32_t>(255U, uint32_t(std::pow(double(w), weightExponent))));
+    }
+    return uint8_t(1);
+}
+
 // Private class to encapsulate parallel logic (Codebase Pattern).
 class InvertedIndexFinder : public MultithreadedObject<InvertedIndexFinder> {
 public:
@@ -481,7 +505,6 @@ private:
         const uint64_t kmerLen = invertedIndexData.k;
         const double maxDriftRate = invertedIndexData.maxDriftRate;
         const uint64_t coveragePeak = invertedIndexData.coveragePeak;
-        const uint8_t* weightLUT = invertedIndexData.weightLut.data();
         const double weightExponent = invertedIndexData.weightExponent;
         const double lowFreqMultiplier = invertedIndexData.lowFreqMultiplier;
         const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
@@ -503,7 +526,6 @@ private:
         const uint32_t mcopyNum = std::max<uint32_t>(1U, invertedIndexData.mcopyNum);
         const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
         const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
-        const uint32_t mcopyTriggerCandidateCount = std::max<uint32_t>(1U, invertedIndexData.mcopyTriggerCandidateCount);
         const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
         const double mcopyOcvWeakKeepRatio = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyOcvWeakKeepRatio));
 
@@ -514,8 +536,22 @@ private:
                 
                 const OrientedReadId orientedReadIdA(readIdA, 0);
                 const auto& markersA = markers[orientedReadIdA.getValue()];
+                const bool haveCanonicalCache =
+                    (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
+                const KmerId* canonicalIdsA = nullptr;
+                size_t canonicalCountA = 0;
+                if(haveCanonicalCache) {
+                    const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
+                    const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
+                    if(e >= b && e <= invertedIndexData.strand0CanonicalKmerIds.size()) {
+                        canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
+                        canonicalCountA = size_t(e - b);
+                    }
+                }
                 const auto& kmerIdsA = markerKmerIds[orientedReadIdA.getValue()];
-                const size_t numMarkersA = std::min(markersA.size(), kmerIdsA.size());
+                const size_t numMarkersA = canonicalIdsA ?
+                    std::min(markersA.size(), canonicalCountA) :
+                    std::min(markersA.size(), kmerIdsA.size());
                 const uint64_t readLenA = reads.getReadRawSequenceLength(readIdA);
                 
                 scratch.clear();
@@ -526,17 +562,14 @@ private:
                 int64_t lastNonHighBoundaryPos = -1;
 
                 auto computeHitWeight = [&](const uint32_t count) -> uint8_t {
-                    if (count <= lowFreqThreshold) {
-                        return uint8_t(std::min<uint32_t>(255U, rareKmerWeight));
-                    }
-                    if (count >= highFreqThreshold) {
-                        const uint32_t w = 1U + uint32_t((uint64_t(count) + highFreqWeightUnit - 1ULL) / highFreqWeightUnit);
-                        if (w < 512U) {
-                            return weightLUT[w];
-                        }
-                        return uint8_t(std::min<uint32_t>(255U, uint32_t(std::pow(double(w), weightExponent))));
-                    }
-                    return uint8_t(1);
+                    return computeInvertedIndexHitWeight(
+                        count,
+                        lowFreqThreshold,
+                        highFreqThreshold,
+                        highFreqWeightUnit,
+                        rareKmerWeight,
+                        invertedIndexData.weightLut,
+                        weightExponent);
                 };
 
                 auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
@@ -575,9 +608,14 @@ private:
                 // --- Step 1: Hit Collection & Early Weighting ---
                 // We scan markers in Read A and find matches in the Inverted Index.
                 for(size_t i = 0; i < numMarkersA; ++i) {
-                    KmerId currentKId = kmerIdsA[i];
-                    KmerId rcKId = getRcKmerId(currentKId, kmerLen);
-                    KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                    KmerId canonicalKId;
+                    if(canonicalIdsA) {
+                        canonicalKId = canonicalIdsA[i];
+                    } else {
+                        KmerId currentKId = kmerIdsA[i];
+                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                        canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                    }
 
                     const uint32_t posA = markersA[i].position;
                     uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
@@ -1016,7 +1054,6 @@ private:
                     // keep best chain plus a limited number of high-scoring alternative peaks.
                     if(enableMcopyFast &&
                         mcopyNum > 1 &&
-                        scratch.chainCandidates.size() >= size_t(mcopyTriggerCandidateCount) &&
                         numHits >= size_t(mcopyKhitCutoff))
                     {
                         const auto getOcc = [&](const ThreadScratchpad::ChainCandidate& c) -> uint32_t {
@@ -1556,10 +1593,10 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
     // We use static load balancing (not dynamic getNextBatch) to ensure that
     // each thread processes the exact same reads in both Pass 1 (Count) and
     // Pass 2 (Fill). This prevents buffer overflows from mismatched counts.
-    checkMarkersAreOpen();
     const ReadId readCount = ReadId(markers->size() / 2);
     vector<uint64_t> threadMarkerCounts(threadCount, 0);
     vector<size_t> threadOffsets(threadCount, 0);
+    vector<uint64_t> readMarkerCounts(size_t(readCount), 0);
 
     // Pass 1: Count markers per thread for memory allocation
     auto countFunction = [&](size_t threadId) {
@@ -1568,7 +1605,11 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
 
         uint64_t count = 0;
         for(ReadId rId = startRead; rId != endRead; ++rId) {
-            count += (*markers)[size_t(rId) << 1].size();
+            const auto& rMarkers = (*markers)[size_t(rId) << 1];
+            const auto& rKmerIds = (*markerKmerIds)[size_t(rId) << 1];
+            const size_t n = std::min<size_t>(rMarkers.size(), rKmerIds.size());
+            readMarkerCounts[size_t(rId)] = uint64_t(n);
+            count += n;
         }
         threadMarkerCounts[threadId] = count;
     };
@@ -1584,8 +1625,18 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
         threadOffsets[i] = totalMarkersFound;
         totalMarkersFound += threadMarkerCounts[i];
     }
+
+    invertedIndexData.strand0CanonicalOffsets.resize(size_t(readCount) + 1, 0);
+    for(size_t r = 0; r < size_t(readCount); ++r) {
+        invertedIndexData.strand0CanonicalOffsets[r + 1] =
+            invertedIndexData.strand0CanonicalOffsets[r] + readMarkerCounts[r];
+    }
+    if(invertedIndexData.strand0CanonicalOffsets.back() != totalMarkersFound) {
+        throw runtime_error("buildInvertedIndex: inconsistent marker counts for canonical cache.");
+    }
     
     invertedIndexData.occurrences.resize(totalMarkersFound);
+    invertedIndexData.strand0CanonicalKmerIds.resize(totalMarkersFound);
     cout << "Index allocated for " << totalMarkersFound << " occurrences (Strand 0 only)." << endl;
 
     // Pass 2: Fill the occurrence array
@@ -1597,9 +1648,9 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
         for(ReadId rId = startRead; rId != endRead; ++rId) {
             const auto& rMarkers = (*markers)[size_t(rId) << 1];
             const auto& rKmerIds = (*markerKmerIds)[size_t(rId) << 1];
-            if(rMarkers.size() != rKmerIds.size()) continue; 
-
-            for(size_t i = 0; i < rMarkers.size(); ++i) {
+            const size_t n = std::min<size_t>(rMarkers.size(), rKmerIds.size());
+            size_t canonicalWriteOffset = size_t(invertedIndexData.strand0CanonicalOffsets[size_t(rId)]);
+            for(size_t i = 0; i < n; ++i) {
                 KmerId kId = rKmerIds[i];
                 KmerId rcKId = getRcKmerId(kId, invertedIndexData.k);
                 KmerId canonicalKId = (kId < rcKId) ? kId : rcKId;
@@ -1609,6 +1660,7 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
                     rId,
                     rMarkers[i].position
                 };
+                invertedIndexData.strand0CanonicalKmerIds[canonicalWriteOffset++] = canonicalKId;
             }
         }
     };
@@ -1634,66 +1686,93 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
     
     if(!invertedIndexData.occurrences.empty()) {
         const size_t n = invertedIndexData.occurrences.size();
-        const size_t numBytes = sizeof(KmerId);
+        // KmerId stores 2*k bits; higher bytes are always zero. Sorting only
+        // active bytes avoids redundant radix passes for wide KmerId types.
+        const size_t numBytes = std::max<size_t>(1, (2 * size_t(invertedIndexData.k) + 7) / 8);
+        constexpr size_t bucketCount = 256;
         
         vector<InvertedIndexOccurrence> buffer(n);
         vector<InvertedIndexOccurrence>* src = &invertedIndexData.occurrences;
         vector<InvertedIndexOccurrence>* dst = &buffer;
+        vector<size_t> threadHistograms(threadCount * bucketCount);
+        vector<size_t> globalBucketCounts(bucketCount);
+        vector<size_t> globalBucketOffsets(bucketCount);
+        vector<size_t> writeOffsets(threadCount * bucketCount);
+        std::atomic<uint8_t> radixStage(0); // 0=histogram, 1=scatter
+        std::atomic<bool> stopWorkers(false);
+        size_t currentByteIdx = 0;
+        std::barrier syncPoint(ptrdiff_t(threadCount + 1));
+        vector<thread> sortThreads;
+        sortThreads.reserve(threadCount);
+        for(size_t tid = 0; tid < threadCount; ++tid) {
+            sortThreads.emplace_back([&, tid]() {
+                const size_t start = (n * tid) / threadCount;
+                const size_t end = (n * (tid + 1)) / threadCount;
+                while(true) {
+                    syncPoint.arrive_and_wait();
+                    if(stopWorkers.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    if(radixStage.load(std::memory_order_relaxed) == 0) {
+                        size_t* localHistogram = threadHistograms.data() + tid * bucketCount;
+                        for(size_t i = start; i < end; ++i) {
+                            const uint8_t byteVal = uint8_t(((*src)[i].kmerId >> (currentByteIdx * 8)) & 0xFF);
+                            localHistogram[byteVal]++;
+                        }
+                    } else {
+                        size_t* localWriteOffsets = writeOffsets.data() + tid * bucketCount;
+                        for(size_t i = start; i < end; ++i) {
+                            const uint8_t byteVal = uint8_t(((*src)[i].kmerId >> (currentByteIdx * 8)) & 0xFF);
+                            (*dst)[localWriteOffsets[byteVal]++] = (*src)[i];
+                        }
+                    }
+                    syncPoint.arrive_and_wait();
+                }
+            });
+        }
         
         for (size_t byteIdx = 0; byteIdx < numBytes; ++byteIdx) {
+            currentByteIdx = byteIdx;
             
             // 2.1 Parallel Histogram Calculation
-            vector<vector<size_t>> threadHistograms(threadCount, vector<size_t>(256, 0));
-            auto countHistFunc = [&](size_t tid) {
-                 size_t start = (n * tid) / threadCount;
-                 size_t end = (n * (tid + 1)) / threadCount;
-                 for(size_t i = start; i < end; ++i) {
-                     uint8_t byteVal = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
-                     threadHistograms[tid][byteVal]++;
-                 }
-            };
-            vector<thread> sortThreads;
-            for(size_t i = 0; i < threadCount; i++) sortThreads.emplace_back(countHistFunc, i);
-            for(auto& t : sortThreads) t.join();
-            sortThreads.clear();
+            std::fill(threadHistograms.begin(), threadHistograms.end(), 0);
+            radixStage.store(0, std::memory_order_relaxed);
+            syncPoint.arrive_and_wait();
+            syncPoint.arrive_and_wait();
             
             // 2.2 Global Offset Calculation
-            size_t globalBucketCounts[256] = {0};
-            for(size_t b = 0; b < 256; ++b) {
+            std::fill(globalBucketCounts.begin(), globalBucketCounts.end(), 0);
+            for(size_t b = 0; b < bucketCount; ++b) {
                 for(size_t tid = 0; tid < threadCount; ++tid) {
-                    globalBucketCounts[b] += threadHistograms[tid][b];
+                    globalBucketCounts[b] += threadHistograms[tid * bucketCount + b];
                 }
             }
-            size_t globalBucketOffsets[256];
             globalBucketOffsets[0] = 0;
-            for(size_t b = 1; b < 256; ++b) {
+            for(size_t b = 1; b < bucketCount; ++b) {
                 globalBucketOffsets[b] = globalBucketOffsets[b - 1] + globalBucketCounts[b - 1];
             }
             
             // 2.3 Individual Thread Starting Offsets
-            vector<vector<size_t>> writeOffsets(threadCount, vector<size_t>(256));
-            for(size_t b = 0; b < 256; ++b) {
+            for(size_t b = 0; b < bucketCount; ++b) {
                 size_t current = globalBucketOffsets[b];
                 for(size_t tid = 0; tid < threadCount; tid++) {
-                    writeOffsets[tid][b] = current;
-                    current += threadHistograms[tid][b];
+                    writeOffsets[tid * bucketCount + b] = current;
+                    current += threadHistograms[tid * bucketCount + b];
                 }
             }
             
             // 2.4 Parallel Data Scattering
-            auto scatterDataFunc = [&](size_t tid) {
-                 size_t start = (n * tid) / threadCount;
-                 size_t end = (n * (tid + 1)) / threadCount;
-                 for(size_t i = start; i < end; ++i) {
-                     uint8_t byteVal = (uint8_t)(((*src)[i].kmerId >> (byteIdx * 8)) & 0xFF);
-                     (*dst)[writeOffsets[tid][byteVal]++] = (*src)[i];
-                 }
-            };
-            for(size_t i = 0; i < threadCount; i++) sortThreads.emplace_back(scatterDataFunc, i);
-            for(auto& t : sortThreads) t.join();
-            sortThreads.clear();
+            radixStage.store(1, std::memory_order_relaxed);
+            syncPoint.arrive_and_wait();
+            syncPoint.arrive_and_wait();
 
             std::swap(src, dst);
+        }
+
+        stopWorkers.store(true, std::memory_order_relaxed);
+        syncPoint.arrive_and_wait();
+        for(auto& t : sortThreads) {
+            t.join();
         }
         
         if (src != &invertedIndexData.occurrences) {
@@ -1841,7 +1920,6 @@ void Assembler::chainAlignmentCandidates(
     invertedIndexData.mcopyNum = overlapCandidatesOptions.invertedIndexMcopyNum;
     invertedIndexData.mcopyRate = overlapCandidatesOptions.invertedIndexMcopyRate;
     invertedIndexData.mcopyKhitCutoff = overlapCandidatesOptions.invertedIndexMcopyKhitCutoff;
-    invertedIndexData.mcopyTriggerCandidateCount = overlapCandidatesOptions.invertedIndexMcopyTriggerCandidateCount;
     invertedIndexData.mcopyOcvWindow = overlapCandidatesOptions.invertedIndexMcopyOcvWindow;
     invertedIndexData.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
     invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
@@ -1872,6 +1950,10 @@ void Assembler::chainAlignmentCandidates(
     invertedIndexData.compactOccurrences.shrink_to_fit();
     invertedIndexData.hashTable.clear();
     invertedIndexData.hashTable.shrink_to_fit();
+    invertedIndexData.strand0CanonicalKmerIds.clear();
+    invertedIndexData.strand0CanonicalKmerIds.shrink_to_fit();
+    invertedIndexData.strand0CanonicalOffsets.clear();
+    invertedIndexData.strand0CanonicalOffsets.shrink_to_fit();
 
     const auto endTime = std::chrono::steady_clock::now();
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
@@ -1941,7 +2023,6 @@ void Assembler::chainPafCandidates(
     invertedIndexData.mcopyNum = overlapCandidatesOptions.invertedIndexMcopyNum;
     invertedIndexData.mcopyRate = overlapCandidatesOptions.invertedIndexMcopyRate;
     invertedIndexData.mcopyKhitCutoff = overlapCandidatesOptions.invertedIndexMcopyKhitCutoff;
-    invertedIndexData.mcopyTriggerCandidateCount = overlapCandidatesOptions.invertedIndexMcopyTriggerCandidateCount;
     invertedIndexData.mcopyOcvWindow = overlapCandidatesOptions.invertedIndexMcopyOcvWindow;
     invertedIndexData.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
     invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
@@ -1992,7 +2073,6 @@ void Assembler::chainPafCandidates(
     const uint32_t mcopyNum = std::max<uint32_t>(1U, invertedIndexData.mcopyNum);
     const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
     const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
-    const uint32_t mcopyTriggerCandidateCount = std::max<uint32_t>(1U, invertedIndexData.mcopyTriggerCandidateCount);
 
     // Thread-local results
     vector<vector<OrientedReadPair>> threadCandidates(threadCount);
@@ -2029,12 +2109,25 @@ void Assembler::chainPafCandidates(
                     const OrientedReadId orientedReadIdA(readIdA, 0);
                     const OrientedReadId orientedReadIdB(readIdB, 0);
                     const auto& markersA = (*markers)[orientedReadIdA.getValue()];
-                    const auto& kmerIdsA = (*markerKmerIds)[orientedReadIdA.getValue()];
                     const auto& markersB = (*markers)[orientedReadIdB.getValue()];
-                    const auto& kmerIdsB = (*markerKmerIds)[orientedReadIdB.getValue()];
+                    const bool haveCanonicalCache =
+                        (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
+                    const KmerId* canonicalIdsA = nullptr;
+                    size_t canonicalCountA = 0;
+                    if(haveCanonicalCache) {
+                        const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
+                        const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
+                        if(e >= b && e <= invertedIndexData.strand0CanonicalKmerIds.size()) {
+                            canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
+                            canonicalCountA = size_t(e - b);
+                        }
+                    }
+                    const auto& kmerIdsA = (*markerKmerIds)[orientedReadIdA.getValue()];
                     
-                    const size_t numMarkersA = std::min(markersA.size(), kmerIdsA.size());
-                    const size_t numMarkersB = std::min(markersB.size(), kmerIdsB.size());
+                    const size_t numMarkersA = canonicalIdsA ?
+                        std::min(markersA.size(), canonicalCountA) :
+                        std::min(markersA.size(), kmerIdsA.size());
+                    const size_t numMarkersB = markersB.size();
                     
                     if(numMarkersA == 0 || numMarkersB == 0) continue;
 
@@ -2048,17 +2141,14 @@ void Assembler::chainPafCandidates(
                     int64_t lastNonHighBoundaryPos = -1;
 
                     auto computeHitWeight = [&](const uint32_t count) -> uint8_t {
-                        if (count <= lowFreqThreshold) {
-                            return uint8_t(std::min<uint32_t>(255U, invertedIndexData.rareKmerWeight));
-                        }
-                        if (count >= highFreqThreshold) {
-                            const uint32_t w = 1U + uint32_t((uint64_t(count) + highFreqWeightUnit - 1ULL) / highFreqWeightUnit);
-                            if (w < 512U) {
-                                return invertedIndexData.weightLut[w];
-                            }
-                            return uint8_t(std::min<uint32_t>(255U, uint32_t(std::pow(double(w), invertedIndexData.weightExponent))));
-                        }
-                        return uint8_t(1);
+                        return computeInvertedIndexHitWeight(
+                            count,
+                            lowFreqThreshold,
+                            highFreqThreshold,
+                            highFreqWeightUnit,
+                            invertedIndexData.rareKmerWeight,
+                            invertedIndexData.weightLut,
+                            invertedIndexData.weightExponent);
                     };
 
                     auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
@@ -2095,9 +2185,14 @@ void Assembler::chainPafCandidates(
                     };
 
                     for(size_t i = 0; i < numMarkersA; i++) {
-                        KmerId currentKId = kmerIdsA[i];
-                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
-                        KmerId canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                        KmerId canonicalKId;
+                        if(canonicalIdsA) {
+                            canonicalKId = canonicalIdsA[i];
+                        } else {
+                            KmerId currentKId = kmerIdsA[i];
+                            KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                            canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                        }
                         
                         const uint32_t posA = markersA[i].position;
                         uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
@@ -2168,10 +2263,11 @@ void Assembler::chainPafCandidates(
                     scratch.hitOrdinalB.assign(numHits, std::numeric_limits<uint32_t>::max());
                     scratch.hitWeights.assign(numHits, 0);
                     for(size_t k = 0; k < numHits; k++) {
-                        scratch.hitPosA[k] = scratch.flatHits[k].posA;
-                        scratch.hitPosB[k] = scratch.flatHits[k].posB;
-                        scratch.hitOrdinalA[k] = scratch.flatHits[k].ordinalA;
-                        scratch.hitWeights[k] = scratch.flatHits[k].weight;
+                        const auto& h = scratch.flatHits[k];
+                        scratch.hitPosA[k] = h.posA;
+                        scratch.hitPosB[k] = h.posB;
+                        scratch.hitOrdinalA[k] = h.ordinalA;
+                        scratch.hitWeights[k] = h.weight;
                     }
                     if(!mapHitPositionsToMarkerOrdinals(
                         scratch.hitPosB, markersB, scratch.hitOrdinalB, scratch.hitOrderByPosB)) {
@@ -2452,9 +2548,7 @@ void Assembler::chainPafCandidates(
                     const bool useSameStrand = pafSameStrand;
                     const bool wantDiff = !useSameStrand;
                     const int32_t bestScPair = useSameStrand ? maxScSame : maxScDiff;
-                    if(bestScPair < 2) {
-                        continue;
-                    }
+                    if(bestScPair < 2) continue;
 
                     int32_t filterThresh = std::max<int32_t>(
                         int32_t(chainFilterMinScore),
@@ -2494,9 +2588,7 @@ void Assembler::chainPafCandidates(
                             }
                         }
                     }
-                    if(scratch.chainCandidates.empty()) {
-                        continue;
-                    }
+                    if(scratch.chainCandidates.empty()) continue;
                     for(auto& cand : scratch.chainCandidates) {
                         if(cand.isDiff) {
                             cand.chainLen = getAlignmentLength(
@@ -2513,7 +2605,6 @@ void Assembler::chainPafCandidates(
                     // Hifiasm-like mcopy-fast endpoint selection for expensive PAF pairs.
                     if(enableMcopyFast &&
                         mcopyNum > 1 &&
-                        scratch.chainCandidates.size() >= size_t(mcopyTriggerCandidateCount) &&
                         numHits >= size_t(mcopyKhitCutoff))
                     {
                         const auto getOcc = [&](const ThreadScratchpad::ChainCandidate& c) -> uint32_t {
@@ -2901,6 +2992,10 @@ void Assembler::chainPafCandidates(
     invertedIndexData.compactOccurrences.shrink_to_fit();
     invertedIndexData.hashTable.clear();
     invertedIndexData.hashTable.shrink_to_fit();
+    invertedIndexData.strand0CanonicalKmerIds.clear();
+    invertedIndexData.strand0CanonicalKmerIds.shrink_to_fit();
+    invertedIndexData.strand0CanonicalOffsets.clear();
+    invertedIndexData.strand0CanonicalOffsets.shrink_to_fit();
 
     const auto endTime = std::chrono::steady_clock::now();
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
