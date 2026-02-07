@@ -182,6 +182,53 @@ def patchRustPortableSimdLaneCountRemoval(cratePath):
                 patchedFiles += 1
 
     return patchedFiles
+
+
+def patchRustObsoleteFeatureGates(workspaceRoot):
+    """Patch obsolete Rust feature gates that fail on recent nightly toolchains.
+
+    Upstream astar-pairwise-aligner currently enables `bigint_helper_methods`
+    in pa-bitpacking, but that gate is no longer recognized by current nightlies.
+    Removing just that gate keeps the crate compatible with modern nightly.
+    """
+    if not os.path.isdir(workspaceRoot):
+        return 0
+
+    patchedFiles = 0
+    for root, _, files in os.walk(workspaceRoot):
+        for name in files:
+            if not name.endswith(".rs"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception:
+                continue
+
+            original = text
+
+            # Common multiline feature-list style:
+            # #![feature(
+            #   bigint_helper_methods,
+            #   ...
+            # )]
+            text = re.sub(
+                r"(?m)^\s*bigint_helper_methods\s*,\s*\n",
+                "",
+                text,
+            )
+
+            # Single-line style fallbacks.
+            text = re.sub(r",\s*bigint_helper_methods\b", "", text)
+            text = re.sub(r"\bbigint_helper_methods\s*,\s*", "", text)
+
+            if text != original:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                patchedFiles += 1
+
+    return patchedFiles
         
 def installPackage(package):
     runCommand("sudo apt-get install --assume-yes " + package)
@@ -385,6 +432,10 @@ def installAstarpa():
         patched = patchRustPortableSimdLaneCountRemoval(os.path.join(workspaceRoot, "pa-bitpacking"))
         if patched:
             print(f"Patched portable_simd LaneCount API in {patched} Rust files.")
+
+        patched = patchRustObsoleteFeatureGates(workspaceRoot)
+        if patched:
+            print(f"Patched obsolete Rust feature gates in {patched} Rust files.")
 
         # Build
         runCommand(cargoPath + " build --release")

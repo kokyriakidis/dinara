@@ -90,18 +90,166 @@ inline uint64_t packSiteReadKey(uint32_t siteId, ReadId readId)
 
 // Decode delta-coded SNP evidence tokens into absolute positions.
 // Hop tokens advance the running position but do not represent mismatches.
-inline void decodeMismatchPositions(span<const SnpEvidence> tokens, vector<uint32_t>& positions)
+inline bool nextMismatchPosition(
+    span<const SnpEvidence> tokens,
+    size_t& tokenIndex,
+    uint32_t& runningPos,
+    uint32_t& mismatchPos)
 {
-    positions.clear();
-    uint32_t pos = 0;
-    for (const SnpEvidence ev : tokens) {
-        pos += ev.delta();
+    while (tokenIndex < tokens.size()) {
+        const SnpEvidence ev = tokens[tokenIndex++];
+        runningPos += ev.delta();
         if (ev.isHop()) {
             continue;
         }
-        positions.push_back(pos);
+        mismatchPos = runningPos;
+        return true;
     }
+    return false;
 }
+
+template<class F>
+inline bool forEachMismatchPair(
+    span<const SnpEvidence> qTokens,
+    span<const SnpEvidence> tTokens,
+    bool reverse,
+    uint32_t reserveHint,
+    vector<uint32_t>& reverseScratch,
+    F&& f)
+{
+    if (!reverse) {
+        size_t qTokenIndex = 0;
+        size_t tTokenIndex = 0;
+        uint32_t qRunningPos = 0;
+        uint32_t tRunningPos = 0;
+        uint32_t qMismatchPos = 0;
+        uint32_t tMismatchPos = 0;
+        while (true) {
+            const bool qOk = nextMismatchPosition(qTokens, qTokenIndex, qRunningPos, qMismatchPos);
+            const bool tOk = nextMismatchPosition(tTokens, tTokenIndex, tRunningPos, tMismatchPos);
+            if (qOk != tOk) {
+                return false;
+            }
+            if (!qOk) {
+                return true;
+            }
+            f(qMismatchPos, tMismatchPos);
+        }
+    }
+
+    reverseScratch.clear();
+    if (reserveHint > reverseScratch.capacity()) {
+        reverseScratch.reserve(reserveHint);
+    }
+    size_t tTokenIndex = 0;
+    uint32_t tRunningPos = 0;
+    uint32_t tMismatchPos = 0;
+    while (nextMismatchPosition(tTokens, tTokenIndex, tRunningPos, tMismatchPos)) {
+        reverseScratch.push_back(tMismatchPos);
+    }
+
+    size_t qTokenIndex = 0;
+    uint32_t qRunningPos = 0;
+    uint32_t qMismatchPos = 0;
+    uint64_t mismatchIndex = 0;
+    while (nextMismatchPosition(qTokens, qTokenIndex, qRunningPos, qMismatchPos)) {
+        if (mismatchIndex >= reverseScratch.size()) {
+            return false;
+        }
+        f(qMismatchPos, reverseScratch[reverseScratch.size() - 1 - mismatchIndex]);
+        mismatchIndex++;
+    }
+
+    return mismatchIndex == reverseScratch.size();
+}
+
+class FlatNodeIdTable {
+public:
+    void reserve(uint64_t expectedSize)
+    {
+        // Keep load factor <= ~0.7.
+        uint64_t capacity = 8;
+        while (capacity * 7 < expectedSize * 10) {
+            capacity *= 2;
+        }
+        rehash(capacity);
+    }
+
+    template<class CreateNodeId>
+    uint64_t getOrCreate(uint64_t key, CreateNodeId&& createNodeId)
+    {
+        if (occupied.empty()) {
+            rehash(8);
+        }
+        if ((used + 1) * 10 >= occupied.size() * 7) {
+            rehash(occupied.size() * 2);
+        }
+
+        const uint64_t mask = occupied.size() - 1;
+        uint64_t i = hash(key) & mask;
+        while (true) {
+            if (!occupied[i]) {
+                occupied[i] = 1;
+                keys[i] = key;
+                values[i] = createNodeId();
+                used++;
+                return values[i];
+            }
+            if (keys[i] == key) {
+                return values[i];
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+private:
+    vector<uint64_t> keys;
+    vector<uint64_t> values;
+    vector<uint8_t> occupied;
+    uint64_t used = 0;
+
+    static uint64_t hash(uint64_t x)
+    {
+        // splitmix64
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
+
+    void rehash(uint64_t newCapacity)
+    {
+        DINARA_ASSERT((newCapacity & (newCapacity - 1)) == 0);
+        vector<uint64_t> oldKeys = std::move(keys);
+        vector<uint64_t> oldValues = std::move(values);
+        vector<uint8_t> oldOccupied = std::move(occupied);
+
+        keys.assign(newCapacity, 0);
+        values.assign(newCapacity, 0);
+        occupied.assign(newCapacity, 0);
+        used = 0;
+
+        if (oldOccupied.empty()) {
+            return;
+        }
+
+        const uint64_t mask = newCapacity - 1;
+        for (size_t j = 0; j < oldOccupied.size(); j++) {
+            if (!oldOccupied[j]) {
+                continue;
+            }
+            const uint64_t key = oldKeys[j];
+            uint64_t i = hash(key) & mask;
+            while (occupied[i]) {
+                i = (i + 1) & mask;
+            }
+            occupied[i] = 1;
+            keys[i] = key;
+            values[i] = oldValues[j];
+            used++;
+        }
+    }
+};
 
 struct MapResult {
     bool ok = false;
@@ -512,7 +660,7 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
     if (threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
-    (void)threadCount; // Currently single-threaded.
+    (void)threadCount; // Global-all clustering path remains single-threaded.
 
     // Typical datasets have several mismatch nodes per overlap. Reserve aggressively
     // to avoid repeated rehash/reallocation in the hot clustering loop.
@@ -520,8 +668,8 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
 
     DynamicDisjointSets dsets;
     dsets.reserve(nodeReserveHint);
-    unordered_map<uint64_t, uint64_t> nodeIdByKey;
-    nodeIdByKey.reserve(size_t(nodeReserveHint));
+    FlatNodeIdTable nodeIdByKey;
+    nodeIdByKey.reserve(nodeReserveHint);
 
     GlobalMismatchSiteClusters result;
     result.nodes.reserve(size_t(nodeReserveHint));
@@ -531,15 +679,12 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
 
     auto getOrAddNode = [&](ReadId readId, uint32_t pos) -> uint64_t {
         const uint64_t key = packReadPosKey(readId, pos);
-        const auto it = nodeIdByKey.find(key);
-        if (it != nodeIdByKey.end()) {
-            return it->second;
-        }
-        const uint64_t nodeId = dsets.add();
-        nodeIdByKey.insert({key, nodeId});
-        DINARA_ASSERT(nodeId == result.nodes.size());
-        result.nodes.push_back({readId, pos});
-        return nodeId;
+        return nodeIdByKey.getOrCreate(key, [&]() {
+            const uint64_t nodeId = dsets.add();
+            DINARA_ASSERT(nodeId == result.nodes.size());
+            result.nodes.push_back({readId, pos});
+            return nodeId;
+        });
     };
 
     // Fast path: use the already-stored mismatch evidence streams.
@@ -547,10 +692,8 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
     // and the order is consistent with the underlying sparse mismatch list, so we can pair
     // by mismatch index (reversing the target order if the overlap is reverse-complemented).
     if (alignedEvidenceStore.index.size() >= alignmentData.size()) {
-        vector<uint32_t> qPositions;
-        vector<uint32_t> tPositions;
-        qPositions.reserve(1024);
-        tPositions.reserve(1024);
+        vector<uint32_t> reverseScratch;
+        reverseScratch.reserve(1024);
 
         for (uint64_t alignmentId = 0; alignmentId < alignmentData.size(); alignmentId++) {
             const AlignmentData& ad = alignmentData[alignmentId];
@@ -563,28 +706,33 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
             if (ad.info.errorRate > float(alignOptions.maxErrorRate)) {
                 continue;
             }
-
-            const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
-            decodeMismatchPositions(alignedEvidenceStore.getSnps1(evidenceId), qPositions); // readIds[0] coords
-            decodeMismatchPositions(alignedEvidenceStore.getSnps0(evidenceId), tPositions); // readIds[1] forward coords
-
-            if (qPositions.size() != tPositions.size()) {
-                skippedMismatchedCounts++;
+            if (ad.info.mismatchCount == 0) {
                 continue;
             }
 
+            const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+            const span<const SnpEvidence> qTokens = alignedEvidenceStore.getSnps1(evidenceId);
+            const span<const SnpEvidence> tTokens = alignedEvidenceStore.getSnps0(evidenceId);
             const ReadId r0 = ad.readIds[0];
             const ReadId r1 = ad.readIds[1];
-            const bool reverse = !ad.isSameStrand;
-            const uint64_t mCount = qPositions.size();
-            for (uint64_t i = 0; i < mCount; i++) {
-                const uint32_t pos0 = qPositions[i];
-                const uint32_t pos1 = reverse ? tPositions[mCount - 1 - i] : tPositions[i];
-                const uint64_t n0 = getOrAddNode(r0, pos0);
-                const uint64_t n1 = getOrAddNode(r1, pos1);
-                dsets.unite(n0, n1);
+            uint64_t mismatchPairs = 0;
+            const bool ok = forEachMismatchPair(
+                qTokens,
+                tTokens,
+                !ad.isSameStrand,
+                ad.info.mismatchCount,
+                reverseScratch,
+                [&](uint32_t pos0, uint32_t pos1) {
+                    const uint64_t n0 = getOrAddNode(r0, pos0);
+                    const uint64_t n1 = getOrAddNode(r1, pos1);
+                    dsets.unite(n0, n1);
+                    mismatchPairs++;
+                });
+            if (!ok) {
+                skippedMismatchedCounts++;
+                continue;
             }
-            totalMismatchEdges += mCount;
+            totalMismatchEdges += mismatchPairs;
         }
 
     } else {
@@ -691,7 +839,7 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
     if (threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
-    (void)threadCount; // Currently single-threaded.
+    threadCount = std::max<uint64_t>(1, threadCount);
 
     // For reachable clustering, initial footprint should still be sizeable to avoid
     // growth churn in highly connected components.
@@ -712,34 +860,8 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
     bool hitReadLimit = false;
     bool hitAlignmentLimit = false;
 
-    DynamicDisjointSets dsets;
-    dsets.reserve(nodeReserveHint);
-    unordered_map<uint64_t, uint64_t> nodeIdByKey;
-    nodeIdByKey.reserve(size_t(nodeReserveHint));
-
-    GlobalMismatchSiteClusters result;
-    result.nodes.reserve(size_t(nodeReserveHint));
-
-    uint64_t totalMismatchEdges = 0;
-    uint64_t skippedMismatchedCounts = 0;
-
-    auto getOrAddNode = [&](ReadId readId, uint32_t pos) -> uint64_t {
-        const uint64_t key = packReadPosKey(readId, pos);
-        const auto it = nodeIdByKey.find(key);
-        if (it != nodeIdByKey.end()) {
-            return it->second;
-        }
-        const uint64_t nodeId = dsets.add();
-        nodeIdByKey.insert({key, nodeId});
-        DINARA_ASSERT(nodeId == result.nodes.size());
-        result.nodes.push_back({readId, pos});
-        return nodeId;
-    };
-
-    vector<uint32_t> qPositions;
-    vector<uint32_t> tPositions;
-    qPositions.reserve(1024);
-    tPositions.reserve(1024);
+    vector<uint64_t> selectedAlignmentIds;
+    selectedAlignmentIds.reserve(16384);
 
     while (queueHead < queue.size()) {
         const ReadId currentReadId = queue[queueHead++];
@@ -777,6 +899,13 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
             if (ad.info.errorRate > float(alignOptions.maxErrorRate)) {
                 continue;
             }
+            if (ad.info.mismatchCount == 0) {
+                continue;
+            }
+            const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+            if (evidenceId >= alignedEvidenceStore.index.size()) {
+                continue;
+            }
 
             // Expand BFS frontier by reads participating in this overlap.
             for (int i = 0; i < 2; i++) {
@@ -789,32 +918,126 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
                     queue.push_back(r);
                 }
             }
-
-            const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
-            decodeMismatchPositions(alignedEvidenceStore.getSnps1(evidenceId), qPositions);
-            decodeMismatchPositions(alignedEvidenceStore.getSnps0(evidenceId), tPositions);
-
-            if (qPositions.size() != tPositions.size()) {
-                skippedMismatchedCounts++;
-                continue;
-            }
-
-            const ReadId r0 = ad.readIds[0];
-            const ReadId r1 = ad.readIds[1];
-            const bool reverse = !ad.isSameStrand;
-            const uint64_t mCount = qPositions.size();
-            for (uint64_t i = 0; i < mCount; i++) {
-                const uint32_t pos0 = qPositions[i];
-                const uint32_t pos1 = reverse ? tPositions[mCount - 1 - i] : tPositions[i];
-                const uint64_t n0 = getOrAddNode(r0, pos0);
-                const uint64_t n1 = getOrAddNode(r1, pos1);
-                dsets.unite(n0, n1);
-            }
-            totalMismatchEdges += mCount;
+            selectedAlignmentIds.push_back(alignmentId);
         }
 
         if (hitAlignmentLimit) {
             break;
+        }
+    }
+
+    DynamicDisjointSets dsets;
+    dsets.reserve(nodeReserveHint);
+    FlatNodeIdTable nodeIdByKey;
+    nodeIdByKey.reserve(nodeReserveHint);
+
+    GlobalMismatchSiteClusters result;
+    result.nodes.reserve(size_t(nodeReserveHint));
+
+    uint64_t totalMismatchEdges = 0;
+    uint64_t skippedMismatchedCounts = 0;
+
+    auto getOrAddNode = [&](ReadId readId, uint32_t pos) -> uint64_t {
+        const uint64_t key = packReadPosKey(readId, pos);
+        return nodeIdByKey.getOrCreate(key, [&]() {
+            const uint64_t nodeId = dsets.add();
+            DINARA_ASSERT(nodeId == result.nodes.size());
+            result.nodes.push_back({readId, pos});
+            return nodeId;
+        });
+    };
+
+    auto processAlignmentIntoDsu = [&](uint64_t alignmentId, vector<uint32_t>& reverseScratch) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+        const span<const SnpEvidence> qTokens = alignedEvidenceStore.getSnps1(evidenceId);
+        const span<const SnpEvidence> tTokens = alignedEvidenceStore.getSnps0(evidenceId);
+        const ReadId r0 = ad.readIds[0];
+        const ReadId r1 = ad.readIds[1];
+        uint64_t mismatchPairs = 0;
+        const bool ok = forEachMismatchPair(
+            qTokens,
+            tTokens,
+            !ad.isSameStrand,
+            ad.info.mismatchCount,
+            reverseScratch,
+            [&](uint32_t pos0, uint32_t pos1) {
+                const uint64_t n0 = getOrAddNode(r0, pos0);
+                const uint64_t n1 = getOrAddNode(r1, pos1);
+                dsets.unite(n0, n1);
+                mismatchPairs++;
+            });
+        if (!ok) {
+            skippedMismatchedCounts++;
+            return;
+        }
+        totalMismatchEdges += mismatchPairs;
+    };
+
+    // BFS discovery is naturally serial; mismatch decoding/pair extraction is parallelizable.
+    // We parallelize extraction into packed-key edges and keep DSU/node assignment serial.
+    if (threadCount <= 1 || selectedAlignmentIds.size() < 1024) {
+        vector<uint32_t> reverseScratch;
+        reverseScratch.reserve(1024);
+        for (const uint64_t alignmentId : selectedAlignmentIds) {
+            processAlignmentIntoDsu(alignmentId, reverseScratch);
+        }
+    } else {
+        const uint64_t workerCount = std::min<uint64_t>(threadCount, selectedAlignmentIds.size());
+        vector<vector<pair<uint64_t, uint64_t>>> edgesByWorker(workerCount);
+        vector<uint64_t> skippedByWorker(workerCount, 0);
+        vector<thread> workers;
+        workers.reserve(size_t(workerCount));
+        const uint64_t chunkSize = (selectedAlignmentIds.size() + workerCount - 1) / workerCount;
+
+        for (uint64_t workerId = 0; workerId < workerCount; workerId++) {
+            workers.emplace_back([&, workerId]() {
+                const uint64_t begin = workerId * chunkSize;
+                const uint64_t end = std::min<uint64_t>(selectedAlignmentIds.size(), begin + chunkSize);
+                auto& localEdges = edgesByWorker[workerId];
+                vector<uint32_t> reverseScratch;
+                reverseScratch.reserve(1024);
+
+                for (uint64_t i = begin; i < end; i++) {
+                    const uint64_t alignmentId = selectedAlignmentIds[i];
+                    const AlignmentData& ad = alignmentData[alignmentId];
+                    const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+                    const span<const SnpEvidence> qTokens = alignedEvidenceStore.getSnps1(evidenceId);
+                    const span<const SnpEvidence> tTokens = alignedEvidenceStore.getSnps0(evidenceId);
+                    const ReadId r0 = ad.readIds[0];
+                    const ReadId r1 = ad.readIds[1];
+                    const bool ok = forEachMismatchPair(
+                        qTokens,
+                        tTokens,
+                        !ad.isSameStrand,
+                        ad.info.mismatchCount,
+                        reverseScratch,
+                        [&](uint32_t pos0, uint32_t pos1) {
+                            localEdges.push_back({
+                                packReadPosKey(r0, pos0),
+                                packReadPosKey(r1, pos1)});
+                        });
+                    if (!ok) {
+                        skippedByWorker[workerId]++;
+                    }
+                }
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+
+        for (uint64_t workerId = 0; workerId < workerCount; workerId++) {
+            skippedMismatchedCounts += skippedByWorker[workerId];
+            const auto& localEdges = edgesByWorker[workerId];
+            totalMismatchEdges += localEdges.size();
+            for (const auto& edge : localEdges) {
+                const uint64_t key0 = edge.first;
+                const uint64_t key1 = edge.second;
+                const uint64_t n0 = getOrAddNode(ReadId(key0 >> 32), uint32_t(key0));
+                const uint64_t n1 = getOrAddNode(ReadId(key1 >> 32), uint32_t(key1));
+                dsets.unite(n0, n1);
+            }
         }
     }
 
