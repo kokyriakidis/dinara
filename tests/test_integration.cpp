@@ -26,10 +26,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <filesystem>
 #include <string>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -163,6 +165,90 @@ const AlignmentData* findAlignmentDataPtr(
         return &ad;
     }
     return nullptr;
+}
+
+AlignOptions makeDefaultAlignOptionsForIntegration()
+{
+    AlignOptions options;
+    options.alignMethod = 6;
+    options.maxSkip = 100;
+    options.maxDrift = 100;
+    options.maxTrim = 10000;
+    options.minAlignedMarkerCount = 4;
+    options.minAlignedFraction = 0.0;
+    options.maxMarkerFrequency = 1000;
+    options.matchScore = 3;
+    options.mismatchScore = -1;
+    options.gapScore = -1;
+    options.downsamplingFactor = 0.1;
+    options.bandExtend = 10;
+    options.maxBand = 1000;
+    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
+    options.suppressContainments = false;
+    options.align4DeltaX = 200;
+    options.align4DeltaY = 10;
+    options.align4MinEntryCountPerCell = 10;
+    options.align4MaxDistanceFromBoundary = 100;
+    options.align5DriftRateTolerance = 0.02;
+    options.align5MinBandExtend = 10;
+    options.maxErrorRate = 0.3;
+    // Base-level overlap DP scoring defaults (hifiasm/minimap2 parity).
+    options.overlapDpMatchScore = 2;
+    options.overlapDpMismatchScore = -4;
+    options.overlapDpGapOpen1 = 4;
+    options.overlapDpGapExtend1 = 2;
+    options.overlapDpGapOpen2 = 24;
+    options.overlapDpGapExtend2 = 1;
+    return options;
+}
+
+std::vector<std::string> collectAlignmentEvidenceFingerprints(const Assembler& assembler)
+{
+    const auto& alignmentData = assembler.alignmentData;
+    const auto& store = assembler.alignedEvidenceStore;
+    std::vector<std::string> fingerprints;
+    fingerprints.reserve(alignmentData.size());
+
+    for(const auto& ad : alignmentData) {
+        if(ad.isDeleted()) {
+            continue;
+        }
+        const uint64_t evidenceId = ad.info.alignmentId;
+        REQUIRE(evidenceId < store.index.size());
+
+        std::ostringstream s;
+        s
+            << ad.readIds[0] << '|'
+            << ad.readIds[1] << '|'
+            << (ad.isSameStrand ? 1 : 0) << '|'
+            << ad.qs << ',' << ad.qe << ',' << ad.ts << ',' << ad.te << '|'
+            << ad.info.mismatchCount << ','
+            << ad.info.gapCount << ','
+            << ad.info.gapEventCount << ','
+            << ad.info.dpScore << ','
+            << (ad.hasLargeIndel ? 1 : 0);
+
+        s << "|S0";
+        for(const auto ev : store.getSnps0(uint32_t(evidenceId))) {
+            s << ',' << ev.data;
+        }
+        s << "|S1";
+        for(const auto ev : store.getSnps1(uint32_t(evidenceId))) {
+            s << ',' << ev.data;
+        }
+        s << "|I0";
+        for(const auto ev : store.getIndels0(uint32_t(evidenceId))) {
+            s << ',' << ev.data;
+        }
+        s << "|I1";
+        for(const auto ev : store.getIndels1(uint32_t(evidenceId))) {
+            s << ',' << ev.data;
+        }
+        fingerprints.push_back(s.str());
+    }
+
+    std::sort(fingerprints.begin(), fingerprints.end());
+    return fingerprints;
 }
 } // namespace
 
@@ -946,39 +1032,12 @@ public:
         });
     }
     
+    void computeAlignments(const AlignOptions& options, uint64_t threadCount = 1) {
+        withSilencedIoInDir(testDir, [&] { assembler->computeAlignmentsWithEvidence(options, threadCount); });
+    }
+
     void computeAlignments() {
-        AlignOptions options;
-        // Initialize all required fields for projected alignment on precomputed chains
-        options.alignMethod = 6;
-        options.maxSkip = 100;
-        options.maxDrift = 100;
-        options.maxTrim = 10000;
-        options.minAlignedMarkerCount = 4;
-        options.minAlignedFraction = 0.0;
-        options.maxMarkerFrequency = 1000;
-        options.matchScore = 3;
-        options.mismatchScore = -1;
-        options.gapScore = -1;
-        options.downsamplingFactor = 0.1;
-        options.bandExtend = 10;
-        options.maxBand = 1000;
-        options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
-        options.suppressContainments = false;
-        options.align4DeltaX = 200;
-        options.align4DeltaY = 10;
-        options.align4MinEntryCountPerCell = 10;
-        options.align4MaxDistanceFromBoundary = 100;
-        options.align5DriftRateTolerance = 0.02;
-        options.align5MinBandExtend = 10;
-        options.maxErrorRate = 0.3; // Higher for synthetic tests
-        // Base-level overlap DP scoring defaults (hifiasm/minimap2 parity).
-        options.overlapDpMatchScore = 2;
-        options.overlapDpMismatchScore = -4;
-        options.overlapDpGapOpen1 = 4;
-        options.overlapDpGapExtend1 = 2;
-        options.overlapDpGapOpen2 = 24;
-        options.overlapDpGapExtend2 = 1;
-        withSilencedIoInDir(testDir, [&] { assembler->computeAlignmentsWithEvidence(options, 1); });
+        computeAlignments(makeDefaultAlignOptionsForIntegration(), 1);
     }
 
     struct PafOverlapSpec {
@@ -1599,6 +1658,359 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     CHECK(s1_03[0].first == 1500);
     CHECK(s0_03[0].second == complementBase[expectedQ03]);
     CHECK(s1_03[0].second == expectedT03);
+}
+
+TEST_CASE("Integration: computeAlignmentsWithEvidence is deterministic across thread counts",
+    "[integration][evidence][determinism][threads]")
+{
+    const std::string base = randomSequence(2600, 7001);
+    std::string r0 = base;
+    std::string r1 = base;
+    std::string r2 = base;
+    std::string r3 = reverseComplement(base);
+    const std::string r4 = randomSequence(2600, 7002);
+
+    r1[900] = otherBase(r1[900]);
+    r1[1700] = otherBase(r1[1700]);
+    r2.erase(1200, 24);
+
+    const std::vector<std::string> seqs = {r0, r1, r2, r3, r4};
+
+    struct RunResult {
+        size_t candidateCount = 0;
+        size_t alignmentCount = 0;
+        std::vector<std::string> fingerprints;
+    };
+
+    auto runPipeline = [&](const uint64_t threadCount) -> RunResult {
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq(seqs);
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+
+        AlignOptions options = makeDefaultAlignOptionsForIntegration();
+        options.maxErrorRate = 1.0;
+        options.minAlignedMarkerCount = 0;
+        fixture.computeAlignments(options, threadCount);
+
+        RunResult r;
+        r.candidateCount = fixture.assembler->alignmentCandidates.candidates.size();
+        r.alignmentCount = fixture.assembler->alignmentData.size();
+        r.fingerprints = collectAlignmentEvidenceFingerprints(*fixture.assembler);
+        return r;
+    };
+
+    const RunResult oneThread = runPipeline(1);
+    const RunResult twoThreads = runPipeline(2);
+
+    REQUIRE(oneThread.candidateCount > 0);
+    REQUIRE(oneThread.alignmentCount > 0);
+    REQUIRE(oneThread.fingerprints.size() == oneThread.alignmentCount);
+    REQUIRE(twoThreads.fingerprints.size() == twoThreads.alignmentCount);
+
+    CHECK(oneThread.candidateCount == twoThreads.candidateCount);
+    CHECK(oneThread.alignmentCount == twoThreads.alignmentCount);
+    CHECK(oneThread.fingerprints == twoThreads.fingerprints);
+}
+
+TEST_CASE("Integration: computeAlignmentsWithEvidence maxErrorRate keeps == threshold and rejects below",
+    "[integration][evidence][boundary][error-rate]")
+{
+    const std::string base = randomSequence(2400, 7101);
+    std::string read0 = base;
+    std::string read1 = base;
+    read1[1300] = otherBase(read1[1300]);
+
+    auto computeObservedErrorRate = [&]() -> double {
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq({read0, read1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+
+        const auto& candidates = fixture.assembler->alignmentCandidates.candidates;
+        const auto& precomputed = fixture.assembler->alignmentCandidatesAlignmentsData.alignments;
+        REQUIRE(candidates.size() == precomputed.size());
+        REQUIRE(!candidates.empty());
+
+        size_t bestIndex = std::numeric_limits<size_t>::max();
+        for(size_t i = 0; i < candidates.size(); ++i) {
+            const auto& c = candidates[i];
+            if(c.readIds[0] == ReadId(0) && c.readIds[1] == ReadId(1) && !precomputed[i].ordinals.empty()) {
+                bestIndex = i;
+                break;
+            }
+        }
+        REQUIRE(bestIndex != std::numeric_limits<size_t>::max());
+
+        const auto& candidate = candidates[bestIndex];
+        const auto& alignment = precomputed[bestIndex];
+        const std::array<OrientedReadId, 2> orientedReadIds = {
+            OrientedReadId(candidate.readIds[0], 0),
+            OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1)
+        };
+
+        const AlignOptions options = makeDefaultAlignOptionsForIntegration();
+        const ProjectedAlignment projectedAlignment(
+            *fixture.assembler,
+            orientedReadIds,
+            alignment,
+            ProjectedAlignment::Method::QuickRawSparse,
+            options.overlapDpMatchScore,
+            options.overlapDpMismatchScore,
+            options.overlapDpGapOpen1,
+            options.overlapDpGapExtend1,
+            options.overlapDpGapOpen2,
+            options.overlapDpGapExtend2);
+        return projectedAlignment.errorRate();
+    };
+
+    const double observedErrorRate = computeObservedErrorRate();
+    REQUIRE(std::isfinite(observedErrorRate));
+    REQUIRE(observedErrorRate > 0.0);
+    REQUIRE(observedErrorRate < 1.0);
+
+    auto countKeptAlignmentsAtThreshold = [&](const double maxErrorRate) -> size_t {
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq({read0, read1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+
+        AlignOptions options = makeDefaultAlignOptionsForIntegration();
+        options.maxErrorRate = maxErrorRate;
+        options.minAlignedMarkerCount = 0;
+        fixture.computeAlignments(options, 1);
+
+        size_t kept = 0;
+        for(const auto& ad : fixture.assembler->alignmentData) {
+            if(!ad.isDeleted()) {
+                ++kept;
+            }
+        }
+        return kept;
+    };
+
+    const size_t keptAtEqual = countKeptAlignmentsAtThreshold(observedErrorRate);
+    const double lowerThreshold = std::nextafter(observedErrorRate, 0.0);
+    REQUIRE(lowerThreshold < observedErrorRate);
+    const size_t keptBelow = countKeptAlignmentsAtThreshold(lowerThreshold);
+
+    CHECK(keptAtEqual > 0);
+    CHECK(keptBelow == 0);
+}
+
+TEST_CASE("Integration: computeAlignmentsWithEvidence minAlignedMarkerCount uses >= boundary semantics",
+    "[integration][evidence][boundary][marker-count]")
+{
+    const std::string base = randomSequence(2500, 7201);
+    std::string read0 = base;
+    std::string read1 = base;
+    read1[1000] = otherBase(read1[1000]);
+    read1[1800] = otherBase(read1[1800]);
+
+    auto getMaxPrecomputedChainLength = [&]() -> size_t {
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq({read0, read1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+
+        size_t maxLen = 0;
+        for(const auto& a : fixture.assembler->alignmentCandidatesAlignmentsData.alignments) {
+            if(!a.ordinals.empty()) {
+                maxLen = std::max(maxLen, a.ordinals.size());
+            }
+        }
+        return maxLen;
+    };
+
+    const size_t maxChainLen = getMaxPrecomputedChainLength();
+    REQUIRE(maxChainLen > 0);
+
+    auto countKeptAlignmentsAtMinMarkers = [&](const int32_t minAlignedMarkerCount) -> size_t {
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq({read0, read1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+
+        AlignOptions options = makeDefaultAlignOptionsForIntegration();
+        options.maxErrorRate = 1.0;
+        options.minAlignedMarkerCount = minAlignedMarkerCount;
+        fixture.computeAlignments(options, 1);
+
+        size_t kept = 0;
+        for(const auto& ad : fixture.assembler->alignmentData) {
+            if(!ad.isDeleted()) {
+                ++kept;
+            }
+        }
+        return kept;
+    };
+
+    const size_t keptAtEqual = countKeptAlignmentsAtMinMarkers(int32_t(maxChainLen));
+    const size_t keptAbove = countKeptAlignmentsAtMinMarkers(int32_t(maxChainLen + 1));
+
+    CHECK(keptAtEqual > 0);
+    CHECK(keptAbove == 0);
+}
+
+TEST_CASE("Integration: randomized evidence invariants hold for computeAlignmentsWithEvidence",
+    "[integration][evidence][fuzz][robustness]")
+{
+    const size_t roundCount = 8;
+    size_t roundsWithCandidates = 0;
+    size_t roundsWithAlignments = 0;
+
+    for(size_t round = 0; round < roundCount; ++round) {
+        const size_t length = 2100 + ((round * 73) % 220);
+        std::string read0 = randomSequence(length, uint32_t(7300 + round));
+        std::string read1 = read0;
+
+        std::mt19937 editGen(uint32_t(880000 + round));
+        const uint32_t safeStart = 120;
+        const uint32_t safeEnd = uint32_t(read1.size() - 121);
+        std::uniform_int_distribution<uint32_t> posDis(safeStart, safeEnd);
+
+        // Inject deterministic SNPs.
+        for(size_t i = 0; i < 6; ++i) {
+            const uint32_t p = posDis(editGen);
+            read1[p] = otherBase(read1[p]);
+        }
+
+        // Alternate between a moderate deletion and insertion.
+        if((round % 2) == 0) {
+            const uint32_t delLen = 6 + uint32_t(round % 5);
+            if(read1.size() > size_t(delLen + 2 * safeStart)) {
+                std::uniform_int_distribution<uint32_t> delPosDis(
+                    safeStart, uint32_t(read1.size() - delLen - safeStart));
+                const uint32_t delPos = delPosDis(editGen);
+                read1.erase(delPos, delLen);
+            }
+        } else {
+            const uint32_t insLen = 5 + uint32_t(round % 6);
+            const uint32_t insPos = posDis(editGen);
+            read1.insert(insPos, randomSequence(insLen, uint32_t(990000 + round)));
+        }
+
+        // Every third round, test opposite-strand handling.
+        if((round % 3) == 2) {
+            read1 = reverseComplement(read1);
+        }
+
+        AssemblerIntegrationFixture fixture;
+        fixture.createFastq({read0, read1});
+        fixture.initAssembler();
+        fixture.loadReads();
+        fixture.generateMarkers(16, 5);
+        fixture.countKmers();
+        fixture.applyFilter(1, 1000);
+        fixture.findCandidates();
+        if(fixture.assembler->alignmentCandidates.candidates.empty()) {
+            continue;
+        }
+        roundsWithCandidates++;
+
+        AlignOptions options = makeDefaultAlignOptionsForIntegration();
+        options.maxErrorRate = 1.0;
+        options.minAlignedMarkerCount = 0;
+        fixture.computeAlignments(options, 2);
+
+        const auto& reads = fixture.assembler->getReads();
+        const auto& store = fixture.assembler->alignedEvidenceStore;
+        const auto& alignmentData = fixture.assembler->alignmentData;
+        if(!alignmentData.empty()) {
+            roundsWithAlignments++;
+        }
+
+        for(const auto& ad : alignmentData) {
+            if(ad.isDeleted()) {
+                continue;
+            }
+
+            const uint32_t evidenceId = uint32_t(ad.info.alignmentId);
+            REQUIRE(evidenceId < store.index.size());
+
+            const uint32_t qLen = uint32_t(reads.getReadRawSequenceLength(ad.readIds[0]));
+            const uint32_t tLen = uint32_t(reads.getReadRawSequenceLength(ad.readIds[1]));
+
+            auto validateSnps = [&](const span<const SnpEvidence> snps, const uint32_t len) -> uint64_t {
+                uint32_t pos = 0;
+                uint32_t lastPos = 0;
+                bool hasLast = false;
+                uint64_t mismatchCount = 0;
+                for(const auto ev : snps) {
+                    pos += ev.delta();
+                    if(ev.isHop()) {
+                        continue;
+                    }
+                    CHECK(ev.base() < 4);
+                    CHECK(pos < len);
+                    if(hasLast) {
+                        CHECK(pos >= lastPos);
+                    }
+                    lastPos = pos;
+                    hasLast = true;
+                    mismatchCount++;
+                }
+                return mismatchCount;
+            };
+
+            auto validateIndels = [&](const span<const IndelEvidence> indels, const uint32_t len)
+                -> std::pair<uint64_t, uint64_t>
+            {
+                uint32_t lastPos = 0;
+                bool hasLast = false;
+                uint64_t totalLen = 0;
+                uint64_t eventCount = 0;
+                for(const auto ev : indels) {
+                    CHECK(ev.len() > 0);
+                    CHECK(ev.type() <= 1);
+                    CHECK(ev.pos() <= len);
+                    if(hasLast) {
+                        CHECK(ev.pos() >= lastPos);
+                    }
+                    lastPos = ev.pos();
+                    hasLast = true;
+                    totalLen += ev.len();
+                    eventCount++;
+                }
+                return {totalLen, eventCount};
+            };
+
+            const uint64_t mismatchCount0 = validateSnps(store.getSnps0(evidenceId), tLen);
+            const uint64_t mismatchCount1 = validateSnps(store.getSnps1(evidenceId), qLen);
+            const auto [indelLen0, indelEvents0] = validateIndels(store.getIndels0(evidenceId), tLen);
+            const auto [indelLen1, indelEvents1] = validateIndels(store.getIndels1(evidenceId), qLen);
+
+            CHECK(mismatchCount0 == uint64_t(ad.info.mismatchCount));
+            CHECK(mismatchCount1 == uint64_t(ad.info.mismatchCount));
+            CHECK(indelLen0 == uint64_t(ad.info.gapCount));
+            CHECK(indelLen1 == uint64_t(ad.info.gapCount));
+            CHECK(indelEvents0 == uint64_t(ad.info.gapEventCount));
+            CHECK(indelEvents1 == uint64_t(ad.info.gapEventCount));
+        }
+    }
+
+    CHECK(roundsWithCandidates >= roundCount / 2);
+    CHECK(roundsWithAlignments >= roundCount / 2);
 }
 
 TEST_CASE("Integration: transitive global het site clustering", "[integration][evidence][hetsites][transitive]") {
