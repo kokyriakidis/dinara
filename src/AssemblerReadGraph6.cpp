@@ -213,15 +213,15 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterHangDel1
          << ", active=" << countActiveAlignments() << endl;
 
-    // Step 6a: Contained read detection (does not remove overlaps).
-    flagContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    uint64_t containedFlagCount = 0;
-    for (ReadId r = 0; r < reads->readCount(); ++r) {
-        if (reads->getFlags(r).isContained) {
-            ++containedFlagCount;
-        }
-    }
-    cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
+    // // Step 6a: Contained read detection (does not remove overlaps).
+    // flagContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // uint64_t containedFlagCount = 0;
+    // for (ReadId r = 0; r < reads->readCount(); ++r) {
+    //     if (reads->getFlags(r).isContained) {
+    //         ++containedFlagCount;
+    //     }
+    // }
+    // cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
 
     // // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
     // // Marks fully contained reads and removes their overlaps

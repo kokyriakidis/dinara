@@ -245,7 +245,7 @@ namespace dinara {
                     std::sort(amis.begin(), amis.end());
                     const auto last = std::unique(amis.begin(), amis.end(),
                         [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
-                            return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
+                            return x.orientedReadId == y.orientedReadId;
                         });
                     const uint64_t uniqueCount = uint64_t(std::distance(amis.begin(), last));
                     for(uint64_t k=0; k<uniqueCount; k++) {
@@ -283,7 +283,7 @@ namespace dinara {
                     std::sort(amis.begin(), amis.end());
                     const auto last = std::unique(amis.begin(), amis.end(),
                         [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
-                            return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
+                            return x.orientedReadId == y.orientedReadId;
                         });
                     amis.erase(last, amis.end());
                     std::reverse(amis.begin(), amis.end());
@@ -451,7 +451,7 @@ namespace dinara {
             std::sort(amis.begin(), amis.end());
             const auto last = std::unique(amis.begin(), amis.end(),
                 [](const shasta2::AnchorMarkerInfo& x, const shasta2::AnchorMarkerInfo& y) {
-                    return x.orientedReadId.getReadId() == y.orientedReadId.getReadId();
+                    return x.orientedReadId == y.orientedReadId;
                 });
             amis.erase(last, amis.end());
             std::reverse(amis.begin(), amis.end());
@@ -474,6 +474,15 @@ namespace dinara {
         dinara::Assembler& assembler,
         const dinara::AssemblerOptions& dinaraOptions,
         uint64_t threadCount
+    ) {
+        createShasta2Anchors(assembler, dinaraOptions, threadCount, {});
+    }
+
+    void createShasta2Anchors(
+        dinara::Assembler& assembler,
+        const dinara::AssemblerOptions& dinaraOptions,
+        uint64_t threadCount,
+        const std::shared_ptr<const dinara::mode3::Anchors>& precomputedDinaraAnchors
     ) {
         cout << timestamp << "Creating Shasta2 Anchors..." << endl;
 
@@ -895,43 +904,50 @@ namespace dinara {
             shastaMarkers,
             shastaMarkerKmers);
 
-        const string& anchorMethod = dinaraOptions.assemblyOptions.mode3Options.anchorCreationMethod;
-        if(anchorMethod == "FromMarkerGraphVerticesBestPerOverlapInterval") {
-            cout << timestamp << "Populating Shasta2 anchors using Dinara BestPerOverlapInterval anchors..." << endl;
-            const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-                minAnchorCoverageDinara,
-                maxAnchorCoverageDinara,
-                threadCount);
-            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
-        } else if(anchorMethod == "FromMarkerGraphVerticesAtOverlapEvents") {
-            cout << timestamp << "Populating Shasta2 anchors using Dinara OverlapEvents anchors..." << endl;
-            const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
-                minAnchorCoverageDinara,
-                maxAnchorCoverageDinara,
-                threadCount);
-            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
-        } else if(anchorMethod == "FromOverlapsBestPerOverlapInterval") {
-            cout << timestamp << "Populating Shasta2 anchors using Dinara overlap-only BestPerOverlapInterval anchors..." << endl;
-            const auto dinaraAnchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
-                minAnchorCoverageDinara,
-                maxAnchorCoverageDinara,
-                threadCount);
-            // Use exactly Dinara's overlap-derived anchors as-is.
-            // Dinara already applies overlap-based filtering/selection; additional Shasta2 k-mer filters
-            // would change the anchor set and make downstream comparisons confusing.
-            populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+        if(precomputedDinaraAnchors) {
+            cout << timestamp
+                 << "Populating Shasta2 anchors from precomputed Dinara anchors (exact handoff), count="
+                 << precomputedDinaraAnchors->size() << endl;
+            populateAnchorsFromMode3Anchors(*precomputedDinaraAnchors, *shastaAnchors, threadCount);
         } else {
-            // Default: treat marker graph vertices as anchors.
-            if((not assembler.markerGraph.verticesPointer) or
-                (not assembler.markerGraph.verticesPointer->isOpen())) {
-                throw runtime_error(
-                    "createShasta2Anchors: anchorCreationMethod=" + anchorMethod +
-                    " requires marker graph vertices, but markerGraph is not open/initialized. "
-                    "Use --Assembly.mode3.anchorCreationMethod FromMarkerGraphVertices... or "
-                    "FromOverlapsBestPerOverlapInterval.");
+            const string& anchorMethod = dinaraOptions.assemblyOptions.mode3Options.anchorCreationMethod;
+            if(anchorMethod == "FromMarkerGraphVerticesBestPerOverlapInterval") {
+                cout << timestamp << "Populating Shasta2 anchors using Dinara BestPerOverlapInterval anchors..." << endl;
+                const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+                    minAnchorCoverageDinara,
+                    maxAnchorCoverageDinara,
+                    threadCount);
+                populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+            } else if(anchorMethod == "FromMarkerGraphVerticesAtOverlapEvents") {
+                cout << timestamp << "Populating Shasta2 anchors using Dinara OverlapEvents anchors..." << endl;
+                const auto dinaraAnchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
+                    minAnchorCoverageDinara,
+                    maxAnchorCoverageDinara,
+                    threadCount);
+                populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+            } else if(anchorMethod == "FromOverlapsBestPerOverlapInterval") {
+                cout << timestamp << "Populating Shasta2 anchors using Dinara overlap-only BestPerOverlapInterval anchors..." << endl;
+                const auto dinaraAnchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
+                    minAnchorCoverageDinara,
+                    maxAnchorCoverageDinara,
+                    threadCount);
+                // Use exactly Dinara's overlap-derived anchors as-is.
+                // Dinara already applies overlap-based filtering/selection; additional Shasta2 k-mer filters
+                // would change the anchor set and make downstream comparisons confusing.
+                populateAnchorsFromMode3Anchors(*dinaraAnchors, *shastaAnchors, threadCount);
+            } else {
+                // Default: treat marker graph vertices as anchors.
+                if((not assembler.markerGraph.verticesPointer) or
+                    (not assembler.markerGraph.verticesPointer->isOpen())) {
+                    throw runtime_error(
+                        "createShasta2Anchors: anchorCreationMethod=" + anchorMethod +
+                        " requires marker graph vertices, but markerGraph is not open/initialized. "
+                        "Use --Assembly.mode3.anchorCreationMethod FromMarkerGraphVertices... or "
+                        "FromOverlapsBestPerOverlapInterval.");
+                }
+                populateAnchors(assembler, *shastaAnchors, threadCount);
             }
-            populateAnchors(assembler, *shastaAnchors, threadCount);
-	        }
+        }
 	        
 	        cout << timestamp << "Shasta2 Anchors created (" << shastaAnchors->size() << " anchors)." << endl;
 

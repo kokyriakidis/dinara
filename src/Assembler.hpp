@@ -726,6 +726,8 @@ public:
     
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
+    // Experimental global-site based phasing/EC pass.
+    void performGlobalSiteECParity(uint64_t threadCount);
 
 
     void computeReadIdsSortedByName();

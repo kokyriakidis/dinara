@@ -601,20 +601,46 @@ void dinara::main::assemble(
     //     assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
 
     // // =========================================================================
-    // // Hifiasm-style Overlap Filtering + Clean ReadGraph (Parity)
+    // // Overlap Filtering + Clean ReadGraph
     // // =========================================================================
-    // // Replicates ha_ec (Round 1) and ha_ec_ff (Final) logic without base correction.
-    // assembler.performHifiasmECParity(threadCount);
+    // // Build global mismatch-site clusters before EC parity paths.
+    // // This guarantees global-site construction runs first for both parity modes.
+    // cout << timestamp << "Precomputing global mismatch-site clusters before EC parity..." << endl;
+    // const auto preEcGlobalHetClusters = assembler.clusterMismatchingPositionsIntoGlobalHetSites(
+    //     assemblerOptions.alignOptions,
+    //     threadCount,
+    //     false,  // includeDeletedAlignments
+    //     false   // readGraphOnly
+    // );
+    // cout << timestamp << "Precomputed global mismatch-site clusters: clusters="
+    //      << preEcGlobalHetClusters.clusterRepresentatives.size()
+    //      << " nodes=" << preEcGlobalHetClusters.nodes.size()
+    //      << endl;
+
+    // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
+    // Optional path: experimental global-site phasing/parity.
+    const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
+    if (useGlobalSiteEcParity) {
+        cout << timestamp << "Using experimental global-site EC parity path." << endl;
+        assembler.performGlobalSiteECParity(threadCount);
+    } else {
+        assembler.performHifiasmECParity(threadCount);
+    }
 
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
 
+    // Global mismatch-site diagnostics and export are expensive and intended for debugging.
+    // Keep them off by default in production runs to preserve assembly throughput.
+    const bool runGlobalHetDiagnostics = (::getenv("DINARA_ENABLE_GLOBAL_HET_DEBUG") != nullptr);
+    if (runGlobalHetDiagnostics) {
     // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
     // This is the fastest way to approximate "pileup across all reads" without a reference.
     {
         const ReadId focalReadId = ReadId(3);
+        const Reads& reads = assembler.getReads();
 
         const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
             focalReadId,
@@ -625,6 +651,8 @@ void dinara::main::assemble(
             false,  // includeDeletedAlignments
             true    // readGraphOnly
         );
+        const uint32_t clusterSiteCount = uint32_t(
+            clusters.clusterMemberOffsets.empty() ? 0 : (clusters.clusterMemberOffsets.size() - 1));
 
         static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
 
@@ -634,7 +662,7 @@ void dinara::main::assemble(
             uint32_t siteId = 0;
         };
         vector<FocalMismatchSite> focalMismatchSites;
-        focalMismatchSites.reserve(4096);
+        focalMismatchSites.reserve(clusterSiteCount);
         for (size_t siteId = 0; siteId + 1 < clusters.clusterMemberOffsets.size(); siteId++) {
             const uint64_t begin = clusters.clusterMemberOffsets[siteId];
             const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
@@ -671,7 +699,7 @@ void dinara::main::assemble(
         const auto propagationSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - propagationStart).count();
 
-        cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << (clusters.clusterMemberOffsets.size() ? clusters.clusterMemberOffsets.size() - 1 : 0)
+        cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << clusterSiteCount
              << " propagatedAssignments=" << members.propagatedAssignments
              << " mappingHoles=" << members.mappingHoles
              << " mappingConflicts=" << members.mappingConflicts
@@ -740,7 +768,7 @@ void dinara::main::assemble(
             mismatchMembersBySite[siteId] = end - begin;
             for (uint64_t j = begin; j < end; j++) {
                 const auto& node = clusters.nodes[clusters.clusterMembers[j]];
-                uint8_t b = assembler.getReads().getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
+                uint8_t b = reads.getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
                 if (b >= 4) {
                     continue;
                 }
@@ -753,9 +781,33 @@ void dinara::main::assemble(
             }
         }
 
+        // Precompute oriented support counts and total members per site once.
+        // These are reused in filtering, printing, and export.
+        vector<array<uint64_t, 4> > orientedSiteCounts(siteCount, array<uint64_t, 4>{0, 0, 0, 0});
+        vector<uint64_t> orientedSiteMembers(siteCount, 0);
+        const uint32_t orientedCount = uint32_t(orientedMembers.offsets.size());
+        for (uint32_t siteId = 0; siteId < siteCount && siteId < orientedCount; siteId++) {
+            const auto& off = orientedMembers.offsets[siteId];
+            for (int allele = 0; allele < 4; allele++) {
+                orientedSiteCounts[siteId][allele] = off[allele + 1] - off[allele];
+                orientedSiteMembers[siteId] += orientedSiteCounts[siteId][allele];
+            }
+        }
+
         // Keep only robust multiallelic sites: at least 2 alleles with support >= 3.
         static constexpr uint32_t minAlleleSupportForExport = 3;
         static constexpr uint32_t minAlleleCountForExport = 2;
+        vector<uint8_t> sitePassesMultiallelic(siteCount, 0);
+        for (uint32_t siteId = 0; siteId < siteCount; siteId++) {
+            uint32_t supportedAlleles = 0;
+            for (int allele = 0; allele < 4; allele++) {
+                if (orientedSiteCounts[siteId][allele] >= minAlleleSupportForExport) {
+                    supportedAlleles++;
+                }
+            }
+            sitePassesMultiallelic[siteId] = uint8_t(supportedAlleles >= minAlleleCountForExport);
+        }
+
         const auto readIndex = assembler.buildFilteredGlobalHetSiteReadIndex(
             members,
             minAlleleSupportForExport,
@@ -776,30 +828,10 @@ void dinara::main::assemble(
             }
         }
 
-        const auto getOrientedSiteCounts = [&](uint32_t siteId) {
-            std::array<uint64_t, 4> siteCounts{0, 0, 0, 0};
-            if (siteId < orientedMembers.offsets.size()) {
-                const auto& off = orientedMembers.offsets[siteId];
-                for (int allele = 0; allele < 4; allele++) {
-                    siteCounts[allele] = off[allele + 1] - off[allele];
-                }
-            }
-            return siteCounts;
-        };
-        const auto passesMultiallelicFilter = [&](uint32_t siteId) {
-            const auto siteCounts = getOrientedSiteCounts(siteId);
-            uint32_t supportedAlleles = 0;
-            for (int allele = 0; allele < 4; allele++) {
-                if (siteCounts[allele] >= minAlleleSupportForExport) {
-                    supportedAlleles++;
-                }
-            }
-            return supportedAlleles >= minAlleleCountForExport;
-        };
         vector<Assembler::GlobalHetSiteReadIndex::ReadSite> filteredFocalReadSites;
         filteredFocalReadSites.reserve(focalReadSites.size());
         for (const auto& s : focalReadSites) {
-            if (passesMultiallelicFilter(s.siteId)) {
+            if (s.siteId < sitePassesMultiallelic.size() && sitePassesMultiallelic[s.siteId]) {
                 filteredFocalReadSites.push_back(s);
             }
         }
@@ -821,8 +853,11 @@ void dinara::main::assemble(
                 (siteId < mismatchCountsForward.size()) ?
                 mismatchCountsForward[siteId] :
                 std::array<uint32_t, 4>{0, 0, 0, 0};
-            const auto siteCounts = getOrientedSiteCounts(siteId);
-            const uint64_t siteMembers = siteCounts[0] + siteCounts[1] + siteCounts[2] + siteCounts[3];
+            const auto siteCounts =
+                (siteId < orientedSiteCounts.size()) ?
+                orientedSiteCounts[siteId] :
+                std::array<uint64_t, 4>{0, 0, 0, 0};
+            const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
 
             cout << timestamp
                  << "GlobalHetSite[" << i << "]"
@@ -877,10 +912,10 @@ void dinara::main::assemble(
                 // If there are none, fall back to the propagated membership list.
                 const bool useMismatchSites = !focalMismatchSites.empty();
                 const size_t exportCount = useMismatchSites ? focalMismatchSites.size() : filteredFocalReadSites.size();
-                vector<uint32_t> readLengths(assembler.getReads().readCount(), 0);
-                for (uint64_t iRead = 0; iRead < assembler.getReads().readCount(); iRead++) {
+                vector<uint32_t> readLengths(reads.readCount(), 0);
+                for (uint64_t iRead = 0; iRead < reads.readCount(); iRead++) {
                     const ReadId rid = ReadId(iRead);
-                    readLengths[iRead] = uint32_t(assembler.getReads().getRead(rid).baseCount);
+                    readLengths[iRead] = uint32_t(reads.getRead(rid).baseCount);
                 }
                 size_t exportedCount = 0;
                 size_t filteredOutCount = 0;
@@ -890,7 +925,7 @@ void dinara::main::assemble(
                         filteredOutCount++;
                         continue;
                     }
-                    if (!passesMultiallelicFilter(siteId)) {
+                    if (siteId >= sitePassesMultiallelic.size() || sitePassesMultiallelic[siteId] == 0) {
                         filteredOutCount++;
                         continue;
                     }
@@ -908,7 +943,10 @@ void dinara::main::assemble(
                         (siteId < mismatchCountsOriented.size()) ?
                         mismatchCountsOriented[siteId] :
                         std::array<uint32_t, 4>{0, 0, 0, 0};
-                    const auto siteCounts = getOrientedSiteCounts(siteId);
+                    const auto siteCounts =
+                        (siteId < orientedSiteCounts.size()) ?
+                        orientedSiteCounts[siteId] :
+                        std::array<uint64_t, 4>{0, 0, 0, 0};
 
                     // Export members using the focal-oriented coordinate frame (strandByRead),
                     // plus the original forward coordinates for debugging.
@@ -943,7 +981,7 @@ void dinara::main::assemble(
                         }
                     }
 
-                    const uint64_t siteMembers = uint64_t(siteCounts[0]) + uint64_t(siteCounts[1]) + uint64_t(siteCounts[2]) + uint64_t(siteCounts[3]);
+                    const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
                     summary << siteId << "\t" << readPos
                             << "\t" << mismatchMembers
                             << "\t" << mismatchCounts[0] << "\t" << mismatchCounts[1] << "\t" << mismatchCounts[2] << "\t" << mismatchCounts[3]
@@ -964,8 +1002,12 @@ void dinara::main::assemble(
             }
         }
     }
+    } else {
+        cout << timestamp << "Skipping global-het diagnostics/export. "
+             << "Set DINARA_ENABLE_GLOBAL_HET_DEBUG=1 to enable." << endl;
+    }
 
-    return;
+    // return;
 
 
     // vector<uint32_t> ids;
@@ -1115,25 +1157,25 @@ void dinara::main::assemble(
     //     minPrimaryCoverage, maxPrimaryCoverage, assemblerOptions.assemblyOptions.mode3Options, threadCount);
 
 
-    // anchors =
-    //         make_shared<mode3::Anchors>(
-    //             MappedMemoryOwner(assembler),
-    //             assembler.getReads(),
-    //             assembler.assemblerInfo->k,
-    //             *assembler.markers,
-    //             assembler.markerGraph,
-    //             minPrimaryCoverage,
-    //             maxPrimaryCoverage,
-    //             threadCount,
-    //             true); // createFromVertices
+    anchors =
+            make_shared<mode3::Anchors>(
+                MappedMemoryOwner(assembler),
+                assembler.getReads(),
+                assembler.assemblerInfo->k,
+                *assembler.markers,
+                assembler.markerGraph,
+                minPrimaryCoverage,
+                maxPrimaryCoverage,
+                threadCount,
+                true); // createFromVertices
 
 
-    anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-        minPrimaryCoverage,
-        maxPrimaryCoverage,
-        threadCount,
-        /*enableColinearityPeeling*/ false,
-        /*minDominantFractionToPeel*/ 0.9);
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     /*enableColinearityPeeling*/ false,
+    //     /*minDominantFractionToPeel*/ 0.9);
 
     // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
     //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
@@ -1298,7 +1340,7 @@ void dinara::main::assemble(
 
     // Create shasta2 anchors equivalent to the marker graph vertices.
     // This allows downstream processing using shasta2 tools.
-    createShasta2Anchors(assembler, assemblerOptions, threadCount);
+    createShasta2Anchors(assembler, assemblerOptions, threadCount, anchors);
 
 }
 
