@@ -592,11 +592,6 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(32),
         "InvertedIndex chaining: minimum chain occurrence count required for secondary mcopy-fast chains.")
 
-        ("OverlapCandidates.invertedIndexMcopyTriggerCandidateCount",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyTriggerCandidateCount)->
-        default_value(1),
-        "InvertedIndex chaining: legacy safety gate for mcopy-fast (default 1 keeps behavior parity-like).")
-
         ("OverlapCandidates.invertedIndexMcopyOcvWindow",
         value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyOcvWindow)->
         default_value(3072),
@@ -1671,7 +1666,6 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexMcopyNum = " << invertedIndexMcopyNum << "\n";
     s << "invertedIndexMcopyRate = " << invertedIndexMcopyRate << "\n";
     s << "invertedIndexMcopyKhitCutoff = " << invertedIndexMcopyKhitCutoff << "\n";
-    s << "invertedIndexMcopyTriggerCandidateCount = " << invertedIndexMcopyTriggerCandidateCount << "\n";
     s << "invertedIndexMcopyOcvWindow = " << invertedIndexMcopyOcvWindow << "\n";
     s << "invertedIndexMcopyOcvWeakKeepRatio = " << invertedIndexMcopyOcvWeakKeepRatio << "\n";
 }

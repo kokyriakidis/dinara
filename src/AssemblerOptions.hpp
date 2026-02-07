@@ -223,7 +223,6 @@ public:
     uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm-like: keep up to 3 score-competitive chains per pair.
     double invertedIndexMcopyRate = 0.70;                    // ONT EC parity: keep chains with score >= bestScore * 0.7.
     uint32_t invertedIndexMcopyKhitCutoff = 32;              // ONT EC parity: require >=32 anchors before enabling secondary mcopy chains.
-    uint32_t invertedIndexMcopyTriggerCandidateCount = 1;    // Legacy safety gate; 1 makes mcopy-fast active whenever other gates pass.
     uint32_t invertedIndexMcopyOcvWindow = 3072;             // Hifiasm COV_W-style window for containing-overlap overload control.
     double invertedIndexMcopyOcvWeakKeepRatio = 0.70;        // Keep weak containing overlaps when non-saturated window coverage fraction >= this value.
 
