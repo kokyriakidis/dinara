@@ -34,9 +34,10 @@ void Assembler::computeAlignmentsWithEvidence(
     uint64_t threadCount
 ) {
     const auto tBegin = steady_clock::now();
+    const size_t candidateCount = alignmentCandidates.candidates.size();
 
     cout << timestamp << "Begin computing alignments with evidence for ";
-    cout << alignmentCandidates.candidates.size() << " alignment candidates." << endl;
+    cout << candidateCount << " alignment candidates." << endl;
 
     // Check that we have what we need.
     reads->checkReadsAreOpen();
@@ -55,17 +56,23 @@ void Assembler::computeAlignmentsWithEvidence(
     // Pick the batch size for computing alignments.
     // Use the same logic as legacy to ensure similar load balancing.
     size_t batchSize = 10;
-    if(batchSize > alignmentCandidates.candidates.size()/threadCount) {
-        batchSize = alignmentCandidates.candidates.size()/threadCount;
+    if(batchSize > candidateCount/threadCount) {
+        batchSize = candidateCount/threadCount;
     }
     if(batchSize == 0) {
         batchSize = 1;
     }
 
     // Prepare data structures for each thread.
-    data.threadAlignmentData.assign(threadCount, {});
+    data.threadAlignmentData.resize(threadCount);
+    for(auto& v : data.threadAlignmentData) {
+        v.clear();
+    }
     data.threadCompressedAlignments.resize(threadCount);
-    data.threadEvidenceStores.assign(threadCount, {});
+    data.threadEvidenceStores.resize(threadCount);
+    for(auto& store : data.threadEvidenceStores) {
+        store.clear();
+    }
     
     // Always resize these to avoid SIGSEGV during aggregation.
     data.threadProjectedAlignmentTime.assign(threadCount, 0.0);
@@ -77,12 +84,14 @@ void Assembler::computeAlignmentsWithEvidence(
     // If needed for variant clustering, resize this as well.
     if (assemblerInfo->readGraphCreationMethod == 5) {
         data.threadVariantClusteringPositionPairs.resize(threadCount);
+    } else {
+        data.threadVariantClusteringPositionPairs.clear();
     }
     
     performanceLog << timestamp << "Alignment computation begins (Unified Chaining & Evidence path)." << endl;
     cout << timestamp << "Alignment computation begins (Unified Chaining & Evidence path)." << endl;
     
-    setupLoadBalancing(alignmentCandidates.candidates.size(), batchSize);
+    setupLoadBalancing(candidateCount, batchSize);
     runThreads(&Assembler::computeAlignmentsWithEvidenceThreadFunction, threadCount);
     
     performanceLog << timestamp << "Alignment computation completed." << endl;
@@ -128,18 +137,24 @@ void Assembler::computeAlignmentsWithEvidence(
 
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         const vector<AlignmentData>& threadAlignmentData = data.threadAlignmentData[threadId];
-        const size_t idShift = alignmentData.size(); // Current global count serves as offset
-        for(const AlignmentData& ad: threadAlignmentData) {
-            alignmentData.push_back(ad);
-            alignmentData.back().info.alignmentId += idShift;
+        const size_t idShift = alignmentData.size(); // Current global count serves as offset.
+        if(!threadAlignmentData.empty()) {
+            alignmentData.resize(idShift + threadAlignmentData.size());
+            std::copy(
+                threadAlignmentData.begin(),
+                threadAlignmentData.end(),
+                alignmentData.begin() + idShift);
+            for(size_t i = 0; i < threadAlignmentData.size(); ++i) {
+                alignmentData[idShift + i].info.alignmentId += idShift;
+            }
         }
 
-        const auto threadCompressedAlignments = data.threadCompressedAlignments[threadId];
-        const auto size = threadCompressedAlignments->size();
+        const auto& threadCompressedAlignments = *data.threadCompressedAlignments[threadId];
+        const auto size = threadCompressedAlignments.size();
         for(size_t i=0; i<size; i++) {
             compressedAlignments.appendVector(
-                (*threadCompressedAlignments)[i].begin(),
-                (*threadCompressedAlignments)[i].end()
+                threadCompressedAlignments[i].begin(),
+                threadCompressedAlignments[i].end()
             );
         }
 
@@ -154,14 +169,18 @@ void Assembler::computeAlignmentsWithEvidence(
         uint64_t globalSnpCheckpointOffset1 = alignedEvidenceStore.snpCheckpoints1.size();
         uint64_t globalIndelOffset1 = alignedEvidenceStore.indelStream1.size();
         
-        for (auto& entry : localStore.index) {
+        const size_t localIndexSize = localStore.index.size();
+        const size_t globalIndexBegin = alignedEvidenceStore.index.size();
+        alignedEvidenceStore.index.resize(globalIndexBegin + localIndexSize);
+        for(size_t i = 0; i < localIndexSize; ++i) {
+            auto entry = localStore.index[i];
             entry.snpOffset0 += globalSnpOffset0;
             entry.indelOffset0 += globalIndelOffset0;
             entry.snpCheckpointOffset0 += globalSnpCheckpointOffset0;
             entry.snpOffset1 += globalSnpOffset1;
             entry.indelOffset1 += globalIndelOffset1;
             entry.snpCheckpointOffset1 += globalSnpCheckpointOffset1;
-            alignedEvidenceStore.index.push_back(entry);
+            alignedEvidenceStore.index[globalIndexBegin + i] = entry;
         }
 
         // Append Streams
@@ -207,6 +226,19 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
     auto& data = computeAlignmentsData;
     const AlignOptions& alignOptions = *data.alignOptions;
     auto& threadAlignmentData = data.threadAlignmentData[threadId];
+    const auto& candidates = alignmentCandidates.candidates;
+    const auto& precomputedAlignments = alignmentCandidatesAlignmentsData.alignments;
+    const uint32_t markerK = uint32_t(assemblerInfo->k);
+    const bool collectProjectedTiming = (assemblerInfo->readGraphCreationMethod == 5);
+    const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
+        size_t(alignOptions.minAlignedMarkerCount) : 0;
+    const double maxErrorRate = alignOptions.maxErrorRate;
+    const int64_t dpMatchScore = alignOptions.overlapDpMatchScore;
+    const int64_t dpMismatchScore = alignOptions.overlapDpMismatchScore;
+    const int64_t dpGapOpen1 = alignOptions.overlapDpGapOpen1;
+    const int64_t dpGapExtend1 = alignOptions.overlapDpGapExtend1;
+    const int64_t dpGapOpen2 = alignOptions.overlapDpGapOpen2;
+    const int64_t dpGapExtend2 = alignOptions.overlapDpGapExtend2;
     
     // Initialize compressed alignment storage for this thread.
     data.threadCompressedAlignments[threadId] = make_shared<MemoryMapped::VectorOfVectors<char, uint64_t>>();
@@ -217,61 +249,76 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
 
     AlignedEvidenceStore& store = data.threadEvidenceStores[threadId];
     string compressedAlignment;
+    array<OrientedReadId, 2> orientedReadIds;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(uint64_t candidateIndex = begin; candidateIndex != end; candidateIndex++) {
-            const OrientedReadPair& candidate = alignmentCandidates.candidates[candidateIndex];
+            const OrientedReadPair& candidate = candidates[candidateIndex];
             
             // This refactored flow EXCLUSIVELY uses precomputed chains.
             // Chaining is now performed upfront during candidate generation/PAF import.
-            const Alignment& alignment = alignmentCandidatesAlignmentsData.alignments[candidateIndex];
+            const Alignment& alignment = precomputedAlignments[candidateIndex];
             if(alignment.ordinals.empty()) {
                 continue;
             }
             // Skip low-support candidates early.
             // This avoids spending time in projected alignment construction for pairs
             // that cannot possibly meet Align.minAlignedMarkerCount.
-            if(alignOptions.minAlignedMarkerCount > 0 &&
-                alignment.ordinals.size() < size_t(alignOptions.minAlignedMarkerCount)) {
+            if(minAlignedMarkerCount > 0 &&
+                alignment.ordinals.size() < minAlignedMarkerCount) {
                 continue;
             }
-            array<OrientedReadId, 2> orientedReadIds = {
-                OrientedReadId(candidate.readIds[0], 0),
-                OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1)
+            orientedReadIds[0] = OrientedReadId(candidate.readIds[0], 0);
+            orientedReadIds[1] = OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1);
+            const array<LongBaseSequenceView, 2> sequenceViews = {
+                reads->getRead(orientedReadIds[0].getReadId()),
+                reads->getRead(orientedReadIds[1].getReadId())
+            };
+            const array<span<const CompressedMarker>, 2> markerSpans = {
+                (*markers)[orientedReadIds[0].getValue()],
+                (*markers)[orientedReadIds[1].getValue()]
             };
 
             // Compute projected alignment metrics and sparse diffs (mismatches/indels).
-            const auto tProjStart = steady_clock::now();
+            steady_clock::time_point tProjStart;
+            if(collectProjectedTiming) {
+                tProjStart = steady_clock::now();
+            }
             const ProjectedAlignment projectedAlignment(
-                *this,
+                markerK,
                 orientedReadIds,
+                sequenceViews,
                 alignment,
+                markerSpans,
                 ProjectedAlignment::Method::QuickRawSparse,
-                alignOptions.overlapDpMatchScore,
-                alignOptions.overlapDpMismatchScore,
-                alignOptions.overlapDpGapOpen1,
-                alignOptions.overlapDpGapExtend1,
-                alignOptions.overlapDpGapOpen2,
-                alignOptions.overlapDpGapExtend2);
-            const auto tProjEnd = steady_clock::now();
-            data.threadProjectedAlignmentTime[threadId] += seconds(tProjEnd - tProjStart);
+                dpMatchScore,
+                dpMismatchScore,
+                dpGapOpen1,
+                dpGapExtend1,
+                dpGapOpen2,
+                dpGapExtend2);
+            if(collectProjectedTiming) {
+                data.threadProjectedAlignmentTime[threadId] += seconds(steady_clock::now() - tProjStart);
+            }
             
             // Error rate filtering.
-            if (projectedAlignment.errorRate() > alignOptions.maxErrorRate) {
+            const double projectedErrorRate = projectedAlignment.errorRate();
+            if(projectedErrorRate > maxErrorRate) {
                 data.threadFilteredByErrorRate[threadId]++;
                 continue;
             }
 
             // Create alignment info summary.
             AlignmentInfo alignmentInfo(alignment, 
-                uint32_t((*markers).size(orientedReadIds[0].getValue())),
-                uint32_t((*markers).size(orientedReadIds[1].getValue()))
+                uint32_t(markerSpans[0].size()),
+                uint32_t(markerSpans[1].size())
             );
             
-            alignmentInfo.errorRate = float(projectedAlignment.errorRate());
+            alignmentInfo.errorRate = float(projectedErrorRate);
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
-            alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
+            const double projectedGapErrorRate = projectedAlignment.errorRateGaps();
+            alignmentInfo.errorRateGaps = float(projectedGapErrorRate);
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount);
             alignmentInfo.dpScore = projectedAlignment.totalDpScore;
@@ -295,7 +342,7 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             // --- Populate AlignedEvidenceStore (APES/TASSD) ---
             // Evidence is stored in dual streams (Target-View and Query-View)
             // ensuring Canonical Coordinate Monotonicity.
-            const LongBaseSequenceView tView = reads->getRead(orientedReadIds[1].getReadId());
+            const LongBaseSequenceView tView = sequenceViews[1];
             const bool tRev = orientedReadIds[1].getStrand();
             DINARA_ASSERT(tView.baseCount <= uint64_t(SnpEvidence::POS_MASK) + 1ULL);
             const uint32_t tRawLen = uint32_t(tView.baseCount);
