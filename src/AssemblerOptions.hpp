@@ -202,8 +202,8 @@ class dinara::OverlapCandidatesOptions {
 public:
     string method;              // "MinHash" or "InvertedIndex".
     double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
-    int minMarkerCount;         // Minimum aligned marker count for candidate filtering.
-    uint32_t minOverlapLength = 500; // Minimum overlap span (bases) for a candidate to be kept (applies to pre-extension span).
+    int minChainMarkerCount = 2;    // Minimum marker count required for a chained overlap candidate.
+    uint32_t minOverlapLength = 50; // Minimum overlap span (bases) for a candidate to be kept (applies to pre-extension span).
     uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension (bases) to reach read ends.
 
     // Additional knobs for the InvertedIndex chaining path (defaults match current hard-coded behavior).
@@ -219,6 +219,7 @@ public:
     uint32_t invertedIndexChainFilterMinScore = 3;           // Minimum filterThresh
     double invertedIndexNonRedundantOverlapFraction = 0.5;   // Reject candidates overlapping > frac of an accepted interval
     bool invertedIndexLchainIsAccurate = true;               // Hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp path).
+    bool invertedIndexUseEcScoring = true;                   // Use comput_sc_ch_ec-style long-gap penalty in chaining.
     bool invertedIndexEnableMcopyFast = true;                // Hifiasm-like multi-peak chain extraction to reduce expensive downstream work.
     uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm-like: keep up to 3 score-competitive chains per pair.
     double invertedIndexMcopyRate = 0.70;                    // ONT EC parity: keep chains with score >= bestScore * 0.7.

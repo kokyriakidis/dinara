@@ -141,6 +141,52 @@ static inline int32_t hifiasm_comput_sc_ch(
     return sc;
 }
 
+// Hifiasm EC chaining score (Hash_Table.cpp:1515-1541, comput_sc_ch_ec).
+// Differs from comput_sc_ch by using a different long-gap penalty behavior:
+//   - dd < 4  => use min(linear, adaptive)
+//   - dd >= 4 => use max(linear, adaptive)
+static inline int32_t hifiasm_comput_sc_ch_ec(
+    uint32_t posAi, uint32_t posBi,
+    uint32_t posAj, uint32_t posBj,
+    uint8_t weightI, uint8_t spanI,
+    double bw_rate,
+    double chn_pen_gap,
+    double chn_pen_skip,
+    uint64_t readLenA, uint64_t readLenB
+) {
+    int32_t dq = (int32_t)posAi - (int32_t)posAj;
+    if (dq <= 0) return INT32_MIN;
+
+    int32_t dr = (int32_t)posBi - (int32_t)posBj;
+    if (dr <= 0) return INT32_MIN;
+
+    int32_t dd = (dr > dq) ? (dr - dq) : (dq - dr);
+    int32_t dg = (dr < dq) ? dr : dq;
+
+    if (dd > 16) {
+        int32_t bw = hifiasm_cal_bw(posAi, posBi, posAj, posBj, bw_rate, readLenA, readLenB);
+        if (dd > bw) return INT32_MIN;
+    }
+
+    int32_t q_span = (int32_t)spanI;
+    int32_t sc = (q_span < dg) ? q_span : dg;
+    sc = HIFIASM_NORMAL_W(sc, (int32_t)weightI);
+
+    if (dd > 0 || (dg > q_span && dg > 0)) {
+        double lin_pen = chn_pen_gap * (double)dd;
+        double a_pen = ((double)sc) * (((double)dd) / ((double)dg)) / bw_rate;
+        if (dd < 4) {
+            lin_pen = (lin_pen > a_pen) ? a_pen : lin_pen;
+        } else {
+            lin_pen = (lin_pen < a_pen) ? a_pen : lin_pen;
+        }
+        lin_pen += chn_pen_skip * (double)dg;
+        sc -= (int32_t)lin_pen;
+    }
+
+    return sc;
+}
+
 // Hifiasm DP chaining parameters (from inter.h)
 struct HifiasmDPParams {
     int32_t max_iter = 10000;        // Maximum lookback window (hifiasm default)
@@ -154,4 +200,3 @@ struct HifiasmDPParams {
 };
 
 } // namespace dinara
-
