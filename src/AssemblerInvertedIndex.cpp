@@ -12,14 +12,13 @@
  *   3. **Hash Table Build**: Populate a power-of-2 sized hash table for O(1)
  *      K-mer lookups during the search phase.
  *   4. **Parallel Candidate Search**: For each read, query the index to find
- *      matching K-mers in other reads. Use DP chaining (with optional AVX2
- *      SIMD pre-filtering) to score potential alignments.
+ *      matching K-mers in other reads. Use DP chaining to score overlaps.
  *
  * Key performance features:
  *   - Structure-of-Arrays (SoA) layout for cache-efficient DP.
  *   - Early K-mer weighting based on occurrence frequency (Hifiasm-compatible).
- *   - AVX2 SIMD pre-filter to skip non-viable DP predecessors (optional).
- *   - Collinear fast-path to skip O(N^2) DP for trivially monotonic hit sets.
+ *   - Prefix quick-check to skip quadratic DP on monotonic hit runs.
+ *   - Shared mcopy-fast style endpoint extraction for repetitive regions.
  *
  * @note All scoring and tie-breaking rules are strictly Hifiasm-compatible.
  */
@@ -37,13 +36,6 @@
 #include <numeric>
 #include <vector>
 #include <thread>
-#include <functional>
-
-// AVX2 intrinsics are only available on x86_64 architectures.
-// The code includes a scalar fallback for other platforms.
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
 
 using namespace std;
 
@@ -134,8 +126,8 @@ static inline HifiasmLchainDpOptions getHifiasmLchainDpOptions(
  * Key arrays:
  *   - `dpSame`, `dpDiff`: DP scores for same-strand and opposite-strand chains.
  *   - `parentSame`, `parentDiff`: Backtrack pointers for chain reconstruction.
- *   - `cumDriftSame`, `cumDriftDiff`: Cumulative indel count for drift constraint.
- *   - `cumLenSame`, `cumLenDiff`: Cumulative alignment length for gap rate.
+ *   - `backtrackVisit*`: marks nodes visited by descendants for max-skip pruning.
+ *   - `chainOccurrences*`: chain anchor counts, used by mcopy/weak suppression.
  */
 struct ThreadScratchpad {
     struct WeakFilterMeta {
@@ -156,8 +148,6 @@ struct ThreadScratchpad {
     // DP score and backtrack arrays (int32_t since scores can be negative)
     vector<int32_t> dpSame, dpDiff;
     vector<int32_t> parentSame, parentDiff;
-    vector<uint32_t> cumDriftSame, cumDriftDiff;
-    vector<uint32_t> cumLenSame, cumLenDiff;
     vector<int32_t> backtrackVisitSame, backtrackVisitDiff;
     vector<uint32_t> chainOccurrencesSame, chainOccurrencesDiff;
 
@@ -173,7 +163,6 @@ struct ThreadScratchpad {
         }
     };
     vector<ChainCandidate> chainCandidates;
-    vector<int> candidateTypes;
     vector<ChainCandidate> filteredCandidates;
     vector<WeakFilterMeta> weakMetas;
     vector<size_t> weakIdxWorkspace;
@@ -196,12 +185,9 @@ struct ThreadScratchpad {
         hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear(); hitOrderByPosB.clear(); hitWeights.clear();
         dpSame.clear(); dpDiff.clear();
         parentSame.clear(); parentDiff.clear();
-        cumDriftSame.clear(); cumDriftDiff.clear();
-        cumLenSame.clear(); cumLenDiff.clear();
         backtrackVisitSame.clear(); backtrackVisitDiff.clear();
         chainOccurrencesSame.clear(); chainOccurrencesDiff.clear();
         chainCandidates.clear();
-        candidateTypes.clear();
         filteredCandidates.clear();
         weakMetas.clear();
         weakIdxWorkspace.clear();
@@ -520,6 +506,63 @@ static inline uint8_t computeInvertedIndexHitWeight(
     return uint8_t(1);
 }
 
+// Populate chaining parameters that are shared by discovery and PAF paths.
+// Keeping this in one place avoids accidental drift between the two entry points.
+template<class InvertedIndexData>
+static inline void configureInvertedIndexDataForChaining(
+    InvertedIndexData& data,
+    const OverlapCandidatesOptions& overlapCandidatesOptions,
+    const uint64_t coveragePeak,
+    const double maxDriftRate)
+{
+    data.maxDriftRate = maxDriftRate;
+    data.coveragePeak = coveragePeak;
+    data.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
+    data.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
+    data.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
+    data.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
+    data.downsampleHighFrequencyMarkers = overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers;
+    data.highFrequencySampleDistance = overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance;
+    data.maxHighFrequencyPerStreak = overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak;
+    data.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
+    data.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
+    data.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
+    data.lchainIsAccurate = overlapCandidatesOptions.invertedIndexLchainIsAccurate;
+    data.useEcScoring = overlapCandidatesOptions.invertedIndexUseEcScoring;
+    data.enableMcopyFast = overlapCandidatesOptions.invertedIndexEnableMcopyFast;
+    data.mcopyNum = overlapCandidatesOptions.invertedIndexMcopyNum;
+    data.mcopyRate = overlapCandidatesOptions.invertedIndexMcopyRate;
+    data.mcopyKhitCutoff = overlapCandidatesOptions.invertedIndexMcopyKhitCutoff;
+    data.mcopyOcvWindow = overlapCandidatesOptions.invertedIndexMcopyOcvWindow;
+    data.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
+    data.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
+    data.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
+}
+
+// Rebuild the small (fixed-size) weight LUT used by frequency-weighted anchor scoring.
+template<class InvertedIndexData>
+static inline void rebuildWeightLut(InvertedIndexData& data)
+{
+    data.weightLut.resize(512);
+    for(size_t i = 0; i < data.weightLut.size(); i++) {
+        data.weightLut[i] = uint8_t(std::min(255.0, std::pow(double(i), data.weightExponent)));
+    }
+}
+
+// Release high-memory transient index buffers that are not needed after chaining.
+template<class InvertedIndexData>
+static inline void clearInvertedIndexTransientData(InvertedIndexData& data)
+{
+    data.compactOccurrences.clear();
+    data.compactOccurrences.shrink_to_fit();
+    data.hashTable.clear();
+    data.hashTable.shrink_to_fit();
+    data.strand0CanonicalKmerIds.clear();
+    data.strand0CanonicalKmerIds.shrink_to_fit();
+    data.strand0CanonicalOffsets.clear();
+    data.strand0CanonicalOffsets.shrink_to_fit();
+}
+
 // Private class to encapsulate parallel logic (Codebase Pattern).
 class InvertedIndexFinder : public MultithreadedObject<InvertedIndexFinder> {
 public:
@@ -539,11 +582,8 @@ public:
         markers(markers),
         markerKmerIds(markerKmerIds),
         invertedIndexData(invertedIndexData),
-        candidates(candidates),
-        precomputedAlignments(precomputedAlignments),
         maxChainLimit(maxChainLimit),
-        minChainedMarkerCount(minChainedMarkerCount),
-        threadCount(threadCount)
+        minChainedMarkerCount(minChainedMarkerCount)
     {
         const ReadId readCount = ReadId(markers.size() / 2); // Indexed by strand 0
         const size_t perThreadReserve = std::max<size_t>(
@@ -591,11 +631,8 @@ private:
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers;
     const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds;
     const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData;
-    [[maybe_unused]] MemoryMapped::Vector<OrientedReadPair>& candidates;
-    [[maybe_unused]] MemoryMapped::Vector<Alignment>& precomputedAlignments;
     uint64_t maxChainLimit;
     uint32_t minChainedMarkerCount;
-    [[maybe_unused]] uint64_t threadCount;
 
     vector<vector<OrientedReadPair>> threadCandidates;
     vector<vector<Alignment>> threadAlignments;
@@ -831,8 +868,6 @@ private:
                     // Pre-allocate/Reset DP work arrays
                     scratch.dpSame.assign(numHits, 0); scratch.dpDiff.assign(numHits, 0);
                     scratch.parentSame.assign(numHits, -1); scratch.parentDiff.assign(numHits, -1);
-                    scratch.cumDriftSame.assign(numHits, 0); scratch.cumDriftDiff.assign(numHits, 0);
-                    scratch.cumLenSame.assign(numHits, 0); scratch.cumLenDiff.assign(numHits, 0);
                     scratch.backtrackVisitSame.assign(numHits, -1); scratch.backtrackVisitDiff.assign(numHits, -1);
                     scratch.chainOccurrencesSame.assign(numHits, 1); scratch.chainOccurrencesDiff.assign(numHits, 1);
 
@@ -858,43 +893,6 @@ private:
                         uint32_t xE = (xR <= yR) ? (uint32_t)(readLenA - 1) : pA + (uint32_t)yR;
                         return (uint64_t)(xE - xB + 1);
                     };
-
-                    // [DISABLED] Collinear Fast-Path: The O(N) pre-check rarely pays off on
-                    // noisy long-read data. Kept here for reference/future benchmarking.
-                    #if 0
-                    bool isStrictlyCollinear = true; 
-                    if (numHits > 1) { 
-                        for (size_t k = 1; k < numHits; ++k) {
-                            int32_t dx = (int32_t)scratch.hitPosA[k] - (int32_t)scratch.hitPosA[k-1];
-                            int32_t dy = (int32_t)scratch.hitPosB[k] - (int32_t)scratch.hitPosB[k-1];
-                            if (dx <= 0 || dy <= 0 || std::abs(dy - dx) > (int32_t)(maxDriftRate * dx)) {
-                                isStrictlyCollinear = false; break;
-                            }
-                        } 
-                    }
-
-                    if (isStrictlyCollinear && numHits > 0) {
-                        const int64_t dRscaled = (int64_t)(maxDriftRate * 1024.0);
-                        uint32_t baseSc = scratch.hitWeights[0] > 1 ? (uint32_t)kmerLen / scratch.hitWeights[0] : (uint32_t)kmerLen;
-                        scratch.dpSame[0] = std::max(1U, baseSc);
-                        int32_t driftS = 0, lenS = 0; bool validS = true;
-                        for (size_t k = 1; k < numHits; ++k) {
-                            int32_t dx = (int32_t)scratch.hitPosA[k] - (int32_t)scratch.hitPosA[k-1];
-                            int32_t dy = (int32_t)scratch.hitPosB[k] - (int32_t)scratch.hitPosB[k-1];
-                            int32_t dd = std::abs(dx - dy); driftS += dd; lenS += dy;
-                            if (dy <= 0 || driftS > lenS * maxDriftRate || (dd > 31 && dd > std::min(dx, dy) * maxDriftRate)) { 
-                                validS = false; break; 
-                            }
-                            uint32_t wS = scratch.hitWeights[k] > 1 ? std::min((uint32_t)std::min(dx, dy), (uint32_t)kmerLen) / scratch.hitWeights[k] : std::min((uint32_t)std::min(dx, dy), (uint32_t)kmerLen);
-                            int32_t pnlty = (lenS > 0) ? (int32_t)(((int64_t)driftS * wS * 1024) / ((int64_t)lenS * dRscaled)) : 0;
-                            scratch.dpSame[k] = scratch.dpSame[k-1] + std::max(1, (int32_t)wS - pnlty);
-                            scratch.parentSame[k] = (int32_t)(k - 1); 
-                            scratch.cumDriftSame[k] = driftS; scratch.cumLenSame[k] = lenS; 
-                            scratch.chainOccurrencesSame[k] = (uint32_t)(k + 1);
-                        }
-                        if (validS) { maxScSame = scratch.dpSame[numHits - 1]; bestEndIdxSame = (int32_t)(numHits - 1); goto end_dp_chaining; }
-                    }
-                    #endif
 
                     // Hifiasm quick_ck_lchain parity:
                     // fast-chain strict monotonic prefixes and run quadratic DP on the rest.
@@ -2036,32 +2034,13 @@ void Assembler::chainAlignmentCandidates(
     alignmentCandidates.candidates.reserve(size_t(readCount) * 50);
     alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); 
 
-    invertedIndexData.maxDriftRate = maxDriftRate;
-    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
-    invertedIndexData.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
-    invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
-    invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
-    invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
-    invertedIndexData.downsampleHighFrequencyMarkers = overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers;
-    invertedIndexData.highFrequencySampleDistance = overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance;
-    invertedIndexData.maxHighFrequencyPerStreak = overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak;
-    invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
-    invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
-    invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
-    invertedIndexData.lchainIsAccurate = overlapCandidatesOptions.invertedIndexLchainIsAccurate;
-    invertedIndexData.useEcScoring = overlapCandidatesOptions.invertedIndexUseEcScoring;
-    invertedIndexData.enableMcopyFast = overlapCandidatesOptions.invertedIndexEnableMcopyFast;
-    invertedIndexData.mcopyNum = overlapCandidatesOptions.invertedIndexMcopyNum;
-    invertedIndexData.mcopyRate = overlapCandidatesOptions.invertedIndexMcopyRate;
-    invertedIndexData.mcopyKhitCutoff = overlapCandidatesOptions.invertedIndexMcopyKhitCutoff;
-    invertedIndexData.mcopyOcvWindow = overlapCandidatesOptions.invertedIndexMcopyOcvWindow;
-    invertedIndexData.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
-    invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
-    invertedIndexData.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
-    invertedIndexData.weightLut.resize(512);
-    for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
-        invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
-    }
+    // Keep all tuning parameters synchronized with the PAF chaining path.
+    configureInvertedIndexDataForChaining(
+        invertedIndexData,
+        overlapCandidatesOptions,
+        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        maxDriftRate);
+    rebuildWeightLut(invertedIndexData);
 
     // Launch the finder across all threads
     InvertedIndexFinder finder(
@@ -2080,14 +2059,8 @@ void Assembler::chainAlignmentCandidates(
     alignmentCandidatesAlignmentsData.alignments.unreserve();
     
     // --- Final Cleanup ---
-    invertedIndexData.compactOccurrences.clear();
-    invertedIndexData.compactOccurrences.shrink_to_fit();
-    invertedIndexData.hashTable.clear();
-    invertedIndexData.hashTable.shrink_to_fit();
-    invertedIndexData.strand0CanonicalKmerIds.clear();
-    invertedIndexData.strand0CanonicalKmerIds.shrink_to_fit();
-    invertedIndexData.strand0CanonicalOffsets.clear();
-    invertedIndexData.strand0CanonicalOffsets.shrink_to_fit();
+    // The index is a one-shot structure for this pass; release it aggressively.
+    clearInvertedIndexTransientData(invertedIndexData);
 
     const auto endTime = std::chrono::steady_clock::now();
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
@@ -2128,7 +2101,7 @@ void Assembler::chainPafCandidates(
     performanceLog << timestamp << "Starting DP chaining for PAF-imported candidates." << endl;
 
     // Check that buildInvertedIndex has been called
-    if(invertedIndexData.compactOccurrences.empty() && invertedIndexData.hashTable.empty()) {
+    if(invertedIndexData.compactOccurrences.empty() || invertedIndexData.hashTable.empty()) {
         throw runtime_error("chainPafCandidates: buildInvertedIndex must be called first.");
     }
 
@@ -2139,34 +2112,23 @@ void Assembler::chainPafCandidates(
 
     cout << timestamp << "Chaining " << alignmentCandidates.candidates.size() << " PAF-imported candidates..." << endl;
 
-    // Store parameters for chaining
-    invertedIndexData.maxDriftRate = maxDriftRate;
-    invertedIndexData.coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
-    invertedIndexData.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
-    invertedIndexData.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
-    invertedIndexData.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
-    invertedIndexData.rareKmerWeight = overlapCandidatesOptions.invertedIndexRareKmerWeight;
-    invertedIndexData.downsampleHighFrequencyMarkers = overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers;
-    invertedIndexData.highFrequencySampleDistance = overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance;
-    invertedIndexData.maxHighFrequencyPerStreak = overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak;
-    invertedIndexData.chainFilterRatio = overlapCandidatesOptions.invertedIndexChainFilterRatio;
-    invertedIndexData.chainFilterMinScore = overlapCandidatesOptions.invertedIndexChainFilterMinScore;
-    invertedIndexData.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
-    invertedIndexData.lchainIsAccurate = overlapCandidatesOptions.invertedIndexLchainIsAccurate;
-    invertedIndexData.useEcScoring = overlapCandidatesOptions.invertedIndexUseEcScoring;
-    invertedIndexData.enableMcopyFast = overlapCandidatesOptions.invertedIndexEnableMcopyFast;
-    invertedIndexData.mcopyNum = overlapCandidatesOptions.invertedIndexMcopyNum;
-    invertedIndexData.mcopyRate = overlapCandidatesOptions.invertedIndexMcopyRate;
-    invertedIndexData.mcopyKhitCutoff = overlapCandidatesOptions.invertedIndexMcopyKhitCutoff;
-    invertedIndexData.mcopyOcvWindow = overlapCandidatesOptions.invertedIndexMcopyOcvWindow;
-    invertedIndexData.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
-    invertedIndexData.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
-    invertedIndexData.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
-    invertedIndexData.weightLut.resize(512);
-    for(size_t i=0; i<invertedIndexData.weightLut.size(); i++) {
-        invertedIndexData.weightLut[i] = (uint8_t)std::min(255.0, std::pow((double)i, invertedIndexData.weightExponent));
-    }
+    // Match discovery-path configuration so PAF and discovery chaining are comparable.
+    configureInvertedIndexDataForChaining(
+        invertedIndexData,
+        overlapCandidatesOptions,
+        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        maxDriftRate);
+    rebuildWeightLut(invertedIndexData);
 
+    // PAF chaining pipeline:
+    //   1) Snapshot imported candidate pairs so output vectors can be rebuilt in-place.
+    //   2) For each pair, recollect marker hits from the index (same machinery as discovery).
+    //   3) Run Hifiasm-parity DP, keeping only the orientation requested by the PAF pair.
+    //   4) Reconstruct a single best chain + alignment per pair.
+    //   5) Apply read-level max_n_chain style filtering and publish survivors.
+    //
+    // Even though input pairs come from PAF, the scoring/filtering code path is shared
+    // conceptually with discovery to keep behavior as close as possible.
     // Create output storage for chained alignments
     alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize);
     alignmentCandidatesAlignmentsData.alignments.reserve(alignmentCandidates.candidates.size());
@@ -2182,6 +2144,9 @@ void Assembler::chainPafCandidates(
     alignmentCandidates.candidates.clear();
     alignmentCandidates.candidates.reserve(originalCandidates.size());
 
+    // Hoist all immutable chaining parameters to local constants before launching threads.
+    // This avoids repeated pointer chasing into `invertedIndexData` in inner loops and
+    // makes per-thread lambdas easier for the compiler to optimize.
     // Setup threading
     const uint64_t hashMask = invertedIndexData.hashTable.size() - 1;
     const auto* hashTablePtr = invertedIndexData.hashTable.data();
@@ -2228,7 +2193,9 @@ void Assembler::chainPafCandidates(
         v.reserve(perThreadResultReserve);
     }
     
-    // Per-thread processing
+    // Per-thread processing:
+    // each worker owns a scratchpad and writes only to its own result vector.
+    // This keeps the hot path lock-free and avoids false sharing.
     const size_t batchSize = std::max(size_t(1), originalCandidates.size() / (threadCount * 10));
     setupLoadBalancing(originalCandidates.size(), batchSize);
 
@@ -2250,6 +2217,8 @@ void Assembler::chainPafCandidates(
             uint64_t startBatch, endBatch;
             while(getNextBatch(startBatch, endBatch)) {
                 for(size_t idx = startBatch; idx < endBatch; idx++) {
+                    // Each iteration handles one imported PAF pair:
+                    // hit recollection -> DP chaining -> chain extraction -> alignment emit.
                     const OrientedReadPair& pair = originalCandidates[idx];
                     const ReadId readIdA = pair.readIds[0];
                     const ReadId readIdB = pair.readIds[1];
@@ -2278,6 +2247,7 @@ void Assembler::chainPafCandidates(
                         std::min(markersA.size(), kmerIdsA.size());
                     const size_t numMarkersB = markersB.size();
                     
+                    // Without markers on either side, no anchor chain is possible.
                     if(numMarkersA == 0 || numMarkersB == 0) continue;
 
                     const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
@@ -2405,7 +2375,8 @@ void Assembler::chainPafCandidates(
                         continue;
                     }
 
-                    // Transfer to SoA
+                    // Transfer hits from temporary AoS layout to SoA vectors.
+                    // SoA layout improves cache locality in the O(N^2) DP loops.
                     scratch.hitPosA.resize(numHits);
                     scratch.hitPosB.resize(numHits);
                     scratch.hitOrdinalA.resize(numHits);
@@ -2423,7 +2394,9 @@ void Assembler::chainPafCandidates(
                         continue;
                     }
 
-                    // Hifiasm-style DP chaining for PAF candidates
+                    // Hifiasm-style DP chaining for this fixed pair.
+                    // Unlike discovery, PAF path enforces a single expected orientation
+                    // (same/diff) based on the imported pair metadata.
                     scratch.dpSame.assign(numHits, 0);
                     scratch.dpDiff.assign(numHits, 0);
                     scratch.parentSame.assign(numHits, -1);
@@ -3136,7 +3109,8 @@ void Assembler::chainPafCandidates(
 
     for(auto& t : threads) t.join();
 
-    // Merge thread-local results.
+    // Merge thread-local results into a single vector for read-level filtering.
+    // This is done once after all workers finish to keep worker code write-only/local.
     vector<PafChainedCandidate> mergedResults;
     {
         size_t total = 0;
@@ -3325,14 +3299,7 @@ void Assembler::chainPafCandidates(
     alignmentCandidatesAlignmentsData.alignments.unreserve();
 
     // Cleanup inverted index data
-    invertedIndexData.compactOccurrences.clear();
-    invertedIndexData.compactOccurrences.shrink_to_fit();
-    invertedIndexData.hashTable.clear();
-    invertedIndexData.hashTable.shrink_to_fit();
-    invertedIndexData.strand0CanonicalKmerIds.clear();
-    invertedIndexData.strand0CanonicalKmerIds.shrink_to_fit();
-    invertedIndexData.strand0CanonicalOffsets.clear();
-    invertedIndexData.strand0CanonicalOffsets.shrink_to_fit();
+    clearInvertedIndexTransientData(invertedIndexData);
 
     const auto endTime = std::chrono::steady_clock::now();
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
