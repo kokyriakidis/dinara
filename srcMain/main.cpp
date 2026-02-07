@@ -572,7 +572,7 @@ void dinara::main::assemble(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
             assemblerOptions.overlapCandidatesOptions,
-            uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+            uint32_t(std::max(0, assemblerOptions.overlapCandidatesOptions.minChainMarkerCount)),
             threadCount
         );
     } else {
@@ -581,7 +581,7 @@ void dinara::main::assemble(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
             assemblerOptions.overlapCandidatesOptions,
-            uint32_t(std::max(0, assemblerOptions.alignOptions.minAlignedMarkerCount)),
+            uint32_t(std::max(0, assemblerOptions.overlapCandidatesOptions.minChainMarkerCount)),
             threadCount
         );
     }

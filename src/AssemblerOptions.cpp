@@ -493,14 +493,19 @@ void AssemblerOptions::addConfigurableOptions()
         "Drift rate tolerance for overlap chaining. "
         "Hifiasm uses 0.05 for ONT reads, 0.02 for HiFi reads, 0.001 for final high-quality overlaps.")
 
+        ("OverlapCandidates.minChainMarkerCount",
+        value<int>(&overlapCandidatesOptions.minChainMarkerCount)->
+        default_value(2),
+        "Minimum marker count required for a candidate overlap chain to be kept.")
+
+        // Backward compatible alias (deprecated).
         ("OverlapCandidates.minMarkerCount",
-        value<int>(&overlapCandidatesOptions.minMarkerCount)->
-        default_value(4),
-        "Minimum aligned marker count for a candidate overlap to be kept.")
+        value<int>(&overlapCandidatesOptions.minChainMarkerCount),
+        "Deprecated alias for OverlapCandidates.minChainMarkerCount.")
 
         ("OverlapCandidates.minOverlapLength",
         value<uint32_t>(&overlapCandidatesOptions.minOverlapLength)->
-        default_value(500),
+        default_value(50),
         "Minimum overlap span in bases for a candidate to be kept. "
         "Implemented as min(qSpan, tSpan) >= threshold, where spans are measured on the "
         "pre-extension marker-derived (or PAF-derived) intervals.")
@@ -571,6 +576,11 @@ void AssemblerOptions::addConfigurableOptions()
         value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
         default_value(true),
         "InvertedIndex chaining: hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp defaults).")
+
+        ("OverlapCandidates.invertedIndexUseEcScoring",
+        value<bool>(&overlapCandidatesOptions.invertedIndexUseEcScoring)->
+        default_value(true),
+        "InvertedIndex chaining: use hifiasm comput_sc_ch_ec long-gap penalty behavior.")
 
         ("OverlapCandidates.invertedIndexEnableMcopyFast",
         value<bool>(&overlapCandidatesOptions.invertedIndexEnableMcopyFast)->
@@ -1648,7 +1658,7 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "[OverlapCandidates]\n";
     s << "method = " << method << "\n";
     s << "driftRateTolerance = " << driftRateTolerance << "\n";
-    s << "minMarkerCount = " << minMarkerCount << "\n";
+    s << "minChainMarkerCount = " << minChainMarkerCount << "\n";
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
     s << "invertedIndexWeightExponent = " << invertedIndexWeightExponent << "\n";
@@ -1662,6 +1672,7 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexChainFilterMinScore = " << invertedIndexChainFilterMinScore << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
     s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
+    s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";
     s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";
     s << "invertedIndexMcopyNum = " << invertedIndexMcopyNum << "\n";
     s << "invertedIndexMcopyRate = " << invertedIndexMcopyRate << "\n";

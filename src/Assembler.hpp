@@ -2460,6 +2460,7 @@ private:
              uint32_t chainFilterMinScore = 3;
              double nonRedundantOverlapFraction = 0.5;
              bool lchainIsAccurate = true;
+             bool useEcScoring = true;
              bool enableMcopyFast = true;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;

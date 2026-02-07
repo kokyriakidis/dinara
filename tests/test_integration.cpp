@@ -897,7 +897,7 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = 0.1;
-        overlapCandidatesOptions.minMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = 4;
         // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
         overlapCandidatesOptions.minOverlapLength = 0;
         withSilencedIoInDir(testDir, [&] {
@@ -909,7 +909,7 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = 0.1;
-        overlapCandidatesOptions.minMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = 4;
         // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
         overlapCandidatesOptions.minOverlapLength = 0;
         overlapCandidatesOptions.maxEndFuzz = maxEndFuzz;
@@ -922,7 +922,7 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = 0.1;
-        overlapCandidatesOptions.minMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = 4;
         overlapCandidatesOptions.minOverlapLength = minOverlapLength;
         withSilencedIoInDir(testDir, [&] {
             assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
@@ -938,7 +938,7 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
-        overlapCandidatesOptions.minMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = 4;
         // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
         overlapCandidatesOptions.minOverlapLength = 0;
         withSilencedIoInDir(testDir, [&] {
@@ -1038,7 +1038,7 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
-        overlapCandidatesOptions.minMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = 4;
         // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
         overlapCandidatesOptions.minOverlapLength = 0;
         overlapCandidatesOptions.maxEndFuzz = maxEndFuzz;
