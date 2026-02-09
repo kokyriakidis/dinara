@@ -619,7 +619,8 @@ void dinara::main::assemble(
 
     // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
     // Optional path: experimental global-site phasing/parity.
-    const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
+    // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
+    const bool useGlobalSiteEcParity = false;
     if (useGlobalSiteEcParity) {
         cout << timestamp << "Using experimental global-site EC parity path." << endl;
         assembler.performGlobalSiteECParity(threadCount);
@@ -634,13 +635,18 @@ void dinara::main::assemble(
 
     // Global mismatch-site diagnostics and export are expensive and intended for debugging.
     // Keep them off by default in production runs to preserve assembly throughput.
-    const bool runGlobalHetDiagnostics = (::getenv("DINARA_ENABLE_GLOBAL_HET_DEBUG") != nullptr);
+    const bool runGlobalHetDiagnostics = true;
     if (runGlobalHetDiagnostics) {
     // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
     // This is the fastest way to approximate "pileup across all reads" without a reference.
     {
-        const ReadId focalReadId = ReadId(3);
+        const OrientedReadId focalOrientedReadId(ReadId(24347), 1);
+        const ReadId focalReadId = focalOrientedReadId.getReadId();
+        const Strand focalReadStrand = focalOrientedReadId.getStrand();
+        const string focalReadLabel =
+            to_string(uint64_t(focalReadId)) + "-" + to_string(uint64_t(focalReadStrand));
         const Reads& reads = assembler.getReads();
+        const uint32_t focalReadLength = uint32_t(reads.getRead(focalReadId).baseCount);
 
         const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
             focalReadId,
@@ -674,6 +680,9 @@ void dinara::main::assemble(
                 }
             }
             if (bestPos != std::numeric_limits<uint32_t>::max()) {
+                if (focalReadStrand == 1 && focalReadLength > 0 && bestPos < focalReadLength) {
+                    bestPos = (focalReadLength - 1U) - bestPos;
+                }
                 focalMismatchSites.push_back(FocalMismatchSite{bestPos, uint32_t(siteId)});
             }
         }
@@ -684,7 +693,7 @@ void dinara::main::assemble(
                 }
                 return a.siteId < b.siteId;
             });
-        cout << timestamp << "Read" << focalReadId
+        cout << timestamp << "Read" << focalReadLabel
              << " mismatch sites (readGraph clusters): " << focalMismatchSites.size() << endl;
 
         const auto propagationStart = std::chrono::steady_clock::now();
@@ -714,6 +723,13 @@ void dinara::main::assemble(
             strandConflicts,
             false // includeDeletedAlignments
         );
+        if (focalReadStrand == 1) {
+            for (int8_t& v : strandByRead) {
+                if (v != -1) {
+                    v = int8_t(v ^ 1);
+                }
+            }
+        }
         {
             uint64_t assigned = 0;
             for (const int8_t v : strandByRead) {
@@ -823,8 +839,14 @@ void dinara::main::assemble(
         vector<char> focalReadAlleleBySite(siteCount, '?');
         for (const auto& s : focalReadSites) {
             if (s.siteId < siteCount) {
-                focalReadPosBySite[s.siteId] = s.readPosition;
-                focalReadAlleleBySite[s.siteId] = baseToAscii[s.allele];
+                uint32_t pos = s.readPosition;
+                uint8_t allele = s.allele;
+                if (focalReadStrand == 1 && focalReadLength > 0 && pos < focalReadLength) {
+                    pos = (focalReadLength - 1U) - pos;
+                    allele = complementBase[allele];
+                }
+                focalReadPosBySite[s.siteId] = pos;
+                focalReadAlleleBySite[s.siteId] = baseToAscii[allele];
             }
         }
 
@@ -836,7 +858,7 @@ void dinara::main::assemble(
             }
         }
 
-        cout << timestamp << "Read" << focalReadId
+        cout << timestamp << "Read" << focalReadLabel
              << " projected global het sites after multiallelic filter: "
              << filteredFocalReadSites.size() << " / " << focalReadSites.size()
              << " (need >= " << minAlleleCountForExport << " alleles with support >= "
@@ -846,7 +868,10 @@ void dinara::main::assemble(
         const size_t toPrint = std::min<size_t>(10, filteredFocalReadSites.size());
         for (size_t i = 0; i < toPrint; i++) {
             const uint32_t siteId = filteredFocalReadSites[i].siteId;
-            const uint32_t focalPos = filteredFocalReadSites[i].readPosition;
+            const uint32_t focalPos =
+                (siteId < focalReadPosBySite.size()) ? focalReadPosBySite[siteId] : invalidPos;
+            const char focalAllele =
+                (siteId < focalReadAlleleBySite.size()) ? focalReadAlleleBySite[siteId] : '?';
             const uint64_t mismatchMembers =
                 (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
             const auto mismatchCounts =
@@ -861,8 +886,8 @@ void dinara::main::assemble(
 
             cout << timestamp
                  << "GlobalHetSite[" << i << "]"
-                 << " read" << focalReadId << "Pos=" << focalPos
-                 << " read" << focalReadId << "Allele=" << baseToAscii[filteredFocalReadSites[i].allele]
+                 << " read" << focalReadLabel << "Pos=" << focalPos
+                 << " read" << focalReadLabel << "Allele=" << focalAllele
                  << " mismatchMembers=" << mismatchMembers
                  << " mismatchCounts(A,C,G,T)=(" << mismatchCounts[0] << "," << mismatchCounts[1] << "," << mismatchCounts[2] << "," << mismatchCounts[3] << ")"
                  << " siteMembers=" << siteMembers
@@ -897,12 +922,12 @@ void dinara::main::assemble(
 
         // Export all SNP sites involving read 0 (summary + full per-allele member list).
         {
-            const string summaryFileName = "Read" + to_string(focalReadId) + "GlobalHetSitesSummary.tsv";
-            const string membersFileName = "Read" + to_string(focalReadId) + "GlobalHetSitesMembers.tsv";
+            const string summaryFileName = "Read" + focalReadLabel + "GlobalHetSitesSummary.tsv";
+            const string membersFileName = "Read" + focalReadLabel + "GlobalHetSitesMembers.tsv";
             std::ofstream summary(summaryFileName);
             std::ofstream membersOut(membersFileName);
             if (!summary || !membersOut) {
-                cout << timestamp << "Failed to open export files for read " << focalReadId << "." << endl;
+                cout << timestamp << "Failed to open export files for read " << focalReadLabel << "." << endl;
             } else {
                 summary << "siteId\treadPos\tmismatchMembers\tmismatchA\tmismatchC\tmismatchG\tmismatchT"
                         << "\tsiteMembers\tsiteA\tsiteC\tsiteG\tsiteT\treadAllele\n";
@@ -992,7 +1017,7 @@ void dinara::main::assemble(
                     exportedCount++;
                 }
 
-                cout << timestamp << "Wrote read" << focalReadId << " global het sites to " << summaryFileName
+                cout << timestamp << "Wrote read" << focalReadLabel << " global het sites to " << summaryFileName
                      << " and " << membersFileName
                      << " (sites=" << exportedCount
                      << ", filteredOut=" << filteredOutCount
@@ -1070,7 +1095,7 @@ void dinara::main::assemble(
         2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
-        false,                                           // allowDuplicateMarkers
+        true,                                           // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);

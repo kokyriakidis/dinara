@@ -1237,7 +1237,10 @@ public:
     // Rescue phased overlaps (try_rescue_overlaps equivalent)
     // Rescues overlaps with directional phasing conflicts if sufficient neighbor support exists.
     void rescuePhasedOverlaps(uint64_t rescueThreshold, uint64_t threadCount);
-    
+
+    // Count active alignments (kept by both sides)
+    uint64_t countActiveAlignments() const;
+
 private:
     void detectChimericReadsThreadFunction(size_t threadId);
     void rescueChimericReadsThreadFunction(size_t threadId);

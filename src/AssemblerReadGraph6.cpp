@@ -125,22 +125,16 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 {
     cout << timestamp << "createReadGraph6 begins." << endl;
 
-    // Check required data
+    // Preconditions: overlap/alignment records must be loaded.
+    // This routine applies overlap-level and read-level filters, then rebuilds the read graph
+    // from the surviving overlaps.
     checkAlignmentDataAreOpen();
     // checkPhasingCigarsAreOpen(); // Removed: PhasingCigars replaced by AlignedEvidenceStore
 
     const uint64_t totalAlignments = alignmentData.size();
-    
-    // Helper to count active alignments (not deleted)
-    auto countActiveAlignments = [this]() -> uint64_t {
-        uint64_t active = 0;
-        for(uint64_t i = 0; i < alignmentData.size(); i++) {
-            if(alignmentData[i].keptByBothSides()) active++;
-        }
-        return active;
-    };
-    
-    // Helper to count reads with isDeleted0 or isDeleted1 set
+
+    // Count per-side overlap deletion flags. These are overlap-local diagnostics and are
+    // different from read-level deletion (validReadIntervals[r].isDeleted).
     auto countPhasingFlags = [this]() -> std::pair<uint64_t, uint64_t> {
         uint64_t del0 = 0, del1 = 0;
         for(uint64_t i = 0; i < alignmentData.size(); i++) {
@@ -149,10 +143,24 @@ void Assembler::createReadGraph6(uint64_t threadCount)
         }
         return {del0, del1};
     };
+
+    // Count reads currently disabled at the read level (ma_hit_sub/chimera/contained pipeline state).
+    auto countDeletedReads = [this]() -> uint64_t {
+        if(validReadIntervals.empty()) {
+            return 0;
+        }
+        uint64_t deleted = 0;
+        for(const auto& interval : validReadIntervals) {
+            if(interval.isDeleted) {
+                ++deleted;
+            }
+        }
+        return deleted;
+    };
     
     cout << timestamp << "[DIAG] Total alignments: " << totalAlignments << endl;
     
-    // Check initial state
+    // Initial overlap-level state before read-level filtering.
     auto [initDel0, initDel1] = countPhasingFlags();
     cout << timestamp << "[DIAG] Initial state: isDeleted0=" << initDel0 
          << ", isDeleted1=" << initDel1 
@@ -166,35 +174,32 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // Hifiasm parity: Full pre-graph filtering pipeline
     // Order matches Hifiasm's clean_graph / gen_init_sg flow
     
-    // // Step 1: Rescue phased overlaps with directional conflicts (try_rescue_overlaps equivalent)
-    // rescuePhasedOverlaps(4, threadCount);
-    // auto [afterRescueDel0, afterRescueDel1] = countPhasingFlags();
-    // cout << timestamp << "[DIAG] After rescuePhasedOverlaps: isDeleted0=" << afterRescueDel0
-    //      << ", isDeleted1=" << afterRescueDel1
-    //      << ", active=" << countActiveAlignments() << endl;
-    
-    // Step 2: Find valid read segments (ma_hit_sub equivalent)
-    // Hifiasm default min_dp is asm_opt.min_overlap_coverage (default 0).
+    // Step 1: Find valid read segments (ma_hit_sub equivalent).
+    // Parity note:
+    // - hifiasm default min_overlap_coverage is 0
+    // - ma_hit_sub treats min_dp <= 1 as "full read is valid"
+    // So with minCoverage=0 we keep [0, readLen) for every read, but still populate
+    // validReadIntervals, which downstream stages use as canonical read-level state.
     const uint64_t minCoverage = 0;
     filterLocalSegments(minCoverage, threadCount);
 
-    // Count deleted reads
-    uint64_t deletedReads = 0;
-    for(uint64_t r = 0; r < validReadIntervals.size(); r++) {
-        if(validReadIntervals[r].isDeleted) deletedReads++;
-    }
+    const uint64_t deletedReads = countDeletedReads();
     cout << timestamp << "[DIAG] After filterLocalSegments: " << deletedReads << "/" << reads->readCount() << " reads marked deleted" << endl;
     cout << timestamp << "[DIAG] After filterLocalSegments: active alignments=" << countActiveAlignments() << endl;
 
-    // Step 3: Detect chimeric reads (detect_chimeric_reads)
-    // Runs after ma_hit_sub and before ma_hit_cut in hifiasm.
+    // Step 2: Detect chimeric reads (detect_chimeric_reads)
+    // Runs after ma_hit_sub and before ma_hit_cut in hifiasm. This stage marks chimeric
+    // reads at read-level state (validReadIntervals/isChimericRead) and propagates overlap
+    // deletion reasons so downstream graph construction can prune incident edges.
     detectChimericReads(threadCount);
     auto [afterChimericDel0, afterChimericDel1] = countPhasingFlags();
     cout << timestamp << "[DIAG] After detectChimericReads: isDeleted0=" << afterChimericDel0
          << ", isDeleted1=" << afterChimericDel1
          << ", active=" << countActiveAlignments() << endl;
+    cout << timestamp << "[DIAG] After detectChimericReads: deletedReads="
+         << countDeletedReads() << "/" << reads->readCount() << endl;
 
-    // Step 4: Clip overlaps to valid regions (ma_hit_cut equivalent)
+    // Step 3: Clip overlaps to valid regions (ma_hit_cut equivalent)
     // Also normalizes coordinates to 0-based relative to valid region.
     const uint64_t minOverlapLength = 50;  // Hifiasm default mini_overlap_length
     applyCoverageCuts(minOverlapLength, threadCount);
@@ -203,7 +208,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterCutDel1
          << ", active=" << countActiveAlignments() << endl;
 
-    // Step 5: Filter hanging overlaps (ma_hit_flt equivalent)
+    // Step 4: Filter hanging overlaps (ma_hit_flt equivalent)
     // Removes overlaps with excessive overhangs
     const uint64_t maxHang = 1000;
     const double maxHangRate = 0.8;
@@ -212,6 +217,21 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     cout << timestamp << "[DIAG] After filterHangingOverlaps: isDeleted0=" << afterHangDel0
          << ", isDeleted1=" << afterHangDel1
          << ", active=" << countActiveAlignments() << endl;
+
+    // // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
+    // // Marks fully contained reads and removes their overlaps
+    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+    //      << ", isDeleted1=" << afterContainDel1
+    //      << ", active=" << countActiveAlignments() << endl;
+
+
+    
+
+
+
+
 
     // // Step 6a: Contained read detection (does not remove overlaps).
     // flagContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
@@ -223,14 +243,6 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // }
     // cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
 
-    // // Step 6b: Remove contained reads (ma_hit_contained_advance equivalent)
-    // // Marks fully contained reads and removes their overlaps
-    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
-    //      << ", isDeleted1=" << afterContainDel1
-    //      << ", active=" << countActiveAlignments() << endl;
-
     // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
     // // This is a diagnostic/experimental alternative to removing contained reads entirely.
     // pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
@@ -240,12 +252,16 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 
 
     
-    // Step 7: Final filtering pass - apply phasing decisions
+    // Step 7: Apply final AND-semantics filter
+    // By this point, all filtering steps (2-6) have set delete reasons on individual alignment sides.
+    // This step applies the conservative AND rule: keep an alignment ONLY if both sides keep it.
     const uint64_t alignmentCount = alignmentData.size();
     std::vector<bool> keepAlignment(alignmentCount, true);
-    
+
     uint64_t keptCount = 0;
-    uint64_t phasedOutCount = 0;
+    uint64_t filteredCount = 0;
+
+    // Breakdown of filter reasons for diagnostics (alignments can have multiple reasons)
     uint64_t filteredByPhase = 0;
     uint64_t filteredBySecondary = 0;
     uint64_t filteredByChemical = 0;
@@ -253,96 +269,46 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     uint64_t filteredByCoverageCut = 0;
     uint64_t filteredByHanging = 0;
     uint64_t filteredByContained = 0;
-    uint64_t palindromicCount = 0;
-    uint64_t chimericCount = 0;
-    uint64_t containedCount = 0;
 
-    auto classifyFilterReason = [&](const AlignmentData& ad) {
-        const AlignmentData::DeleteReasonMask reasons = ad.deleteReasons0 | ad.deleteReasons1;
-        if (reasons & AlignmentData::DeleteReasonPhase) ++filteredByPhase;
-        if (reasons & AlignmentData::DeleteReasonSecondary) ++filteredBySecondary;
-        if (reasons & AlignmentData::DeleteReasonChemical) ++filteredByChemical;
-        if (reasons & AlignmentData::DeleteReasonLocal) ++filteredByLocalSegment;
-        if (reasons & AlignmentData::DeleteReasonCoverageCut) ++filteredByCoverageCut;
-        if (reasons & AlignmentData::DeleteReasonHanging) ++filteredByHanging;
-        if (reasons & AlignmentData::DeleteReasonContained) ++filteredByContained;
-    };
-
-#ifdef _OPENMP
-    #pragma omp parallel for reduction(+:keptCount, phasedOutCount, filteredByPhase, filteredBySecondary, filteredByChemical, filteredByLocalSegment, filteredByCoverageCut, filteredByHanging, filteredByContained, palindromicCount, chimericCount, containedCount)
-#endif
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
-        
-        // 1. AND semantics: keep an overlap only if BOTH reads keep it.
-        // Drop it if either side has any deletion reason (hifiasm-style conservative rule).
+
+        // AND semantics: keep only if BOTH sides keep it (no delete reasons on either side)
         if(!ad.keptByBothSides()) {
             keepAlignment[i] = false;
             ad.info.isInReadGraph = 0;
-            phasedOutCount++;
-            classifyFilterReason(ad);
+            filteredCount++;
+
+            // Classify the reason(s) - alignments can have multiple delete reasons
+            const AlignmentData::DeleteReasonMask reasons = ad.deleteReasons0 | ad.deleteReasons1;
+            if (reasons & AlignmentData::DeleteReasonPhase) ++filteredByPhase;
+            if (reasons & AlignmentData::DeleteReasonSecondary) ++filteredBySecondary;
+            if (reasons & AlignmentData::DeleteReasonChemical) ++filteredByChemical;
+            if (reasons & AlignmentData::DeleteReasonLocal) ++filteredByLocalSegment;
+            if (reasons & AlignmentData::DeleteReasonCoverageCut) ++filteredByCoverageCut;
+            if (reasons & AlignmentData::DeleteReasonHanging) ++filteredByHanging;
+            if (reasons & AlignmentData::DeleteReasonContained) ++filteredByContained;
             continue;
         }
-        
-        // 2. Check if reads are marked as deleted in validReadIntervals
-        if (validReadIntervals.size() > 0) {
-            if (validReadIntervals[ad.readIds[0]].isDeleted || 
-                validReadIntervals[ad.readIds[1]].isDeleted) {
-                const AlignmentData::DeleteReasonMask already =
-                    ad.deleteReasons0 | ad.deleteReasons1;
-                const AlignmentData::DeleteReasonMask majorReadLevel =
-                    AlignmentData::DeleteReasonContained | AlignmentData::DeleteReasonChimeric;
-                if ((already & majorReadLevel) == 0) {
-                    ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonLocal);
-                }
-                keepAlignment[i] = false;
-                ad.info.isInReadGraph = 0;
-                containedCount++;
-                continue;
-            }
-        }
-        
-        // 3. Check palindromic reads
-        if (reads->getFlags(ad.readIds[0]).isPalindromic || 
-            reads->getFlags(ad.readIds[1]).isPalindromic) {
-            ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonPalindromic);
-            keepAlignment[i] = false;
-            ad.info.isInReadGraph = 0;
-            palindromicCount++;
-            continue;
-        }
-        
-        // 4. Check chimeric reads
-        if(isChimericRead.size() > 0) {
-            if(isChimericRead[ad.readIds[0]] || isChimericRead[ad.readIds[1]]) {
-                keepAlignment[i] = false;
-                ad.info.isInReadGraph = 0;
-                chimericCount++;
-                continue;
-            }
-        }
-        
-        // Alignment passes all filters
+
+        // Alignment passes all filters - mark as in read graph
         ad.info.isInReadGraph = 1;
         keptCount++;
     }
 
-    cout << timestamp << "Phasing removed " << phasedOutCount << " alignments." << endl;
-    if (phasedOutCount) {
-        cout << timestamp << "  reasons among not-kept overlaps:"
-             << " phase=" << filteredByPhase
+    cout << timestamp << "Read graph filtering complete: " << filteredCount << " alignments filtered, "
+         << keptCount << " kept (" << (100.0 * keptCount / alignmentCount) << "%)." << endl;
+    if (filteredCount > 0) {
+        cout << timestamp << "  Filter reason breakdown (alignments can have multiple reasons):" << endl;
+        cout << timestamp << "    phase=" << filteredByPhase
              << " secondary=" << filteredBySecondary
              << " chemical=" << filteredByChemical
-             << " ma_hit_sub(read)=" << filteredByLocalSegment
-             << " ma_hit_cut=" << filteredByCoverageCut
-             << " ma_hit_flt=" << filteredByHanging
-             << " ma_hit_contained=" << filteredByContained
+             << " local(ma_hit_sub)=" << filteredByLocalSegment
+             << " cut(ma_hit_cut)=" << filteredByCoverageCut
+             << " hanging(ma_hit_flt)=" << filteredByHanging
+             << " contained(ma_hit_contained)=" << filteredByContained
              << endl;
     }
-    cout << timestamp << "Contained/deleted reads removed " << containedCount << " alignments." << endl;
-    cout << timestamp << "Palindromic filter removed " << palindromicCount << " alignments." << endl;
-    cout << timestamp << "Chimeric filter removed " << chimericCount << " alignments." << endl;
-    cout << timestamp << "Kept " << keptCount << " / " << alignmentCount << " alignments." << endl;
 
     // Step 8: Create read graph from kept alignments.
     // Directed read graph is optional for createReadGraph6 (it is expensive and not
@@ -411,7 +377,7 @@ void Assembler::createReadGraphFromFilteredAlignments()
         }
 
         // Also check if reads are marked deleted globally (e.g. from chimeras/containment).
-        if (validReadIntervals.size() > 0) {
+        if (!validReadIntervals.empty()) {
             if (validReadIntervals[ad.readIds[0]].isDeleted ||
                 validReadIntervals[ad.readIds[1]].isDeleted) {
                 keepAlignmentByte[i] = 0;
