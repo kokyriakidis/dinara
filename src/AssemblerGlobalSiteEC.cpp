@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <thread>
 #include <unordered_map>
@@ -195,6 +196,7 @@ struct CandidateGlobal {
     uint32_t ts = 0;
     uint32_t te = 0;
     uint32_t targetId = 0;
+    bool targetIsRc = false;
     uint8_t isMatch = 1;
 };
 
@@ -218,6 +220,8 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
     if (threadCount == 0) {
         threadCount = 1;
     }
+
+    const bool debugCheckBases = (::getenv("DINARA_EC_GLOBALSITE_ASSERT_BASES") != nullptr);
 
     AlignOptions clusteringAlignOptions{};
     clusteringAlignOptions.maxErrorRate = 1.0;
@@ -347,6 +351,7 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                     c.ts = tsFwd;
                     c.te = teFwd;
                     c.targetId = uint32_t(o1.getReadId());
+                    c.targetIsRc = (o1.getStrand() != 0);
                     c.isMatch = 1;
                     candidates.push_back(c);
                 }
@@ -393,6 +398,7 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                     uint32_t concordantAlleles = 0;
                     uint32_t discordantAlleles = 0;
 
+                    static const uint8_t complementBase[4] = {3, 2, 1, 0};
                     for (auto it = qBeginIt; it != qEndIt; ++it) {
                         const uint32_t siteId = it->siteId;
                         const auto tIt = lower_bound(
@@ -407,8 +413,25 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                             continue;
                         }
 
+                        if (debugCheckBases) {
+                            const uint8_t qBase = reads->getOrientedReadBase(
+                                OrientedReadId(ReadId(readId), 0), it->position).value;
+                            if (qBase < 4) {
+                                DINARA_ASSERT(qBase == it->allele);
+                            }
+                            const uint8_t tBase = reads->getOrientedReadBase(
+                                OrientedReadId(ReadId(candidate.targetId), 0), tIt->position).value;
+                            if (tBase < 4) {
+                                DINARA_ASSERT(tBase == tIt->allele);
+                            }
+                        }
+
                         sharedSites++;
-                        if (tIt->allele == it->allele) {
+                        uint8_t targetAllele = tIt->allele;
+                        if (candidate.targetIsRc && targetAllele < 4) {
+                            targetAllele = complementBase[targetAllele];
+                        }
+                        if (targetAllele == it->allele) {
                             concordantAlleles++;
                         } else {
                             discordantAlleles++;
@@ -434,7 +457,6 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                     const bool keep = !isInformativeRead || (candidate.isMatch == 1);
                     if (keep) {
                         ad.clearDeleteReasonsFromReadPerspective(queryReadId, AlignmentData::DeleteReasonPhase);
-                        ad.info.isInReadGraph = 1;
                     } else {
                         ad.addDeleteReasonsFromReadPerspective(queryReadId, AlignmentData::DeleteReasonPhase);
                     }
