@@ -557,20 +557,20 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(16),
         "InvertedIndex chaining: hard cap on retained high-frequency markers per streak (hifiasm MAX_MAX_HIGH_OCC equivalent).")
 
-        ("OverlapCandidates.invertedIndexChainFilterRatio",
-        value<double>(&overlapCandidatesOptions.invertedIndexChainFilterRatio)->
-        default_value(0.80),
-        "InvertedIndex chaining: keep chain ends with score >= bestScore * ratio.")
+        ("OverlapCandidates.invertedIndexHighFactor",
+        value<double>(&overlapCandidatesOptions.invertedIndexHighFactor)->
+        default_value(5.0),
+        "Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain). Default 5.0.")
 
-        ("OverlapCandidates.invertedIndexChainFilterMinScore",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexChainFilterMinScore)->
-        default_value(3),
-        "InvertedIndex chaining: minimum score threshold for candidate chain ends.")
+        ("OverlapCandidates.invertedIndexMinNChain",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMinNChain)->
+        default_value(100),
+        "Hifiasm MIN_N_CHAIN: minimum value for max_n_chain. Default 100.")
 
         ("OverlapCandidates.invertedIndexNonRedundantOverlapFraction",
         value<double>(&overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction)->
-        default_value(0.5),
-        "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction.")
+        default_value(1.0),
+        "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction. Default 1.0 (disabled) matches hifiasm r484 commented-out state.")
 
         ("OverlapCandidates.invertedIndexLchainIsAccurate",
         value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
@@ -1668,8 +1668,8 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexDownsampleHighFrequencyMarkers = " << convertBoolToPythonString(invertedIndexDownsampleHighFrequencyMarkers) << "\n";
     s << "invertedIndexHighFrequencySampleDistance = " << invertedIndexHighFrequencySampleDistance << "\n";
     s << "invertedIndexMaxHighFrequencyPerStreak = " << invertedIndexMaxHighFrequencyPerStreak << "\n";
-    s << "invertedIndexChainFilterRatio = " << invertedIndexChainFilterRatio << "\n";
-    s << "invertedIndexChainFilterMinScore = " << invertedIndexChainFilterMinScore << "\n";
+    s << "invertedIndexHighFactor = " << invertedIndexHighFactor << "\n";
+    s << "invertedIndexMinNChain = " << invertedIndexMinNChain << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
     s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
     s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";

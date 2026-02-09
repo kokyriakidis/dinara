@@ -278,6 +278,7 @@ public:
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
     void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
+    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -2402,6 +2403,15 @@ private:
     };
     FindMarkersSimdClosedSyncmersData findMarkersSimdClosedSyncmersData;
 
+    void findMarkersSimdMinimizersPass1(size_t threadId);
+    void findMarkersSimdMinimizersPass2(size_t threadId);
+    class FindMarkersSimdMinimizersData {
+    public:
+         int k;
+         int w; // window size for minimizers
+    };
+    FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
+
 public:
     // Prune existing markers based on KmerCounter frequencies.
     void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount);
@@ -2461,8 +2471,8 @@ private:
              bool downsampleHighFrequencyMarkers = true;
              uint32_t highFrequencySampleDistance = 500;
              uint32_t maxHighFrequencyPerStreak = 16;
-             double chainFilterRatio = 0.80;
-             uint32_t chainFilterMinScore = 3;
+             double highFactor = 5.0;        // Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain)
+             uint32_t minNChain = 100;       // Hifiasm MIN_N_CHAIN: minimum max_n_chain value
              double nonRedundantOverlapFraction = 0.5;
              bool lchainIsAccurate = true;
              bool useEcScoring = true;

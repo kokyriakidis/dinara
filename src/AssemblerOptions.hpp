@@ -206,26 +206,45 @@ public:
     uint32_t minOverlapLength = 50; // Minimum overlap span (bases) for a candidate to be kept (applies to pre-extension span).
     uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension (bases) to reach read ends.
 
-    // Additional knobs for the InvertedIndex chaining path (defaults match current hard-coded behavior).
+    // Additional knobs for the InvertedIndex chaining path (defaults match hifiasm behavior).
     // These exist so we can more easily match hifiasm/minimap2 behavior when needed.
-    double invertedIndexWeightExponent = 1.1;                // Exponent used in the frequency weight LUT: pow(w, exponent)
-    double invertedIndexLowFreqMultiplier = 0.333;           // lowFreq = coveragePeak * multiplier
-    double invertedIndexHighFreqMultiplier = 1.667;          // highFreq = coveragePeak * multiplier
-    uint32_t invertedIndexRareKmerWeight = 2;                // Weight used for rare/informative kmers
-    bool invertedIndexDownsampleHighFrequencyMarkers = true; // If true, downsample high-frequency marker streaks before chaining.
-    uint32_t invertedIndexHighFrequencySampleDistance = 500; // Hifiasm-like sample distance used to compute how many high-frequency markers to keep per streak.
-    uint32_t invertedIndexMaxHighFrequencyPerStreak = 16;    // Hard cap on retained high-frequency markers per streak (hifiasm MAX_MAX_HIGH_OCC).
-    double invertedIndexChainFilterRatio = 0.80;             // filterThresh = bestScore * ratio
-    uint32_t invertedIndexChainFilterMinScore = 3;           // Minimum filterThresh
-    double invertedIndexNonRedundantOverlapFraction = 0.5;   // Reject candidates overlapping > frac of an accepted interval
-    bool invertedIndexLchainIsAccurate = true;               // Hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp path).
-    bool invertedIndexUseEcScoring = true;                   // Use comput_sc_ch_ec-style long-gap penalty in chaining.
-    bool invertedIndexEnableMcopyFast = true;                // Hifiasm-like multi-peak chain extraction to reduce expensive downstream work.
-    uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm-like: keep up to 3 score-competitive chains per pair.
-    double invertedIndexMcopyRate = 0.70;                    // ONT EC parity: keep chains with score >= bestScore * 0.7.
-    uint32_t invertedIndexMcopyKhitCutoff = 32;              // ONT EC parity: require >=32 anchors before enabling secondary mcopy chains.
-    uint32_t invertedIndexMcopyOcvWindow = 3072;             // Hifiasm COV_W-style window for containing-overlap overload control.
-    double invertedIndexMcopyOcvWeakKeepRatio = 0.70;        // Keep weak containing overlaps when non-saturated window coverage fraction >= this value.
+
+    // --- Marker frequency-based weighting (hifiasm anchor.cpp) ---
+    double invertedIndexWeightExponent = 1.1;                // Exponent for frequency-based weight LUT: weight = pow(count, exponent)
+    double invertedIndexLowFreqMultiplier = 0.333;           // Hifiasm HA_KMER_GOOD_RATIO: low_occ = hom_cov * 0.333
+    double invertedIndexHighFreqMultiplier = 1.667;          // Hifiasm: high_occ = hom_cov * (2.0 - HA_KMER_GOOD_RATIO) = hom_cov * 1.667
+    uint32_t invertedIndexRareKmerWeight = 2;                // Weight assigned to rare/informative kmers
+
+    // --- High-frequency marker downsampling (hifiasm sketch.cpp) ---
+    bool invertedIndexDownsampleHighFrequencyMarkers = true; // Downsample high-frequency marker streaks before chaining
+    uint32_t invertedIndexHighFrequencySampleDistance = 500; // Sample distance for computing streak retention
+    uint32_t invertedIndexMaxHighFrequencyPerStreak = 16;    // Hifiasm MAX_MAX_HIGH_OCC: hard cap on high-freq markers per streak
+
+    // --- Chain selection strategy (hifiasm anchor.cpp soft ranking) ---
+    // Hifiasm uses soft ranking: keep top N overlaps per read by score, no hard minimum score threshold.
+    // The max_n_chain limit (max overlaps per read) is computed as: max(hom_cov * high_factor, min_n_chain)
+    double invertedIndexHighFactor = 5.0;                    // Hifiasm high_factor: max_n_chain = max(hom_cov * 5.0, 100) (CommandLines.cpp:271,413)
+    uint32_t invertedIndexMinNChain = 100;                   // Hifiasm MIN_N_CHAIN: minimum max_n_chain (CommandLines.h:28)
+
+    // --- Redundant chain suppression (hifiasm chain_cutoff logic) ---
+    // Note: Hifiasm's r484 interval overlap filtering (anchor.cpp:1874-1911) is commented out.
+    // Setting to 1.0 disables this filtering to match hifiasm's current behavior (no interval filtering).
+    // If hifiasm's r484 were active, it would use 0.95 threshold.
+    double invertedIndexNonRedundantOverlapFraction = 1.0;   // Disabled (was 0.5) - matches hifiasm r484 commented-out state
+
+    // --- Chaining parameters (hifiasm lchain) ---
+    bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
+    bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring
+
+    // --- Multi-peak chain extraction (hifiasm mcopy) ---
+    bool invertedIndexEnableMcopyFast = true;                // Enable mcopy_fast: extract multiple score-competitive chains
+    uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm ecovlp.cpp:3274: keep up to 3 chains per pair
+    double invertedIndexMcopyRate = 0.70;                    // Hifiasm ecovlp.cpp:3274: keep chains with score >= best * 0.7
+    uint32_t invertedIndexMcopyKhitCutoff = 32;              // Hifiasm ecovlp.cpp:3274: require >=32 markers to enable mcopy
+
+    // --- Overlap coverage control (hifiasm COV_W) ---
+    uint32_t invertedIndexMcopyOcvWindow = 3072;             // Hifiasm COV_W=3072: window size for containing-overlap detection
+    double invertedIndexMcopyOcvWeakKeepRatio = 0.70;        // Keep weak overlaps when window coverage fraction >= 0.7
 
     void write(ostream&) const;
 };
