@@ -202,7 +202,7 @@ class dinara::OverlapCandidatesOptions {
 public:
     string method;              // "MinHash" or "InvertedIndex".
     double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
-    int minChainMarkerCount = 2;    // Minimum marker count required for a chained overlap candidate.
+    int minChainMarkerCount = 1;    // Minimum marker count required for a chained overlap candidate. Hifiasm: no hard minimum (uses soft ranking).
     uint32_t minOverlapLength = 50; // Minimum overlap span (bases) for a candidate to be kept (applies to pre-extension span).
     uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension (bases) to reach read ends.
 
