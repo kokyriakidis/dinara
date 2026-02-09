@@ -496,12 +496,20 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD closed syncmers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
-        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
+        // ORIGINAL: Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
         // This generates a superset of the markers we eventually want.
         assembler.findMarkersSimdClosedSyncmers(
             threadCount,
             assemblerOptions.kmersOptions.k,
             assemblerOptions.kmersOptions.syncmerS);
+
+        // // NEW: Use SIMD-accelerated minimizers instead of closed syncmers.
+        // // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
+        // // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+        // assembler.findMarkersSimdMinimizers(
+        //     threadCount,
+        //     assemblerOptions.kmersOptions.k,
+        //     assemblerOptions.kmersOptions.k);  // Using syncmerS as window size w
 
         // Compute histogram using the pre-calculated KmerIds.
         // This avoids accessing the Reads data structure (Cache Misses).
@@ -557,9 +565,28 @@ void dinara::main::assemble(
     // }
 
 
-    // Compute maxChainLimit from coverage (Hifiasm parity: max(100, hom_cov * 5))
+    // ========================================================================
+    // HIFIASM MAX_N_CHAIN CALCULATION (Per-Read Overlap Limiting)
+    // ========================================================================
+    // Reference: Hifiasm CommandLines.cpp:413, anchor.cpp:191-220
+    //
+    // Compute max_n_chain = max(MIN_N_CHAIN, hom_cov * high_factor)
+    //
+    // Purpose: Limit total number of overlaps kept per read across ALL partners
+    // - Applied AFTER chaining all read pairs (not during DP chaining)
+    // - Prevents memory explosion from reads with many partners
+    // - Keeps top N overlaps by score, grouped by overlap type
+    //
+    // Hifiasm defaults:
+    //   high_factor = 5.0 (CommandLines.cpp:271)
+    //   MIN_N_CHAIN = 100 (CommandLines.h:28)
+    //
+    // Example: coverage = 30x → max(100, 30*5) = 150 overlaps per read
+    //
     const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
-    const uint64_t maxChainLimit = std::max(100UL, coveragePeak * 5);
+    const uint64_t maxChainLimit = std::max<uint64_t>(
+        assemblerOptions.overlapCandidatesOptions.invertedIndexMinNChain,     // MIN_N_CHAIN = 100
+        uint64_t(double(coveragePeak) * assemblerOptions.overlapCandidatesOptions.invertedIndexHighFactor + 0.499));  // hom_cov * 5.0
 
     // Always build the inverted index for k-mer lookups (needed by both paths)
     assembler.buildInvertedIndex(threadCount);
