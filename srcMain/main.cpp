@@ -1122,7 +1122,7 @@ void dinara::main::assemble(
         2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
-        true,                                           // allowDuplicateMarkers
+        false,                                           // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);

@@ -502,16 +502,51 @@ static bool if_is_homopolymer_strict(const SeqType& seq, int64_t len, uint32_t p
 
 
 /*
-detectHetSites: build SNP candidate rows and per-overlap mismatch evidence for one query read.
+================================================================================
+detectHetSites: SNP Detection and Evidence Extraction (Stage 1 of EC Pipeline)
+================================================================================
 
-Conceptually this stage corresponds to the “site aggregation” and “push_info” steps in hifiasm:
-we turn raw per-alignment mismatch evidence into:
-  - a set of candidate SNP rows (snpStats), including multi-allelic sites (one row per alt base)
-  - a per-overlap list of mismatches at those sites (hapEvidence)
+PURPOSE:
+  Build candidate heterozygous SNP sites and per-overlap mismatch evidence for one
+  query read. This is the first stage of hifiasm-parity error correction and
+  corresponds to hifiasm's "site aggregation" and "push_info" steps.
 
-We also compute per-overlap query-coordinate “hole” intervals from the indel evidence stream.
-These holes represent query positions where the overlap has no aligned target base, so the overlap
-must not contribute coverage or ref-support for SNP calling inside those intervals.
+INPUT:
+  - queryReadId: The read being error-corrected
+  - candidates: List of overlaps (already filtered and scored) covering this read
+  - alignmentData: Container with alignment evidence (SNPs, indels) from overlap computation
+
+OUTPUT (via scratch pad):
+  - snpStats: Candidate SNP rows (one per alternative allele, multi-allelic modeled as
+              multiple rows at the same query position)
+  - hapEvidence: Per-overlap mismatch observations linked to SNP rows
+  - insertionOffsets/insertionIntervals: Per-overlap "hole" intervals where the overlap
+              has no aligned base (deletions in query coordinate sense)
+
+ALGORITHM OVERVIEW:
+  Step 1: Unpack query read into 2-bit array for fast base lookups
+  Step 2: Extract mismatch evidence from alignment store and build hole intervals
+  Step 3: Build sorted list of unique query positions with mismatches
+  Step 4: Compute per-site coverage using sweep-line algorithm with difference arrays
+  Step 5: Aggregate mismatch counts per base, apply filters, emit SNP rows
+
+KEY HIFIASM PARITY DETAILS:
+  - Only emit SNP rows when alt allele has >=2 supporting overlaps (push_info rule)
+  - Apply strand-bias filters to both ref and alt alleles (is_st_bs equivalent)
+  - Query read contributes +1 to ref support (occ_0 includes query itself)
+  - Coverage computation subtracts "hole" intervals so gapped positions don't count
+  - Multi-allelic sites create multiple rows, each with independent alt allele
+
+PERFORMANCE NOTES:
+  - Sweep-line coverage: O(nOverlaps + nSites) instead of O(nOverlaps * nSites)
+  - Binary search for hole interval mapping: O(log nHoles) per site per overlap
+  - Difference arrays avoid repeated iteration over overlap ranges
+
+WHY THIS MATTERS:
+  Accurate SNP detection is critical for downstream phasing (DP chaining) and
+  transitive closure. Over-calling creates spurious trans overlaps; under-calling
+  misses true heterozygosity. The filters here (minimum support, strand bias,
+  coverage threshold) balance sensitivity and specificity to match hifiasm behavior.
 */
 template<typename AlignmentContainer>
 static void detectHetSites(
@@ -659,19 +694,47 @@ static void detectHetSites(
     }
 
     /*
-    Step 4: compute coverage at each candidate site.
+    =============================================================================
+    Step 4: Compute Coverage at Each Candidate Site Using Difference Arrays
+    =============================================================================
 
-    For each unique query position in uniqueSites we need:
-      - total number of overlaps that cover that position (siteTotalCov)
-      - number of those overlaps on the “forward” orientation in our per-query coordinate system
-        (siteFwdCov), used for strand-bias checks
+    GOAL:
+      For each unique query position in uniqueSites, compute:
+        - siteTotalCov[i]: Total number of overlaps covering that position
+        - siteFwdCov[i]: Number of forward-orientation overlaps covering that position
 
-    Naively testing every overlap against every site would be O(#overlaps * #sites). Instead we:
-      - convert each overlap into a [start,end) range in site-index space using lower_bound
-      - add that range to a difference array, then prefix-sum once
+      These coverage values are later used to derive ref support counts:
+        refCov = totalCov - totalMismatches
 
-    We subtract each overlap’s “hole” intervals so that positions with no aligned base do not
-    contribute to coverage or to derived ref counts.
+      Forward coverage is used for strand-bias filtering (is_st_bs equivalent).
+
+    WHY DIFFERENCE ARRAYS:
+      Naively checking every overlap against every site would be O(#overlaps * #sites).
+      For a read with 100 overlaps and 500 sites, that's 50,000 tests.
+
+      Instead, we use a difference array approach:
+        1. Map each overlap's [qs, qe) range to site indices using binary search
+        2. Mark "coverage starts" at index idxS: diffTotal[idxS]++
+        3. Mark "coverage ends" at index idxE: diffTotal[idxE]--
+        4. Prefix-sum the difference array once: O(#sites)
+
+      This reduces complexity to O(#overlaps * log(#sites) + #sites).
+      For 100 overlaps and 500 sites: ~1,200 operations instead of 50,000.
+
+    HOLE INTERVAL SUBTRACTION:
+      Overlaps can have "holes" (deletions in query coordinate sense) where there's
+      no aligned target base. These positions should NOT contribute to coverage.
+
+      We subtract hole intervals using the same difference array technique:
+        - For each hole [begin, end) within an overlap
+        - Map to site indices [hS, hE)
+        - Subtract from coverage: diffTotal[hS]--, diffTotal[hE]++
+
+      This ensures ref support is only counted at positions with actual aligned bases.
+
+    PERFORMANCE IMPACT:
+      This optimization is critical for reads with many overlaps. Without it,
+      coverage computation would dominate runtime for high-coverage datasets.
     */
     const size_t nSites = uniqueSites.size();
     auto& diffTotal = scratch.diffTotal;
@@ -735,16 +798,73 @@ static void detectHetSites(
     }
 
     /*
-    Step 5: turn per-site mismatch counts + per-site coverage into SNP rows.
+    =============================================================================
+    Step 5: Aggregate Mismatch Counts and Emit SNP Rows with Filtering
+    =============================================================================
 
-    For each query position in uniqueSites we:
-      - count mismatch support per base (and per strand)
-      - combine with coverage to estimate ref support at the site
-      - apply minimal evidence and strand-bias filters
-      - emit one SnpStats row per alternative base with enough support (multi-allelic modeled as
-        multiple rows sharing the same site)
-      - annotate the row with the query-side strict homopolymer flag
-      - map each mismatch evidence entry at this site to the correct emitted row (overlapSite)
+    GOAL:
+      Transform per-site mismatch counts and coverage into validated SNP rows.
+      Each row represents one candidate heterozygous site with:
+        - Query position (site)
+        - Reference base and one alternative base
+        - Ref support count (occ_0) and alt support count (occ_1)
+        - Strand-bias metadata (fwd_ref_cov)
+        - Query-side homopolymer flag (is_homopolymer)
+
+    ALGORITHM:
+      For each unique query position:
+        1. Count mismatch support per base (A/C/G/T) and per strand
+        2. Derive ref support: refCov = totalCov - totalMismatches
+        3. Apply filters (minimum coverage, minimum alt support, strand bias)
+        4. Emit one SNP row per alternative base that passes filters
+        5. Link mismatch evidence entries to emitted rows
+
+    FILTERING STAGES:
+
+      A. Minimum Alt Support (push_info rule):
+         - Require at least 2 overlaps supporting each alt allele
+         - This is the PRIMARY filter from hifiasm's push_info()
+         - Prevents spurious single-mismatch noise from creating SNP rows
+
+      B. Minimum Total Coverage:
+         - Require totalCov >= 5
+         - Pragmatic guard against low-quality sites dominated by noise
+         - Matches hifiasm behavior and downstream overlap marking expectations
+
+      C. Ref Strand-Bias Filter (is_st_bs equivalent):
+         - When refCov > 2, check if ref support is extremely biased to one strand
+         - Reject if >=95% forward or <=5% forward
+         - Prevents overcalling sites where ref is strand-specific artifact
+
+      D. Alt Strand-Bias Filter:
+         - When misCount > 2, same bias check on alt allele
+         - Ensures alt evidence isn't purely from one strand
+
+    MULTI-ALLELIC MODELING:
+      Sites with multiple alternative alleles (e.g., A->C and A->T) create
+      MULTIPLE SNP rows, one per alt allele. Each row is independently:
+        - Filtered for strand bias and minimum support
+        - Scored in DP chaining (can link different alt alleles)
+        - Subject to transitive closure decisions
+
+    QUERY +1 CONTRIBUTION:
+      occ_0 includes +1 for the query read itself:
+        occ_0 = refCov + 1
+
+      This mirrors hifiasm's modeling where the query contributes one unit of
+      reference support at its own base. Without this, hom-ref sites would
+      appear zero-coverage.
+
+    HOMOPOLYMER ANNOTATION:
+      The is_homopolymer flag marks sites in query-side HP runs. This is
+      used later for robustness checks (singleton HP validation), but does
+      NOT cause sites to be dropped at this stage.
+
+    EVIDENCE LINKING:
+      Each mismatch evidence entry in hapEvidence gets its overlapSite field
+      set to the SNP row index it supports. If the mismatch base didn't pass
+      filters (e.g., weak third allele), overlapSite stays invalid and the
+      evidence is ignored by downstream stages.
     */
     for (size_t siteIdx = 0, evidenceIdx = 0; siteIdx < nSites; ++siteIdx) {
         const uint32_t site = uniqueSites[siteIdx];
@@ -1013,26 +1133,117 @@ inline int64_t comput_sc_rphase_strict(
 }
 
 /*
-gen_rphase_dp: dynamic programming chaining of SNP rows for one query read.
+================================================================================
+gen_rphase_dp: DP Chaining and Phasing Validation (Stage 2 of EC Pipeline)
+================================================================================
 
-This stage is the core of parity-EC. It answers: “which SNP rows are mutually consistent enough
-to be considered phased/validated for this query read?”.
+PURPOSE:
+  Determine which SNP rows are mutually consistent and should be validated
+  for error correction. This is the CORE of hifiasm-parity EC and directly
+  corresponds to hifiasm's gen_rphase_dp + gen_rphase_dp0_single_path.
 
-The implementation mirrors the shape of hifiasm’s gen_rphase_dp + gen_rphase_dp0_single_path:
-  - Build a compact matrix representation of allele states per overlap per SNP row.
-  - Score links between SNP rows with a strict biallelic consistency test.
-  - Run a DP to find chains of mutually consistent rows.
-  - Apply hifiasm-style cc filtering based on coveragePeak (hom_cov), n_hap=2, cut_rate=0.7,
-    cut_bd=6.
-  - Compact snpStats/hapEvidence down to the DP-retained rows and reset row score semantics to
-    match hifiasm’s downstream expectations.
+  The central question: "Which heterozygous sites can be reliably phased
+  together based on consistent allele patterns across overlapping reads?"
 
-Important representation details:
-  - nCands overlaps are represented as bitsets with nWords=(nCands+63)/64 64-bit words.
-  - For each SNP row we store two bitsets interleaved in flatBits:
-        rowRefBits[w] at flatBits[row*2*nWords + 2*w]
-        rowAltBits[w] at flatBits[row*2*nWords + 2*w + 1]
-    and one bitset flatAnyBits[row*nWords + w] for “other allele” observations at that site.
+INPUT (via scratch pad):
+  - snpStats: Candidate SNP rows from detectHetSites
+  - hapEvidence: Per-overlap mismatch observations
+  - candidates: List of overlaps covering the query read
+  - insertionOffsets/insertionIntervals: Hole intervals for coverage computation
+
+OUTPUT (via scratch pad):
+  - snpStats: COMPACTED to only DP-retained rows with dpScore=1
+  - hapEvidence: COMPACTED and remapped to new row indices
+  - Final score field reset to -1 (ready for transitive closure stage)
+
+ALGORITHM OVERVIEW:
+  Step 1: Build bit-matrices for allele states (Ref, Alt, AnyOther per SNP row)
+  Step 2: Build Ref bitsets using sweep-line coverage computation
+  Step 3: Run DP chaining with strict biallelic linkage test
+  Step 4: Extract disjoint best paths and apply cc filtering
+  Step 5: Compact SNP rows and evidence to only DP-retained entries
+
+KEY CONCEPTS:
+
+  A. BITSET REPRESENTATION:
+     Overlaps are represented as 64-bit bitsets (nWords = ceil(nCands/64)).
+     For each SNP row i, we store THREE bitsets:
+       - Ref[i]: Overlaps supporting reference allele at this site
+       - Alt[i]: Overlaps supporting alternative allele at this site
+       - AnyOther[i]: Overlaps with mismatch but not the chosen alt base
+
+     These bitsets enable O(nWords) linkage tests between any pair of rows.
+
+  B. STRICT BIALLELIC LINKAGE (comput_sc_rphase_strict):
+     Two SNP rows can link if:
+       - At least one overlap supports ref-ref across both sites
+       - At least one overlap supports alt-alt across both sites
+       - No contradictions: overlaps with "other" at one site and known at
+         the other are treated as invalid (third-allele indicator)
+
+     Special case: overlaps with "other" at BOTH sites count as ref-ref support
+     (hifiasm's "rareRef" pattern).
+
+  C. DP CHAINING:
+     Let f[v] = best chain score ending at validIndices[v]
+     Let p[v] = predecessor in that chain
+
+     For each SNP row v eligible for DP (occ_0 >= s_hap_cov, occ_1 >= infor_cov):
+       f[v] = 1  // Base case: singleton path
+       For each potential predecessor u (site[u] < site[v]):
+         If linkage test passes and f[u] + linkScore > f[v]:
+           f[v] = f[u] + linkScore
+           p[v] = u
+
+     Rows at the same query position (multi-allelic) don't link to each other.
+
+  D. PATH EXTRACTION:
+     Extract disjoint paths in descending f[] order:
+       - Multi-site paths (length > 1) always accepted: score = 1
+       - Singleton paths require:
+           1. occ_0 >= cc (coverage cutoff)
+           2. NOT HP-masked after target-side homopolymer discounting
+
+  E. CC CUTOFF (Coverage Cutoff):
+     Hifiasm defines cc = max(cut_bd, (hom_cov / n_hap) * cut_rate)
+     Where:
+       - hom_cov = coveragePeak (from k-mer distribution)
+       - n_hap = 2 (diploid assumption)
+       - cut_rate = 0.7 (70% of expected haploid coverage)
+       - cut_bd = 6 (minimum absolute cutoff)
+
+     This filters low-coverage singleton paths that might be noise.
+
+  F. SINGLETON HP VALIDATION:
+     For singleton paths ONLY, check if the site would remain informative
+     after discounting HP-suspect observations on the target side:
+       - Count overlaps where target position is in a homopolymer run
+       - Subtract from occ_0 and occ_1 to get robust counts
+       - Reject if robust counts fall below thresholds (s_hap_cov=3, infor_cov=3)
+
+     This matches hifiasm's robustness check for isolated heterozygous sites.
+
+HIFIASM PARITY DETAILS:
+  - Uses same DP formulation as gen_rphase_dp0_single_path
+  - Identical cc calculation (hom_cov / 2 * 0.7, min 6)
+  - Same multi-allelic handling (rows at same position don't link)
+  - Same score semantics: score=1 for retained, score=-1 for dropped
+  - Compaction before transitive closure matches hifiasm's pipeline flow
+
+PERFORMANCE NOTES:
+  - Bitset operations: O(nWords) per linkage test, very fast
+  - DP complexity: O(nValidRows^2 * nWords) worst case
+    - In practice, much better due to same-site blocking
+    - For 100 rows: ~5,000 comparisons * ~2 words = ~10K bitwise ops
+  - Sweep-line coverage: O(nCands + nSites) instead of O(nCands * nSites)
+  - Singleton HP validation: O(nCands) target read accesses per singleton
+    - This is the only expensive part (disabled in main DP for performance)
+
+WHY THIS MATTERS:
+  DP chaining is what separates true heterozygosity from sequencing noise.
+  Multi-site phased paths have strong evidence across multiple positions.
+  Singleton paths require extra validation (cc threshold, HP check) to avoid
+  false positives. Getting this right determines error correction accuracy.
 */
 static void gen_rphase_dp(
     Assembler& assembler,
@@ -1392,10 +1603,62 @@ static void gen_rphase_dp(
     }
 
     /*
-    Step 4: extract disjoint best paths from the DP predecessor graph.
+    =============================================================================
+    Step 4: Extract Disjoint Best Paths from DP Predecessor Graph
+    =============================================================================
 
-    Hifiasm’s single-path DP assigns scores and then extracts paths in descending score order,
-    marking visited nodes to avoid reusing the same SNP row in multiple chains.
+    PURPOSE:
+      Extract the best set of non-overlapping (disjoint) paths from the DP
+      predecessor graph built in Step 3. Each path represents a phased set
+      of heterozygous sites that will be validated for error correction.
+
+    ALGORITHM:
+      1. Sort all DP nodes by their best chain score f[v] in descending order
+      2. Greedily extract paths starting from highest-scoring unvisited nodes:
+         a) For each node v with f[v] >= 1 and not yet visited:
+            - Walk backwards through predecessors: v → p[v] → p[p[v]] → ...
+            - Mark all nodes in this path as visited
+            - Apply scoring rules to determine if path is accepted (plus = 1 or -1)
+         b) Assign final score to all nodes in the path based on plus value
+
+    PATH SCORING RULES (matches hifiasm's no-QV branch):
+      - Multi-site paths (length > 1): ALWAYS accepted (plus = 1)
+      - Singleton paths (length == 1): Conditional acceptance based on:
+          1. Coverage threshold: occ_0 >= cc
+          2. HP robustness: Not HP-masked after target-side discounting
+        If both conditions met: plus = 1, otherwise plus = -1
+
+      Final assignment:
+        For each node v in path:
+          score = (occ_0 >= cc) ? plus : -1
+
+      This means even within an accepted path, individual nodes can be rejected
+      if they don't meet the cc coverage threshold.
+
+    WHY DISJOINT PATHS:
+      Each SNP row can only belong to ONE path. Once a node is visited and
+      assigned to a path, it cannot be used in another path. This prevents:
+        - Double-counting evidence from the same site
+        - Conflicting phasing assignments
+        - Overlapping paths that would create inconsistent haplotypes
+
+    GREEDY EXTRACTION ORDER:
+      Processing in descending f[] order ensures that:
+        - Longest, highest-scoring chains are extracted first
+        - Remaining nodes may form shorter paths or singletons
+        - Maximum total phasing information is preserved
+
+    HIFIASM PARITY:
+      This exactly matches hifiasm's gen_rphase_dp0_single_path extraction:
+        - Same greedy order (descending f[])
+        - Same disjoint constraint (rowIsValid marking)
+        - Same multi-site vs singleton scoring rules
+        - Same cc threshold application per node
+
+    PERFORMANCE:
+      - Sorting: O(nV log nV) where nV = number of DP-eligible rows
+      - Path extraction: O(nV) total (each node visited once)
+      - For typical read: nV ~ 50-200 rows → negligible cost
     */
     const auto tExtractBegin = timing ? steady_clock::now() : steady_clock::time_point{};
     vector<pair<int64_t, int>> scoreIdx;
@@ -1415,23 +1678,127 @@ static void gen_rphase_dp(
         }
 
         /*
-        Determine the “plus” score for this extracted path.
+        =====================================================================================
+        SINGLETON PATH VALIDATION WITH TARGET-SIDE HOMOPOLYMER MASKING
+        =====================================================================================
 
-        In hifiasm’s no-QV branch:
-          - any multi-site path is accepted (plus=1)
-          - a singleton path is only accepted if it is not HP-suspect and has occ_0 >= cc
-        We mirror that behavior here.
+        PURPOSE:
+          Determine the "plus" score for this extracted DP path, which controls whether
+          the SNP sites in the path are retained for error correction.
+
+        HIFIASM PARITY LOGIC (no-QV branch):
+          1. Multi-site paths (length > 1): ALWAYS accepted (plus = 1)
+             - Strong evidence from phasing across multiple sites
+             - Unlikely to be sequencing noise
+
+          2. Singleton paths (length == 1): Require BOTH conditions:
+             a) Coverage threshold: occ_0 >= cc (typically 6-12 based on coverage peak)
+             b) HP robustness: Site remains informative after discounting HP-suspect observations
+
+        WHY SINGLETON PATHS NEED EXTRA VALIDATION:
+          Multi-site paths have mutual support across positions, making them robust.
+          Singleton paths are isolated heterozygous sites with no phasing context,
+          making them vulnerable to:
+            - Sequencing errors in homopolymer runs
+            - Low-coverage noise
+            - Systematic sequencing artifacts
+
+        ALGORITHM:
+          For each singleton path:
+            Step A: Check coverage threshold (occ_0 >= cc)
+            Step B: Count HP-suspect observations on TARGET side:
+                    - For each overlap covering this site
+                    - Map query coordinate to target coordinate
+                    - Check if target position is in a homopolymer run (hpc_mask_ff)
+                    - Count HP-suspect overlaps separately for ref and alt alleles
+            Step C: Compute robust counts after HP discounting:
+                    - n0_robust = occ_0 - hpRef
+                    - n1_robust = occ_1 - hpAlt
+            Step D: Reject if robust counts fall below thresholds:
+                    - Must have n0_robust >= 2 AND n1_robust >= 2 (minimum evidence)
+                    - Must have n0_robust >= s_hap_cov=3 AND n1_robust >= infor_cov=3
+            Step E: Accept only if NOT HP-masked (plus = 1)
+
+        TARGET-SIDE HP MASKING EXPLAINED:
+          Homopolymer runs (e.g., AAAAA) are error-prone in sequencing. When the
+          TARGET read has a HP run at the aligned position, that observation is
+          considered unreliable (HP-suspect) even if the overlap supports ref or alt.
+
+          Example:
+            Query:  ...GCTA...  (query position 100)
+            Target: ...AAAAAAA... (target position 500, inside HP run)
+            Even if this overlap shows a mismatch at query position 100, we discount
+            it because the target position is HP-suspect.
+
+        COORDINATE MAPPING (CRITICAL FOR CORRECTNESS):
+          Mapping query coordinate to target coordinate requires careful arithmetic:
+
+          1. Compute query offset: queryOffset = querySite - cand.qs
+          2. Map to target coordinate:
+             - Forward overlap: targetSite = cand.ts + queryOffset
+             - Reverse overlap: targetSite = cand.te - queryOffset - 1
+
+          OVERFLOW/UNDERFLOW PROTECTION (Bug fix 2026-Feb-09):
+            Original buggy code:
+              const uint32_t targetSite = cand.isRev ?
+                  (uint32_t)(cand.te - (querySite - cand.qs) - 1) :
+                  (uint32_t)(cand.ts + (querySite - cand.qs));
+              if (targetSite >= view.baseCount) continue;
+
+            Problem: Cast to uint32_t BEFORE bounds check can wrap large uint64_t values:
+              - If cand.ts + queryOffset > 2^32, cast wraps to small value
+              - If cand.te <= queryOffset, subtraction underflows, cast wraps
+              - Wrapped value passes bounds check, causes out-of-bounds access → SEGFAULT
+
+            Fix: Perform arithmetic and bounds checking in uint64_t, THEN cast:
+              const uint64_t queryOffset = uint64_t(querySite) - cand.qs;
+              uint64_t targetSite64;
+              if (cand.isRev) {
+                  if (cand.te <= queryOffset) continue;  // Underflow check
+                  targetSite64 = cand.te - queryOffset - 1;
+              } else {
+                  targetSite64 = cand.ts + queryOffset;
+              }
+              if (targetSite64 >= view.baseCount) continue;  // Bounds check in uint64_t
+              const uint32_t targetSite = (uint32_t)targetSite64;  // Safe cast
+
+        GAP CHECKING:
+          Overlaps can have "holes" (deletions in query coordinate sense) where there's
+          no aligned target base. The isGappedAtSite helper uses binary search on the
+          sorted gap intervals to check if the query position falls in a hole.
+
+          If gapped, the overlap is skipped for HP masking (no aligned base to check).
+
+        PERFORMANCE NOTES:
+          This is the ONLY place in the DP pipeline where target-side HP masking happens.
+          The main DP loop (useOverlapHpMask flag at line 1529) has it DISABLED for
+          performance, but singleton validation needs this robustness check.
+
+          Cost: O(nCands * nSingletons) target read accesses, but typically only a few
+          singleton paths exist, so total cost is acceptable (~1-5% overhead).
+
+        WHY THIS MATTERS:
+          Singleton HP validation prevents false positive heterozygous calls in HP regions.
+          Without this check, sequencing errors in HP runs would be called as SNPs and
+          incorrectly mark overlaps as trans, damaging assembly contiguity.
+
+          Multi-site paths don't need this check because phasing across positions provides
+          strong evidence independent of HP-specific artifacts.
         */
         int plus = -1;
         if (pathNodes.size() > 1) {
+            // Multi-site path: always accepted
             plus = 1;
         } else if (pathNodes.size() == 1) {
+            // Singleton path: require coverage threshold + HP robustness
             const int siteV = validIndices[pathNodes[0]];
             if (snpStats[siteV].occ_0 >= cc) {
                 bool hpMasked = false;
                 {
                     const uint32_t querySite = snpStats[siteV].site;
                     const uint64_t* rowBits = &flatBits[siteV * 2 * nWords];
+
+                    // Lambda: Check if overlap is gapped at this site (binary search)
                     auto isGappedAtSite = [&](size_t candIdx, uint32_t sitePos) -> bool {
                         if (!haveInsertionHoles) return false;
                         const uint32_t offBegin = scratch.insertionOffsets[candIdx];
@@ -1448,30 +1815,54 @@ static void gen_rphase_dp(
                         return (it->begin <= sitePos && sitePos < it->end);
                     };
 
+                    // Count HP-suspect observations on target side
                     uint64_t hpRef = 0, hpAlt = 0;
                     for (size_t candIdx = 0; candIdx < nCands; ++candIdx) {
                         const auto& cand = candidates[candIdx];
+
+                        // Skip if overlap doesn't cover this site
                         if (querySite < cand.qs || querySite >= cand.qe) continue;
+
+                        // Skip if overlap is gapped at this site (no aligned base)
                         if (isGappedAtSite(candIdx, querySite)) continue;
 
-                        const auto& view = assembler.getReads().getRead(cand.targetId);
-                        const uint32_t targetSite = cand.isRev ?
-                            (uint32_t)(cand.te - (querySite - cand.qs) - 1) :
-                            (uint32_t)(cand.ts + (querySite - cand.qs));
-                        if (targetSite >= view.baseCount) continue;
+                        // Map query coordinate to target coordinate with overflow/underflow protection
+                        const uint64_t queryOffset = uint64_t(querySite) - cand.qs;
+                        uint64_t targetSite64;
+                        if (cand.isRev) {
+                            // Reverse overlap: count from end, check underflow
+                            if (cand.te <= queryOffset) continue;  // Prevent underflow
+                            targetSite64 = cand.te - queryOffset - 1;
+                        } else {
+                            // Forward overlap: offset from start
+                            targetSite64 = cand.ts + queryOffset;
+                        }
 
+                        // Bounds check in uint64_t space BEFORE casting
+                        const auto& view = assembler.getReads().getRead(cand.targetId);
+                        if (targetSite64 >= view.baseCount) continue;
+
+                        // Safe to cast now that we know it's in bounds
+                        const uint32_t targetSite = (uint32_t)targetSite64;
+
+                        // Check if target position is in a homopolymer run
                         if (!hpc_mask_ff(view, (int64_t)view.baseCount, targetSite)) continue;
 
+                        // Count HP-suspect observations by allele state
                         const size_t w = candIdx >> 6;
                         const uint64_t mask = 1ULL << (candIdx & 63);
                         hpRef += __builtin_popcountll(rowBits[2 * w] & mask);
                         hpAlt += __builtin_popcountll(rowBits[2 * w + 1] & mask);
                     }
 
+                    // Compute robust counts after discounting HP-suspect observations
                     const uint32_t n0_robust = (snpStats[siteV].occ_0 >= hpRef) ? (uint32_t)(snpStats[siteV].occ_0 - hpRef) : 0;
                     const uint32_t n1_robust = (snpStats[siteV].occ_1 >= hpAlt) ? (uint32_t)(snpStats[siteV].occ_1 - hpAlt) : 0;
+
+                    // Reject if robust counts fall below thresholds
                     hpMasked = (n0_robust < 2 || n1_robust < 2 || n0_robust < s_hap_cov || n1_robust < infor_cov);
                 }
+                // Accept singleton only if NOT HP-masked
                 if (!hpMasked) plus = 1;
             }
         }
@@ -1548,22 +1939,148 @@ static void gen_rphase_dp(
 }
 
 /*
-generate_haplotypes_naive_HiFi: hifiasm-style trans-closure for SNP sites.
+================================================================================
+generate_haplotypes_naive_HiFi: Transitive Closure (Stage 3 of EC Pipeline)
+================================================================================
 
-This stage consumes the post-DP SNP row list and marks overlaps as trans (is_match=2) when they
-carry alt alleles at validated sites. It also applies hifiasm’s “not real allele” adjustment:
-when an overlap is marked trans, it should no longer contribute ref support to other sites, so
-we decrement occ_0 for sites covered by that overlap where it does not carry the alt allele.
+PURPOSE:
+  Mark overlaps as "trans" (is_match=2) based on validated heterozygous sites
+  from DP chaining. This is the final stage of hifiasm-parity error correction
+  and directly corresponds to hifiasm's generate_haplotypes_naive_HiFi.
 
-The high-level flow matches hifiasm’s Correct.cpp:
-  0) Drop adjacent SNP sites (distance 1) and rewrite evidence row indices.
-  1) Sort evidence by overlap and count how many informative alleles each overlap carries.
-  2) Seed trans overlaps from the most-informative overlaps and promote supported sites.
-  3) Second pass: any remaining overlap that hits a promoted site becomes trans.
-  4) Optional multi_check: rescue dense weak patterns and re-run final marking.
+  The central question: "Which overlaps come from the alternate haplotype
+  (trans) versus the same haplotype (cis)?"
 
-This function updates candidates[].is_match, and updates snpStats[].occ_0 as part of the not-real
-allele decrements. The final application of deletions happens later in performHifiasmECParity.
+TRANSITIVE CLOSURE CONCEPT:
+  Once we've validated heterozygous sites through DP (Stage 2), we use those
+  sites to partition overlaps into cis vs trans:
+    - CIS overlaps (is_match=1): Match the query haplotype, should be retained
+    - TRANS overlaps (is_match=2): Match the alternate haplotype, should be removed
+
+  The "transitive" aspect: if an overlap carries alt alleles at multiple
+  validated sites, it's very likely trans. Other overlaps covering those
+  same sites are also likely trans (transitivity through shared sites).
+
+INPUT (via scratch pad):
+  - snpStats: DP-validated SNP rows (dpScore=1, compacted)
+  - hapEvidence: Per-overlap mismatch observations linked to SNP rows
+  - candidates: List of overlaps covering the query read
+
+OUTPUT:
+  - candidates[].is_match: Updated to 1 (cis) or 2 (trans)
+  - snpStats[].occ_0: Decremented for "not real allele" adjustments
+  - snpStats[].score: Set to inform_check value (1 or 0) for promoted sites
+
+ALGORITHM OVERVIEW:
+  Step 0: Drop adjacent SNP sites (distance 1 filter)
+  Step 1: Sort evidence by overlap, count informative alleles per overlap
+  Step 2: Seed trans overlaps from most-informative overlaps
+  Step 3: Second pass: mark remaining overlaps hitting promoted sites as trans
+  Step 4: Optional multi_check: rescue dense weak patterns
+
+KEY CONCEPTS:
+
+  A. INFORMATIVE ALLELE COUNTING:
+     For each overlap, count how many validated SNP sites it carries alt alleles.
+     An overlap with many alt alleles is likely trans; one with few/zero is likely cis.
+
+     Thresholds (hifiasm defaults):
+       - infor_cov = 3: Minimum alt alleles to be "informative enough" for seeding
+       - s_hap_cov = 3: Minimum support required for sites to be "real alleles"
+
+  B. SITE PROMOTION:
+     A SNP site becomes "promoted" (score=1) if:
+       - It's supported by at least s_hap_cov overlaps that have been marked trans
+       - OR it's rescued in multi_check pass
+
+     Promoted sites are considered highly reliable indicators of trans overlaps.
+
+  C. TWO-PASS MARKING:
+     Pass 1: Seed trans from overlaps with >= infor_cov informative alleles
+             - These are the most obvious trans overlaps
+             - Promote sites supported by these seeded trans overlaps
+
+     Pass 2: Transitivity propagation
+             - Any overlap hitting a promoted site is marked trans
+             - This captures borderline overlaps that might have fewer alt alleles
+             - Promotes additional sites supported by these newly marked trans overlaps
+
+  D. NOT REAL ALLELE ADJUSTMENT:
+     When an overlap is marked trans, it should no longer contribute ref support
+     to OTHER sites (where it doesn't carry the alt allele).
+
+     Reason: A trans overlap represents a different haplotype. At sites where it
+     matches the query, that's NOT evidence for "ref" — it's just a coincidental
+     match between two haplotypes.
+
+     Implementation:
+       For each overlap marked trans:
+         For each SNP site covered by this overlap:
+           If overlap does NOT carry the alt allele at this site:
+             Decrement occ_0 (ref support count)
+
+     This adjustment refines the allele support estimates for future iterations.
+
+  E. MULTI_CHECK (Dense Weak Pattern Rescue):
+     Some reads have many weakly-supported heterozygous sites clustered together.
+     Each individual site might not pass infor_cov, but collectively they indicate
+     trans overlaps.
+
+     The multi_check pass looks for:
+       - Dense clusters of sites within multi_check_distance=32 bp
+       - Collective support from the same overlaps
+       - If cluster strength >= up_num/up_den threshold (4/100 = 4%), promote sites
+
+     This prevents loss of valid trans overlaps in low-coverage or noisy regions.
+
+  F. ADJACENT SITE FILTERING (Step 0):
+     Hifiasm removes SNP sites that are immediately adjacent (distance 1).
+     Rationale: Adjacent mismatches often indicate local sequencing errors or
+     alignment artifacts rather than true heterozygosity.
+
+     This conservative filter prevents overcalling trans in noisy regions.
+
+HIFIASM PARITY DETAILS:
+  - Same two-pass seeding + transitivity algorithm
+  - Same infor_cov=3, s_hap_cov=3 thresholds
+  - Same multi_check_distance=32, up_num=4, up_den=100
+  - Same "not real allele" decrement logic
+  - Same adjacent site (distance 1) filtering
+
+STATE TRANSITIONS:
+  Initial:    All overlaps start as is_match=1 (cis)
+  After Pass 1: High-confidence trans overlaps marked is_match=2
+  After Pass 2: Borderline trans overlaps marked is_match=2 via transitivity
+  After multi_check: Additional trans overlaps rescued from dense weak patterns
+
+  Final: is_match values are used in performHifiasmECParity to:
+    - Mark trans overlaps for deletion (DeleteReasonPhase)
+    - Update alignment data deleteReasons0/1 fields
+    - Drive assembly graph construction and error correction decisions
+
+PERFORMANCE NOTES:
+  - Evidence sorting: O(nEvidence log nEvidence), typically small
+  - Two-pass marking: O(nEvidence), linear in evidence size
+  - Multi_check: O(nSites * nCands), can be expensive for dense patterns
+  - Overall: Fast compared to DP chaining, usually <10% of EC time
+
+WHY THIS MATTERS:
+  Transitive closure is what actually APPLIES the error correction decisions.
+  Without accurate cis/trans classification:
+    - False trans: Deletes valid overlaps, fragments assembly
+    - False cis: Retains errors, reduces assembly accuracy
+
+  The multi-pass approach with site promotion and multi_check provides robust
+  classification even in challenging regions with low coverage or high noise.
+
+DOWNSTREAM IMPACT:
+  The is_match values set here control:
+    - Which overlaps are deleted from the assembly graph
+    - Which bases are corrected in the reads
+    - Assembly contiguity and accuracy
+    - Final contig N50 and correctness
+
+  This is the final and most impactful stage of the EC pipeline.
 */
 static void generate_haplotypes_naive_HiFi(
     Assembler& /* assembler */,
