@@ -2503,14 +2503,10 @@ private:
              uint32_t maxHighFrequencyPerStreak = 16;
              double highFactor = 5.0;        // Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain)
              uint32_t minNChain = 100;       // Hifiasm MIN_N_CHAIN: minimum max_n_chain value
-	         double nonRedundantOverlapFraction = 0.5;
-	             // If true, use hifiasm's pre-EC chaining algorithm (chain_DP in Hash_Table.cpp)
-	             // instead of the lchain_qdp-style chaining. This mode also expects hifiasm-style
-	             // overlap pruning (max_n_chain in anchor.cpp:191-220) and disables mcopy/COV_W logic.
-	             bool useHifiasmChainDp = true;
-	             bool lchainIsAccurate = true;
-	             bool useEcScoring = true;
-             bool enableMcopyFast = true;
+	             double nonRedundantOverlapFraction = 0.5;
+		             bool lchainIsAccurate = true;
+		             bool useEcScoring = true;
+	             bool enableMcopyFast = true;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;
              uint32_t mcopyKhitCutoff = 32;

@@ -156,255 +156,6 @@ static int getOverlapType(uint32_t start, uint32_t end, uint32_t readLen) {
     else return (start == 0) ? 0 : 1;                  // left or right overhang
 }
 
-// ============================================================================
-// HIFIASM chain_DP (Hash_Table.cpp:894) PARITY HELPERS
-// ============================================================================
-// Hifiasm's pre-error-correction overlap discovery (worker_ovec -> ha_get_new_candidates)
-// uses chain_DP (Hash_Table.cpp) rather than the lchain_qdp chaining logic.
-//
-// Key aspects we match here:
-// - Sort hits by (posB, self_offset) inside each (readIdB, rev) bucket.
-// - Weighting uses normal_w(score, cnt) where cnt is the frequency-derived hit weight.
-// - Backtracking uses the same max_skip logic and tmp[] visitation heuristic.
-// - Tie-breaking selects the smallest get_chainLen(...) when dp scores tie.
-// ============================================================================
-static constexpr int32_t HIFIASM_CHAIN_DP_THRESHOLD_MAX_SIZE = 31; // Hash_Table.h:24 THRESHOLD_MAX_SIZE
-
-static inline int64_t hifiasmChainDpNormalW(const int64_t x, const int64_t y)
-{
-    // Hash_Table.cpp:20 normal_w(x, y) ((x)>=(y)?(x)/(y):1)
-    return (x >= y) ? (x / y) : 1;
-}
-
-static inline int64_t hifiasmChainDpGetChainLen(
-    int64_t xBeg, int64_t xEnd, int64_t xLen,
-    int64_t yBeg, int64_t yEnd, int64_t yLen)
-{
-    // Hash_Table.cpp:779 get_chainLen
-    if(xBeg <= yBeg) {
-        yBeg -= xBeg;
-        xBeg = 0;
-    } else {
-        xBeg -= yBeg;
-        yBeg = 0;
-    }
-
-    const int64_t xRight = xLen - xEnd - 1;
-    const int64_t yRight = yLen - yEnd - 1;
-    if(xRight <= yRight) {
-        xEnd = xLen - 1;
-        yEnd += xRight;
-    } else {
-        xEnd += yRight;
-        yEnd = yLen - 1;
-    }
-    return xEnd - xBeg + 1;
-}
-
-struct HifiasmChainDpHit {
-    uint32_t offset = 0;      // pos on read B (forward)
-    uint32_t selfOffset = 0;  // pos on read A (possibly transformed for rev bucket)
-    uint32_t ordinalA = 0;    // marker ordinal on read A (strand 0)
-    uint32_t ordinalB = 0;    // marker ordinal on read B (strand 0)
-    uint32_t cnt = 1;         // frequency-derived weight (hifiasm k_mer_hit.cnt)
-};
-
-struct HifiasmChainDpScratch {
-    vector<int64_t> score;
-    vector<int32_t> pre;
-    vector<int64_t> indels;
-    vector<int64_t> selfLen;
-    vector<int32_t> tmp;
-
-    void resize(size_t n)
-    {
-        score.resize(n);
-        pre.resize(n);
-        indels.resize(n);
-        selfLen.resize(n);
-        tmp.resize(n);
-    }
-};
-
-static inline int32_t hifiasmChainDpHaChainCheck(
-    const vector<HifiasmChainDpHit>& a,
-    HifiasmChainDpScratch& dp,
-    const int32_t minSc,
-    const double bwThres)
-{
-    // Hash_Table.cpp:855 ha_chain_check
-    const int32_t n = int32_t(a.size());
-    if(n == 0) {
-        return -1;
-    }
-    for(int32_t i = 1; i < n; ++i) {
-        if(a[i - 1].selfOffset >= a[i].selfOffset) {
-            return -1;
-        }
-    }
-    const double bwPen = 1.0 / bwThres;
-    dp.score[0] = hifiasmChainDpNormalW(minSc, int64_t(a[0].cnt));
-    dp.pre[0] = -1;
-    dp.indels[0] = 0;
-    dp.selfLen[0] = 0;
-    for(int32_t i = 1; i < n; ++i) {
-        const int32_t dx = int32_t(a[i].offset) - int32_t(a[i - 1].offset);
-        const int32_t dy = int32_t(a[i].selfOffset) - int32_t(a[i - 1].selfOffset);
-        const int32_t dd = (dx > dy) ? (dx - dy) : (dy - dx);
-        dp.indels[i] = dp.indels[i - 1] + dd;
-        dp.selfLen[i] = dp.selfLen[i - 1] + dy;
-        if(double(dp.indels[i]) > double(dp.selfLen[i]) * bwThres) {
-            return -1;
-        }
-        const int32_t dg = (dx < dy) ? dx : dy;
-        if(dd > HIFIASM_CHAIN_DP_THRESHOLD_MAX_SIZE && double(dd) > double(dg) * bwThres) {
-            return -1;
-        }
-        int64_t sc = (dg < minSc) ? dg : minSc;
-        sc = hifiasmChainDpNormalW(sc, int64_t(a[i].cnt));
-        const double gapRate = double(dp.indels[i]) / double(dp.selfLen[i]);
-        sc -= int64_t(gapRate * double(sc) * bwPen);
-        dp.score[i] = dp.score[i - 1] + sc;
-        dp.pre[i] = i - 1;
-    }
-    return n;
-}
-
-struct HifiasmChainDpResult {
-    int64_t sharedSeed = -1;
-    int64_t overlapLen = 0;
-    // Indices (in hit array order) of the chosen chain, in DP order (start->end).
-    vector<uint32_t> chain;
-};
-
-static inline HifiasmChainDpResult runHifiasmChainDp(
-    const vector<HifiasmChainDpHit>& a,
-    HifiasmChainDpScratch& dp,
-    const double bandWidthThreshold,
-    const int32_t maxSkip,
-    const int64_t xReadLen,
-    const int64_t yReadLen,
-    const int32_t kmerLen)
-{
-    // Hash_Table.cpp:894 chain_DP (ported, minus fake cigar generation).
-    HifiasmChainDpResult result;
-    const int32_t n = int32_t(a.size());
-    if(n == 0) {
-        return result;
-    }
-    dp.resize(a.size());
-
-    const double bandWidthPenalty = 1.0 / bandWidthThreshold;
-    const int64_t minScore = kmerLen;
-
-    const int32_t quickN = hifiasmChainDpHaChainCheck(a, dp, int32_t(minScore), bandWidthThreshold);
-    if(quickN > 0) {
-        // Linear, fully monotone case. The best endpoint is the max score.
-        // We still apply the same endpoint selection logic below.
-    } else {
-        std::fill(dp.tmp.begin(), dp.tmp.end(), -1);
-        for(int32_t i = 0; i < n; ++i) {
-            int32_t nChnSkip = 0;
-            int32_t nMaxSkip = 0;
-            const int64_t pos = a[i].offset;
-            const int64_t selfPos = a[i].selfOffset;
-            int32_t maxJ = -1;
-            int64_t maxSc = hifiasmChainDpNormalW(minScore, int64_t(a[i].cnt));
-            int64_t maxIndels = 0;
-            int64_t maxSelfLen = 0;
-
-            for(int32_t j = i - 1; j >= 0; --j) {
-                const int64_t distancePos = pos - int64_t(a[j].offset);
-                const int64_t distanceSelfPos = selfPos - int64_t(a[j].selfOffset);
-                if(distancePos == 0 || distanceSelfPos <= 0) {
-                    continue;
-                }
-                const int64_t distanceGap =
-                    (distancePos > distanceSelfPos) ? (distancePos - distanceSelfPos) : (distanceSelfPos - distancePos);
-                const int64_t totalIndels = dp.indels[j] + distanceGap;
-                const int64_t totalSelfLen = dp.selfLen[j] + distanceSelfPos;
-                if(double(totalIndels) > bandWidthThreshold * double(totalSelfLen)) {
-                    continue;
-                }
-
-                const int64_t distanceMin = (distancePos < distanceSelfPos) ? distancePos : distanceSelfPos;
-                int64_t sc = (distanceMin < minScore) ? distanceMin : minScore;
-                sc = hifiasmChainDpNormalW(sc, int64_t(a[j].cnt));
-                const double gapRate = double(totalIndels) / double(totalSelfLen);
-                sc -= int64_t(gapRate * double(sc) * bandWidthPenalty);
-                sc += dp.score[j];
-
-                if(sc > maxSc) { // strict >
-                    maxSc = sc;
-                    maxJ = j;
-                    maxIndels = totalIndels;
-                    maxSelfLen = totalSelfLen;
-                    nMaxSkip = 0;
-                    if(nChnSkip > 0) {
-                        --nChnSkip;
-                    }
-                } else {
-                    if(++nMaxSkip > maxSkip) {
-                        break;
-                    }
-                    if(dp.tmp[j] == i) {
-                        if(++nChnSkip > maxSkip) {
-                            break;
-                        }
-                    }
-                }
-                if(dp.pre[j] >= 0) {
-                    dp.tmp[size_t(dp.pre[j])] = i;
-                }
-            }
-
-            dp.score[i] = maxSc;
-            dp.pre[i] = maxJ;
-            dp.indels[i] = maxIndels;
-            dp.selfLen[i] = maxSelfLen;
-        }
-    }
-
-    int64_t maxSc = -1;
-    int32_t maxI = -1;
-    int64_t miniXLen = xReadLen * 2 + 2;
-    for(int32_t i = 0; i < n; ++i) {
-        if(dp.score[i] > maxSc) {
-            maxSc = dp.score[i];
-            maxI = i;
-            miniXLen = hifiasmChainDpGetChainLen(
-                int64_t(a[i].selfOffset), int64_t(a[i].selfOffset), xReadLen,
-                int64_t(a[i].offset), int64_t(a[i].offset), yReadLen);
-        } else if(dp.score[i] == maxSc) {
-            const int64_t tmpXLen = hifiasmChainDpGetChainLen(
-                int64_t(a[i].selfOffset), int64_t(a[i].selfOffset), xReadLen,
-                int64_t(a[i].offset), int64_t(a[i].offset), yReadLen);
-            if(tmpXLen < miniXLen) {
-                maxSc = dp.score[i];
-                maxI = i;
-                miniXLen = tmpXLen;
-            }
-        }
-    }
-
-    if(maxI < 0) {
-        return result;
-    }
-    result.sharedSeed = maxSc;
-    result.overlapLen = miniXLen;
-
-    // Backtrack and return chain indices in DP order.
-    result.chain.clear();
-    for(int32_t i = maxI; i >= 0; i = dp.pre[i]) {
-        result.chain.push_back(uint32_t(i));
-        if(dp.pre[i] < 0) {
-            break;
-        }
-    }
-    std::reverse(result.chain.begin(), result.chain.end());
-    return result;
-}
-
 // Hifiasm weak-overlap suppression constants (anchor.cpp).
 static constexpr double HIFIASM_OFL = 0.95;
 static constexpr uint32_t HIFIASM_CH_OCC = 4;
@@ -1553,8 +1304,8 @@ static inline void hifiasm_lchain_qgen_mcopy_fast_postfilter(
                         if (g >= allHits.size()) continue;
                         const uint64_t me = uint64_t(allHits[size_t(g)].self_offset);
                         const uint64_t span = uint64_t(allHits[size_t(g)].cnt & 0xffu);
-                        const int64_t msSigned = int64_t(me) - int64_t(span);
-                        const uint64_t ms = (msSigned > 0) ? uint64_t(msSigned) : 0ULL;
+                        // Match hifiasm's unsigned wrap semantics: ms = me - span.
+                        const uint64_t ms = me - span;
                         if (ms >= os && me <= oe) ++kn;
                     }
                     if (kn >= ocn) break;
@@ -1712,7 +1463,6 @@ static inline void configureInvertedIndexDataForChaining(
     data.highFactor = overlapCandidatesOptions.invertedIndexHighFactor;
     data.minNChain = overlapCandidatesOptions.invertedIndexMinNChain;
     data.nonRedundantOverlapFraction = overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction;
-    data.useHifiasmChainDp = overlapCandidatesOptions.invertedIndexUseHifiasmChainDp;
     data.lchainIsAccurate = overlapCandidatesOptions.invertedIndexLchainIsAccurate;
     data.useEcScoring = overlapCandidatesOptions.invertedIndexUseEcScoring;
     data.enableMcopyFast = overlapCandidatesOptions.invertedIndexEnableMcopyFast;
@@ -1785,9 +1535,12 @@ public:
         markers(markers),
         markerKmerIds(markerKmerIds),
         invertedIndexData(invertedIndexData),
-        maxChainLimit(maxChainLimit),
-        minChainedMarkerCount(minChainedMarkerCount)
+        maxChainLimit(maxChainLimit)
     {
+        // Kept for API compatibility. In strict hifiasm ONT parity mode, `chain_cutoff` is fixed
+        // (2) and we do not apply an additional per-read-pair minimum here.
+        (void)minChainedMarkerCount;
+
         const ReadId readCount = ReadId(markers.size() / 2); // Indexed by strand 0
         const size_t perThreadReserve = std::max<size_t>(
             10000,
@@ -1835,7 +1588,6 @@ private:
     const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds;
     const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData;
     uint64_t maxChainLimit;
-    uint32_t minChainedMarkerCount;
 
     vector<vector<OrientedReadPair>> threadCandidates;
     vector<vector<Alignment>> threadAlignments;
@@ -1850,9 +1602,6 @@ private:
             Alignment alignment;
             int32_t score = 0;
             uint8_t overlapType = 0;
-            // For hifiasm-style "one best overlap per partner read (y_id)" filtering.
-            // Note this is tracked in the query read's space (readIdA in this threadFunction),
-            // even though `candidate` is canonicalized to keep readIds[0] < readIds[1].
             ReadId partnerReadId = invalidReadId;
             uint32_t querySpan = 0; // pre-extension span on the query read (bases)
         };
@@ -1909,7 +1658,7 @@ private:
         const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
 	        const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
 	        const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
-	        const bool useHifiasmChainDp = invertedIndexData.useHifiasmChainDp;
+	        // Dinara only supports the strict hifiasm ONT lchain+mcopy path for inverted-index chaining.
 
 
         uint64_t startBatch, endBatch;
@@ -2169,280 +1918,14 @@ private:
 	                if(scratch.flatHits.empty()) continue;
 	                radixSortFlatHitsByPartnerReadIdAndPosA(scratch.flatHits, scratch.flatHitsTmp);
 
-                if(useHifiasmChainDp) {
-                    // ================================================================
-                    // STEP 2 (HIFIASM PRE-EC PARITY): chain_DP PER (readIdB, rev)
-                    // ================================================================
-                    // Reference: hifiasm anchor.cpp:178 (calculate_overlap_region_by_chaining)
-                    //            hifiasm Hash_Table.cpp:894 (chain_DP)
-                    //
-                    // We bucket hits by:
-                    // - partner readIdB
-                    // - rev = z->rev ^ y->rev, where "rev" indicates whether the partner
-                    //   read is on the opposite strand relative to the query (read A strand 0).
-                    //
-                    // In our inverted-index, we store canonical k-mers, so we reconstruct
-                    // z->rev/y->rev via:
-                    // - isRcA: (kmerId > rcKmerId) for the query marker on strand 0
-                    // - isRcB: same for the partner occurrence (encoded in compactOccurrences position)
-                    //
-                    // For each (readIdB, rev) bucket we:
-                    // 1) sort hits by (posB, selfOffset)
-                    // 2) run hifiasm chain_DP to get (shared_seed, overlapLen) and the best chain path
-                    // 3) emit at most one chained candidate per bucket
-                    HifiasmChainDpScratch chainDpScratch;
-                    vector<uint8_t> hitRev; // 0=same, 1=diff
-                    vector<HifiasmChainDpHit> chainDpHits;
-                    chainDpHits.reserve(256);
-
-                    size_t hitIter = 0;
-                    while(hitIter < scratch.flatHits.size()) {
-                        const ReadId readIdB = scratch.flatHits[hitIter].partnerReadId;
-
-                        // Skip mirrored pairs and self-comparisons (Dinara convention).
-                        if(readIdB <= readIdA) {
-                            while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) {
-                                ++hitIter;
-                            }
-                            continue;
-                        }
-
-                        const size_t startInFlat = hitIter;
-                        while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) {
-                            ++hitIter;
-                        }
-                        const size_t numHitsAll = hitIter - startInFlat;
-                        if(numHitsAll == 0) {
-                            continue;
-                        }
-
-                        const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
-                        const OrientedReadId orientedReadB(readIdB, 0);
-                        const auto& mB = markers[orientedReadB.getValue()];
-                        const uint32_t markerCountA = uint32_t(markersA.size());
-                        const uint32_t markerCountB = uint32_t(mB.size());
-
-                        // Map partner positions to marker ordinals once per readIdB.
-                        scratch.hitPosA.resize(numHitsAll);
-                        scratch.hitPosB.resize(numHitsAll);
-                        scratch.hitOrdinalA.resize(numHitsAll);
-                        scratch.hitOrdinalB.assign(numHitsAll, std::numeric_limits<uint32_t>::max());
-                        scratch.hitWeights.resize(numHitsAll);
-                        hitRev.resize(numHitsAll);
-                        for(size_t k = 0; k < numHitsAll; ++k) {
-                            const auto& h = scratch.flatHits[startInFlat + k];
-                            scratch.hitPosA[k] = h.posA;
-                            scratch.hitPosB[k] = h.posB;
-                            scratch.hitOrdinalA[k] = h.ordinalA;
-                            scratch.hitWeights[k] = h.weight;
-                            hitRev[k] = uint8_t(h.isRcA ^ h.isRcB);
-                        }
-                        if(!mapHitPositionsToMarkerOrdinals(
-                            scratch.hitPosB, mB, scratch.hitOrdinalB, scratch.hitOrderByPosB)) {
-                            continue;
-                        }
-
-                        auto emitBestForRev = [&](const uint8_t revBucket) {
-                            // Collect hits for this rev bucket and sort by (posB, selfOffset).
-                            chainDpHits.clear();
-                            chainDpHits.reserve(numHitsAll);
-                            for(size_t k = 0; k < numHitsAll; ++k) {
-                                if(hitRev[k] != revBucket) {
-                                    continue;
-                                }
-                                const uint32_t ordB = scratch.hitOrdinalB[k];
-                                if(ordB == std::numeric_limits<uint32_t>::max()) {
-                                    continue;
-                                }
-                                const uint32_t posA = scratch.hitPosA[k];
-                                const uint32_t posB = scratch.hitPosB[k];
-                                uint64_t selfOff64 = posA;
-                                if(revBucket == 1U) {
-                                    // hifiasm behavior: when rev==1, chain_DP runs with query coordinates
-                                    // on the reverse-complement of read A, and later swaps orientation.
-                                    // Here we mirror that by transforming A positions into RC space.
-                                    if(uint64_t(posA) + kmerLen > readLenA) {
-                                        continue;
-                                    }
-                                    selfOff64 = readLenA - uint64_t(posA) - kmerLen;
-                                }
-                                if(selfOff64 > uint64_t(std::numeric_limits<uint32_t>::max())) {
-                                    continue;
-                                }
-                                chainDpHits.push_back(HifiasmChainDpHit{
-                                    posB,
-                                    uint32_t(selfOff64),
-                                    scratch.hitOrdinalA[k],
-                                    ordB,
-                                    scratch.hitWeights[k]});
-                            }
-                            if(chainDpHits.empty()) {
-                                return;
-                            }
-                            std::sort(chainDpHits.begin(), chainDpHits.end(),
-                                [](const HifiasmChainDpHit& a, const HifiasmChainDpHit& b) {
-                                    if(a.offset != b.offset) {
-                                        return a.offset < b.offset;
-                                    }
-                                    return a.selfOffset < b.selfOffset;
-                                });
-                            // Remove exact duplicate (offset,selfOffset) pairs to match hifiasm's "no duplicates" assumption.
-                            chainDpHits.erase(
-                                std::unique(chainDpHits.begin(), chainDpHits.end(),
-                                    [](const HifiasmChainDpHit& a, const HifiasmChainDpHit& b) {
-                                        return a.offset == b.offset && a.selfOffset == b.selfOffset;
-                                    }),
-                                chainDpHits.end());
-
-                            if(minChainedMarkerCount > 0 && chainDpHits.size() < size_t(minChainedMarkerCount)) {
-                                return;
-                            }
-
-                            const HifiasmChainDpResult dpRes = runHifiasmChainDp(
-                                chainDpHits,
-                                chainDpScratch,
-                                maxDriftRate,
-                                25, // hifiasm chain_DP max_skip
-                                int64_t(readLenA),
-                                int64_t(readLenB),
-                                int32_t(kmerLen));
-                            if(dpRes.chain.empty() || dpRes.sharedSeed <= 0) {
-                                return;
-                            }
-
-                            // Build a marker-chain alignment from the DP backtrack path.
-                            // For rev==1, DP order is increasing in RC(A) and increasing in B(fwd),
-                            // which corresponds to decreasing in A(fwd). Reverse the chain so A(fwd)
-                            // is increasing and then express B on strand 1 (RC) so its ordinals increase too.
-                            vector<uint32_t> chainIdx = dpRes.chain;
-                            if(revBucket == 1U) {
-                                std::reverse(chainIdx.begin(), chainIdx.end());
-                            }
-
-                            Alignment al;
-                            al.ordinals.reserve(chainIdx.size());
-                            for(const uint32_t idx : chainIdx) {
-                                const auto& h = chainDpHits[idx];
-                                uint32_t ordB = h.ordinalB;
-                                if(revBucket == 1U) {
-                                    ordB = markerCountB - 1 - ordB;
-                                }
-                                al.ordinals.push_back({h.ordinalA, ordB});
-                            }
-
-                            // Compute pre-extension spans on A and B (using forward marker positions).
-                            const uint32_t qPstart = markersA[al.ordinals.front()[0]].position;
-                            const uint32_t qPend = markersA[al.ordinals.back()[0]].position + uint32_t(kmerLen);
-
-                            // For B positions we need the forward-strand ordinals, so use chainDpHits.
-                            const uint32_t ordBFirstFwd = chainDpHits[chainIdx.front()].ordinalB;
-                            const uint32_t ordBLastFwd = chainDpHits[chainIdx.back()].ordinalB;
-                            const uint32_t bPfirst = mB[ordBFirstFwd].position;
-                            const uint32_t bPlast = mB[ordBLastFwd].position;
-
-	                            uint32_t tS, tE;
-	                            if(revBucket == 1U) {
-	                                const uint32_t minB = std::min(bPfirst, bPlast);
-	                                const uint32_t maxB = std::max(bPfirst, bPlast) + uint32_t(kmerLen);
-	                                if(uint64_t(maxB) > readLenB) {
-	                                    return;
-	                                }
-	                                tS = uint32_t(readLenB) - maxB;
-	                                tE = uint32_t(readLenB) - minB;
-	                            } else {
-	                                tS = bPfirst;
-	                                tE = bPlast + uint32_t(kmerLen);
-	                                if(uint64_t(tE) > readLenB) {
-	                                    return;
-	                                }
-	                                if(tE < tS) {
-	                                    std::swap(tS, tE);
-	                                }
-	                            }
-
-                            // Optional: minimum overlap length in bases (pre-extension span).
-                            if(invertedIndexData.minOverlapLength > 0) {
-                                const uint64_t qSpan = uint64_t(qPend) - uint64_t(qPstart);
-                                const uint64_t tSpan = uint64_t(tE) - uint64_t(tS);
-                                if(std::min(qSpan, tSpan) < uint64_t(invertedIndexData.minOverlapLength)) {
-                                    return;
-                                }
-                            }
-
-                            // Optional: discard internal overlaps that would require large end extension.
-                            if(invertedIndexData.maxEndFuzz > 0) {
-                                const uint32_t leftNeed = std::min(qPstart, tS);
-                                const int64_t qRight = int64_t(readLenA) - int64_t(qPend);
-                                const int64_t tRight = int64_t(readLenB) - int64_t(tE);
-                                const uint32_t rightNeed = uint32_t(std::min<int64_t>(
-                                    std::max<int64_t>(qRight, 0), std::max<int64_t>(tRight, 0)));
-                                if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
-                                    return;
-                                }
-                            }
-
-                            // Extend the chain to read ends using hifiasm's get_chainLen / append_inexact_overlap_region_alloc logic.
-                            uint32_t fQs = qPstart, fQe = qPend, fTs = tS, fTe = tE;
-                            if (fQs <= fTs) { fTs -= fQs; fQs = 0; } else { fQs -= fTs; fTs = 0; }
-                            const int64_t remQ = int64_t(readLenA) - int64_t(fQe);
-                            const int64_t remT = int64_t(readLenB) - int64_t(fTe);
-                            if (remQ <= remT) { fQe = uint32_t(readLenA); fTe += uint32_t(remQ); }
-                            else { fTe = uint32_t(readLenB); fQe += uint32_t(remT); }
-
-                            al.qs = fQs;
-                            al.qe = fQe;
-
-                            bool isSameStrand = (revBucket == 0U);
-                            if(!isSameStrand) {
-                                const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), fTs, fTe);
-                                al.ts = p.first;
-                                al.te = p.second;
-                            } else {
-                                al.ts = fTs;
-                                al.te = fTe;
-                            }
-
-                            // Canonicalize candidate so readIds[0] < readIds[1], and keep alignment consistent.
-                            ReadId cand0 = readIdA;
-                            ReadId cand1 = readIdB;
-                            canonicalizeCandidateAndAlignment(cand0, cand1, isSameStrand, al, markerCountA, markerCountB);
-
-                            // Keep overlap-type classification in the query-read (readIdA) space.
-                            // We use the extended interval [fQs, fQe) to match hifiasm's ha_ov_type(x_pos_s, x_pos_e).
-                            const uint8_t overlapType = uint8_t(getOverlapType(fQs, fQe, uint32_t(readLenA)));
-                            const int64_t sharedSeed = dpRes.sharedSeed;
-                            const int32_t sharedSeed32 =
-                                (sharedSeed > int64_t(std::numeric_limits<int32_t>::max())) ?
-                                std::numeric_limits<int32_t>::max() :
-                                int32_t(sharedSeed);
-                            const uint64_t overlapLen64 = uint64_t(std::max<int64_t>(0, dpRes.overlapLen));
-                            const uint32_t overlapLen32 =
-                                (overlapLen64 > uint64_t(std::numeric_limits<uint32_t>::max())) ?
-                                std::numeric_limits<uint32_t>::max() : uint32_t(overlapLen64);
-
-                            emittedForRead.push_back(EmittedChainedCandidate{
-                                OrientedReadPair(cand0, cand1, isSameStrand),
-                                std::move(al),
-                                sharedSeed32,
-                                overlapType,
-                                // partner read id for the current query read (readIdA)
-                                (cand0 == readIdA) ? cand1 : cand0,
-                                // hifiasm tie-break uses overlap_region.overlapLen
-                                overlapLen32});
-                        };
-
-                        emitBestForRev(0);
-                        emitBestForRev(1);
-                    }
-                
-                } else {
-                    // ================================================================
-                    // STEP 2 (HIFIASM ONT PARITY): lchain_qdp_mcopy_fast + mcopy + ocv_w
-                    // ================================================================
-                    // Reference:
-                    // - anchor.cpp:1920-2100 lchain_qgen_mcopy_fast
-                    // - Hash_Table.cpp:2007-2095 quick_ck_lchain
-                    // - Hash_Table.cpp:2097-2284 lchain_qdp_mcopy_fast
+	                {
+	                    // ================================================================
+	                    // STEP 2 (HIFIASM ONT PARITY): lchain_qdp_mcopy_fast + mcopy + ocv_w
+	                    // ================================================================
+	                    // Reference:
+	                    // - anchor.cpp:1920-2100 lchain_qgen_mcopy_fast
+	                    // - Hash_Table.cpp:2007-2095 quick_ck_lchain
+	                    // - Hash_Table.cpp:2097-2284 lchain_qdp_mcopy_fast
                     //
                     // Strict parity choices:
                     // - Build a hifiasm-like `k_mer_hit` array per partner read B that includes both strands.
@@ -2485,8 +1968,22 @@ private:
                         if(numHits == 0) {
                             continue;
                         }
-                        // Hifiasm parity: chain_cutoff is a >= threshold.
-                        if(minChainedMarkerCount > 0 && numHits < size_t(minChainedMarkerCount)) {
+
+                        // Hifiasm ONT EC parity: `chain_cutoff` is passed as a constant 2
+                        // (ecovlp.cpp:3274) and is applied inside minimizers_qgen_input(...)
+                        // (anchor.cpp:1489) as a per-(readIdB, rev) minimum bucket size.
+                        // In other words, a pair can be kept if (rev==0 has >=2 hits) OR (rev==1 has >=2 hits),
+                        // and the smaller bucket is dropped entirely.
+                        static constexpr uint32_t hifiasmChainCutoff = 2;
+                        size_t revCount[2] = {0, 0};
+                        for(size_t k = 0; k < numHits; ++k) {
+                            const auto& h = scratch.flatHits[startInFlat + k];
+                            const uint8_t rev = uint8_t(h.isRcA ^ h.isRcB); // z->rev ^ y->rev
+                            ++revCount[rev ? 1 : 0];
+                        }
+                        const bool keepRev0 = (revCount[0] >= size_t(hifiasmChainCutoff));
+                        const bool keepRev1 = (revCount[1] >= size_t(hifiasmChainCutoff));
+                        if(!keepRev0 && !keepRev1) {
                             continue;
                         }
 
@@ -2510,11 +2007,15 @@ private:
                         for(size_t k = 0; k < numHits; ++k) {
                             const auto& h = scratch.flatHits[startInFlat + k];
                             const uint8_t rev = uint8_t(h.isRcA ^ h.isRcB); // z->rev ^ y->rev
+                            if((rev == 0 && !keepRev0) || (rev == 1 && !keepRev1)) {
+                                continue;
+                            }
 
                             // Hifiasm uses minimizer end positions; Dinara stores marker start positions.
                             // Convert start -> end by adding span-1.
-                            const uint32_t selfOff = h.posA + uint32_t(span - 1U);
-                            const uint32_t offSame = h.posB + uint32_t(span - 1U);
+                            const uint32_t seedSpan = uint32_t(span);
+                            const uint32_t selfOff = h.posA + (seedSpan - 1U);
+                            const uint32_t offSame = h.posB + (seedSpan - 1U);
                             // anchor.cpp:1062-1064 simplifies to offset = tl - start - 1 for strand==1.
                             const uint32_t offDiff = uint32_t(readLenB - 1ULL - uint64_t(h.posB));
 
@@ -2525,7 +2026,8 @@ private:
                             kh.offset = (rev == 0) ? offSame : offDiff;
 
                             const uint32_t w = (h.weight > 0xffffffu) ? 0xffffffu : h.weight;
-                            kh.cnt = (w << 8) | uint32_t(span);
+                            const uint32_t span8 = std::min<uint32_t>(seedSpan, 0xffu);
+                            kh.cnt = (w << 8) | span8;
 
                             kh.ordinalA = h.ordinalA;
                             kh.ordinalB = scratch.hitOrdinalB[k];
@@ -2687,9 +2189,9 @@ private:
                             overlapType,
                             (cand0 == readIdA) ? cand1 : cand0,
                             preSpan});
-                    }
+	                    }
 
-	                } // end lchain path (else of useHifiasmChainDp)
+		                } // end lchain path
 
 	                // ============================================================
 	                // HIFIASM MAX_N_CHAIN PER-READ FILTERING
@@ -2713,92 +2215,8 @@ private:
                 // - Type 2 (right): 180 overlaps → keep top 150 by score
                 // - Type 3 (contained): 300 overlaps → keep top 150 + weak rescue
                 //
-                if(maxChainLimit > 0 && emittedForRead.size() > maxChainLimit) {
-                    if(useHifiasmChainDp) {
-                        // hifiasm anchor.cpp:191-220 max_n_chain pruning (no COV_W rescue).
-                        // Sort only by shared_seed (score) descending.
-                        std::sort(emittedForRead.begin(), emittedForRead.end(),
-                            [](const EmittedChainedCandidate& a, const EmittedChainedCandidate& b) {
-                                return a.score > b.score;
-                            });
-
-                        uint64_t countByType[4] = {0, 0, 0, 0};
-                        int32_t thresholdByType[4] = {0, 0, 0, 0};
-                        for(const auto& e : emittedForRead) {
-                            const uint32_t type = std::min<uint32_t>(3, e.overlapType);
-                            ++countByType[type];
-                            if(countByType[type] == maxChainLimit) {
-                                thresholdByType[type] = e.score;
-                            }
-                        }
-
-                        if(thresholdByType[0] > 0 || thresholdByType[1] > 0 ||
-                           thresholdByType[2] > 0 || thresholdByType[3] > 0) {
-                            filteredForRead.clear();
-                            filteredForRead.reserve(emittedForRead.size());
-                            for(auto& e : emittedForRead) {
-                                const uint32_t type = std::min<uint32_t>(3, e.overlapType);
-                                if(e.score >= thresholdByType[type]) {
-                                    filteredForRead.push_back(std::move(e));
-                                }
-                            }
-                            emittedForRead.swap(filteredForRead);
-                        }
-                    } else {
-                        // Strict hifiasm lchain+mcopy parity:
-                        // max_n_chain + ocv_w rescue + r485 suppression were already applied in the lchain stage
-                        // (hifiasm_lchain_qgen_mcopy_fast_postfilter), so do not filter again here.
-                    }
-                }
-
-	                // ============================================================
-	                // HIFIASM "ONE BEST OVERLAP PER PARTNER READ (y_id)"
-	                // ============================================================
-	                // Reference (HiFi pre-EC path): hifiasm anchor.cpp:745-776 (ha_get_candidates_interface)
-	                //
-	                // Ordering note: hifiasm applies max_n_chain inside `ha_get_new_candidates(...)` (anchor.cpp:191-220),
-	                // then later applies the per-partner "keep one" filter inside `ha_get_candidates_interface(...)`.
-	                // We mirror that ordering here: max_n_chain pruning first, then y_id dedup in chain_DP mode.
-	                if(useHifiasmChainDp && emittedForRead.size() > 1) {
-	                    std::sort(emittedForRead.begin(), emittedForRead.end(),
-	                        [](const EmittedChainedCandidate& a, const EmittedChainedCandidate& b) {
-	                            if(a.partnerReadId != b.partnerReadId) {
-	                                return a.partnerReadId < b.partnerReadId;
-	                            }
-	                            if(a.score != b.score) {
-	                                return a.score > b.score;
-	                            }
-	                            if(a.querySpan != b.querySpan) {
-	                                return a.querySpan < b.querySpan;
-	                            }
-	                            if(a.candidate.isSameStrand != b.candidate.isSameStrand) {
-	                                // Deterministic tie-break only; hifiasm doesn't prefer strand here.
-	                                return a.candidate.isSameStrand < b.candidate.isSameStrand;
-	                            }
-	                            if(a.candidate.readIds[0] != b.candidate.readIds[0]) {
-	                                return a.candidate.readIds[0] < b.candidate.readIds[0];
-	                            }
-	                            if(a.candidate.readIds[1] != b.candidate.readIds[1]) {
-	                                return a.candidate.readIds[1] < b.candidate.readIds[1];
-	                            }
-	                            return a.alignment.qs < b.alignment.qs;
-	                        });
-
-	                    filteredForRead.clear();
-	                    filteredForRead.reserve(emittedForRead.size());
-	                    size_t i = 0;
-	                    while(i < emittedForRead.size()) {
-	                        size_t j = i + 1;
-	                        while(j < emittedForRead.size() &&
-	                              emittedForRead[j].partnerReadId == emittedForRead[i].partnerReadId) {
-	                            ++j;
-	                        }
-	                        // Because of the sort order, emittedForRead[i] is the best for this partnerReadId.
-	                        filteredForRead.push_back(std::move(emittedForRead[i]));
-	                        i = j;
-	                    }
-	                    emittedForRead.swap(filteredForRead);
-	                }
+	                // Note: max_n_chain + ocv_w rescue + r485 suppression were already applied in the lchain stage
+	                // (hifiasm_lchain_qgen_mcopy_fast_postfilter), so do not filter again here.
 
 	                for(auto& e : emittedForRead) {
 	                    localCandidates.push_back(e.candidate);

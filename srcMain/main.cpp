@@ -651,12 +651,11 @@ void dinara::main::assemble(
     }
 
     // Hifiasm ONT EC (`--ont`) uses lchain+mcopy and only later collapses duplicate chains per partner
-    // using base-level error statistics (`dedup_chains`, ecovlp.cpp:2984). In Dinara, this situation
-    // arises when we run the inverted-index lchain+mcopy path (invertedIndexUseHifiasmChainDp=false),
-    // which can emit multiple candidates per (readIds[0], readIds[1]).
-    // Deduplicate those now, after alignments and phasing parity have populated mismatch metrics and
+    // using base-level error statistics (`dedup_chains`, ecovlp.cpp:2984).
+    // Dinara's inverted-index lchain+mcopy discovery can emit multiple candidates per (readIds[0], readIds[1]),
+    // so deduplicate those now, after alignments and phasing parity have populated mismatch metrics and
     // DeleteReasonPhase, so we can pick the best one per partner.
-    if(!assemblerOptions.overlapCandidatesOptions.invertedIndexUseHifiasmChainDp) {
+    if(assemblerOptions.overlapCandidatesOptions.method == "InvertedIndex") {
         assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
     }
 
@@ -1347,14 +1346,14 @@ void dinara::main::assemble(
 
     // Compute oriented read journeys.
     anchors->computeJourneys(threadCount);
-    const vector<uint64_t> keptAnchors =
-        anchors->writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
-        assembler.readGraph,
-        assembler.alignmentData,
-        threadCount);
+    // const vector<uint64_t> keptAnchors =
+    //     anchors->writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
+    //     assembler.readGraph,
+    //     assembler.alignmentData,
+    //     threadCount);
 
-    // Recompute journeys using only the anchors selected as best in at least one stable interval.
-    anchors->computeJourneys(threadCount, &keptAnchors);
+    // // Recompute journeys using only the anchors selected as best in at least one stable interval.
+    // anchors->computeJourneys(threadCount, &keptAnchors);
 
     // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
     assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
