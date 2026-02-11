@@ -874,9 +874,11 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLike(uint64_t threadCou
     //   3) tie-break by longer span
     //
     // Dinara's inverted-index lchain+mcopy path can also produce multiple candidates per partner.
-    // We don't have hifiasm's `non_homopolymer_errors`; in Dinara the reads are typically stored
-    // in run-length representation (RLE), so raw mismatchCount is a reasonable proxy for the
-    // non-homopolymer error term hifiasm uses.
+    // We don't have hifiasm's `non_homopolymer_errors` field; however, hifiasm sets it after
+    // base-level refinement to a total edit-error count over the overlap (mismatches + gap bases).
+    // In Dinara we can approximate the same quantity from the computed base CIGAR:
+    //   nonHomopolymerErrorsProxy = mismatchCount + gapCount
+    // (see src/Alignment.hpp: `gapCount` is total gap BASES).
     //
     // This function runs after computeAlignmentsWithEvidence and after performHifiasmECParity
     // (so DeleteReasonPhase already reflects cis/trans decisions). It marks all but the best
@@ -907,7 +909,7 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
     struct CandidateInfo {
         uint32_t alignmentId = 0;
         ReadId partner = invalidReadId;
-        uint32_t mismatchCount = 0;
+        uint32_t errorCount = 0; // mismatchCount + gapCount (gap bases)
         uint32_t span = 0;
         uint8_t isMatchRank = 2; // 1=cis, 2=trans (matches hifiasm preference for smaller is_match)
         int64_t score = std::numeric_limits<int64_t>::min();
@@ -920,7 +922,7 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
             return;
         }
 
-        // Pick the best entry according to hifiasm's dedup_chains ordering, using mismatchCount as proxy.
+        // Pick the best entry according to hifiasm's dedup_chains ordering.
         size_t best = 0;
         for(size_t i = 1; i < group.size(); ++i) {
             const auto& a = group[i];
@@ -1008,10 +1010,12 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
 
                 const uint32_t span = ad.qe - ad.qs;
                 const uint32_t mism = (ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount;
+                const uint32_t gaps = (ad.info.gapCount == invalid<uint32_t>) ? 0U : ad.info.gapCount;
+                const uint32_t err = mism + gaps;
                 const bool isCisFromQuery = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
                 const uint8_t isMatchRank = isCisFromQuery ? uint8_t(1) : uint8_t(2);
-                const int64_t score = int64_t(span) - 12 * int64_t(mism);
-                group.push_back(CandidateInfo{alignmentId, partner, mism, span, isMatchRank, score});
+                const int64_t score = int64_t(span) - 12 * int64_t(err);
+                group.push_back(CandidateInfo{alignmentId, partner, err, span, isMatchRank, score});
             }
 
             flushGroup();
