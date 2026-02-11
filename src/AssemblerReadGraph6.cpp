@@ -218,13 +218,13 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterHangDel1
          << ", active=" << countActiveAlignments() << endl;
 
-    // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
-    // Marks fully contained reads and removes their overlaps
-    removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
-         << ", isDeleted1=" << afterContainDel1
-         << ", active=" << countActiveAlignments() << endl;
+    // // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
+    // // Marks fully contained reads and removes their overlaps
+    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+    //      << ", isDeleted1=" << afterContainDel1
+    //      << ", active=" << countActiveAlignments() << endl;
 
 
     
@@ -315,66 +315,66 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // required by all pipelines). Enable if needed.
     rebuildReadGraphUsingSelectedAlignments(keepAlignment, /*rebuildDirectedReadGraph*/false);
 
-    // Step 9 (hifiasm `ma_sg_gen`): create directed string graph arcs from kept overlaps.
-    createStringGraphUsingSelectedAlignments(keepAlignment);
+    // // Step 9 (hifiasm `ma_sg_gen`): create directed string graph arcs from kept overlaps.
+    // createStringGraphUsingSelectedAlignments(keepAlignment);
 
-    // Step 9a: make readGraph match the just-built stringGraph immediately.
-    rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
-
-    // Step 10 (hifiasm `asg_arc_del_trans`): pure transitive reduction (no tip cutting here).
-    reduceStringGraphTransitiveHifiasm(/*gapFuzz*/1000);
-
-    // Step 10a: Reflect string-graph deletions in the read graph so changes are visible there.
-    rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
-
-    // Step 10b (hifiasm `ul_clean_gfa` ONT): cut weak arcs before the initial tip cut.
-    // Hifiasm does this only when `asm_opt.is_ont`.
-    // Note: Dinara currently has no explicit ONT/HiFi switch for createReadGraph6, so this is always run.
-    // // TODO(hifiasm-parity): gate this behind an explicit ONT mode flag.
-    // cutStringGraphWeakArcsOntHifiasm(/*maxExtReads*/3, /*lenRatio*/0.975, /*minDiff*/16);
-
-    // Step 11 (hifiasm `ul_clean_gfa` initial): cut short tips before main cleaning loop.
-    // Hifiasm calls `asg_arc_cut_tips(sg, max_tip, ...)` as first operation in ul_clean_gfa.
-    // Default max_short_tip=3 means unitigs with ≤3 reads are considered tips.
-    // TODO(hifiasm-parity): hifiasm's `asg_arc_cut_tips(..., telo_end_t* te)` skips cutting if the tip start
-    // or any vertex along the candidate tip-unitig is telomere-marked (`te->hh[readId]`), to avoid trimming
-    // true chromosome ends. Dinara's `StringGraph` currently has only `readDeleted` (no telomere state), so
-    // `cutStringGraphTips()` cannot implement this "don't cut if telomeric" rule yet.
-    // TODO(hifiasm-parity): UL/ONT mode in hifiasm uses `asg_arc_cut_tips(..., is_ou, R_to_U* ru, ...)` and
-    // consults per-arc `asg_arc_t.ou` along the candidate path (tracking `mm_ou = MIN(ou)` and adjusting the
-    // effective extension length before deciding if it is "short"), plus an additional deletion pass using
-    // `R_to_U` when `ru && is_ou`. Dinara's `StringGraphArc` does not store `ou` and the pipeline does not
-    // provide `is_ou/ru`, so `cutStringGraphTips()` currently matches only the non-OU/non-ru logic.
-    cutStringGraphTips(/*maxShortTipReads*/3);
-
-    // Step 11a: Sync read graph after tip cutting.
-    rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
-
-    // // Step 12 (hifiasm `ul_clean_gfa` main loop): iterative cleaning with 4 rounds.
-    // // Each round removes semi-circular edges, bubbles, tips, short overlaps with
-    // // progressively increasing stringency (drop ratio: 0.2 → 0.4 → 0.6 → 0.8).
-    // // Hifiasm defaults: clean_round=4, min_drop_rate=0.2, max_drop_rate=0.8.
-    // cleanStringGraphIterativeHifiasm(
-    //     /*cleanRounds*/4,
-    //     /*minDropRate*/0.2,
-    //     /*maxDropRate*/0.8,
-    //     /*maxShortTipReads*/3);
-
-    // // Step 12a: Sync read graph after iterative cleaning.
+    // // Step 9a: make readGraph match the just-built stringGraph immediately.
     // rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
-    // //
-    // // // Next hifiasm stage: compress the cleaned string graph into unitigs.
-    // // createUnitigGraphFromStringGraph();
-    // //
-    // // // Additional hifiasm-like cleaning at the unitig level (topology-only).
-    // // cleanUnitigGraphInitialHifiasm(/*gapFuzz*/1000, /*maxShortTipUnitigs*/3);
-    // // cleanUnitigGraphPreCleanHifiasm(/*maxShortTipUnitigs*/3);
-    // // cleanUnitigGraphDropOverlapRoundsHifiasm(
+
+    // // Step 10 (hifiasm `asg_arc_del_trans`): pure transitive reduction (no tip cutting here).
+    // reduceStringGraphTransitiveHifiasm(/*gapFuzz*/1000);
+
+    // // Step 10a: Reflect string-graph deletions in the read graph so changes are visible there.
+    // rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
+
+    // // Step 10b (hifiasm `ul_clean_gfa` ONT): cut weak arcs before the initial tip cut.
+    // // Hifiasm does this only when `asm_opt.is_ont`.
+    // // Note: Dinara currently has no explicit ONT/HiFi switch for createReadGraph6, so this is always run.
+    // // // TODO(hifiasm-parity): gate this behind an explicit ONT mode flag.
+    // // cutStringGraphWeakArcsOntHifiasm(/*maxExtReads*/3, /*lenRatio*/0.975, /*minDiff*/16);
+
+    // // Step 11 (hifiasm `ul_clean_gfa` initial): cut short tips before main cleaning loop.
+    // // Hifiasm calls `asg_arc_cut_tips(sg, max_tip, ...)` as first operation in ul_clean_gfa.
+    // // Default max_short_tip=3 means unitigs with ≤3 reads are considered tips.
+    // // TODO(hifiasm-parity): hifiasm's `asg_arc_cut_tips(..., telo_end_t* te)` skips cutting if the tip start
+    // // or any vertex along the candidate tip-unitig is telomere-marked (`te->hh[readId]`), to avoid trimming
+    // // true chromosome ends. Dinara's `StringGraph` currently has only `readDeleted` (no telomere state), so
+    // // `cutStringGraphTips()` cannot implement this "don't cut if telomeric" rule yet.
+    // // TODO(hifiasm-parity): UL/ONT mode in hifiasm uses `asg_arc_cut_tips(..., is_ou, R_to_U* ru, ...)` and
+    // // consults per-arc `asg_arc_t.ou` along the candidate path (tracking `mm_ou = MIN(ou)` and adjusting the
+    // // effective extension length before deciding if it is "short"), plus an additional deletion pass using
+    // // `R_to_U` when `ru && is_ou`. Dinara's `StringGraphArc` does not store `ou` and the pipeline does not
+    // // provide `is_ou/ru`, so `cutStringGraphTips()` currently matches only the non-OU/non-ru logic.
+    // cutStringGraphTips(/*maxShortTipReads*/3);
+
+    // // Step 11a: Sync read graph after tip cutting.
+    // rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
+
+    // // // Step 12 (hifiasm `ul_clean_gfa` main loop): iterative cleaning with 4 rounds.
+    // // // Each round removes semi-circular edges, bubbles, tips, short overlaps with
+    // // // progressively increasing stringency (drop ratio: 0.2 → 0.4 → 0.6 → 0.8).
+    // // // Hifiasm defaults: clean_round=4, min_drop_rate=0.2, max_drop_rate=0.8.
+    // // cleanStringGraphIterativeHifiasm(
     // //     /*cleanRounds*/4,
     // //     /*minDropRate*/0.2,
     // //     /*maxDropRate*/0.8,
-    // //     /*maxShortTipUnitigs*/3,
-    // //     /*finalMinOverlapLen*/2000);
+    // //     /*maxShortTipReads*/3);
+
+    // // // Step 12a: Sync read graph after iterative cleaning.
+    // // rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
+    // // //
+    // // // // Next hifiasm stage: compress the cleaned string graph into unitigs.
+    // // // createUnitigGraphFromStringGraph();
+    // // //
+    // // // // Additional hifiasm-like cleaning at the unitig level (topology-only).
+    // // // cleanUnitigGraphInitialHifiasm(/*gapFuzz*/1000, /*maxShortTipUnitigs*/3);
+    // // // cleanUnitigGraphPreCleanHifiasm(/*maxShortTipUnitigs*/3);
+    // // // cleanUnitigGraphDropOverlapRoundsHifiasm(
+    // // //     /*cleanRounds*/4,
+    // // //     /*minDropRate*/0.2,
+    // // //     /*maxDropRate*/0.8,
+    // // //     /*maxShortTipUnitigs*/3,
+    // // //     /*finalMinOverlapLen*/2000);
     
     cout << timestamp << "createReadGraph6 completed." << endl;
 }
