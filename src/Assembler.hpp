@@ -2490,9 +2490,6 @@ private:
 	         double maxDriftRate;
 	         uint64_t k; // k-mer length for canonicalization
 	         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
-             uint32_t minOverlapLength = 500; // Minimum overlap span (bases) to keep a candidate (min of query/target spans).
-             uint32_t maxEndFuzz = 0; // If >0, discard candidates needing more extension to read ends.
-
              // InvertedIndex chaining configuration (see OverlapCandidatesOptions for meaning).
              double weightExponent = 1.1;
              double lowFreqMultiplier = 0.333;
@@ -2512,6 +2509,8 @@ private:
              uint32_t mcopyKhitCutoff = 32;
              uint32_t mcopyOcvWindow = 3072;
              double mcopyOcvWeakKeepRatio = 0.70;
+             uint32_t minOverlapLength = 0;  // If >0, reject candidates whose min(qSpan, tSpan) < threshold.
+             uint32_t maxEndFuzz = 0;        // If >0, reject candidates needing more extension to read ends.
 	             vector<uint32_t> weightLut; // size 512 (pow(weightBase, weightExponent) truncated)
 	         
 	         // Phase 1: Heavy vector with Keys (for Sort/Group).

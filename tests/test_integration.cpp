@@ -984,32 +984,6 @@ public:
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = 0.1;
         overlapCandidatesOptions.minChainMarkerCount = 4;
-        // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
-        overlapCandidatesOptions.minOverlapLength = 0;
-        withSilencedIoInDir(testDir, [&] {
-            assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
-        });
-    }
-
-    void findCandidatesWithMaxEndFuzz(uint32_t maxEndFuzz) {
-        OverlapCandidatesOptions overlapCandidatesOptions;
-        overlapCandidatesOptions.method = "InvertedIndex";
-        overlapCandidatesOptions.driftRateTolerance = 0.1;
-        overlapCandidatesOptions.minChainMarkerCount = 4;
-        // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
-        overlapCandidatesOptions.minOverlapLength = 0;
-        overlapCandidatesOptions.maxEndFuzz = maxEndFuzz;
-        withSilencedIoInDir(testDir, [&] {
-            assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
-        });
-    }
-
-    void findCandidatesWithMinOverlapLength(uint32_t minOverlapLength) {
-        OverlapCandidatesOptions overlapCandidatesOptions;
-        overlapCandidatesOptions.method = "InvertedIndex";
-        overlapCandidatesOptions.driftRateTolerance = 0.1;
-        overlapCandidatesOptions.minChainMarkerCount = 4;
-        overlapCandidatesOptions.minOverlapLength = minOverlapLength;
         withSilencedIoInDir(testDir, [&] {
             assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
         });
@@ -1025,8 +999,6 @@ public:
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
         overlapCandidatesOptions.minChainMarkerCount = 4;
-        // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
-        overlapCandidatesOptions.minOverlapLength = 0;
         withSilencedIoInDir(testDir, [&] {
             assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 0, 1);
         });
@@ -1091,16 +1063,12 @@ public:
     void chainPafCandidates(
         double maxDriftRate = 0.1,
         uint64_t maxChainLimit = 100,
-        uint32_t maxEndFuzz = 0,
         uint32_t minChainedMarkerCount = 0)
     {
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
         overlapCandidatesOptions.minChainMarkerCount = 4;
-        // Keep tests independent of production defaults (synthetic reads/overlaps can be short).
-        overlapCandidatesOptions.minOverlapLength = 0;
-        overlapCandidatesOptions.maxEndFuzz = maxEndFuzz;
         withSilencedIoInDir(testDir, [&] {
             assembler->chainPafCandidates(
                 maxDriftRate,
@@ -1111,158 +1079,6 @@ public:
         });
     }
 };
-
-TEST_CASE("OverlapCandidates.maxEndFuzz discards internal candidates", "[integration][candidates][extension]")
-{
-    // Two reads that only overlap in the middle, so hifiasm-parity end extension would be large.
-    const std::string left0 = randomSequence(1200, 9001);
-    const std::string shared = randomSequence(600, 9002);
-    const std::string right0 = randomSequence(1200, 9003);
-    const std::string left1 = randomSequence(1200, 9011);
-    const std::string right1 = randomSequence(1200, 9013);
-
-    const std::string r0 = left0 + shared + right0;
-    const std::string r1 = left1 + shared + right1;
-
-    // Baseline: without filtering, we should find at least one candidate.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-        fixture.findCandidatesWithMaxEndFuzz(0);
-        REQUIRE(fixture.assembler->alignmentCandidates.candidates.size() > 0);
-    }
-
-    // With maxEndFuzz=300, this internal overlap should be discarded.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-        fixture.findCandidatesWithMaxEndFuzz(300);
-        CHECK(fixture.assembler->alignmentCandidates.candidates.size() == 0);
-    }
-}
-
-std::string reverseComplement(const std::string& seq);
-
-TEST_CASE("OverlapCandidates.maxEndFuzz discards internal reverse PAF candidates", "[integration][candidates][extension][paf]")
-{
-    // Keep this test small: a large number of repeated kmers can make chaining O(n^2) and slow.
-    const std::string left0 = randomSequence(600, 9101);
-    const std::string right0 = randomSequence(600, 9102);
-    const std::string left1 = randomSequence(600, 9103);
-    const std::string right1 = randomSequence(600, 9104);
-    const std::string shared = randomSequence(600, 9105);
-
-    // Construct a reverse-strand overlap: r0 contains `shared`, r1 contains reverseComplement(shared).
-    const std::string r0 = left0 + shared + right0;
-    const std::string r1 = left1 + reverseComplement(shared) + right1;
-
-    const uint32_t qStart = uint32_t(left0.size());
-    const uint32_t qEnd = qStart + uint32_t(shared.size());
-    const uint32_t tStart = uint32_t(left1.size());
-    const uint32_t tEnd = tStart + uint32_t(shared.size());
-
-    // Baseline: without filtering, chaining should emit at least one candidate with opposite strand.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-
-        const std::string pafPath = fixture.createPafFile({
-            AssemblerIntegrationFixture::PafOverlapSpec{"read_0", "read_1", false, qStart, qEnd, tStart, tEnd}
-        });
-
-        fixture.buildIndex();
-        fixture.importPafCandidates(pafPath);
-        const size_t importedCount = fixture.assembler->alignmentCandidates.candidates.size();
-        CAPTURE(importedCount);
-        REQUIRE(importedCount >= 1);
-
-        fixture.chainPafCandidates(0.1, 100, 0);
-        const size_t chainedCount = fixture.assembler->alignmentCandidates.candidates.size();
-        CAPTURE(chainedCount);
-        REQUIRE(chainedCount > 0);
-
-        bool foundOpposite = false;
-        for(const auto& c : fixture.assembler->alignmentCandidates.candidates) {
-            if ((c.readIds[0] == 0 && c.readIds[1] == 1) || (c.readIds[0] == 1 && c.readIds[1] == 0)) {
-                foundOpposite = true;
-                CHECK(c.isSameStrand == false);
-                break;
-            }
-        }
-        CHECK(foundOpposite);
-    }
-
-    // With maxEndFuzz=300, the internal overlap should be discarded during chaining.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-
-        const std::string pafPath = fixture.createPafFile({
-            AssemblerIntegrationFixture::PafOverlapSpec{"read_0", "read_1", false, qStart, qEnd, tStart, tEnd}
-        });
-
-        fixture.buildIndex();
-        fixture.importPafCandidates(pafPath);
-        fixture.chainPafCandidates(0.1, 100, 300);
-        CHECK(fixture.assembler->alignmentCandidates.candidates.size() == 0);
-    }
-}
-
-TEST_CASE("OverlapCandidates.minOverlapLength filters short candidates", "[integration][candidates][overlap-length]")
-{
-    // Two reads overlapping at ends by only 400bp.
-    const std::string shared = randomSequence(400, 9201);
-    const std::string suffix0 = randomSequence(800, 9202);
-    const std::string prefix1 = randomSequence(800, 9203);
-    const std::string r0 = shared + suffix0;
-    const std::string r1 = prefix1 + shared;
-
-    // With low threshold, we should get candidates.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-        fixture.findCandidatesWithMinOverlapLength(0);
-        REQUIRE(fixture.assembler->alignmentCandidates.candidates.size() > 0);
-    }
-
-    // With default-like threshold 500, the candidate should be rejected.
-    {
-        AssemblerIntegrationFixture fixture;
-        fixture.createFastq({r0, r1});
-        fixture.initAssembler();
-        fixture.loadReads();
-        fixture.generateMarkers(16, 5);
-        fixture.countKmers();
-        fixture.applyFilter(1, 1000);
-        fixture.findCandidatesWithMinOverlapLength(500);
-        CHECK(fixture.assembler->alignmentCandidates.candidates.size() == 0);
-    }
-}
 
 TEST_CASE("ReadGraph.filterSecondaryRequireNonRedundantOnBothReads removes symmetric-only overlaps",
     "[integration][readgraph][secondary][symmetry]")
@@ -5449,7 +5265,7 @@ TEST_CASE("Integration: PAF chain cutoff uses >= semantics", "[integration][paf]
 
     AssemblerIntegrationFixture baseline;
     setupFixture(baseline);
-    baseline.chainPafCandidates(0.1, 100, 0, 0);
+    baseline.chainPafCandidates(0.1, 100, 0);
     REQUIRE(baseline.assembler->alignmentCandidates.candidates.size() > 0);
     REQUIRE(baseline.assembler->alignmentCandidatesAlignmentsData.alignments.size() > 0);
 
@@ -5461,12 +5277,12 @@ TEST_CASE("Integration: PAF chain cutoff uses >= semantics", "[integration][paf]
 
     AssemblerIntegrationFixture equalCutoff;
     setupFixture(equalCutoff);
-    equalCutoff.chainPafCandidates(0.1, 100, 0, uint32_t(bestChainLen));
+    equalCutoff.chainPafCandidates(0.1, 100, uint32_t(bestChainLen));
     CHECK(equalCutoff.assembler->alignmentCandidates.candidates.size() > 0);
 
     AssemblerIntegrationFixture aboveCutoff;
     setupFixture(aboveCutoff);
-    aboveCutoff.chainPafCandidates(0.1, 100, 0, uint32_t(bestChainLen + 1));
+    aboveCutoff.chainPafCandidates(0.1, 100, uint32_t(bestChainLen + 1));
     CHECK(aboveCutoff.assembler->alignmentCandidates.candidates.size() == 0);
 }
 
