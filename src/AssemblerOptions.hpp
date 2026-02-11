@@ -233,6 +233,11 @@ public:
     double invertedIndexNonRedundantOverlapFraction = 1.0;   // Disabled (was 0.5) - matches hifiasm r484 commented-out state
 
     // --- Chaining parameters (hifiasm lchain) ---
+	    // If true, use hifiasm's chain_DP (Hash_Table.cpp:894) for pre-EC overlap discovery.
+	    // If false, use the lchain_qdp-style DP implemented in AssemblerInvertedIndex.cpp.
+	    // Note: chain_DP parity mode uses per-hit z->rev^y->rev orientation bucketing, and
+	    // applies the simpler max_n_chain pruning from anchor.cpp:191-220 (no COV_W rescue).
+	    bool invertedIndexUseHifiasmChainDp = false;
     bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
     bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring
 

@@ -986,15 +986,34 @@ private:
     };
     FlagPalindromicReadsData flagPalindromicReadsData;
 
-    // Filter secondary/redundant alignments per read pair (hifiasm-style).
-    void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
-    std::atomic<uint64_t> removedSecondaryAlignmentCount;
-    std::atomic<uint64_t> removedSecondaryAlignmentBySymmetryOnlyCount;
-    bool filterSecondaryRequireNonRedundantOnBothReads = false;
-public:
-    void filterSecondaryAlignmentsPerReadPair(
-        uint64_t threadCount,
-        bool requireNonRedundantOnBothReads = false);
+	    // Filter secondary/redundant alignments per read pair (hifiasm-style).
+		    void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
+		    void keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t threadId);
+		    void deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size_t threadId);
+		    std::atomic<uint64_t> removedSecondaryAlignmentCount;
+		    std::atomic<uint64_t> removedSecondaryAlignmentBySymmetryOnlyCount;
+		    std::atomic<uint64_t> removedOntDeduplicatedChainCount;
+		    bool filterSecondaryRequireNonRedundantOnBothReads = false;
+		public:
+		    void filterSecondaryAlignmentsPerReadPair(
+		        uint64_t threadCount,
+		        bool requireNonRedundantOnBothReads = false);
+	public:
+	    // ONT EC parity helper:
+	    // In hifiasm's ONT pipeline, `h_ec_lchain` can emit multiple chains per (query, partner).
+	    // Later, after base-level alignment refinement and phasing (`gen_hc_r_alin_ea`, `rphase_hc`),
+	    // hifiasm collapses duplicates with `dedup_chains` (ecovlp.cpp:2984), using base-level error
+	    // statistics and cis/trans state to select one best overlap per partner.
+	    //
+	    // Dinara's inverted-index lchain+mcopy path mirrors the "emit multiple chains" behavior.
+	    // This function mirrors the "dedup later" stage and marks all but the best overlap per
+	    // (readIds[0], readIds[1]) as `DeleteReasonSecondary`.
+	    void deduplicateOntChainsPerPartnerReadHifiasmLike(uint64_t threadCount);
+	public:
+	    // More aggressive than filterSecondaryAlignmentsPerReadPair:
+	    // for each (read0, read1) pair, keep only the single best overlap by DP score
+	    // among overlaps that are cis on both reads and not already deleted.
+	    void keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount);
 public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
@@ -1840,7 +1859,15 @@ public:
 	    void createStringGraphUsingSelectedAlignments(const vector<bool>& keepAlignment);
     void createUnitigGraphFromStringGraph();
     void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
+    void rebuildReadGraphFromCurrentStringGraph(bool rebuildDirectedReadGraph = false);
+    uint64_t reduceStringGraphTransitiveHifiasm(uint32_t gapFuzz);
+    uint64_t cutStringGraphTips(uint32_t maxShortTipReads);
     void cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipReads);
+    void cleanStringGraphIterativeHifiasm(
+        uint32_t cleanRounds,
+        double minDropRate,
+        double maxDropRate,
+        uint32_t maxShortTipReads);
     void cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads);
     void cleanStringGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
     void cleanStringGraphDropOverlapRoundsHifiasm(
@@ -1849,6 +1876,9 @@ public:
         double maxDropRate,
         uint32_t maxShortTipReads,
         uint32_t finalMinOverlapLen);
+
+    // ONT-only hifiasm parity: weak arc cutting (ul_clean_gfa: asg_arc_cut_weak) on the StringGraph.
+    uint64_t cutStringGraphWeakArcsOntHifiasm(uint32_t maxExtReads, double lenRatio, uint32_t minDiff);
     uint64_t cleanStringGraphBreakShortCycles(uint32_t maxCycleReads);
 
     void cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs);
@@ -2473,16 +2503,20 @@ private:
              uint32_t maxHighFrequencyPerStreak = 16;
              double highFactor = 5.0;        // Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain)
              uint32_t minNChain = 100;       // Hifiasm MIN_N_CHAIN: minimum max_n_chain value
-             double nonRedundantOverlapFraction = 0.5;
-             bool lchainIsAccurate = true;
-             bool useEcScoring = true;
+	         double nonRedundantOverlapFraction = 0.5;
+	             // If true, use hifiasm's pre-EC chaining algorithm (chain_DP in Hash_Table.cpp)
+	             // instead of the lchain_qdp-style chaining. This mode also expects hifiasm-style
+	             // overlap pruning (max_n_chain in anchor.cpp:191-220) and disables mcopy/COV_W logic.
+	             bool useHifiasmChainDp = true;
+	             bool lchainIsAccurate = true;
+	             bool useEcScoring = true;
              bool enableMcopyFast = true;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;
              uint32_t mcopyKhitCutoff = 32;
              uint32_t mcopyOcvWindow = 3072;
              double mcopyOcvWeakKeepRatio = 0.70;
-             vector<uint8_t> weightLut; // size 512
+	             vector<uint32_t> weightLut; // size 512 (pow(weightBase, weightExponent) truncated)
 	         
 	         // Phase 1: Heavy vector with Keys (for Sort/Group).
 	         vector<InvertedIndexOccurrence> occurrences; 
@@ -2490,11 +2524,15 @@ private:
          // Phase 2: Compact vector for Query (8 bytes/hit).
          vector<CompactOccurrence> compactOccurrences;
 
-         // Canonical k-mer ids for strand-0 markers, laid out read-contiguously.
-         // offsets[r]..offsets[r+1]-1 corresponds to read r strand 0.
-         // This cache lets chaining avoid per-marker reverse-complement work.
-         vector<uint64_t> strand0CanonicalOffsets;
-         vector<KmerId> strand0CanonicalKmerIds;
+	         // Canonical k-mer ids for strand-0 markers, laid out read-contiguously.
+	         // offsets[r]..offsets[r+1]-1 corresponds to read r strand 0.
+	         // This cache lets chaining avoid per-marker reverse-complement work.
+	         vector<uint64_t> strand0CanonicalOffsets;
+	         vector<KmerId> strand0CanonicalKmerIds;
+	         // For each entry in strand0CanonicalKmerIds, stores whether the observed k-mer on strand 0
+	         // was the reverse complement of the canonical k-mer (1) or the canonical itself (0).
+	         // This is the hifiasm z->rev equivalent needed to compute per-hit rev = z->rev ^ y->rev.
+	         vector<uint8_t> strand0CanonicalIsRc;
 
 
          // Open Addressing Hash Table (Linear Probing).

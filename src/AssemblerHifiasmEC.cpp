@@ -3226,11 +3226,18 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                    candidates.reserve(alignments.size());
                     
                     const auto tGatherBegin = steady_clock::now();
-                    for(uint32_t alignmentId : alignments) {
-                        const auto& thisAlignmentData = alignmentData[alignmentId];
-                        
-	                        /* Skip alignments already deleted by earlier graph filtering. */
-	                        if(thisAlignmentData.isDeleted()) continue;
+	                    for(uint32_t alignmentId : alignments) {
+	                        const auto& thisAlignmentData = alignmentData[alignmentId];
+	                        
+		                        /*
+		                        Skip alignments deleted from THIS query read's perspective.
+		
+		                        This matches hifiasm's pre-EC overlap list semantics: each query read has
+		                        its own candidate list, and deletions/filters applied to that list should
+		                        be respected when building the EC candidate set. Using isDeleted() (both
+		                        sides) would incorrectly retain overlaps removed only for this read.
+		                        */
+		                        if(thisAlignmentData.isDeletedFromReadPerspective(ReadId(readId))) continue;
 
                         CandidateEC candidate;
                         candidate.alignmentId = alignmentId;

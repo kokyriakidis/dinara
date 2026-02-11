@@ -269,12 +269,13 @@ void Mode3Assembler::exploreAnchor(const vector<string>& request, ostream& html)
         const uint32_t position1 = orientedReadMarkers[ordinal1].position;
 
         AnchorId previousAnchorInJourney = invalid<AnchorId>;
-        if(markerInterval.positionInJourney > 0) {
-            previousAnchorInJourney = journey[markerInterval.positionInJourney - 1];
+        const uint64_t posInJourney = markerInterval.positionInJourney;
+        if(posInJourney != invalid<uint32_t> && posInJourney > 0 && posInJourney < journey.size()) {
+            previousAnchorInJourney = journey[posInJourney - 1];
         }
         AnchorId nextAnchorInJourney = invalid<AnchorId>;
-        if(markerInterval.positionInJourney < journey.size() - 1) {
-            nextAnchorInJourney = journey[markerInterval.positionInJourney + 1];
+        if(posInJourney != invalid<uint32_t> && (posInJourney + 1) < journey.size()) {
+            nextAnchorInJourney = journey[posInJourney + 1];
         }
 
         html <<
