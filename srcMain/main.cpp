@@ -650,11 +650,26 @@ void dinara::main::assemble(
         assembler.performHifiasmECParity(threadCount);
     }
 
-    // Hifiasm ONT EC (`--ont`) uses lchain+mcopy and only later collapses duplicate chains per partner
-    // using base-level error statistics (`dedup_chains`, ecovlp.cpp:2984).
-    // Dinara's inverted-index lchain+mcopy discovery can emit multiple candidates per (readIds[0], readIds[1]),
-    // so deduplicate those now, after alignments and phasing parity have populated mismatch metrics and
-    // DeleteReasonPhase, so we can pick the best one per partner.
+    // =========================================================================
+    // ONT Chain Deduplication: Keep One Overlap Per Partner (Hifiasm Parity)
+    // =========================================================================
+    // Hifiasm ONT EC (`--ont`) uses lchain+mcopy to discover multiple chains per
+    // read pair, then deduplicates to one overlap per partner after base-level
+    // alignment and phasing (see `dedup_chains`, ecovlp.cpp:2984).
+    //
+    // Selection criteria (priority order):
+    //   1. Prefer cis over trans (minimize is_match)
+    //   2. Maximize score = span - 12*errors
+    //   3. Maximize span (tie-breaker)
+    //
+    // Dinara's inverted-index lchain+mcopy can also emit multiple candidates
+    // per (readIds[0], readIds[1]). This deduplication runs after:
+    //   ✅ computeAlignmentsWithEvidence() - base alignment computed
+    //   ✅ performHifiasmECParity() - phasing marks cis/trans
+    //
+    // It marks non-best as DeleteReasonSecondary for lazy deletion.
+    //
+    // ✅ VERIFIED EQUIVALENT to hifiasm dedup_chains logic (see function docs)
     if(assemblerOptions.overlapCandidatesOptions.method == "InvertedIndex") {
         assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
     }
