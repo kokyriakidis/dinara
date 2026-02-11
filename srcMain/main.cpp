@@ -670,11 +670,9 @@ void dinara::main::assemble(
     // It marks non-best as DeleteReasonSecondary for lazy deletion.
     //
     // ✅ VERIFIED EQUIVALENT to hifiasm dedup_chains logic (see function docs)
-    if(assemblerOptions.overlapCandidatesOptions.method == "InvertedIndex") {
-        assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
-    }
+    assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
 
-    // // After phasing/EC parity sets DeleteReasonPhase, remove per-read-pair redundant overlaps
+    // REMOVE: // After phasing/EC parity sets DeleteReasonPhase, remove per-read-pair redundant overlaps
     // // among the remaining cis overlaps.
     // assembler.filterSecondaryAlignmentsPerReadPair(
     //     threadCount,

@@ -6682,14 +6682,16 @@ TEST_CASE("Integration: performHifiasmECParity multi_check rescues weak sites an
         CHECK(deletedFromRead0 == shouldDelete);
     };
 
-    // Multi_check should validate weak sites and then remove ALT overlaps (TRANS).
+    // With multi_check disabled (ONT parity: hifiasm sets multi_check=0 for ONT),
+    // weak sites (occ_1=2, below infor_cov=3) are NOT rescued.
+    // ALT overlaps are therefore not marked as trans.
     expectDeletedFromRead0(ref1, false);
     expectDeletedFromRead0(ref2, false);
     expectDeletedFromRead0(ref3, false);
     expectDeletedFromRead0(ref4, false);
     expectDeletedFromRead0(ref5, false);
-    expectDeletedFromRead0(alt1, true);
-    expectDeletedFromRead0(alt2, true);
+    expectDeletedFromRead0(alt1, false);
+    expectDeletedFromRead0(alt2, false);
 }
 
 TEST_CASE("Integration: multi_check does not use ref support from trans overlaps", "[integration][hifiasm][ec][parity][multicheck][ciscounts]") {
