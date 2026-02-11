@@ -20,6 +20,7 @@
 #include "MarkerGraphEdgePairInfo.hpp"
 #include "MemoryMappedObject.hpp"
 #include "MultithreadedObject.hpp"
+#include "BidirectionalReadGraph.hpp"
 #include "ReadGraph.hpp"
 #include "StringGraph.hpp"
 #include "UnitigGraph.hpp"
@@ -642,6 +643,14 @@ public:
     // then select one marker ordinal per interval and gather matching marker ordinals on overlapping reads
     // using AlignmentInfo ordinal-offset bounds and k-mer validation.
     shared_ptr<mode3::Anchors> createAnchorsFromOverlapsBestPerOverlapInterval(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
+    // BidirectionalReadGraph-aware variant of createAnchorsFromOverlapsBestPerOverlapInterval.
+    // Uses orientation-aware traversal via edge.traverse() instead of the strand-doubled
+    // ReadGraph, preserving cross-strand overlaps at inversion/segdup boundaries.
+    shared_ptr<mode3::Anchors> createAnchorsFromOverlapsBestPerOverlapIntervalBidirectional(
         uint64_t minAnchorCoverage,
         uint64_t maxAnchorCoverage,
         uint64_t threadCount);
@@ -1568,6 +1577,7 @@ private:
 	    ReadGraph readGraph;
 	    ReadGraph readGraphAllAlignments;
 	    DirectedReadGraph directedReadGraph;
+	    BidirectionalReadGraph bidirectionalReadGraph;
 	    StringGraph stringGraph;
 	    UnitigGraph unitigGraph;
     void createReadGraph(
@@ -1595,6 +1605,13 @@ private:
     void checkReadGraphIsOpen() const;
     void accessDirectedReadGraph();
     void checkDirectedReadGraphIsOpen() const;
+    // BidirectionalReadGraph: one vertex per read, one edge per alignment.
+    void createBidirectionalReadGraph();
+    void createBidirectionalReadGraphFromSelectedAlignments(const vector<bool>& keepAlignment);
+    void accessBidirectionalReadGraph();
+    void accessBidirectionalReadGraphReadWrite();
+    void checkBidirectionalReadGraphIsOpen() const;
+    void removeBidirectionalReadGraph();
     void accessStringGraph();
     void accessStringGraphReadWrite();
     void checkStringGraphIsOpen() const;
@@ -1949,6 +1966,17 @@ private:
             uint32_t maxDistance,
             bool allowChimericReads,
             bool allowCrossStrandEdges,
+            bool allowInconsistentAlignmentEdges,
+            double timeout,
+            LocalReadGraph&);
+
+        // Create a local subgraph of the BidirectionalReadGraph.
+        // Uses orientation-aware BFS via edge.traverse().
+        // Produces a LocalReadGraph with derived OrientedReadId vertices.
+        bool createLocalBidirectionalReadGraph(
+            const vector<OrientedReadId>& starts,
+            uint32_t maxDistance,
+            bool allowChimericReads,
             bool allowInconsistentAlignmentEdges,
             double timeout,
             LocalReadGraph&);
@@ -3193,6 +3221,7 @@ public:
     void alignSequencesInBaseRepresentation(const vector<string>&, ostream&);
     void exploreAlignmentGraph(const vector<string>&, ostream&);
     void exploreReadGraph(const vector<string>&, ostream&);
+    void exploreBidirectionalReadGraph(const vector<string>&, ostream&);
     void exploreStringGraph(const vector<string>&, ostream&);
     void exploreUnitigGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);

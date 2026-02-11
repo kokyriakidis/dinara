@@ -683,6 +683,12 @@ void dinara::main::assemble(
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
 
+    // Create the bidirectional read graph.
+    // This is built from the same alignments that are in the ReadGraph
+    // (isInReadGraph == 1), but stores one vertex per physical read and
+    // one edge per alignment (no strand doubling).
+    assembler.createBidirectionalReadGraph();
+
     // Global mismatch-site diagnostics and export are expensive and intended for debugging.
     // Keep them off by default in production runs to preserve assembly throughput.
     const bool runGlobalHetDiagnostics = true;

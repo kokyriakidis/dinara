@@ -4271,3 +4271,755 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
     anchors->computeJourneys(threadCount);
     return anchors;
 }
+
+
+
+// ============================================================================
+// createAnchorsFromOverlapsBestPerOverlapIntervalBidirectional
+// ============================================================================
+// BidirectionalReadGraph-aware variant of createAnchorsFromOverlapsBestPerOverlapInterval.
+//
+// Uses bidirectionalReadGraph (one vertex per physical read, one edge per alignment)
+// instead of the strand-doubled readGraph.  Orientation-aware traversal via
+// edge.traverse(readId, strand) replaces the legacy crossesStrands gate:
+//
+//   Old: readGraph.connectivity[orientedReadId.getValue()]
+//        edge.crossesStrands → skip
+//        edge.getOther(orientedReadId) → OrientedReadId
+//
+//   New: bidirectionalReadGraph.connectivity[readId]
+//        edge.isDeleted → skip  (no crossesStrands concept)
+//        edge.traverse(readId, 0) → (ReadId, Strand) → OrientedReadId
+//
+// This preserves cross-strand overlaps (inversions, segdups) that the legacy
+// graph would discard, letting anchors span inversion breakpoints.
+shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapIntervalBidirectional(
+    uint64_t minAnchorCoverage,
+    uint64_t maxAnchorCoverage,
+    uint64_t threadCount)
+{
+    reads->checkReadsAreOpen();
+    checkMarkersAreOpen();
+    computeMarkerKmerIds(threadCount);
+    checkBidirectionalReadGraphIsOpen();
+    if(!alignmentData.isOpen) {
+        throw runtime_error("Alignment data are not accessible.");
+    }
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const uint64_t readCount = reads->readCount();
+    // Only generate anchors from strand-0 oriented reads (read+).
+    // We always emit the reverse-complement anchor explicitly.
+    const uint64_t orientedReadCount = readCount;
+    const uint64_t k = assemblerInfo->k;
+    const vector<uint64_t> maxAnchorRepeatLength = {8, 3, 3, 3, 3};
+
+    // Informative het restriction (same logic as the strand-doubled version).
+    bool restrictToInformativeHetReads = false;
+    vector<uint8_t> readHasInformativeHet(readCount, 0);
+    {
+        for(uint64_t alignmentId=0; alignmentId<alignmentData.size(); ++alignmentId) {
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if(!ad.coversHetSite()) {
+                continue;
+            }
+            restrictToInformativeHetReads = true;
+            if(ad.readIds[0] < readCount) {
+                readHasInformativeHet[ad.readIds[0]] = 1;
+            }
+            if(ad.readIds[1] < readCount) {
+                readHasInformativeHet[ad.readIds[1]] = 1;
+            }
+        }
+    }
+    if(restrictToInformativeHetReads) {
+        cout << timestamp << "BRG: Using informative-het-only mode for overlap-only anchors." << endl;
+    } else {
+        cout << timestamp << "BRG: No informative het coverage detected; generating overlap-only anchors from all reads." << endl;
+    }
+
+    if((not markerKmerIds) or (not markerKmerIds->isOpen())) {
+        throw runtime_error("MarkerKmerIds are required for FromOverlapsBestPerOverlapIntervalBidirectional.");
+    }
+
+    // Precompute canonical marker k-mers with duplicate ReadIds.
+    vector<vector<KmerId>> duplicateCanonicalKmerIdsByThread(threadCount);
+    {
+        vector<thread> dupThreads;
+        dupThreads.reserve(threadCount);
+
+        uint64_t chunk2 = readCount / threadCount;
+        if(chunk2 == 0) chunk2 = 1;
+
+        for(uint64_t t=0; t<threadCount; t++) {
+            dupThreads.emplace_back([&, t]() {
+                const uint64_t begin = t * chunk2;
+                const uint64_t end = (t == threadCount - 1) ? readCount : min(readCount, (t+1) * chunk2);
+
+                auto& duplicates = duplicateCanonicalKmerIdsByThread[t];
+                duplicates.clear();
+                duplicates.reserve(1024);
+
+                unordered_set<KmerId, KmerIdHasher> seen;
+                seen.reserve(4096);
+
+                for(uint64_t r=begin; r<end; ++r) {
+                    const ReadId readId = ReadId(r);
+                    const OrientedReadId or0(readId, 0);
+                    const OrientedReadId or1(readId, 1);
+                    const auto kmerIds0 = (*markerKmerIds)[or0.getValue()];
+                    const auto kmerIds1 = (*markerKmerIds)[or1.getValue()];
+                    const uint32_t markerCount = uint32_t(kmerIds0.size());
+                    if(markerCount == 0) {
+                        continue;
+                    }
+                    DINARA_ASSERT(kmerIds1.size() == markerCount);
+
+                    seen.clear();
+                    if(seen.bucket_count() < size_t(markerCount) * 2ULL) {
+                        seen.reserve(size_t(markerCount) * 2ULL);
+                    }
+
+                    for(uint32_t ordinal0=0; ordinal0<markerCount; ++ordinal0) {
+                        const uint32_t ordinal1 = markerCount - 1U - ordinal0;
+                        const KmerId id0 = kmerIds0[ordinal0];
+                        const KmerId id1 = kmerIds1[ordinal1];
+                        const KmerId canonical = (id0 <= id1) ? id0 : id1;
+                        const auto inserted = seen.insert(canonical).second;
+                        if(not inserted) {
+                            duplicates.push_back(canonical);
+                        }
+                    }
+                }
+            });
+        }
+        for(auto& th : dupThreads) {
+            th.join();
+        }
+    }
+
+    vector<KmerId> duplicateCanonicalKmerIds;
+    {
+        size_t total = 0;
+        for(const auto& v : duplicateCanonicalKmerIdsByThread) total += v.size();
+        duplicateCanonicalKmerIds.reserve(total);
+        for(auto& v : duplicateCanonicalKmerIdsByThread) {
+            duplicateCanonicalKmerIds.insert(duplicateCanonicalKmerIds.end(), v.begin(), v.end());
+        }
+        sort(duplicateCanonicalKmerIds.begin(), duplicateCanonicalKmerIds.end());
+        duplicateCanonicalKmerIds.erase(
+            unique(duplicateCanonicalKmerIds.begin(), duplicateCanonicalKmerIds.end()),
+            duplicateCanonicalKmerIds.end());
+    }
+
+    unordered_set<KmerId, KmerIdHasher> canonicalKmerIdsWithDuplicateReadIds;
+    canonicalKmerIdsWithDuplicateReadIds.reserve(duplicateCanonicalKmerIds.size() * 2ULL + 1ULL);
+    for(const KmerId& id : duplicateCanonicalKmerIds) {
+        canonicalKmerIdsWithDuplicateReadIds.insert(id);
+    }
+    cout << timestamp << "BRG: Identified " << canonicalKmerIdsWithDuplicateReadIds.size()
+         << " canonical marker k-mers with duplicate ReadIds." << endl;
+
+    struct CandidateAnchor {
+        ReadId seedReadId;
+        uint32_t overlapIntervalIndex = 0;
+        uint32_t intervalStart = 0;
+        uint32_t intervalEnd = 0;
+        uint32_t seedOrdinal = 0;
+        uint32_t support = 0;
+        vector<Interval> anchor;
+    };
+
+    vector<vector<OverlapInterval>> overlapIntervalsPerRead(readCount);
+    vector<vector<CandidateAnchor>> threadCandidates(threadCount);
+
+    uint64_t chunk = orientedReadCount / threadCount;
+    if(chunk == 0) chunk = 1;
+
+    // ========================================================================
+    // Main parallel loop: for each physical read (strand 0), sweep-line over
+    // BRG edges to find overlap-event intervals and select anchor seeds.
+    // ========================================================================
+    vector<thread> threads;
+    threads.reserve(threadCount);
+    for(uint64_t t=0; t<threadCount; t++) {
+        threads.emplace_back([&, t]() {
+            const uint64_t begin = t * chunk;
+            const uint64_t end = (t == threadCount - 1) ? orientedReadCount : min(orientedReadCount, (t+1) * chunk);
+            auto& outCandidates = threadCandidates[t];
+            outCandidates.reserve(end - begin);
+
+            vector<OverlapEvent> events;
+            events.reserve(512);
+            vector<uint32_t> activeEdgeIds;
+            activeEdgeIds.reserve(256);
+
+            vector<uint32_t> segmentEdgeIds;
+            segmentEdgeIds.reserve(256);
+
+            for(uint64_t v=begin; v<end; ++v) {
+                const ReadId readId0 = ReadId(v);
+                const OrientedReadId orientedReadId0(readId0, 0);
+                if(reads->getFlags(readId0).isContained) {
+                    continue;
+                }
+                const uint32_t markerCount0 = uint32_t(markers->size(orientedReadId0.getValue()));
+                if(markerCount0 == 0) {
+                    continue;
+                }
+                const OrientedReadId orientedReadId0rc(readId0, 1);
+                const auto orientedReadKmerIds0 = (*markerKmerIds)[orientedReadId0.getValue()];
+                const auto orientedReadKmerIds1 = (*markerKmerIds)[orientedReadId0rc.getValue()];
+                DINARA_ASSERT(orientedReadKmerIds0.size() == markerCount0);
+                DINARA_ASSERT(orientedReadKmerIds1.size() == markerCount0);
+
+                auto& outIntervals = overlapIntervalsPerRead[v];
+                outIntervals.clear();
+
+                events.clear();
+                if(restrictToInformativeHetReads) {
+                    if(v >= readHasInformativeHet.size() || !readHasInformativeHet[v]) {
+                        continue;
+                    }
+                }
+
+                // ----------------------------------------------------------
+                // Collect start/end events from BidirectionalReadGraph edges.
+                // ----------------------------------------------------------
+                // BRG: connectivity is indexed by ReadId (not OrientedReadId::getValue()).
+                // Each edge stores isSameStrand instead of crossesStrands.
+                // We use edge.traverse(readId0, 0) to derive the neighbour's OrientedReadId.
+                for(const uint32_t edgeId : bidirectionalReadGraph.connectivity[readId0]) {
+                    const BidirectionalReadGraphEdge& edge = bidirectionalReadGraph.edges[edgeId];
+                    if(edge.isDeleted) {
+                        continue;
+                    }
+                    if(edge.hasInconsistentAlignment) {
+                        continue;
+                    }
+                    const uint64_t alignmentId = edge.alignmentId;
+                    const AlignmentData& ad = alignmentData[alignmentId];
+                    if(!ad.keptByBothSides()) {
+                        continue;
+                    }
+                    if(!ad.info.isInReadGraph) {
+                        continue;
+                    }
+                    if(restrictToInformativeHetReads) {
+                        const AlignmentData::DeleteReasonMask reasons =
+                            (ad.readIds[0] == readId0) ? ad.deleteReasons0 : ad.deleteReasons1;
+                        if(reasons & AlignmentData::DeleteReasonPhase) {
+                            continue;
+                        }
+                    }
+
+                    // Orientation-aware traversal: derive the neighbour's OrientedReadId.
+                    const auto [readId1, strand1] = edge.traverse(readId0, Strand(0));
+                    const OrientedReadId orientedReadId1(readId1, strand1);
+
+                    const AlignmentInfo info = ad.orient(orientedReadId0, orientedReadId1);
+                    const uint32_t first = info.data[0].firstOrdinal;
+                    const uint32_t last = info.data[0].lastOrdinal;
+                    if(first < markerCount0) {
+                        events.push_back({first, +1, edgeId});
+                    }
+                    const uint32_t afterLast = last + 1;
+                    if(afterLast < markerCount0) {
+                        events.push_back({afterLast, -1, edgeId});
+                    }
+                }
+
+                if(events.empty()) {
+                    continue;
+                }
+
+                std::sort(events.begin(), events.end(), [](const OverlapEvent& a, const OverlapEvent& b) {
+                    if(a.ordinal != b.ordinal) {
+                        return a.ordinal < b.ordinal;
+                    }
+                    return a.delta < b.delta;
+                });
+
+                auto deactivate = [&](uint32_t edgeIdToRemove) {
+                    const auto it = std::find(activeEdgeIds.begin(), activeEdgeIds.end(), edgeIdToRemove);
+                    if(it != activeEdgeIds.end()) {
+                        *it = activeEdgeIds.back();
+                        activeEdgeIds.pop_back();
+                    }
+                };
+
+                auto shouldSkipKmerDueToRepeats = [&](const Kmer& kmer0) -> bool {
+                    for(uint64_t i=0; i<maxAnchorRepeatLength.size(); i++) {
+                        const uint64_t period = i + 1;
+                        const uint64_t maxAllowedCopyNumber = maxAnchorRepeatLength[i];
+                        uint64_t copies = 0;
+                        switch(period) {
+                        case 1: copies = kmer0.countExactRepeatCopies<1>(k); break;
+                        case 2: copies = kmer0.countExactRepeatCopies<2>(k); break;
+                        case 3: copies = kmer0.countExactRepeatCopies<3>(k); break;
+                        case 4: copies = kmer0.countExactRepeatCopies<4>(k); break;
+                        case 5: copies = kmer0.countExactRepeatCopies<5>(k); break;
+                        case 6: copies = kmer0.countExactRepeatCopies<6>(k); break;
+                        default:
+                            copies = 0;
+                            break;
+                        }
+                        if(copies > maxAllowedCopyNumber) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                // Build an anchor for this seed marker using BRG edges.
+                auto buildAnchorAtSeed = [&](uint32_t seedOrdinal, const Kmer& seedKmer,
+                    const vector<uint32_t>& edgeIds, vector<Interval>& anchorOut) -> uint32_t
+                {
+                    anchorOut.clear();
+                    anchorOut.reserve(64);
+                    anchorOut.emplace_back(orientedReadId0, seedOrdinal);
+
+                    std::unordered_set<ReadId> usedReadIds;
+                    usedReadIds.reserve(128);
+                    usedReadIds.insert(readId0);
+                    uint32_t fullSupport = 1;
+                    const uint32_t storeLimit = uint32_t(maxAnchorCoverage);
+
+                    for(const uint32_t activeEdgeId : edgeIds) {
+                        const BidirectionalReadGraphEdge& edge = bidirectionalReadGraph.edges[activeEdgeId];
+                        if(edge.isDeleted) {
+                            continue;
+                        }
+                        if(edge.hasInconsistentAlignment) {
+                            continue;
+                        }
+                        const uint64_t alignmentId = edge.alignmentId;
+                        const AlignmentData& ad = alignmentData[alignmentId];
+                        if(!ad.keptByBothSides()) {
+                            continue;
+                        }
+                        if(!ad.info.isInReadGraph) {
+                            continue;
+                        }
+
+                        // BRG orientation-aware traversal.
+                        const auto [readId1, strand1] = edge.traverse(readId0, Strand(0));
+                        const OrientedReadId orientedReadId1(readId1, strand1);
+                        if(usedReadIds.contains(readId1)) {
+                            continue;
+                        }
+
+                        const AlignmentInfo info = ad.orient(orientedReadId0, orientedReadId1);
+                        uint32_t ordinal1 = 0;
+                        if(!mapMarkerOrdinalByOffsetAndKmer(
+                            *reads,
+                            *markers,
+                            k,
+                            info,
+                            orientedReadId0,
+                            seedOrdinal,
+                            orientedReadId1,
+                            ordinal1,
+                            seedKmer,
+                            /*maxSearchRadius*/ 8,
+                            /*maxOffsetRange*/ 32)) {
+                            continue;
+                        }
+
+                        ++fullSupport;
+                        if(anchorOut.size() < storeLimit) {
+                            anchorOut.emplace_back(orientedReadId1, ordinal1);
+                        }
+                        usedReadIds.insert(readId1);
+                    }
+                    return fullSupport;
+                };
+
+                vector<Interval> tmpAnchor;
+                vector<Interval> bestAnchor;
+
+                activeEdgeIds.clear();
+                size_t ei = 0;
+                while(ei < events.size()) {
+                    const uint32_t ordinal = events[ei].ordinal;
+
+                    while(ei < events.size() && events[ei].ordinal == ordinal) {
+                        if(events[ei].delta > 0) {
+                            activeEdgeIds.push_back(events[ei].edgeId);
+                        } else {
+                            deactivate(events[ei].edgeId);
+                        }
+                        ++ei;
+                    }
+
+                    const uint32_t nextOrdinal = (ei < events.size()) ? events[ei].ordinal : markerCount0;
+                    if(activeEdgeIds.empty()) {
+                        continue;
+                    }
+                    if(nextOrdinal <= ordinal) {
+                        continue;
+                    }
+
+                    const uint32_t segmentStart = ordinal;
+                    const uint32_t segmentEnd = nextOrdinal;
+
+                    constexpr uint32_t maxIntervalMarkers = 200;
+                    const uint32_t segmentLen = segmentEnd - segmentStart;
+                    const bool splitSegment = (segmentLen <= maxIntervalMarkers);
+
+                    // Early exit: count unique other reads from BRG edges.
+                    segmentEdgeIds = activeEdgeIds;
+                    std::sort(segmentEdgeIds.begin(), segmentEdgeIds.end(), [&](uint32_t a, uint32_t b) {
+                        // BRG: getOther returns ReadId directly (no OrientedReadId unwrapping).
+                        const ReadId ra = bidirectionalReadGraph.edges[a].getOther(readId0);
+                        const ReadId rb = bidirectionalReadGraph.edges[b].getOther(readId0);
+                        if(ra != rb) {
+                            return ra < rb;
+                        }
+                        return a < b;
+                    });
+                    {
+                        ReadId prev = invalid<ReadId>;
+                        uint32_t uniqueOtherReads = 0;
+                        for(const uint32_t edgeId : segmentEdgeIds) {
+                            const ReadId r = bidirectionalReadGraph.edges[edgeId].getOther(readId0);
+                            if(r != prev) {
+                                ++uniqueOtherReads;
+                                prev = r;
+                            }
+                        }
+                        const uint32_t maxPossible = std::min<uint32_t>(uint32_t(maxAnchorCoverage), 1 + uniqueOtherReads);
+                        if(maxPossible < minAnchorCoverage) {
+                            continue;
+                        }
+                    }
+
+                    for(uint32_t intervalStart = segmentStart; intervalStart < segmentEnd; intervalStart += (splitSegment ? maxIntervalMarkers : segmentLen)) {
+                        const uint32_t intervalEnd = splitSegment ? std::min(segmentEnd, intervalStart + maxIntervalMarkers) : segmentEnd;
+                        const uint32_t intervalLen = intervalEnd - intervalStart;
+                        if(intervalLen == 0) {
+                            continue;
+                        }
+
+                        outIntervals.push_back({intervalStart, intervalEnd});
+                        const uint32_t overlapIntervalIndex = uint32_t(outIntervals.size() - 1);
+
+                        vector<uint32_t> seedCandidates;
+                        seedCandidates.reserve(intervalLen);
+                        for(uint32_t o = intervalStart; o < intervalEnd; ++o) {
+                            seedCandidates.push_back(o);
+                        }
+
+                        uint32_t bestSeed = invalid<uint32_t>;
+                        uint32_t bestScore = 0;
+                        uint32_t bestFullSupport = 0;
+                        bestAnchor.clear();
+
+                        auto seedBetter = [&](uint32_t a, uint32_t b) -> bool {
+                            const int64_t center = int64_t(intervalStart) + int64_t(intervalLen) / 2;
+                            const int64_t da = (int64_t(a) >= center) ? (int64_t(a) - center) : (center - int64_t(a));
+                            const int64_t db = (int64_t(b) >= center) ? (int64_t(b) - center) : (center - int64_t(b));
+                            if(da != db) {
+                                return da < db;
+                            }
+                            return a < b;
+                        };
+
+                        for(const uint32_t seedOrdinal : seedCandidates) {
+                            if(seedOrdinal < intervalStart || seedOrdinal >= intervalEnd) {
+                                continue;
+                            }
+
+                            const uint32_t seedOrdinalRc = markerCount0 - 1U - seedOrdinal;
+                            const KmerId id0 = orientedReadKmerIds0[seedOrdinal];
+                            const KmerId id1 = orientedReadKmerIds1[seedOrdinalRc];
+                            const KmerId canonicalId = (id0 <= id1) ? id0 : id1;
+                            if(canonicalKmerIdsWithDuplicateReadIds.contains(canonicalId)) {
+                                continue;
+                            }
+
+                            const Kmer seedKmer = getMarkerKmer(*reads, *markers, k, orientedReadId0, seedOrdinal);
+                            if(shouldSkipKmerDueToRepeats(seedKmer)) {
+                                continue;
+                            }
+                            const uint32_t fullSupport = buildAnchorAtSeed(seedOrdinal, seedKmer, segmentEdgeIds, tmpAnchor);
+                            if(fullSupport < minAnchorCoverage) {
+                                continue;
+                            }
+                            const uint32_t score = std::min<uint32_t>(fullSupport, uint32_t(maxAnchorCoverage));
+
+                            if(score > bestScore ||
+                               (score == bestScore && (bestSeed == invalid<uint32_t> || fullSupport < bestFullSupport)) ||
+                               (score == bestScore && fullSupport == bestFullSupport &&
+                                   bestSeed != invalid<uint32_t> && seedBetter(seedOrdinal, bestSeed))) {
+                                bestScore = score;
+                                bestSeed = seedOrdinal;
+                                bestFullSupport = fullSupport;
+                                bestAnchor = tmpAnchor;
+                            }
+                        }
+
+                        if(bestSeed == invalid<uint32_t> || bestScore < minAnchorCoverage) {
+                            continue;
+                        }
+
+                        std::sort(bestAnchor.begin(), bestAnchor.end(), [](const Interval& a, const Interval& b) {
+                            return a.orientedReadId < b.orientedReadId;
+                        });
+
+                        if(bestAnchor.size() > maxAnchorCoverage) {
+                            bestAnchor.resize(maxAnchorCoverage);
+                        }
+
+                        CandidateAnchor candidate;
+                        candidate.seedReadId = readId0;
+                        candidate.overlapIntervalIndex = overlapIntervalIndex;
+                        candidate.intervalStart = intervalStart;
+                        candidate.intervalEnd = intervalEnd;
+                        candidate.seedOrdinal = bestSeed;
+                        candidate.support = bestScore;
+                        candidate.anchor = std::move(bestAnchor);
+                        outCandidates.push_back(std::move(candidate));
+                    }
+                }
+            }
+        });
+    }
+    for(auto& th : threads) {
+        th.join();
+    }
+
+    vector<CandidateAnchor> candidates;
+    {
+        size_t total = 0;
+        for(const auto& v : threadCandidates) total += v.size();
+        candidates.reserve(total);
+        for(auto& v : threadCandidates) {
+            candidates.insert(candidates.end(), v.begin(), v.end());
+        }
+    }
+
+    cout << timestamp << "BRG: Constructed " << candidates.size()
+         << " candidate anchors from overlaps." << endl;
+
+    // Diagnostics.
+    {
+        uint64_t count = 0;
+        uint64_t sum = 0;
+        uint32_t minSupport = std::numeric_limits<uint32_t>::max();
+        uint32_t maxSupport = 0;
+        for(const CandidateAnchor& c : candidates) {
+            ++count;
+            sum += c.support;
+            minSupport = std::min(minSupport, c.support);
+            maxSupport = std::max(maxSupport, c.support);
+        }
+        if(count) {
+            cout << timestamp << "[DIAG] BRG candidate anchor support: "
+                 << "min=" << minSupport << " max=" << maxSupport
+                 << " mean=" << double(sum) / double(count)
+                 << " (n=" << count << ")." << endl;
+        }
+    }
+
+    // Select anchors with cross-read overlap-interval claiming.
+    vector<vector<uint8_t>> intervalClaimed(readCount);
+    for(uint64_t v=0; v<readCount; ++v) {
+        intervalClaimed[v].assign(overlapIntervalsPerRead[v].size(), 0);
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const CandidateAnchor& a, const CandidateAnchor& b) {
+        if(a.support != b.support) {
+            return a.support > b.support;
+        }
+        if(a.seedReadId != b.seedReadId) {
+            return a.seedReadId < b.seedReadId;
+        }
+        if(a.intervalStart != b.intervalStart) {
+            return a.intervalStart < b.intervalStart;
+        }
+        if(a.intervalEnd != b.intervalEnd) {
+            return a.intervalEnd < b.intervalEnd;
+        }
+        return a.seedOrdinal < b.seedOrdinal;
+    });
+
+    vector<vector<Interval>> selected;
+    selected.reserve(candidates.size());
+
+    auto claimIntervalForMarker = [&](const Interval& interval) -> std::optional<pair<ReadId, uint32_t>> {
+        const ReadId readId = interval.orientedReadId.getReadId();
+        if(uint64_t(readId) >= readCount) {
+            return std::nullopt;
+        }
+        uint32_t idx = 0;
+        if(!findOverlapIntervalIndex(overlapIntervalsPerRead[readId], interval.ordinal0, idx)) {
+            return std::nullopt;
+        }
+        return pair<ReadId, uint32_t>(readId, idx);
+    };
+
+    auto selectCandidate = [&](const CandidateAnchor& candidate) -> bool {
+        const uint64_t v = uint64_t(candidate.seedReadId);
+        if(v >= readCount) {
+            return false;
+        }
+        if(candidate.overlapIntervalIndex >= overlapIntervalsPerRead[v].size()) {
+            return false;
+        }
+        if(intervalClaimed[v][candidate.overlapIntervalIndex]) {
+            return false;
+        }
+
+        vector<Interval> anchor;
+        anchor.reserve(candidate.anchor.size());
+
+        vector<pair<ReadId, uint32_t>> toClaim;
+        toClaim.reserve(candidate.anchor.size());
+
+        anchor.emplace_back(OrientedReadId(candidate.seedReadId, 0), candidate.seedOrdinal);
+        toClaim.emplace_back(candidate.seedReadId, candidate.overlapIntervalIndex);
+
+        vector<pair<Interval, pair<ReadId, uint32_t>>> claimedDeferred;
+        claimedDeferred.reserve(candidate.anchor.size());
+
+        for(const Interval& interval : candidate.anchor) {
+            const ReadId readId = interval.orientedReadId.getReadId();
+            if(readId == candidate.seedReadId) {
+                continue;
+            }
+
+            const auto keyOpt = claimIntervalForMarker(interval);
+            if(!keyOpt) {
+                continue;
+            }
+            const auto [rid, idx] = *keyOpt;
+            if(intervalClaimed[rid][idx]) {
+                claimedDeferred.push_back({interval, {rid, idx}});
+                continue;
+            }
+            anchor.push_back(interval);
+            toClaim.push_back({rid, idx});
+            if(anchor.size() >= maxAnchorCoverage) {
+                break;
+            }
+        }
+
+        if(anchor.size() < maxAnchorCoverage) {
+            for(const auto& x : claimedDeferred) {
+                anchor.push_back(x.first);
+                if(anchor.size() >= maxAnchorCoverage) {
+                    break;
+                }
+            }
+        }
+
+        if(anchor.size() < minAnchorCoverage || anchor.size() > maxAnchorCoverage) {
+            return false;
+        }
+
+        std::sort(anchor.begin(), anchor.end(), [](const Interval& a, const Interval& b) {
+            return a.orientedReadId < b.orientedReadId;
+        });
+
+        selected.push_back(anchor);
+
+        for(const auto& [rid, idx] : toClaim) {
+            intervalClaimed[rid][idx] = 1;
+        }
+        return true;
+    };
+
+    uint64_t selectedCount = 0;
+    for(const CandidateAnchor& candidate : candidates) {
+        if(selectCandidate(candidate)) {
+            ++selectedCount;
+        }
+    }
+
+    cout << timestamp << "BRG: Selected " << selected.size() << " anchors." << endl;
+
+    // Diagnostics: selected anchor size distribution.
+    {
+        uint64_t count = 0;
+        uint64_t sum = 0;
+        uint64_t minSize = std::numeric_limits<uint64_t>::max();
+        uint64_t maxSize = 0;
+        for(const auto& a : selected) {
+            const uint64_t n = a.size();
+            ++count;
+            sum += n;
+            minSize = std::min(minSize, n);
+            maxSize = std::max(maxSize, n);
+        }
+        if(count) {
+            cout << timestamp << "[DIAG] BRG selected anchor size: "
+                 << "min=" << minSize << " max=" << maxSize
+                 << " mean=" << double(sum) / double(count)
+                 << " (n=" << count << ")." << endl;
+        }
+    }
+
+    uint64_t totalIntervals = 0;
+    uint64_t claimedIntervals = 0;
+    for(uint64_t v=0; v<readCount; ++v) {
+        totalIntervals += intervalClaimed[v].size();
+        for(const uint8_t x : intervalClaimed[v]) {
+            claimedIntervals += (x != 0);
+        }
+    }
+    if(totalIntervals) {
+        cout << timestamp << "BRG: Claimed " << claimedIntervals << " / " << totalIntervals
+             << " overlap intervals (" << double(claimedIntervals) / double(totalIntervals) << ")." << endl;
+    }
+
+    // Emit explicit reverse complements.
+    vector<vector<Interval>> anchorsExplicit;
+    anchorsExplicit.reserve(selected.size() * 2);
+    for(const auto& anchor : selected) {
+        anchorsExplicit.push_back(anchor);
+        anchorsExplicit.push_back(reverseComplementAnchor(anchor, *markers));
+    }
+
+    // Deterministic sort and dedup.
+    auto anchorLessLex = [](const vector<Interval>& a, const vector<Interval>& b) -> bool {
+        const size_t n = std::min(a.size(), b.size());
+        for(size_t i=0; i<n; ++i) {
+            if(a[i].orientedReadId != b[i].orientedReadId) {
+                return a[i].orientedReadId < b[i].orientedReadId;
+            }
+            if(a[i].ordinal0 != b[i].ordinal0) {
+                return a[i].ordinal0 < b[i].ordinal0;
+            }
+        }
+        return a.size() < b.size();
+    };
+    std::sort(anchorsExplicit.begin(), anchorsExplicit.end(), [&](const vector<Interval>& a, const vector<Interval>& b) {
+        if(a.size() != b.size()) {
+            return a.size() > b.size();
+        }
+        return anchorLessLex(a, b);
+    });
+    anchorsExplicit.erase(std::unique(anchorsExplicit.begin(), anchorsExplicit.end(),
+        [&](const vector<Interval>& a, const vector<Interval>& b) {
+            return a.size() == b.size() && !anchorLessLex(a, b) && !anchorLessLex(b, a);
+        }), anchorsExplicit.end());
+
+    cout << timestamp << "BRG: Selected " << anchorsExplicit.size()
+         << " anchors (including reverse complements) after deduplication." << endl;
+
+    auto anchors = make_shared<mode3::Anchors>(
+        MappedMemoryOwner(*this),
+        getReads(),
+        assemblerInfo->k,
+        *markers,
+        anchorsExplicit,
+        /*ordinalOffset*/ 0,
+        threadCount);
+
+    anchors->computeJourneys(threadCount);
+    return anchors;
+}
