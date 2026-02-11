@@ -237,6 +237,7 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(alignSequencesInBaseRepresentation);
     DINARA_ADD_TO_FUNCTION_TABLE(assessAlignments);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectionalReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreStringGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreUnitigGraph);
@@ -513,11 +514,21 @@ void Assembler::writeNavigation(ostream& html) const
         } catch(...) {
         }
 
+        bool bidirectionalReadGraphIsAvailable = false;
+        try {
+            checkBidirectionalReadGraphIsOpen();
+            bidirectionalReadGraphIsAvailable = true;
+        } catch(...) {
+        }
+
         vector<pair<string, string>> items = {
             {"Read graph", "exploreReadGraph"},
         };
         if(directedReadGraphIsAvailable) {
             items.push_back({"Directed read graph", "exploreDirectedReadGraph"});
+        }
+        if(bidirectionalReadGraphIsAvailable) {
+            items.push_back({"Bidirectional read graph", "exploreBidirectionalReadGraph"});
         }
         writeNavigation(html, "Read graph", items);
     }
@@ -875,6 +886,14 @@ void Assembler::accessAllSoft()
         accessDirectedReadGraph();
     } catch(const exception& e) {
         cout << "The directed read graph is not accessible." << endl;
+        // Don't set allDataAreAvailable = false since this is optional.
+    }
+
+    // Bidirectional read graph is optional.
+    try {
+        accessBidirectionalReadGraph();
+    } catch(const exception& e) {
+        cout << "The bidirectional read graph is not accessible." << endl;
         // Don't set allDataAreAvailable = false since this is optional.
     }
 
