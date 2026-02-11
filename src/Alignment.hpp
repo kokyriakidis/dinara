@@ -269,11 +269,25 @@ public:
         return score;
     }
 
-    // Return the stored DP score (computed from the base CIGAR using a two-piece affine model).
-    // This is required to be populated anywhere we use hifiasm-style overlap ranking.
-    int64_t hifiasmDpScoreOrApprox(uint64_t overlapLen) const
+    // Hifiasm overlap ranking note (important for parity work):
+    // - hifiasm ranks multiple overlap candidates for the same (query, target) by `overlap_region.shared_seed`,
+    //   which is the *chaining DP score* produced by lchain_dp/lchain_qdp in Hash_Table.cpp, NOT a base-level
+    //   alignment DP score computed from a base CIGAR.
+    // - When shared_seed ties, hifiasm prefers the *smaller* overlapLen.
+    //
+    // Dinara currently does not compute/store hifiasm's minimizer-chain DP (`shared_seed`) for each overlap.
+    // For hifiasm-style redundant-overlap filtering we therefore use a deterministic proxy that correlates
+    // with "chain strength": the number of aligned markers in the marker alignment.
+    int64_t hifiasmSharedSeedScoreProxy() const
     {
-        (void)overlapLen;
+        // Guaranteed non-zero for a valid alignment (see markerCount doc).
+        return int64_t(markerCount);
+    }
+
+    // Return the stored base-level DP score (computed from the base CIGAR using a two-piece affine model).
+    // This is a separate quantity from hifiasm's overlap_region.shared_seed (chain DP score).
+    int64_t baseDpScoreOrThrow() const
+    {
         if(dpScore == invalid<int64_t>) {
             throw std::runtime_error(
                 "AlignmentInfo::dpScore is not populated. Regenerate alignments with ProjectedAlignment DP scoring enabled.");
@@ -575,6 +589,16 @@ public:
     bool isDeleted1() const { return deleteReasons1 != DeleteReasonNone; }
     bool keptByBothSides() const { return !isDeleted0() && !isDeleted1(); }
     bool isDeleted() const { return isDeleted0() && isDeleted1(); } // fully deleted (both sides)
+    bool isDeletedFromReadPerspective(ReadId readId) const
+    {
+        if (readIds[0] == readId) {
+            return deleteReasons0 != DeleteReasonNone;
+        } else if (readIds[1] == readId) {
+            return deleteReasons1 != DeleteReasonNone;
+        } else {
+            return false;
+        }
+    }
     bool isCisByBothSides() const
     {
         return

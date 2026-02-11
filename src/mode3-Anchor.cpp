@@ -1,6 +1,8 @@
 #include "mode3-Anchor.hpp"
+#include "Alignment.hpp"
 #include "deduplicate.hpp"
 #include "html.hpp"
+#include "ReadGraph.hpp"
 #include "Marker.hpp"
 #include "orderPairs.hpp"
 #include "performanceLog.hpp"
@@ -9,7 +11,32 @@
 using namespace dinara;
 using namespace mode3;
 
+#include <atomic>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <system_error>
+#include <unordered_set>
+
+namespace {
+    inline mode3::AnchorId reverseComplementAnchorId(mode3::AnchorId anchorId)
+    {
+        return anchorId ^ 1ULL;
+    }
+
+    inline std::pair<mode3::AnchorId, mode3::AnchorId> canonicalEndpointPair(
+        mode3::AnchorId startAnchorId,
+        mode3::AnchorId endAnchorId)
+    {
+        const std::pair<mode3::AnchorId, mode3::AnchorId> p0 = {startAnchorId, endAnchorId};
+        const std::pair<mode3::AnchorId, mode3::AnchorId> p1 = {
+            reverseComplementAnchorId(endAnchorId),
+            reverseComplementAnchorId(startAnchorId)};
+        return (p1 < p0) ? p1 : p0;
+    }
+}
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
@@ -726,11 +753,27 @@ AnchorId dinara::mode3::anchorIdFromString(const string& s)
 
 
 
-void Anchors::computeJourneys(uint64_t threadCount)
+void Anchors::computeJourneys(uint64_t threadCount, const vector<uint64_t>* keepAnchorWords)
 {
     performanceLog << timestamp << "Anchors::computeJourneys begins." << endl;
 
     const uint64_t orientedReadCount = 2 * reads.readCount();
+
+    // If we are recomputing journeys (potentially with filtering), make sure we are not
+    // appending to stale state and that all marker intervals start with invalid positions.
+    if (journeys.isOpen()) {
+        journeys.remove();
+    }
+
+    journeyAnchorFilterData.keepAnchorWords = keepAnchorWords;
+
+    // Reset positionInJourney on all marker intervals. If we filter anchors, some anchors
+    // may no longer appear in any journey; their positionInJourney must not retain stale values.
+    {
+        const uint64_t anchorBatchCount = 1000;
+        setupLoadBalancing(size(), anchorBatchCount);
+        runThreads(&Anchors::resetPositionInJourneyThreadFunction, threadCount);
+    }
 
     // Pass1: make space for the journeysWithOrdinals.
     journeysWithOrdinals.createNew(largeDataName("tmp-JourneysWithOrdinals"), largeDataPageSize);
@@ -763,6 +806,8 @@ void Anchors::computeJourneys(uint64_t threadCount)
     performanceLog << timestamp << "Anchors::computeJourneys ends." << endl;
 
     writeJourneys();
+
+    journeyAnchorFilterData.keepAnchorWords = nullptr;
 }
 
 
@@ -791,6 +836,437 @@ void Anchors::writeJourneys() const
     }
 }
 
+namespace {
+    struct OverlapEvent {
+        uint32_t pos = 0;
+        uint8_t type = 0; // 0=end, 1=start
+        uint32_t otherOrientedReadValue = 0;
+    };
+
+    inline bool getAlignmentIntervalOnOrientedRead(
+        const Reads& reads,
+        const AlignmentData& ad,
+        OrientedReadId orientedReadId,
+        uint32_t& start,
+        uint32_t& end)
+    {
+        const ReadId readId = orientedReadId.getReadId();
+        if (readId == ad.readIds[0]) {
+            start = ad.qs;
+            end = ad.qe;
+        } else if (readId == ad.readIds[1]) {
+            start = ad.ts;
+            end = ad.te;
+        } else {
+            return false;
+        }
+
+        const uint32_t readLen = uint32_t(reads.getRead(readId).baseCount);
+        if (start > end) return false;
+        if (end > readLen) end = readLen;
+        if (start > readLen) start = readLen;
+        if (end <= start) return false;
+
+        if (orientedReadId.getStrand() == 1) {
+            // ad.* are in forward coordinates of the read; invert for reverse-complement strand.
+            const uint32_t rcStart = readLen - end;
+            const uint32_t rcEnd = readLen - start;
+            start = rcStart;
+            end = rcEnd;
+            if (end <= start) return false;
+        }
+
+        return true;
+    }
+}
+
+void Anchors::writeStableOverlapIntervalsBestAnchors(
+    const ReadGraph& readGraph,
+    const MemoryMapped::Vector<AlignmentData>& alignmentData,
+    uint64_t threadCount,
+    const string& outCsvName,
+    bool strand0Only,
+    uint32_t minIntervalLength)
+{
+    performanceLog << timestamp << "Anchors::writeStableOverlapIntervalsBestAnchors begins." << endl;
+
+    reads.checkReadsAreOpen();
+    DINARA_ASSERT(readGraph.edges.isOpen);
+    DINARA_ASSERT(readGraph.connectivity.isOpen());
+
+    stableOverlapIntervalsBestAnchorsData.readGraph = &readGraph;
+    stableOverlapIntervalsBestAnchorsData.alignmentData = &alignmentData;
+    stableOverlapIntervalsBestAnchorsData.outCsvName = outCsvName;
+    stableOverlapIntervalsBestAnchorsData.strand0Only = strand0Only;
+    stableOverlapIntervalsBestAnchorsData.minIntervalLength = minIntervalLength;
+    stableOverlapIntervalsBestAnchorsData.threadFileNames.assign(threadCount, string());
+
+    const uint64_t workItems = strand0Only ? reads.readCount() : (2 * reads.readCount());
+    const uint64_t batchSize = 2000;
+    setupLoadBalancing(workItems, batchSize);
+    runThreads(&Anchors::writeStableOverlapIntervalsBestAnchorsThreadFunction, threadCount);
+
+    // Merge per-thread files.
+    {
+        ofstream out(outCsvName);
+        out << "OrientedReadId,IntervalBegin,IntervalEnd,IntervalLength,"
+               "ActiveOverlapCount,CandidateAnchorCount,ChosenAnchorId,DesiredReads,"
+               "CoveredDesiredReads,MissingDesiredReads,ExtraReads,ChosenAnchorCoverage,"
+               "ChosenAnchorCount,ChosenAnchorIds,FinalCoveredDesiredReads,FinalMissingDesiredReads,TotalExtraReads\n";
+
+        for (uint64_t t = 0; t < threadCount; ++t) {
+            const string& fn = stableOverlapIntervalsBestAnchorsData.threadFileNames[t];
+            if (fn.empty()) continue;
+            ifstream in(fn);
+            if (!in) continue;
+            string line;
+            bool first = true;
+            while (std::getline(in, line)) {
+                if (first) { first = false; continue; } // skip header
+                out << line << "\n";
+            }
+            in.close();
+            std::error_code ec;
+            std::filesystem::remove(fn, ec);
+        }
+    }
+
+    // Clean up pointers.
+    stableOverlapIntervalsBestAnchorsData.readGraph = nullptr;
+    stableOverlapIntervalsBestAnchorsData.alignmentData = nullptr;
+    stableOverlapIntervalsBestAnchorsData.keepAnchorWords = nullptr;
+    stableOverlapIntervalsBestAnchorsData.threadFileNames.clear();
+
+    performanceLog << timestamp << "Anchors::writeStableOverlapIntervalsBestAnchors ends." << endl;
+}
+
+
+
+vector<uint64_t> Anchors::writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
+    const ReadGraph& readGraph,
+    const MemoryMapped::Vector<AlignmentData>& alignmentData,
+    uint64_t threadCount,
+    const string& outCsvName,
+    bool strand0Only,
+    uint32_t minIntervalLength,
+    bool keepReverseComplementPairs)
+{
+    // Build a global bitset of anchors chosen as "best" in at least one stable interval.
+    // This can be used to filter and recompute journeys afterwards.
+    const uint64_t wordCount = (size() + 63ULL) / 64ULL;
+    vector<std::atomic<uint64_t>> keepWordsAtomic(wordCount);
+    for (uint64_t i = 0; i < wordCount; ++i) {
+        keepWordsAtomic[i].store(0ULL, std::memory_order_relaxed);
+    }
+
+    stableOverlapIntervalsBestAnchorsData.keepAnchorWords = &keepWordsAtomic;
+    writeStableOverlapIntervalsBestAnchors(
+        readGraph, alignmentData, threadCount, outCsvName, strand0Only, minIntervalLength);
+    stableOverlapIntervalsBestAnchorsData.keepAnchorWords = nullptr;
+
+    vector<uint64_t> keepWords(wordCount);
+    for (uint64_t i = 0; i < wordCount; ++i) {
+        keepWords[i] = keepWordsAtomic[i].load(std::memory_order_relaxed);
+    }
+
+    if (keepReverseComplementPairs) {
+        // Reverse-complement AnchorId is `anchorId^1` (toggles the last bit).
+        // In the bitset, this just swaps each adjacent bit-pair (0<->1, 2<->3, ...),
+        // so we can add the RC anchors in a single post-pass without any atomics.
+        static constexpr uint64_t evenMask = 0x5555555555555555ULL; // bits 0,2,4,...
+        static constexpr uint64_t oddMask  = 0xAAAAAAAAAAAAAAAAULL; // bits 1,3,5,...
+        for (uint64_t i = 0; i < wordCount; ++i) {
+            const uint64_t w = keepWords[i];
+            keepWords[i] = w | ((w & evenMask) << 1) | ((w & oddMask) >> 1);
+        }
+    }
+    return keepWords;
+}
+
+
+
+void Anchors::writeStableOverlapIntervalsBestAnchorsThreadFunction(uint64_t threadId)
+{
+    const auto* readGraphPtr = stableOverlapIntervalsBestAnchorsData.readGraph;
+    const auto* alignmentDataPtr = stableOverlapIntervalsBestAnchorsData.alignmentData;
+    DINARA_ASSERT(readGraphPtr);
+    DINARA_ASSERT(alignmentDataPtr);
+    const ReadGraph& readGraph = *readGraphPtr;
+    const MemoryMapped::Vector<AlignmentData>& alignmentData = *alignmentDataPtr;
+
+    const string threadFileName =
+        stableOverlapIntervalsBestAnchorsData.outCsvName + ".thread" + std::to_string(threadId) + ".csv";
+    stableOverlapIntervalsBestAnchorsData.threadFileNames[threadId] = threadFileName;
+    ofstream out(threadFileName);
+    out << "OrientedReadId,IntervalBegin,IntervalEnd,IntervalLength,"
+           "ActiveOverlapCount,CandidateAnchorCount,ChosenAnchorId,DesiredReads,"
+           "CoveredDesiredReads,MissingDesiredReads,ExtraReads,ChosenAnchorCoverage,"
+           "ChosenAnchorCount,ChosenAnchorIds,FinalCoveredDesiredReads,FinalMissingDesiredReads,TotalExtraReads\n";
+
+    const bool strand0Only = stableOverlapIntervalsBestAnchorsData.strand0Only;
+    const uint32_t minIntervalLength = stableOverlapIntervalsBestAnchorsData.minIntervalLength;
+
+    vector<OverlapEvent> events;
+    events.reserve(256);
+    std::unordered_set<uint32_t> active;
+    active.reserve(64);
+    std::unordered_set<uint32_t> uncovered;
+    uncovered.reserve(64);
+
+    // Loop over all batches assigned to this thread.
+    uint64_t begin = 0, end = 0;
+    while (getNextBatch(begin, end)) {
+        for (uint64_t item = begin; item != end; ++item) {
+            OrientedReadId orientedReadId;
+            if (strand0Only) {
+                orientedReadId = OrientedReadId(ReadId(item), 0);
+            } else {
+                orientedReadId = OrientedReadId::fromValue(uint32_t(item));
+            }
+
+            const auto journey = journeys[orientedReadId.getValue()];
+            if (journey.empty()) continue;
+
+            // Build overlap events from incident readGraph edges.
+            events.clear();
+            const auto inc = readGraph.connectivity[orientedReadId.getValue()];
+            events.reserve(2 * inc.size());
+            for (const uint32_t edgeId : inc) {
+                if (edgeId >= readGraph.edges.size()) continue;
+                const ReadGraphEdge& edge = readGraph.edges[edgeId];
+                const uint64_t alignmentId = edge.alignmentId;
+                if (alignmentId >= alignmentData.size()) continue;
+                const AlignmentData& ad = alignmentData[alignmentId];
+                if (!ad.keptByBothSides()) continue;
+
+                uint32_t s = 0, e = 0;
+                if (!getAlignmentIntervalOnOrientedRead(reads, ad, orientedReadId, s, e)) continue;
+
+                const OrientedReadId other = edge.getOther(orientedReadId);
+                const uint32_t otherValue = other.getValue();
+                events.push_back({s, 1, otherValue});
+                events.push_back({e, 0, otherValue});
+            }
+
+            if (events.empty()) continue;
+
+            std::sort(events.begin(), events.end(), [](const OverlapEvent& a, const OverlapEvent& b) {
+                if (a.pos != b.pos) return a.pos < b.pos;
+                return a.type < b.type; // end(0) before start(1)
+            });
+
+            // Precompute anchor mid positions for this journey (monotone increasing).
+            const auto orientedMarkers = markers[orientedReadId.getValue()];
+            vector<uint32_t> journeyAnchorMid(journey.size());
+            for (uint64_t i = 0; i < journey.size(); ++i) {
+                const AnchorId anchorId = journey[i];
+                const uint32_t ordinal0 = getFirstOrdinal(anchorId, orientedReadId);
+                const uint32_t p = orientedMarkers[ordinal0].position;
+                journeyAnchorMid[i] = p + uint32_t(kHalf);
+            }
+
+                // Sweep stable intervals and pick best anchor.
+                active.clear();
+                uint64_t journeyIdx = 0;
+
+                // Sweep line over overlap start/end events.
+                // After applying all events at position `pos`, the set `active` contains exactly
+                // the overlaps that are active over the half-open interval [pos, nextPos).
+                uint64_t i = 0;
+                while (i < events.size()) {
+                    const uint32_t pos = events[i].pos;
+
+                // Apply all end events at pos.
+                while (i < events.size() && events[i].pos == pos && events[i].type == 0) {
+                    active.erase(events[i].otherOrientedReadValue);
+                    ++i;
+                }
+                // Apply all start events at pos.
+                while (i < events.size() && events[i].pos == pos && events[i].type == 1) {
+                    active.insert(events[i].otherOrientedReadValue);
+                    ++i;
+                }
+
+                const uint32_t nextPos = (i < events.size()) ? events[i].pos : pos;
+                if (nextPos <= pos) {
+                    continue;
+                }
+
+                const uint32_t intervalLen = nextPos - pos;
+                if (minIntervalLength && intervalLen < minIntervalLength) {
+                    continue;
+                }
+                if (active.empty()) {
+                    continue;
+                }
+
+                // Advance journeyIdx to first anchor inside the interval.
+                while (journeyIdx < journeyAnchorMid.size() && journeyAnchorMid[journeyIdx] < pos) {
+                    ++journeyIdx;
+                }
+                uint64_t jEnd = journeyIdx;
+                while (jEnd < journeyAnchorMid.size() && journeyAnchorMid[jEnd] < nextPos) {
+                    ++jEnd;
+                }
+                const uint64_t candidateCount = jEnd - journeyIdx;
+                if (candidateCount == 0) {
+                    continue;
+                }
+
+                const uint32_t desiredReads = uint32_t(active.size()) + 1U; // active overlaps + self
+                const uint32_t selfValue = orientedReadId.getValue();
+
+                // Greedy multi-anchor selection within the interval:
+                // Many regions will have a single anchor that cleanly contains all desired reads (missing=0).
+                // Collapsed/noisy regions often do not: overlap partners can be split across multiple anchors.
+                // In that case, keeping just the "best single anchor" can still retain a collapsed anchor.
+                //
+                // Failsafe: iteratively pick anchors that cover *new* uncovered desired reads until we cover
+                // the whole desired set or we can no longer make progress. We still penalize anchors that
+                // contain unrelated reads ("extra") to avoid keeping broadly-collapsed anchors.
+
+                // Initialize the desired set and the uncovered desired reads.
+                uncovered.clear();
+                uncovered.insert(selfValue);
+                for (const uint32_t v : active) {
+                    uncovered.insert(v);
+                }
+
+                vector<AnchorId> chosenAnchors;
+                chosenAnchors.reserve(4);
+                uint32_t totalExtraReads = 0;
+
+                // We cap the number of chosen anchors per interval to prevent pathological explosion
+                // in highly collapsed regions.
+                const uint32_t maxChosenAnchors =
+                    std::min<uint32_t>(8U, desiredReads); // never need more than desiredReads anchors.
+
+                // Track a "primary" anchor score compatible with the old output columns.
+                AnchorId primaryAnchorId = invalid<AnchorId>;
+                uint32_t primaryCovered = 0;
+                uint32_t primaryMissing = std::numeric_limits<uint32_t>::max();
+                uint32_t primaryExtra = std::numeric_limits<uint32_t>::max();
+                uint32_t primaryCoverage = 0;
+
+                // Greedy loop.
+                for (uint32_t step = 0; step < maxChosenAnchors && !uncovered.empty(); ++step) {
+                    AnchorId bestAnchorId = invalid<AnchorId>;
+                    uint32_t bestGain = 0;
+                    uint32_t bestExtra = std::numeric_limits<uint32_t>::max();
+                    uint32_t bestCoveredDesired = 0;
+                    uint32_t bestAnchorCoverage = 0;
+
+                    for (uint64_t j = journeyIdx; j < jEnd; ++j) {
+                        const AnchorId anchorId = journey[j];
+                        bool alreadyChosen = false;
+                        for (const AnchorId x : chosenAnchors) {
+                            if (x == anchorId) {
+                                alreadyChosen = true;
+                                break;
+                            }
+                        }
+                        if (alreadyChosen) continue;
+
+                        const Anchor anchor = (*this)[anchorId];
+
+                        // Compute:
+                        // - coveredDesired: |anchor ∩ desired|
+                        // - gain: |anchor ∩ uncovered|
+                        // - extra: |anchor \ desired|
+                        uint32_t coveredDesired = 0;
+                        uint32_t gain = 0;
+                        bool hasSelf = false;
+                        for (const auto& mi : anchor) {
+                            const uint32_t v = mi.orientedReadId.getValue();
+                            const bool inDesired = (v == selfValue) || (active.find(v) != active.end());
+                            if (inDesired) {
+                                ++coveredDesired;
+                                if (uncovered.find(v) != uncovered.end()) {
+                                    ++gain;
+                                }
+                                if (v == selfValue) {
+                                    hasSelf = true;
+                                }
+                            }
+                        }
+                        if (!hasSelf) continue;
+                        if (gain == 0) continue;
+
+                        const uint32_t extra = uint32_t(anchor.size()) - coveredDesired;
+
+                        // Choose anchor with maximum gain, then minimum extra, then maximum coveredDesired.
+                        if (gain > bestGain ||
+                            (gain == bestGain && extra < bestExtra) ||
+                            (gain == bestGain && extra == bestExtra && coveredDesired > bestCoveredDesired)) {
+                            bestAnchorId = anchorId;
+                            bestGain = gain;
+                            bestExtra = extra;
+                            bestCoveredDesired = coveredDesired;
+                            bestAnchorCoverage = uint32_t(anchor.size());
+                        }
+                    }
+
+                    if (bestAnchorId == invalid<AnchorId>) {
+                        // No candidate can cover any additional desired reads.
+                        break;
+                    }
+
+                    // Apply selection.
+                    chosenAnchors.push_back(bestAnchorId);
+                    totalExtraReads += bestExtra;
+
+                    // Update uncovered set by removing desired reads present on the chosen anchor.
+                    {
+                        const Anchor chosenAnchor = (*this)[bestAnchorId];
+                        for (const auto& mi : chosenAnchor) {
+                            const uint32_t v = mi.orientedReadId.getValue();
+                            uncovered.erase(v);
+                        }
+                    }
+
+                    // Capture primary-anchor columns (the first chosen anchor).
+                    if (step == 0) {
+                        primaryAnchorId = bestAnchorId;
+                        primaryCovered = bestCoveredDesired;
+                        primaryMissing = desiredReads - bestCoveredDesired;
+                        primaryExtra = bestExtra;
+                        primaryCoverage = bestAnchorCoverage;
+                    }
+
+                    // Record chosen anchor in the global keep-bitset (if requested).
+                    if (stableOverlapIntervalsBestAnchorsData.keepAnchorWords) {
+                        auto& keepWords = *stableOverlapIntervalsBestAnchorsData.keepAnchorWords;
+                        const uint64_t word = uint64_t(bestAnchorId) >> 6;
+                        const uint64_t bit = uint64_t(bestAnchorId) & 63ULL;
+                        if (word < keepWords.size()) {
+                            keepWords[word].fetch_or(1ULL << bit, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                if (chosenAnchors.empty()) continue;
+
+                const uint32_t finalMissing = uint32_t(uncovered.size());
+                const uint32_t finalCovered = desiredReads - finalMissing;
+
+                // Serialize chosen anchors as a semicolon-separated list.
+                std::ostringstream chosenList;
+                for (uint64_t k = 0; k < chosenAnchors.size(); ++k) {
+                    if (k) chosenList << ";";
+                    chosenList << anchorIdToString(chosenAnchors[k]);
+                }
+
+                out << orientedReadId << "," << pos << "," << nextPos << "," << intervalLen << ","
+                    << active.size() << "," << candidateCount << "," << anchorIdToString(primaryAnchorId) << ","
+                    << desiredReads << "," << primaryCovered << "," << primaryMissing << "," << primaryExtra << ","
+                    << primaryCoverage << ","
+                    << chosenAnchors.size() << "," << chosenList.str() << ","
+                    << finalCovered << "," << finalMissing << "," << totalExtraReads << "\n";
+            }
+        }
+    }
+}
+
 
 
 void Anchors::computeJourneysThreadFunction2(uint64_t /* threadId */)
@@ -803,6 +1279,7 @@ void Anchors::computeJourneysThreadFunction2(uint64_t /* threadId */)
 void Anchors::computeJourneysThreadFunction12(uint64_t pass)
 {
     Anchors& anchors = *this;
+    const auto* keepWords = anchors.journeyAnchorFilterData.keepAnchorWords;
 
     // Loop over all batches assigned to this thread.
     uint64_t begin, end;
@@ -810,6 +1287,13 @@ void Anchors::computeJourneysThreadFunction12(uint64_t pass)
 
         // Loop over all AnchorIds in this batch.
         for(AnchorId anchorId=begin; anchorId!=end; anchorId++) {
+            if (keepWords) {
+                const uint64_t word = uint64_t(anchorId) >> 6;
+                const uint64_t bit = uint64_t(anchorId) & 63ULL;
+                if (word >= keepWords->size() || (((*keepWords)[word] >> bit) & 1ULL) == 0ULL) {
+                    continue;
+                }
+            }
             Anchor anchor = anchors[anchorId];
 
             // Loop over the marker intervals of this Anchor.
@@ -829,6 +1313,21 @@ void Anchors::computeJourneysThreadFunction12(uint64_t pass)
     }
 }
 
+
+
+void Anchors::resetPositionInJourneyThreadFunction(uint64_t /* threadId */)
+{
+    // Loop over all batches assigned to this thread.
+    uint64_t begin = 0, end = 0;
+    while (getNextBatch(begin, end)) {
+        for (AnchorId anchorId = begin; anchorId != end; ++anchorId) {
+            span<AnchorMarkerInterval> markerIntervals = anchorMarkerIntervals[anchorId];
+            for (AnchorMarkerInterval& mi : markerIntervals) {
+                mi.positionInJourney = invalid<uint32_t>;
+            }
+        }
+    }
+}
 
 
 
@@ -901,6 +1400,9 @@ void Anchors::findChildren(
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
         const auto journey = journeys[orientedReadId.getValue()];
         const uint64_t position = markerInterval.positionInJourney;
+        if (position == invalid<uint32_t> || position >= journey.size()) {
+            continue;
+        }
         const uint64_t nextPosition = position + 1;
         if(nextPosition < journey.size()) {
             const AnchorId nextAnchorId = journey[nextPosition];
@@ -927,6 +1429,9 @@ void Anchors::findParents(
         const OrientedReadId orientedReadId = markerInterval.orientedReadId;
         const auto journey = journeys[orientedReadId.getValue()];
         const uint64_t position = markerInterval.positionInJourney;
+        if (position == invalid<uint32_t> || position >= journey.size()) {
+            continue;
+        }
         if(position > 0) {
             const uint64_t previousPosition = position - 1;
             const AnchorId previousAnchorId = journey[previousPosition];
@@ -994,7 +1499,13 @@ void Anchors::followOrientedReads(
     for(const AnchorMarkerInterval& anchorMarkerInterval: anchor0) {
         const OrientedReadId orientedReadId = anchorMarkerInterval.orientedReadId;
         const uint64_t position0 = anchorMarkerInterval.positionInJourney;
+        if (position0 == invalid<uint32_t>) {
+            continue;
+        }
         const auto journey = journeys[orientedReadId.getValue()];
+        if (position0 >= journey.size()) {
+            continue;
+        }
 
         // Figure out the forward or backward portion of the journey.
         uint64_t begin;
@@ -1108,4 +1619,108 @@ void Anchors::writeAnchorGapsByRead() const
         }
         csv << readId << "," << readLength << "," << journey.size() << "," << maxGap << "\n";
     }
+}
+
+
+
+void Anchors::writeJourneyEndpoints() const
+{
+    class PairStats {
+    public:
+        uint64_t readCount = 0;
+        uint64_t anchorCountSum = 0;
+        uint64_t terminalSpanSum = 0;
+        uint64_t unanchoredStartSum = 0;
+        uint64_t unanchoredEndSum = 0;
+    };
+
+    // Use strand 0 only so each physical read contributes at most once.
+    std::map<std::pair<AnchorId, AnchorId>, PairStats> pairStats;
+    uint64_t readCountWithJourneys = 0;
+    uint64_t readCountWithTerminalPair = 0;
+
+    ofstream perReadCsv("JourneyEndpoints.csv");
+    perReadCsv << "ReadId,AnchorCount,StartAnchor,EndAnchor,CanonicalStartAnchor,CanonicalEndAnchor,"
+                  "StartPosition,EndPosition,ReadLength,TerminalSpan,UnanchoredStart,UnanchoredEnd\n";
+
+    for(ReadId readId=0; readId<reads.readCount(); readId++) {
+        const OrientedReadId orientedReadId(readId, 0);
+        const auto journey = journeys[orientedReadId.getValue()];
+        const uint64_t anchorCount = journey.size();
+        if(anchorCount == 0) {
+            perReadCsv << readId << ",0,,,,,,,,,,\n";
+            continue;
+        }
+
+        ++readCountWithJourneys;
+        const uint64_t readLength = reads.getRead(readId).baseCount;
+        const AnchorId startAnchorId = journey.front();
+        const AnchorId endAnchorId = journey.back();
+        const auto canonicalPair = canonicalEndpointPair(startAnchorId, endAnchorId);
+
+        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+        const uint32_t startOrdinal = getFirstOrdinal(startAnchorId, orientedReadId);
+        const uint32_t endOrdinal = getFirstOrdinal(endAnchorId, orientedReadId);
+        const uint64_t startPosition = orientedReadMarkers[startOrdinal].position;
+        const uint64_t endPosition = orientedReadMarkers[endOrdinal].position;
+        DINARA_ASSERT(endPosition >= startPosition);
+        DINARA_ASSERT(readLength >= endPosition);
+
+        const uint64_t terminalSpan = endPosition - startPosition;
+        const uint64_t unanchoredStart = startPosition;
+        const uint64_t unanchoredEnd = readLength - endPosition;
+
+        perReadCsv << readId << "," << anchorCount << ","
+            << anchorIdToString(startAnchorId) << ","
+            << anchorIdToString(endAnchorId) << ","
+            << anchorIdToString(canonicalPair.first) << ","
+            << anchorIdToString(canonicalPair.second) << ","
+            << startPosition << "," << endPosition << "," << readLength << ","
+            << terminalSpan << "," << unanchoredStart << "," << unanchoredEnd << "\n";
+
+        if(anchorCount < 2) {
+            continue;
+        }
+
+        ++readCountWithTerminalPair;
+        PairStats& stats = pairStats[canonicalPair];
+        ++stats.readCount;
+        stats.anchorCountSum += anchorCount;
+        stats.terminalSpanSum += terminalSpan;
+        stats.unanchoredStartSum += unanchoredStart;
+        stats.unanchoredEndSum += unanchoredEnd;
+    }
+
+    vector< pair< pair<AnchorId, AnchorId>, PairStats> > sortedPairStats(
+        pairStats.begin(), pairStats.end());
+    sort(sortedPairStats.begin(), sortedPairStats.end(),
+        [](const auto& x, const auto& y) {
+            if(x.second.readCount != y.second.readCount) {
+                return x.second.readCount > y.second.readCount;
+            }
+            return x.first < y.first;
+        });
+
+    ofstream pairCsv("JourneyEndpointPairs.csv");
+    pairCsv << "CanonicalStartAnchor,CanonicalEndAnchor,ReadCount,"
+               "AverageAnchorCount,AverageTerminalSpan,AverageUnanchoredStart,AverageUnanchoredEnd\n";
+    for(const auto& p: sortedPairStats) {
+        const std::pair<AnchorId, AnchorId>& pair = p.first;
+        const PairStats& stats = p.second;
+        const double readCountInverse = 1.0 / double(stats.readCount);
+        pairCsv
+            << anchorIdToString(pair.first) << ","
+            << anchorIdToString(pair.second) << ","
+            << stats.readCount << ","
+            << double(stats.anchorCountSum) * readCountInverse << ","
+            << double(stats.terminalSpanSum) * readCountInverse << ","
+            << double(stats.unanchoredStartSum) * readCountInverse << ","
+            << double(stats.unanchoredEndSum) * readCountInverse << "\n";
+    }
+
+    performanceLog << timestamp
+        << "Wrote JourneyEndpoints.csv for " << readCountWithJourneys << " reads and "
+        << "JourneyEndpointPairs.csv for " << pairStats.size()
+        << " canonical endpoint links (from " << readCountWithTerminalPair
+        << " reads with at least 2 anchors)." << endl;
 }

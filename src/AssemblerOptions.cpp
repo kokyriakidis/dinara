@@ -572,6 +572,11 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(1.0),
         "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction. Default 1.0 (disabled) matches hifiasm r484 commented-out state.")
 
+        ("OverlapCandidates.invertedIndexUseHifiasmChainDp",
+        value<bool>(&overlapCandidatesOptions.invertedIndexUseHifiasmChainDp)->
+        default_value(false),
+        "InvertedIndex chaining: use hifiasm chain_DP (Hash_Table.cpp) for pre-EC overlap discovery and apply anchor.cpp:191-220 max_n_chain pruning (disables lchain/mcopy/COV_W).")
+
         ("OverlapCandidates.invertedIndexLchainIsAccurate",
         value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
         default_value(true),
@@ -1671,6 +1676,7 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexHighFactor = " << invertedIndexHighFactor << "\n";
     s << "invertedIndexMinNChain = " << invertedIndexMinNChain << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
+    s << "invertedIndexUseHifiasmChainDp = " << convertBoolToPythonString(invertedIndexUseHifiasmChainDp) << "\n";
     s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
     s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";
     s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";

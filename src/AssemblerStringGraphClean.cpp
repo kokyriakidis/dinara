@@ -93,6 +93,49 @@ namespace {
         } while (--maxExtReads > 0);
         return ret;
     }
+
+    // Hifiasm parity: implements `asg_check_unambi1` (unique outgoing neighbor, else invalid).
+    inline uint32_t stringGraphCheckUnambiguous1(const StringGraph& g, uint32_t v)
+    {
+        uint32_t next = std::numeric_limits<uint32_t>::max();
+        uint32_t count = 0;
+        for (const uint32_t arcId : g.outgoing[v]) {
+            if (g.arcs[arcId].del) continue;
+            next = g.arcs[arcId].to;
+            ++count;
+            if (count > 1) break;
+        }
+        return (count == 1) ? next : std::numeric_limits<uint32_t>::max();
+    }
+
+    // Hifiasm parity: implements `asg_topocut_aux`.
+    inline int stringGraphTopocutAux(const StringGraph& g, uint32_t v, int maxExtReads)
+    {
+        int nExt = 1;
+        for (; nExt < maxExtReads && v != std::numeric_limits<uint32_t>::max(); ++nExt) {
+            if (stringGraphCheckUnambiguous1(g, v ^ 1U) == std::numeric_limits<uint32_t>::max()) {
+                --nExt;
+                break;
+            }
+            v = stringGraphCheckUnambiguous1(g, v);
+        }
+        return nExt;
+    }
+}
+
+
+
+static void sortStringGraphOutgoingByLen(Assembler& assembler, uint64_t vertexCount)
+{
+    for (uint32_t v = 0; v < vertexCount; ++v) {
+        uint32_t* b = assembler.stringGraph.outgoing.begin(v);
+        uint32_t* e = assembler.stringGraph.outgoing.end(v);
+        std::stable_sort(b, e, [&](uint32_t aId, uint32_t bId) {
+            const auto& a = assembler.stringGraph.arcs[aId];
+            const auto& bArc = assembler.stringGraph.arcs[bId];
+            return a.len < bArc.len;
+        });
+    }
 }
 
 
@@ -137,26 +180,130 @@ static void rebuildStringGraphAdjacency(Assembler& assembler, uint64_t vertexCou
     }
 
     // Sort outgoing adjacency by `len` (required by transitive reduction).
-    for (uint32_t v = 0; v < vertexCount; ++v) {
-        uint32_t* b = assembler.stringGraph.outgoing.begin(v);
-        uint32_t* e = assembler.stringGraph.outgoing.end(v);
-        std::sort(b, e, [&](uint32_t aId, uint32_t bId) {
-            const auto& a = assembler.stringGraph.arcs[aId];
-            const auto& bArc = assembler.stringGraph.arcs[bId];
-            if (a.len != bArc.len) return a.len < bArc.len;
-            return a.to < bArc.to;
-        });
-    }
+    sortStringGraphOutgoingByLen(assembler, vertexCount);
 }
 
 
 
-static uint64_t stringGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz, uint32_t vertexCount)
+static void cleanupStringGraphLikeHifiasm(Assembler& assembler, uint32_t vertexCount)
+{
+    // Hifiasm `asg_cleanup` effect:
+    // - hard-remove arcs marked deleted
+    // - hard-remove arcs incident to deleted reads
+    // Here we keep arc storage stable and rebuild adjacency to include only surviving arcs.
+    StringGraph& g = assembler.stringGraph;
+    if (g.readDeleted.isOpen) {
+        for (uint64_t arcId = 0; arcId < g.arcs.size(); ++arcId) {
+            auto& a = g.arcs[arcId];
+            if (a.del) {
+                continue;
+            }
+            const uint32_t fromRead = a.from >> 1U;
+            const uint32_t toRead = a.to >> 1U;
+            if ((fromRead < g.readDeleted.size() && g.readDeleted[fromRead]) ||
+                (toRead < g.readDeleted.size() && g.readDeleted[toRead])) {
+                a.del = 1;
+            }
+        }
+    }
+    rebuildStringGraphAdjacency(assembler, vertexCount);
+}
+
+
+
+static uint64_t deleteStringGraphMultiArcsLikeHifiasm(Assembler& assembler, uint32_t vertexCount)
+{
+    // Hifiasm `asg_arc_del_multi`: for each v, keep one v->w arc and delete additional duplicates.
+    StringGraph& g = assembler.stringGraph;
+    vector<uint32_t> count(vertexCount, 0);
+    uint64_t removed = 0;
+
+    for (uint32_t v = 0; v < vertexCount; ++v) {
+        const span<const uint32_t> out = g.outgoing[v];
+        if (out.size() < 2) {
+            continue;
+        }
+
+        for (uint64_t i = out.size(); i > 0; --i) {
+            const uint32_t arcId = out[i - 1];
+            ++count[g.arcs[arcId].to];
+        }
+        for (uint64_t i = out.size(); i > 0; --i) {
+            const uint32_t arcId = out[i - 1];
+            const uint32_t w = g.arcs[arcId].to;
+            if (--count[w] != 0) {
+                g.arcs[arcId].del = 1;
+                ++removed;
+            }
+        }
+    }
+
+    if (removed) {
+        cleanupStringGraphLikeHifiasm(assembler, vertexCount);
+    }
+    return removed;
+}
+
+
+
+static uint64_t deleteStringGraphAsymmetricArcsLikeHifiasm(Assembler& assembler, uint32_t vertexCount)
+{
+    // Hifiasm `asg_arc_del_asymm`: delete u->v if (v^1)->(u^1) is absent.
+    StringGraph& g = assembler.stringGraph;
+    uint64_t removed = 0;
+
+    for (uint32_t u = 0; u < vertexCount; ++u) {
+        const span<const uint32_t> out = g.outgoing[u];
+        for (const uint32_t arcId : out) {
+            const uint32_t v = g.arcs[arcId].to;
+            const uint32_t rcFrom = v ^ 1U;
+            const uint32_t rcTo = u ^ 1U;
+
+            bool found = false;
+            for (const uint32_t arcRcId : g.outgoing[rcFrom]) {
+                if (g.arcs[arcRcId].to == rcTo) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                g.arcs[arcId].del = 1;
+                ++removed;
+            }
+        }
+    }
+
+    if (removed) {
+        cleanupStringGraphLikeHifiasm(assembler, vertexCount);
+    }
+    return removed;
+}
+
+
+
+static void symmetrizeStringGraphLikeHifiasm(Assembler& assembler, uint32_t vertexCount)
+{
+    // Hifiasm `asg_symm` = delete multi-arcs then delete asymmetric arcs.
+    (void)deleteStringGraphMultiArcsLikeHifiasm(assembler, vertexCount);
+    (void)deleteStringGraphAsymmetricArcsLikeHifiasm(assembler, vertexCount);
+}
+
+
+
+static uint64_t stringGraphTransitiveReduce(
+    Assembler& assembler,
+    uint32_t fuzz,
+    uint32_t vertexCount,
+    bool rebuildBefore)
 {
     StringGraph& g = assembler.stringGraph;
 
     // Ensure adjacency exists and is sorted by `len`.
-    rebuildStringGraphAdjacency(assembler, vertexCount);
+    if (rebuildBefore) {
+        rebuildStringGraphAdjacency(assembler, vertexCount);
+    } else {
+        sortStringGraphOutgoingByLen(assembler, vertexCount);
+    }
 
     vector<uint8_t> mark(vertexCount, 0);
     uint64_t reduced = 0;
@@ -164,6 +311,7 @@ static uint64_t stringGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz,
     for (uint32_t v = 0; v < vertexCount; ++v) {
         if (g.readDeleted.isOpen && g.readDeleted[v >> 1U]) {
             for (const uint32_t arcId : g.outgoing[v]) {
+                ++reduced;
                 g.arcs[arcId].del = 1;
             }
             continue;
@@ -204,8 +352,10 @@ static uint64_t stringGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz,
     }
 
     if (reduced) {
-        symmetrizeArcDeletion(g);
-        rebuildStringGraphAdjacency(assembler, vertexCount);
+        // Hifiasm `asg_arc_del_trans` post-processing:
+        // `asg_cleanup(g); asg_symm(g);`
+        cleanupStringGraphLikeHifiasm(assembler, vertexCount);
+        symmetrizeStringGraphLikeHifiasm(assembler, vertexCount);
     }
     return reduced;
 }
@@ -216,37 +366,89 @@ static uint64_t stringGraphCutTips(Assembler& assembler, uint32_t maxShortTipRea
 {
     StringGraph& g = assembler.stringGraph;
 
+    if (maxShortTipReads == 0) return 0;
+
+    // Match hifiasm gfa_ut.cpp:asg_arc_cut_tips for the non-OU/non-telomere case:
+    // - Collect candidate tips (short unitigs) first.
+    // - Sort by unitig length (shortest first).
+    // - Re-check each candidate before deleting.
+    //
+    // Note: hifiasm supports additional behaviors via `is_ou`, `ru`, and `te` parameters.
+    // Dinara's string graph does not currently encode `ou` or telomere state, so those
+    // paths are intentionally not implemented here.
+
+    auto outdegree0 = [&](uint32_t v) -> bool {
+        return countOutgoingNonDeleted(g, v) == 0;
+    };
+
+    auto deleteRead = [&](uint32_t orientedVertex) {
+        const ReadId readId = ReadId(orientedVertex >> 1U);
+        if (g.readDeleted.isOpen && readId < g.readDeleted.size()) {
+            g.readDeleted[readId] = 1;
+        }
+        const uint32_t v0 = uint32_t(readId) << 1U;
+        const uint32_t v1 = v0 ^ 1U;
+        for (const uint32_t arcId : g.outgoing[v0]) {
+            g.arcs[arcId].del = 1;
+        }
+        for (const uint32_t arcId : g.outgoing[v1]) {
+            g.arcs[arcId].del = 1;
+        }
+    };
+
+    vector<uint64_t> candidates;
+    candidates.reserve(vertexCount / 8 + 16);
+
+    // Phase 1: gather candidate short tips.
+    for (uint32_t v = 0; v < vertexCount; ++v) {
+        if (g.readDeleted.isOpen && g.readDeleted[v >> 1U]) continue;
+        if (!outdegree0(v ^ 1U)) continue; // tip start: no incoming arcs into v
+
+        uint32_t w = v;
+        uint32_t kv = 1;
+        uint32_t i = 0;
+        for (i = 0; i < maxShortTipReads; ++i) {
+            uint32_t nextVertex = 0;
+            if (stringGraphIsUtgEnd(g, w ^ 1U, &nextVertex) != ASG_ET_MERGEABLE) break;
+            w = nextVertex;
+            ++kv;
+        }
+
+        if (i < maxShortTipReads) {
+            candidates.push_back((uint64_t(kv) << 32) | uint64_t(v));
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+
+    // Phase 2: cut tips, shortest first, re-checking each candidate.
     uint64_t cutCount = 0;
     vector<uint32_t> path;
+    path.reserve(maxShortTipReads + 2);
 
-    for (uint32_t v = 0; v < vertexCount; ++v) {
-        if (g.readDeleted.isOpen && g.readDeleted[v >> 1U]) {
-            continue;
-        }
-        if (stringGraphIsUtgEnd(g, v, nullptr) != ASG_ET_TIP) {
-            continue;
-        }
-        const int ret = stringGraphExtend(g, v, int(maxShortTipReads), path);
-        if (ret == ASG_ET_MERGEABLE) {
-            continue;
-        }
+    for (const uint64_t key : candidates) {
+        const uint32_t v = uint32_t(key);
+        if (g.readDeleted.isOpen && g.readDeleted[v >> 1U]) continue;
+        if (!outdegree0(v ^ 1U)) continue; // no longer a tip
 
-        for (const uint32_t vv : path) {
-            const ReadId readId = ReadId(vv >> 1U);
-            if (g.readDeleted.isOpen && readId < g.readDeleted.size()) {
-                g.readDeleted[readId] = 1;
-            }
-            const uint32_t v0 = uint32_t(readId) << 1U;
-            const uint32_t v1 = v0 ^ 1U;
-            for (const uint32_t arcId : g.outgoing[v0]) {
-                g.arcs[arcId].del = 1;
-            }
-            for (const uint32_t arcId : g.outgoing[v1]) {
-                g.arcs[arcId].del = 1;
-            }
+        path.clear();
+        path.push_back(v);
+
+        uint32_t w = v;
+        uint32_t i = 0;
+        for (i = 0; i < maxShortTipReads; ++i) {
+            uint32_t nextVertex = 0;
+            if (stringGraphIsUtgEnd(g, w ^ 1U, &nextVertex) != ASG_ET_MERGEABLE) break;
+            w = nextVertex;
+            path.push_back(w);
         }
 
-        ++cutCount;
+        if (i < maxShortTipReads) {
+            for (const uint32_t vv : path) {
+                deleteRead(vv);
+            }
+            ++cutCount;
+        }
     }
 
     if (cutCount) {
@@ -378,6 +580,229 @@ static uint64_t stringGraphRemoveSingleNodeBubbles(Assembler& assembler, uint32_
 
 
 
+uint64_t Assembler::reduceStringGraphTransitiveHifiasm(uint32_t gapFuzz)
+{
+    reads->checkReadsAreOpen();
+    if (!stringGraph.arcs.isOpen) {
+        throw runtime_error("reduceStringGraphTransitiveHifiasm: StringGraph is not open.");
+    }
+    if (!stringGraph.outgoing.isOpen()) {
+        throw runtime_error("reduceStringGraphTransitiveHifiasm: StringGraph adjacency is not open.");
+    }
+
+    const uint32_t vertexCount = uint32_t(2 * reads->readCount());
+    const auto t0 = steady_clock::now();
+    cout << timestamp << "String graph transitive reduction (hifiasm asg_arc_del_trans) begins." << endl;
+
+    // This entry point is used right after ma_sg_gen, so adjacency is already current.
+    const uint64_t reduced = stringGraphTransitiveReduce(*this, gapFuzz, vertexCount, /*rebuildBefore*/false);
+    cout << timestamp << "  transitively reduced " << reduced << " arcs (gapFuzz=" << gapFuzz << ")" << endl;
+    cout << timestamp << "String graph transitive reduction complete in " << seconds(steady_clock::now() - t0) << " s" << endl;
+    return reduced;
+}
+
+
+
+uint64_t Assembler::cutStringGraphTips(uint32_t maxShortTipReads)
+{
+    reads->checkReadsAreOpen();
+    if (!stringGraph.arcs.isOpen) {
+        throw runtime_error("cutStringGraphTips: StringGraph is not open.");
+    }
+    if (!stringGraph.outgoing.isOpen()) {
+        throw runtime_error("cutStringGraphTips: StringGraph adjacency is not open.");
+    }
+
+    const uint32_t vertexCount = uint32_t(2 * reads->readCount());
+    const auto t0 = steady_clock::now();
+    cout << timestamp << "String graph tip cutting (hifiasm asg_arc_cut_tips) begins." << endl;
+
+    const uint64_t cut = stringGraphCutTips(*this, maxShortTipReads, vertexCount);
+    cout << timestamp << "  cut " << cut << " tips (maxShortTipReads=" << maxShortTipReads << ")" << endl;
+    cout << timestamp << "String graph tip cutting complete in " << seconds(steady_clock::now() - t0) << " s" << endl;
+    return cut;
+}
+
+uint64_t Assembler::cutStringGraphWeakArcsOntHifiasm(uint32_t maxExtReads, double lenRatio, uint32_t minDiff)
+{
+    reads->checkReadsAreOpen();
+    checkAlignmentDataAreOpen();
+    if (!stringGraph.arcs.isOpen) {
+        throw runtime_error("cutStringGraphWeakArcsOntHifiasm: StringGraph is not open.");
+    }
+    if (!stringGraph.outgoing.isOpen()) {
+        throw runtime_error("cutStringGraphWeakArcsOntHifiasm: StringGraph adjacency is not open.");
+    }
+
+    const uint32_t vertexCount = uint32_t(2 * reads->readCount());
+    const auto t0 = steady_clock::now();
+    cout << timestamp << "String graph weak-arc cutting (hifiasm asg_arc_cut_weak, ONT path) begins." << endl;
+
+    StringGraph& g = stringGraph;
+    if (maxExtReads == 0) return 0;
+
+    auto hasAlignmentBetweenOrientedReads = [&](OrientedReadId a, OrientedReadId b) -> bool {
+        const span<const uint32_t> section = alignmentTable[a.getValue()];
+        auto it = std::lower_bound(
+            section.begin(),
+            section.end(),
+            b,
+            [&](uint32_t alignmentId, const OrientedReadId& target) {
+                const OrientedReadId other = alignmentData[alignmentId].getOther(a);
+                return other < target;
+            });
+        if (it == section.end()) return false;
+        return alignmentData[*it].getOther(a) == b;
+    };
+
+    auto hasAnyAlignmentBetweenReads = [&](ReadId a, ReadId b) -> bool {
+        for (Strand sa = 0; sa < 2; ++sa) {
+            for (Strand sb = 0; sb < 2; ++sb) {
+                if (hasAlignmentBetweenOrientedReads(OrientedReadId(a, sa), OrientedReadId(b, sb))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    auto readIsDeleted = [&](uint32_t v) -> bool {
+        return g.readDeleted.isOpen && (v >> 1U) < g.readDeleted.size() && g.readDeleted[v >> 1U];
+    };
+
+    // Approximate parity with hifiasm gfa_ut.cpp:asg_arc_cut_weak for the ONT call site used by ul_clean_gfa:
+    //   asg_arc_cut_weak(sg, &bu, max_tip, 0.975, 0, is_ou, 0, 1, 16, UL_COV_THRES-1, 0, rev, NULL, NULL)
+    // We intentionally do not implement trio/OU/R_to_U paths here (Dinara does not store `ou`).
+
+    vector<uint64_t> candidates;
+    candidates.reserve(1024);
+
+    // Phase 1: gather weak-arc candidates.
+    // We use "not the best-overlap outgoing arc" as the weak-arc proxy, and require that the best target
+    // overlaps the weak target (dedup check), matching the intent of hifiasm's `is_dedup_weak_arc`.
+    for (uint32_t v = 0; v < vertexCount; ++v) {
+        if (readIsDeleted(v)) continue;
+        const span<const uint32_t> out = g.outgoing[v];
+
+        uint32_t maxOl = 0;
+        uint32_t outCount = 0;
+        uint32_t maxArcId = std::numeric_limits<uint32_t>::max();
+        for (const uint32_t arcId : out) {
+            const auto& a = g.arcs[arcId];
+            if (a.del) continue;
+            ++outCount;
+            if (a.overlapLen > maxOl) {
+                maxOl = a.overlapLen;
+                maxArcId = arcId;
+            }
+        }
+        if (outCount < 2) continue;
+        if (maxArcId == std::numeric_limits<uint32_t>::max()) continue;
+
+        const ReadId strongRead = ReadId(g.arcs[maxArcId].to >> 1U);
+        for (const uint32_t arcId : out) {
+            const auto& a = g.arcs[arcId];
+            if (a.del) continue;
+            if (arcId == maxArcId) continue;
+
+            if (a.overlapLen >= maxOl) continue;
+            if (uint32_t(double(a.overlapLen)) + minDiff > maxOl) continue;
+            if (double(a.overlapLen) > double(maxOl) * lenRatio) continue;
+
+            const ReadId weakRead = ReadId(a.to >> 1U);
+            if (!hasAnyAlignmentBetweenReads(strongRead, weakRead)) continue;
+
+            candidates.push_back((uint64_t(a.overlapLen) << 32) | uint64_t(arcId));
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+
+    // Phase 2: evaluate candidates in increasing overlap length and delete if supported by local criteria.
+    uint64_t cut = 0;
+    for (const uint64_t key : candidates) {
+        const uint32_t arcId = uint32_t(key);
+        if (arcId >= g.arcs.size()) continue;
+        if (g.arcs[arcId].del) continue;
+
+        const uint32_t v = g.arcs[arcId].from;
+        const uint32_t to = g.arcs[arcId].to;
+        const uint32_t w = to ^ 1U; // hifiasm: w = ve->v^1
+        if (readIsDeleted(v) || readIsDeleted(w)) continue;
+
+        const uint32_t kv = countOutgoingNonDeleted(g, v);
+        const uint32_t kw = countOutgoingNonDeleted(g, w);
+        if (kv <= 1 && kw <= 1) continue;
+
+        const uint32_t twinId = arcId ^ 1U;
+        if (twinId >= g.arcs.size()) continue;
+        const auto& ve = g.arcs[arcId];
+        const auto& we = g.arcs[twinId];
+
+        const uint32_t mmOl = std::min(ve.overlapLen, we.overlapLen);
+
+        // Find best alternative on v side that overlaps the weak target read.
+        uint32_t vOlMax = 0;
+        for (const uint32_t altId : g.outgoing[v]) {
+            const auto& a = g.arcs[altId];
+            if (a.del) continue;
+            if (a.to == ve.to) continue;
+            if (a.overlapLen <= ve.overlapLen) continue;
+            if (!hasAnyAlignmentBetweenReads(ReadId(a.to >> 1U), ReadId(ve.to >> 1U))) continue;
+            vOlMax = std::max(vOlMax, a.overlapLen);
+        }
+        if (kv >= 2) {
+            if (vOlMax == 0) continue;
+            if (double(mmOl) > double(vOlMax) * lenRatio) continue;
+            if (mmOl + minDiff > vOlMax) continue;
+        }
+
+        // Find best alternative on w side that overlaps the weak source read (mirrors symmetric checks).
+        uint32_t wOlMax = 0;
+        for (const uint32_t altId : g.outgoing[w]) {
+            const auto& a = g.arcs[altId];
+            if (a.del) continue;
+            if (a.to == we.to) continue;
+            if (a.overlapLen <= we.overlapLen) continue;
+            if (!hasAnyAlignmentBetweenReads(ReadId(a.to >> 1U), ReadId(we.to >> 1U))) continue;
+            wOlMax = std::max(wOlMax, a.overlapLen);
+        }
+        if (kw >= 2) {
+            if (wOlMax == 0) continue;
+            if (double(mmOl) > double(wOlMax) * lenRatio) continue;
+            if (mmOl + minDiff > wOlMax) continue;
+        }
+
+        // Topology criterion (hifiasm `is_topo=1` path).
+        bool toDel = false;
+        if (kv > 1 && kw > 1) {
+            toDel = true;
+        } else if (kw == 1) {
+            if (stringGraphTopocutAux(g, w ^ 1U, int(maxExtReads)) < int(maxExtReads)) toDel = true;
+        } else if (kv == 1) {
+            if (stringGraphTopocutAux(g, v ^ 1U, int(maxExtReads)) < int(maxExtReads)) toDel = true;
+        }
+
+        if (toDel) {
+            g.arcs[arcId].del = 1;
+            g.arcs[twinId].del = 1;
+            ++cut;
+        }
+    }
+
+    if (cut) {
+        symmetrizeArcDeletion(g);
+        rebuildStringGraphAdjacency(*this, vertexCount);
+    }
+
+    cout << timestamp << "  cut " << cut << " weak arcs (maxExtReads=" << maxExtReads
+         << ", lenRatio=" << lenRatio << ", minDiff=" << minDiff << ")" << endl;
+    cout << timestamp << "String graph weak-arc cutting complete in " << seconds(steady_clock::now() - t0) << " s" << endl;
+    return cut;
+}
+
+
+
 void Assembler::cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipReads)
 {
     reads->checkReadsAreOpen();
@@ -393,7 +818,7 @@ void Assembler::cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxSho
     const auto t0 = steady_clock::now();
     cout << timestamp << "Cleaning string graph (hifiasm initial clean): transitive reduction + tip cut" << endl;
 
-    const uint64_t reduced = stringGraphTransitiveReduce(*this, gapFuzz, vertexCount);
+    const uint64_t reduced = stringGraphTransitiveReduce(*this, gapFuzz, vertexCount, /*rebuildBefore*/true);
     cout << timestamp << "  transitively reduced " << reduced << " arcs (gapFuzz=" << gapFuzz << ")" << endl;
 
     if (maxShortTipReads > 0) {
@@ -402,6 +827,58 @@ void Assembler::cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxSho
     }
 
     cout << timestamp << "String graph clean complete in " << seconds(steady_clock::now() - t0) << " s" << endl;
+}
+
+
+
+void Assembler::cleanStringGraphIterativeHifiasm(
+    uint32_t cleanRounds,
+    double minDropRate,
+    double maxDropRate,
+    uint32_t maxShortTipReads)
+{
+    reads->checkReadsAreOpen();
+    if (!stringGraph.arcs.isOpen || !stringGraph.outgoing.isOpen()) {
+        throw runtime_error("cleanStringGraphIterativeHifiasm: StringGraph is not open.");
+    }
+
+    if (cleanRounds == 0) return;
+    if (minDropRate <= 0. || maxDropRate <= 0. || minDropRate > maxDropRate || maxDropRate >= 1.) {
+        throw runtime_error("cleanStringGraphIterativeHifiasm: invalid drop-rate range.");
+    }
+
+    const auto t0 = steady_clock::now();
+    cout << timestamp << "String graph iterative cleaning (hifiasm ul_clean_gfa) begins: "
+         << cleanRounds << " rounds, drop ratio " << minDropRate << " → " << maxDropRate << endl;
+
+    const double step = (cleanRounds == 1) ? 0. : (maxDropRate - minDropRate) / double(cleanRounds - 1);
+    double dropRatio = minDropRate;
+
+    for (uint32_t round = 0; round < cleanRounds; ++round, dropRatio += step) {
+        if (dropRatio > maxDropRate) dropRatio = maxDropRate;
+
+        cout << timestamp << "  Round " << (round + 1) << "/" << cleanRounds
+             << " (dropRatio=" << dropRatio << ")" << endl;
+
+        // Hifiasm ul_clean_gfa round structure:
+        // 1. Semi-circular removal (approximated by cycle breaking)
+        // 2. Bubble identification + chimeric cutting + tips
+        // 3. Bubble identification + inexact overlap removal + tips
+        // 4. Bubble identification + overlap-length-ratio cut + tips
+        // 5. Bubble identification + bubble links + complex bubble links + tips
+
+        // Phase 1: Topology cleaning (cycles, bubbles, tips)
+        cleanStringGraphPreCleanHifiasm(maxShortTipReads);
+
+        // Phase 2: Overlap-based cleaning (drop short overlaps by ratio)
+        cleanStringGraphDropShortOverlaps(dropRatio, /*minOverlapLen*/0);
+
+        // Phase 3: Re-clean topology after overlap changes
+        cleanStringGraphPreCleanHifiasm(maxShortTipReads);
+    }
+
+    cout << timestamp << "String graph iterative cleaning complete in "
+         << seconds(steady_clock::now() - t0) << " s" << endl;
 }
 
 
@@ -415,7 +892,7 @@ void Assembler::cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads)
 
     const uint32_t vertexCount = uint32_t(2 * reads->readCount());
     const auto t0 = steady_clock::now();
-    cout << timestamp << "String graph pre-clean (small bubbles + tip cut) begins." << endl;
+    cout << timestamp << "    String graph pre-clean (cycles + bubbles + tips) begins." << endl;
 
     uint64_t totalBubbleArcRemoved = 0;
     uint64_t totalTipsCut = 0;
@@ -436,8 +913,9 @@ void Assembler::cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads)
         }
     }
 
-    cout << timestamp << "  broke " << totalCyclesBroken << " cycle arcs; removed " << totalBubbleArcRemoved << " bubble arcs; cut " << totalTipsCut << " tips" << endl;
-    cout << timestamp << "String graph pre-clean complete in " << seconds(steady_clock::now() - t0) << " s" << endl;
+    cout << timestamp << "      broke " << totalCyclesBroken << " cycles, removed "
+         << totalBubbleArcRemoved << " bubble arcs, cut " << totalTipsCut
+         << " tips (" << seconds(steady_clock::now() - t0) << " s)" << endl;
 }
 
 

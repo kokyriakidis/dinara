@@ -2323,7 +2323,7 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
         vector<uint32_t> bestAlignmentIdsToParent;
         bestAlignmentIdsToParent.reserve(2);
 
-        // Fallback: best dpScore among all active overlaps for this contained read.
+        // Fallback: best hifiasm shared_seed proxy among all active overlaps for this contained read.
         int64_t bestScoreAny = std::numeric_limits<int64_t>::min();
         vector<uint32_t> bestAlignmentIdsAny;
         bestAlignmentIdsAny.reserve(4);
@@ -2339,7 +2339,7 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
             if(!ad.keptByBothSides()) {
                 continue;
             }
-            const int64_t score = ad.info.hifiasmDpScoreOrApprox(0);
+            const int64_t score = ad.info.hifiasmSharedSeedScoreProxy();
 
             // Update best-overlap-to-parent (if applicable).
             if (containmentRoot != ReadId(invalidReadId)) {

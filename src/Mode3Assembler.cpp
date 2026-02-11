@@ -45,6 +45,7 @@ Mode3Assembler::Mode3Assembler(
     DINARA_ASSERT(anchorsPointer);
     anchors().writeCoverageHistogram();
     anchors().writeAnchorGapsByRead();
+    anchors().writeJourneyEndpoints();
 
     performanceLog << timestamp << "Mode 3 assembly begins." << endl;
 

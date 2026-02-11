@@ -233,10 +233,14 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
         threadCount,
         false,
         false);
+    // Global-site EC is primarily a phasing/consistency filter. For low-coverage or small
+    // integration scenarios we still want to keep biallelic sites even if each allele is
+    // supported by only a single read (the later decision step still requires multiple
+    // shared sites, see minSharedSitesForDecision).
     const GlobalReadSiteIndex globalIndex = buildGlobalReadSiteIndexFromClusters(
         *this,
         clusters,
-        3, // minAlleleSupport
+        1, // minAlleleSupport
         2  // minAllelesWithSupport
     );
     const double tBuildSites = seconds(steady_clock::now() - tBuildSitesBegin);

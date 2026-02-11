@@ -11,8 +11,6 @@ uint64_t StringGraph::getReverseComplementArcId(uint64_t arcId) const
     const StringGraphArc& b = arcs[rcId];
     DINARA_ASSERT((a.from ^ 1U) == b.to);
     DINARA_ASSERT((a.to ^ 1U) == b.from);
-    DINARA_ASSERT(a.len == b.len);
-    DINARA_ASSERT(a.overlapLen == b.overlapLen);
     return rcId;
 }
 

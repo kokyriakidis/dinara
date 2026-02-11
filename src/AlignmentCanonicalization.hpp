@@ -94,7 +94,7 @@ static inline int32_t hifiasm_cal_bw(
 static inline int32_t hifiasm_comput_sc_ch(
     uint32_t posAi, uint32_t posBi,     // Current hit positions
     uint32_t posAj, uint32_t posBj,     // Previous hit positions
-    uint8_t weightI, uint8_t spanI,     // CURRENT hit's weight and span (not previous!)
+    uint32_t weightI, uint8_t spanI,    // CURRENT hit's weight and span (not previous!)
     double bw_rate,                      // Bandwidth rate
     double chn_pen_gap,                  // Gap penalty coefficient
     double chn_pen_skip,                 // Skip penalty coefficient
@@ -120,7 +120,10 @@ static inline int32_t hifiasm_comput_sc_ch(
     // Base score: min(span, dg) normalized by weight
     int32_t q_span = (int32_t)spanI;
     int32_t sc = (q_span < dg) ? q_span : dg;
-    sc = HIFIASM_NORMAL_W(sc, (int32_t)weightI);
+    const int32_t w =
+        (weightI > uint32_t(std::numeric_limits<int32_t>::max())) ?
+        std::numeric_limits<int32_t>::max() : int32_t(weightI);
+    sc = HIFIASM_NORMAL_W(sc, w);
 
     // Apply gap penalty if there are indels or if dg exceeds span
     if (dd > 0 || (dg > q_span && dg > 0)) {
@@ -148,7 +151,7 @@ static inline int32_t hifiasm_comput_sc_ch(
 static inline int32_t hifiasm_comput_sc_ch_ec(
     uint32_t posAi, uint32_t posBi,
     uint32_t posAj, uint32_t posBj,
-    uint8_t weightI, uint8_t spanI,
+    uint32_t weightI, uint8_t spanI,
     double bw_rate,
     double chn_pen_gap,
     double chn_pen_skip,
@@ -170,7 +173,10 @@ static inline int32_t hifiasm_comput_sc_ch_ec(
 
     int32_t q_span = (int32_t)spanI;
     int32_t sc = (q_span < dg) ? q_span : dg;
-    sc = HIFIASM_NORMAL_W(sc, (int32_t)weightI);
+    const int32_t w =
+        (weightI > uint32_t(std::numeric_limits<int32_t>::max())) ?
+        std::numeric_limits<int32_t>::max() : int32_t(weightI);
+    sc = HIFIASM_NORMAL_W(sc, w);
 
     if (dd > 0 || (dg > q_span && dg > 0)) {
         double lin_pen = chn_pen_gap * (double)dd;

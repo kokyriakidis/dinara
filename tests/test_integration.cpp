@@ -4337,11 +4337,12 @@ TEST_CASE("Integration: StringGraph arcs use target forward coordinates with rev
         // Pick values that trigger the qs>tl5 branch in hifiasm's ma_hit2arc for rev=1:
         // Choose values that survive ma_hit_flt internal-fraction checks and still satisfy qs>tl5:
         // tl5 = tl - te = 10, qs = 100 => qs>tl5 and ext5=min(qs,tl5)=10.
+        // Also ensure we do not trigger ma_hit2arc containment checks by keeping ts>0 (tl3=ts).
         AlignmentInfo info;
         info.alignmentId = 0;
         AlignmentData ad(OrientedReadPair(ReadId(0), ReadId(1), false), info);
         ad.qs = 100; ad.qe = 1000;
-        ad.ts = 0;   ad.te = 990;
+        ad.ts = 10;  ad.te = 990;
         fixture.assembler->alignmentData[0] = ad;
 
         fixture.assembler->computeAlignmentTableForTesting();
@@ -4616,6 +4617,69 @@ TEST_CASE("Integration: StringGraph drop-short-overlaps prunes weak overlaps by 
         out0.push_back(arcId);
     }
     CHECK(out0 == std::vector<uint32_t>({0}));
+}
+
+TEST_CASE("Integration: StringGraph ONT weak-arc cutting removes deduplicated weaker arc", "[integration][stringgraph][clean][weak]") {
+    AssemblerIntegrationFixture fixture;
+
+    fixture.createFastq({randomSequence(1000, 801), randomSequence(1000, 802), randomSequence(1000, 803)});
+    fixture.initAssembler();
+    fixture.loadReads();
+
+    withSilencedIoInDir(fixture.testDir, [&] {
+        fixture.assembler->alignmentData.createNew("", 4096);
+        fixture.assembler->alignmentData.resize(3);
+
+        // Build a small pattern:
+        // v=0 has two outgoing arcs: 0->1 (stronger) and 0->2 (weaker).
+        // Additionally, 1 overlaps 2, so 0->2 is "deduplicated" by 0->1 + 1->2.
+        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
+            AlignmentInfo info;
+            info.alignmentId = alignmentId;
+            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
+            ad.qs = len;
+            ad.qe = 1000;
+            ad.ts = 0;
+            ad.te = 1000 - len;
+            fixture.assembler->alignmentData[alignmentId] = ad;
+        };
+        makeAlignment(0, ReadId(0), ReadId(1), 50);   // strong: ol=950
+        makeAlignment(1, ReadId(0), ReadId(2), 200);  // weak:   ol=800
+        makeAlignment(2, ReadId(1), ReadId(2), 50);   // supports dedup
+
+        fixture.assembler->computeAlignmentTableForTesting();
+        std::vector<bool> keep(3, true);
+        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
+
+        // Apply ONT weak-arc cutting with the same parameters used by ul_clean_gfa call site.
+        fixture.assembler->cutStringGraphWeakArcsOntHifiasm(/*maxExtReads*/3, /*lenRatio*/0.975, /*minDiff*/16);
+    });
+
+    // Verify that the weaker arc 0+ -> 2+ is deleted (and its twin).
+    const uint32_t v0 = OrientedReadId(ReadId(0), 0).getValue();
+    const uint32_t v2 = OrientedReadId(ReadId(2), 0).getValue();
+    bool found = false;
+    for (uint64_t arcId = 0; arcId < fixture.assembler->stringGraph.arcs.size(); ++arcId) {
+        const auto& a = fixture.assembler->stringGraph.arcs[arcId];
+        if (a.from == v0 && a.to == v2) {
+            found = true;
+            CHECK(a.del == 1);
+            CHECK(fixture.assembler->stringGraph.arcs[arcId ^ 1U].del == 1);
+        }
+    }
+    REQUIRE(found);
+
+    // Strong arcs remain.
+    const uint32_t v1 = OrientedReadId(ReadId(1), 0).getValue();
+    bool strong01Ok = false;
+    bool support12Ok = false;
+    for (uint64_t arcId = 0; arcId < fixture.assembler->stringGraph.arcs.size(); ++arcId) {
+        const auto& a = fixture.assembler->stringGraph.arcs[arcId];
+        if (a.from == v0 && a.to == v1) strong01Ok |= (a.del == 0);
+        if (a.from == v1 && a.to == v2) support12Ok |= (a.del == 0);
+    }
+    CHECK(strong01Ok);
+    CHECK(support12Ok);
 }
 
 TEST_CASE("Integration: StringGraph breaks simple short cycles", "[integration][stringgraph][clean][cycle]") {

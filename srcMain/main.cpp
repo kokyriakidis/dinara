@@ -622,11 +622,6 @@ void dinara::main::assemble(
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
 
-    // // Filter secondary/redundant alignments per read pair (Hifiasm Parity)
-    // assembler.filterSecondaryAlignmentsPerReadPair(
-    //     threadCount,
-    //     assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
-
     // // =========================================================================
     // // Overlap Filtering + Clean ReadGraph
     // // =========================================================================
@@ -654,6 +649,22 @@ void dinara::main::assemble(
     } else {
         assembler.performHifiasmECParity(threadCount);
     }
+
+    // Hifiasm ONT EC (`--ont`) uses lchain+mcopy and only later collapses duplicate chains per partner
+    // using base-level error statistics (`dedup_chains`, ecovlp.cpp:2984). In Dinara, this situation
+    // arises when we run the inverted-index lchain+mcopy path (invertedIndexUseHifiasmChainDp=false),
+    // which can emit multiple candidates per (readIds[0], readIds[1]).
+    // Deduplicate those now, after alignments and phasing parity have populated mismatch metrics and
+    // DeleteReasonPhase, so we can pick the best one per partner.
+    if(!assemblerOptions.overlapCandidatesOptions.invertedIndexUseHifiasmChainDp) {
+        assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
+    }
+
+    // // After phasing/EC parity sets DeleteReasonPhase, remove per-read-pair redundant overlaps
+    // // among the remaining cis overlaps.
+    // assembler.filterSecondaryAlignmentsPerReadPair(
+    //     threadCount,
+    //     assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
 
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
@@ -1122,7 +1133,7 @@ void dinara::main::assemble(
         2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
-        false,                                           // allowDuplicateMarkers
+        true,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);
@@ -1336,6 +1347,14 @@ void dinara::main::assemble(
 
     // Compute oriented read journeys.
     anchors->computeJourneys(threadCount);
+    const vector<uint64_t> keptAnchors =
+        anchors->writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
+        assembler.readGraph,
+        assembler.alignmentData,
+        threadCount);
+
+    // Recompute journeys using only the anchors selected as best in at least one stable interval.
+    anchors->computeJourneys(threadCount, &keptAnchors);
 
     // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
     assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);

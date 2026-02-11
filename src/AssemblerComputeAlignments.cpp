@@ -515,8 +515,17 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                 }
 
                 // Sort group by score descending.
+                // Hifiasm tie-break when shared_seed ties: prefer smaller overlapLen.
                 sort(group.begin(), group.end(), [](const CandidateInfo& a, const CandidateInfo& b) {
-                    return a.score > b.score;
+                    if(a.score != b.score) {
+                        return a.score > b.score;
+                    }
+                    const uint64_t lenA = a.qe - a.qs;
+                    const uint64_t lenB = b.qe - b.qs;
+                    if(lenA != lenB) {
+                        return lenA < lenB;
+                    }
+                    return a.alignmentId < b.alignmentId;
                 });
 
                 const int64_t bestScore = group[0].score;
@@ -653,6 +662,19 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                 const uint32_t alignmentId = table[tableIndex];
                 const auto& ad = alignmentData[alignmentId];
 
+                // This filter is intended to run after phasing/EC parity:
+                // only consider overlaps that are cis on BOTH reads.
+                // (Trans overlaps already carry DeleteReasonPhase and should not compete for "best" here.)
+                if(!ad.isCisByBothSides()) {
+                    continue;
+                }
+
+                // Skip alignments already deleted for other reasons. We only want to mark *additional*
+                // redundancies among alignments that are still eligible for the graph.
+                if(!ad.keptByBothSides()) {
+                    continue;
+                }
+
                 // Mark self-overlaps as deleted immediately.
                 if(ad.readIds[0] == ad.readIds[1]) {
                     alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
@@ -679,7 +701,11 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
                 // Overlap length on r0.
                 const uint64_t overlapLenOnR0 = uint64_t(ad.qe) - uint64_t(ad.qs);
 
-                const int64_t score = info.hifiasmDpScoreOrApprox(overlapLenOnR0);
+                // Hifiasm keeps the best chain(s) by overlap_region.shared_seed (chaining DP score),
+                // not by a base-level alignment DP score. We use a proxy score derived from the
+                // marker alignment strength (see AlignmentInfo::hifiasmSharedSeedScoreProxy()).
+                (void)overlapLenOnR0;
+                const int64_t score = info.hifiasmSharedSeedScoreProxy();
 
                 // Overlap interval on r0 (forward coordinates).
                 const uint64_t qs = ad.qs;
@@ -696,4 +722,301 @@ void Assembler::filterSecondaryAlignmentsPerReadPairThreadFunction(size_t)
 
     removedSecondaryAlignmentCount += localRemovedCount;
     removedSecondaryAlignmentBySymmetryOnlyCount += localSymmetryOnlyRemovedCount;
+}
+
+
+
+void Assembler::keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount)
+{
+    // For each read pair (r0,r1), multiple alignment chains can exist.
+    // This keeps only the single best-scoring chain (hifiasm shared_seed proxy score),
+    // and deletes the rest as redundant/secondary.
+    //
+    // This is intentionally aggressive. It can remove legitimate alternative placements
+    // (repeats / multi-mapping) and should be used as an experimental clean-up step.
+    const auto tBegin = steady_clock::now();
+    cout << timestamp << "Keeping only best alignment per read pair by DP score begins." << endl;
+
+    removedSecondaryAlignmentCount = 0;
+    removedSecondaryAlignmentBySymmetryOnlyCount = 0;
+
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100); // Batch size heuristic.
+    runThreads(&Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction, threadCount);
+
+    const auto tEnd = steady_clock::now();
+    const double tSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "Keeping only best alignment per read pair by DP score ends in " << tSeconds << " s." << endl;
+    cout << timestamp << "Removed " << removedSecondaryAlignmentCount << " alignments (marked DeleteReasonSecondary)." << endl;
+}
+
+
+
+void Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t)
+{
+    uint64_t begin = 0, end = 0;
+    uint64_t localRemovedCount = 0;
+
+    // Reuse buffers across reads to avoid repeated allocations.
+    struct CandidateInfo {
+        uint32_t alignmentId = 0;
+        int64_t score = 0;
+        ReadId target = invalidReadId;
+        uint64_t overlapLen = 0;
+    };
+    vector<CandidateInfo> group;
+    group.reserve(16);
+
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); r0++) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) {
+                continue;
+            }
+
+            group.clear();
+            ReadId currentTarget = invalidReadId;
+
+            auto flushGroup = [&]() {
+                if(group.size() <= 1) {
+                    return;
+                }
+                // Keep the single best by score.
+                size_t bestIndex = 0;
+                for(size_t i = 1; i < group.size(); ++i) {
+                    if(group[i].score > group[bestIndex].score) {
+                        bestIndex = i;
+                    } else if(group[i].score == group[bestIndex].score && group[i].overlapLen < group[bestIndex].overlapLen) {
+                        // Hifiasm tie-break when shared_seed ties: prefer smaller overlapLen.
+                        bestIndex = i;
+                    }
+                }
+                for(size_t i = 0; i < group.size(); ++i) {
+                    if(i == bestIndex) continue;
+                    alignmentData[group[i].alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
+                    ++localRemovedCount;
+                }
+            };
+
+            // Same canonical prefix skip as filterSecondaryAlignmentsPerReadPair to reduce scanning.
+            size_t firstIndex = 0;
+            {
+                size_t lo = 0;
+                size_t hi = table.size();
+                while(lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const uint32_t alignmentId = table[mid];
+                    const OrientedReadId other = alignmentData[alignmentId].getOther(orientedR0);
+                    if(other < orientedR0) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                firstIndex = lo;
+            }
+
+            for(size_t tableIndex = firstIndex; tableIndex < table.size(); ++tableIndex) {
+                const uint32_t alignmentId = table[tableIndex];
+                const auto& ad = alignmentData[alignmentId];
+
+                // Only consider overlaps that passed phasing (cis on both) and are still eligible.
+                if(!ad.isCisByBothSides()) {
+                    continue;
+                }
+                if(!ad.keptByBothSides()) {
+                    continue;
+                }
+
+                // Mark self-overlaps as deleted immediately.
+                if(ad.readIds[0] == ad.readIds[1]) {
+                    alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
+                    ++localRemovedCount;
+                    continue;
+                }
+
+                // Canonical ordering: only process from the smaller ReadId side.
+                if(ad.readIds[0] != r0) {
+                    continue;
+                }
+                const ReadId target = ad.readIds[1];
+
+                if(target != currentTarget) {
+                    flushGroup();
+                    group.clear();
+                    currentTarget = target;
+                }
+
+                const uint64_t overlapLenOnR0 = uint64_t(ad.qe) - uint64_t(ad.qs);
+                const int64_t score = ad.info.hifiasmSharedSeedScoreProxy();
+                group.push_back(CandidateInfo{alignmentId, score, target, overlapLenOnR0});
+            }
+
+            flushGroup();
+        }
+    }
+
+    removedSecondaryAlignmentCount += localRemovedCount;
+}
+
+
+
+void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLike(uint64_t threadCount)
+{
+    // Hifiasm reference: ecovlp.cpp:2984 `dedup_chains(overlap_region_alloc* ol)`
+    //
+    // In the ONT EC pipeline, hifiasm can keep multiple overlap_region entries for the same
+    // (query rid, partner y_id) after lchain+mcopy and base-level refinement/phasing.
+    // It then collapses them to a single best overlap per partner using:
+    //   1) prefer cis over trans (smaller is_match)
+    //   2) maximize (spanOnQuery - 12 * non_homopolymer_errors)
+    //   3) tie-break by longer span
+    //
+    // Dinara's inverted-index lchain+mcopy path can also produce multiple candidates per partner.
+    // We don't have hifiasm's `non_homopolymer_errors`; in Dinara the reads are typically stored
+    // in run-length representation (RLE), so raw mismatchCount is a reasonable proxy for the
+    // non-homopolymer error term hifiasm uses.
+    //
+    // This function runs after computeAlignmentsWithEvidence and after performHifiasmECParity
+    // (so DeleteReasonPhase already reflects cis/trans decisions). It marks all but the best
+    // alignment per partner as `DeleteReasonSecondary`.
+
+    const auto tBegin = steady_clock::now();
+    cout << timestamp << "ONT-style dedup (one overlap per partner) begins." << endl;
+
+    removedOntDeduplicatedChainCount = 0;
+
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100); // Same heuristic as other per-read filters.
+    runThreads(&Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction, threadCount);
+
+    const auto tEnd = steady_clock::now();
+    const double tSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "ONT-style dedup ends in " << tSeconds << " s. Removed "
+         << removedOntDeduplicatedChainCount.load() << " redundant overlaps (marked DeleteReasonSecondary)." << endl;
+}
+
+
+
+void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size_t)
+{
+    uint64_t begin = 0, end = 0;
+    uint64_t localRemoved = 0;
+
+    struct CandidateInfo {
+        uint32_t alignmentId = 0;
+        ReadId partner = invalidReadId;
+        uint32_t mismatchCount = 0;
+        uint32_t span = 0;
+        uint8_t isMatchRank = 2; // 1=cis, 2=trans (matches hifiasm preference for smaller is_match)
+        int64_t score = std::numeric_limits<int64_t>::min();
+    };
+    vector<CandidateInfo> group;
+    group.reserve(8);
+
+    auto flushGroup = [&]() {
+        if(group.size() <= 1) {
+            return;
+        }
+
+        // Pick the best entry according to hifiasm's dedup_chains ordering, using mismatchCount as proxy.
+        size_t best = 0;
+        for(size_t i = 1; i < group.size(); ++i) {
+            const auto& a = group[i];
+            const auto& b = group[best];
+            if(a.isMatchRank != b.isMatchRank) {
+                if(a.isMatchRank < b.isMatchRank) best = i;
+                continue;
+            }
+            if(a.score != b.score) {
+                if(a.score > b.score) best = i;
+                continue;
+            }
+            if(a.span != b.span) {
+                if(a.span > b.span) best = i;
+                continue;
+            }
+            if(a.alignmentId < b.alignmentId) {
+                best = i;
+            }
+        }
+
+        for(size_t i = 0; i < group.size(); ++i) {
+            if(i == best) continue;
+            alignmentData[group[i].alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonSecondary);
+            ++localRemoved;
+        }
+    };
+
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); ++r0) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) {
+                continue;
+            }
+
+            group.clear();
+            ReadId currentPartner = invalidReadId;
+
+            // Skip prefix where partner oriented read id < orientedR0 to reduce scanning.
+            size_t firstIndex = 0;
+            {
+                size_t lo = 0;
+                size_t hi = table.size();
+                while(lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const uint32_t alignmentId = table[mid];
+                    const OrientedReadId other = alignmentData[alignmentId].getOther(orientedR0);
+                    if(other < orientedR0) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                firstIndex = lo;
+            }
+
+            for(size_t tableIndex = firstIndex; tableIndex < table.size(); ++tableIndex) {
+                const uint32_t alignmentId = table[tableIndex];
+                const auto& ad = alignmentData[alignmentId];
+
+                // Canonical ordering: only process groups where r0 is readIds[0]
+                // so ad.qs/qe represent span on this query read.
+                if(ad.readIds[0] != r0) {
+                    continue;
+                }
+                const ReadId partner = ad.readIds[1];
+
+                // Match hifiasm's ONT behavior more closely: dedup is done after phasing marks
+                // cis/trans (is_match), but before overlaps are hard-removed from the local list.
+                // Therefore we allow overlaps that are phase-deleted (trans) to participate,
+                // but we skip overlaps that already carry any OTHER deletion reason.
+                const auto nonPhase0 = ad.deleteReasons0 & ~AlignmentData::DeleteReasonPhase;
+                const auto nonPhase1 = ad.deleteReasons1 & ~AlignmentData::DeleteReasonPhase;
+                if(nonPhase0 != AlignmentData::DeleteReasonNone ||
+                   nonPhase1 != AlignmentData::DeleteReasonNone) {
+                    continue;
+                }
+
+                if(partner != currentPartner) {
+                    flushGroup();
+                    group.clear();
+                    currentPartner = partner;
+                }
+
+                const uint32_t span = ad.qe - ad.qs;
+                const uint32_t mism = (ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount;
+                const bool isCisFromQuery = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
+                const uint8_t isMatchRank = isCisFromQuery ? uint8_t(1) : uint8_t(2);
+                const int64_t score = int64_t(span) - 12 * int64_t(mism);
+                group.push_back(CandidateInfo{alignmentId, partner, mism, span, isMatchRank, score});
+            }
+
+            flushGroup();
+        }
+    }
+
+    removedOntDeduplicatedChainCount += localRemoved;
 }

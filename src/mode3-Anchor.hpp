@@ -14,9 +14,11 @@
 #include <boost/property_tree/ptree_fwd.hpp>
 
 // Standard library.
+#include <atomic>
 #include "cstdint.hpp"
 #include "memory.hpp"
 #include "span.hpp"
+#include "vector.hpp"
 
 
 
@@ -27,6 +29,8 @@ namespace dinara {
     class MarkerGraph;
     class MarkerInterval;
     class Reads;
+    class ReadGraph;
+    class AlignmentData;
 
 
     // The main input to mode 3 assembly is a set of anchors.
@@ -107,7 +111,7 @@ public:
 
 
 
-class dinara::mode3::Anchors :
+    class dinara::mode3::Anchors :
     public MultithreadedObject<Anchors>,
     public MappedMemoryOwner {
 public:
@@ -245,18 +249,68 @@ public:
     // The journey of each oriented read is the sequence of AnchorIds
     // encountered by the oriented read.
     MemoryMapped::VectorOfVectors<AnchorId, uint64_t> journeys;
-    void computeJourneys(uint64_t threadCount);
+    // Recompute oriented-read journeys. If keepAnchorWords is non-null, only
+    // anchors with their bit set are included in journeys (global filter).
+    // keepAnchorWords is a bitset indexed by AnchorId: word = id/64, bit = id%64.
+    void computeJourneys(uint64_t threadCount, const vector<uint64_t>* keepAnchorWords = nullptr);
     void writeJourneys() const;
     void writeAnchorGapsByRead() const;
-private:
-    void computeJourneysThreadFunction1(uint64_t threadId);
-    void computeJourneysThreadFunction2(uint64_t threadId);
-    void computeJourneysThreadFunction12(uint64_t pass);
-    void computeJourneysThreadFunction3(uint64_t threadId);
-    void computeJourneysThreadFunction4(uint64_t threadId);
+    void writeJourneyEndpoints() const;
 
-    // Temporary storage of journeys with ordinals.
-    MemoryMapped::VectorOfVectors<pair<uint64_t, uint32_t>, uint64_t> journeysWithOrdinals;
+    // Post-process journeys using readGraph overlaps:
+    // For each oriented read, build stable overlap intervals (segments where the
+    // active overlap set does not change), then within each segment choose the
+    // anchor on the journey that best matches the overlap set: cover as many
+    // overlapping oriented reads as possible while minimizing extra unrelated reads.
+    // Output is written as a CSV report.
+    void writeStableOverlapIntervalsBestAnchors(
+        const ReadGraph& readGraph,
+        const MemoryMapped::Vector<AlignmentData>& alignmentData,
+        uint64_t threadCount,
+        const string& outCsvName = "StableOverlapIntervalsBestAnchors.csv",
+        bool strand0Only = true,
+        uint32_t minIntervalLength = 0);
+
+    // Like writeStableOverlapIntervalsBestAnchors, but also returns a bitset
+    // of globally-kept anchors (union of all chosen anchors across all intervals).
+    // If keepReverseComplementPairs is true, selecting anchorId also keeps (anchorId^1).
+    vector<uint64_t> writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
+        const ReadGraph& readGraph,
+        const MemoryMapped::Vector<AlignmentData>& alignmentData,
+        uint64_t threadCount,
+        const string& outCsvName = "StableOverlapIntervalsBestAnchors.csv",
+        bool strand0Only = true,
+        uint32_t minIntervalLength = 0,
+        bool keepReverseComplementPairs = true);
+	private:
+	    void computeJourneysThreadFunction1(uint64_t threadId);
+	    void computeJourneysThreadFunction2(uint64_t threadId);
+	    void computeJourneysThreadFunction12(uint64_t pass);
+	    void computeJourneysThreadFunction3(uint64_t threadId);
+	    void computeJourneysThreadFunction4(uint64_t threadId);
+        void resetPositionInJourneyThreadFunction(uint64_t threadId);
+
+        class JourneyAnchorFilterData {
+        public:
+            const vector<uint64_t>* keepAnchorWords = nullptr;
+        };
+        JourneyAnchorFilterData journeyAnchorFilterData;
+
+	    class StableOverlapIntervalsBestAnchorsData {
+	    public:
+	        const ReadGraph* readGraph = nullptr;
+	        const MemoryMapped::Vector<AlignmentData>* alignmentData = nullptr;
+	        string outCsvName;
+	        bool strand0Only = true;
+	        uint32_t minIntervalLength = 0;
+	        vector<string> threadFileNames;
+            vector<std::atomic<uint64_t>>* keepAnchorWords = nullptr;
+	    };
+	    StableOverlapIntervalsBestAnchorsData stableOverlapIntervalsBestAnchorsData;
+	    void writeStableOverlapIntervalsBestAnchorsThreadFunction(uint64_t threadId);
+
+	    // Temporary storage of journeys with ordinals.
+	    MemoryMapped::VectorOfVectors<pair<uint64_t, uint32_t>, uint64_t> journeysWithOrdinals;
 
     void check() const;
 
