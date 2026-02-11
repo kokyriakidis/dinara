@@ -9,6 +9,35 @@ means we match hifiasm’s decision structure and state transitions using Dinara
 alignment-derived evidence streams instead of hifiasm’s overlap_region_alloc and internal
 haplotype_evdience lists.
 
+IMPORTANT: HIFIASM's ONT PATH ACTUALLY USES QV
+  In hifiasm, the ONT mode (--ont) sets is_sc=1, which means base-quality arrays
+  are loaded and the qv parameter passed to gen_rphase_dp is non-NULL. This causes
+  gen_rphase_dp0_single_path to take the QV branch (using get_hq_value scoring).
+  Dinara deliberately omits QV scoring and instead adapts the no-QV branch logic,
+  supplemented with select hardening features borrowed from the QV branch (notably
+  the +8bp consecutive-site demotion). See the detailed note at +8bp demotion below.
+
+HIFIASM ONT EC CALL CHAIN (Correct.cpp, v0.25.0-r726):
+  ecovlp.cpp:3301 -> rphase_hc(... std_bs=is_ont=1, dp=&chainDP, q8=&v8q ...)
+    +-- Correct.cpp:20191  rphase_hc()        ONT entry point
+         |-- push_info()                      SNP row emission (occ_0, occ_1, overlap_num)
+         |-- gen_rphase_dp(... st_rate=0.05, st_max=2, qv=q8 ...)
+         |    |-- Site QV filtering            (qv != NULL -> QV branch)
+         |    |-- fill_incom()                 Fill incomplete overlap evidence
+         |    +-- gen_rphase_dp0_single_path(... qual_a=qv->a ...)
+         |         |-- DP transitions          comput_sc_rphase
+         |         |-- Path extraction          Greedy by descending f[]
+         |         +-- Path scoring             QV branch: get_hq_value + +8bp demotion
+         |                                    no-QV branch: HP masking + cc threshold
+         |                                    (Dinara uses no-QV + borrowed +8bp demotion)
+         |-- Post-DP compaction               Keep score==1, recount occ_0/overlap_num
+         |-- generate_haplotypes_naive_HiFi(... multi_check=0, st_rate=0.05, st_max=2 ...)
+         |    |-- Adjacent site filter          Remove distance-1 sites
+         |    |-- Two-pass trans-closure        Seed -> propagate via is_st_bs
+         |    +-- Final trans marking           is_st_bs gated
+         |-- rphase_lidel()                   (not implemented in Dinara)
+         +-- generate_haplotypes_sv()         SV-based trans marking (no is_st_bs)
+
 Per query read, the pipeline is:
 
   (A) Candidate gathering
@@ -1446,14 +1475,52 @@ static void gen_rphase_dp(
     }
 
     /*
-    Step 3: DP chaining and per-row scoring.
+    =============================================================================
+    Step 3: DP Chaining and Per-Row Scoring (gen_rphase_dp parity)
+    =============================================================================
 
-    At this point we have bit-matrices that allow O(nWords) linkage tests between any pair of SNP
-    rows. We now:
-      - select which rows are eligible for DP (must already be “real alleles”: >=s_hap_cov/infor_cov)
-      - run DP transitions using comput_sc_rphase_strict
-      - extract disjoint best paths and assign per-row score
-      - finally compact to score==1 rows and reset score semantics for trans-closure
+    PURPOSE:
+      Chain validated SNP rows into phased haplotype paths using dynamic programming,
+      then assign per-row acceptance scores. This corresponds to hifiasm's
+      gen_rphase_dp -> gen_rphase_dp0_single_path pipeline.
+
+    AT THIS POINT WE HAVE:
+      - snpStats[]: SNP rows from detectHetSites (push_info-like emission)
+      - flatBits[]: Bit-matrices encoding per-overlap ref/alt/any allele observations
+        that allow O(nWords) linkage tests between any pair of SNP rows
+
+    WHAT THIS STEP DOES:
+      1. Select eligible rows ("real alleles"): occ_0 >= s_hap_cov AND occ_1 >= infor_cov,
+         with is_st_bs strand-bias filtering for ONT
+      2. Run DP transitions using comput_sc_rphase_strict (bit-parallel linkage)
+      3. Extract disjoint best paths via greedy extraction by descending f[]
+      4. Score paths: multi-site auto-accept, singleton HP+cc validation
+      5. Consecutive-position contamination check (from QV branch): if any node in a
+         run of adjacent-bp sites was rejected, reject the entire run
+      6. Compact to score==1 rows and reset score semantics for trans-closure
+
+    HIFIASM NO-QV vs QV BRANCH:
+      In hifiasm, gen_rphase_dp0_single_path has two branches controlled by the
+      qual_a parameter (Correct.cpp ~line 9472):
+
+      if(!qual_a) {   <-- NO-QV BRANCH (Dinara's primary model)
+        Multi-site chains: auto-accept (plus=1)
+        Singletons: require !is_hpc_vec && occ_0>=cc
+        No +8bp demotion check
+
+      } else {        <-- QV BRANCH (hifiasm's actual ONT path, since is_sc=1 -> qv!=NULL)
+        Uses get_hq_value() to split base-quality into b0l/b0h, b1l/b1h
+        Has +8bp consecutive-site demotion (krn=1 if all gaps <= 8bp)
+        Multi-site chains: per-node QV scoring
+        Singletons/demoted: stricter QV + 70% confidence + cc threshold
+        Consecutive-position contamination check on QV-scored runs
+
+      Dinara uses the no-QV branch structure but BORROWS two elements from
+      the QV branch as hardening measures:
+        1. +8bp consecutive-site demotion (see detailed note below)
+        2. Consecutive-position contamination check: if any node in a run of
+           adjacent-position sites (gap==1bp) was rejected, all nodes in the
+           run are forced to rejected. See detailed note below.
     */
     const uint32_t s_hap_cov = 3;
     const uint32_t infor_cov = 3;
@@ -1504,7 +1571,32 @@ static void gen_rphase_dp(
     SNP rows are created in detectHetSites when occ_1>=2 (push_info-like emission), but hifiasm
     only feeds “real allele” rows into DP: both alleles must meet s_hap_cov/infor_cov (default 3/3).
     */
+    /*
+    ONT strand-bias constants for is_st_bs filtering (hifiasm parity).
+
+    Hifiasm's is_st_bs macro rejects sites where ref support is extremely strand-biased:
+      #define is_st_bs(s, rr, mm) (((mm) != ((uint64_t)-1)) &&
+            (((s).overlap_num + mm) >= ((s).occ_0)) &&
+            ((((s).occ_0*(rr) + (s).overlap_num)) >= ((s).occ_0)))
+
+    For ONT (std_bs=1): st_rate=0.05, st_max=2
+    For HiFi (std_bs=0): st_rate=0.0, st_max=(uint64_t)-1 (disabled)
+
+    Dinara maps: fwd_ref_cov ↔ hifiasm overlap_num (forward-strand ref count + 1 for query)
+    */
+    constexpr double st_rate = 0.05;
+    constexpr uint64_t st_max = 2;
+
+    auto isStrandBiased = [](const SnpStats& s, double stRate, uint64_t stMax) -> bool {
+        if (stMax == UINT64_MAX) return false;
+        if (uint64_t(s.fwd_ref_cov) + stMax < uint64_t(s.occ_0)) return false;
+        if (double(s.occ_0) * stRate + double(s.fwd_ref_cov) < double(s.occ_0)) return false;
+        return true;
+    };
+
     for (size_t i = 0; i < nSites; ++i) {
+        if (snpStats[i].occ_0 < 2 || snpStats[i].occ_1 < 2) { snpStats[i].score = -1; continue; }
+        if (isStrandBiased(snpStats[i], st_rate, st_max)) { snpStats[i].score = -1; continue; }
         if (snpStats[i].occ_0 >= s_hap_cov && snpStats[i].occ_1 >= infor_cov) {
             validIndices.push_back((int)i);
         }
@@ -1785,91 +1877,284 @@ static void gen_rphase_dp(
           Multi-site paths don't need this check because phasing across positions provides
           strong evidence independent of HP-specific artifacts.
         */
-        int plus = -1;
-        if (pathNodes.size() > 1) {
-            // Multi-site path: always accepted
-            plus = 1;
-        } else if (pathNodes.size() == 1) {
-            // Singleton path: require coverage threshold + HP robustness
-            const int siteV = validIndices[pathNodes[0]];
-            if (snpStats[siteV].occ_0 >= cc) {
-                bool hpMasked = false;
-                {
-                    const uint32_t querySite = snpStats[siteV].site;
-                    const uint64_t* rowBits = &flatBits[siteV * 2 * nWords];
+        /*
+        Lambda: Check if overlap is gapped at this site (binary search).
+        Defined once, reused for all singleton and demoted-chain node evaluations.
+        */
+        auto isGappedAtSite = [&](size_t candIdx, uint32_t sitePos) -> bool {
+            if (!haveInsertionHoles) return false;
+            const uint32_t offBegin = scratch.insertionOffsets[candIdx];
+            const uint32_t offEnd = scratch.insertionOffsets[candIdx + 1];
+            if (offBegin >= offEnd) return false;
+            const auto* beginIt = scratch.insertionIntervals.data() + offBegin;
+            const auto* endIt = scratch.insertionIntervals.data() + offEnd;
+            auto it = std::upper_bound(
+                beginIt, endIt, sitePos,
+                [](uint32_t value, const HifiasmECScratchPad::GapInterval& iv) { return value < iv.begin; }
+            );
+            if (it == beginIt) return false;
+            --it;
+            return (it->begin <= sitePos && sitePos < it->end);
+        };
 
-                    // Lambda: Check if overlap is gapped at this site (binary search)
-                    auto isGappedAtSite = [&](size_t candIdx, uint32_t sitePos) -> bool {
-                        if (!haveInsertionHoles) return false;
-                        const uint32_t offBegin = scratch.insertionOffsets[candIdx];
-                        const uint32_t offEnd = scratch.insertionOffsets[candIdx + 1];
-                        if (offBegin >= offEnd) return false;
-                        const auto* beginIt = scratch.insertionIntervals.data() + offBegin;
-                        const auto* endIt = scratch.insertionIntervals.data() + offEnd;
-                        auto it = std::upper_bound(
-                            beginIt, endIt, sitePos,
-                            [](uint32_t value, const HifiasmECScratchPad::GapInterval& iv) { return value < iv.begin; }
-                        );
-                        if (it == beginIt) return false;
-                        --it;
-                        return (it->begin <= sitePos && sitePos < it->end);
-                    };
+        /*
+        Lambda: Per-node singleton HP-masking check.
+        Returns true if the node should be REJECTED (HP-masked).
+        This is the no-QV equivalent of hifiasm's is_hpc_vec check:
+        discount target-side HP-suspect observations and re-check thresholds.
+        */
+        auto isNodeHpMasked = [&](int siteIdx) -> bool {
+            const uint32_t querySite = snpStats[siteIdx].site;
+            const uint64_t* rowBits = &flatBits[siteIdx * 2 * nWords];
 
-                    // Count HP-suspect observations on target side
-                    uint64_t hpRef = 0, hpAlt = 0;
-                    for (size_t candIdx = 0; candIdx < nCands; ++candIdx) {
-                        const auto& cand = candidates[candIdx];
+            uint64_t hpRef = 0, hpAlt = 0;
+            for (size_t candIdx = 0; candIdx < nCands; ++candIdx) {
+                const auto& cand = candidates[candIdx];
+                if (querySite < cand.qs || querySite >= cand.qe) continue;
+                if (isGappedAtSite(candIdx, querySite)) continue;
 
-                        // Skip if overlap doesn't cover this site
-                        if (querySite < cand.qs || querySite >= cand.qe) continue;
-
-                        // Skip if overlap is gapped at this site (no aligned base)
-                        if (isGappedAtSite(candIdx, querySite)) continue;
-
-                        // Map query coordinate to target coordinate with overflow/underflow protection
-                        const uint64_t queryOffset = uint64_t(querySite) - cand.qs;
-                        uint64_t targetSite64;
-                        if (cand.isRev) {
-                            // Reverse overlap: count from end, check underflow
-                            if (cand.te <= queryOffset) continue;  // Prevent underflow
-                            targetSite64 = cand.te - queryOffset - 1;
-                        } else {
-                            // Forward overlap: offset from start
-                            targetSite64 = cand.ts + queryOffset;
-                        }
-
-                        // Bounds check in uint64_t space BEFORE casting
-                        const auto& view = assembler.getReads().getRead(cand.targetId);
-                        if (targetSite64 >= view.baseCount) continue;
-
-                        // Safe to cast now that we know it's in bounds
-                        const uint32_t targetSite = (uint32_t)targetSite64;
-
-                        // Check if target position is in a homopolymer run
-                        if (!hpc_mask_ff(view, (int64_t)view.baseCount, targetSite)) continue;
-
-                        // Count HP-suspect observations by allele state
-                        const size_t w = candIdx >> 6;
-                        const uint64_t mask = 1ULL << (candIdx & 63);
-                        hpRef += __builtin_popcountll(rowBits[2 * w] & mask);
-                        hpAlt += __builtin_popcountll(rowBits[2 * w + 1] & mask);
-                    }
-
-                    // Compute robust counts after discounting HP-suspect observations
-                    const uint32_t n0_robust = (snpStats[siteV].occ_0 >= hpRef) ? (uint32_t)(snpStats[siteV].occ_0 - hpRef) : 0;
-                    const uint32_t n1_robust = (snpStats[siteV].occ_1 >= hpAlt) ? (uint32_t)(snpStats[siteV].occ_1 - hpAlt) : 0;
-
-                    // Reject if robust counts fall below thresholds
-                    hpMasked = (n0_robust < 2 || n1_robust < 2 || n0_robust < s_hap_cov || n1_robust < infor_cov);
+                const uint64_t queryOffset = uint64_t(querySite) - cand.qs;
+                uint64_t targetSite64;
+                if (cand.isRev) {
+                    if (cand.te <= queryOffset) continue;
+                    targetSite64 = cand.te - queryOffset - 1;
+                } else {
+                    targetSite64 = cand.ts + queryOffset;
                 }
-                // Accept singleton only if NOT HP-masked
-                if (!hpMasked) plus = 1;
+
+                const auto& view = assembler.getReads().getRead(cand.targetId);
+                if (targetSite64 >= view.baseCount) continue;
+                const uint32_t targetSite = (uint32_t)targetSite64;
+
+                if (!hpc_mask_ff(view, (int64_t)view.baseCount, targetSite)) continue;
+
+                const size_t w = candIdx >> 6;
+                const uint64_t mask = 1ULL << (candIdx & 63);
+                hpRef += __builtin_popcountll(rowBits[2 * w] & mask);
+                hpAlt += __builtin_popcountll(rowBits[2 * w + 1] & mask);
+            }
+
+            const uint32_t n0_robust = (snpStats[siteIdx].occ_0 >= hpRef) ? (uint32_t)(snpStats[siteIdx].occ_0 - hpRef) : 0;
+            const uint32_t n1_robust = (snpStats[siteIdx].occ_1 >= hpAlt) ? (uint32_t)(snpStats[siteIdx].occ_1 - hpAlt) : 0;
+
+            return (n0_robust < 2 || n1_robust < 2 || n0_robust < s_hap_cov || n1_robust < infor_cov);
+        };
+
+        /*
+        =====================================================================================
+        +8BP CONSECUTIVE-SITE DEMOTION — DELIBERATELY BORROWED FROM HIFIASM'S QV BRANCH
+        =====================================================================================
+
+        WHAT THIS DOES:
+          If ALL consecutive sites in a multi-site DP chain are within +8bp of each
+          other, the entire chain is "demoted" to singleton-level validation. Instead
+          of auto-accepting (plus=1), each node must independently pass the singleton
+          HP-masking + cc-threshold checks.
+
+        WHERE THIS COMES FROM IN HIFIASM:
+          This logic exists ONLY in hifiasm's QV branch of gen_rphase_dp0_single_path
+          (Correct.cpp ~line 9554-9555):
+
+            for (i = 1; (i < rn) && ((a[res->a[rn0+i]].site+8) >= a[res->a[rn0+i-1]].site); i++);
+            if(i >= rn) krn = 1;  // demote: treat as singleton-length chain
+
+          The no-QV branch (Correct.cpp ~line 9480-9510) does NOT have this check.
+          It simply auto-accepts all multi-site chains unconditionally (plus=1).
+
+        WHY DINARA INCLUDES IT DESPITE USING THE NO-QV BRANCH:
+          Hifiasm's real ONT path (is_sc=1 → qv!=NULL) takes the QV branch, which
+          DOES have this demotion. Since Dinara omits per-base QV scoring entirely,
+          borrowing the +8bp demotion provides a useful safeguard: it prevents
+          tightly clustered sequencing noise (common in ONT homopolymer regions)
+          from being auto-accepted as a multi-site chain, without requiring the
+          full QV scoring machinery.
+
+          In effect, this makes Dinara's no-QV adaptation MORE conservative than
+          the pure no-QV branch and CLOSER to the behavior of hifiasm's actual ONT
+          code path (the QV branch), which is the desired outcome.
+
+        ALGORITHM:
+          pathNodes are stored in extraction order (end→start of the chain), so
+          pathNodes[0] has the highest site position and pathNodes[N-1] the lowest.
+          We check: for every consecutive pair, is siteCur + 8 >= sitePrev?
+          If ALL pairs satisfy this, every gap is ≤ 8bp → demote.
+          If ANY pair has a gap > 8bp, the chain has real spread → keep as multi-site.
+
+        DEMOTION EFFECT:
+          Demoted chains go through the singleton validation path below, where each
+          node is independently checked:
+            - Coverage: occ_0 >= cc
+            - HP robustness: !isNodeHpMasked (target-side HP discounting)
+          This is much stricter than the auto-accept that multi-site chains get.
+        */
+        bool demotedToSingleton = false;
+        if (pathNodes.size() > 1) {
+            demotedToSingleton = true;
+            for (size_t pi = 1; pi < pathNodes.size(); ++pi) {
+                const uint32_t siteCur = snpStats[validIndices[pathNodes[pi]]].site;
+                const uint32_t sitePrev = snpStats[validIndices[pathNodes[pi - 1]]].site;
+                // pathNodes are end→start, so sitePrev >= siteCur; check gap <= 8
+                if (siteCur + 8 < sitePrev) {
+                    demotedToSingleton = false;
+                    break;
+                }
             }
         }
 
-        for (int v : pathNodes) {
-            const int snpIdx = validIndices[v];
-            snpStats[snpIdx].score = (snpStats[snpIdx].occ_0 >= cc) ? plus : -1;
+        if (pathNodes.size() > 1 && !demotedToSingleton) {
+            /*
+            TRUE MULTI-SITE PATH — AUTO-ACCEPT (hifiasm no-QV: plus=1)
+
+            Hifiasm reference (Correct.cpp ~line 9482):
+              if(rn > 1) { plus = 1; }   ← unconditional accept for multi-site
+
+            Then per-node (Correct.cpp ~line 9509):
+              if(a[...].occ_0 >= cc) { score = plus; } else { score = -1; }
+
+            So even within an accepted multi-site chain, individual nodes that
+            don't meet the cc coverage threshold are still rejected. This prevents
+            weak nodes from riding the coattails of strong chains.
+            */
+            for (int v : pathNodes) {
+                const int snpIdx = validIndices[v];
+                snpStats[snpIdx].score = (snpStats[snpIdx].occ_0 >= cc) ? 1 : -1;
+            }
+        } else {
+            /*
+            SINGLETON OR DEMOTED CHAIN — PER-NODE VALIDATION
+
+            Hifiasm no-QV reference (Correct.cpp ~line 9490-9493):
+              if(rn == 1) {
+                if((!is_hpc_vec(&(a[...]), ...)) && (a[...].occ_0 >= cc)) plus = 1;
+              }
+
+            Two conditions must BOTH be met for acceptance:
+              1. Coverage threshold:  occ_0 >= cc
+                 cc = max(hom_cov/n_hap * cut_rate, cut_bd)
+                 Typically 6-12 depending on sequencing depth.
+
+              2. HP robustness:  !isNodeHpMasked()
+                 Discount target-side homopolymer-suspect observations and
+                 re-check that robust counts still exceed thresholds
+                 (n0_robust >= s_hap_cov=3 AND n1_robust >= infor_cov=3).
+                 This is the no-QV equivalent of hifiasm's is_hpc_vec.
+
+            For demoted chains (all sites within +8bp, see demotion note above),
+            each node goes through this same validation independently. This is
+            stricter than the QV branch's demotion behavior (which uses QV-based
+            scoring), but provides a reasonable conservative approximation.
+            */
+            for (int v : pathNodes) {
+                const int siteV = validIndices[v];
+                int nodeScore = -1;
+                if (snpStats[siteV].occ_0 >= cc) {
+                    if (!isNodeHpMasked(siteV)) {
+                        nodeScore = 1;
+                    }
+                }
+                snpStats[siteV].score = nodeScore;
+            }
+        }
+
+        /*
+        =====================================================================================
+        CONSECUTIVE-POSITION CONTAMINATION CHECK — BORROWED FROM HIFIASM'S QV BRANCH
+        =====================================================================================
+
+        WHAT THIS DOES:
+          After scoring all nodes in the extracted path (whether multi-site, demoted,
+          or singleton), scan for runs of consecutive genomic positions (gap == 1bp)
+          within the path. If ANY node in a consecutive run was rejected (score == -1),
+          ALL nodes in that run are forced to score == -1.
+
+        WHERE THIS COMES FROM IN HIFIASM:
+          This logic lives in the QV branch of gen_rphase_dp0_single_path
+          (Correct.cpp ~lines 9579-9591), immediately after per-node QV scoring:
+
+            for (i = j = 0; i < rn; i = j) {
+                plus = a[res->a[rn0 + i]].score;
+                for (j = i + 1; (j < rn) && ((site[i] - site[j]) == (j - i)); j++) {
+                    if(a[res->a[rn0 + j]].score == -1) plus = -1;
+                }
+                if(plus == -1) { for (; i < j; i++) a[res->a[rn0+i]].score = plus; }
+            }
+
+          It applies ONLY in the QV branch (else clause of `if(!qual_a)`).
+          The no-QV branch that Dinara primarily follows does NOT have this check.
+
+        WHY DINARA INCLUDES IT:
+          Hifiasm's real ONT path (is_sc=1 → qv!=NULL) takes the QV branch, which
+          DOES apply this contamination check. Since Dinara adapts the no-QV
+          branch structure, borrowing this check provides a useful safeguard:
+
+          Adjacent-base-position SNPs (gap == 1bp) are highly suspicious for
+          systematic ONT sequencing artifacts, especially around homopolymer
+          boundaries. If one site in a consecutive run fails validation (HP
+          masking, coverage threshold, or QV scoring in hifiasm's case), the
+          neighboring sites at adjacent positions are very likely to be artifacts
+          of the same underlying sequencing error.
+
+          This check requires NO quality values — it is pure structural logic
+          operating on position coordinates and previously-assigned scores.
+
+        ALGORITHM:
+          pathNodes are stored in extraction order (end→start), so pathNodes[0]
+          has the highest site position and pathNodes[N-1] the lowest.
+          Sites are in DESCENDING order within pathNodes.
+
+          We scan pathNodes sequentially, grouping runs where:
+            site[pathNodes[i]] - site[pathNodes[j]] == (j - i)
+          i.e., each successive path node has a site exactly 1bp lower.
+
+          Within each such consecutive run:
+            - If ANY member has score == -1, set ALL members to score == -1
+            - If all members have score == 1, leave them unchanged
+
+          This matches hifiasm's exact semantics: the outer loop advances by
+          runs (i = j after each run), and the inner loop extends j while the
+          gap is exactly 1bp per step.
+
+        EXAMPLE:
+          Path nodes with sites: [105, 104, 103, 100, 50]
+                                  ^^^^^^^^^^^  ^^^  ^^
+                                  run1 (gap=1) |    singleton
+                                               singleton
+
+          If site 104 has score==-1 but 105 and 103 have score==1:
+            → All three (105, 104, 103) get score = -1
+          Site 100 and 50 are unaffected (not part of a consecutive run).
+
+        APPLICABILITY:
+          This check applies to ALL path types:
+          - Multi-site chains: nodes scored via auto-accept + cc gate
+          - Demoted chains (+8bp): nodes scored via singleton HP validation
+          - True singletons: only 1 node, so no consecutive run possible
+          For singletons, pathNodes.size()==1 means the outer loop runs once
+          with a run of length 1, which is a no-op.
+
+        PERFORMANCE:
+          O(pathNodes.size()) per path — negligible cost.
+        */
+        if (pathNodes.size() > 1) {
+            for (size_t pi = 0, pj = 0; pi < pathNodes.size(); pi = pj) {
+                const uint32_t siteI = snpStats[validIndices[pathNodes[pi]]].site;
+                bool anyRejected = (snpStats[validIndices[pathNodes[pi]]].score == -1);
+
+                // Extend run: each next node must have site exactly 1bp lower
+                for (pj = pi + 1; pj < pathNodes.size(); ++pj) {
+                    const uint32_t siteJ = snpStats[validIndices[pathNodes[pj]]].site;
+                    // pathNodes are descending, so siteI > siteJ for consecutive
+                    if (siteI - siteJ != (uint32_t)(pj - pi)) break;
+                    if (snpStats[validIndices[pathNodes[pj]]].score == -1) anyRejected = true;
+                }
+
+                // If any member of the consecutive run was rejected, reject all
+                if (anyRejected) {
+                    for (size_t pk = pi; pk < pj; ++pk) {
+                        snpStats[validIndices[pathNodes[pk]]].score = -1;
+                    }
+                }
+            }
         }
     }
     if (timing) {
@@ -2118,7 +2403,33 @@ static void generate_haplotypes_naive_HiFi(
     constexpr uint32_t multi_check_distance = 32;
     constexpr uint64_t up_num = 4;
     constexpr uint64_t up_den = 100;
-    constexpr bool enable_multi_check = true;
+    /*
+    Hifiasm disables multi_check for the ONT path (multi_check=0 in rphase_hc when std_bs=1).
+    Multi_check is a HiFi-specific recovery mechanism for dense weak heterozygous patterns;
+    it is not used in the ONT error-correction pipeline.
+    */
+    constexpr bool enable_multi_check = false;
+
+    /*
+    ONT strand-bias constants for is_st_bs filtering (hifiasm parity).
+
+    Hifiasm's is_st_bs macro rejects sites where ref support is extremely strand-biased:
+      #define is_st_bs(s, rr, mm) (((mm) != ((uint64_t)-1)) &&
+            (((s).overlap_num + mm) >= ((s).occ_0)) &&
+            ((((s).occ_0*(rr) + (s).overlap_num)) >= ((s).occ_0)))
+
+    For ONT (std_bs=1): st_rate=0.05, st_max=2
+    Dinara maps: fwd_ref_cov <-> hifiasm overlap_num (forward-strand ref count + 1 for query)
+    */
+    constexpr double st_rate_tc = 0.05;
+    constexpr uint64_t st_max_tc = 2;
+
+    auto isStrandBiasedTC = [](const SnpStats& s, double stRate, uint64_t stMax) -> bool {
+        if (stMax == UINT64_MAX) return false;
+        if (uint64_t(s.fwd_ref_cov) + stMax < uint64_t(s.occ_0)) return false;
+        if (double(s.occ_0) * stRate + double(s.fwd_ref_cov) < double(s.occ_0)) return false;
+        return true;
+    };
 
     /*
     Step 0: drop adjacent SNP sites.
@@ -2302,6 +2613,7 @@ static void generate_haplotypes_naive_HiFi(
             if (row == invalid<uint32_t> || row >= nSites) continue;
             const auto& s = snpStats[row];
             if (s.occ_0 < 2 || s.occ_1 < 2) continue;
+            if (isStrandBiasedTC(s, st_rate_tc, st_max_tc)) continue;
             if (s.occ_0 >= s_hap_cov && s.occ_1 >= infor_cov) ++o;
         }
         return o;
@@ -2388,6 +2700,15 @@ static void generate_haplotypes_naive_HiFi(
             for (uint32_t r = beginRow; r < endRow; ++r) {
                 uint32_t& occ0 = snpStats[r].occ_0;
                 occ0 = (occ0 > 1) ? (occ0 - 1) : 1U;
+                /*
+                Hifiasm also decrements overlap_num (fwd_ref_cov) when the trans overlap
+                is forward-strand. This keeps strand-bias tracking accurate as overlaps
+                are marked trans. (Correct.cpp ~line 9006)
+                */
+                if (!candidates[c].isRev) {
+                    uint32_t& frc = snpStats[r].fwd_ref_cov;
+                    frc = (frc > 1) ? (frc - 1) : 1U;
+                }
             }
         }
     };
@@ -2421,20 +2742,24 @@ static void generate_haplotypes_naive_HiFi(
     /*
     Step 4: closure pass.
 
-    Any overlap that is still cis (is_match==1) but has a mismatch at a promoted site becomes trans.
+    Any overlap that is still cis (is_match==1) but has a mismatch at a promoted site becomes
+    trans, provided the site still passes basic thresholds and strand-bias filtering.
+    Hifiasm applies is_st_bs here too (Correct.cpp ~line 9033).
     */
     for (size_t c = 0; c < nCands; ++c) {
         if (candidates[c].is_match == 2) continue;
         const size_t begin = ovOffsets[c];
         const size_t end = ovOffsets[c + 1];
+        uint32_t o = 0;
         for (size_t k = begin; k < end; ++k) {
             const uint32_t row = hapEvidence[perm[k]].overlapSite;
             if (row == invalid<uint32_t> || row >= nSites) continue;
-            if (snpStats[row].score == 1) {
-                candidates[c].is_match = 2;
-                break;
-            }
+            const auto& s = snpStats[row];
+            if (s.occ_0 < 2 || s.occ_1 < 2) continue;
+            if (isStrandBiasedTC(s, st_rate_tc, st_max_tc)) continue;
+            if (s.score == 1) ++o;
         }
+        if (o > 0) candidates[c].is_match = 2;
     }
 
     /*
@@ -2539,10 +2864,25 @@ static void generate_haplotypes_naive_HiFi(
     }
 
     /*
-    Step 7: final trans marking after multi_check.
+    Step 7: Final trans marking (hifiasm Correct.cpp ~line 9085-9110).
 
-    After multi_check potentially marks additional rows score=1, we perform one more pass:
-    any overlap that is still cis but has a mismatch at a score==1 row becomes trans.
+    After multi_check (disabled for ONT) potentially marks additional rows score=1,
+    we perform one final pass: any overlap that is still cis (is_match==1) but has a
+    mismatch at a score==1 row becomes trans (is_match=2).
+
+    Hifiasm reference (generate_haplotypes_naive_HiFi, Correct.cpp ~line 9093-9099):
+      if(s->score == 1 && (!(s->occ_0 < 2 || s->occ_1 < 2)) && (!(is_st_bs((*s), st_rate, st_max)))) {
+          overlap_list->list[ii].is_match = 2;
+      }
+
+    Note: this final marking has THREE conditions, all of which we replicate:
+      1. score == 1          (site has been promoted by trans-closure)
+      2. occ_0 >= 2 AND occ_1 >= 2  (minimum allele support)
+      3. !is_st_bs           (not strand-biased — ONT-specific guard)
+
+    Contrast with generate_haplotypes_sv's final marking (Correct.cpp ~line 9230-9237),
+    which does NOT check is_st_bs — only checks score==1 && occ_0>=2 && occ_1>=2.
+    This is correct because SV evidence is less susceptible to strand bias artifacts.
     */
     for (size_t c = 0; c < nCands; ++c) {
         if (candidates[c].is_match == 2) continue;
@@ -2554,6 +2894,7 @@ static void generate_haplotypes_naive_HiFi(
             const auto& s = snpStats[row];
             if (s.score != 1) continue;
             if (s.occ_0 < 2 || s.occ_1 < 2) continue;
+            if (isStrandBiasedTC(s, st_rate_tc, st_max_tc)) continue;
             candidates[c].is_match = 2;
             break;
         }
