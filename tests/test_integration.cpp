@@ -20,6 +20,7 @@
 #include "../src/markerAccessFunctions.hpp"
 #include "../src/AlignmentCanonicalization.hpp"
 #include "../src/MarkerGraph.hpp"
+#include "../src/mode3-DirectedAnchorGraph.hpp"
 
 // Standard library
 #include <algorithm>
@@ -6806,4 +6807,482 @@ TEST_CASE("Integration: performHifiasmECParity filters SV/large-indel overlaps l
     CHECK_FALSE(deletedFromRead0(ref1));
     CHECK_FALSE(deletedFromRead0(ref2));
     CHECK_FALSE(deletedFromRead0(ref3));
+}
+
+namespace {
+
+uint64_t addDagSimpleNode(
+    dinara::mode3::DirectedAnchorGraph& dag,
+    uint64_t markerId,
+    uint64_t lengthBp,
+    double coverage)
+{
+    dinara::mode3::DagNodeInfo info;
+    info.anchorChain.push_back(markerId);
+    info.lengthBp = lengthBp;
+    info.coverage = coverage;
+    info.removed = false;
+    return dag.addNode(info);
+}
+
+bool dagHasOutEdge(
+    const dinara::mode3::DirectedAnchorGraph& dag,
+    dinara::mode3::DagNodeId from,
+    dinara::mode3::DagNodeId to)
+{
+    const auto& out = dag.getOutEdges(from);
+    return std::find(out.begin(), out.end(), to) != out.end();
+}
+
+uint64_t findDagSegmentByAnchorChain(
+    const dinara::mode3::DirectedAnchorGraph& dag,
+    const std::vector<dinara::mode3::DagNodeId>& chain)
+{
+    for(uint64_t segId : dag.getActiveNodeIds()) {
+        if(dag.getNode(segId).anchorChain == chain) {
+            return segId;
+        }
+    }
+    return std::numeric_limits<uint64_t>::max();
+}
+
+} // namespace
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll collapses MBG-style linear chains and rewrites paths",
+    "[integration][dag][unitigify][mbg]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segR = addDagSimpleNode(dag, 90, 7, 5.0);
+    const uint64_t segS = addDagSimpleNode(dag, 91, 7, 5.0);
+    const uint64_t segP = addDagSimpleNode(dag, 100, 8, 10.0);
+    const uint64_t segA = addDagSimpleNode(dag, 101, 10, 20.0);
+    const uint64_t segB = addDagSimpleNode(dag, 102, 12, 30.0);
+    const uint64_t segC = addDagSimpleNode(dag, 103, 14, 40.0);
+    const uint64_t segQ = addDagSimpleNode(dag, 104, 9, 50.0);
+    const uint64_t segT = addDagSimpleNode(dag, 110, 7, 5.0);
+    const uint64_t segU = addDagSimpleNode(dag, 111, 7, 5.0);
+
+    dag.addEdge(fwdNodeId(segR), fwdNodeId(segP), 1);
+    dag.addEdge(fwdNodeId(segS), fwdNodeId(segP), 1);
+    dag.addEdge(fwdNodeId(segP), fwdNodeId(segA), 2);
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 3);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segC), 4);
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segQ), 1);
+    dag.addEdge(fwdNodeId(segQ), fwdNodeId(segT), 1);
+    dag.addEdge(fwdNodeId(segQ), fwdNodeId(segU), 1);
+
+    const uint64_t p0 = dag.addPath({
+        fwdNodeId(segP),
+        fwdNodeId(segA),
+        fwdNodeId(segB),
+        fwdNodeId(segC),
+        fwdNodeId(segQ)
+    }, 1);
+    const uint64_t p1 = dag.addPath({
+        fwdNodeId(segB),
+        fwdNodeId(segC),
+        fwdNodeId(segQ)
+    }, 1);
+    const uint64_t p2 = dag.addPath({
+        fwdNodeId(segP),
+        fwdNodeId(segA),
+        fwdNodeId(segB)
+    }, 1);
+
+    REQUIRE(dag.nodeCount() == 9);
+    REQUIRE(dag.pathCount() == 3);
+
+    dag.unitigifyAll();
+
+    REQUIRE(dag.nodeExists(segP) == false);
+    REQUIRE(dag.nodeExists(segA) == false);
+    REQUIRE(dag.nodeExists(segB) == false);
+    REQUIRE(dag.nodeExists(segC) == false);
+    REQUIRE(dag.nodeExists(segQ) == false);
+    REQUIRE(dag.nodeExists(segR));
+    REQUIRE(dag.nodeExists(segS));
+    REQUIRE(dag.nodeExists(segT));
+    REQUIRE(dag.nodeExists(segU));
+    REQUIRE(dag.nodeCount() == 5);
+    REQUIRE(dag.pathCount() == 3);
+
+    uint64_t mergedSeg = std::numeric_limits<uint64_t>::max();
+    for(uint64_t segId : dag.getActiveNodeIds()) {
+        const auto& node = dag.getNode(segId);
+        if(node.anchorChain == std::vector<DagNodeId>{100, 101, 102, 103, 104}) {
+            mergedSeg = segId;
+            break;
+        }
+    }
+    REQUIRE(mergedSeg != std::numeric_limits<uint64_t>::max());
+
+    const auto& mergedInfo = dag.getNode(mergedSeg);
+    REQUIRE(mergedInfo.lengthBp == (8 + (10 - 2) + (12 - 3) + (14 - 4) + (9 - 1)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(segR), fwdNodeId(mergedSeg)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(segS), fwdNodeId(mergedSeg)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedSeg), fwdNodeId(segT)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedSeg), fwdNodeId(segU)));
+
+    REQUIRE(dag.getPath(p0) ==
+        std::vector<DagNodeId>{fwdNodeId(mergedSeg)});
+    REQUIRE(dag.getPath(p1) ==
+        std::vector<DagNodeId>{fwdNodeId(mergedSeg)});
+    REQUIRE(dag.getPath(p2) ==
+        std::vector<DagNodeId>{fwdNodeId(mergedSeg)});
+}
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll handles circular unitigs in MBG style",
+    "[integration][dag][unitigify][mbg][circular]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segA = addDagSimpleNode(dag, 201, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 202, 11, 11.0);
+    const uint64_t segC = addDagSimpleNode(dag, 203, 12, 12.0);
+
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 2);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segC), 2);
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segA), 2);
+
+    const uint64_t p0 = dag.addPath({
+        fwdNodeId(segA),
+        fwdNodeId(segB),
+        fwdNodeId(segC),
+        fwdNodeId(segA)
+    }, 1);
+
+    REQUIRE(dag.nodeCount() == 3);
+    dag.unitigifyAll();
+    REQUIRE(dag.nodeCount() == 1);
+    REQUIRE(dag.pathCount() == 1);
+
+    const auto active = dag.getActiveNodeIds();
+    REQUIRE(active.size() == 1);
+    const uint64_t mergedSeg = active.front();
+
+    const auto& rewritten = dag.getPath(p0);
+    REQUIRE(rewritten.empty() == false);
+    for(DagNodeId n : rewritten) {
+        REQUIRE(segmentOf(n) == mergedSeg);
+    }
+}
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll leaves non-unitigifiable branch nodes unchanged",
+    "[integration][dag][unitigify][mbg][no-merge]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segA = addDagSimpleNode(dag, 401, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 402, 11, 11.0);
+    const uint64_t segC = addDagSimpleNode(dag, 403, 12, 12.0);
+    const uint64_t segD = addDagSimpleNode(dag, 404, 13, 13.0);
+
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 2);
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segC), 2);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segD), 2);
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segD), 2);
+
+    const uint64_t p0 = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segB), fwdNodeId(segD)
+    }, 1);
+    const uint64_t p1 = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segC), fwdNodeId(segD)
+    }, 1);
+
+    dag.unitigifyAll();
+
+    REQUIRE(dag.nodeCount() == 4);
+    REQUIRE(dag.nodeExists(segA));
+    REQUIRE(dag.nodeExists(segB));
+    REQUIRE(dag.nodeExists(segC));
+    REQUIRE(dag.nodeExists(segD));
+
+    REQUIRE(dag.getPath(p0) == std::vector<DagNodeId>{
+        fwdNodeId(segA), fwdNodeId(segB), fwdNodeId(segD)
+    });
+    REQUIRE(dag.getPath(p1) == std::vector<DagNodeId>{
+        fwdNodeId(segA), fwdNodeId(segC), fwdNodeId(segD)
+    });
+
+    for(uint64_t segId : dag.getActiveNodeIds()) {
+        REQUIRE(dag.getNode(segId).anchorChain.size() == 1);
+    }
+}
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll merges disjoint chains and is idempotent",
+    "[integration][dag][unitigify][mbg][idempotent]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segA = addDagSimpleNode(dag, 501, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 502, 12, 12.0);
+    const uint64_t segC = addDagSimpleNode(dag, 503, 14, 14.0);
+    const uint64_t segD = addDagSimpleNode(dag, 504, 16, 16.0);
+    const uint64_t segE = addDagSimpleNode(dag, 505, 9, 9.0);
+
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 3);
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segD), 4);
+
+    const uint64_t p0 = dag.addPath({fwdNodeId(segA), fwdNodeId(segB)}, 1);
+    const uint64_t p1 = dag.addPath({fwdNodeId(segC), fwdNodeId(segD)}, 1);
+
+    dag.unitigifyAll();
+
+    REQUIRE(dag.nodeCount() == 3);
+    REQUIRE(dag.nodeExists(segE));
+    REQUIRE_FALSE(dag.nodeExists(segA));
+    REQUIRE_FALSE(dag.nodeExists(segB));
+    REQUIRE_FALSE(dag.nodeExists(segC));
+    REQUIRE_FALSE(dag.nodeExists(segD));
+
+    const uint64_t mergedAB =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{501, 502});
+    const uint64_t mergedCD =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{503, 504});
+    REQUIRE(mergedAB != std::numeric_limits<uint64_t>::max());
+    REQUIRE(mergedCD != std::numeric_limits<uint64_t>::max());
+
+    REQUIRE(dag.getPath(p0) == std::vector<DagNodeId>{fwdNodeId(mergedAB)});
+    REQUIRE(dag.getPath(p1) == std::vector<DagNodeId>{fwdNodeId(mergedCD)});
+
+    const uint64_t nodesAfterFirst = dag.nodeCount();
+    const uint64_t edgesAfterFirst = dag.edgeCount();
+    const auto path0AfterFirst = dag.getPath(p0);
+    const auto path1AfterFirst = dag.getPath(p1);
+
+    dag.unitigifyAll();
+
+    REQUIRE(dag.nodeCount() == nodesAfterFirst);
+    REQUIRE(dag.edgeCount() == edgesAfterFirst);
+    REQUIRE(dag.getPath(p0) == path0AfterFirst);
+    REQUIRE(dag.getPath(p1) == path1AfterFirst);
+}
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll preserves MBG endpoint rewiring corner cases",
+    "[integration][dag][unitigify][mbg][rewire]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segA = addDagSimpleNode(dag, 601, 20, 8.0);
+    const uint64_t segB = addDagSimpleNode(dag, 602, 21, 8.0);
+    const uint64_t segC = addDagSimpleNode(dag, 603, 22, 8.0);
+    const uint64_t segX = addDagSimpleNode(dag, 604, 10, 5.0);
+    const uint64_t segY = addDagSimpleNode(dag, 605, 10, 5.0);
+
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 3);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segC), 4);
+    dag.addEdge(revNodeId(segA), revNodeId(segC), 5);  // rc(first)->rc(last)
+    dag.addEdge(revNodeId(segA), fwdNodeId(segA), 2);  // rc(first)->first
+    dag.addEdge(revNodeId(segA), fwdNodeId(segX), 1);  // rc(first)->outside
+    dag.addEdge(fwdNodeId(segC), revNodeId(segC), 2);  // last->rc(last)
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segY), 1);  // last->outside
+
+    const uint64_t pFwd = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segB), fwdNodeId(segC)
+    }, 1);
+    const uint64_t pRev = dag.addPath({
+        revNodeId(segC), revNodeId(segB), revNodeId(segA)
+    }, 1);
+
+    dag.unitigifyAll();
+
+    const uint64_t mergedABC =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{601, 602, 603});
+    REQUIRE(mergedABC != std::numeric_limits<uint64_t>::max());
+
+    REQUIRE(dag.getPath(pFwd) == std::vector<DagNodeId>{fwdNodeId(mergedABC)});
+    REQUIRE(dag.getPath(pRev) == std::vector<DagNodeId>{revNodeId(mergedABC)});
+
+    REQUIRE(dagHasOutEdge(dag, revNodeId(mergedABC), revNodeId(mergedABC)));
+    REQUIRE(dagHasOutEdge(dag, revNodeId(mergedABC), fwdNodeId(mergedABC)));
+    REQUIRE(dagHasOutEdge(dag, revNodeId(mergedABC), fwdNodeId(segX)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedABC), revNodeId(mergedABC)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedABC), fwdNodeId(segY)));
+}
+
+TEST_CASE("DirectedAnchorGraph unitigifyAll rewrites internal and reverse-entry path orientations",
+    "[integration][dag][unitigify][mbg][path-rewrite]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    const uint64_t segA = addDagSimpleNode(dag, 701, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 702, 11, 11.0);
+    const uint64_t segC = addDagSimpleNode(dag, 703, 12, 12.0);
+    const uint64_t segZ = addDagSimpleNode(dag, 704, 8, 6.0);
+    const uint64_t segW = addDagSimpleNode(dag, 705, 8, 6.0);
+
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 2);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segC), 2);
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segW), 1);
+    dag.addEdge(fwdNodeId(segZ), revNodeId(segC), 1);
+
+    const uint64_t p0 = dag.addPath({fwdNodeId(segB), fwdNodeId(segC)}, 1);
+    const uint64_t p1 = dag.addPath({revNodeId(segB), revNodeId(segA)}, 1);
+    const uint64_t p2 = dag.addPath({
+        fwdNodeId(segZ), revNodeId(segC), revNodeId(segB)
+    }, 1);
+    const uint64_t p3 = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segB), fwdNodeId(segC)
+    }, 1);
+
+    dag.unitigifyAll();
+
+    const uint64_t mergedABC =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{701, 702, 703});
+    REQUIRE(mergedABC != std::numeric_limits<uint64_t>::max());
+
+    REQUIRE(dag.getPath(p0) == std::vector<DagNodeId>{fwdNodeId(mergedABC)});
+    REQUIRE(dag.getPath(p1) == std::vector<DagNodeId>{revNodeId(mergedABC)});
+    REQUIRE(dag.getPath(p2) == std::vector<DagNodeId>{
+        fwdNodeId(segZ), revNodeId(mergedABC)
+    });
+    REQUIRE(dag.getPath(p3) == std::vector<DagNodeId>{fwdNodeId(mergedABC)});
+
+    const auto& crossing = dag.getPathsCrossingNode(mergedABC);
+    REQUIRE(crossing.count(p0) == 1);
+    REQUIRE(crossing.count(p1) == 1);
+    REQUIRE(crossing.count(p2) == 1);
+    REQUIRE(crossing.count(p3) == 1);
+}
+
+// Regression test: batch unitigifyAll must preserve edges between
+// adjacent chains separated by a hub. Two chains [A,B] and [C,D]
+// connected through hub H (H has degree > 1 in both directions)
+// should produce merged nodes M_AB and M_CD with edges M_AB→H and H→M_CD.
+TEST_CASE("DirectedAnchorGraph unitigifyAll preserves cross-chain edges",
+    "[integration][dag][unitigify][mbg][cross-chain]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    // Hub P has out-degree 2 → can't be part of any chain.
+    const uint64_t segP = addDagSimpleNode(dag, 800, 10, 5.0);
+    const uint64_t segX = addDagSimpleNode(dag, 806, 8, 4.0);
+    // Chain 1: A→B
+    const uint64_t segA = addDagSimpleNode(dag, 801, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 802, 12, 12.0);
+    // Hub H between chains.
+    // H needs in-degree >= 2 (so B can't extend into H)
+    // and out-degree >= 2 (so C can't extend backward into H).
+    const uint64_t segH = addDagSimpleNode(dag, 808, 10, 6.0);
+    const uint64_t segZ = addDagSimpleNode(dag, 809, 8, 4.0);  // H→Z
+    const uint64_t segW = addDagSimpleNode(dag, 810, 8, 4.0);  // W→H
+    // Chain 2: C→D
+    const uint64_t segC = addDagSimpleNode(dag, 803, 14, 14.0);
+    const uint64_t segD = addDagSimpleNode(dag, 804, 11, 11.0);
+    // Hub Q has in-degree 2.
+    const uint64_t segQ = addDagSimpleNode(dag, 805, 10, 5.0);
+    const uint64_t segY = addDagSimpleNode(dag, 807, 8, 4.0);
+
+    dag.addEdge(fwdNodeId(segP), fwdNodeId(segA), 2);
+    dag.addEdge(fwdNodeId(segP), fwdNodeId(segX), 1);  // P out-degree 2
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 3);   // chain 1 internal
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segH), 2);   // chain 1 → hub
+    dag.addEdge(fwdNodeId(segW), fwdNodeId(segH), 1);   // H in-degree 2
+    dag.addEdge(fwdNodeId(segH), fwdNodeId(segC), 2);   // hub → chain 2
+    dag.addEdge(fwdNodeId(segH), fwdNodeId(segZ), 1);   // H out-degree 2
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segD), 3);   // chain 2 internal
+    dag.addEdge(fwdNodeId(segD), fwdNodeId(segQ), 2);
+    dag.addEdge(fwdNodeId(segY), fwdNodeId(segQ), 1);   // Q in-degree 2
+
+    // Path crossing both chains through hub.
+    const uint64_t p0 = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segB),
+        fwdNodeId(segH),
+        fwdNodeId(segC), fwdNodeId(segD)
+    }, 1);
+
+    dag.unitigifyAll();
+
+    // Find merged nodes by anchor chain.
+    const uint64_t mergedAB =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{801, 802});
+    const uint64_t mergedCD =
+        findDagSegmentByAnchorChain(dag, std::vector<DagNodeId>{803, 804});
+    REQUIRE(mergedAB != std::numeric_limits<uint64_t>::max());
+    REQUIRE(mergedCD != std::numeric_limits<uint64_t>::max());
+
+    // Edges through hub must exist.
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedAB), fwdNodeId(segH)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(segH), fwdNodeId(mergedCD)));
+
+    // External edges preserved.
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(segP), fwdNodeId(mergedAB)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedCD), fwdNodeId(segQ)));
+
+    // Path must be rewritten to use both merged nodes.
+    REQUIRE(dag.getPath(p0) == std::vector<DagNodeId>{
+        fwdNodeId(mergedAB), fwdNodeId(segH), fwdNodeId(mergedCD)
+    });
+}
+
+// Regression test: batch unitigifyAll must perform secondary merges.
+// When chain [A,B] and chain [C,D] are adjacent (B→C) with both
+// endpoints having degree 1 after merging, the merged nodes M1→M2
+// should themselves be merged into a single node M3.
+TEST_CASE("DirectedAnchorGraph unitigifyAll performs secondary merges",
+    "[integration][dag][unitigify][mbg][secondary-merge]")
+{
+    using namespace dinara::mode3;
+
+    DirectedAnchorGraph dag;
+
+    // Hub P with out-degree 2 prevents A from extending backward.
+    const uint64_t segP = addDagSimpleNode(dag, 900, 10, 5.0);
+    const uint64_t segX = addDagSimpleNode(dag, 906, 8, 4.0);
+    // Chain 1: A→B (P has out-degree 2, so A can't extend backward past P)
+    const uint64_t segA = addDagSimpleNode(dag, 901, 10, 10.0);
+    const uint64_t segB = addDagSimpleNode(dag, 902, 12, 12.0);
+    // Chain 2: C→D (Q has in-degree 2, so D can't extend forward past Q)
+    const uint64_t segC = addDagSimpleNode(dag, 903, 14, 14.0);
+    const uint64_t segD = addDagSimpleNode(dag, 904, 11, 11.0);
+    // Hub Q with in-degree 2 prevents D from extending forward.
+    const uint64_t segQ = addDagSimpleNode(dag, 905, 10, 5.0);
+    const uint64_t segY = addDagSimpleNode(dag, 907, 8, 4.0);
+
+    dag.addEdge(fwdNodeId(segP), fwdNodeId(segA), 2);
+    dag.addEdge(fwdNodeId(segP), fwdNodeId(segX), 1);  // P out-degree 2
+    dag.addEdge(fwdNodeId(segA), fwdNodeId(segB), 3);
+    dag.addEdge(fwdNodeId(segB), fwdNodeId(segC), 2);   // cross-chain
+    dag.addEdge(fwdNodeId(segC), fwdNodeId(segD), 3);
+    dag.addEdge(fwdNodeId(segD), fwdNodeId(segQ), 2);
+    dag.addEdge(fwdNodeId(segY), fwdNodeId(segQ), 1);   // Q in-degree 2
+
+    // Path spanning all four chain members.
+    const uint64_t p0 = dag.addPath({
+        fwdNodeId(segA), fwdNodeId(segB),
+        fwdNodeId(segC), fwdNodeId(segD)
+    }, 1);
+
+    dag.unitigifyAll();
+
+    // After batch merge: M_AB and M_CD both have degree 1 connecting
+    // to each other. The secondary pass should merge them into M_ABCD.
+    const uint64_t mergedABCD =
+        findDagSegmentByAnchorChain(dag,
+            std::vector<DagNodeId>{901, 902, 903, 904});
+    REQUIRE(mergedABCD != std::numeric_limits<uint64_t>::max());
+
+    // The path should reference the fully-merged node.
+    REQUIRE(dag.getPath(p0) == std::vector<DagNodeId>{
+        fwdNodeId(mergedABCD)
+    });
+
+    // External edges must reach the final merged node.
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(segP), fwdNodeId(mergedABCD)));
+    REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedABCD), fwdNodeId(segQ)));
 }

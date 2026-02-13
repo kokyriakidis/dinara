@@ -260,6 +260,11 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorPair);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreJourney);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchor);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedJourney);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphNode);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphPath);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
@@ -603,6 +608,14 @@ void Assembler::writeNavigation(ostream& html) const
             {"Journey", "exploreJourney"},
             {"Read following on anchors", "exploreReadFollowing"},
             {"Local anchor graph", "exploreLocalAnchorGraph"},
+            {"Bidirected Anchor", "exploreBidirectedAnchor"},
+            {"Bidirected Journey", "exploreBidirectedJourney"},
+            });
+
+        writeNavigation(html, "Directed Anchor Graph", {
+            {"Graph summary", "exploreDirectedAnchorGraph"},
+            {"Node", "exploreDirectedAnchorGraphNode"},
+            {"Path", "exploreDirectedAnchorGraphPath"},
             });
 
 #if DINARA_ENABLE_VARIANT_CLUSTERING
@@ -1002,6 +1015,12 @@ void Assembler::accessAllSoft()
         } catch(const exception& e) {
             cout << "The mode 3 assembler is not accessible." << endl;
             allDataAreAvailable = false;
+        }
+
+        try {
+            accessBidirectedAnchors();
+        } catch(const exception& e) {
+            cout << "Bidirected anchors are not accessible." << endl;
         }
     }
 

@@ -95,6 +95,8 @@ namespace dinara {
 
     namespace mode3 {
         class Anchors;
+        class BidirectedAnchors;
+        class DirectedAnchorGraph;
     }
 
     namespace MemoryMapped {
@@ -593,6 +595,20 @@ public:
         uint64_t threadCount
     );
 
+    // BRG-aware variant of createMarkerGraphVertices.
+    // Uses BidirectionalReadGraph edges (skipping isDeleted) for the
+    // disjoint-set union step instead of ReadGraph edges.
+    // The marker graph reflects the cleaned BRG overlap set.
+    void createMarkerGraphVerticesFromBrg(
+        size_t minCoverage,
+        size_t maxCoverage,
+        uint64_t minCoveragePerStrand,
+        bool allowDuplicateMarkers,
+        double peakFinderMinAreaFraction,
+        uint64_t peakFinderAreaStartIndex,
+        uint64_t threadCount
+    );
+
     // Filter marker graph vertices whose marker k-mer is a short-period exact repeat
     // (including homopolymers). This removes vertices that tend to generate unreliable
     // anchors and artifacts in repetitive regions.
@@ -655,6 +671,23 @@ public:
         uint64_t maxAnchorCoverage,
         uint64_t threadCount);
 
+    // Create anchors from BRG-aware (self-RC) marker graph vertices.
+    // Handles self-RC vertices by extracting only strand-0 markers for the
+    // forward anchor and deriving the RC anchor by flipping.
+    shared_ptr<mode3::Anchors> createAnchorsFromBrgMarkerGraphVertices(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
+    // Create BRG-native anchors (no RC doubling) from self-RC marker
+    // graph vertices.  Returns a BidirectedAnchors object.
+    shared_ptr<mode3::BidirectedAnchors> createBidirectedAnchors(
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage,
+        uint64_t threadCount);
+
+    // Create and run Verkko-style directed anchor graph resolution.
+    void runDirectedAnchorGraphResolution();
 
 
     // Find the vertex of the global marker graph that contains a given marker.
@@ -1612,6 +1645,24 @@ private:
     void accessBidirectionalReadGraphReadWrite();
     void checkBidirectionalReadGraphIsOpen() const;
     void removeBidirectionalReadGraph();
+
+    // BidirectionalReadGraph cleaning (string-graph-style operations on BRG).
+    // Individual operations (each builds a temporary directed view):
+    uint64_t reduceBidirectionalReadGraphTransitive(uint32_t gapFuzz = 1000);
+    uint64_t cutBidirectionalReadGraphTips(uint32_t maxShortTipReads = 3);
+    uint64_t cutBidirectionalReadGraphWeakArcs(
+        uint32_t maxExtReads = 3,
+        double lenRatio = 0.975,
+        uint32_t minDiff = 16);
+    // Combined cleaning passes:
+    void cleanBidirectionalReadGraphInitial(
+        uint32_t gapFuzz = 1000,
+        uint32_t maxShortTipReads = 3);
+    void cleanBidirectionalReadGraphIterative(
+        uint32_t cleanRounds = 4,
+        double minDropRate = 0.2,
+        double maxDropRate = 0.8,
+        uint32_t maxShortTipReads = 3);
     void accessStringGraph();
     void accessStringGraphReadWrite();
     void checkStringGraphIsOpen() const;
@@ -3459,6 +3510,13 @@ public:
     shared_ptr<Mode3Assembler> mode3Assembler;
     void accessMode3Assembler();
 
+    // BRG-native anchors (stored for HTTP server visualization).
+    shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
+    void accessBidirectedAnchors();
+
+    // Verkko-style directed anchor graph (built from BRG anchors).
+    shared_ptr<mode3::DirectedAnchorGraph> directedAnchorGraph;
+
     // If the coverage range for primary marker graph edges is not
     // specified, this uses the disjoint sets histogram to compute reasonable values.
     pair<uint64_t, uint64_t> getPrimaryCoverageRange();
@@ -3496,6 +3554,15 @@ public:
     void exploreMode3AssemblyGraph(const vector<string>&, ostream&);
     void exploreSegment(const vector<string>&, ostream&);
     void exploreReadFollowingAssemblyGraph(const vector<string>&, ostream&);
+
+    // Http server functions for BRG-native anchors.
+    void exploreBidirectedAnchor(const vector<string>&, ostream&);
+    void exploreBidirectedJourney(const vector<string>&, ostream&);
+
+    // Http server functions for the directed anchor graph (Verkko-style).
+    void exploreDirectedAnchorGraph(const vector<string>&, ostream&);
+    void exploreDirectedAnchorGraphNode(const vector<string>&, ostream&);
+    void exploreDirectedAnchorGraphPath(const vector<string>&, ostream&);
 
 
 public:
