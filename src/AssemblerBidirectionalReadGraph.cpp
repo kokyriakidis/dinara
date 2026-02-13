@@ -229,6 +229,11 @@ void Assembler::removeBidirectionalReadGraph()
 // a LocalReadGraph with OrientedReadId vertices so the result can be rendered
 // with the same pipeline as the legacy ReadGraph explorer.
 //
+// Each physical read appears exactly once in the output graph.
+// Visited status is tracked by ReadId, not OrientedReadId.
+// The displayed strand is the "derived strand" from the BFS — i.e. the
+// inferred orientation relative to the seed read.
+//
 // Orientation is derived via edge.traverse():
 //   - Each start read enters with its user-supplied strand.
 //   - Edges propagate strand through: toStrand = fromStrand ^ (!isSameStrand).
@@ -249,8 +254,12 @@ bool Assembler::createLocalBidirectionalReadGraph(
 
     checkBidirectionalReadGraphIsOpen();
 
-    // BFS queue entries: (ReadId, derived Strand, distance from start).
-    // We track (ReadId, Strand) → OrientedReadId for the LocalReadGraph.
+    // Track which physical reads have been visited.
+    // Maps ReadId → the OrientedReadId assigned in the LocalReadGraph.
+    // This ensures each physical read appears exactly once, regardless of
+    // how many paths reach it or which derived strand each path implies.
+    std::map<ReadId, OrientedReadId> visitedReads;
+
     std::queue<OrientedReadId> q;
 
     for(const OrientedReadId& start : starts) {
@@ -262,12 +271,18 @@ bool Assembler::createLocalBidirectionalReadGraph(
             continue;
         }
 
+        // Skip if this physical read was already added by a prior start vertex.
+        if(visitedReads.count(readId)) {
+            continue;
+        }
+
         const OrientedReadId orientedReadId(readId, strand);
         graph.addVertex(
             orientedReadId,
             uint32_t((*markers)[orientedReadId.getValue()].size()),
             reads->getFlags(readId).isChimeric,
             0);
+        visitedReads[readId] = orientedReadId;
         q.push(orientedReadId);
     }
 
@@ -309,8 +324,6 @@ bool Assembler::createLocalBidirectionalReadGraph(
                 continue;
             }
 
-            const OrientedReadId orientedReadId1(toReadId, toStrand);
-
             // Get alignment information for markerCount.
             const AlignmentData& alignment = alignmentData[edge.alignmentId];
             OrientedReadId alignmentOrientedReadId0(alignment.readIds[0], 0);
@@ -333,29 +346,33 @@ bool Assembler::createLocalBidirectionalReadGraph(
             // so they are drawn in orange, matching the legacy coloring convention.
             const bool crossesStrands = !edge.isSameStrand;
 
-            // BFS expansion.
+            // BFS expansion — track by ReadId so each physical read appears once.
             const uint32_t distance1 = distance0 + 1;
             if(distance0 < maxDistance) {
-                if(!graph.vertexExists(orientedReadId1)) {
+                if(visitedReads.count(toReadId) == 0) {
+                    // First time visiting this physical read.
+                    const OrientedReadId orientedReadId1(toReadId, toStrand);
                     graph.addVertex(
                         orientedReadId1,
                         uint32_t((*markers)[orientedReadId1.getValue()].size()),
                         reads->getFlags(toReadId).isChimeric,
                         distance1);
+                    visitedReads[toReadId] = orientedReadId1;
                     q.push(orientedReadId1);
                 }
+                // Use the canonical OrientedReadId assigned to this read.
                 graph.addEdge(
                     orientedReadId0,
-                    orientedReadId1,
+                    visitedReads[toReadId],
                     markerCount,
                     edgeIndex,
                     crossesStrands);
             } else {
                 DINARA_ASSERT(distance0 == maxDistance);
-                if(graph.vertexExists(orientedReadId1)) {
+                if(visitedReads.count(toReadId)) {
                     graph.addEdge(
                         orientedReadId0,
-                        orientedReadId1,
+                        visitedReads[toReadId],
                         markerCount,
                         edgeIndex,
                         crossesStrands);

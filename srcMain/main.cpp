@@ -12,6 +12,9 @@
 #endif
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
+#include "mode3-BidirectedAnchor.hpp"
+#include "mode3-DirectedAnchors.hpp"
+#include "mode3-DirectedAnchorGraph.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -517,7 +520,7 @@ void dinara::main::assemble(
         
         // Retrieve peak and set thresholds.
         const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
-        const uint64_t minFreq = 4;
+        const uint64_t minFreq = 2;
         const uint64_t maxFreq = 5 * coveragePeak;
         const uint64_t distinctKmerCount = assembler.kmerCounter->kmerIdFrequencies.size();
 
@@ -689,404 +692,412 @@ void dinara::main::assemble(
     // one edge per alignment (no strand doubling).
     assembler.createBidirectionalReadGraph();
 
-    // Global mismatch-site diagnostics and export are expensive and intended for debugging.
-    // Keep them off by default in production runs to preserve assembly throughput.
-    const bool runGlobalHetDiagnostics = true;
-    if (runGlobalHetDiagnostics) {
-    // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
-    // This is the fastest way to approximate "pileup across all reads" without a reference.
-    {
-        const OrientedReadId focalOrientedReadId(ReadId(24347), 1);
-        const ReadId focalReadId = focalOrientedReadId.getReadId();
-        const Strand focalReadStrand = focalOrientedReadId.getStrand();
-        const string focalReadLabel =
-            to_string(uint64_t(focalReadId)) + "-" + to_string(uint64_t(focalReadStrand));
-        const Reads& reads = assembler.getReads();
-        const uint32_t focalReadLength = uint32_t(reads.getRead(focalReadId).baseCount);
+    // Clean the BRG using string-graph-style operations:
+    // Step 10: transitive reduction + Step 11: tip cutting.
+    // This removes redundant edges while operating on the undirected BRG
+    // via a temporary directed-arc view derived from alignment coordinates.
+    assembler.cleanBidirectionalReadGraphInitial(
+        /*gapFuzz*/1000,
+        /*maxShortTipReads*/3);
 
-        const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
-            focalReadId,
-            assemblerOptions.alignOptions,
-            threadCount,
-            0,      // maxReadsToProcess
-            0,      // maxAlignmentsToProcess
-            false,  // includeDeletedAlignments
-            true    // readGraphOnly
-        );
-        const uint32_t clusterSiteCount = uint32_t(
-            clusters.clusterMemberOffsets.empty() ? 0 : (clusters.clusterMemberOffsets.size() - 1));
+    // // Global mismatch-site diagnostics and export are expensive and intended for debugging.
+    // // Keep them off by default in production runs to preserve assembly throughput.
+    // const bool runGlobalHetDiagnostics = true;
+    // if (runGlobalHetDiagnostics) {
+    // // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
+    // // This is the fastest way to approximate "pileup across all reads" without a reference.
+    // {
+    //     const OrientedReadId focalOrientedReadId(ReadId(24347), 1);
+    //     const ReadId focalReadId = focalOrientedReadId.getReadId();
+    //     const Strand focalReadStrand = focalOrientedReadId.getStrand();
+    //     const string focalReadLabel =
+    //         to_string(uint64_t(focalReadId)) + "-" + to_string(uint64_t(focalReadStrand));
+    //     const Reads& reads = assembler.getReads();
+    //     const uint32_t focalReadLength = uint32_t(reads.getRead(focalReadId).baseCount);
 
-        static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
+    //     const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
+    //         focalReadId,
+    //         assemblerOptions.alignOptions,
+    //         threadCount,
+    //         0,      // maxReadsToProcess
+    //         0,      // maxAlignmentsToProcess
+    //         false,  // includeDeletedAlignments
+    //         true    // readGraphOnly
+    //     );
+    //     const uint32_t clusterSiteCount = uint32_t(
+    //         clusters.clusterMemberOffsets.empty() ? 0 : (clusters.clusterMemberOffsets.size() - 1));
 
-        // Collect mismatch-defined sites that explicitly involve focalReadId (it has a mismatch at that site).
-        struct FocalMismatchSite {
-            uint32_t focalPos = 0;
-            uint32_t siteId = 0;
-        };
-        vector<FocalMismatchSite> focalMismatchSites;
-        focalMismatchSites.reserve(clusterSiteCount);
-        for (size_t siteId = 0; siteId + 1 < clusters.clusterMemberOffsets.size(); siteId++) {
-            const uint64_t begin = clusters.clusterMemberOffsets[siteId];
-            const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
-            uint32_t bestPos = std::numeric_limits<uint32_t>::max();
-            for (uint64_t i = begin; i < end; i++) {
-                const auto& node = clusters.nodes[clusters.clusterMembers[i]];
-                if (node.first == focalReadId) {
-                    bestPos = std::min(bestPos, node.second);
-                }
-            }
-            if (bestPos != std::numeric_limits<uint32_t>::max()) {
-                if (focalReadStrand == 1 && focalReadLength > 0 && bestPos < focalReadLength) {
-                    bestPos = (focalReadLength - 1U) - bestPos;
-                }
-                focalMismatchSites.push_back(FocalMismatchSite{bestPos, uint32_t(siteId)});
-            }
-        }
-        sort(focalMismatchSites.begin(), focalMismatchSites.end(),
-            [](const FocalMismatchSite& a, const FocalMismatchSite& b) {
-                if (a.focalPos != b.focalPos) {
-                    return a.focalPos < b.focalPos;
-                }
-                return a.siteId < b.siteId;
-            });
-        cout << timestamp << "Read" << focalReadLabel
-             << " mismatch sites (readGraph clusters): " << focalMismatchSites.size() << endl;
+    //     static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
 
-        const auto propagationStart = std::chrono::steady_clock::now();
-        cout << timestamp << "GlobalHetSite member propagation (readGraph): starting..." << endl;
-        const auto members = assembler.computeGlobalHetSiteAlleleMembersUsingReadGraph(
-            clusters,
-            assemblerOptions.alignOptions,
-            0,      // maxPendingTasks
-            false,  // includeDeletedAlignments
-            focalReadId
-        );
-        const auto propagationSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - propagationStart).count();
+    //     // Collect mismatch-defined sites that explicitly involve focalReadId (it has a mismatch at that site).
+    //     struct FocalMismatchSite {
+    //         uint32_t focalPos = 0;
+    //         uint32_t siteId = 0;
+    //     };
+    //     vector<FocalMismatchSite> focalMismatchSites;
+    //     focalMismatchSites.reserve(clusterSiteCount);
+    //     for (size_t siteId = 0; siteId + 1 < clusters.clusterMemberOffsets.size(); siteId++) {
+    //         const uint64_t begin = clusters.clusterMemberOffsets[siteId];
+    //         const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
+    //         uint32_t bestPos = std::numeric_limits<uint32_t>::max();
+    //         for (uint64_t i = begin; i < end; i++) {
+    //             const auto& node = clusters.nodes[clusters.clusterMembers[i]];
+    //             if (node.first == focalReadId) {
+    //                 bestPos = std::min(bestPos, node.second);
+    //             }
+    //         }
+    //         if (bestPos != std::numeric_limits<uint32_t>::max()) {
+    //             if (focalReadStrand == 1 && focalReadLength > 0 && bestPos < focalReadLength) {
+    //                 bestPos = (focalReadLength - 1U) - bestPos;
+    //             }
+    //             focalMismatchSites.push_back(FocalMismatchSite{bestPos, uint32_t(siteId)});
+    //         }
+    //     }
+    //     sort(focalMismatchSites.begin(), focalMismatchSites.end(),
+    //         [](const FocalMismatchSite& a, const FocalMismatchSite& b) {
+    //             if (a.focalPos != b.focalPos) {
+    //                 return a.focalPos < b.focalPos;
+    //             }
+    //             return a.siteId < b.siteId;
+    //         });
+    //     cout << timestamp << "Read" << focalReadLabel
+    //          << " mismatch sites (readGraph clusters): " << focalMismatchSites.size() << endl;
 
-        cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << clusterSiteCount
-             << " propagatedAssignments=" << members.propagatedAssignments
-             << " mappingHoles=" << members.mappingHoles
-             << " mappingConflicts=" << members.mappingConflicts
-             << " elapsedSec=" << propagationSeconds
-             << endl;
+    //     const auto propagationStart = std::chrono::steady_clock::now();
+    //     cout << timestamp << "GlobalHetSite member propagation (readGraph): starting..." << endl;
+    //     const auto members = assembler.computeGlobalHetSiteAlleleMembersUsingReadGraph(
+    //         clusters,
+    //         assemblerOptions.alignOptions,
+    //         0,      // maxPendingTasks
+    //         false,  // includeDeletedAlignments
+    //         focalReadId
+    //     );
+    //     const auto propagationSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+    //         std::chrono::steady_clock::now() - propagationStart).count();
 
-        // Compute a consistent strand assignment for reads reachable from the focal read in the read graph.
-        // This lets us export member positions (and alleles) in a single, focal-oriented coordinate frame.
-        uint64_t strandConflicts = 0;
-        vector<int8_t> strandByRead = assembler.computeReadGraphStrandsFromSeed(
-            focalReadId,
-            strandConflicts,
-            false // includeDeletedAlignments
-        );
-        if (focalReadStrand == 1) {
-            for (int8_t& v : strandByRead) {
-                if (v != -1) {
-                    v = int8_t(v ^ 1);
-                }
-            }
-        }
-        {
-            uint64_t assigned = 0;
-            for (const int8_t v : strandByRead) {
-                if (v != -1) {
-                    assigned++;
-                }
-            }
-            cout << timestamp << "ReadGraph strand assignment: assigned=" << assigned
-                 << " conflicts=" << strandConflicts << endl;
-        }
+    //     cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << clusterSiteCount
+    //          << " propagatedAssignments=" << members.propagatedAssignments
+    //          << " mappingHoles=" << members.mappingHoles
+    //          << " mappingConflicts=" << members.mappingConflicts
+    //          << " elapsedSec=" << propagationSeconds
+    //          << endl;
 
-        static const uint8_t complementBase[4] = {3, 2, 1, 0};
-        const auto orientedMembers = assembler.orientGlobalHetSiteAlleleMembers(members, strandByRead);
+    //     // Compute a consistent strand assignment for reads reachable from the focal read in the read graph.
+    //     // This lets us export member positions (and alleles) in a single, focal-oriented coordinate frame.
+    //     uint64_t strandConflicts = 0;
+    //     vector<int8_t> strandByRead = assembler.computeReadGraphStrandsFromSeed(
+    //         focalReadId,
+    //         strandConflicts,
+    //         false // includeDeletedAlignments
+    //     );
+    //     if (focalReadStrand == 1) {
+    //         for (int8_t& v : strandByRead) {
+    //             if (v != -1) {
+    //                 v = int8_t(v ^ 1);
+    //             }
+    //         }
+    //     }
+    //     {
+    //         uint64_t assigned = 0;
+    //         for (const int8_t v : strandByRead) {
+    //             if (v != -1) {
+    //                 assigned++;
+    //             }
+    //         }
+    //         cout << timestamp << "ReadGraph strand assignment: assigned=" << assigned
+    //              << " conflicts=" << strandConflicts << endl;
+    //     }
 
-        // Spot-check: verify that a few sites involving the focal read have self-consistent positions
-        // under a readGraph-only multi-source traversal seeded from the mismatch members.
-        {
-            const size_t checkCount = std::min<size_t>(3, focalMismatchSites.size());
-            for (size_t i = 0; i < checkCount; i++) {
-                const uint32_t siteId = focalMismatchSites[i].siteId;
-                const auto stats = assembler.debugVerifyGlobalHetSitePositionsUsingReadGraph(
-                    clusters,
-                    members,
-                    siteId,
-                    assemblerOptions.alignOptions,
-                    20000,   // maxNodesToVisit
-                    200000,  // maxAlignmentsToScan
-                    false    // includeDeletedAlignments
-                );
-                cout << timestamp << "GlobalHetSite verify: siteId=" << siteId
-                     << " expected=" << stats.expectedMembers
-                     << " reached=" << stats.reachedMembers
-                     << " checked=" << stats.checkedMappings
-                     << " mismatched=" << stats.mismatchedPositions
-                     << " holes=" << stats.mappingHoles
-                     << " fails=" << stats.mappingFailures
-                     << " hitNodeLimit=" << stats.hitNodeLimit
-                     << " hitAlignmentLimit=" << stats.hitAlignmentLimit
-                     << endl;
-            }
-        }
+    //     static const uint8_t complementBase[4] = {3, 2, 1, 0};
+    //     const auto orientedMembers = assembler.orientGlobalHetSiteAlleleMembers(members, strandByRead);
 
-        const uint32_t siteCount = uint32_t(members.offsets.size());
+    //     // Spot-check: verify that a few sites involving the focal read have self-consistent positions
+    //     // under a readGraph-only multi-source traversal seeded from the mismatch members.
+    //     {
+    //         const size_t checkCount = std::min<size_t>(3, focalMismatchSites.size());
+    //         for (size_t i = 0; i < checkCount; i++) {
+    //             const uint32_t siteId = focalMismatchSites[i].siteId;
+    //             const auto stats = assembler.debugVerifyGlobalHetSitePositionsUsingReadGraph(
+    //                 clusters,
+    //                 members,
+    //                 siteId,
+    //                 assemblerOptions.alignOptions,
+    //                 20000,   // maxNodesToVisit
+    //                 200000,  // maxAlignmentsToScan
+    //                 false    // includeDeletedAlignments
+    //             );
+    //             cout << timestamp << "GlobalHetSite verify: siteId=" << siteId
+    //                  << " expected=" << stats.expectedMembers
+    //                  << " reached=" << stats.reachedMembers
+    //                  << " checked=" << stats.checkedMappings
+    //                  << " mismatched=" << stats.mismatchedPositions
+    //                  << " holes=" << stats.mappingHoles
+    //                  << " fails=" << stats.mappingFailures
+    //                  << " hitNodeLimit=" << stats.hitNodeLimit
+    //                  << " hitAlignmentLimit=" << stats.hitAlignmentLimit
+    //                  << endl;
+    //         }
+    //     }
 
-        // Precompute mismatch-member counts and per-allele mismatch counts once per site.
-        vector<array<uint32_t, 4> > mismatchCountsForward(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
-        vector<array<uint32_t, 4> > mismatchCountsOriented(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
-        vector<uint64_t> mismatchMembersBySite(siteCount, 0);
-        for (uint32_t siteId = 0; siteId < siteCount && (siteId + 1) < clusters.clusterMemberOffsets.size(); siteId++) {
-            const uint64_t begin = clusters.clusterMemberOffsets[siteId];
-            const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
-            mismatchMembersBySite[siteId] = end - begin;
-            for (uint64_t j = begin; j < end; j++) {
-                const auto& node = clusters.nodes[clusters.clusterMembers[j]];
-                uint8_t b = reads.getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
-                if (b >= 4) {
-                    continue;
-                }
-                mismatchCountsForward[siteId][b]++;
-                const int8_t s = (uint64_t(node.first) < strandByRead.size()) ? strandByRead[uint64_t(node.first)] : int8_t(-1);
-                if (s == 1) {
-                    b = complementBase[b];
-                }
-                mismatchCountsOriented[siteId][b]++;
-            }
-        }
+    //     const uint32_t siteCount = uint32_t(members.offsets.size());
 
-        // Precompute oriented support counts and total members per site once.
-        // These are reused in filtering, printing, and export.
-        vector<array<uint64_t, 4> > orientedSiteCounts(siteCount, array<uint64_t, 4>{0, 0, 0, 0});
-        vector<uint64_t> orientedSiteMembers(siteCount, 0);
-        const uint32_t orientedCount = uint32_t(orientedMembers.offsets.size());
-        for (uint32_t siteId = 0; siteId < siteCount && siteId < orientedCount; siteId++) {
-            const auto& off = orientedMembers.offsets[siteId];
-            for (int allele = 0; allele < 4; allele++) {
-                orientedSiteCounts[siteId][allele] = off[allele + 1] - off[allele];
-                orientedSiteMembers[siteId] += orientedSiteCounts[siteId][allele];
-            }
-        }
+    //     // Precompute mismatch-member counts and per-allele mismatch counts once per site.
+    //     vector<array<uint32_t, 4> > mismatchCountsForward(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
+    //     vector<array<uint32_t, 4> > mismatchCountsOriented(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
+    //     vector<uint64_t> mismatchMembersBySite(siteCount, 0);
+    //     for (uint32_t siteId = 0; siteId < siteCount && (siteId + 1) < clusters.clusterMemberOffsets.size(); siteId++) {
+    //         const uint64_t begin = clusters.clusterMemberOffsets[siteId];
+    //         const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
+    //         mismatchMembersBySite[siteId] = end - begin;
+    //         for (uint64_t j = begin; j < end; j++) {
+    //             const auto& node = clusters.nodes[clusters.clusterMembers[j]];
+    //             uint8_t b = reads.getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
+    //             if (b >= 4) {
+    //                 continue;
+    //             }
+    //             mismatchCountsForward[siteId][b]++;
+    //             const int8_t s = (uint64_t(node.first) < strandByRead.size()) ? strandByRead[uint64_t(node.first)] : int8_t(-1);
+    //             if (s == 1) {
+    //                 b = complementBase[b];
+    //             }
+    //             mismatchCountsOriented[siteId][b]++;
+    //         }
+    //     }
 
-        // Keep only robust multiallelic sites: at least 2 alleles with support >= 3.
-        static constexpr uint32_t minAlleleSupportForExport = 3;
-        static constexpr uint32_t minAlleleCountForExport = 2;
-        vector<uint8_t> sitePassesMultiallelic(siteCount, 0);
-        for (uint32_t siteId = 0; siteId < siteCount; siteId++) {
-            uint32_t supportedAlleles = 0;
-            for (int allele = 0; allele < 4; allele++) {
-                if (orientedSiteCounts[siteId][allele] >= minAlleleSupportForExport) {
-                    supportedAlleles++;
-                }
-            }
-            sitePassesMultiallelic[siteId] = uint8_t(supportedAlleles >= minAlleleCountForExport);
-        }
+    //     // Precompute oriented support counts and total members per site once.
+    //     // These are reused in filtering, printing, and export.
+    //     vector<array<uint64_t, 4> > orientedSiteCounts(siteCount, array<uint64_t, 4>{0, 0, 0, 0});
+    //     vector<uint64_t> orientedSiteMembers(siteCount, 0);
+    //     const uint32_t orientedCount = uint32_t(orientedMembers.offsets.size());
+    //     for (uint32_t siteId = 0; siteId < siteCount && siteId < orientedCount; siteId++) {
+    //         const auto& off = orientedMembers.offsets[siteId];
+    //         for (int allele = 0; allele < 4; allele++) {
+    //             orientedSiteCounts[siteId][allele] = off[allele + 1] - off[allele];
+    //             orientedSiteMembers[siteId] += orientedSiteCounts[siteId][allele];
+    //         }
+    //     }
 
-        const auto readIndex = assembler.buildFilteredGlobalHetSiteReadIndex(
-            members,
-            minAlleleSupportForExport,
-            minAlleleCountForExport
-        );
-        const uint32_t invalidPos = std::numeric_limits<uint32_t>::max();
-        const vector<Assembler::GlobalHetSiteReadIndex::ReadSite> emptyFocalReadSites;
-        const auto& focalReadSites =
-            (uint64_t(focalReadId) < readIndex.sitesByRead.size()) ?
-            readIndex.sitesByRead[uint64_t(focalReadId)] :
-            emptyFocalReadSites;
-        vector<uint32_t> focalReadPosBySite(siteCount, invalidPos);
-        vector<char> focalReadAlleleBySite(siteCount, '?');
-        for (const auto& s : focalReadSites) {
-            if (s.siteId < siteCount) {
-                uint32_t pos = s.readPosition;
-                uint8_t allele = s.allele;
-                if (focalReadStrand == 1 && focalReadLength > 0 && pos < focalReadLength) {
-                    pos = (focalReadLength - 1U) - pos;
-                    allele = complementBase[allele];
-                }
-                focalReadPosBySite[s.siteId] = pos;
-                focalReadAlleleBySite[s.siteId] = baseToAscii[allele];
-            }
-        }
+    //     // Keep only robust multiallelic sites: at least 2 alleles with support >= 3.
+    //     static constexpr uint32_t minAlleleSupportForExport = 3;
+    //     static constexpr uint32_t minAlleleCountForExport = 2;
+    //     vector<uint8_t> sitePassesMultiallelic(siteCount, 0);
+    //     for (uint32_t siteId = 0; siteId < siteCount; siteId++) {
+    //         uint32_t supportedAlleles = 0;
+    //         for (int allele = 0; allele < 4; allele++) {
+    //             if (orientedSiteCounts[siteId][allele] >= minAlleleSupportForExport) {
+    //                 supportedAlleles++;
+    //             }
+    //         }
+    //         sitePassesMultiallelic[siteId] = uint8_t(supportedAlleles >= minAlleleCountForExport);
+    //     }
 
-        vector<Assembler::GlobalHetSiteReadIndex::ReadSite> filteredFocalReadSites;
-        filteredFocalReadSites.reserve(focalReadSites.size());
-        for (const auto& s : focalReadSites) {
-            if (s.siteId < sitePassesMultiallelic.size() && sitePassesMultiallelic[s.siteId]) {
-                filteredFocalReadSites.push_back(s);
-            }
-        }
+    //     const auto readIndex = assembler.buildFilteredGlobalHetSiteReadIndex(
+    //         members,
+    //         minAlleleSupportForExport,
+    //         minAlleleCountForExport
+    //     );
+    //     const uint32_t invalidPos = std::numeric_limits<uint32_t>::max();
+    //     const vector<Assembler::GlobalHetSiteReadIndex::ReadSite> emptyFocalReadSites;
+    //     const auto& focalReadSites =
+    //         (uint64_t(focalReadId) < readIndex.sitesByRead.size()) ?
+    //         readIndex.sitesByRead[uint64_t(focalReadId)] :
+    //         emptyFocalReadSites;
+    //     vector<uint32_t> focalReadPosBySite(siteCount, invalidPos);
+    //     vector<char> focalReadAlleleBySite(siteCount, '?');
+    //     for (const auto& s : focalReadSites) {
+    //         if (s.siteId < siteCount) {
+    //             uint32_t pos = s.readPosition;
+    //             uint8_t allele = s.allele;
+    //             if (focalReadStrand == 1 && focalReadLength > 0 && pos < focalReadLength) {
+    //                 pos = (focalReadLength - 1U) - pos;
+    //                 allele = complementBase[allele];
+    //             }
+    //             focalReadPosBySite[s.siteId] = pos;
+    //             focalReadAlleleBySite[s.siteId] = baseToAscii[allele];
+    //         }
+    //     }
 
-        cout << timestamp << "Read" << focalReadLabel
-             << " projected global het sites after multiallelic filter: "
-             << filteredFocalReadSites.size() << " / " << focalReadSites.size()
-             << " (need >= " << minAlleleCountForExport << " alleles with support >= "
-             << minAlleleSupportForExport << ")" << endl;
+    //     vector<Assembler::GlobalHetSiteReadIndex::ReadSite> filteredFocalReadSites;
+    //     filteredFocalReadSites.reserve(focalReadSites.size());
+    //     for (const auto& s : focalReadSites) {
+    //         if (s.siteId < sitePassesMultiallelic.size() && sitePassesMultiallelic[s.siteId]) {
+    //             filteredFocalReadSites.push_back(s);
+    //         }
+    //     }
 
-        // Print 10 sites involving focalReadId.
-        const size_t toPrint = std::min<size_t>(10, filteredFocalReadSites.size());
-        for (size_t i = 0; i < toPrint; i++) {
-            const uint32_t siteId = filteredFocalReadSites[i].siteId;
-            const uint32_t focalPos =
-                (siteId < focalReadPosBySite.size()) ? focalReadPosBySite[siteId] : invalidPos;
-            const char focalAllele =
-                (siteId < focalReadAlleleBySite.size()) ? focalReadAlleleBySite[siteId] : '?';
-            const uint64_t mismatchMembers =
-                (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
-            const auto mismatchCounts =
-                (siteId < mismatchCountsForward.size()) ?
-                mismatchCountsForward[siteId] :
-                std::array<uint32_t, 4>{0, 0, 0, 0};
-            const auto siteCounts =
-                (siteId < orientedSiteCounts.size()) ?
-                orientedSiteCounts[siteId] :
-                std::array<uint64_t, 4>{0, 0, 0, 0};
-            const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
+    //     cout << timestamp << "Read" << focalReadLabel
+    //          << " projected global het sites after multiallelic filter: "
+    //          << filteredFocalReadSites.size() << " / " << focalReadSites.size()
+    //          << " (need >= " << minAlleleCountForExport << " alleles with support >= "
+    //          << minAlleleSupportForExport << ")" << endl;
 
-            cout << timestamp
-                 << "GlobalHetSite[" << i << "]"
-                 << " read" << focalReadLabel << "Pos=" << focalPos
-                 << " read" << focalReadLabel << "Allele=" << focalAllele
-                 << " mismatchMembers=" << mismatchMembers
-                 << " mismatchCounts(A,C,G,T)=(" << mismatchCounts[0] << "," << mismatchCounts[1] << "," << mismatchCounts[2] << "," << mismatchCounts[3] << ")"
-                 << " siteMembers=" << siteMembers
-                 << " siteCounts(A,C,G,T)=(" << siteCounts[0] << "," << siteCounts[1] << "," << siteCounts[2] << "," << siteCounts[3] << ")"
-                 << " members={";
+    //     // Print 10 sites involving focalReadId.
+    //     const size_t toPrint = std::min<size_t>(10, filteredFocalReadSites.size());
+    //     for (size_t i = 0; i < toPrint; i++) {
+    //         const uint32_t siteId = filteredFocalReadSites[i].siteId;
+    //         const uint32_t focalPos =
+    //             (siteId < focalReadPosBySite.size()) ? focalReadPosBySite[siteId] : invalidPos;
+    //         const char focalAllele =
+    //             (siteId < focalReadAlleleBySite.size()) ? focalReadAlleleBySite[siteId] : '?';
+    //         const uint64_t mismatchMembers =
+    //             (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
+    //         const auto mismatchCounts =
+    //             (siteId < mismatchCountsForward.size()) ?
+    //             mismatchCountsForward[siteId] :
+    //             std::array<uint32_t, 4>{0, 0, 0, 0};
+    //         const auto siteCounts =
+    //             (siteId < orientedSiteCounts.size()) ?
+    //             orientedSiteCounts[siteId] :
+    //             std::array<uint64_t, 4>{0, 0, 0, 0};
+    //         const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
 
-            // Show up to 8 members per allele.
-            for (int allele = 0; allele < 4; allele++) {
-                const uint64_t b0 = orientedMembers.offsets[siteId][allele];
-                const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
-                const uint64_t show = std::min<uint64_t>(b1 - b0, 8);
-                if (show == 0) {
-                    continue;
-                }
-                cout << baseToAscii[allele] << ":{";
-                for (uint64_t k = 0; k < show; k++) {
-                    const auto& m = orientedMembers.members[b0 + k];
-                    cout << m.orientedReadId.getReadId()
-                         << (m.orientedReadId.getStrand() == 1 ? "rc" : "fw")
-                         << "-" << m.position;
-                    if (k + 1 < show) {
-                        cout << ",";
-                    }
-                }
-                if ((b1 - b0) > show) {
-                    cout << ",...";
-                }
-                cout << "}";
-            }
-            cout << "}" << endl;
-        }
+    //         cout << timestamp
+    //              << "GlobalHetSite[" << i << "]"
+    //              << " read" << focalReadLabel << "Pos=" << focalPos
+    //              << " read" << focalReadLabel << "Allele=" << focalAllele
+    //              << " mismatchMembers=" << mismatchMembers
+    //              << " mismatchCounts(A,C,G,T)=(" << mismatchCounts[0] << "," << mismatchCounts[1] << "," << mismatchCounts[2] << "," << mismatchCounts[3] << ")"
+    //              << " siteMembers=" << siteMembers
+    //              << " siteCounts(A,C,G,T)=(" << siteCounts[0] << "," << siteCounts[1] << "," << siteCounts[2] << "," << siteCounts[3] << ")"
+    //              << " members={";
 
-        // Export all SNP sites involving read 0 (summary + full per-allele member list).
-        {
-            const string summaryFileName = "Read" + focalReadLabel + "GlobalHetSitesSummary.tsv";
-            const string membersFileName = "Read" + focalReadLabel + "GlobalHetSitesMembers.tsv";
-            std::ofstream summary(summaryFileName);
-            std::ofstream membersOut(membersFileName);
-            if (!summary || !membersOut) {
-                cout << timestamp << "Failed to open export files for read " << focalReadLabel << "." << endl;
-            } else {
-                summary << "siteId\treadPos\tmismatchMembers\tmismatchA\tmismatchC\tmismatchG\tmismatchT"
-                        << "\tsiteMembers\tsiteA\tsiteC\tsiteG\tsiteT\treadAllele\n";
-                membersOut << "siteId\treadPos0\treadAllele\treadId\treadStrand\tposition0\tpositionForward0\treadLength\n";
+    //         // Show up to 8 members per allele.
+    //         for (int allele = 0; allele < 4; allele++) {
+    //             const uint64_t b0 = orientedMembers.offsets[siteId][allele];
+    //             const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
+    //             const uint64_t show = std::min<uint64_t>(b1 - b0, 8);
+    //             if (show == 0) {
+    //                 continue;
+    //             }
+    //             cout << baseToAscii[allele] << ":{";
+    //             for (uint64_t k = 0; k < show; k++) {
+    //                 const auto& m = orientedMembers.members[b0 + k];
+    //                 cout << m.orientedReadId.getReadId()
+    //                      << (m.orientedReadId.getStrand() == 1 ? "rc" : "fw")
+    //                      << "-" << m.position;
+    //                 if (k + 1 < show) {
+    //                     cout << ",";
+    //                 }
+    //             }
+    //             if ((b1 - b0) > show) {
+    //                 cout << ",...";
+    //             }
+    //             cout << "}";
+    //         }
+    //         cout << "}" << endl;
+    //     }
 
-                // Prefer the mismatch-defined sites for "SNP sites of read0".
-                // If there are none, fall back to the propagated membership list.
-                const bool useMismatchSites = !focalMismatchSites.empty();
-                const size_t exportCount = useMismatchSites ? focalMismatchSites.size() : filteredFocalReadSites.size();
-                vector<uint32_t> readLengths(reads.readCount(), 0);
-                for (uint64_t iRead = 0; iRead < reads.readCount(); iRead++) {
-                    const ReadId rid = ReadId(iRead);
-                    readLengths[iRead] = uint32_t(reads.getRead(rid).baseCount);
-                }
-                size_t exportedCount = 0;
-                size_t filteredOutCount = 0;
-                for (size_t idx = 0; idx < exportCount; idx++) {
-                    const uint32_t siteId = useMismatchSites ? focalMismatchSites[idx].siteId : filteredFocalReadSites[idx].siteId;
-                    if (siteId >= readIndex.sitePassesFilter.size() || readIndex.sitePassesFilter[siteId] == 0) {
-                        filteredOutCount++;
-                        continue;
-                    }
-                    if (siteId >= sitePassesMultiallelic.size() || sitePassesMultiallelic[siteId] == 0) {
-                        filteredOutCount++;
-                        continue;
-                    }
-                    if (siteId >= focalReadPosBySite.size() || focalReadPosBySite[siteId] == invalidPos) {
-                        // Keep per-read-consistency filtering strict for DP-ready exports.
-                        filteredOutCount++;
-                        continue;
-                    }
-                    const uint32_t readPos = focalReadPosBySite[siteId];
-                    const char readAllele = focalReadAlleleBySite[siteId];
+    //     // Export all SNP sites involving read 0 (summary + full per-allele member list).
+    //     {
+    //         const string summaryFileName = "Read" + focalReadLabel + "GlobalHetSitesSummary.tsv";
+    //         const string membersFileName = "Read" + focalReadLabel + "GlobalHetSitesMembers.tsv";
+    //         std::ofstream summary(summaryFileName);
+    //         std::ofstream membersOut(membersFileName);
+    //         if (!summary || !membersOut) {
+    //             cout << timestamp << "Failed to open export files for read " << focalReadLabel << "." << endl;
+    //         } else {
+    //             summary << "siteId\treadPos\tmismatchMembers\tmismatchA\tmismatchC\tmismatchG\tmismatchT"
+    //                     << "\tsiteMembers\tsiteA\tsiteC\tsiteG\tsiteT\treadAllele\n";
+    //             membersOut << "siteId\treadPos0\treadAllele\treadId\treadStrand\tposition0\tpositionForward0\treadLength\n";
 
-                    const uint64_t mismatchMembers =
-                        (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
-                    const auto mismatchCounts =
-                        (siteId < mismatchCountsOriented.size()) ?
-                        mismatchCountsOriented[siteId] :
-                        std::array<uint32_t, 4>{0, 0, 0, 0};
-                    const auto siteCounts =
-                        (siteId < orientedSiteCounts.size()) ?
-                        orientedSiteCounts[siteId] :
-                        std::array<uint64_t, 4>{0, 0, 0, 0};
+    //             // Prefer the mismatch-defined sites for "SNP sites of read0".
+    //             // If there are none, fall back to the propagated membership list.
+    //             const bool useMismatchSites = !focalMismatchSites.empty();
+    //             const size_t exportCount = useMismatchSites ? focalMismatchSites.size() : filteredFocalReadSites.size();
+    //             vector<uint32_t> readLengths(reads.readCount(), 0);
+    //             for (uint64_t iRead = 0; iRead < reads.readCount(); iRead++) {
+    //                 const ReadId rid = ReadId(iRead);
+    //                 readLengths[iRead] = uint32_t(reads.getRead(rid).baseCount);
+    //             }
+    //             size_t exportedCount = 0;
+    //             size_t filteredOutCount = 0;
+    //             for (size_t idx = 0; idx < exportCount; idx++) {
+    //                 const uint32_t siteId = useMismatchSites ? focalMismatchSites[idx].siteId : filteredFocalReadSites[idx].siteId;
+    //                 if (siteId >= readIndex.sitePassesFilter.size() || readIndex.sitePassesFilter[siteId] == 0) {
+    //                     filteredOutCount++;
+    //                     continue;
+    //                 }
+    //                 if (siteId >= sitePassesMultiallelic.size() || sitePassesMultiallelic[siteId] == 0) {
+    //                     filteredOutCount++;
+    //                     continue;
+    //                 }
+    //                 if (siteId >= focalReadPosBySite.size() || focalReadPosBySite[siteId] == invalidPos) {
+    //                     // Keep per-read-consistency filtering strict for DP-ready exports.
+    //                     filteredOutCount++;
+    //                     continue;
+    //                 }
+    //                 const uint32_t readPos = focalReadPosBySite[siteId];
+    //                 const char readAllele = focalReadAlleleBySite[siteId];
 
-                    // Export members using the focal-oriented coordinate frame (strandByRead),
-                    // plus the original forward coordinates for debugging.
-                    const uint32_t readPos0 = readPos;
-                    // Export members in oriented coordinates (position0/1) consistent with readStrand,
-                    // plus forward positions for debugging.
-                    for (int allele = 0; allele < 4; allele++) {
-                        const uint64_t b0 = orientedMembers.offsets[siteId][allele];
-                        const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
-                        for (uint64_t k = b0; k < b1; k++) {
-                            const auto& om = orientedMembers.members[k];
-                            const ReadId rid = om.orientedReadId.getReadId();
-                            const Strand strand = om.orientedReadId.getStrand();
-                            const uint32_t posOriented0 = om.position;
-                            const uint32_t len = (uint64_t(rid) < readLengths.size()) ? readLengths[uint64_t(rid)] : 0;
-                            if (len == 0 || posOriented0 >= len) {
-                                continue;
-                            }
-                            const uint32_t posFwd0 = (strand == 1) ? ((len - 1U) - posOriented0) : posOriented0;
+    //                 const uint64_t mismatchMembers =
+    //                     (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
+    //                 const auto mismatchCounts =
+    //                     (siteId < mismatchCountsOriented.size()) ?
+    //                     mismatchCountsOriented[siteId] :
+    //                     std::array<uint32_t, 4>{0, 0, 0, 0};
+    //                 const auto siteCounts =
+    //                     (siteId < orientedSiteCounts.size()) ?
+    //                     orientedSiteCounts[siteId] :
+    //                     std::array<uint64_t, 4>{0, 0, 0, 0};
 
-                            // Allele char is already in oriented frame by construction (bucketed by allele).
-                            const char alleleChar = baseToAscii[allele];
+    //                 // Export members using the focal-oriented coordinate frame (strandByRead),
+    //                 // plus the original forward coordinates for debugging.
+    //                 const uint32_t readPos0 = readPos;
+    //                 // Export members in oriented coordinates (position0/1) consistent with readStrand,
+    //                 // plus forward positions for debugging.
+    //                 for (int allele = 0; allele < 4; allele++) {
+    //                     const uint64_t b0 = orientedMembers.offsets[siteId][allele];
+    //                     const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
+    //                     for (uint64_t k = b0; k < b1; k++) {
+    //                         const auto& om = orientedMembers.members[k];
+    //                         const ReadId rid = om.orientedReadId.getReadId();
+    //                         const Strand strand = om.orientedReadId.getStrand();
+    //                         const uint32_t posOriented0 = om.position;
+    //                         const uint32_t len = (uint64_t(rid) < readLengths.size()) ? readLengths[uint64_t(rid)] : 0;
+    //                         if (len == 0 || posOriented0 >= len) {
+    //                             continue;
+    //                         }
+    //                         const uint32_t posFwd0 = (strand == 1) ? ((len - 1U) - posOriented0) : posOriented0;
 
-                            membersOut << siteId << "\t" << readPos0
-                                       << "\t" << alleleChar
-                                       << "\t" << rid
-                                       << "\t" << int(strand)
-                                       << "\t" << posOriented0
-                                       << "\t" << posFwd0
-                                       << "\t" << len
-                                       << "\n";
-                        }
-                    }
+    //                         // Allele char is already in oriented frame by construction (bucketed by allele).
+    //                         const char alleleChar = baseToAscii[allele];
 
-                    const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
-                    summary << siteId << "\t" << readPos
-                            << "\t" << mismatchMembers
-                            << "\t" << mismatchCounts[0] << "\t" << mismatchCounts[1] << "\t" << mismatchCounts[2] << "\t" << mismatchCounts[3]
-                            << "\t" << siteMembers
-                            << "\t" << siteCounts[0] << "\t" << siteCounts[1] << "\t" << siteCounts[2] << "\t" << siteCounts[3]
-                            << "\t" << readAllele
-                            << "\n";
-                    exportedCount++;
-                }
+    //                         membersOut << siteId << "\t" << readPos0
+    //                                    << "\t" << alleleChar
+    //                                    << "\t" << rid
+    //                                    << "\t" << int(strand)
+    //                                    << "\t" << posOriented0
+    //                                    << "\t" << posFwd0
+    //                                    << "\t" << len
+    //                                    << "\n";
+    //                     }
+    //                 }
 
-                cout << timestamp << "Wrote read" << focalReadLabel << " global het sites to " << summaryFileName
-                     << " and " << membersFileName
-                     << " (sites=" << exportedCount
-                     << ", filteredOut=" << filteredOutCount
-                     << ", criteria: >= " << minAlleleCountForExport
-                     << " alleles with support >= " << minAlleleSupportForExport
-                     << ")." << endl;
-            }
-        }
-    }
-    } else {
-        cout << timestamp << "Skipping global-het diagnostics/export. "
-             << "Set DINARA_ENABLE_GLOBAL_HET_DEBUG=1 to enable." << endl;
-    }
+    //                 const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
+    //                 summary << siteId << "\t" << readPos
+    //                         << "\t" << mismatchMembers
+    //                         << "\t" << mismatchCounts[0] << "\t" << mismatchCounts[1] << "\t" << mismatchCounts[2] << "\t" << mismatchCounts[3]
+    //                         << "\t" << siteMembers
+    //                         << "\t" << siteCounts[0] << "\t" << siteCounts[1] << "\t" << siteCounts[2] << "\t" << siteCounts[3]
+    //                         << "\t" << readAllele
+    //                         << "\n";
+    //                 exportedCount++;
+    //             }
+
+    //             cout << timestamp << "Wrote read" << focalReadLabel << " global het sites to " << summaryFileName
+    //                  << " and " << membersFileName
+    //                  << " (sites=" << exportedCount
+    //                  << ", filteredOut=" << filteredOutCount
+    //                  << ", criteria: >= " << minAlleleCountForExport
+    //                  << " alleles with support >= " << minAlleleSupportForExport
+    //                  << ")." << endl;
+    //         }
+    //     }
+    // }
+    // } else {
+    //     cout << timestamp << "Skipping global-het diagnostics/export. "
+    //          << "Set DINARA_ENABLE_GLOBAL_HET_DEBUG=1 to enable." << endl;
+    // }
 
     // return;
 
@@ -1143,15 +1154,11 @@ void dinara::main::assemble(
     DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
 
 
-
-
-    // To create a complete marker graph, generate all vertices
-    // regardless of coverage, and allow duplicate markers on vertices.
     assembler.createMarkerGraphVertices(
         2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
-        true,                                          // allowDuplicateMarkers
+        true,                                           // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);
@@ -1164,20 +1171,9 @@ void dinara::main::assemble(
     // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
-    // // Clean up of duplicate markers, if requested and necessary.
-    // if(assemblerOptions.markerGraphOptions.allowDuplicateMarkers and
-    //     assemblerOptions.markerGraphOptions.cleanupDuplicateMarkers) {
-    //     assembler.cleanupDuplicateMarkers(
-    //         threadCount,
-    //         assembler.getMarkerGraphMinCoverageUsed(),    // Stored by createMarkerGraphVertices.
-    //         assemblerOptions.markerGraphOptions.minCoveragePerStrand,
-    //         assemblerOptions.markerGraphOptions.duplicateMarkersPattern1Threshold,
-    //         true, true);
-    //     }
-
-    // Create edges of the marker graph.
-    assembler.createMarkerGraphEdges(threadCount);
-    assembler.findMarkerGraphReverseComplementEdges(threadCount);
+    // // Create edges of the marker graph.
+    // assembler.createMarkerGraphEdges(threadCount);
+    // assembler.findMarkerGraphReverseComplementEdges(threadCount);
 
     if(assemblerOptions.markerGraphOptions.writeVertexCoverageHistogram) {
         cout << timestamp << "Writing marker graph vertex coverage histogram to " <<
@@ -1187,68 +1183,185 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
-    // // Now that the marker graph is built from the broad read-graph overlap set,
-    // // we can tighten the overlap set by pruning overlaps for contained reads.
-    // // This changes the read graph (rebuilt below) but keeps the marker graph intact.
-    // const uint64_t minOverlapLengthForContainment = 50;
-    // const uint64_t maxHangForContainment = 1000;
-    // const double maxHangRateForContainment = 0.8;
-    // assembler.flagContainedReads(
-    //     maxHangForContainment,
-    //     maxHangRateForContainment,
-    //     minOverlapLengthForContainment,
-    //     threadCount);
-    // {
-    //     uint64_t containedFlagCount = 0;
-    //     for (ReadId r = 0; r < assembler.getReads().readCount(); ++r) {
-    //         if (assembler.getReads().getFlags(r).isContained) {
-    //             ++containedFlagCount;
-    //         }
-    //     }
-    //     cout << timestamp << "[DIAG] After flagContainedReads: containedReads=" << containedFlagCount << endl;
-    // }
-
-
-
     // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::Anchors> anchors;
+    shared_ptr<mode3::DirectedAnchors> anchors;
 
-    // Compute the coverage range for primary marker graph edges (anchors).
-    // This is done BEFORE marker graph vertex creation so filtering happens at source.
-    uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
-    uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;
-    if((minPrimaryCoverage == 0) and (maxPrimaryCoverage == 0)) {
-        tie(minPrimaryCoverage, maxPrimaryCoverage) = assembler.getPrimaryCoverageRange();
-        cout << "Automatically determined: minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-        minPrimaryCoverage = uint64_t(std::round(
-            double(minPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverageMultiplier));
-        maxPrimaryCoverage = uint64_t(std::round(
-            double(maxPrimaryCoverage) * assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverageMultiplier));
-        cout << "After applying specified multipliers: minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    } else {
-        cout << "Using minAnchorCoverage = " << minPrimaryCoverage <<
-            ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-    }
-
-    // // Robust vertex-based anchors: split marker graph vertices using surviving readGraph overlaps
-    // // (bridge removal + quasi-clique peeling), then emit per-cluster anchors (+ RC anchors).
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
-    //     minPrimaryCoverage, maxPrimaryCoverage, assemblerOptions.assemblyOptions.mode3Options, threadCount);
+    // Verkko-style: keep all vertices with coverage >= 2, no upper cap.
+    // MBG uses -a 1 (min k-mer abundance) + -u 2 (min unitig abundance) with no max.
+    // High-coverage repeat nodes are intentionally kept for triplet-based resolution.
+    const uint64_t minPrimaryCoverage = 2;
+    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    cout << "Using Verkko-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
+        ", maxAnchorCoverage = unlimited" << endl;
 
 
     anchors =
-            make_shared<mode3::Anchors>(
-                MappedMemoryOwner(assembler),
-                assembler.getReads(),
-                assembler.assemblerInfo->k,
-                *assembler.markers,
-                assembler.markerGraph,
-                minPrimaryCoverage,
-                maxPrimaryCoverage,
-                threadCount,
-                true); // createFromVertices
+        make_shared<mode3::DirectedAnchors>(
+            MappedMemoryOwner(assembler),
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            *assembler.markers,
+            assembler.markerGraph,
+            minPrimaryCoverage,
+            maxPrimaryCoverage,
+            threadCount,
+            true); // createFromVertices
+
+    // // Compute oriented read journeys.
+    // // AnchorIds already encode orientation (even=fwd, odd=rev), same as DagNodeId.
+    // anchors->computeJourneys(threadCount);
+
+    // // Run Mode 3 assembly.
+    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+
+    // ========================================================================
+    // Verkko-style directed anchor graph resolution — expanded pipeline.
+    // Each step can be individually commented out for debugging.
+    // ========================================================================
+
+    // Step 1: Build the DirectedAnchorGraph from anchors.
+    // Each anchor pair (2*m, 2*m+1) maps directly to a DAG segment m.
+    // AnchorId IS DagNodeId — no intermediate BidirectedAnchors needed.
+    // MBG Optimization: We skip alignment-based read intervals to avoid a slow serial loop.
+    // Paths and coordinates are based purely on journeys.
+    assembler.directedAnchorGraph = make_shared<mode3::DirectedAnchorGraph>();
+    assembler.directedAnchorGraph->buildFromAnchors(
+        *anchors,
+        threadCount);
+
+    auto& dag = *assembler.directedAnchorGraph;
+
+    cout << "Initial directed anchor graph: "
+         << dag.nodeCount() << " nodes, "
+         << dag.edgeCount() << " edges, "
+         << dag.pathCount() << " paths." << endl;
+
+    // Step 1b: Global segment filtering (MBG -u)
+    dag.removeLowCoverageSegments(2.0);
+    cout << "After global segment filtering (minCoverage=2.0): "
+         << dag.nodeCount() << " nodes, "
+         << dag.edgeCount() << " edges." << endl;
+
+    // Step 2: Initial unitigification (MBG workflow)
+    dag.unitigifyAll();
+    cout << "After initial unitigification: "
+         << dag.nodeCount() << " nodes, "
+         << dag.edgeCount() << " edges, "
+         << dag.pathCount() << " paths." << endl;
+    dag.writeSummary(cout);
+    dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
+
+    // Step 3: MBG-style cleaning phase
+    cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
+    const uint64_t maxResolveLength = 500000;
+    const bool doRoundCleaning = true;
+    const bool doGuessworkCleaning = true;
+    const uint64_t maxUnconditionalResolveLength = 0;
+    const bool copycountFilterHeuristic = false;
+    const uint64_t maxLocalResolve = 0;
+    const bool resolvePalindromesGlobal = false;
+
+    // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
+    auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
+    if(tipStats1.nodesRemoved > 0) {
+        cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
+             << tipStats1.edgesRemoved << " edges." << endl;
+        dag.unitigifyAll();
+        cout << "  After tip removal: "
+             << dag.nodeCount() << " nodes, "
+             << dag.edgeCount() << " edges." << endl;
+    }
+
+    // Step 3b: Remove low-coverage crosslinks
+    auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
+    if(crosslinkStats.edgesRemoved > 0) {
+        cout << "  Removed " << crosslinkStats.edgesRemoved
+             << " crosslink edges." << endl;
+        dag.unitigifyAll();
+        cout << "  After crosslink removal: "
+             << dag.nodeCount() << " nodes, "
+             << dag.edgeCount() << " edges." << endl;
+    }
+
+    // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
+    if(doGuessworkCleaning) {
+        double totalCov = 0.0;
+        uint64_t count = 0;
+        for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
+            if(!dag.nodeExists(segId)) continue;
+            totalCov += dag.getPathCoverage(segId);
+            count++;
+        }
+        const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
+        auto copyStats = dag.cleanComponentsByCopynumber(
+            avgCov,
+            50000,
+            0,
+            max(maxResolveLength, maxLocalResolve),
+            {},
+            0);
+        if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
+            cout << "  Copy-number cleaning removed "
+                 << copyStats.nodesRemoved << " nodes, "
+                 << copyStats.edgesRemoved << " edges." << endl;
+            dag.unitigifyAll();
+            cout << "  After copy-number cleaning: "
+                 << dag.nodeCount() << " nodes, "
+                 << dag.edgeCount() << " edges." << endl;
+        }
+    }
+
+    cout << timestamp << "Cleaning phase complete." << endl;
+    dag.writeSummary(cout);
+    dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
+
+    return;
+
+    // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
+    const uint64_t initialMinEdgeSupport = 20;
+
+    // Step 4a: Resolve with minEdgeSupport = initial pass.
+    cout << timestamp
+         << "Resolution step with minEdgeSupport="
+         << initialMinEdgeSupport << endl;
+    dag.resolveRound(
+        initialMinEdgeSupport,
+        maxResolveLength,
+        doRoundCleaning,
+        doGuessworkCleaning,
+        maxUnconditionalResolveLength,
+        copycountFilterHeuristic,
+        maxLocalResolve,
+        resolvePalindromesGlobal);
+    dag.unitigifyAll();
+    cout << "  After resolution step " << initialMinEdgeSupport << ": "
+         << dag.nodeCount() << " nodes, "
+         << dag.edgeCount() << " edges, "
+         << dag.pathCount() << " paths." << endl;
+
+    // Step 4b: MBG-style second pass with minimal support.
+    cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
+    dag.resolveRound(
+        1,
+        maxResolveLength,
+        doRoundCleaning,
+        doGuessworkCleaning,
+        maxUnconditionalResolveLength,
+        copycountFilterHeuristic,
+        maxLocalResolve,
+        resolvePalindromesGlobal);
+    dag.unitigifyAll();
+    cout << "  After final low-support pass: "
+         << dag.nodeCount() << " nodes, "
+         << dag.edgeCount() << " edges, "
+         << dag.pathCount() << " paths." << endl;
+
+    // Step 5: Write final graph
+    dag.verifyEdgeConsistency();
+    dag.writeSummary(cout);
+    dag.writeGfa("DirectedAnchorGraph.gfa");
+    dag.writePaths("DirectedAnchorGraph.paths.gaf");
 
 
     // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
@@ -1363,19 +1476,7 @@ void dinara::main::assemble(
     // }
     
 
-    // Compute oriented read journeys.
-    anchors->computeJourneys(threadCount);
-    // const vector<uint64_t> keptAnchors =
-    //     anchors->writeStableOverlapIntervalsBestAnchorsAndCollectKeptAnchors(
-    //     assembler.readGraph,
-    //     assembler.alignmentData,
-    //     threadCount);
-
-    // // Recompute journeys using only the anchors selected as best in at least one stable interval.
-    // anchors->computeJourneys(threadCount, &keptAnchors);
-
-    // Run Mode 3 assembly (initializes mode3Assembler for HTTP server).
-    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    
 
     // Store elapsed time for assembly.
     const auto steadyClock1 = std::chrono::steady_clock::now();

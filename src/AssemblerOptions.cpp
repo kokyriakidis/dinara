@@ -1335,6 +1335,8 @@ void AssemblerOptions::addConfigurableOptions()
         "FromMarkerGraphVerticesBestPerOverlapInterval, "
         "FromMarkerGraphVerticesBestPerOverlapIntervalDecomposed, "
         "FromMarkerGraphVerticesSplitUsingReadGraph, "
+        "FromOverlapsBestPerOverlapInterval, "
+        "FromOverlapsBestPerOverlapIntervalBidirectional, "
         "FromMarkerKmers, FromJson.")
 
         ("Assembly.mode3.minAnchorCoverage",
