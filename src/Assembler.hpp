@@ -2523,7 +2523,7 @@ private:
 
 public:
     // Prune existing markers based on KmerCounter frequencies.
-    void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount);
+    void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes = true);
 
     // Alignment candidates using Inverted Index (modular pipeline).
     // Phase 1-4: Build the inverted index for overlap candidate discovery.
@@ -2630,6 +2630,7 @@ private:
     public:
         uint64_t minFreq;
         uint64_t maxFreq;
+        bool filterPalindromes;
         shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> oldMarkers;
         shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> oldMarkerKmerIds;
         

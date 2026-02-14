@@ -1246,10 +1246,11 @@ void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
  * @param maxFreq Maximum k-mer frequency threshold (inclusive)
  * @param threadCount Number of worker threads (0 = auto-detect)
  */
-void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount)
+void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes)
 {
     performanceLog << timestamp << "Filtering markers by frequency [" 
-                   << minFreq << ", " << maxFreq << "]." << endl;
+                   << minFreq << ", " << maxFreq << "] and palindromes: " 
+                   << (filterPalindromes ? "yes" : "no") << "." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
     // =========================================================================
@@ -1279,6 +1280,7 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
 
     applyKmerCountFilterData.minFreq = minFreq;
     applyKmerCountFilterData.maxFreq = maxFreq;
+    applyKmerCountFilterData.filterPalindromes = filterPalindromes;
 
     markers->createNew(markersName, largeDataPageSize);
     markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
@@ -1417,6 +1419,12 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
                 const uint64_t freq = kmerCounter->getFrequencyFast(canonical);
                 
                 if(freq >= minF && freq <= maxF) {
+                    
+                    // Palindrome check: if requested, skip markers where kmerId == rcKmerId.
+                    if(applyKmerCountFilterData.filterPalindromes && kmerId == rcKmerId) {
+                        continue;
+                    }
+
                     // Set validity bit using bitwise ops (>> 3 = /8, & 7 = %8).
                     validityBits[i >> 3] |= (uint8_t(1) << (i & 7));
                     // Cache rcKmerId for Pass 2 (avoids recomputing reverseComplement).

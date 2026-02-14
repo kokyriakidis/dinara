@@ -499,23 +499,21 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD closed syncmers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
-        // ORIGINAL: Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
-        // This generates a superset of the markers we eventually want.
+        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
         assembler.findMarkersSimdClosedSyncmers(
             threadCount,
             assemblerOptions.kmersOptions.k,
             assemblerOptions.kmersOptions.syncmerS);
 
-        // // NEW: Use SIMD-accelerated minimizers instead of closed syncmers.
+        // // Use SIMD-accelerated minimizers instead of closed syncmers.
         // // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
         // // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
         // assembler.findMarkersSimdMinimizers(
         //     threadCount,
         //     assemblerOptions.kmersOptions.k,
-        //     assemblerOptions.kmersOptions.k);  // Using syncmerS as window size w
+        //     assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
 
         // Compute histogram using the pre-calculated KmerIds.
-        // This avoids accessing the Reads data structure (Cache Misses).
         assembler.countKmersFromMarkerKmerIds(threadCount);
         
         // Retrieve peak and set thresholds.
@@ -526,7 +524,7 @@ void dinara::main::assemble(
 
         cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
         cout << "Filtering minimizers: Peak coverage is " << coveragePeak << "." << endl;
-        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "]." << endl;
+        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "] and excluding palindromic k-mers." << endl;
              
         // Prune the existing markers in-place using the KmerCounter and markerKmerIds.
         assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount);
