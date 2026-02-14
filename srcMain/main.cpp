@@ -1207,12 +1207,14 @@ void dinara::main::assemble(
             threadCount,
             true); // createFromVertices
 
-    // // Compute oriented read journeys.
-    // // AnchorIds already encode orientation (even=fwd, odd=rev), same as DagNodeId.
-    // anchors->computeJourneys(threadCount);
+    // Compute oriented read journeys.
+    // AnchorIds already encode orientation (even=fwd, odd=rev), same as DagNodeId.
+    anchors->computeJourneys(threadCount);
 
-    // // Run Mode 3 assembly.
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    // Run Mode 3 assembly.
+    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+    return;
 
 
     // ========================================================================
@@ -1316,7 +1318,7 @@ void dinara::main::assemble(
     dag.writeSummary(cout);
     dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
 
-    return;
+    
 
     // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
     const uint64_t initialMinEdgeSupport = 20;
@@ -1362,6 +1364,8 @@ void dinara::main::assemble(
     dag.writeSummary(cout);
     dag.writeGfa("DirectedAnchorGraph.gfa");
     dag.writePaths("DirectedAnchorGraph.paths.gaf");
+
+    return;
 
 
     // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(

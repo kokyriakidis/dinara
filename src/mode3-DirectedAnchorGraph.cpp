@@ -110,8 +110,7 @@ uint64_t mapPathPositionToRead(
 template class dinara::MultithreadedObject<mode3::DirectedAnchorGraph>;
 
 const vector<DagNodeId> DirectedAnchorGraph::emptyEdgeVec;
-const unordered_set<uint64_t> DagPathsCrossingIndex::emptySet;
-
+const vector<DagPathOccurrence> DagPathsCrossingIndex::emptyList;
 
 // ============================================================================
 // DagPathsCrossingIndex — indexes by segment ID (= nodeId >> 1).
@@ -120,8 +119,9 @@ const unordered_set<uint64_t> DagPathsCrossingIndex::emptySet;
 void DagPathsCrossingIndex::addPath(
     uint64_t pathIdx, const vector<DagNodeId>& path)
 {
-    for(DagNodeId n : path) {
-        index[segmentOf(n)].insert(pathIdx);
+    for(size_t i = 0; i < path.size(); ++i) {
+        // Store (pathIdx, offset).
+        index[segmentOf(path[i])].push_back({pathIdx, (uint32_t)i});
     }
 }
 
@@ -132,8 +132,22 @@ void DagPathsCrossingIndex::removePath(
         uint64_t seg = segmentOf(n);
         auto it = index.find(seg);
         if(it != index.end()) {
-            it->second.erase(pathIdx);
-            if(it->second.empty()) {
+            // Remove occurrences of pathIdx.
+            // Since we use vector, we must iterate and remove.
+            vector<DagPathOccurrence>& vec = it->second;
+            size_t writeIdx = 0;
+            for(size_t readIdx = 0; readIdx < vec.size(); ++readIdx) {
+                if(vec[readIdx].pathIdx != pathIdx) {
+                    if(writeIdx != readIdx) {
+                        vec[writeIdx] = vec[readIdx];
+                    }
+                    writeIdx++;
+                }
+            }
+            if(writeIdx < vec.size()) {
+                vec.resize(writeIdx);
+            }
+            if(vec.empty()) {
                 index.erase(it);
             }
         }
@@ -152,14 +166,14 @@ void DagPathsCrossingIndex::rebuild(
     }
 }
 
-const unordered_set<uint64_t>& DagPathsCrossingIndex::getPathsCrossing(
+const vector<DagPathOccurrence>& DagPathsCrossingIndex::getPathsCrossing(
     uint64_t segId) const
 {
     auto it = index.find(segId);
     if(it != index.end()) {
         return it->second;
     }
-    return emptySet;
+    return emptyList;
 }
 
 bool DagPathsCrossingIndex::hasPathsCrossing(uint64_t segId) const
@@ -1413,8 +1427,9 @@ void DirectedAnchorGraph::buildFromDirectedAnchorsThreadFunction(size_t threadId
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(uint64_t idx = begin; idx < end; ++idx) {
-            const OrientedReadId orid0 = strand0Indices[idx];
-            const OrientedReadId orid1 = orid0.getOppositeStrand();
+            const OrientedReadId orid0 = OrientedReadId::fromValue(strand0Indices[idx]);
+            OrientedReadId orid1 = orid0;
+            orid1.flipStrand();
             
             auto processOneStrand = [&](const OrientedReadId orid) {
                 const auto journey = anchors.journeysWithPositions[orid.getValue()];

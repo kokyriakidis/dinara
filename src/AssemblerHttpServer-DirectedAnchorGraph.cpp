@@ -276,8 +276,13 @@ void Assembler::exploreDirectedAnchorGraphNode(const vector<string>& request, os
     if(crossingPathIndices.empty()) {
         html << "<p>No paths cross this segment.";
     } else {
-        vector<uint64_t> sortedIndices(crossingPathIndices.begin(), crossingPathIndices.end());
+        vector<uint64_t> sortedIndices;
+        sortedIndices.reserve(crossingPathIndices.size());
+        for(const auto& occ : crossingPathIndices) {
+            sortedIndices.push_back(occ.pathIdx);
+        }
         sort(sortedIndices.begin(), sortedIndices.end());
+        sortedIndices.erase(unique(sortedIndices.begin(), sortedIndices.end()), sortedIndices.end());
 
         const uint64_t maxShow = 100;
         const uint64_t showCount = min(uint64_t(sortedIndices.size()), maxShow);

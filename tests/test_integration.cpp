@@ -7152,10 +7152,16 @@ TEST_CASE("DirectedAnchorGraph unitigifyAll rewrites internal and reverse-entry 
     REQUIRE(dag.getPath(p3) == std::vector<DagNodeId>{fwdNodeId(mergedABC)});
 
     const auto& crossing = dag.getPathsCrossingNode(mergedABC);
-    REQUIRE(crossing.count(p0) == 1);
-    REQUIRE(crossing.count(p1) == 1);
-    REQUIRE(crossing.count(p2) == 1);
-    REQUIRE(crossing.count(p3) == 1);
+    auto hasPath = [&](uint64_t pathIdx) {
+        for(const auto& occ : crossing) {
+            if(occ.pathIdx == pathIdx) return true;
+        }
+        return false;
+    };
+    REQUIRE(hasPath(p0));
+    REQUIRE(hasPath(p1));
+    REQUIRE(hasPath(p2));
+    REQUIRE(hasPath(p3));
 }
 
 // Regression test: batch unitigifyAll must preserve edges between

@@ -150,21 +150,28 @@ struct DagNodeInfo {
 // DagPathsCrossingIndex — maps segment ID → set of path indices.
 // ============================================================================
 
+struct DagPathOccurrence {
+    uint64_t pathIdx;
+    uint32_t offset;
+};
+
 class DagPathsCrossingIndex {
 public:
     void clear() { index.clear(); }
 
     void addPath(uint64_t pathIdx, const std::vector<DagNodeId>& path);
-    void removePath(uint64_t pathIdx, const std::vector<DagNodeId>& path);
+    void removePath(uint64_t pathIdx, const std::vector<DagNodeId>& path); // Helper, though expensive with vector
     void rebuild(const std::vector<std::vector<DagNodeId>>& paths,
                  const std::vector<bool>& pathRemoved);
 
-    const std::unordered_set<uint64_t>& getPathsCrossing(uint64_t segId) const;
+    // Returns all occurrences of this segment in paths.
+    // A path may appear multiple times if it crosses the segment multiple times.
+    const std::vector<DagPathOccurrence>& getPathsCrossing(uint64_t segId) const;
     bool hasPathsCrossing(uint64_t segId) const;
 
 private:
-    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> index;
-    static const std::unordered_set<uint64_t> emptySet;
+    std::unordered_map<uint64_t, std::vector<DagPathOccurrence>> index;
+    static const std::vector<DagPathOccurrence> emptyList;
 };
 
 
@@ -416,7 +423,7 @@ public:
 
     // ---- HTTP server accessors ----
 
-    const std::unordered_set<uint64_t>& getPathsCrossingNode(uint64_t segId) const {
+    const std::vector<DagPathOccurrence>& getPathsCrossingNode(uint64_t segId) const {
         return pathsCrossing.getPathsCrossing(segId);
     }
 
