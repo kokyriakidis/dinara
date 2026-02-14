@@ -42,17 +42,19 @@ void Assembler::findMarkers(uint64_t threadCount)
 
 // Helper: compute deduplicated canonical closed syncmer markers for a read.
 // The sketcher must be configured with (k_scan, s) where k_scan = k for odd k, or k+1 for even k.
-// Output is written to the caller-provided validMarkers buffer (cleared on entry).
-static void getSyncmerMarkersForRead(
+// If validMarkers is provided, it is filled with (position, kmerId).
+// If validMarkers is nullptr, it returns the count of markers without filling a buffer.
+static size_t getSyncmerMarkersForRead(
     ReadId readId,
     const Reads& reads,
     int k,
     SimdSketcher* sketcher,
     const shared_ptr<KmerChecker>& kmerChecker,
     string& readSequence,
-    std::vector<std::pair<uint32_t, KmerId>>& validMarkers
+    std::vector<uint32_t>& positionBuffer,
+    std::vector<std::pair<uint32_t, KmerId>>* validMarkers = nullptr
 ) {
-    validMarkers.clear();
+    if(validMarkers) validMarkers->clear();
     const LongBaseSequenceView read = reads.getRead(readId);
     const uint64_t baseCount = read.baseCount;
 
@@ -60,7 +62,7 @@ static void getSyncmerMarkersForRead(
     const int k_scan = (k % 2 == 0) ? k + 1 : k;
 
     if(baseCount < uint64_t(k_scan)) {
-        return;
+        return 0;
     }
 
     // Convert read to string.
@@ -69,50 +71,78 @@ static void getSyncmerMarkersForRead(
         readSequence[i] = read[i].character();
     }
 
-    // Compute canonical closed syncmer positions.
-    SyncmerList syncmerPositions = canonical_syncmer_positions(
+    // Compute canonical closed syncmer positions and merge with forced read ends (0 and baseCount - k_scan).
+    // Read end forcing ensures that the very first and last possible k-mers of every read
+    // are included as markers, which is critical for graph connectivity at read boundaries.
+    SyncmerList syncmerList = canonical_syncmer_positions(
         sketcher, readSequence.c_str(), readSequence.size());
+    
+    positionBuffer.assign(syncmerList.data, syncmerList.data + syncmerList.len);
+    positionBuffer.push_back(0);
+    positionBuffer.push_back(uint32_t(baseCount - k_scan));
+    free_syncmer_list(syncmerList);
 
-    // Sort in-place and deduplicate.
-    std::sort(syncmerPositions.data, syncmerPositions.data + syncmerPositions.len);
-    const size_t uniqueCount = static_cast<size_t>(
-        std::unique(syncmerPositions.data, syncmerPositions.data + syncmerPositions.len)
-        - syncmerPositions.data);
+    // Sort and deduplicate to handle cases where read ends were already selected as syncmers.
+    std::sort(positionBuffer.begin(), positionBuffer.end());
+    positionBuffer.erase(std::unique(positionBuffer.begin(), positionBuffer.end()), positionBuffer.end());
 
-    validMarkers.reserve(uniqueCount);
+    const size_t uniqueCandidateCount = positionBuffer.size();
+    
+    // Pass 1 optimization: if kmerChecker is null (initial discovery) and we only need the count,
+    // we can return uniqueCandidateCount directly for odd k.
+    if(!validMarkers && !kmerChecker && k_scan == k) {
+        return uniqueCandidateCount;
+    }
+
+    if(validMarkers) validMarkers->reserve(uniqueCandidateCount);
+    size_t validCount = 0;
 
     if(k_scan == k) {
         // Odd k: positions are directly usable as k-mer start positions.
-        for(size_t i = 0; i < uniqueCount; i++) {
-            const uint32_t position = syncmerPositions.data[i];
+        for(size_t i = 0; i < uniqueCandidateCount; i++) {
+            const uint32_t position = positionBuffer[i];
             if(uint64_t(position) + uint64_t(k) > baseCount) continue;
 
-            Kmer kmer;
-            extractKmer(read, uint64_t(position), uint64_t(k), kmer);
-            const KmerId kmerId = kmer.id(uint64_t(k));
-
-            if(!kmerChecker || kmerChecker->isMarker(kmerId)) {
-                validMarkers.push_back({position, kmerId});
+            if(!kmerChecker) {
+                // Initial discovery: everything is a marker.
+                if(validMarkers) {
+                    Kmer kmer;
+                    extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                    validMarkers->push_back({position, kmer.id(uint64_t(k))});
+                }
+                validCount++;
+            } else {
+                // Filtering mode: check if k-mer is a known marker.
+                Kmer kmer;
+                extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                const KmerId kmerId = kmer.id(uint64_t(k));
+                if(kmerChecker->isMarker(kmerId)) {
+                    if(validMarkers) validMarkers->push_back({position, kmerId});
+                    validCount++;
+                }
             }
         }
     } else {
         // Even k: positions are (k+1)-mer positions. Adjust to k-mer positions
         // based on canonicality of each (k+1)-mer.
-        // If the (k+1)-mer is canonical (forward < RC): take the prefix (position P).
-        // If non-canonical (forward > RC): take the suffix (position P+1).
         // Since k_scan is odd, palindromes are impossible.
-        // After adjustment, positions remain in non-decreasing order, but
-        // two adjacent (k+1)-mer positions can map to the same k-mer position.
         uint32_t lastPosition = UINT32_MAX;
-        for(size_t i = 0; i < uniqueCount; i++) {
-            uint32_t position = syncmerPositions.data[i];
+        for(size_t i = 0; i < uniqueCandidateCount; i++) {
+            uint32_t position = positionBuffer[i];
             if(uint64_t(position) + uint64_t(k_scan) > baseCount) continue;
 
-            Kmer kmerScan;
-            extractKmer(read, uint64_t(position), uint64_t(k_scan), kmerScan);
-            if(!(kmerScan < kmerScan.reverseComplement(k_scan))) {
-                position++;
+            // Efficient string-based canonicality check for (k+1)-mer.
+            // If canonical (forward < RC): take the prefix (position P). 
+            // If non-canonical: take the suffix (position P+1).
+            bool isCanonical = true;
+            for(int j=0; j < k_scan; ++j) {
+                const char f = readSequence[position + j];
+                const char r = readSequence[position + k_scan - 1 - j];
+                const char rc = (r == 'A') ? 'T' : (r == 'T') ? 'A' : (r == 'C') ? 'G' : 'C';
+                if(f < rc) { isCanonical = true; break; }
+                if(f > rc) { isCanonical = false; break; }
             }
+            if(!isCanonical) position++;
 
             // Skip duplicate positions from the adjustment.
             if(position == lastPosition) continue;
@@ -120,17 +150,25 @@ static void getSyncmerMarkersForRead(
 
             if(uint64_t(position) + uint64_t(k) > baseCount) continue;
 
-            Kmer kmer;
-            extractKmer(read, uint64_t(position), uint64_t(k), kmer);
-            const KmerId kmerId = kmer.id(uint64_t(k));
-
-            if(!kmerChecker || kmerChecker->isMarker(kmerId)) {
-                validMarkers.push_back({position, kmerId});
+            if(!kmerChecker) {
+                if(validMarkers) {
+                    Kmer kmer;
+                    extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                    validMarkers->push_back({position, kmer.id(uint64_t(k))});
+                }
+                validCount++;
+            } else {
+                Kmer kmer;
+                extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                const KmerId kmerId = kmer.id(uint64_t(k));
+                if(kmerChecker->isMarker(kmerId)) {
+                    if(validMarkers) validMarkers->push_back({position, kmerId});
+                    validCount++;
+                }
             }
         }
     }
-
-    free_syncmer_list(syncmerPositions);
+    return validCount;
 }
 
 void Assembler::findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s)
@@ -191,15 +229,14 @@ void Assembler::findMarkersSimdClosedSyncmersPass1(size_t /* threadId */)
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k_scan), static_cast<uint8_t>(s));
     string readSequence;
-    std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
+    std::vector<uint32_t> positionBuffer;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
-            getSyncmerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, markerBuffer);
+            const size_t count = getSyncmerMarkersForRead(
+                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, nullptr);
 
-            const uint64_t count = markerBuffer.size();
             this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count);
             this->markers->incrementCount(OrientedReadId(readId, 1).getValue(), count);
             markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count);
@@ -217,6 +254,7 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k_scan), static_cast<uint8_t>(s));
     string readSequence;
+    std::vector<uint32_t> positionBuffer;
     std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
 
     uint64_t begin, end;
@@ -224,7 +262,7 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId);
             getSyncmerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, markerBuffer);
+                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, &markerBuffer);
 
             if(markerBuffer.empty()) continue;
 
@@ -260,22 +298,24 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
 // ============================================================================
 
 // Helper: compute deduplicated canonical minimizer positions and their KmerIds for a read.
-// Output is written to the caller-provided validMarkers buffer (cleared on entry).
-static void getMinimizerMarkersForRead(
+// If validMarkers is provided, it is filled with (position, kmerId).
+// If validMarkers is nullptr, it returns the count of markers without filling a buffer.
+static size_t getMinimizerMarkersForRead(
     ReadId readId,
     const Reads& reads,
     int k,
     SimdSketcher* sketcher,
     const shared_ptr<KmerChecker>& kmerChecker,
     string& readSequence,
-    std::vector<std::pair<uint32_t, KmerId>>& validMarkers
+    std::vector<uint32_t>& positionBuffer,
+    std::vector<std::pair<uint32_t, KmerId>>* validMarkers = nullptr
 ) {
-    validMarkers.clear();
+    if(validMarkers) validMarkers->clear();
     const LongBaseSequenceView read = reads.getRead(readId);
     const uint64_t baseCount = read.baseCount;
 
     if(baseCount < uint64_t(k)) {
-        return;
+        return 0;
     }
 
     // Convert read to string for simd-minimizers.
@@ -284,34 +324,55 @@ static void getMinimizerMarkersForRead(
         readSequence[i] = read[i].character();
     }
 
-    // Compute canonical minimizer positions.
-    MinimizerList minimizerPositions = canonical_minimizer_positions(
+    // Compute canonical minimizer positions and merge with forced read ends (0 and baseCount - k).
+    // Read end forcing ensures that the very first and last possible k-mers of every read
+    // are included as markers, which is critical for graph connectivity at read boundaries.
+    MinimizerList minimizerList = canonical_minimizer_positions(
         sketcher,
         readSequence.c_str(),
         readSequence.size());
+    positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
+    positionBuffer.push_back(0);
+    positionBuffer.push_back(uint32_t(baseCount - k));
+    free_minimizer_list(minimizerList);
 
-    // Sort in-place and deduplicate.
-    std::sort(minimizerPositions.data, minimizerPositions.data + minimizerPositions.len);
-    const size_t uniqueCount = static_cast<size_t>(
-        std::unique(minimizerPositions.data, minimizerPositions.data + minimizerPositions.len)
-        - minimizerPositions.data);
+    // Sort and deduplicate to handle cases where read ends were already selected as minimizers.
+    std::sort(positionBuffer.begin(), positionBuffer.end());
+    positionBuffer.erase(std::unique(positionBuffer.begin(), positionBuffer.end()), positionBuffer.end());
 
-    validMarkers.reserve(uniqueCount);
+    const size_t uniqueCandidateCount = positionBuffer.size();
 
-    for(size_t i = 0; i < uniqueCount; i++) {
-        const uint32_t position = minimizerPositions.data[i];
-        if(uint64_t(position) + uint64_t(k) > baseCount) continue;
-
-        Kmer kmer;
-        extractKmer(read, uint64_t(position), uint64_t(k), kmer);
-        const KmerId kmerId = kmer.id(uint64_t(k));
-
-        if(!kmerChecker || kmerChecker->isMarker(kmerId)) {
-            validMarkers.push_back({position, kmerId});
-        }
+    // Pass 1 optimization: if kmerChecker is null (initial discovery) and we only need the count,
+    // we can return uniqueCandidateCount directly.
+    if(!validMarkers && !kmerChecker) {
+        return uniqueCandidateCount;
     }
 
-    free_minimizer_list(minimizerPositions);
+    if(validMarkers) validMarkers->reserve(uniqueCandidateCount);
+    size_t validCount = 0;
+
+    for(size_t i = 0; i < uniqueCandidateCount; i++) {
+        const uint32_t position = positionBuffer[i];
+        if(uint64_t(position) + uint64_t(k) > baseCount) continue;
+
+        if(!kmerChecker) {
+            if(validMarkers) {
+                Kmer kmer;
+                extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                validMarkers->push_back({position, kmer.id(uint64_t(k))});
+            }
+            validCount++;
+        } else {
+            Kmer kmer;
+            extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+            const KmerId kmerId = kmer.id(uint64_t(k));
+            if(kmerChecker->isMarker(kmerId)) {
+                if(validMarkers) validMarkers->push_back({position, kmerId});
+                validCount++;
+            }
+        }
+    }
+    return validCount;
 }
 
 void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
@@ -366,19 +427,19 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
     string readSequence;
-    std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
+    std::vector<uint32_t> positionBuffer;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
-            getMinimizerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, markerBuffer);
+            const size_t count = getMinimizerMarkersForRead(
+                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, nullptr);
 
-            const uint64_t count = markerBuffer.size();
-            this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count);
-            this->markers->incrementCount(OrientedReadId(readId, 1).getValue(), count);
-            markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count);
-            markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count);
+            const uint64_t count64 = count;
+            this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+            this->markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+            markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+            markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
         }
     }
     simd_sketcher_free(sketcher);
@@ -391,6 +452,7 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
     string readSequence;
+    std::vector<uint32_t> positionBuffer;
     std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
 
     uint64_t begin, end;
@@ -398,7 +460,7 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId);
             getMinimizerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, markerBuffer);
+                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, &markerBuffer);
 
             if(markerBuffer.empty()) continue;
 
@@ -1421,6 +1483,8 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
                 if(freq >= minF && freq <= maxF) {
                     
                     // Palindrome check: if requested, skip markers where kmerId == rcKmerId.
+                    // Palindromic k-mers can cause ambiguity in directed graph construction 
+                    // because their forward and reverse orientations are identical.
                     if(applyKmerCountFilterData.filterPalindromes && kmerId == rcKmerId) {
                         continue;
                     }
