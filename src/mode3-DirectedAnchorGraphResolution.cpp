@@ -62,8 +62,9 @@ uint64_t DirectedAnchorGraph::getCrossingCount(uint64_t segId) const
 {
     uint64_t total = 0;
     const auto& crossing = pathsCrossing.getPathsCrossing(segId);
-    for(uint64_t pathIdx : crossing) {
-        total += pathGroupWeight(pathIdx);
+    for(const auto& occ : crossing) {
+        // If a path crosses twice, we count it twice. Matches MBG behavior.
+        total += pathGroupWeight(occ.pathIdx);
     }
     return total;
 }
@@ -84,29 +85,104 @@ uint64_t DirectedAnchorGraph::getTrimAmountToCheck(
     uint64_t minClip = nodeBpLength(segmentOf(from));
     bool foundBoundarySupport = false;
     const auto& crossing = pathsCrossing.getPathsCrossing(segmentOf(from));
-    for(uint64_t pathIdx : crossing) {
+    for(const auto& occ : crossing) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const size_t i = occ.offset;
+
         if(pathIdx >= paths.size() || pathRemoved[pathIdx] ||
            pathIdx >= pathReadIds.size()) {
             continue;
         }
         const auto& path = paths[pathIdx];
         if(pathReadIds[pathIdx].empty() || path.size() < 2) continue;
-        for(size_t i = 0; i + 1 < path.size(); i++) {
-            if(path[i] != from || path[i + 1] != to) continue;
-            if(isForward(from)) {
-                if(i + 1 != path.size() - 1) continue;
-                for(const auto& read : pathReadIds[pathIdx]) {
-                    minClip = min(minClip, read.rightClip);
-                    foundBoundarySupport = true;
-                }
-            } else {
-                if(i != 0) continue;
-                for(const auto& read : pathReadIds[pathIdx]) {
-                    minClip = min(minClip, read.leftClip);
-                    foundBoundarySupport = true;
+
+        // Verify that this occurrence corresponds to the edge (from -> to).
+        // path[i] is segmentOf(from).
+        // Check if forward or reverse match.
+        bool match = false;
+        
+        // Forward: path[i] == from
+        if(path[i] == from) {
+            if(i + 1 < path.size() && path[i+1] == to) {
+                // Determine if this is a boundary read.
+                if(isForward(from)) {
+                    // from is forward, so we look at rightClip?
+                    // Original code: if(isForward(from)) { if(i+1 != path.size()-1) continue; ... }
+                    // Wait, original code:
+                    /*
+                    for(size_t i = 0; i + 1 < path.size(); i++) {
+                        if(path[i] != from || path[i + 1] != to) continue;
+                        if(isForward(from)) {
+                            if(i + 1 != path.size() - 1) continue;
+                    */
+                   // So we only care if this edge is the LAST edge of the path (for forward 'from')?
+                   if(i + 1 == path.size() - 1) {
+                       match = true;
+                       for(const auto& read : pathReadIds[pathIdx]) {
+                           minClip = min(minClip, read.rightClip);
+                           foundBoundarySupport = true;
+                       }
+                   }
+                } else {
+                    // from is reverse. Original code:
+                    /*
+                    } else {
+                        if(i != 0) continue;
+                    */
+                   if(i == 0) {
+                       match = true;
+                       for(const auto& read : pathReadIds[pathIdx]) {
+                           minClip = min(minClip, read.leftClip); // Wait, original used leftClip for !isForward(from)?
+                           // If from is reverse, it's <A. And edge is <A -> B.
+                           // This means path starts with <A.
+                           // So it's a start tip?
+                           foundBoundarySupport = true;
+                       }
+                   }
                 }
             }
         }
+        
+        // Reverse: path[i] == rc(from)?
+        // Original loop checked `path[i] != from`.
+        // So it implicitly required `path[i] == from`.
+        // It did NOT handle `rc(from)` case in original code?
+        // Let's re-read original code.
+        /*
+        for(size_t i = 0; i + 1 < path.size(); i++) {
+            if(path[i] != from || path[i + 1] != to) continue;
+            if(isForward(from)) { ... } else { ... }
+        }
+        */
+        // Yes, it only checked `path[i] == from`.
+        // It did not check `rc(from)`.
+        // Does this mean `getTrimAmountToCheck` relies on `from` being the oriented node?
+        // Yes.
+        // And path must contain that oriented node.
+        // So if path contains `rc(from)`, it is ignored.
+        //
+        // So here, `occ` gives us `path[i]`. `path[i]` must be `from`.
+        // But `occ` is for `segmentOf(from)`. So `path[i]` could be `from` or `rc(from)`.
+        
+        if (!match && path[i] == from && i + 1 < path.size() && path[i+1] == to) {
+             if(isForward(from)) {
+                if(i + 1 == path.size() - 1) {
+                    for(const auto& read : pathReadIds[pathIdx]) {
+                        minClip = min(minClip, read.rightClip);
+                        foundBoundarySupport = true;
+                    }
+                }
+            } else {
+                if(i == 0) {
+                    for(const auto& read : pathReadIds[pathIdx]) {
+                        minClip = min(minClip, read.leftClip);
+                        foundBoundarySupport = true;
+                    }
+                }
+            }
+        }
+        // Note: original code `if(isForward(from))` checked `i+1 != path.size()-1`.
+        // `else` checked `i != 0`.
     }
     if(!foundBoundarySupport) {
         return 0;
@@ -133,15 +209,21 @@ uint64_t DirectedAnchorGraph::getAnchorSize(
     const uint64_t toLen = nodeBpLength(segmentOf(to));
     uint64_t result = 0;
     const auto& crossing = pathsCrossing.getPathsCrossing(segmentOf(from));
-    for(uint64_t pathIdx : crossing) {
+    for(const auto& occ : crossing) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const size_t i = occ.offset;
+
         if(pathIdx >= paths.size() || pathRemoved[pathIdx] ||
            pathIdx >= pathReadIds.size()) {
             continue;
         }
         const auto& path = paths[pathIdx];
         if(path.size() < 2 || pathReadIds[pathIdx].empty()) continue;
-        for(size_t i = 0; i < path.size(); i++) {
-            if(i + 1 < path.size() && path[i] == from && path[i + 1] == to) {
+
+        // Check forward: from -> to.
+        // If occ refers to 'from' node.
+        if(path[i] == from) {
+            if(i + 1 < path.size() && path[i + 1] == to) {
                 if(i + 1 < path.size() - 1) {
                     return toLen;
                 }
@@ -151,7 +233,12 @@ uint64_t DirectedAnchorGraph::getAnchorSize(
                     }
                 }
             }
-            if(i > 0 && path[i] == rcNode(from) && path[i - 1] == rcNode(to)) {
+        }
+
+        // Check reverse: rc(to) -> rc(from).
+        // This corresponds to path[i-1] == rc(to) && path[i] == rc(from).
+        if(path[i] == rcNode(from)) {
+            if(i > 0 && path[i - 1] == rcNode(to)) {
                 if(i > 1) {
                     return toLen;
                 }
@@ -214,14 +301,16 @@ uint64_t DirectedAnchorGraph::createEdgeNode(
     }
 
     const uint64_t overlap = getBpOverlap(from, to);
-    const uint64_t availableIncrease =
-        (nodeBpLength(toSeg) > overlap + 1) ?
-        (nodeBpLength(toSeg) - overlap - 1) : 1;
     const bool toIsResolvable =
         resolvables.count(toSeg) == 1 && unresolvables.count(toSeg) == 0;
 
     if(toIsResolvable) {
-        info.lengthBp += availableIncrease;
+        // Exact merge length: L1 + L2 - overlap.
+        // We already have L1 (info.lengthBp). Add L2 - overlap.
+        if (nodeBpLength(toSeg) > overlap) {
+            info.lengthBp += (nodeBpLength(toSeg) - overlap);
+        }
+
         if(isForward(to)) {
             info.anchorChain.insert(
                 info.anchorChain.end(),
@@ -234,7 +323,9 @@ uint64_t DirectedAnchorGraph::createEdgeNode(
             }
         }
     } else {
-        info.lengthBp += availableIncrease;
+        // MBG logic: if destination is unresolvable, we extend by 1 unit (kmer/bp)
+        // to represent the step into the node, but do not satisfy the full length.
+        info.lengthBp += 1;
     }
 
     const uint64_t newSeg = addNode(info);
@@ -261,7 +352,10 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
     unordered_map<pair<DagNodeId, DagNodeId>, uint64_t, PairHash> tripletCounts;
 
     const auto& crossingPaths = pathsCrossing.getPathsCrossing(segId);
-    for(uint64_t pathIdx : crossingPaths) {
+    for(const auto& occ : crossingPaths) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const size_t i = occ.offset;
+
         if(pathIdx >= paths.size() || pathRemoved[pathIdx]) {
             continue;
         }
@@ -271,8 +365,8 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
         const uint64_t fallbackWeight = pathGroupWeight(pathIdx);
         if(!haveReads && fallbackWeight == 0) continue;
 
-        for(uint64_t i = 0; i < path.size(); ++i) {
-            if(segmentOf(path[i]) != segId) continue;
+        // occ logic: path[i] is this segment.
+        if(segmentOf(path[i]) != segId) continue; // Should be redundant but safe.
 
             DagNodeId from = dagTipSentinel;
             DagNodeId to = dagTipSentinel;
@@ -387,8 +481,6 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
                 tripletCounts[{from, to}] += coverageHere;
             }
         }
-    }
-
     unordered_map<pair<DagNodeId, DagNodeId>, uint64_t, PairHash> partTripletCounts =
         tripletCounts;
 
@@ -403,7 +495,8 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
         unordered_map<uint64_t, PathReadPos> bwReads;
         const uint64_t invalidPath = numeric_limits<uint64_t>::max();
 
-        for(uint64_t pathIdx : crossingPaths) {
+        for(const auto& occ : crossingPaths) {
+            uint64_t pathIdx = occ.pathIdx;
             if(pathIdx >= paths.size() || pathRemoved[pathIdx] ||
                pathIdx >= pathReadIds.size()) {
                 continue;
@@ -415,32 +508,31 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
                 continue;
             }
 
-            for(uint64_t pos = 0; pos < path.size(); pos++) {
-                if(segmentOf(path[pos]) != segId) continue;
-                if(pos == 0) {
-                    for(const auto& read : pathReadIds[pathIdx]) {
-                        auto it = fwReads.find(read.readNameIndex);
-                        if(it != fwReads.end()) {
-                            it->second = {invalidPath, {0, 0}};
-                        } else {
-                            fwReads[read.readNameIndex] = {
-                                pathIdx,
-                                {read.readPosZeroOffset, read.readPosStartIndex}
-                            };
-                        }
+            uint64_t pos = occ.offset;
+            // Derived from occ.offset.
+            if(pos == 0) {
+                for(const auto& read : pathReadIds[pathIdx]) {
+                    auto it = fwReads.find(read.readNameIndex);
+                    if(it != fwReads.end()) {
+                        it->second = {invalidPath, {0, 0}};
+                    } else {
+                        fwReads[read.readNameIndex] = {
+                            pathIdx,
+                            {read.readPosZeroOffset, read.readPosStartIndex}
+                        };
                     }
                 }
-                if(pos + 1 == path.size()) {
-                    for(const auto& read : pathReadIds[pathIdx]) {
-                        auto it = bwReads.find(read.readNameIndex);
-                        if(it != bwReads.end()) {
-                            it->second = {invalidPath, {0, 0}};
-                        } else {
-                            bwReads[read.readNameIndex] = {
-                                pathIdx,
-                                {read.readPosZeroOffset, read.readPosEndIndex}
-                            };
-                        }
+            }
+            if(pos + 1 == path.size()) {
+                for(const auto& read : pathReadIds[pathIdx]) {
+                    auto it = bwReads.find(read.readNameIndex);
+                    if(it != bwReads.end()) {
+                        it->second = {invalidPath, {0, 0}};
+                    } else {
+                        bwReads[read.readNameIndex] = {
+                            pathIdx,
+                            {read.readPosZeroOffset, read.readPosEndIndex}
+                        };
                     }
                 }
             }
@@ -516,6 +608,8 @@ vector<DagTriplet> DirectedAnchorGraph::getRawTriplets(
                 }
             }
         }
+
+
     }
 
     vector<DagTriplet> supported;
@@ -896,7 +990,16 @@ unordered_set<uint64_t> DirectedAnchorGraph::resolveHairpins(
 
         // Rewrite paths: forward strand → fwdCopy, reverse strand → bwdCopy.
         const auto& crossingPaths = pathsCrossing.getPathsCrossing(segId);
-        vector<uint64_t> pathsToUpdate(crossingPaths.begin(), crossingPaths.end());
+        
+        static thread_local vector<uint64_t> pathsToUpdate;
+        pathsToUpdate.clear();
+        pathsToUpdate.reserve(crossingPaths.size());
+        for(const auto& occ : crossingPaths) {
+            pathsToUpdate.push_back(occ.pathIdx);
+        }
+        sort(pathsToUpdate.begin(), pathsToUpdate.end());
+        pathsToUpdate.erase(unique(pathsToUpdate.begin(), pathsToUpdate.end()), pathsToUpdate.end());
+        
         for(uint64_t pathIdx : pathsToUpdate) {
             if(pathRemoved[pathIdx]) continue;
             auto& path = paths[pathIdx];
@@ -923,6 +1026,9 @@ unordered_set<uint64_t> DirectedAnchorGraph::resolveHairpins(
 // ============================================================================
 // resolveNodes — create edge nodes for each valid triplet.
 // ============================================================================
+
+
+
 
 DirectedAnchorGraph::ResolveStats DirectedAnchorGraph::resolveNodes(
     const vector<uint64_t>& candidates,
@@ -1756,7 +1862,7 @@ void DirectedAnchorGraph::replacePathsFromEdgeNodes(
             vector<DagPathReadSupport> reads;
         };
         vector<Segment> segments;
-        for(const auto [beginIdx, endIdx] : ranges) {
+        for(const auto& [beginIdx, endIdx] : ranges) {
             if(beginIdx >= endIdx || endIdx > newPath.size()) continue;
             Segment seg;
             seg.nodes.insert(seg.nodes.end(),
@@ -1942,7 +2048,7 @@ void DirectedAnchorGraph::splitPathsAtBreaks()
             vector<uint64_t> boundaries;
         };
         vector<Segment> segments;
-        for(const auto [beginIdx, endIdx] : segmentRanges) {
+        for(const auto& [beginIdx, endIdx] : segmentRanges) {
             Segment seg;
             seg.nodes.reserve(endIdx - beginIdx);
             seg.boundaries.reserve((endIdx - beginIdx) + 1);
@@ -2265,7 +2371,9 @@ uint64_t DirectedAnchorGraph::replaceUnitig(const vector<DagNodeId>& chain)
     vector<uint64_t> affectedPaths;
     for(DagNodeId nodeId : chain) {
         const auto& crossing = pathsCrossing.getPathsCrossing(segmentOf(nodeId));
-        affectedPaths.insert(affectedPaths.end(), crossing.begin(), crossing.end());
+        for(const auto& occ : crossing) {
+            affectedPaths.push_back(occ.pathIdx);
+        }
     }
     sort(affectedPaths.begin(), affectedPaths.end());
     affectedPaths.erase(
@@ -2949,8 +3057,8 @@ double DirectedAnchorGraph::getPathCoverage(uint64_t segId) const
     if(!nodeExists(segId)) return 0.0;
     double coverage = 0.0;
     const auto& crossing = pathsCrossing.getPathsCrossing(segId);
-    for(uint64_t pathIdx : crossing) {
-        const uint64_t weight = pathGroupWeight(pathIdx);
+    for(const auto& occ : crossing) {
+        const uint64_t weight = pathGroupWeight(occ.pathIdx);
         if(weight > 0) {
             coverage += double(weight);
         }
@@ -2975,19 +3083,58 @@ uint64_t DirectedAnchorGraph::getEdgePathCoverage(
 
     uint64_t result = 0;
     const auto& crossing = pathsCrossing.getPathsCrossing(segmentOf(from));
-    for(uint64_t pathIdx : crossing) {
+    
+    // We want to avoid duplicates if multiple occurrences map to the same path index,
+    // although getEdgePathCoverage logic sums "occurrences that match the edge".
+    // If a path crosses 'from' multiple times, 'crossing' has multiple entries.
+    // For each entry, we check if it forms the edge (from, to).
+    // This naturally handles looping edges correctly (if path goes A->B -> ... -> A->B).
+    
+    for(const auto& occ : crossing) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const uint32_t j = occ.offset;
+        
         if(pathIdx >= paths.size() || pathRemoved[pathIdx]) continue;
         const uint64_t weight = pathGroupWeight(pathIdx);
         if(weight == 0) continue;
+        
         const auto& path = paths[pathIdx];
-        for(uint64_t j = 0; j < path.size(); j++) {
-            if(j + 1 < path.size() && path[j] == from && path[j + 1] == to) {
-                result += weight;
-                if(result > maxCount) return result;
+        
+        // Check forward: from -> to
+        // If occ refers to 'from' node.
+        if(j + 1 < path.size() && path[j] == from && path[j + 1] == to) {
+            result += weight;
+            if(result > maxCount) return result;
+        }
+        
+        // Check reverse: rc(to) -> rc(from)
+        // This corresponds to path[j-1] == rc(to) && path[j] == rc(from)
+        // Here 'path[j]' matches 'from' if path[j] == rcNode(rcNode(from)) = from.
+        // Wait, 'from' passed to this function is an oriented ID.
+        // And 'path[j]' matches 'segmentOf(from)'.
+        // So path[j] is either 'from' or 'rcNode(from)'.
+        //
+        // If path[j] == from, we check path[j+1] == to.
+        // If path[j] == rcNode(from), we check path[j-1] == rcNode(to).
+        //
+        // NOTE: The previous loop iterated j over the whole path and checked both conditions:
+        // 1. path[j] == from && path[j+1] == to
+        // 2. path[j] == rcNode(from) && path[j-1] == rcNode(to)
+        //
+        // Now 'j' points to segmentOf(from).
+        // So path[j] is either from or rcNode(from).
+        
+        if (path[j] == from) {
+            if (j + 1 < path.size() && path[j+1] == to) {
+                // Already handled above? Yes.
+                // The block above `if(j+1 < ...)` covers this.
             }
-            if(j > 0 && path[j] == rcNode(from) && path[j - 1] == rcNode(to)) {
-                result += weight;
-                if(result > maxCount) return result;
+        }
+        
+        if (path[j] == rcNode(from)) {
+            if (j > 0 && path[j-1] == rcNode(to)) {
+                 result += weight;
+                 if(result > maxCount) return result;
             }
         }
     }
@@ -3511,15 +3658,23 @@ bool DirectedAnchorGraph::nodeIsPalindrome(uint64_t segId) const
     unordered_set<uint64_t> readsWhichCoverFw;
     unordered_set<uint64_t> readsWhichCoverBw;
     const auto& crossing = pathsCrossing.getPathsCrossing(segId);
-    for(uint64_t pathIdx : crossing) {
+    
+    for(const auto& occ : crossing) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const size_t pos = occ.offset;
+        
         if(pathIdx >= paths.size() || pathRemoved[pathIdx] ||
            pathIdx >= pathReadIds.size()) {
             continue;
         }
         const auto& path = paths[pathIdx];
         if(path.size() < 2 || pathReadIds[pathIdx].empty()) continue;
-        for(size_t pos = 1; pos + 1 < path.size(); pos++) {
-            if(segmentOf(path[pos]) != segId) continue;
+        
+        // Use occ.offset logic
+        if(pos > 0 && pos + 1 < path.size()) {
+            // Verify? path[pos] should be segmentOf segId.
+            // if(segmentOf(path[pos]) != segId) continue; // Should be guaranteed by index.
+            
             for(const auto& read : pathReadIds[pathIdx]) {
                 const uint64_t readName = read.readNameIndex;
                 if(isForward(path[pos])) {
@@ -3541,31 +3696,42 @@ bool DirectedAnchorGraph::isLocallyRepetitive(uint64_t segId) const
     const auto& crossing = pathsCrossing.getPathsCrossing(segId);
 
     // MBG: direct repeated occurrences on same path.
-    for(uint64_t pathIdx : crossing) {
-        if(pathIdx >= paths.size() || pathRemoved[pathIdx]) continue;
-        const auto& path = paths[pathIdx];
-        if(path.size() < 2) continue;
-        uint64_t nodeCount = 0;
-        for(DagNodeId n : path) {
-            if(segmentOf(n) == segId) nodeCount++;
+    // Since crossing now contains all occurrences, if pathIdx appears >= 2 times,
+    // it means the path crosses the segment multiple times.
+    // Optimization: Check for duplicate pathIdx in crossing.
+    {
+        // Vector to sort and check duplicates.
+        // We only care about active paths.
+        static thread_local vector<uint64_t> activePaths;
+        activePaths.clear();
+        activePaths.reserve(crossing.size());
+        
+        for(const auto& occ : crossing) {
+             if(occ.pathIdx < paths.size() && !pathRemoved[occ.pathIdx]) {
+                 activePaths.push_back(occ.pathIdx);
+             }
         }
-        if(nodeCount >= 2) {
-            return true;
+        sort(activePaths.begin(), activePaths.end());
+        for(size_t i = 1; i < activePaths.size(); ++i) {
+            if(activePaths[i] == activePaths[i-1]) return true;
         }
     }
 
     // MBG: repeated read support over internal occurrences.
     unordered_set<uint64_t> readsWhichCover;
-    for(uint64_t pathIdx : crossing) {
+    for(const auto& occ : crossing) {
+        const uint64_t pathIdx = occ.pathIdx;
+        const size_t pos = occ.offset;
+
         if(pathIdx >= paths.size() || pathRemoved[pathIdx] ||
            pathIdx >= pathReadIds.size()) {
             continue;
         }
         const auto& path = paths[pathIdx];
         if(path.size() < 2 || pathReadIds[pathIdx].empty()) continue;
-        for(size_t pos = 1; pos + 1 < path.size(); pos++) {
-            if(segmentOf(path[pos]) != segId) continue;
-            for(const auto& read : pathReadIds[pathIdx]) {
+        
+        if(pos > 0 && pos + 1 < path.size()) {
+             for(const auto& read : pathReadIds[pathIdx]) {
                 const uint64_t readName = read.readNameIndex;
                 if(readsWhichCover.count(readName) == 1) return true;
                 readsWhichCover.insert(readName);
@@ -3596,8 +3762,20 @@ unordered_set<uint64_t> DirectedAnchorGraph::filterToOnlyLocallyRepetitives(
 
         bool found = false;
         const auto& crossing = pathsCrossing.getPathsCrossing(segId);
-        for(uint64_t pathIdx : crossing) {
-            if(pathIdx >= paths.size() || pathRemoved[pathIdx]) continue;
+
+        // Filter to unique paths to avoid O(N^2) behavior on paths with many repeats.
+        static thread_local vector<uint64_t> uniquePaths;
+        uniquePaths.clear();
+        uniquePaths.reserve(crossing.size());
+        for(const auto& occ : crossing) {
+            if(occ.pathIdx < paths.size() && !pathRemoved[occ.pathIdx]) {
+                uniquePaths.push_back(occ.pathIdx);
+            }
+        }
+        sort(uniquePaths.begin(), uniquePaths.end());
+        uniquePaths.erase(unique(uniquePaths.begin(), uniquePaths.end()), uniquePaths.end());
+
+        for(uint64_t pathIdx : uniquePaths) {
             const auto& path = paths[pathIdx];
             if(path.size() < 2) continue;
             uint64_t last = numeric_limits<uint64_t>::max();
@@ -3643,27 +3821,27 @@ unordered_set<uint64_t> DirectedAnchorGraph::trimNodes(
         uint64_t maxReadTrim = nodeBpLength(segId);
         bool hasBoundary = false;
         const auto crossing = pathsCrossing.getPathsCrossing(segId);
-        for(uint64_t pathIdx : crossing) {
+        for(const auto& occ : crossing) {
+            const uint64_t pathIdx = occ.pathIdx;
+            const size_t j = occ.offset;
+
             if(pathIdx >= paths.size() || pathRemoved[pathIdx]) continue;
             if(pathIdx >= pathReadIds.size()) continue;
             const auto& path = paths[pathIdx];
-            for(uint64_t j = 0; j < path.size(); j++) {
-                if(segmentOf(path[j]) != segId) continue;
-                if(j == 0 && path[j] == rcNode(pos)) {
-                    hasBoundary = true;
-                    for(const auto& read : pathReadIds[pathIdx]) {
-                        maxReadTrim = min(maxReadTrim, read.leftClip);
-                    }
-                    if(maxReadTrim == 0) return 0;
-                } else if(j + 1 == path.size() && path[j] == pos) {
-                    hasBoundary = true;
-                    for(const auto& read : pathReadIds[pathIdx]) {
-                        maxReadTrim = min(maxReadTrim, read.rightClip);
-                    }
-                    if(maxReadTrim == 0) return 0;
-                } else {
-                    return 0;
+            
+            // Check boundary condition using offset j.
+            if(j == 0 && path[j] == rcNode(pos)) {
+                hasBoundary = true;
+                for(const auto& read : pathReadIds[pathIdx]) {
+                    maxReadTrim = min(maxReadTrim, read.leftClip);
                 }
+                if(maxReadTrim == 0) return 0;
+            } else if(j + 1 == path.size() && path[j] == pos) {
+                hasBoundary = true;
+                for(const auto& read : pathReadIds[pathIdx]) {
+                    maxReadTrim = min(maxReadTrim, read.rightClip);
+                }
+                if(maxReadTrim == 0) return 0;
             }
         }
         return hasBoundary ? maxReadTrim : 0;
@@ -3750,27 +3928,28 @@ unordered_set<uint64_t> DirectedAnchorGraph::trimNodes(
         }
 
         const auto crossing = pathsCrossing.getPathsCrossing(segId);
-        for(uint64_t pathIdx : crossing) {
+        for(const auto& occ : crossing) {
+            const uint64_t pathIdx = occ.pathIdx;
+            const size_t j = occ.offset;
+
             if(pathIdx >= paths.size() || pathRemoved[pathIdx]) continue;
             if(pathIdx >= pathReadIds.size()) continue;
             const auto& path = paths[pathIdx];
-            for(uint64_t j = 0; j < path.size(); j++) {
-                if(segmentOf(path[j]) != segId) continue;
-                if(j == 0 && path[j] == rcNode(pos)) {
-                    for(auto& read : pathReadIds[pathIdx]) {
-                        if(read.leftClip < trimAmount) {
-                            read.leftClip = 0;
-                        } else {
-                            read.leftClip -= trimAmount;
-                        }
+            
+            if(j == 0 && path[j] == rcNode(pos)) {
+                for(auto& read : pathReadIds[pathIdx]) {
+                    if(read.leftClip < trimAmount) {
+                        read.leftClip = 0;
+                    } else {
+                        read.leftClip -= trimAmount;
                     }
-                } else if(j + 1 == path.size() && path[j] == pos) {
-                    for(auto& read : pathReadIds[pathIdx]) {
-                        if(read.rightClip < trimAmount) {
-                            read.rightClip = 0;
-                        } else {
-                            read.rightClip -= trimAmount;
-                        }
+                }
+            } else if(j + 1 == path.size() && path[j] == pos) {
+                for(auto& read : pathReadIds[pathIdx]) {
+                    if(read.rightClip < trimAmount) {
+                        read.rightClip = 0;
+                    } else {
+                        read.rightClip -= trimAmount;
                     }
                 }
             }
@@ -3984,6 +4163,7 @@ void DirectedAnchorGraph::resolveRound(
         << ", resolvePalindromesGlobal=" << resolvePalindromesGlobal
         << ", copycountFilterHeuristic=" << copycountFilterHeuristic
         << ")." << endl;
+    cout << timestamp << "  resolveRound(minEdgeSupport=" << minEdgeSupport << ") begins." << endl;
     checkValidity();
 
     // Min-heap of (lengthBp, segId).
