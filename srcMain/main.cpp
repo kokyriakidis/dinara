@@ -640,16 +640,22 @@ void dinara::main::assemble(
     //      << " nodes=" << preEcGlobalHetClusters.nodes.size()
     //      << endl;
 
-    // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
-    // Optional path: experimental global-site phasing/parity.
-    // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
-    const bool useGlobalSiteEcParity = false;
-    if (useGlobalSiteEcParity) {
-        cout << timestamp << "Using experimental global-site EC parity path." << endl;
-        assembler.performGlobalSiteECParity(threadCount);
-    } else {
-        assembler.performHifiasmECParity(threadCount);
-    }
+    // // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
+    // // Optional path: experimental global-site phasing/parity.
+    // // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
+    // const bool useGlobalSiteEcParity = false;
+    // if (useGlobalSiteEcParity) {
+    //     cout << timestamp << "Using experimental global-site EC parity path." << endl;
+    //     assembler.performGlobalSiteECParity(threadCount);
+    // } else {
+    //     assembler.performHifiasmECParity(threadCount);
+    // }
+
+
+
+    // Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics)
+    assembler.performHifiasmECParity(threadCount);
+
 
     // =========================================================================
     // ONT Chain Deduplication: Keep One Overlap Per Partner (Hifiasm Parity)
@@ -673,16 +679,13 @@ void dinara::main::assemble(
     // ✅ VERIFIED EQUIVALENT to hifiasm dedup_chains logic (see function docs)
     assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
 
-    // REMOVE: // After phasing/EC parity sets DeleteReasonPhase, remove per-read-pair redundant overlaps
-    // // among the remaining cis overlaps.
-    // assembler.filterSecondaryAlignmentsPerReadPair(
-    //     threadCount,
-    //     assemblerOptions.readGraphOptions.filterSecondaryRequireNonRedundantOnBothReads);
 
     // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
+
+    return;
 
     // Create the bidirectional read graph.
     // This is built from the same alignments that are in the ReadGraph

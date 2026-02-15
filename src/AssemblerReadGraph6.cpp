@@ -129,7 +129,6 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // This routine applies overlap-level and read-level filters, then rebuilds the read graph
     // from the surviving overlaps.
     checkAlignmentDataAreOpen();
-    // checkPhasingCigarsAreOpen(); // Removed: PhasingCigars replaced by AlignedEvidenceStore
 
     const uint64_t totalAlignments = alignmentData.size();
 
@@ -218,13 +217,13 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << afterHangDel1
          << ", active=" << countActiveAlignments() << endl;
 
-    // // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
-    // // Marks fully contained reads and removes their overlaps
-    // removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
-    // auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
-    // cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
-    //      << ", isDeleted1=" << afterContainDel1
-    //      << ", active=" << countActiveAlignments() << endl;
+    // Step 5: Remove contained reads (ma_hit_contained_advance equivalent)
+    // Marks fully contained reads and removes their overlaps
+    removeContainedReads(maxHang, maxHangRate, minOverlapLength, threadCount);
+    auto [afterContainDel0, afterContainDel1] = countPhasingFlags();
+    cout << timestamp << "[DIAG] After removeContainedReads: isDeleted0=" << afterContainDel0
+         << ", isDeleted1=" << afterContainDel1
+         << ", active=" << countActiveAlignments() << endl;
 
 
     
@@ -272,6 +271,15 @@ void Assembler::createReadGraph6(uint64_t threadCount)
 
     for(uint64_t i = 0; i < alignmentCount; i++) {
         auto& ad = alignmentData[i];
+
+        // Propagate read-level deletions (ma_hit_sub/isolated) to the alignment reasons.
+        // Hifiasm ma_sg_gen parity: if(sq->del || st->del) continue;
+        if (!validReadIntervals.empty()) {
+            if (validReadIntervals[ad.readIds[0]].isDeleted ||
+                validReadIntervals[ad.readIds[1]].isDeleted) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonLocal);
+            }
+        }
 
         // AND semantics: keep only if BOTH sides keep it (no delete reasons on either side)
         if(!ad.keptByBothSides()) {

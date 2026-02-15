@@ -15,7 +15,7 @@ namespace {
     // hifiasm constants used by boundary_verify / verify_single_window.
     constexpr uint32_t HifiasmWindow = 375;
     constexpr uint32_t HifiasmThresholdMaxSize = 31;
-    constexpr double HifiasmMaxOvDiffEc = 0.04;
+    constexpr double HifiasmMaxOvDiffEc = 0.07;
 
     using Word = uint64_t;
 
