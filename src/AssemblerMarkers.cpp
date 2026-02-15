@@ -78,9 +78,27 @@ static size_t getSyncmerMarkersForRead(
         sketcher, readSequence.c_str(), readSequence.size());
     
     positionBuffer.assign(syncmerList.data, syncmerList.data + syncmerList.len);
-    positionBuffer.push_back(0);
-    positionBuffer.push_back(uint32_t(baseCount - k_scan));
     free_syncmer_list(syncmerList);
+
+    // Force all k-mer positions before the first syncmer and after the last syncmer.
+    // This ensures that read boundaries are fully covered with candidates,
+    // maximizing the chance that at least one survives frequency filtering.
+    const uint32_t lastKmerPos = uint32_t(baseCount - k_scan);
+    if(!positionBuffer.empty()) {
+        const uint32_t firstSyncmer = positionBuffer.front();
+        const uint32_t lastSyncmer  = positionBuffer.back();
+        for(uint32_t p = 0; p < firstSyncmer; ++p) {
+            positionBuffer.push_back(p);
+        }
+        for(uint32_t p = lastSyncmer + 1; p <= lastKmerPos; ++p) {
+            positionBuffer.push_back(p);
+        }
+    } else {
+        // No syncmers found: force all positions.
+        for(uint32_t p = 0; p <= lastKmerPos; ++p) {
+            positionBuffer.push_back(p);
+        }
+    }
 
     // Sort and deduplicate to handle cases where read ends were already selected as syncmers.
     std::sort(positionBuffer.begin(), positionBuffer.end());
@@ -332,9 +350,24 @@ static size_t getMinimizerMarkersForRead(
         readSequence.c_str(),
         readSequence.size());
     positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
-    positionBuffer.push_back(0);
-    positionBuffer.push_back(uint32_t(baseCount - k));
     free_minimizer_list(minimizerList);
+
+    // Force all k-mer positions before the first minimizer and after the last minimizer.
+    const uint32_t lastKmerPos = uint32_t(baseCount - k);
+    if(!positionBuffer.empty()) {
+        const uint32_t firstMinimizer = positionBuffer.front();
+        const uint32_t lastMinimizer  = positionBuffer.back();
+        for(uint32_t p = 0; p < firstMinimizer; ++p) {
+            positionBuffer.push_back(p);
+        }
+        for(uint32_t p = lastMinimizer + 1; p <= lastKmerPos; ++p) {
+            positionBuffer.push_back(p);
+        }
+    } else {
+        for(uint32_t p = 0; p <= lastKmerPos; ++p) {
+            positionBuffer.push_back(p);
+        }
+    }
 
     // Sort and deduplicate to handle cases where read ends were already selected as minimizers.
     std::sort(positionBuffer.begin(), positionBuffer.end());
