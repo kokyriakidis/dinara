@@ -4439,11 +4439,6 @@ void Assembler::chainPafCandidates(
                         });
 
                     const size_t numHits = scratch.flatHits.size();
-                    // Hifiasm parity: chain_cutoff is a >= threshold.
-                    // A pair with exactly minChainedMarkerCount anchors is still eligible.
-                    if(minChainedMarkerCount > 0 && numHits < size_t(minChainedMarkerCount)) {
-                        continue;
-                    }
 
                     // Transfer hits from temporary AoS layout to SoA vectors.
                     // SoA layout improves cache locality in the O(N^2) DP loops.
@@ -5088,11 +5083,6 @@ void Assembler::chainPafCandidates(
                     }
                     std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
 
-                    // Hifiasm parity: keep chains with length >= chain_cutoff.
-                    if(minChainedMarkerCount > 0 &&
-                        scratch.currentChainPath.size() < size_t(minChainedMarkerCount)) {
-                        continue;
-                    }
 
                     // Build alignment
                     Alignment al;
