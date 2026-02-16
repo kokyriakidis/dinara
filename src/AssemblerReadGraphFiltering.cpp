@@ -833,6 +833,171 @@ void Assembler::filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint
          << " total reads marked deleted (no surviving overlaps)." << endl;
 }
 
+/*
+deleteContainmentOverlaps: Delete overlaps where one read is contained in the other.
+
+Runs early (e.g. after computeAlignmentsWithEvidence) to remove containment overlaps
+without removing the contained reads themselves. Uses ma_hit2arc_containment to detect
+QCONT (query contained in target) or TCONT (target contained in query), and marks
+those overlaps with DeleteReasonContained.
+
+Uses extended coordinates (ad.qs/qe/ts/te) from chaining.
+*/
+void Assembler::deleteContainmentOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+{
+    cout << timestamp << "Deleting containment overlaps (maxHang=" << maxHang
+         << ", maxHangRate=" << maxHangRate << ", minOverlapLength=" << minOverlapLength << ")." << endl;
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    hangingFilterMaxHang = maxHang;
+    hangingFilterMaxHangRate = maxHangRate;
+    hangingFilterMinOverlap = minOverlapLength;
+
+    uint64_t containmentBefore = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonContained) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonContained)) {
+            ++containmentBefore;
+        }
+    }
+
+    setupLoadBalancing(alignmentData.size(), 10000);
+    runThreads(&Assembler::deleteContainmentOverlapsThreadFunction, threadCount);
+
+    uint64_t containmentAfter = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonContained) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonContained)) {
+            ++containmentAfter;
+        }
+    }
+
+    cout << timestamp << "Containment overlaps: " << (containmentAfter - containmentBefore) << " deleted ("
+         << containmentAfter << " total)." << endl;
+}
+
+void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
+{
+    static_cast<void>(threadId);
+    uint64_t begin, end;
+    const uint64_t maxHang = this->hangingFilterMaxHang;
+    const double maxHangRate = this->hangingFilterMaxHangRate;
+    const uint64_t minOvlp = this->hangingFilterMinOverlap;
+
+    while (getNextBatch(begin, end)) {
+        for (uint64_t i = begin; i != end; i++) {
+            AlignmentData& ad = alignmentData[i];
+            if (!ad.keptByBothSides()) continue;
+
+            ReadId qn = ad.readIds[0];
+            ReadId tn = ad.readIds[1];
+            const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qn));
+            const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(tn));
+
+            const uint32_t qs = ad.qs, qe = ad.qe, ts = ad.ts, te = ad.te;
+            if (qe <= qs || te <= ts) continue;
+
+            const int result = ma_hit2arc_containment(
+                (int32_t)qs, (int32_t)qe, (int32_t)qLen,
+                (int32_t)ts, (int32_t)te, (int32_t)tLen,
+                !ad.isSameStrand,
+                (int32_t)maxHang,
+                maxHangRate,
+                (int32_t)minOvlp);
+
+            // result 1 = QCONT, 2 = TCONT: delete this overlap
+            if (result == 1 || result == 2) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
+            }
+        }
+    }
+}
+
+/*
+deleteInternalOverlaps: Delete overlaps classified as internal or too short by ma_hit2arc_containment.
+
+Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches:
+  - result -1: internal (excessive overhangs on both reads)
+  - result -2: too short (effective overlap < min_ovlp)
+
+Uses extended coordinates (ad.qs/qe/ts/te) from chaining.
+*/
+void Assembler::deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+{
+    cout << timestamp << "Deleting internal overlaps (maxHang=" << maxHang
+         << ", maxHangRate=" << maxHangRate << ", minOverlapLength=" << minOverlapLength << ")." << endl;
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    hangingFilterMaxHang = maxHang;
+    hangingFilterMaxHangRate = maxHangRate;
+    hangingFilterMinOverlap = minOverlapLength;
+
+    uint64_t internalBefore = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
+            ++internalBefore;
+        }
+    }
+
+    setupLoadBalancing(alignmentData.size(), 10000);
+    runThreads(&Assembler::deleteInternalOverlapsThreadFunction, threadCount);
+
+    uint64_t internalAfter = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
+            ++internalAfter;
+        }
+    }
+
+    cout << timestamp << "Internal overlaps: " << (internalAfter - internalBefore) << " deleted ("
+         << internalAfter << " total)." << endl;
+}
+
+void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
+{
+    static_cast<void>(threadId);
+    uint64_t begin, end;
+    const uint64_t maxHang = this->hangingFilterMaxHang;
+    const double maxHangRate = this->hangingFilterMaxHangRate;
+    const uint64_t minOvlp = this->hangingFilterMinOverlap;
+
+    while (getNextBatch(begin, end)) {
+        for (uint64_t i = begin; i != end; i++) {
+            AlignmentData& ad = alignmentData[i];
+            if (!ad.keptByBothSides()) continue;
+
+            ReadId qn = ad.readIds[0];
+            ReadId tn = ad.readIds[1];
+            const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qn));
+            const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(tn));
+
+            const uint32_t qs = ad.qs, qe = ad.qe, ts = ad.ts, te = ad.te;
+            if (qe <= qs || te <= ts) continue;
+
+            const int result = ma_hit2arc_containment(
+                (int32_t)qs, (int32_t)qe, (int32_t)qLen,
+                (int32_t)ts, (int32_t)te, (int32_t)tLen,
+                !ad.isSameStrand,
+                (int32_t)maxHang,
+                maxHangRate,
+                (int32_t)minOvlp);
+
+            // result -1 = internal, -2 = too short: delete this overlap
+            if (result < 0) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
+            }
+        }
+    }
+}
+
 void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
 {
     static_cast<void>(threadId);

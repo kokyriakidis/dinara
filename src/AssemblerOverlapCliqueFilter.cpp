@@ -1,6 +1,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "Reads.hpp"
+#include "hifiasmCoordinateTransforms.hpp"
 #include "overlapClassification.hpp"
 #include "timestamp.hpp"
 using namespace dinara;
@@ -116,44 +117,81 @@ void Assembler::filterOverlapsByRegionalCliques(
             // Determine which read is R and which is the partner.
             const bool isRead0 = (ad.readIds[0] == readId);
             const ReadId partnerId = isRead0 ? ad.readIds[1] : ad.readIds[0];
+            const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(partnerId));
 
-            // Compute interval on R.
-            // AlignmentData stores: readIds[0] on strand 0, qs/qe for readIds[0], ts/te for readIds[1].
+            // Use raw overlap bounds (not tip-extended), for parity with ma_hit_cut/ma_hit_flt.
+            uint32_t rawQs = ad.qs, rawQe = ad.qe, rawTs = ad.ts, rawTe = ad.te;
+            {
+                const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(ad.readIds[0]));
+                const uint32_t tLenInner = uint32_t(reads->getReadRawSequenceLength(ad.readIds[1]));
+                auto getRawBoundsIfAvailable = [&](uint32_t& outQs, uint32_t& outQe, uint32_t& outTs, uint32_t& outTe) -> bool {
+                    if (!markers || !markers->isOpen()) return false;
+                    const auto& d0 = ad.info.data[0];
+                    const auto& d1 = ad.info.data[1];
+                    if (d0.markerCount == 0 || d1.markerCount == 0) return false;
+                    if (d0.firstOrdinal > d0.lastOrdinal || d1.firstOrdinal > d1.lastOrdinal) return false;
+
+                    const OrientedReadId oid0(ad.readIds[0], 0);
+                    const OrientedReadId oid1(ad.readIds[1], ad.isSameStrand ? 0 : 1);
+                    const auto& m0 = (*markers)[oid0.getValue()];
+                    const auto& m1 = (*markers)[oid1.getValue()];
+                    if (d0.lastOrdinal >= m0.size() || d1.lastOrdinal >= m1.size()) return false;
+
+                    const uint32_t k = uint32_t(assemblerInfo->k);
+                    const uint32_t qs0 = m0[d0.firstOrdinal].position;
+                    const uint32_t qe0 = m0[d0.lastOrdinal].position + k;
+
+                    const uint32_t tsOriented = m1[d1.firstOrdinal].position;
+                    const uint32_t teOriented = m1[d1.lastOrdinal].position + k;
+
+                    uint32_t ts0 = tsOriented;
+                    uint32_t te0 = teOriented;
+                    if (!ad.isSameStrand) {
+                        const auto p = dinara::rcIntervalToForward(tLenInner, tsOriented, teOriented);
+                        ts0 = p.first;
+                        te0 = p.second;
+                    }
+
+                    if (qs0 >= qe0 || qe0 > qLen) return false;
+                    if (ts0 >= te0 || te0 > tLenInner) return false;
+
+                    outQs = qs0; outQe = qe0; outTs = ts0; outTe = te0;
+                    return true;
+                };
+                (void)getRawBoundsIfAvailable(rawQs, rawQe, rawTs, rawTe);
+            }
+
+            // Compute interval on R from raw bounds.
             uint32_t startOnR, endOnR;
             if (isRead0) {
-                startOnR = ad.qs;
-                endOnR = ad.qe;
+                startOnR = rawQs;
+                endOnR = rawQe;
             } else {
-                startOnR = ad.ts;
-                endOnR = ad.te;
+                startOnR = rawTs;
+                endOnR = rawTe;
             }
 
             // Skip degenerate intervals.
             if (endOnR <= startOnR) continue;
 
-            // Classify using the same hifiasm ma_hit2arc_containment function.
-            // The function expects query=R, target=partner.
-            // When R is readIds[0]: qs/qe are R's coords, ts/te are partner's coords.
-            // When R is readIds[1]: swap so R is query.
+            // Classify using raw bounds (ma_hit2arc_containment expects query=R, target=partner).
             int32_t classQs, classQe, classQl, classTs, classTe, classTl;
             bool classIsReverse;
             if (isRead0) {
-                classQs = (int32_t)ad.qs;
-                classQe = (int32_t)ad.qe;
+                classQs = (int32_t)rawQs;
+                classQe = (int32_t)rawQe;
                 classQl = (int32_t)rLen;
-                classTs = (int32_t)ad.ts;
-                classTe = (int32_t)ad.te;
-                classTl = (int32_t)reads->getReadRawSequenceLength(partnerId);
+                classTs = (int32_t)rawTs;
+                classTe = (int32_t)rawTe;
+                classTl = (int32_t)tLen;
                 classIsReverse = !ad.isSameStrand;
             } else {
-                // R is readIds[1], partner is readIds[0].
-                // Swap query/target so R is the query.
-                classQs = (int32_t)ad.ts;
-                classQe = (int32_t)ad.te;
+                classQs = (int32_t)rawTs;
+                classQe = (int32_t)rawTe;
                 classQl = (int32_t)rLen;
-                classTs = (int32_t)ad.qs;
-                classTe = (int32_t)ad.qe;
-                classTl = (int32_t)reads->getReadRawSequenceLength(partnerId);
+                classTs = (int32_t)rawQs;
+                classTe = (int32_t)rawQe;
+                classTl = (int32_t)tLen;
                 classIsReverse = !ad.isSameStrand;
             }
 
@@ -163,8 +201,8 @@ void Assembler::filterOverlapsByRegionalCliques(
                 classIsReverse, maxHang, intFrac, minOvlp);
 
             // result 0 = dovetail, 1 = R contained, 2 = partner contained
-            // result < 0 = internal/too-short (should already be filtered, but handle gracefully)
-            const bool isDovetail = (classification == 0);
+            // Skip contained overlaps entirely; only use dovetails.
+            if (classification != 0) continue;
 
             candidates.push_back({
                 alignmentIdx,
@@ -172,7 +210,7 @@ void Assembler::filterOverlapsByRegionalCliques(
                 startOnR,
                 endOnR,
                 ad.info.dpScore,
-                isDovetail
+                true   // dovetail only (contained skipped above)
             });
         }
 
