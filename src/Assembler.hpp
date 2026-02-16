@@ -95,6 +95,7 @@ namespace dinara {
 
     namespace mode3 {
         class Anchors;
+        class AnchorGraph;
         class BidirectedAnchors;
         class DirectedAnchorGraph;
     }
@@ -684,6 +685,7 @@ public:
     shared_ptr<mode3::BidirectedAnchors> createBidirectedAnchors(
         uint64_t minAnchorCoverage,
         uint64_t maxAnchorCoverage,
+        uint64_t minEdgeCoverage,
         uint64_t threadCount);
 
     // Create and run Verkko-style directed anchor graph resolution.
@@ -1061,6 +1063,7 @@ public:
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeReadsFlaggedContained(uint64_t threadCount);
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
@@ -1452,6 +1455,10 @@ private:
     // The order in compressedAlignments matches that in alignmentData.
 public:
     MemoryMapped::Vector<AlignmentData> alignmentData;
+    const MemoryMapped::VectorOfVectors<uint32_t, uint32_t>& getAlignmentTable() const
+    {
+        return alignmentTable;
+    }
 #ifdef DINARA_TESTING
 public:
     // Test-only hook: allows integration tests to construct a consistent alignmentTable
@@ -3515,6 +3522,9 @@ public:
     shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
     void accessBidirectedAnchors();
 
+    // Global AnchorGraph (created for all anchors, not per-component).
+    shared_ptr<mode3::AnchorGraph> anchorGraph;
+
     // Verkko-style directed anchor graph (built from BRG anchors).
     shared_ptr<mode3::DirectedAnchorGraph> directedAnchorGraph;
 
@@ -3559,6 +3569,12 @@ public:
     // Http server functions for BRG-native anchors.
     void exploreBidirectedAnchor(const vector<string>&, ostream&);
     void exploreBidirectedJourney(const vector<string>&, ostream&);
+    void exploreBidirectedAnchorGraph(const vector<string>&, ostream&);
+    void exploreBidirectedAnchorGraphNode(const vector<string>&, ostream&);
+    void exploreBidirectedAnchorGraphPath(const vector<string>&, ostream&);
+
+    // Http server function for the global AnchorGraph.
+    void exploreAnchorGraph(const vector<string>&, ostream&);
 
     // Http server functions for the directed anchor graph (Verkko-style).
     void exploreDirectedAnchorGraph(const vector<string>&, ostream&);

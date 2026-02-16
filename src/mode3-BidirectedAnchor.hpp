@@ -50,7 +50,9 @@ in mode3-BidirectedAnchor.cpp and AssemblerBidirectedAnchors.cpp.
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <set>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -320,7 +322,8 @@ public:
     // an edge is recorded from OrientedBidirectedAnchor(A,sA) to OrientedBidirectedAnchor(B,sB),
     // AND the symmetric reverse edge from reverse(B,sB) to reverse(A,sA).
     // Edge coverage counts how many reads support the edge.
-    void computeEdges(uint64_t threadCount);
+    // Edges with coverage < minEdgeCoverage are discarded.
+    void computeEdges(uint64_t threadCount, uint64_t minEdgeCoverage = 0);
 
     // Get all outgoing edges from a directed anchor (O(1) lookup).
     std::span<const BidirectedEdge> getOutEdges(OrientedBidirectedAnchor oa) const;
@@ -332,6 +335,48 @@ public:
 
     // Write edges to CSV for diagnostics.
     void writeEdges() const;
+
+    // Export the bidirected anchor graph in GFA 1 format.
+    // Segments correspond to anchor ids. Links correspond to oriented edges.
+    // If includePaths is true, physical read journeys are also written as P lines.
+    void writeGfa(const std::string& fileName, bool includePaths = false) const;
+
+
+    // ---- Transitive reduction ----
+
+    // Remove low-coverage edges that are redundant, i.e. the target is
+    // reachable from the source via an alternate path using only edges
+    // with strictly higher coverage, within maxDistance hops.
+    // Processes edges from coverage 1 up to maxEdgeCoverage.
+    void transitiveReduction(uint64_t maxEdgeCoverage, uint64_t maxDistance);
+
+
+    // ---- Unitigification ----
+
+    // Merge maximal linear chains of anchors into single "unitig" anchors.
+    // A chain is a maximal sequence of oriented anchors where each internal
+    // transition has out-degree 1 at the source and in-degree 1 at the target.
+    // After this call:
+    //   - anchorCount is reduced to the number of unitigs.
+    //   - Marker intervals are the union of intervals from chain members.
+    //   - Journeys are collapsed (consecutive same-unitig entries merged).
+    //   - Edge table is recomputed from the collapsed journeys.
+    //   - unitigChains stores the original chain composition for traceability.
+    void unitigifyAll();
+
+    // Access the chain composition of a unitig (only valid after unitigifyAll).
+    // Returns the sequence of original oriented anchors that were merged.
+    const std::vector<OrientedBidirectedAnchor>& chain(BidirectedAnchorId unitigId) const {
+        return unitigChains.at(unitigId);
+    }
+
+    // Get the chain length (number of original anchors) of a unitig.
+    uint64_t chainLength(BidirectedAnchorId unitigId) const {
+        return unitigChains.at(unitigId).size();
+    }
+
+    // True if unitigifyAll() has been called.
+    bool isUnitigified() const { return !unitigChains.empty(); }
 
 
     // ---- Neighbor finding (from precomputed edges) ----
@@ -409,6 +454,21 @@ private:
     BidirectedVectorWithDirection<std::vector<BidirectedEdge>> inEdges;
 
     bool edgesComputed = false;
+
+    // BFS helper for transitive reduction.
+    // Returns true if an alternate path exists from `from` to `to`
+    // using only edges with coverage > edgeCoverage that are not in removedSet,
+    // within maxDistance hops.
+    bool transitiveReductionCanRemove(
+        OrientedBidirectedAnchor from,
+        OrientedBidirectedAnchor to,
+        uint64_t edgeCoverage,
+        uint64_t maxDistance,
+        const std::set<std::pair<OrientedBidirectedAnchor, OrientedBidirectedAnchor>>& removedSet) const;
+
+    // Unitig chain composition (populated by unitigifyAll).
+    // For each unitig anchor, stores the original oriented anchors that were merged.
+    std::vector<std::vector<OrientedBidirectedAnchor>> unitigChains;
 
     // Temporary storage used during journey computation.
     struct JourneyWithOrdinal {

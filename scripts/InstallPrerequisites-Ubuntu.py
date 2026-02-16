@@ -543,6 +543,42 @@ def installSimdMinimizers():
         os.chdir(oldDirectory)
 
 
+def installBubbleFinder():
+    print("Installing BubbleFinder...")
+
+    installBinDir = os.path.join(HOME, ".local", "bin")
+    installBinary = os.path.join(installBinDir, "BubbleFinder")
+    sourceDir = os.path.join(HOME, "Downloads", "BubbleFinder")
+
+    os.makedirs(installBinDir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building BubbleFinder using temporary directory", temporaryDirectory)
+
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+
+        if os.path.exists(sourceDir):
+            print("Updating existing BubbleFinder source at", sourceDir)
+            runCommand("git -C " + sourceDir + " pull --ff-only")
+        else:
+            print("Cloning BubbleFinder source to", sourceDir)
+            runCommand("git clone https://github.com/algbio/BubbleFinder.git " + sourceDir)
+
+        buildDir = os.path.join(sourceDir, "build")
+        if os.path.exists(buildDir):
+            shutil.rmtree(buildDir)
+
+        runCommand("cmake -S " + sourceDir + " -B " + buildDir + " -DCMAKE_BUILD_TYPE=Release")
+        runCommand("cmake --build " + buildDir + " -j")
+        runCommand("cp " + os.path.join(buildDir, "BubbleFinder") + " " + installBinary)
+        runCommand("chmod +x " + installBinary)
+
+        os.chdir(oldDirectory)
+
+    print("BubbleFinder installed at " + installBinary)
+
+
 
 # Initialize build directory (clean start)
 initializeBuildDirectory()
@@ -765,6 +801,7 @@ def installShasta2():
 installAstarpa()
 installPoasta()
 installSimdMinimizers()
+installBubbleFinder()
 
 # Install shasta2 (and abpoa via shasta2 scripts)
 installShasta2()

@@ -1,4 +1,6 @@
 #include "mode3-LocalAnchorGraph.hpp"
+#include "mode3-AnchorGraph.hpp"
+#include "mode3-BidirectedAnchor.hpp"
 #include "computeLayout.hpp"
 #include "html.hpp"
 #include "HttpServer.hpp"
@@ -27,7 +29,7 @@ LocalAnchorGraph::LocalAnchorGraph(
     bool filterEdgesByCoverageLoss,
     double maxCoverageLoss,
     uint64_t minCoverage) :
-    anchors(anchors),
+    anchorsPtr(&anchors),
     maxDistance(maxDistance)
 {
     LocalAnchorGraph& graph = *this;
@@ -53,7 +55,7 @@ LocalAnchorGraph::LocalAnchorGraph(
         const uint64_t distance0 = vertex0.distance;
         const uint64_t distance1 = distance0 + 1;
 
-        anchors.findChildren(anchorId0, neighbors, coverage, minCoverage);
+        anchorsPtr->findChildren(anchorId0, neighbors, coverage, minCoverage);
         for(uint64_t i=0; i<neighbors.size(); i++) {
             const AnchorId anchorId1 = neighbors[i];
             auto it1 = vertexMap.find(anchorId1);
@@ -65,7 +67,7 @@ LocalAnchorGraph::LocalAnchorGraph(
             if(filterEdgesByCoverageLoss) {
                 LocalAnchorGraphEdge edge;
                 edge.coverage = coverage[i];
-                anchors.analyzeAnchorPair(anchorId0, anchorId1, edge.info);
+                anchorsPtr->analyzeAnchorPair(anchorId0, anchorId1, edge.info);
                 if(edge.coverageLoss() > maxCoverageLoss) {
                     continue;
                 }
@@ -78,7 +80,7 @@ LocalAnchorGraph::LocalAnchorGraph(
             }
         }
 
-        anchors.findParents(anchorId0, neighbors, coverage, minCoverage);
+        anchorsPtr->findParents(anchorId0, neighbors, coverage, minCoverage);
         for(uint64_t i=0; i<neighbors.size(); i++) {
             const AnchorId anchorId1 = neighbors[i];
             auto it1 = vertexMap.find(anchorId1);
@@ -90,7 +92,7 @@ LocalAnchorGraph::LocalAnchorGraph(
             if(filterEdgesByCoverageLoss) {
                 LocalAnchorGraphEdge edge;
                 edge.coverage = coverage[i];
-                anchors.analyzeAnchorPair(anchorId0, anchorId1, edge.info);
+                anchorsPtr->analyzeAnchorPair(anchorId0, anchorId1, edge.info);
                 if(edge.coverageLoss() > maxCoverageLoss) {
                     continue;
                 }
@@ -109,7 +111,7 @@ LocalAnchorGraph::LocalAnchorGraph(
     // Now add the edges.
     BGL_FORALL_VERTICES(v0, graph, LocalAnchorGraph) {
         const AnchorId anchorId0 = graph[v0].anchorId;
-        anchors.findChildren(anchorId0, neighbors, coverage);
+        anchorsPtr->findChildren(anchorId0, neighbors, coverage);
         for(uint64_t i=0; i<neighbors.size(); i++) {
             if(coverage[i] < minCoverage) {
                 continue;
@@ -124,7 +126,7 @@ LocalAnchorGraph::LocalAnchorGraph(
             // Create the tentative edge.
             LocalAnchorGraphEdge edge;
             edge.coverage = coverage[i];
-            anchors.analyzeAnchorPair(anchorId0, anchorId1, edge.info);
+            anchorsPtr->analyzeAnchorPair(anchorId0, anchorId1, edge.info);
 
             // Add it if requested.
             if((not filterEdgesByCoverageLoss) or
@@ -133,6 +135,228 @@ LocalAnchorGraph::LocalAnchorGraph(
                 tie(e, ignore) = add_edge(v0, v1, edge, graph);
             }
         }
+    }
+}
+
+
+
+// Construct by BFS on a pre-computed global AnchorGraph.
+// Vertex and edge descriptors use L (local) suffix for LocalAnchorGraph
+// and G (global) for AnchorGraph.
+LocalAnchorGraph::LocalAnchorGraph(
+    const Anchors& anchors,
+    const AnchorGraph& anchorGraph,
+    const vector<AnchorId>& anchorIds,
+    uint64_t maxDistance,
+    uint64_t minCoverage) :
+    anchorsPtr(&anchors),
+    maxDistance(maxDistance)
+{
+    LocalAnchorGraph& localAnchorGraph = *this;
+
+    // Initialize a BFS from these AnchorIds.
+    std::queue<vertex_descriptor> q;
+    for(const AnchorId anchorId: anchorIds) {
+        DINARA_ASSERT(not vertexMap.contains(anchorId));
+        const vertex_descriptor vL = boost::add_vertex(LocalAnchorGraphVertex(anchorId, 0), localAnchorGraph);
+        vertexMap.insert({anchorId, vL});
+        q.push(vL);
+    }
+
+    // BFS to find the vertices. We will add the edges later.
+    while(not q.empty()) {
+
+        // Dequeue a vertex.
+        const vertex_descriptor v0L = q.front();
+        q.pop();
+        const LocalAnchorGraphVertex& vertex0L = localAnchorGraph[v0L];
+        const AnchorId anchorId0 = vertex0L.anchorId;
+        const uint64_t distance0 = vertex0L.distance;
+        const uint64_t distance1 = distance0 + 1;
+
+        // Get the corresponding global AnchorGraph vertex.
+        const AnchorGraph::vertex_descriptor v0G = anchorGraph.vertexDescriptors[anchorId0];
+
+        // Loop over out-edges in the global graph.
+        BGL_FORALL_OUTEDGES(v0G, eG, anchorGraph, AnchorGraph) {
+            if(anchorGraph[eG].coverage < minCoverage) {
+                continue;
+            }
+            const AnchorGraph::vertex_descriptor v1G = target(eG, anchorGraph);
+            const AnchorId anchorId1 = anchorGraph.anchorIds[anchorGraph[v1G].localAnchorId];
+
+            auto it1 = vertexMap.find(anchorId1);
+            if(it1 != vertexMap.end()) {
+                continue;
+            }
+
+            const vertex_descriptor v1L = boost::add_vertex(LocalAnchorGraphVertex(anchorId1, distance1), localAnchorGraph);
+            vertexMap.insert({anchorId1, v1L});
+            if(distance1 < maxDistance) {
+                q.push(v1L);
+            }
+        }
+
+        // Loop over in-edges in the global graph.
+        BGL_FORALL_INEDGES(v0G, eG, anchorGraph, AnchorGraph) {
+            if(anchorGraph[eG].coverage < minCoverage) {
+                continue;
+            }
+            const AnchorGraph::vertex_descriptor v1G = source(eG, anchorGraph);
+            const AnchorId anchorId1 = anchorGraph.anchorIds[anchorGraph[v1G].localAnchorId];
+
+            auto it1 = vertexMap.find(anchorId1);
+            if(it1 != vertexMap.end()) {
+                continue;
+            }
+
+            const vertex_descriptor v1L = boost::add_vertex(LocalAnchorGraphVertex(anchorId1, distance1), localAnchorGraph);
+            vertexMap.insert({anchorId1, v1L});
+            if(distance1 < maxDistance) {
+                q.push(v1L);
+            }
+        }
+    }
+
+    // Now add the edges.
+    BGL_FORALL_VERTICES(v0L, localAnchorGraph, LocalAnchorGraph) {
+        const AnchorId anchorId0 = localAnchorGraph[v0L].anchorId;
+        const AnchorGraph::vertex_descriptor v0G = anchorGraph.vertexDescriptors[anchorId0];
+
+        BGL_FORALL_OUTEDGES(v0G, eG, anchorGraph, AnchorGraph) {
+            if(anchorGraph[eG].coverage < minCoverage) {
+                continue;
+            }
+            const AnchorGraph::vertex_descriptor v1G = target(eG, anchorGraph);
+            const AnchorId anchorId1 = anchorGraph.anchorIds[anchorGraph[v1G].localAnchorId];
+
+            auto it1 = vertexMap.find(anchorId1);
+            if(it1 != vertexMap.end()) {
+                const vertex_descriptor v1L = it1->second;
+
+                LocalAnchorGraphEdge edge;
+                edge.info = anchorGraph[eG].info;
+                edge.coverage = anchorGraph[eG].coverage;
+                add_edge(v0L, v1L, edge, localAnchorGraph);
+            }
+        }
+    }
+}
+
+
+
+// Construct from a precomputed BidirectedAnchors local subgraph.
+LocalAnchorGraph::LocalAnchorGraph(
+    const BidirectedAnchors& bidirectedAnchors,
+    const std::unordered_map<uint64_t, uint64_t>& nodeDistance,
+    const vector<LocalBidirectedEdge>& edges,
+    uint64_t maxDistance) :
+    bidirectedAnchorsPtr(&bidirectedAnchors),
+    maxDistance(maxDistance)
+{
+    LocalAnchorGraph& graph = *this;
+
+    // Create vertices from the nodeDistance map.
+    for(const auto& [nodeId, distance] : nodeDistance) {
+        const AnchorId anchorId = AnchorId(nodeId);
+        const vertex_descriptor v = boost::add_vertex(
+            LocalAnchorGraphVertex(anchorId, distance), graph);
+        vertexMap.insert({anchorId, v});
+    }
+
+    // Create edges.
+    for(const LocalBidirectedEdge& edge : edges) {
+        const AnchorId anchorId0 = AnchorId(edge.from);
+        const AnchorId anchorId1 = AnchorId(edge.to);
+
+        auto it0 = vertexMap.find(anchorId0);
+        auto it1 = vertexMap.find(anchorId1);
+        if(it0 == vertexMap.end() or it1 == vertexMap.end()) {
+            continue;
+        }
+
+        LocalAnchorGraphEdge graphEdge;
+        graphEdge.coverage = edge.coverage;
+
+        // Populate partial AnchorPairInfo from BidirectedAnchors data.
+        // anchorId0 and anchorId1 are already canonical BidirectedAnchorIds.
+        graphEdge.info.totalA = bidirectedAnchors.coverage(anchorId0);
+        graphEdge.info.totalB = bidirectedAnchors.coverage(anchorId1);
+        graphEdge.info.common = bidirectedAnchors.countCommon(anchorId0, anchorId1);
+        graphEdge.info.onlyA = graphEdge.info.totalA > graphEdge.info.common ?
+            graphEdge.info.totalA - graphEdge.info.common : 0;
+        graphEdge.info.onlyB = graphEdge.info.totalB > graphEdge.info.common ?
+            graphEdge.info.totalB - graphEdge.info.common : 0;
+        graphEdge.info.offsetInBases = 0;
+        graphEdge.info.offsetInMarkers = 0;
+        graphEdge.info.onlyAShort = 0;
+        graphEdge.info.onlyBShort = 0;
+
+        add_edge(it0->second, it1->second, graphEdge, graph);
+    }
+}
+
+
+
+// Helper methods that dispatch based on data source.
+
+uint64_t LocalAnchorGraph::getVertexCoverage(AnchorId anchorId) const
+{
+    if(bidirectedAnchorsPtr) {
+        // anchorId is a canonical BidirectedAnchorId.
+        return bidirectedAnchorsPtr->coverage(anchorId);
+    } else {
+        return (*anchorsPtr)[anchorId].coverage();
+    }
+}
+
+string LocalAnchorGraph::getAnchorIdString(AnchorId anchorId) const
+{
+    if(bidirectedAnchorsPtr) {
+        // anchorId is a canonical BidirectedAnchorId.
+        return to_string(anchorId);
+    } else {
+        return anchorIdToString(anchorId);
+    }
+}
+
+string LocalAnchorGraph::getAnchorUrl(AnchorId anchorId) const
+{
+    if(bidirectedAnchorsPtr) {
+        // anchorId is a canonical BidirectedAnchorId.
+        return "exploreBidirectedAnchorGraphNode?nodeId=" + to_string(anchorId);
+    } else {
+        return "exploreAnchor?anchorIdString=" + HttpServer::urlEncode(anchorIdToString(anchorId));
+    }
+}
+
+string LocalAnchorGraph::getEdgeUrl(AnchorId anchorId0, AnchorId anchorId1) const
+{
+    if(bidirectedAnchorsPtr) {
+        return "";
+    } else {
+        return "exploreAnchorPair?"
+            "anchorIdAString=" + HttpServer::urlEncode(anchorIdToString(anchorId0)) + "&"
+            "anchorIdBString=" + HttpServer::urlEncode(anchorIdToString(anchorId1));
+    }
+}
+
+void LocalAnchorGraph::getAnchorPairInfo(
+    AnchorId referenceAnchorId, AnchorId anchorId, AnchorPairInfo& info) const
+{
+    if(bidirectedAnchorsPtr) {
+        // Both are canonical BidirectedAnchorIds.
+        info.totalA = bidirectedAnchorsPtr->coverage(referenceAnchorId);
+        info.totalB = bidirectedAnchorsPtr->coverage(anchorId);
+        info.common = bidirectedAnchorsPtr->countCommon(referenceAnchorId, anchorId);
+        info.onlyA = info.totalA > info.common ? info.totalA - info.common : 0;
+        info.onlyB = info.totalB > info.common ? info.totalB - info.common : 0;
+        info.offsetInBases = 0;
+        info.offsetInMarkers = 0;
+        info.onlyAShort = 0;
+        info.onlyBShort = 0;
+    } else {
+        anchorsPtr->analyzeAnchorPair(referenceAnchorId, anchorId, info);
     }
 }
 
@@ -155,15 +379,24 @@ void LocalAnchorGraph::writeGraphviz(
     const LocalAnchorGraph& graph = *this;
 
     AnchorId referenceAnchorId = invalid<AnchorId>;
+    uint64_t referenceAnchorIdCoverage = 0;
     if(options.vertexColoring == "byReadComposition") {
-        referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
-        if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchors.size())) {
-            throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
-                ". Must be a number between 0 and " +
-                to_string(anchors.size() / 2 - 1) + " followed by + or -.");
+        if(bidirectedAnchorsPtr) {
+            // Parse canonical anchor id (plain number).
+            const string& refStr = options.referenceAnchorIdString;
+            if(!refStr.empty()) {
+                referenceAnchorId = AnchorId(stoull(refStr));
+            }
+        } else {
+            referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
+            if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
+                throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
+                    ". Must be a number between 0 and " +
+                    to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
+            }
         }
+        referenceAnchorIdCoverage = getVertexCoverage(referenceAnchorId);
     }
-    const uint64_t referenceAnchorIdCoverage = anchors[referenceAnchorId].coverage();
 
     s << "digraph LocalAnchorGraph {\n";
 
@@ -171,8 +404,8 @@ void LocalAnchorGraph::writeGraphviz(
     BGL_FORALL_VERTICES(v, graph, LocalAnchorGraph) {
         const LocalAnchorGraphVertex& vertex = graph[v];
         const AnchorId anchorId = vertex.anchorId;
-        const string anchorIdString = anchorIdToString(anchorId);
-        const uint64_t coverage = anchors[anchorId].coverage();
+        const string anchorIdString = getAnchorIdString(anchorId);
+        const uint64_t coverage = getVertexCoverage(anchorId);
 
         // Vertex name.
         s << "\"" << anchorIdString << "\"";
@@ -181,7 +414,7 @@ void LocalAnchorGraph::writeGraphviz(
         s << "[";
 
         // URL
-        s << "URL=\"exploreAnchor?anchorIdString=" << HttpServer::urlEncode(anchorIdString) << "\"";
+        s << "URL=\"" << getAnchorUrl(anchorId) << "\"";
 
         // Tooltip.
         s << " tooltip=\"" << anchorIdString << " " << coverage << "\"";
@@ -203,7 +436,7 @@ void LocalAnchorGraph::writeGraphviz(
             // Color by similarity of read composition with the reference Anchor.
             if(options.vertexColoring == "byReadComposition") {
                 AnchorPairInfo info;
-                anchors.analyzeAnchorPair(referenceAnchorId, anchorId, info);
+                getAnchorPairInfo(referenceAnchorId, anchorId, info);
 
                 double hue = 1.;    // 0=red, 1=green.
                 if(options.similarityMeasure == "commonCount") {
@@ -264,8 +497,8 @@ void LocalAnchorGraph::writeGraphviz(
         const AnchorId anchorId0 = vertex0.anchorId;
         const AnchorId anchorId1 = vertex1.anchorId;
 
-        const string anchorId0String = anchorIdToString(anchorId0);
-        const string anchorId1String = anchorIdToString(anchorId1);
+        const string anchorId0String = getAnchorIdString(anchorId0);
+        const string anchorId1String = getAnchorIdString(anchorId1);
 
         s << "\"" << anchorId0String << "\"->";
         s << "\"" << anchorId1String << "\"";
@@ -274,24 +507,31 @@ void LocalAnchorGraph::writeGraphviz(
         s << " [";
 
         // URL
-        s << "URL=\"exploreAnchorPair?"
-            "anchorIdAString=" << HttpServer::urlEncode(anchorId0String) << "&"
-            "anchorIdBString=" << HttpServer::urlEncode(anchorId1String) << "\"";
+        const string edgeUrl = getEdgeUrl(anchorId0, anchorId1);
+        if(!edgeUrl.empty()) {
+            s << "URL=\"" << edgeUrl << "\"";
+        }
 
         // Tooltip.
         s << " tooltip="
             "\"" << anchorId0String << " to "
             << anchorId1String <<
             " " << edge.coverage << "/" << edge.info.common <<
-            " loss " << std::fixed << std::setprecision(2) << loss <<
-            " offset " << edge.info.offsetInBases << "\"";
+            " loss " << std::fixed << std::setprecision(2) << loss;
+        if(!bidirectedAnchorsPtr) {
+            s << " offset " << edge.info.offsetInBases;
+        }
+        s << "\"";
 
         // Label.
         if(options.edgeLabels) {
             s << " label=\"" <<
                 edge.coverage << "/" << edge.info.common <<
-                "\\nLoss " << std::fixed << std::setprecision(2) << loss <<
-                "\\nOffset " << edge.info.offsetInBases << "\"";
+                "\\nLoss " << std::fixed << std::setprecision(2) << loss;
+            if(!bidirectedAnchorsPtr) {
+                s << "\\nOffset " << edge.info.offsetInBases;
+            }
+            s << "\"";
         }
 
         // Color.
@@ -753,23 +993,32 @@ void LocalAnchorGraph::writeVertices(
 
     // Get the reference anchor, if needed.
     AnchorId referenceAnchorId = invalid<AnchorId>;
+    uint64_t referenceAnchorIdCoverage = 0;
     if(options.vertexColoring == "byReadComposition") {
-        referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
-        if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchors.size())) {
-            throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
-                ". Must be a number between 0 and " +
-                to_string(anchors.size() / 2 - 1) + " followed by + or -.");
+        if(bidirectedAnchorsPtr) {
+            // Parse canonical anchor id (plain number).
+            const string& refStr = options.referenceAnchorIdString;
+            if(!refStr.empty()) {
+                referenceAnchorId = AnchorId(stoull(refStr));
+            }
+        } else {
+            referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
+            if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
+                throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
+                    ". Must be a number between 0 and " +
+                    to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
+            }
         }
+        referenceAnchorIdCoverage = getVertexCoverage(referenceAnchorId);
     }
-    const uint64_t referenceAnchorIdCoverage = anchors[referenceAnchorId].coverage();
 
     html << "\n<g id='vertices' style='stroke:none'>";
 
     BGL_FORALL_VERTICES(v, graph, LocalAnchorGraph) {
         const LocalAnchorGraphVertex& vertex = graph[v];
         const AnchorId anchorId = vertex.anchorId;
-        const string anchorIdString = anchorIdToString(anchorId);
-        const uint64_t coverage = anchors[anchorId].coverage();
+        const string anchorIdString = getAnchorIdString(anchorId);
+        const uint64_t coverage = getVertexCoverage(anchorId);
 
         // Get the position of this vertex in the computed layout.
         const auto it = layout.find(v);
@@ -780,7 +1029,7 @@ void LocalAnchorGraph::writeVertices(
 
         AnchorPairInfo info;
         if(options.vertexColoring == "byReadComposition") {
-            anchors.analyzeAnchorPair(referenceAnchorId, anchorId, info);
+            getAnchorPairInfo(referenceAnchorId, anchorId, info);
         }
 
         // Choose the color for this vertex.
@@ -816,8 +1065,7 @@ void LocalAnchorGraph::writeVertices(
         }
 
         // Hyperlink.
-        html << "\n<a href='exploreAnchor?anchorIdString=" <<
-            HttpServer::urlEncode(anchorIdString) << "'>";
+        html << "\n<a href='" << getAnchorUrl(anchorId) << "'>";
 
         // Write the vertex.
         html << "<circle cx='" << x << "' cy='" << y <<
@@ -829,7 +1077,7 @@ void LocalAnchorGraph::writeVertices(
             html << ", common " << info.common << ", J " <<
                 std::fixed << std::setprecision(2) << info.jaccard() <<
                 ", J' " << info.correctedJaccard();
-            if(info.common > 0) {
+            if(info.common > 0 && !bidirectedAnchorsPtr) {
                 html << ", offset " << info.offsetInBases;
             }
         }
@@ -875,10 +1123,10 @@ void LocalAnchorGraph::writeEdges(
 
         const LocalAnchorGraphVertex& vertex0 = graph[v0];
         const AnchorId anchorId0 = vertex0.anchorId;
-        const string anchorIdString0 = anchorIdToString(anchorId0);
+        const string anchorIdString0 = getAnchorIdString(anchorId0);
         const LocalAnchorGraphVertex& vertex1 = graph[v1];
         const AnchorId anchorId1 = vertex1.anchorId;
-        const string anchorIdString1 = anchorIdToString(anchorId1);
+        const string anchorIdString1 = getAnchorIdString(anchorId1);
 
         string color = "Black";
 
@@ -892,9 +1140,10 @@ void LocalAnchorGraph::writeEdges(
         }
 
         // Hyperlink.
-        html << "\n<a href='exploreAnchorPair?"
-            "anchorIdAString=" << HttpServer::urlEncode(anchorIdString0) << "&"
-            "anchorIdBString=" << HttpServer::urlEncode(anchorIdString1) << "'>";
+        const string edgeUrl = getEdgeUrl(anchorId0, anchorId1);
+        if(!edgeUrl.empty()) {
+            html << "\n<a href='" << edgeUrl << "'>";
+        }
 
         html <<
             "\n<line x1='" << x0 << "' y1='" << y0 <<
@@ -914,7 +1163,9 @@ void LocalAnchorGraph::writeEdges(
         html << "</title>""</line>";
 
         // End the hyperlink.
-        html << "</a>";
+        if(!edgeUrl.empty()) {
+            html << "</a>";
+        }
     }
     html << "</g>";
 

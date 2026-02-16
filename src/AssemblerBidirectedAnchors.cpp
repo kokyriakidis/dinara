@@ -10,6 +10,7 @@ using namespace dinara;
 shared_ptr<mode3::BidirectedAnchors> Assembler::createBidirectedAnchors(
     uint64_t minAnchorCoverage,
     uint64_t maxAnchorCoverage,
+    uint64_t minEdgeCoverage,
     uint64_t threadCount)
 {
     cout << timestamp << "createBidirectedAnchors begins." << endl;
@@ -25,7 +26,7 @@ shared_ptr<mode3::BidirectedAnchors> Assembler::createBidirectedAnchors(
         threadCount);
 
     bidirectedAnchors->computeJourneys(threadCount);
-    bidirectedAnchors->computeEdges(threadCount);
+    bidirectedAnchors->computeEdges(threadCount, minEdgeCoverage);
 
     cout << timestamp << "createBidirectedAnchors ends with "
          << bidirectedAnchors->size() << " anchors." << endl;

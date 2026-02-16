@@ -15,6 +15,8 @@
 #include "mode3-BidirectedAnchor.hpp"
 #include "mode3-DirectedAnchors.hpp"
 #include "mode3-DirectedAnchorGraph.hpp"
+#include "mode3-AnchorGraph.hpp"
+#include "mode3-AnchorGraphSuperbubbles.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -35,8 +37,14 @@ using namespace dinara;
 
 // Standard library.
 #include "chrono.hpp"
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include "iostream.hpp"
+#include <set>
+#include <unordered_set>
 
 #include "stdexcept.hpp"
 
@@ -96,6 +104,265 @@ namespace dinara {
     Tee tee;
     ofstream dinaraLog;
 }
+
+
+namespace {
+
+using BubbleEndpointPair = std::pair<std::string, std::string>;
+
+BubbleEndpointPair canonicalBubblePair(std::string a, std::string b)
+{
+    if(a <= b) {
+        return {std::move(a), std::move(b)};
+    }
+    return {std::move(b), std::move(a)};
+}
+
+
+std::string normalizeBubbleEndpoint(std::string s)
+{
+    if(!s.empty() && (s.back() == '+' || s.back() == '-')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+
+std::string shellQuote(const std::string& s)
+{
+    std::string quoted = "'";
+    for(const char c: s) {
+        if(c == '\'') {
+            quoted += "'\"'\"'";
+        } else {
+            quoted += c;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+
+bool envFlagIsEnabled(const char* variableName)
+{
+    const char* value = ::getenv(variableName);
+    if(value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(
+        s.begin(),
+        s.end(),
+        s.begin(),
+        [](unsigned char c) { return char(std::tolower(c)); });
+    return
+        s == "1" ||
+        s == "true" ||
+        s == "yes" ||
+        s == "on";
+}
+
+
+bool envFlagIsDisabled(const char* variableName)
+{
+    const char* value = ::getenv(variableName);
+    if(value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(
+        s.begin(),
+        s.end(),
+        s.begin(),
+        [](unsigned char c) { return char(std::tolower(c)); });
+    return
+        s == "0" ||
+        s == "false" ||
+        s == "no" ||
+        s == "off";
+}
+
+
+uint64_t envUintOrDefault(const char* variableName, uint64_t defaultValue)
+{
+    const char* value = ::getenv(variableName);
+    if(value == nullptr || *value == '\0') {
+        return defaultValue;
+    }
+    try {
+        const uint64_t parsed = std::stoull(value);
+        return std::max<uint64_t>(1, parsed);
+    } catch(...) {
+        return defaultValue;
+    }
+}
+
+
+void maybeRunBubbleFinderDirectedSuperbubbleComparison(
+    const mode3::AnchorGraph& anchorGraph,
+    const std::vector<std::pair<
+        mode3::AnchorGraph::vertex_descriptor,
+        mode3::AnchorGraph::vertex_descriptor> >& onoderaSuperbubbles,
+    uint64_t defaultThreadCount)
+{
+    if(envFlagIsDisabled("DINARA_BUBBLEFINDER_COMPARE")) {
+        cout << "[SuperbubbleDetection] BubbleFinder comparison disabled by "
+            "DINARA_BUBBLEFINDER_COMPARE." << endl;
+        return;
+    }
+
+    std::string bubbleFinderBinary = "BubbleFinder";
+    if(const char* value = ::getenv("DINARA_BUBBLEFINDER_BIN")) {
+        if(*value != '\0') {
+            bubbleFinderBinary = value;
+        }
+    }
+
+    const uint64_t bubbleFinderThreadCount =
+        envUintOrDefault("DINARA_BUBBLEFINDER_THREADS", defaultThreadCount);
+    const uint64_t bubbleFinderSampleCount =
+        envUintOrDefault("DINARA_BUBBLEFINDER_SAMPLE_COUNT", 10);
+
+    const std::string gfaFileName = "AnchorGraph-BubbleFinder.gfa";
+    const std::string outputFileName =
+        "AnchorGraph-BubbleFinder.directed-superbubbles.txt";
+    const std::string stdoutLogFileName = "AnchorGraph-BubbleFinder.stdout.log";
+    const std::string stderrLogFileName = "AnchorGraph-BubbleFinder.stderr.log";
+
+    std::unordered_set<std::string> nodeLabels;
+    nodeLabels.reserve(num_vertices(anchorGraph));
+    for(auto vp = boost::vertices(anchorGraph); vp.first != vp.second; ++vp.first) {
+        const auto v = *vp.first;
+        nodeLabels.insert(std::to_string(anchorGraph.getAnchorId(v)));
+    }
+
+    std::vector<std::pair<std::string, std::string> > directedEdges;
+    directedEdges.reserve(num_edges(anchorGraph));
+    for(auto ep = boost::edges(anchorGraph); ep.first != ep.second; ++ep.first) {
+        const auto e = *ep.first;
+        const auto v0 = source(e, anchorGraph);
+        const auto v1 = target(e, anchorGraph);
+        directedEdges.emplace_back(
+            std::to_string(anchorGraph.getAnchorId(v0)),
+            std::to_string(anchorGraph.getAnchorId(v1)));
+    }
+
+    {
+        std::ofstream gfaFile(gfaFileName);
+        if(!gfaFile) {
+            cout << "[SuperbubbleDetection] BubbleFinder comparison skipped: "
+                "failed to open " << gfaFileName << " for writing." << endl;
+            return;
+        }
+
+        gfaFile << "H\tVN:Z:1.0\n";
+        for(const std::string& label: nodeLabels) {
+            gfaFile << "S\t" << label << "\t*\n";
+        }
+        for(const auto& [u, v]: directedEdges) {
+            gfaFile << "L\t" << u << "\t+\t" << v << "\t+\t0M\n";
+        }
+    }
+
+    const std::string command =
+        shellQuote(bubbleFinderBinary) +
+        " directed-superbubbles --gfa-directed -g " +
+        shellQuote(gfaFileName) +
+        " -o " +
+        shellQuote(outputFileName) +
+        " -j " +
+        std::to_string(bubbleFinderThreadCount) +
+        " > " +
+        shellQuote(stdoutLogFileName) +
+        " 2> " +
+        shellQuote(stderrLogFileName);
+
+    cout << "[SuperbubbleDetection] Running BubbleFinder directed-superbubbles "
+        "for AnchorGraph comparison." << endl;
+    const int errorCode = ::system(command.c_str());
+    if(errorCode != 0) {
+        cout << "[SuperbubbleDetection] BubbleFinder comparison failed with exit code "
+            << errorCode << ". Command stderr: " << stderrLogFileName << endl;
+        return;
+    }
+
+    std::set<BubbleEndpointPair> onoderaPairs;
+    onoderaPairs.clear();
+    for(const auto& p: onoderaSuperbubbles) {
+        const auto entrance = std::to_string(anchorGraph.getAnchorId(p.first));
+        const auto exit = std::to_string(anchorGraph.getAnchorId(p.second));
+        onoderaPairs.insert(canonicalBubblePair(entrance, exit));
+    }
+
+    std::ifstream bubbleFinderOutput(outputFileName);
+    if(!bubbleFinderOutput) {
+        cout << "[SuperbubbleDetection] BubbleFinder comparison skipped: "
+            "failed to open " << outputFileName << " for reading." << endl;
+        return;
+    }
+
+    uint64_t declaredPairCount = 0;
+    if(!(bubbleFinderOutput >> declaredPairCount)) {
+        cout << "[SuperbubbleDetection] BubbleFinder comparison skipped: "
+            "invalid output header in " << outputFileName << "." << endl;
+        return;
+    }
+
+    std::set<BubbleEndpointPair> bubbleFinderPairs;
+    std::vector<BubbleEndpointPair> bubbleFinderSamples;
+    uint64_t parsedPairCount = 0;
+    uint64_t ignoredAuxiliaryPairCount = 0;
+    std::string u;
+    std::string v;
+    while(bubbleFinderOutput >> u >> v) {
+        parsedPairCount++;
+        u = normalizeBubbleEndpoint(u);
+        v = normalizeBubbleEndpoint(v);
+        if(nodeLabels.find(u) == nodeLabels.end() ||
+           nodeLabels.find(v) == nodeLabels.end()) {
+            ignoredAuxiliaryPairCount++;
+            continue;
+        }
+        const auto pair = canonicalBubblePair(u, v);
+        bubbleFinderPairs.insert(pair);
+        if(bubbleFinderSamples.size() < bubbleFinderSampleCount) {
+            bubbleFinderSamples.push_back(pair);
+        }
+    }
+
+    uint64_t sharedPairCount = 0;
+    for(const auto& pair: onoderaPairs) {
+        if(bubbleFinderPairs.find(pair) != bubbleFinderPairs.end()) {
+            sharedPairCount++;
+        }
+    }
+
+    const uint64_t onoderaOnlyCount = onoderaPairs.size() - sharedPairCount;
+    const uint64_t bubbleFinderOnlyCount = bubbleFinderPairs.size() - sharedPairCount;
+
+    cout << "[SuperbubbleDetection] BubbleFinder comparison: "
+        << "Onodera=" << onoderaPairs.size()
+        << ", BubbleFinder=" << bubbleFinderPairs.size()
+        << ", shared=" << sharedPairCount
+        << ", onoderaOnly=" << onoderaOnlyCount
+        << ", bubbleFinderOnly=" << bubbleFinderOnlyCount
+        << ", ignoredAuxiliary=" << ignoredAuxiliaryPairCount;
+    if(parsedPairCount != declaredPairCount) {
+        cout << ", declaredPairs=" << declaredPairCount
+            << ", parsedPairs=" << parsedPairCount;
+    }
+    cout << "." << endl;
+
+    if(!bubbleFinderSamples.empty()) {
+        cout << "[SuperbubbleDetection] BubbleFinder sample pairs:";
+        for(const auto& p: bubbleFinderSamples) {
+            cout << " " << p.first << "->" << p.second;
+        }
+        cout << endl;
+    }
+}
+
+} // namespace
 
 
 
@@ -619,6 +886,21 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+
+    // Early filter: remove internal/hanging overlaps before EC/phasing.
+    const uint64_t earlyMinOverlapLength = 50;
+    assembler.filterHangingOverlaps(1000, 0.8, earlyMinOverlapLength, threadCount);
+
+    // Region-aware interval clique filtering: for each read (longest first),
+    // greedily accept overlaps by DP score (dovetails first), checking that each
+    // new candidate overlaps a sufficient fraction of already-accepted reads
+    // covering the same interval. Spurious overlaps are flagged with DeleteReasonClique.
+    const uint64_t minIntervalOverlap = 1000; // bases of interval overlap on R to be "same region"
+    const uint64_t minRegionSize = 0;         // min accepted reads before clique check enforced
+    const double minCliqueFraction = 0.5;     // fraction of region reads candidate must overlap (0.5 = diploid-safe)
+    assembler.filterOverlapsByRegionalCliques(minIntervalOverlap, minRegionSize, minCliqueFraction, threadCount);
+
+
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
@@ -680,26 +962,27 @@ void dinara::main::assemble(
     assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
 
 
-    // assembler.performHifiasmECFinalFilteringParity(threadCount);
     // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
     // This uses conservative AND parity semantics (both reads must keep the overlap).
     assembler.createReadGraph6(threadCount);
 
-    return;
+    
 
-    // Create the bidirectional read graph.
-    // This is built from the same alignments that are in the ReadGraph
-    // (isInReadGraph == 1), but stores one vertex per physical read and
-    // one edge per alignment (no strand doubling).
-    assembler.createBidirectionalReadGraph();
+    // // Create the bidirectional read graph.
+    // // This is built from the same alignments that are in the ReadGraph
+    // // (isInReadGraph == 1), but stores one vertex per physical read and
+    // // one edge per alignment (no strand doubling).
+    // assembler.createBidirectionalReadGraph();
 
-    // Clean the BRG using string-graph-style operations:
-    // Step 10: transitive reduction + Step 11: tip cutting.
-    // This removes redundant edges while operating on the undirected BRG
-    // via a temporary directed-arc view derived from alignment coordinates.
-    assembler.cleanBidirectionalReadGraphInitial(
-        /*gapFuzz*/1000,
-        /*maxShortTipReads*/3);
+    // return;
+
+    // // Clean the BRG using string-graph-style operations:
+    // // Step 10: transitive reduction + Step 11: tip cutting.
+    // // This removes redundant edges while operating on the undirected BRG
+    // // via a temporary directed-arc view derived from alignment coordinates.
+    // assembler.cleanBidirectionalReadGraphInitial(
+    //     /*gapFuzz*/1000,
+    //     /*maxShortTipReads*/3);
 
     // // Global mismatch-site diagnostics and export are expensive and intended for debugging.
     // // Keep them off by default in production runs to preserve assembly throughput.
@@ -1142,11 +1425,11 @@ void dinara::main::assemble(
     // // assembler.createReadGraphFromEcParityCisOverlaps(threadCount, /*rebuildDirectedReadGraph*/ false);
     // assembler.createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(threadCount,  false);
 
-    // Snapshot the broad keep-set used for marker-graph collapse.
-    std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
-    for (uint64_t i = 0; i < keepForMarkerGraph.size(); ++i) {
-        keepForMarkerGraph[i] = (assembler.alignmentData[i].info.isInReadGraph != 0);
-    }
+    // // Snapshot the broad keep-set used for marker-graph collapse.
+    // std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
+    // for (uint64_t i = 0; i < keepForMarkerGraph.size(); ++i) {
+    //     keepForMarkerGraph[i] = (assembler.alignmentData[i].info.isInReadGraph != 0);
+    // }
 
     // Mode 3 assembly requires reads in raw representation (not RLE).
     DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
@@ -1184,16 +1467,57 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
+    // shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
+
+    // const uint64_t minAnchorCoverage = 4;
+    // const uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max();
+    // const uint64_t minEdgeCoverage = 4;
+
+    // bidirectedAnchors = assembler.createBidirectedAnchors(
+    //     minAnchorCoverage,
+    //     maxAnchorCoverage,
+    //     minEdgeCoverage,
+    //     threadCount);
+
+    // cout << "BidirectedAnchors: " << bidirectedAnchors->size() << " anchors." << endl;
+
+    // const string bidirectedGfaFileName = "BidirectedAnchorGraph.gfa";
+    // bidirectedAnchors->writeGfa(bidirectedGfaFileName, false);
+    // cout << timestamp << "Wrote bidirected anchor graph GFA to "
+    //      << std::filesystem::absolute(bidirectedGfaFileName).string() << endl;
+
+    // // Transitive reduction: remove low-coverage edges that have an alternate
+    // // path through higher-coverage edges.
+    // const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    // const uint64_t transitiveReductionMaxDistance = 10;
+    // bidirectedAnchors->transitiveReduction(
+    //     transitiveReductionMaxEdgeCoverage,
+    //     transitiveReductionMaxDistance);
+
+    // // Unitigify: merge maximal linear chains into single unitig anchors.
+    // bidirectedAnchors->unitigifyAll();
+    // cout << "After unitigification: " << bidirectedAnchors->size() << " unitigs." << endl;
+
+    // const string unitigGfaFileName = "BidirectedUnitigGraph.gfa";
+    // bidirectedAnchors->writeGfa(unitigGfaFileName, false);
+    // cout << timestamp << "Wrote unitigified graph GFA to "
+    //      << std::filesystem::absolute(unitigGfaFileName).string() << endl;
+
+
+
+
     // Declare anchors pointer here to avoid scope issues
     shared_ptr<mode3::DirectedAnchors> anchors;
 
     // Verkko-style: keep all vertices with coverage >= 2, no upper cap.
     // MBG uses -a 1 (min k-mer abundance) + -u 2 (min unitig abundance) with no max.
     // High-coverage repeat nodes are intentionally kept for triplet-based resolution.
-    const uint64_t minPrimaryCoverage = 2;
-    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    // const uint64_t minPrimaryCoverage = 2;
+    // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    const uint64_t minPrimaryCoverage = 4;
+    const uint64_t maxPrimaryCoverage = 200;
     cout << "Using Verkko-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
-        ", maxAnchorCoverage = unlimited" << endl;
+        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
 
 
     anchors =
@@ -1212,161 +1536,207 @@ void dinara::main::assemble(
     // AnchorIds already encode orientation (even=fwd, odd=rev), same as DagNodeId.
     anchors->computeJourneys(threadCount);
 
+    // // Create the AnchorGraph.
+    // const uint64_t minEdgeCoverage = 0;
+    // cout << timestamp << "Creating AnchorGraph..." << endl;
+    // assembler.anchorGraph = make_shared<mode3::AnchorGraph>(
+    //     *anchors,
+    //     minEdgeCoverage,
+    //     &assembler.alignmentData,
+    //     &assembler.getAlignmentTable());
+    // cout << "The AnchorGraph has " <<
+    //     num_vertices(*assembler.anchorGraph) << " vertices and " <<
+    //     num_edges(*assembler.anchorGraph) << " edges." << endl;
+
+    // // --- Superbubble detection (Onodera/Verkko algorithm, for AnchorGraph) ---
+    // auto onoderaSuperbubbles = mode3::find_superbubbles_boost(*assembler.anchorGraph);
+    // std::cout << "[SuperbubbleDetection] AnchorGraph: Found " << onoderaSuperbubbles.size() << " superbubbles (Onodera/Verkko)." << std::endl;
+    // maybeRunBubbleFinderDirectedSuperbubbleComparison(
+    //     *assembler.anchorGraph,
+    //     onoderaSuperbubbles,
+    //     threadCount);
+
+    // // Shared parameters for local path-based simplification steps.
+    // const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    // const uint64_t transitiveReductionMaxDistance = 10;
+
+    // // Superbubble detection using flow-based convergence.
+    // {
+    //     vector<mode3::AnchorGraphSuperbubble> superbubbles;
+    //     assembler.anchorGraph->findSuperbubbles(superbubbles, transitiveReductionMaxDistance);
+    //     cout << "Superbubbles detected: " << superbubbles.size() << endl;
+    //     assembler.anchorGraph->removeContainedSuperbubbles(superbubbles);
+    //     vector<mode3::AnchorGraphSuperbubbleChain> chains;
+    //     assembler.anchorGraph->findSuperbubbleChains(superbubbles, chains);
+
+    //     cout << "Superbubbles detected: " << superbubbles.size() << endl;
+    //     cout << "Superbubble chains: " << chains.size() << endl;
+
+    // }
+
+    // // Transitive reduction.
+    // assembler.anchorGraph->transitiveReduction(
+    //     transitiveReductionMaxEdgeCoverage,
+    //     transitiveReductionMaxDistance);
+    // assembler.anchorGraph->resolvePhasedSuperbubbles(
+    //     transitiveReductionMaxDistance,
+    //     false);
+
     // Run Mode 3 assembly.
     assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
     return;
 
 
-    // ========================================================================
-    // Verkko-style directed anchor graph resolution — expanded pipeline.
-    // Each step can be individually commented out for debugging.
-    // ========================================================================
+    // // ========================================================================
+    // // Verkko-style directed anchor graph resolution — expanded pipeline.
+    // // Each step can be individually commented out for debugging.
+    // // ========================================================================
 
-    // Step 1: Build the DirectedAnchorGraph from anchors.
-    // Each anchor pair (2*m, 2*m+1) maps directly to a DAG segment m.
-    // AnchorId IS DagNodeId — no intermediate BidirectedAnchors needed.
-    // MBG Optimization: We skip alignment-based read intervals to avoid a slow serial loop.
-    // Paths and coordinates are based purely on journeys.
-    assembler.directedAnchorGraph = make_shared<mode3::DirectedAnchorGraph>();
-    assembler.directedAnchorGraph->buildFromAnchors(
-        *anchors,
-        threadCount);
+    // // Step 1: Build the DirectedAnchorGraph from anchors.
+    // // Each anchor pair (2*m, 2*m+1) maps directly to a DAG segment m.
+    // // AnchorId IS DagNodeId — no intermediate BidirectedAnchors needed.
+    // // MBG Optimization: We skip alignment-based read intervals to avoid a slow serial loop.
+    // // Paths and coordinates are based purely on journeys.
+    // assembler.directedAnchorGraph = make_shared<mode3::DirectedAnchorGraph>();
+    // assembler.directedAnchorGraph->buildFromAnchors(
+    //     *anchors,
+    //     threadCount);
 
-    auto& dag = *assembler.directedAnchorGraph;
+    // auto& dag = *assembler.directedAnchorGraph;
 
-    cout << "Initial directed anchor graph: "
-         << dag.nodeCount() << " nodes, "
-         << dag.edgeCount() << " edges, "
-         << dag.pathCount() << " paths." << endl;
+    // cout << "Initial directed anchor graph: "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
 
-    // Step 1b: Global segment filtering (MBG -u)
-    dag.removeLowCoverageSegments(2.0);
-    cout << "After global segment filtering (minCoverage=2.0): "
-         << dag.nodeCount() << " nodes, "
-         << dag.edgeCount() << " edges." << endl;
+    // // Step 1b: Global segment filtering (MBG -u)
+    // dag.removeLowCoverageSegments(2.0);
+    // cout << "After global segment filtering (minCoverage=2.0): "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges." << endl;
 
-    // Step 2: Initial unitigification (MBG workflow)
-    dag.unitigifyAll();
-    cout << "After initial unitigification: "
-         << dag.nodeCount() << " nodes, "
-         << dag.edgeCount() << " edges, "
-         << dag.pathCount() << " paths." << endl;
-    dag.writeSummary(cout);
-    dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
+    // // Step 2: Initial unitigification (MBG workflow)
+    // dag.unitigifyAll();
+    // cout << "After initial unitigification: "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
+    // dag.writeSummary(cout);
+    // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
 
-    // Step 3: MBG-style cleaning phase
-    cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
-    const uint64_t maxResolveLength = 500000;
-    const bool doRoundCleaning = true;
-    const bool doGuessworkCleaning = true;
-    const uint64_t maxUnconditionalResolveLength = 0;
-    const bool copycountFilterHeuristic = false;
-    const uint64_t maxLocalResolve = 0;
-    const bool resolvePalindromesGlobal = false;
+    // // Step 3: MBG-style cleaning phase
+    // cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
+    // const uint64_t maxResolveLength = 500000;
+    // const bool doRoundCleaning = true;
+    // const bool doGuessworkCleaning = true;
+    // const uint64_t maxUnconditionalResolveLength = 0;
+    // const bool copycountFilterHeuristic = false;
+    // const uint64_t maxLocalResolve = 0;
+    // const bool resolvePalindromesGlobal = false;
 
-    // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
-    auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
-    if(tipStats1.nodesRemoved > 0) {
-        cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
-             << tipStats1.edgesRemoved << " edges." << endl;
-        dag.unitigifyAll();
-        cout << "  After tip removal: "
-             << dag.nodeCount() << " nodes, "
-             << dag.edgeCount() << " edges." << endl;
-    }
+    // // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
+    // auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
+    // if(tipStats1.nodesRemoved > 0) {
+    //     cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
+    //          << tipStats1.edgesRemoved << " edges." << endl;
+    //     dag.unitigifyAll();
+    //     cout << "  After tip removal: "
+    //          << dag.nodeCount() << " nodes, "
+    //          << dag.edgeCount() << " edges." << endl;
+    // }
 
-    // Step 3b: Remove low-coverage crosslinks
-    auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
-    if(crosslinkStats.edgesRemoved > 0) {
-        cout << "  Removed " << crosslinkStats.edgesRemoved
-             << " crosslink edges." << endl;
-        dag.unitigifyAll();
-        cout << "  After crosslink removal: "
-             << dag.nodeCount() << " nodes, "
-             << dag.edgeCount() << " edges." << endl;
-    }
+    // // Step 3b: Remove low-coverage crosslinks
+    // auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
+    // if(crosslinkStats.edgesRemoved > 0) {
+    //     cout << "  Removed " << crosslinkStats.edgesRemoved
+    //          << " crosslink edges." << endl;
+    //     dag.unitigifyAll();
+    //     cout << "  After crosslink removal: "
+    //          << dag.nodeCount() << " nodes, "
+    //          << dag.edgeCount() << " edges." << endl;
+    // }
 
-    // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
-    if(doGuessworkCleaning) {
-        double totalCov = 0.0;
-        uint64_t count = 0;
-        for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
-            if(!dag.nodeExists(segId)) continue;
-            totalCov += dag.getPathCoverage(segId);
-            count++;
-        }
-        const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
-        auto copyStats = dag.cleanComponentsByCopynumber(
-            avgCov,
-            50000,
-            0,
-            max(maxResolveLength, maxLocalResolve),
-            {},
-            0);
-        if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
-            cout << "  Copy-number cleaning removed "
-                 << copyStats.nodesRemoved << " nodes, "
-                 << copyStats.edgesRemoved << " edges." << endl;
-            dag.unitigifyAll();
-            cout << "  After copy-number cleaning: "
-                 << dag.nodeCount() << " nodes, "
-                 << dag.edgeCount() << " edges." << endl;
-        }
-    }
+    // // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
+    // if(doGuessworkCleaning) {
+    //     double totalCov = 0.0;
+    //     uint64_t count = 0;
+    //     for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
+    //         if(!dag.nodeExists(segId)) continue;
+    //         totalCov += dag.getPathCoverage(segId);
+    //         count++;
+    //     }
+    //     const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
+    //     auto copyStats = dag.cleanComponentsByCopynumber(
+    //         avgCov,
+    //         50000,
+    //         0,
+    //         max(maxResolveLength, maxLocalResolve),
+    //         {},
+    //         0);
+    //     if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
+    //         cout << "  Copy-number cleaning removed "
+    //              << copyStats.nodesRemoved << " nodes, "
+    //              << copyStats.edgesRemoved << " edges." << endl;
+    //         dag.unitigifyAll();
+    //         cout << "  After copy-number cleaning: "
+    //              << dag.nodeCount() << " nodes, "
+    //              << dag.edgeCount() << " edges." << endl;
+    //     }
+    // }
 
-    cout << timestamp << "Cleaning phase complete." << endl;
-    dag.writeSummary(cout);
-    dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
+    // cout << timestamp << "Cleaning phase complete." << endl;
+    // dag.writeSummary(cout);
+    // dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
 
     
 
-    // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
-    const uint64_t initialMinEdgeSupport = 20;
+    // // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
+    // const uint64_t initialMinEdgeSupport = 20;
 
-    // Step 4a: Resolve with minEdgeSupport = initial pass.
-    cout << timestamp
-         << "Resolution step with minEdgeSupport="
-         << initialMinEdgeSupport << endl;
-    dag.resolveRound(
-        initialMinEdgeSupport,
-        maxResolveLength,
-        doRoundCleaning,
-        doGuessworkCleaning,
-        maxUnconditionalResolveLength,
-        copycountFilterHeuristic,
-        maxLocalResolve,
-        resolvePalindromesGlobal);
-    dag.unitigifyAll();
-    cout << "  After resolution step " << initialMinEdgeSupport << ": "
-         << dag.nodeCount() << " nodes, "
-         << dag.edgeCount() << " edges, "
-         << dag.pathCount() << " paths." << endl;
+    // // Step 4a: Resolve with minEdgeSupport = initial pass.
+    // cout << timestamp
+    //      << "Resolution step with minEdgeSupport="
+    //      << initialMinEdgeSupport << endl;
+    // dag.resolveRound(
+    //     initialMinEdgeSupport,
+    //     maxResolveLength,
+    //     doRoundCleaning,
+    //     doGuessworkCleaning,
+    //     maxUnconditionalResolveLength,
+    //     copycountFilterHeuristic,
+    //     maxLocalResolve,
+    //     resolvePalindromesGlobal);
+    // dag.unitigifyAll();
+    // cout << "  After resolution step " << initialMinEdgeSupport << ": "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
 
-    // Step 4b: MBG-style second pass with minimal support.
-    cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
-    dag.resolveRound(
-        1,
-        maxResolveLength,
-        doRoundCleaning,
-        doGuessworkCleaning,
-        maxUnconditionalResolveLength,
-        copycountFilterHeuristic,
-        maxLocalResolve,
-        resolvePalindromesGlobal);
-    dag.unitigifyAll();
-    cout << "  After final low-support pass: "
-         << dag.nodeCount() << " nodes, "
-         << dag.edgeCount() << " edges, "
-         << dag.pathCount() << " paths." << endl;
+    // // Step 4b: MBG-style second pass with minimal support.
+    // cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
+    // dag.resolveRound(
+    //     1,
+    //     maxResolveLength,
+    //     doRoundCleaning,
+    //     doGuessworkCleaning,
+    //     maxUnconditionalResolveLength,
+    //     copycountFilterHeuristic,
+    //     maxLocalResolve,
+    //     resolvePalindromesGlobal);
+    // dag.unitigifyAll();
+    // cout << "  After final low-support pass: "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
 
-    // Step 5: Write final graph
-    dag.verifyEdgeConsistency();
-    dag.writeSummary(cout);
-    dag.writeGfa("DirectedAnchorGraph.gfa");
-    dag.writePaths("DirectedAnchorGraph.paths.gaf");
+    // // Step 5: Write final graph
+    // dag.verifyEdgeConsistency();
+    // dag.writeSummary(cout);
+    // dag.writeGfa("DirectedAnchorGraph.gfa");
+    // dag.writePaths("DirectedAnchorGraph.paths.gaf");
 
-    return;
+    // return;
 
 
     // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
@@ -1533,9 +1903,9 @@ void dinara::main::assemble(
         int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
 
-    // Create shasta2 anchors equivalent to the marker graph vertices.
-    // This allows downstream processing using shasta2 tools.
-    createShasta2Anchors(assembler, assemblerOptions, threadCount, anchors);
+    // // Create shasta2 anchors equivalent to the marker graph vertices.
+    // // This allows downstream processing using shasta2 tools.
+    // createShasta2Anchors(assembler, assemblerOptions, threadCount, anchors);
 
 }
 

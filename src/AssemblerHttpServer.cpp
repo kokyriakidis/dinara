@@ -262,12 +262,16 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreJourney);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedJourney);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraphNode);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraphPath);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphNode);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphPath);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorGraph);
 #if DINARA_ENABLE_VARIANT_CLUSTERING
     DINARA_ADD_TO_FUNCTION_TABLE(exploreClusterGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantCluster);
@@ -610,6 +614,16 @@ void Assembler::writeNavigation(ostream& html) const
             {"Local anchor graph", "exploreLocalAnchorGraph"},
             {"Bidirected Anchor", "exploreBidirectedAnchor"},
             {"Bidirected Journey", "exploreBidirectedJourney"},
+            });
+
+        writeNavigation(html, "Anchor Graph", {
+            {"Graph summary", "exploreAnchorGraph"},
+            });
+
+        writeNavigation(html, "Bidirected Anchor Graph", {
+            {"Graph summary", "exploreBidirectedAnchorGraph"},
+            {"Node", "exploreBidirectedAnchorGraphNode"},
+            {"Path", "exploreBidirectedAnchorGraphPath"},
             });
 
         writeNavigation(html, "Directed Anchor Graph", {
