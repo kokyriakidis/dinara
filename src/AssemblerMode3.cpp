@@ -1,9 +1,12 @@
 // Dinara
 #include "Assembler.hpp"
+#include "deduplicate.hpp"
+#include "HttpServer.hpp"
 #include "LocalMarkerGraph1.hpp"
 #include "mode3-LocalAssembly.hpp"
 #include "mode3-AssemblyGraph.hpp"
 #include "mode3-AnchorGraph.hpp"
+#include "mode3-LocalAnchorGraph.hpp"
 #include "Mode3Assembler.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
@@ -11,7 +14,9 @@
 using namespace dinara;
 
 // Boost libraries.
+#include <boost/algorithm/string.hpp>
 #include <boost/graph/iteration_macros.hpp>
+#include <boost/tokenizer.hpp>
 
 // Standard library.
 #include "fstream.hpp"
@@ -639,6 +644,128 @@ void Assembler::exploreLocalAnchorGraph(const vector<string>& request, ostream& 
         }
     }
     mode3Assembler->exploreLocalAnchorGraph(request, html);
+}
+
+
+
+void Assembler::exploreAnchorGraph(const vector<string>& request, ostream& html)
+{
+    using namespace mode3;
+
+    // Access the anchors via mode3Assembler.
+    if(!mode3Assembler) {
+        try {
+            accessMode3Assembler();
+        } catch(const exception& e) {
+            html << "<p>Mode 3 assembler is not accessible: " << e.what();
+            return;
+        }
+        if(!mode3Assembler) {
+            html << "<p>Mode 3 assembler is not accessible.";
+            return;
+        }
+    }
+
+    const Anchors& anchorsRef = mode3Assembler->anchors();
+
+    // Lazily create the global AnchorGraph if not already available.
+    if(!anchorGraph) {
+        const uint64_t minEdgeCoverage = 0;
+        cout << timestamp << "Creating AnchorGraph..." << endl;
+        anchorGraph = make_shared<AnchorGraph>(anchorsRef, minEdgeCoverage);
+        cout << "The AnchorGraph has " <<
+            num_vertices(*anchorGraph) << " vertices and " <<
+            num_edges(*anchorGraph) << " edges." << endl;
+    }
+
+    // Get the options that control graph creation.
+    string anchorIdsString;
+    HttpServer::getParameterValue(request, "anchorIdsString", anchorIdsString);
+    boost::trim(anchorIdsString);
+
+    uint64_t distance = 10;
+    HttpServer::getParameterValue(request, "distance", distance);
+
+    uint64_t minCoverage = 1;
+    HttpServer::getParameterValue(request, "minCoverage", minCoverage);
+
+    // Get the options that control graph display.
+    const LocalAnchorGraphDisplayOptions displayOptions(request);
+
+    // Start the form.
+    html << "<form><table>";
+
+    // Form items for options that control graph creation.
+    html <<
+        "<tr title='Enter comma or space separated anchor ids, each a number between 0 and " <<
+        anchorsRef.size() / 2 - 1 << " followed by + or -.'>"
+        "<th class=left>Starting anchor ids"
+        "<td class=centered><input type=text name=anchorIdsString style='text-align:center' required";
+    if(not anchorIdsString.empty()) {
+        html << " value='" << anchorIdsString + "'";
+    }
+    html <<
+        " size=8 title='Enter comma or space separated anchor ids, each between 0 and " <<
+        anchorsRef.size() / 2 - 1 << " followed by + or -.'>";
+
+    html << "<tr>"
+        "<th class=left>Distance"
+        "<td class=centered>"
+        "<input type=text name=distance style='text-align:center' required size=8 value=" <<
+        distance << ">";
+
+    html << "<tr>"
+        "<th class=left>Minimum coverage"
+        "<td class=centered>"
+        "<input type=text name=minCoverage style='text-align:center' required size=8 value=" <<
+        minCoverage << ">";
+
+    // Form items for options that control graph display.
+    displayOptions.writeForm(html);
+
+    // End the form.
+    html <<
+        "</table>"
+        "<input type=submit value='Create local anchor graph'>"
+        "</form>";
+
+    // If the anchor ids are missing, stop here.
+    if(anchorIdsString.empty()) {
+        return;
+    }
+
+    // Extract the AnchorIds.
+    vector<AnchorId> anchorIds;
+    boost::tokenizer< boost::char_separator<char> > tokenizer(
+        anchorIdsString, boost::char_separator<char>(", "));
+
+    for(const string& anchorIdString: tokenizer) {
+        const AnchorId anchorId = anchorIdFromString(anchorIdString);
+
+        if((anchorId == invalid<AnchorId>) or (anchorId >= anchorsRef.size())) {
+            html << "<p>Invalid anchor id " << anchorIdString << ". Must be a number between 0 and " <<
+                anchorsRef.size() / 2 - 1 << " followed by + or -.";
+            return;
+        }
+
+        anchorIds.push_back(anchorId);
+    }
+    deduplicate(anchorIds);
+
+    // Create the LocalAnchorGraph by BFS on the global AnchorGraph.
+    LocalAnchorGraph graph(
+        anchorsRef,
+        *anchorGraph,
+        anchorIds,
+        distance,
+        minCoverage);
+
+    html << "<h1>Local anchor graph</h1>";
+    html << "The local anchor graph has " << num_vertices(graph) <<
+         " vertices and " << num_edges(graph) << " edges.";
+
+    // Write it to html.
+    graph.writeHtml(html, displayOptions);
 }
 
 

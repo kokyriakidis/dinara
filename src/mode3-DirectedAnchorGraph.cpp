@@ -8,6 +8,7 @@
 
 #include "mode3-DirectedAnchorGraph.hpp"
 #include "mode3-Anchor.hpp"
+#include "mode3-AnchorGraphSuperbubbles.hpp"
 #include "mode3-DirectedAnchors.hpp"
 #include "DINARA_ASSERT.hpp"
 #include "Marker.hpp"
@@ -959,6 +960,55 @@ void DirectedAnchorGraph::buildFromAnchors(
         << nodeCount() << " nodes, "
         << edgeCount() << " directed edges, "
         << pathCount() << " path groups (" << totalPaths << " raw paths)." << endl;
+
+    // --- Superbubble detection (Onodera et al. 2013, Verkko-style) ---
+    // Define a minimal wrapper to expose the required interface for superbubble detection.
+    struct SuperbubbleGraph {
+        using vertex_descriptor = DagNodeId;
+        const DirectedAnchorGraph& g;
+        SuperbubbleGraph(const DirectedAnchorGraph& g_) : g(g_) {}
+        std::vector<vertex_descriptor> vertices() const {
+            std::vector<vertex_descriptor> v;
+            for(uint64_t i = 0; i < g.nodes.size(); ++i) {
+                if(!g.nodes[i].removed) {
+                    v.push_back(fwdNodeId(i));
+                    v.push_back(revNodeId(i));
+                }
+            }
+            return v;
+        }
+        size_t in_degree(vertex_descriptor v) const {
+            size_t deg = 0;
+            for(const auto& evec : g.edges) {
+                for(DagNodeId w : evec) {
+                    if(w == v) deg++;
+                }
+            }
+            return deg;
+        }
+        size_t out_degree(vertex_descriptor v) const {
+            if(v < g.edges.size()) return g.edges[v].size();
+            return 0;
+        }
+        std::vector<vertex_descriptor> out_neighbors(vertex_descriptor v) const {
+            if(v < g.edges.size()) return g.edges[v];
+            return {};
+        }
+        std::vector<vertex_descriptor> in_neighbors(vertex_descriptor v) const {
+            std::vector<vertex_descriptor> neighbors;
+            for(uint64_t from = 0; from < g.edges.size(); ++from) {
+                for(const DagNodeId to: g.edges[from]) {
+                    if(to == v) {
+                        neighbors.push_back(from);
+                    }
+                }
+            }
+            return neighbors;
+        }
+    } superbubbleGraph(*this);
+
+    auto onoderaSuperbubbles = find_superbubbles(superbubbleGraph);
+    std::cout << "[SuperbubbleDetection] Found " << onoderaSuperbubbles.size() << " superbubbles (Onodera/Verkko)." << std::endl;
 }
 
 
