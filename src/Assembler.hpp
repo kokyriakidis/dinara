@@ -1063,6 +1063,12 @@ public:
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    /// Delete overlaps where one read is contained in the other (ma_hit2arc containment).
+    /// Runs early (e.g. after computeAlignmentsWithEvidence) to remove containment overlaps.
+    void deleteContainmentOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    /// Delete internal overlaps (ma_hit2arc result -1/-2: excessive overhangs or too short).
+    /// Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches.
+    void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeReadsFlaggedContained(uint64_t threadCount);
@@ -1095,6 +1101,10 @@ private:
 
     // Filter hanging overlaps (ma_hit_flt equivalent) - thread function
     void filterHangingOverlapsThreadFunction(size_t threadId);
+    // Delete containment overlaps - thread function
+    void deleteContainmentOverlapsThreadFunction(size_t threadId);
+    // Delete internal overlaps - thread function
+    void deleteInternalOverlapsThreadFunction(size_t threadId);
     uint64_t hangingFilterMaxHang = 1000;
     double hangingFilterMaxHangRate = 0.8;
     uint64_t hangingFilterMinOverlap = 0;

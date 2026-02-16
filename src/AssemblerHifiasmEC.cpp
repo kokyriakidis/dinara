@@ -3571,14 +3571,10 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                        const auto& thisAlignmentData = alignmentData[alignmentId];
 	                        
 		                        /*
-		                        Skip alignments deleted from THIS query read's perspective.
-		
-		                        This matches hifiasm's pre-EC overlap list semantics: each query read has
-		                        its own candidate list, and deletions/filters applied to that list should
-		                        be respected when building the EC candidate set. Using isDeleted() (both
-		                        sides) would incorrectly retain overlaps removed only for this read.
+		                        Skip alignments deleted on either side. Only use overlaps kept by both
+		                        reads (keptByBothSides).
 		                        */
-		                        if(thisAlignmentData.isDeletedFromReadPerspective(ReadId(readId))) continue;
+		                        if(!thisAlignmentData.keptByBothSides()) continue;
 
                         CandidateEC candidate;
                         candidate.alignmentId = alignmentId;
@@ -4211,10 +4207,24 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
     cout << timestamp << "  SV detect:         " << total.svDetect << " s" << endl;
     cout << timestamp << "  SV validate:       " << total.validateSv << " s" << endl;
     cout << timestamp << "  finalize flags:    " << total.finalizeFlags << " s" << endl;
+    uint64_t transMarked = 0;
+    uint64_t keptByBoth = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonPhase)) {
+            ++transMarked;
+        }
+        if (ad.keptByBothSides()) {
+            ++keptByBoth;
+        }
+    }
+
     cout << timestamp << "Parity EC Round 1 wall time: " << tAll << " s"
          << " (reads=" << total.readsVisited
          << ", withAlignments=" << total.readsWithAlignments
-         << ", withCandidates=" << total.readsWithCandidates << ")" << endl;
+         << ", withCandidates=" << total.readsWithCandidates
+         << ", transMarked=" << transMarked
+         << ", keptByBoth=" << keptByBoth << ")" << endl;
 
     cout << timestamp << "Parity EC Round 1 Complete." << endl;
 }

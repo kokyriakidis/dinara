@@ -886,19 +886,11 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+    // Delete overlaps where one read is contained in the other.
+    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
 
-    // Early filter: remove internal/hanging overlaps before EC/phasing.
-    const uint64_t earlyMinOverlapLength = 50;
-    assembler.filterHangingOverlaps(1000, 0.8, earlyMinOverlapLength, threadCount);
-
-    // Region-aware interval clique filtering: for each read (longest first),
-    // greedily accept overlaps by DP score (dovetails first), checking that each
-    // new candidate overlaps a sufficient fraction of already-accepted reads
-    // covering the same interval. Spurious overlaps are flagged with DeleteReasonClique.
-    const uint64_t minIntervalOverlap = 1000; // bases of interval overlap on R to be "same region"
-    const uint64_t minRegionSize = 0;         // min accepted reads before clique check enforced
-    const double minCliqueFraction = 0.5;     // fraction of region reads candidate must overlap (0.5 = diploid-safe)
-    assembler.filterOverlapsByRegionalCliques(minIntervalOverlap, minRegionSize, minCliqueFraction, threadCount);
+    // Delete internal overlaps (excessive overhangs or too short).
+    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
 
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
@@ -937,6 +929,42 @@ void dinara::main::assemble(
 
     // Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics)
     assembler.performHifiasmECParity(threadCount);
+
+    // Delete overlaps where one read is contained in the other.
+    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+
+    // Delete internal overlaps (excessive overhangs or too short).
+    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+
+    // Second round: re-phase using only overlaps kept by both sides (cis set from round 1).
+    assembler.performHifiasmECParity(threadCount);
+
+    // Delete overlaps where one read is contained in the other.
+    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+
+    // Delete internal overlaps (excessive overhangs or too short).
+    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+
+    // Third round: re-phase using only overlaps kept by both sides (cis set from round 2).
+    assembler.performHifiasmECParity(threadCount);
+
+    // Delete overlaps where one read is contained in the other.
+    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+
+    // Delete internal overlaps (excessive overhangs or too short).
+    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+
+    // Fourth round: re-phase using only overlaps kept by both sides (cis set from round 3).
+    assembler.performHifiasmECParity(threadCount);
+
+    // // Region-aware interval clique filtering: for each read (longest first),
+    // // greedily accept overlaps by DP score (dovetails first), checking that each
+    // // new candidate overlaps a sufficient fraction of already-accepted reads
+    // // covering the same interval. Spurious overlaps are flagged with DeleteReasonClique.
+    // const uint64_t minIntervalOverlap = 50; // bases of interval overlap on R to be "same region"
+    // const uint64_t minRegionSize = 0;         // min accepted reads before clique check enforced
+    // const double minCliqueFraction = 1.0;     // fraction of region reads candidate must overlap (0.5 = diploid-safe)
+    // assembler.filterOverlapsByRegionalCliques(minIntervalOverlap, minRegionSize, minCliqueFraction, threadCount);
 
 
     // =========================================================================
@@ -1442,7 +1470,7 @@ void dinara::main::assemble(
         2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
-        true,                                           // allowDuplicateMarkers
+        false,                                           // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
         invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
         threadCount);
@@ -1515,7 +1543,7 @@ void dinara::main::assemble(
     // const uint64_t minPrimaryCoverage = 2;
     // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
     const uint64_t minPrimaryCoverage = 4;
-    const uint64_t maxPrimaryCoverage = 200;
+    const uint64_t maxPrimaryCoverage = 60;
     cout << "Using Verkko-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
 
