@@ -15,6 +15,7 @@
 
 #include "mode3-BidirectedAnchor.hpp"
 #include "DINARA_ASSERT.hpp"
+#include "findLinearChains.hpp"
 #include "findMarkerId.hpp"
 #include "invalid.hpp"
 #include "Marker.hpp"
@@ -23,16 +24,34 @@
 #include "Reads.hpp"
 #include "timestamp.hpp"
 
+#include <boost/graph/adjacency_list.hpp>
+#include <boost/graph/iteration_macros.hpp>
+
 // For MultithreadedObject explicit instantiation.
 #include "MultithreadedObject.tpp"
 
 #include <algorithm>
+#include <unordered_map>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#include <boost/archive/binary_iarchive.hpp>
+#include <boost/archive/binary_oarchive.hpp>
+#include <boost/serialization/serialization.hpp>
+#include <boost/serialization/vector.hpp>
+
+namespace boost { namespace serialization {
+template<class Archive>
+void serialize(Archive& ar, dinara::mode3::BidirectedEdge& e, const unsigned int /*version*/) {
+    ar & e.from.anchorId & e.from.strand & e.to.anchorId & e.to.strand & e.coverage & e.useForAssembly;
+}
+}}
 
 using namespace dinara;
 using namespace mode3;
@@ -276,12 +295,20 @@ BidirectedAnchors::BidirectedAnchors(
 
     anchorCount = anchorMarkerIntervals.size();
 
+    try {
+        anchorLevelJourneys.accessExistingReadOnly(
+            largeDataName("BidirectedAnchorLevelJourneys"));
+    } catch(...) {
+        /* Shasta2-style anchor-level journeys optional (e.g. pre-unitigify data). */
+    }
+
     cout << timestamp << "Accessed existing BidirectedAnchors: "
          << anchorCount << " anchors, "
          << journeys.size() << " journey entries." << endl;
 
-    // Recompute in-memory edge table from journeys.
-    computeEdges(1);
+    if(!loadEdgeTable()) {
+        computeEdges(1);
+    }
 }
 
 
@@ -417,11 +444,20 @@ void BidirectedAnchors::computeJourneysThreadFunction4(uint64_t /* threadId */)
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(uint64_t readIdValue = begin; readIdValue < end; ++readIdValue) {
+            const ReadId readId(readIdValue);
             const auto v = journeysWithOrdinals[readIdValue];
             const auto jrn = journeys[readIdValue];
             DINARA_ASSERT(jrn.size() == v.size());
             for(uint64_t i = 0; i < v.size(); ++i) {
                 jrn[i] = BidirectedJourneyEntry(v[i].anchorId, v[i].strand);
+                // Shasta2-style: set positionInJourney on the corresponding marker interval.
+                auto intervals = anchorMarkerIntervals[v[i].anchorId];
+                for(auto& mi : intervals) {
+                    if(mi.readId == readId && mi.strand == v[i].strand && mi.ordinal == v[i].ordinal) {
+                        mi.positionInJourney = uint32_t(i);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -431,6 +467,12 @@ void BidirectedAnchors::computeJourneysThreadFunction4(uint64_t /* threadId */)
 span<const BidirectedJourneyEntry> BidirectedAnchors::journey(ReadId readId) const
 {
     return journeys[uint64_t(readId)];
+}
+
+span<const BidirectedJourneyEntry> BidirectedAnchors::anchorLevelJourney(ReadId readId) const
+{
+    if(!anchorLevelJourneys.isOpen()) return {};
+    return anchorLevelJourneys[uint64_t(readId)];
 }
 
 
@@ -589,14 +631,14 @@ span<const BidirectedEdge> BidirectedAnchors::getInEdges(OrientedBidirectedAncho
 void BidirectedAnchors::writeEdges() const
 {
     ofstream csv("BidirectedEdges.csv");
-    csv << "FromAnchor,FromStrand,ToAnchor,ToStrand,Coverage\n";
+    csv << "FromAnchor,FromStrand,ToAnchor,ToStrand,Coverage,UseForAssembly\n";
     for(uint64_t i = 0; i < anchorCount; ++i) {
         for(Strand s = 0; s <= 1; ++s) {
             const auto edges = getOutEdges(OrientedBidirectedAnchor(i, s));
             for(const auto& e : edges) {
                 csv << e.from.anchorId << "," << uint32_t(e.from.strand)
                     << "," << e.to.anchorId << "," << uint32_t(e.to.strand)
-                    << "," << e.coverage << "\n";
+                    << "," << e.coverage << "," << (e.useForAssembly ? 1 : 0) << "\n";
             }
         }
     }
@@ -825,11 +867,12 @@ void BidirectedAnchors::transitiveReduction(
     }
 
     // ----------------------------------------------------------------
-    // Step 5: Rebuild adjacency lists excluding removed edges.
+    // Step 5: Shasta2-style — set useForAssembly=false for removed edges.
+    //         Keep all edges; do not physically remove.
     // ----------------------------------------------------------------
 
-    uint64_t directedBefore = 0;
-    uint64_t directedAfter = 0;
+    uint64_t directedTotal = 0;
+    uint64_t useForAssemblyCount = 0;
 
     for(BidirectedAnchorId i = 0; i < anchorCount; ++i) {
         for(Strand s = 0; s <= 1; ++s) {
@@ -838,36 +881,21 @@ void BidirectedAnchors::transitiveReduction(
 
             auto& out = outEdges[oa];
             const auto& outCanonIds = directedEdgeCanonId[oi];
-            directedBefore += out.size();
+            directedTotal += out.size();
 
-            // In-place removal using pre-computed canon IDs.
-            uint64_t writePos = 0;
             for(uint64_t j = 0; j < out.size(); ++j) {
-                if(!isRemoved[outCanonIds[j]]) {
-                    if(writePos != j) {
-                        out[writePos] = out[j];
-                    }
-                    ++writePos;
-                }
+                const bool removed = isRemoved[outCanonIds[j]];
+                out[j].useForAssembly = !removed;
+                if(!removed) ++useForAssemblyCount;
             }
-            out.resize(writePos);
-            directedAfter += writePos;
 
-            // Rebuild inEdges similarly — but inEdges don't have pre-computed
-            // canon IDs, so compute on the fly (done once, not in BFS).
             auto& in = inEdges[oa];
-            uint64_t inWritePos = 0;
             for(uint64_t j = 0; j < in.size(); ++j) {
                 auto ce = canon(in[j].from, in[j].to);
                 auto it = canonToId.find(ce);
-                if(it == canonToId.end() || !isRemoved[it->second]) {
-                    if(inWritePos != j) {
-                        in[inWritePos] = in[j];
-                    }
-                    ++inWritePos;
-                }
+                const bool removed = (it != canonToId.end() && isRemoved[it->second]);
+                in[j].useForAssembly = !removed;
             }
-            in.resize(inWritePos);
         }
     }
 
@@ -879,10 +907,94 @@ void BidirectedAnchors::transitiveReduction(
     performanceLog << timestamp << "BidirectedAnchors::transitiveReduction ends. "
         << removedCount << " of " << totalCanonicalBefore
         << " canonical edges removed. "
-        << directedBefore << " directed edges before, "
-        << directedAfter << " after." << endl;
+        << useForAssemblyCount << " useForAssembly of " << directedTotal
+        << " directed edges." << endl;
+
+    saveEdgeTable();
 }
 
+
+void BidirectedAnchors::saveEdgeTable() const
+{
+    if(largeDataFileNamePrefix.empty()) return;
+
+    vector<vector<BidirectedEdge>> fwd(anchorCount), bwd(anchorCount);
+    for(BidirectedAnchorId i = 0; i < anchorCount; ++i) {
+        fwd[i] = outEdges[OrientedBidirectedAnchor(i, 0)];
+        bwd[i] = outEdges[OrientedBidirectedAnchor(i, 1)];
+    }
+
+    std::ostringstream oss;
+    {
+        boost::archive::binary_oarchive oa(oss);
+        oa << anchorCount;
+        oa << fwd << bwd;
+    }
+    const string dataString = oss.str();
+
+    MemoryMapped::Vector<char> data;
+    data.createNew(largeDataName("BidirectedEdgeTable"), largeDataPageSize);
+    data.resize(dataString.size());
+    std::copy(dataString.begin(), dataString.end(), data.begin());
+
+    cout << timestamp << "Saved edge table (Shasta2-style Boost serialization)." << endl;
+}
+
+
+bool BidirectedAnchors::loadEdgeTable()
+{
+    if(largeDataFileNamePrefix.empty()) return false;
+
+    MemoryMapped::Vector<char> data;
+    try {
+        data.accessExistingReadOnly(largeDataName("BidirectedEdgeTable"));
+    } catch(...) {
+        return false;
+    }
+
+    const string dataString(data.begin(), data.size());
+    std::istringstream iss(dataString);
+    try {
+        boost::archive::binary_iarchive ia(iss);
+        uint64_t loadedAnchorCount = 0;
+        ia >> loadedAnchorCount;
+        if(loadedAnchorCount != anchorCount) {
+            cout << timestamp << "Edge table anchor count " << loadedAnchorCount
+                 << " != " << anchorCount << ". Recomputing." << endl;
+            return false;
+        }
+        vector<vector<BidirectedEdge>> fwd, bwd;
+        ia >> fwd >> bwd;
+        if(fwd.size() != anchorCount || bwd.size() != anchorCount) {
+            cout << timestamp << "Edge table size mismatch. Recomputing." << endl;
+            return false;
+        }
+        outEdges.clear();
+        outEdges.resize(anchorCount);
+        for(BidirectedAnchorId i = 0; i < anchorCount; ++i) {
+            outEdges[OrientedBidirectedAnchor(i, 0)] = std::move(fwd[i]);
+            outEdges[OrientedBidirectedAnchor(i, 1)] = std::move(bwd[i]);
+        }
+    } catch(...) {
+        cout << timestamp << "Failed to deserialize edge table. Recomputing." << endl;
+        return false;
+    }
+
+    inEdges.clear();
+    inEdges.resize(anchorCount);
+    for(BidirectedAnchorId i = 0; i < anchorCount; ++i) {
+        for(Strand s = 0; s <= 1; ++s) {
+            const OrientedBidirectedAnchor from(i, s);
+            for(const auto& e : outEdges[from]) {
+                inEdges[e.to].push_back(e);
+            }
+        }
+    }
+
+    edgesComputed = true;
+    cout << timestamp << "Loaded edge table (Shasta2-style, transitive-reduced)." << endl;
+    return true;
+}
 
 
 void BidirectedAnchors::writeGfa(const string& fileName, bool includePaths) const
@@ -908,12 +1020,13 @@ void BidirectedAnchors::writeGfa(const string& fileName, bool includePaths) cons
             << "\n";
     }
 
-    // L lines: one per canonical oriented edge.
+    // L lines: one per canonical oriented edge (useForAssembly only).
     map<pair<OrientedBidirectedAnchor, OrientedBidirectedAnchor>, uint64_t> canonicalEdges;
     for(BidirectedAnchorId anchorId = 0; anchorId < anchorCount; ++anchorId) {
         for(Strand strand = 0; strand <= 1; ++strand) {
             const OrientedBidirectedAnchor oa(anchorId, strand);
             for(const BidirectedEdge& edge : getOutEdges(oa)) {
+                if(!edge.useForAssembly) continue;
                 const auto canonicalEdge = canon(edge.from, edge.to);
                 auto it = canonicalEdges.find(canonicalEdge);
                 if(it == canonicalEdges.end()) {
@@ -977,10 +1090,10 @@ void BidirectedAnchors::findForwardNeighbors(
     neighbors.clear();
 
     if(edgesComputed) {
-        // O(1) lookup from edge table.
+        // O(1) lookup from edge table (useForAssembly only).
         const auto edges = getOutEdges(oa);
         for(const auto& e : edges) {
-            if(e.coverage >= minCount) {
+            if(e.useForAssembly && e.coverage >= minCount) {
                 neighbors.push_back(Neighbor{e.to.anchorId, e.to.strand, e.coverage});
             }
         }
@@ -1034,10 +1147,10 @@ void BidirectedAnchors::findBackwardNeighbors(
     neighbors.clear();
 
     if(edgesComputed) {
-        // O(1) lookup from edge table.
+        // O(1) lookup from edge table (useForAssembly only).
         const auto edges = getInEdges(oa);
         for(const auto& e : edges) {
-            if(e.coverage >= minCount) {
+            if(e.useForAssembly && e.coverage >= minCount) {
                 neighbors.push_back(Neighbor{e.from.anchorId, e.from.strand, e.coverage});
             }
         }
@@ -1129,71 +1242,79 @@ void BidirectedAnchors::unitigifyAll()
 
     performanceLog << timestamp << "BidirectedAnchors::unitigifyAll begins." << endl;
 
+    // Remove persisted edge table — unitigification changes anchor count.
+    try {
+        std::filesystem::remove(largeDataName("BidirectedEdgeTable"));
+    } catch(...) { /* ignore */ }
+
     const uint64_t oldAnchorCount = anchorCount;
     const uint64_t readCount = reads.readCount();
 
     // ----------------------------------------------------------------
-    // Step 1: Find maximal unitig chains.
+    // Step 1: Find maximal unitig chains (Shasta2-style edge-centric
+    // findLinearChains: iterate over edges, extend forward/backward with
+    // degree-1 rule, detect circular chains, minimumLength=1).
     // ----------------------------------------------------------------
 
-    vector<bool> visited(oldAnchorCount, false);
+    using BglGraph = boost::adjacency_list<
+        boost::listS, boost::vecS, boost::bidirectionalS>;
+    using Vertex = BglGraph::vertex_descriptor;
+    using Edge = BglGraph::edge_descriptor;
+
+    const uint64_t vertexCount = 2 * oldAnchorCount;
+    BglGraph graph(vertexCount);
+
+    auto toVertex = [](OrientedBidirectedAnchor oa) -> Vertex {
+        return Vertex(oa.anchorId * 2 + oa.strand);
+    };
+    auto toOrientedAnchor = [](Vertex v) -> OrientedBidirectedAnchor {
+        return OrientedBidirectedAnchor(v / 2, Strand(v % 2));
+    };
+
+    // Add canonical useForAssembly edges only (one direction per bidirected edge).
+    std::set<std::pair<OrientedBidirectedAnchor, OrientedBidirectedAnchor>> seenCanon;
+    for(BidirectedAnchorId aid = 0; aid < oldAnchorCount; ++aid) {
+        for(Strand s = 0; s <= 1; ++s) {
+            OrientedBidirectedAnchor from(aid, s);
+            for(const auto& e : getOutEdges(from)) {
+                if(!e.useForAssembly) continue;
+                auto [cFrom, cTo] = canon(from, e.to);
+                if(seenCanon.insert({cFrom, cTo}).second) {
+                    boost::add_edge(toVertex(cFrom), toVertex(cTo), graph);
+                }
+            }
+        }
+    }
+
+    vector<std::list<Edge>> edgeChains;
+    dinara::findLinearChains(graph, 1, edgeChains);
+
     vector<vector<OrientedBidirectedAnchor>> chains;
-    chains.reserve(oldAnchorCount);  // upper bound; shrinks after
+    chains.reserve(edgeChains.size() + oldAnchorCount);
+    vector<bool> anchorInChain(oldAnchorCount, false);
 
-    for(BidirectedAnchorId anchorId = 0; anchorId < oldAnchorCount; ++anchorId) {
-        if(visited[anchorId]) continue;
-        visited[anchorId] = true;
-
-        OrientedBidirectedAnchor start(anchorId, 0);
-
-        // Extend forward.
-        vector<OrientedBidirectedAnchor> fwd;
-        fwd.push_back(start);
-        {
-            OrientedBidirectedAnchor cur = start;
-            while(true) {
-                const auto outgoing = getOutEdges(cur);
-                if(outgoing.size() != 1) break;
-                const OrientedBidirectedAnchor next = outgoing[0].to;
-                if(visited[next.anchorId]) break;
-                const auto incoming = getInEdges(next);
-                if(incoming.size() != 1) break;
-                fwd.push_back(next);
-                visited[next.anchorId] = true;
-                cur = next;
-            }
-        }
-
-        // Extend backward.
-        vector<OrientedBidirectedAnchor> bwd;
-        {
-            OrientedBidirectedAnchor cur = start;
-            while(true) {
-                const auto incoming = getInEdges(cur);
-                if(incoming.size() != 1) break;
-                const OrientedBidirectedAnchor prev = incoming[0].from;
-                if(visited[prev.anchorId]) break;
-                const auto outgoing = getOutEdges(prev);
-                if(outgoing.size() != 1) break;
-                bwd.push_back(prev);
-                visited[prev.anchorId] = true;
-                cur = prev;
-            }
-        }
-
-        // Combine: reverse(backward) + forward.
+    for(const auto& edgeChain : edgeChains) {
+        if(edgeChain.empty()) continue;
         vector<OrientedBidirectedAnchor> chain;
-        chain.reserve(bwd.size() + fwd.size());
-        for(auto it = bwd.rbegin(); it != bwd.rend(); ++it) {
-            chain.push_back(*it);
+        auto it = edgeChain.begin();
+        Vertex first = boost::source(*it, graph);
+        chain.push_back(toOrientedAnchor(first));
+        anchorInChain[first / 2] = true;
+        for(; it != edgeChain.end(); ++it) {
+            Vertex v = boost::target(*it, graph);
+            if(v == first) break;  // Circular chain: don't duplicate start vertex
+            chain.push_back(toOrientedAnchor(v));
+            anchorInChain[v / 2] = true;
         }
-        for(const auto& oa : fwd) {
-            chain.push_back(oa);
-        }
-
         chains.push_back(std::move(chain));
     }
-    chains.shrink_to_fit();
+
+    // Isolated anchors (no useForAssembly edges) become singleton unitigs.
+    for(BidirectedAnchorId aid = 0; aid < oldAnchorCount; ++aid) {
+        if(!anchorInChain[aid]) {
+            chains.push_back({OrientedBidirectedAnchor(aid, 0)});
+        }
+    }
 
     const uint64_t newAnchorCount = chains.size();
 
@@ -1260,6 +1381,7 @@ void BidirectedAnchors::unitigifyAll()
         for(Strand s = 0; s <= 1; ++s) {
             OrientedBidirectedAnchor oldOa(oldAnchorId, s);
             for(const auto& edge : getOutEdges(oldOa)) {
+                if(!edge.useForAssembly) continue;
                 const auto& fromMap = anchorToUnitig[edge.from.anchorId];
                 const auto& toMap = anchorToUnitig[edge.to.anchorId];
 
@@ -1364,37 +1486,105 @@ void BidirectedAnchors::unitigifyAll()
     }
 
     // ----------------------------------------------------------------
-    // Step 5: Build new journeys.
-    // Two-pass: count entries first, then fill.
-    // Avoids allocating millions of small std::vector objects.
+    // Step 5: Build new journeys (Shasta2-style edge-centric).
+    // - Preserve anchor-level journeys (never overwrite the source).
+    // - Compute unitig-level journeys via edge-centric algorithm using
+    //   positionInJourney; apply single-edge rule.
     // ----------------------------------------------------------------
 
-    // Pass 1: count collapsed journey entries per read.
-    vector<uint64_t> journeySizes(readCount, 0);
-
+    // Shasta2-style: save anchor-level journeys before overwriting.
+    try { anchorLevelJourneys.remove(); } catch(...) { /* ignore */ }
+    anchorLevelJourneys.createNew(
+        largeDataName("BidirectedAnchorLevelJourneys"), largeDataPageSize);
     for(uint64_t readIdValue = 0; readIdValue < readCount; ++readIdValue) {
+        anchorLevelJourneys.appendVector();
         const auto jrn = journeys[readIdValue];
-        if(jrn.empty()) continue;
-
-        uint64_t lastUnitigId = invalid<uint64_t>;
-        Strand lastStrand = 0;
-
         for(uint64_t i = 0; i < jrn.size(); ++i) {
-            const auto& mapping = anchorToUnitig[jrn[i].anchorId];
-            const uint64_t unitigId = mapping.unitigId;
-            const Strand unitigStrand =
-                (jrn[i].strand == mapping.strandInChain) ? Strand(0) : Strand(1);
+            anchorLevelJourneys.append(jrn[i]);
+        }
+    }
 
-            if(unitigId != lastUnitigId || unitigStrand != lastStrand) {
-                ++journeySizes[readIdValue];
-                lastUnitigId = unitigId;
-                lastStrand = unitigStrand;
+    // Edge-centric journey computation (Shasta2 AssemblyGraph::computeJourneys).
+    // Phase A: Build uncompressed entries per read from chain steps.
+    struct UnitigJourneyEntry {
+        uint64_t unitigId;
+        Strand unitigStrand;
+        uint64_t positionInJourneyA;
+        uint64_t positionInJourneyB;
+        bool operator<(const UnitigJourneyEntry& that) const {
+            return positionInJourneyA + positionInJourneyB <
+                that.positionInJourneyA + that.positionInJourneyB;
+        }
+    };
+    vector<vector<UnitigJourneyEntry>> unitigJourneyEntries(readCount);
+
+    for(uint64_t unitigId = 0; unitigId < newAnchorCount; ++unitigId) {
+        const auto& chainAnchors = chains[unitigId];
+        if(chainAnchors.size() < 2) continue;
+
+        for(size_t step = 0; step < chainAnchors.size() - 1; ++step) {
+            const auto& oaA = chainAnchors[step];
+            const auto& oaB = chainAnchors[step + 1];
+
+            const auto intervalsA = anchorMarkerIntervals[oaA.anchorId];
+            const auto intervalsB = anchorMarkerIntervals[oaB.anchorId];
+
+            std::unordered_map<ReadId, std::vector<std::pair<Strand, uint32_t>>> mapA;
+            for(const auto& mi : intervalsA) {
+                if(mi.positionInJourney == invalid<uint32_t>) continue;
+                mapA[mi.readId].emplace_back(mi.strand, mi.positionInJourney);
+            }
+            std::unordered_map<ReadId, std::vector<std::pair<Strand, uint32_t>>> mapB;
+            for(const auto& mi : intervalsB) {
+                if(mi.positionInJourney == invalid<uint32_t>) continue;
+                mapB[mi.readId].emplace_back(mi.strand, mi.positionInJourney);
+            }
+
+            for(const auto& [readId, vecA] : mapA) {
+                auto itB = mapB.find(readId);
+                if(itB == mapB.end()) continue;
+                for(const auto& [strandA, posA] : vecA) {
+                    for(const auto& [strandB, posB] : itB->second) {
+                        const int64_t diff = static_cast<int64_t>(posA) - static_cast<int64_t>(posB);
+                        if(diff != 1 && diff != -1) continue;
+                        const uint64_t posMin = (posA < posB) ? posA : posB;
+                        const uint64_t posMax = (posA < posB) ? posB : posA;
+                        Strand unitigStrand;
+                        if(posA < posB) {
+                            unitigStrand = (strandA == oaA.strand) ? Strand(0) : Strand(1);
+                        } else {
+                            unitigStrand = (strandB == oaB.strand) ? Strand(0) : Strand(1);
+                        }
+                        unitigJourneyEntries[uint64_t(readId)].push_back(
+                            {unitigId, unitigStrand, posMin, posMax});
+                    }
+                }
             }
         }
     }
 
-    // Pass 2: fill a flat buffer.
-    // Compute offsets from sizes.
+    // Phase B: Sort each read's entries by positionInJourneyA + positionInJourneyB.
+    for(auto& v : unitigJourneyEntries) {
+        sort(v.begin(), v.end());
+    }
+
+    // Phase C & D: Compress (emit only on unitig transition) and apply single-edge rule.
+    vector<uint64_t> journeySizes(readCount, 0);
+    for(uint64_t readIdValue = 0; readIdValue < readCount; ++readIdValue) {
+        const auto& entries = unitigJourneyEntries[readIdValue];
+        if(entries.empty()) continue;
+        uint64_t lastUnitigId = invalid<uint64_t>;
+        Strand lastStrand = 0;
+        for(const auto& e : entries) {
+            if(e.unitigId != lastUnitigId || e.unitigStrand != lastStrand) {
+                ++journeySizes[readIdValue];
+                lastUnitigId = e.unitigId;
+                lastStrand = e.unitigStrand;
+            }
+        }
+        if(journeySizes[readIdValue] == 1) journeySizes[readIdValue] = 0;
+    }
+
     vector<uint64_t> journeyOffsets(readCount + 1, 0);
     for(uint64_t i = 0; i < readCount; ++i) {
         journeyOffsets[i + 1] = journeyOffsets[i] + journeySizes[i];
@@ -1403,23 +1593,16 @@ void BidirectedAnchors::unitigifyAll()
     vector<BidirectedJourneyEntry> flatJourneys(totalJourneyEntries);
 
     for(uint64_t readIdValue = 0; readIdValue < readCount; ++readIdValue) {
-        const auto jrn = journeys[readIdValue];
-        if(jrn.empty()) continue;
-
+        const auto& entries = unitigJourneyEntries[readIdValue];
+        if(entries.empty()) continue;
         uint64_t pos = journeyOffsets[readIdValue];
         uint64_t lastUnitigId = invalid<uint64_t>;
         Strand lastStrand = 0;
-
-        for(uint64_t i = 0; i < jrn.size(); ++i) {
-            const auto& mapping = anchorToUnitig[jrn[i].anchorId];
-            const uint64_t unitigId = mapping.unitigId;
-            const Strand unitigStrand =
-                (jrn[i].strand == mapping.strandInChain) ? Strand(0) : Strand(1);
-
-            if(unitigId != lastUnitigId || unitigStrand != lastStrand) {
-                flatJourneys[pos++] = BidirectedJourneyEntry(unitigId, unitigStrand);
-                lastUnitigId = unitigId;
-                lastStrand = unitigStrand;
+        for(const auto& e : entries) {
+            if(e.unitigId != lastUnitigId || e.unitigStrand != lastStrand) {
+                flatJourneys[pos++] = BidirectedJourneyEntry(e.unitigId, e.unitigStrand);
+                lastUnitigId = e.unitigId;
+                lastStrand = e.unitigStrand;
             }
         }
     }
@@ -1467,6 +1650,23 @@ void BidirectedAnchors::unitigifyAll()
             journeys.append(flatJourneys[j]);
         }
     }
+
+    // Recompute positionInJourney on new unitig-level marker intervals.
+    for(uint64_t readIdValue = 0; readIdValue < readCount; ++readIdValue) {
+        const ReadId readId(readIdValue);
+        const auto jrn = journeys[readIdValue];
+        for(uint64_t position = 0; position < jrn.size(); ++position) {
+            const BidirectedAnchorId unitigId = jrn[position].anchorId;
+            auto intervals = anchorMarkerIntervals[unitigId];
+            for(auto& mi : intervals) {
+                if(mi.readId == readId) {
+                    mi.positionInJourney = uint32_t(position);
+                    break;
+                }
+            }
+        }
+    }
+
     flatJourneys.clear();
     flatJourneys.shrink_to_fit();
     journeyOffsets.clear();

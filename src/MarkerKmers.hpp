@@ -81,6 +81,19 @@ public:
     // Construct the reverse complement of a MarkerInfo.
     MarkerInfo reverseComplement(const MarkerInfo&) const;
 
+    const Reads& getReads() const
+    {
+        return reads;
+    }
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& getMarkers() const
+    {
+        return markers;
+    }
+    uint64_t getK() const
+    {
+        return k;
+    }
+
 private:
 
     // Constructor arguments.

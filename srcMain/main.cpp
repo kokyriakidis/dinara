@@ -17,6 +17,10 @@
 #include "mode3-DirectedAnchorGraph.hpp"
 #include "mode3-AnchorGraph.hpp"
 #include "mode3-AnchorGraphSuperbubbles.hpp"
+#include "Shasta2Anchors.hpp"
+#include "Shasta2Journeys.hpp"
+#include "Shasta2AnchorGraph.hpp"
+#include "Shasta2AssemblyGraph.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -1495,162 +1499,84 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
-    // shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
-
-    // const uint64_t minAnchorCoverage = 4;
-    // const uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max();
-    // const uint64_t minEdgeCoverage = 4;
-
-    // bidirectedAnchors = assembler.createBidirectedAnchors(
-    //     minAnchorCoverage,
-    //     maxAnchorCoverage,
-    //     minEdgeCoverage,
-    //     threadCount);
-
-    // cout << "BidirectedAnchors: " << bidirectedAnchors->size() << " anchors." << endl;
-
-    // const string bidirectedGfaFileName = "BidirectedAnchorGraph.gfa";
-    // bidirectedAnchors->writeGfa(bidirectedGfaFileName, false);
-    // cout << timestamp << "Wrote bidirected anchor graph GFA to "
-    //      << std::filesystem::absolute(bidirectedGfaFileName).string() << endl;
-
-    // // Transitive reduction: remove low-coverage edges that have an alternate
-    // // path through higher-coverage edges.
-    // const uint64_t transitiveReductionMaxEdgeCoverage = 10;
-    // const uint64_t transitiveReductionMaxDistance = 10;
-    // bidirectedAnchors->transitiveReduction(
-    //     transitiveReductionMaxEdgeCoverage,
-    //     transitiveReductionMaxDistance);
-
-    // // Unitigify: merge maximal linear chains into single unitig anchors.
-    // bidirectedAnchors->unitigifyAll();
-    // cout << "After unitigification: " << bidirectedAnchors->size() << " unitigs." << endl;
-
-    // const string unitigGfaFileName = "BidirectedUnitigGraph.gfa";
-    // bidirectedAnchors->writeGfa(unitigGfaFileName, false);
-    // cout << timestamp << "Wrote unitigified graph GFA to "
-    //      << std::filesystem::absolute(unitigGfaFileName).string() << endl;
+    // Shasta2 default (--min-anchor-graph-edge-coverage).
+    const uint64_t minEdgeCoverage = 4;
 
 
+    // // Declare anchors pointer here to avoid scope issues
+    shared_ptr<mode3::Anchors> anchors;
+    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
-
-    // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::DirectedAnchors> anchors;
-
-    // Verkko-style: keep all vertices with coverage >= 2, no upper cap.
-    // MBG uses -a 1 (min k-mer abundance) + -u 2 (min unitig abundance) with no max.
-    // High-coverage repeat nodes are intentionally kept for triplet-based resolution.
-    // const uint64_t minPrimaryCoverage = 2;
-    // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    // // Verkko-style: keep all vertices with coverage >= 2, no upper cap.
+    // // MBG uses -a 1 (min k-mer abundance) + -u 2 (min unitig abundance) with no max.
+    // // High-coverage repeat nodes are intentionally kept for triplet-based resolution.
+    // // const uint64_t minPrimaryCoverage = 2;
+    // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
     const uint64_t minPrimaryCoverage = 4;
     const uint64_t maxPrimaryCoverage = 60;
-    cout << "Using Verkko-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
+    cout << "Using Shasta-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-
-
-    anchors =
-        make_shared<mode3::DirectedAnchors>(
+    
+    // Create Shasta2Anchors
+    // We use the markerGraph structure to define anchors.
+    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
             MappedMemoryOwner(assembler),
             assembler.getReads(),
             assembler.assemblerInfo->k,
             *assembler.markers,
             assembler.markerGraph,
-            minPrimaryCoverage,
-            maxPrimaryCoverage,
-            threadCount,
-            true); // createFromVertices
+            threadCount);
+    auto& shasta2Anchors = assembler.shasta2Anchors;
 
-    // Compute oriented read journeys.
-    // AnchorIds already encode orientation (even=fwd, odd=rev), same as DagNodeId.
-    anchors->computeJourneys(threadCount);
+    // Compute journeys.
+    cout << timestamp << "Creating Shasta2Journeys..." << endl;
+    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
+        2 * assembler.getReads().readCount(),
+        shasta2Anchors,
+        threadCount,
+        MappedMemoryOwner(assembler));
+    auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // // Create the AnchorGraph.
-    // const uint64_t minEdgeCoverage = 0;
-    // cout << timestamp << "Creating AnchorGraph..." << endl;
-    // assembler.anchorGraph = make_shared<mode3::AnchorGraph>(
-    //     *anchors,
-    //     minEdgeCoverage,
-    //     &assembler.alignmentData,
-    //     &assembler.getAlignmentTable());
-    // cout << "The AnchorGraph has " <<
-    //     num_vertices(*assembler.anchorGraph) << " vertices and " <<
-    //     num_edges(*assembler.anchorGraph) << " edges." << endl;
+    // Create the Shasta2AnchorGraph.
+    // const uint64_t minEdgeCoverage = 4; // Already defined above as 3 or 4. Using existing value.
+    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
+    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        minEdgeCoverage);
+    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
+    
+    // Transitive reduction.
+    // Shared parameters for local path-based simplification steps.
+    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    const uint64_t transitiveReductionMaxDistance = 10;
 
-    // // --- Superbubble detection (Onodera/Verkko algorithm, for AnchorGraph) ---
-    // auto onoderaSuperbubbles = mode3::find_superbubbles_boost(*assembler.anchorGraph);
-    // std::cout << "[SuperbubbleDetection] AnchorGraph: Found " << onoderaSuperbubbles.size() << " superbubbles (Onodera/Verkko)." << std::endl;
-    // maybeRunBubbleFinderDirectedSuperbubbleComparison(
-    //     *assembler.anchorGraph,
-    //     onoderaSuperbubbles,
-    //     threadCount);
+    shasta2AnchorGraph->transitiveReduction(
+        transitiveReductionMaxEdgeCoverage,
+        transitiveReductionMaxDistance);
 
-    // // Shared parameters for local path-based simplification steps.
-    // const uint64_t transitiveReductionMaxEdgeCoverage = 10;
-    // const uint64_t transitiveReductionMaxDistance = 10;
+    // Shasta2 logic parity: save AnchorGraph after transitive reduction.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
-    // // Superbubble detection using flow-based convergence.
-    // {
-    //     vector<mode3::AnchorGraphSuperbubble> superbubbles;
-    //     assembler.anchorGraph->findSuperbubbles(superbubbles, transitiveReductionMaxDistance);
-    //     cout << "Superbubbles detected: " << superbubbles.size() << endl;
-    //     assembler.anchorGraph->removeContainedSuperbubbles(superbubbles);
-    //     vector<mode3::AnchorGraphSuperbubbleChain> chains;
-    //     assembler.anchorGraph->findSuperbubbleChains(superbubbles, chains);
+    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
+    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
+    shasta2AssemblyGraphOptions.threadCount = threadCount;
+    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = false;
+    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        *shasta2AnchorGraph,
+        shasta2AssemblyGraphOptions);
+    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
 
-    //     cout << "Superbubbles detected: " << superbubbles.size() << endl;
-    //     cout << "Superbubble chains: " << chains.size() << endl;
-
-    // }
-
-    // // Transitive reduction.
-    // assembler.anchorGraph->transitiveReduction(
-    //     transitiveReductionMaxEdgeCoverage,
-    //     transitiveReductionMaxDistance);
-    // assembler.anchorGraph->resolvePhasedSuperbubbles(
-    //     transitiveReductionMaxDistance,
-    //     false);
-
-    // Run Mode 3 assembly.
-    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
+    shasta2AssemblyGraph->simplifyAndAssemble();
 
     return;
 
-
-    // // ========================================================================
-    // // Verkko-style directed anchor graph resolution — expanded pipeline.
-    // // Each step can be individually commented out for debugging.
-    // // ========================================================================
-
-    // // Step 1: Build the DirectedAnchorGraph from anchors.
-    // // Each anchor pair (2*m, 2*m+1) maps directly to a DAG segment m.
-    // // AnchorId IS DagNodeId — no intermediate BidirectedAnchors needed.
-    // // MBG Optimization: We skip alignment-based read intervals to avoid a slow serial loop.
-    // // Paths and coordinates are based purely on journeys.
-    // assembler.directedAnchorGraph = make_shared<mode3::DirectedAnchorGraph>();
-    // assembler.directedAnchorGraph->buildFromAnchors(
-    //     *anchors,
-    //     threadCount);
-
-    // auto& dag = *assembler.directedAnchorGraph;
-
-    // cout << "Initial directed anchor graph: "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-
-    // // Step 1b: Global segment filtering (MBG -u)
-    // dag.removeLowCoverageSegments(2.0);
-    // cout << "After global segment filtering (minCoverage=2.0): "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges." << endl;
-
-    // // Step 2: Initial unitigification (MBG workflow)
-    // dag.unitigifyAll();
-    // cout << "After initial unitigification: "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-    // dag.writeSummary(cout);
     // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
 
     // // Step 3: MBG-style cleaning phase
