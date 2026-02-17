@@ -1500,27 +1500,37 @@ void dinara::main::assemble(
     }
 
     // Shasta2 default (--min-anchor-graph-edge-coverage).
-    const uint64_t minEdgeCoverage = 4;
+    const uint64_t minEdgeCoverage = 6;
 
 
-    // // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::Anchors> anchors;
+    // // // Declare anchors pointer here to avoid scope issues
+    // shared_ptr<mode3::Anchors> anchors;
+    // anchors = make_shared<mode3::Anchors>(
+    //     MappedMemoryOwner(assembler),
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     *assembler.markers,
+    //     assembler.markerGraph,
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     true); // createFromVertices
     // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
-    // // Verkko-style: keep all vertices with coverage >= 2, no upper cap.
-    // // MBG uses -a 1 (min k-mer abundance) + -u 2 (min unitig abundance) with no max.
-    // // High-coverage repeat nodes are intentionally kept for triplet-based resolution.
+
     // // const uint64_t minPrimaryCoverage = 2;
     // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
     const uint64_t minPrimaryCoverage = 4;
     const uint64_t maxPrimaryCoverage = 60;
     cout << "Using Shasta-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+
+    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
     
     // Create Shasta2Anchors
     // We use the markerGraph structure to define anchors.
     assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
-            MappedMemoryOwner(assembler),
+            shasta2Owner,
             assembler.getReads(),
             assembler.assemblerInfo->k,
             *assembler.markers,
@@ -1534,7 +1544,7 @@ void dinara::main::assemble(
         2 * assembler.getReads().readCount(),
         shasta2Anchors,
         threadCount,
-        MappedMemoryOwner(assembler));
+        shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
     // Create the Shasta2AnchorGraph.

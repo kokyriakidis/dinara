@@ -87,6 +87,11 @@ public:
     uint64_t sequenceLength() const;
     void getSequence(vector<Base>&) const;
     uint64_t length() const;
+    void swapSteps(Shasta2AssemblyGraphEdge& that)
+    {
+        vector<Shasta2AssemblyGraphEdgeStep>::swap(that);
+    }
+
     Shasta2AnchorId firstAnchorId() const
     {
         return front().anchorPair.anchorIdA;
@@ -152,13 +157,19 @@ public:
     uint64_t nextEdgeId = 0;
 
     void simplifyAndAssemble();
-    uint64_t compressLinearChains();
+    uint64_t compress();
     uint64_t compressDebugLevel = 0; // 1=minimal, 2=compact, 3=detailed.
     uint64_t bubbleCleanup();
     uint64_t phaseSuperbubbleChains();
     void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
+
+    // Compute compressed journeys in the Shasta2AssemblyGraph.
+    void computeJourneys();
+    vector< vector<edge_descriptor> > compressedJourneys;
+
     void findAndConnectAssemblyPaths();
     bool canConnect(edge_descriptor, edge_descriptor) const;
+    void removeEmptyEdges();
     void removeIsolatedVertices();
     void removeLowN50Components(uint64_t minN50);
     void assembleAll();
@@ -209,6 +220,9 @@ public:
     void write(const string& stage);
     void check() const;
     void clearSequence();
+
+    void findStrongComponents(vector< vector<vertex_descriptor> >&) const;
+    void colorStrongComponents() const;
 
     class PhaseSuperbubbleChainsData {
     public:

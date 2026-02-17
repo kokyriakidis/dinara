@@ -21,6 +21,9 @@ dinara-install/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Run directory
+DinaraRun/
 /.cargo-target-astarpa/release/.fingerprint/aho-corasick-b067abf2de59168f/dep-lib-aho_corasick
 /.cargo-target-astarpa/release/.fingerprint/aho-corasick-b067abf2de59168f/invoked.timestamp
 /.cargo-target-astarpa/release/.fingerprint/aho-corasick-b067abf2de59168f/lib-aho_corasick
