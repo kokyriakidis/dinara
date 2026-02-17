@@ -277,6 +277,10 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantCluster);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantClusters);
 #endif
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Anchor);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorPair);
+
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowingAssemblyGraph);
@@ -630,6 +634,15 @@ void Assembler::writeNavigation(ostream& html) const
             {"Graph summary", "exploreDirectedAnchorGraph"},
             {"Node", "exploreDirectedAnchorGraphNode"},
             {"Path", "exploreDirectedAnchorGraphPath"},
+            });
+
+        writeNavigation(html, "Shasta2 Anchor Graph", {
+            {"Graph summary", "exploreShasta2AnchorGraph"},
+            });
+
+        writeNavigation(html, "Shasta2 Anchors", {
+            {"Anchor", "exploreShasta2Anchor"},
+            {"Anchor Pair", "exploreShasta2AnchorPair"},
             });
 
 #if DINARA_ENABLE_VARIANT_CLUSTERING

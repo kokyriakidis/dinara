@@ -197,10 +197,11 @@ namespace dinara {
             OrientedBidirectedAnchor from;
             OrientedBidirectedAnchor to;
             uint64_t coverage = 0;  // number of reads supporting this edge
+            bool useForAssembly = true;  // Shasta2-style: transitive reduction sets false for removed edges
 
             BidirectedEdge() {}
             BidirectedEdge(OrientedBidirectedAnchor from, OrientedBidirectedAnchor to, uint64_t coverage = 0) :
-                from(from), to(to), coverage(coverage) {}
+                from(from), to(to), coverage(coverage), useForAssembly(true) {}
 
             bool operator==(const BidirectedEdge& o) const {
                 return from == o.from && to == o.to;
@@ -223,6 +224,7 @@ public:
     ReadId readId;
     uint32_t ordinal;       // Marker ordinal on strand 0 of the read.
     Strand  strand;         // 0 or 1: which strand's marker is in this anchor.
+    uint32_t positionInJourney = invalid<uint32_t>;  // Set during computeJourneys (Shasta2-style).
 
     BidirectedAnchorMarkerInterval() {}
     BidirectedAnchorMarkerInterval(ReadId readId, uint32_t ordinal, Strand strand) :
@@ -309,7 +311,12 @@ public:
     void computeJourneys(uint64_t threadCount);
 
     // Access the journey for a given ReadId.
+    // After unitigifyAll, returns unitig-level journey (computed from anchor-level).
     std::span<const BidirectedJourneyEntry> journey(ReadId readId) const;
+
+    // Shasta2-style: anchor-level journey (preserved, never overwritten).
+    // Only valid after unitigifyAll; returns empty span if not available.
+    std::span<const BidirectedJourneyEntry> anchorLevelJourney(ReadId readId) const;
 
     // Write journeys to CSV for diagnostics.
     void writeJourneys() const;
@@ -440,7 +447,12 @@ private:
     MemoryMapped::Vector<BidirectedAnchorInfo> anchorInfos;
 
     // Per-ReadId journeys (sorted by ordinal within each read).
+    // After unitigifyAll: unitig-level (computed from anchor-level).
     MemoryMapped::VectorOfVectors<BidirectedJourneyEntry, uint64_t> journeys;
+
+    // Shasta2-style: anchor-level journeys preserved when unitigifying.
+    // Never overwritten; unitig journeys are computed from this.
+    MemoryMapped::VectorOfVectors<BidirectedJourneyEntry, uint64_t> anchorLevelJourneys;
 
     // ---- Edge table storage ----
     // Indexed by OrientedBidirectedAnchor via BidirectedVectorWithDirection.
@@ -454,6 +466,10 @@ private:
     BidirectedVectorWithDirection<std::vector<BidirectedEdge>> inEdges;
 
     bool edgesComputed = false;
+
+    // Shasta2-style: save/load full edge table (with useForAssembly) via Boost serialization.
+    void saveEdgeTable() const;
+    bool loadEdgeTable();
 
     // BFS helper for transitive reduction.
     // Returns true if an alternate path exists from `from` to `to`

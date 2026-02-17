@@ -86,6 +86,10 @@ namespace dinara {
     class Reads;
     class ReferenceOverlapMap;
     class ProjectedAlignment;
+    class Shasta2Anchors;
+    class Shasta2Journeys;
+    class Shasta2AnchorGraph;
+    class Shasta2AssemblyGraph;
 
     // VariantPositionContext is defined in mode3-Anchor.hpp
 
@@ -687,6 +691,11 @@ public:
         uint64_t maxAnchorCoverage,
         uint64_t minEdgeCoverage,
         uint64_t threadCount);
+
+    /// Save the bidirected anchor graph to GFA. Call after createBidirectedAnchors
+    /// and after each modification (transitive reduction, unitigify, etc.) to persist
+    /// the current state. Requires assembler.bidirectedAnchors to be set.
+    void saveAnchorGraph(const std::string& fileName, bool includePaths = false) const;
 
     // Create and run Verkko-style directed anchor graph resolution.
     void runDirectedAnchorGraphResolution();
@@ -3531,6 +3540,16 @@ public:
     // BRG-native anchors (stored for HTTP server visualization).
     shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
     void accessBidirectedAnchors();
+
+    // Shasta2-style Anchors for Mode 3.
+    std::shared_ptr<Shasta2Anchors> shasta2Anchors;
+    std::shared_ptr<Shasta2Journeys> shasta2Journeys;
+    std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
+    std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
+
+    void exploreShasta2AnchorGraph(const vector<string>& request, ostream& html);
+    void exploreShasta2Anchor(const vector<string>& request, ostream& html);
+    void exploreShasta2AnchorPair(const vector<string>& request, ostream& html);
 
     // Global AnchorGraph (created for all anchors, not per-component).
     shared_ptr<mode3::AnchorGraph> anchorGraph;

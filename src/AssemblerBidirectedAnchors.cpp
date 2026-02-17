@@ -4,6 +4,9 @@
 #include "mode3-BidirectedAnchor.hpp"
 #include "timestamp.hpp"
 
+#include <filesystem>
+#include <stdexcept>
+
 using namespace dinara;
 
 
@@ -31,7 +34,20 @@ shared_ptr<mode3::BidirectedAnchors> Assembler::createBidirectedAnchors(
     cout << timestamp << "createBidirectedAnchors ends with "
          << bidirectedAnchors->size() << " anchors." << endl;
 
+    this->bidirectedAnchors = bidirectedAnchors;
     return bidirectedAnchors;
+}
+
+
+void Assembler::saveAnchorGraph(const std::string& fileName, bool includePaths) const
+{
+    if (!bidirectedAnchors) {
+        throw std::runtime_error("Assembler::saveAnchorGraph called but bidirectedAnchors is not set.");
+    }
+    bidirectedAnchors->writeGfa(fileName, includePaths);
+    cout << timestamp << "Saved anchor graph to "
+         << std::filesystem::absolute(fileName).string()
+         << " (" << bidirectedAnchors->size() << " segments)." << endl;
 }
 
 
