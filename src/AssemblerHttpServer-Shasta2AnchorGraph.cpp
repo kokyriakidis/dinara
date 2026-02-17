@@ -13,11 +13,13 @@ namespace {
 
 void accessShasta2HttpData(Assembler& assembler)
 {
+    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
+
     // Anchors are needed by all Shasta2 HTTP views.
     if(!assembler.shasta2Anchors) {
         assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
             "",
-            MappedMemoryOwner(assembler),
+            shasta2Owner,
             assembler.getReads(),
             assembler.assemblerInfo->k,
             *assembler.markers);
@@ -27,11 +29,11 @@ void accessShasta2HttpData(Assembler& assembler)
     if(!assembler.shasta2AnchorGraph) {
         try {
             assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-                MappedMemoryOwner(assembler),
+                shasta2Owner,
                 "Shasta2AnchorGraphAfterTransitiveReduction");
         } catch(const exception&) {
             assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-                MappedMemoryOwner(assembler),
+                shasta2Owner,
                 "Shasta2AnchorGraph");
         }
     }

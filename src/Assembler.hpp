@@ -3547,6 +3547,18 @@ public:
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
     std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
 
+    // Use a separate mapped-memory prefix for Shasta2 objects so we can
+    // keep upstream shasta2 object names ("Journeys", "AnchorGraph", ...)
+    // without colliding with other Dinara pipelines.
+    MappedMemoryOwner shasta2MappedMemoryOwner() const
+    {
+        MappedMemoryOwner owner(*this);
+        if(!owner.largeDataFileNamePrefix.empty()) {
+            owner.largeDataFileNamePrefix += "Shasta2-";
+        }
+        return owner;
+    }
+
     void exploreShasta2AnchorGraph(const vector<string>& request, ostream& html);
     void exploreShasta2Anchor(const vector<string>& request, ostream& html);
     void exploreShasta2AnchorPair(const vector<string>& request, ostream& html);

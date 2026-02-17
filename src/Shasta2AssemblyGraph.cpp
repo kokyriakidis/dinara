@@ -1,3 +1,5 @@
+#include <boost/pending/disjoint_sets.hpp>
+
 #include "Shasta2AssemblyGraph.hpp"
 #include "Shasta2ReadFollowing.hpp"
 #include "Shasta2AreSimilarSequences.hpp"
@@ -11,6 +13,9 @@
 #include "timestamp.hpp"
 #include "DINARA_ASSERT.hpp"
 #include "MultithreadedObject.tpp"
+namespace dinara {
+    template class MultithreadedObject<Shasta2AssemblyGraph>;
+}
 #include "deduplicate.hpp"
 #include "findConvergingVertex.hpp"
 #include "findLinearChains.hpp"
@@ -22,6 +27,7 @@
 #include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/iteration_macros.hpp>
 #include <boost/graph/reverse_graph.hpp>
+#include <boost/graph/strong_components.hpp>
 
 #include <algorithm>
 #include <array>
@@ -324,7 +330,7 @@ void Shasta2AssemblyGraph::simplifyAndAssemble()
         uint64_t changeCount = 0;
 
         changeCount += bubbleCleanup();
-        changeCount += compressLinearChains();
+        changeCount += compress();
         writeIntermediateStageIfRequested("B" + to_string(iteration));
 
         changeCount += phaseSuperbubbleChains();
@@ -386,12 +392,7 @@ void Shasta2AssemblyGraph::findBubbles(vector<Bubble>& bubbles) const
                 bubble.v0 = v0;
                 bubble.v1 = v1;
                 bubble.edges = edges;
-                sort(
-                    bubble.edges.begin(),
-                    bubble.edges.end(),
-                    [&assemblyGraph](const edge_descriptor e0, const edge_descriptor e1) {
-                        return assemblyGraph[e0].id < assemblyGraph[e1].id;
-                    });
+                std::ranges::sort(bubble.edges, orderById);
                 bubbles.push_back(bubble);
             }
         }
@@ -546,16 +547,24 @@ bool Shasta2AssemblyGraph::bubbleCleanup(const Bubble& bubble)
             branchGroups.front().push_back(i);
         }
     } else {
-        Shasta2DisjointSets disjointSets(ploidy);
-        for(const auto& p: similarPairs) {
-            disjointSets.unionSet(p.first, p.second);
+        vector<uint64_t> rank(ploidy);
+        vector<uint64_t> parent(ploidy);
+        boost::disjoint_sets<uint64_t*, uint64_t*> disjointSets(&rank[0], &parent[0]);
+        for(uint64_t i=0; i<ploidy; i++) {
+            disjointSets.make_set(i);
         }
+
+        for(const auto& p: similarPairs) {
+            disjointSets.union_set(p.first, p.second);
+        }
+
         vector< vector<uint64_t> > groups(ploidy);
         for(uint64_t i=0; i<ploidy; i++) {
-            groups[disjointSets.findSet(i)].push_back(i);
+            groups[disjointSets.find_set(i)].push_back(i);
         }
+
         for(const auto& group: groups) {
-            if(!group.empty()) {
+            if(not group.empty()) {
                 branchGroups.push_back(group);
             }
         }
@@ -628,7 +637,7 @@ uint64_t Shasta2AssemblyGraph::phaseSuperbubbleChains()
     data.superbubbleChains = nullptr;
     uint64_t changeCount = data.totalChangeCount;
 
-    changeCount += compressLinearChains();
+    changeCount += compress();
     performanceLog << timestamp << "Shasta2AssemblyGraph::phaseSuperbubbleChains ends." << endl;
     return changeCount;
 }
@@ -731,15 +740,11 @@ void Shasta2AssemblyGraph::removeContainedSuperbubbles(vector<Shasta2Superbubble
         const auto& internalEdges1 = superbubbles[p.second].internalEdges;
 
         commonEdges.clear();
-        set_intersection(
-            internalEdges0.begin(),
-            internalEdges0.end(),
-            internalEdges1.begin(),
-            internalEdges1.end(),
+        std::set_intersection(
+            internalEdges0.begin(), internalEdges0.end(),
+            internalEdges1.begin(), internalEdges1.end(),
             back_inserter(commonEdges),
-            [&assemblyGraph](const edge_descriptor e0, const edge_descriptor e1) {
-                return assemblyGraph[e0].id < assemblyGraph[e1].id;
-            });
+            orderById);
 
         if(commonEdges.size() == internalEdges0.size()) {
             superbubblesToBeRemoved.push_back(p.first);
@@ -847,6 +852,212 @@ void Shasta2AssemblyGraph::findSuperbubbleChains(
         for(const uint64_t id: forward) {
             wasUsed[id] = true;
             superbubbleChain.push_back(superbubbles[id]);
+        }
+    }
+}
+
+
+
+// Find the non-trivial strongly connected components.
+// Each component is stored with vertices sorted to permit binary searches.
+void Shasta2AssemblyGraph::findStrongComponents(
+    vector< vector<vertex_descriptor> >& strongComponents) const
+{
+    const Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Map the vertices to integers.
+    uint64_t vertexIndex = 0;
+    std::map<vertex_descriptor, uint64_t> vertexMap;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        vertexMap.insert({v, vertexIndex++});
+    }
+
+    // Compute strong components.
+    std::map<vertex_descriptor, uint64_t> componentMap;
+    boost::strong_components(
+        assemblyGraph,
+        boost::make_assoc_property_map(componentMap),
+        boost::vertex_index_map(boost::make_assoc_property_map(vertexMap)));
+
+    // Gather the vertices in each strong component.
+    std::map<uint64_t, vector<vertex_descriptor> > componentVertices;
+    for(const auto& p: componentMap) {
+        componentVertices[p.second].push_back(p.first);
+    }
+
+    strongComponents.clear();
+    for(const auto& p: componentVertices) {
+        const vector<vertex_descriptor>& component = p.second;
+        if(component.size() > 1) {
+            strongComponents.push_back(component);
+            sort(strongComponents.back().begin(), strongComponents.back().end());
+        }
+    }
+}
+
+
+
+// This creates a csv file that can be loaded in bandage to see
+// the strongly connected components.
+void Shasta2AssemblyGraph::colorStrongComponents() const
+{
+    const Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    vector< vector<vertex_descriptor> > strongComponents;
+    findStrongComponents(strongComponents);
+
+    ofstream csv("StrongComponents.csv");
+    csv << "Id,Color,Component\n";
+
+    // Loop over the non-trivial strongly connected components.
+    for(uint64_t i=0; i<strongComponents.size(); i++) {
+        const vector<vertex_descriptor>& strongComponent = strongComponents[i];
+
+        for(const vertex_descriptor v0: strongComponent) {
+            BGL_FORALL_OUTEDGES(v0, e, assemblyGraph, Shasta2AssemblyGraph) {
+                const vertex_descriptor v1 = target(e, assemblyGraph);
+                if(std::binary_search(strongComponent.begin(), strongComponent.end(), v1)) {
+                    csv << assemblyGraph[e].id << ",Green," << i << "\n";
+                }
+            }
+        }
+    }
+}
+
+
+
+// Compute oriented read journeys in the Shasta2AssemblyGraph.
+void Shasta2AssemblyGraph::computeJourneys()
+{
+    DINARA_ASSERT(anchorsPointer);
+    DINARA_ASSERT(journeysPointer);
+    const Shasta2Anchors& anchors = *anchorsPointer;
+    const Shasta2Journeys& journeys = *journeysPointer;
+
+    const uint64_t orientedReadCount = journeys.size();
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Compute uncompressed journeys for all oriented reads.
+    class AssemblyGraphJourneyEntry {
+    public:
+        edge_descriptor e;
+        uint64_t stepId;
+        uint64_t positionInJourneyA;
+        uint64_t positionInJourneyB;
+
+        bool operator<(const AssemblyGraphJourneyEntry& that) const
+        {
+            return positionInJourneyA + positionInJourneyB <
+                that.positionInJourneyA + that.positionInJourneyB;
+        }
+    };
+    vector< vector<AssemblyGraphJourneyEntry> > assemblyGraphJourneys(orientedReadCount);
+
+    // Loop over Shasta2AssemblyGraph edges.
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+
+        // Loop over steps of this edge.
+        for(uint64_t stepId=0; stepId<edge.size(); stepId++) {
+            const Shasta2AssemblyGraphEdgeStep& step = edge[stepId];
+
+            // Locate the anchors for this step.
+            const Shasta2AnchorPair& anchorPair = step.anchorPair;
+            const Shasta2AnchorId anchorIdA = anchorPair.anchorIdA;
+            const Shasta2AnchorId anchorIdB = anchorPair.anchorIdB;
+            const Shasta2Anchor anchorA = anchors[anchorIdA];
+            const Shasta2Anchor anchorB = anchors[anchorIdB];
+
+            // Loop over OrientedReadIds of this step.
+            auto itA = anchorA.begin();
+            auto itB = anchorB.begin();
+            for(const OrientedReadId orientedReadId: anchorPair.orientedReadIds) {
+
+                // Locate this OrientedReadId in the two anchors.
+                for(; (itA != anchorA.end()) and (itA->orientedReadId != orientedReadId); ++itA) {}
+                DINARA_ASSERT(itA != anchorA.end());
+                DINARA_ASSERT(itA->orientedReadId == orientedReadId);
+                const Shasta2AnchorMarkerInfo& infoA = *itA;
+                for(; (itB != anchorB.end()) and (itB->orientedReadId != orientedReadId); ++itB) {}
+                DINARA_ASSERT(itB != anchorB.end());
+                const Shasta2AnchorMarkerInfo& infoB = *itB;
+                DINARA_ASSERT(itB->orientedReadId == orientedReadId);
+
+                const uint32_t positionInJourneyA = infoA.positionInJourney;
+                const uint32_t positionInJourneyB = infoB.positionInJourney;
+
+                AssemblyGraphJourneyEntry entry;
+                entry.e = e;
+                entry.stepId = stepId;
+                entry.positionInJourneyA = positionInJourneyA;
+                entry.positionInJourneyB = positionInJourneyB;
+
+                assemblyGraphJourneys[orientedReadId.getValue()].push_back(entry);
+            }
+        }
+    }
+
+    // Sort the journeys.
+    for(vector<AssemblyGraphJourneyEntry>& v: assemblyGraphJourneys) {
+        sort(v.begin(), v.end());
+    }
+
+    // Create the compressed journeys.
+    // Here, we only consider transitions between Shasta2AssemblyGraph edges.
+    // Compressed journeys consisting of only one edge are considered empty.
+    compressedJourneys.clear();
+    compressedJourneys.resize(orientedReadCount);
+    for(ReadId orientedReadIdValue=0; orientedReadIdValue<orientedReadCount; orientedReadIdValue++) {
+        const vector<AssemblyGraphJourneyEntry>& assemblyGraphJourney = assemblyGraphJourneys[orientedReadIdValue];
+        vector<edge_descriptor>& compressedJourney = compressedJourneys[orientedReadIdValue];
+
+        for(uint64_t i1=0; i1<assemblyGraphJourney.size(); i1++) {
+            const AssemblyGraphJourneyEntry& entry1 = assemblyGraphJourney[i1];
+            const edge_descriptor e1 = entry1.e;
+
+            if(i1 == 0) {
+                compressedJourney.push_back(e1);
+            } else {
+                const uint64_t i0 = i1 - 1;
+                const AssemblyGraphJourneyEntry& entry0 = assemblyGraphJourney[i0];
+                const edge_descriptor e0 = entry0.e;
+                if(e1 != e0) {
+                    compressedJourney.push_back(e1);
+                }
+            }
+        }
+        if(compressedJourney.size() == 1) {
+            compressedJourney.clear();
+        }
+    }
+
+    // Write out the compressed journeys.
+    {
+        ofstream csv("AssemblyGraphCompressedJourneys.csv");
+        for(ReadId orientedReadIdValue=0; orientedReadIdValue<orientedReadCount; orientedReadIdValue++) {
+            const OrientedReadId orientedReadId = OrientedReadId::fromValue(orientedReadIdValue);
+            const vector<edge_descriptor>& compressedJourney = compressedJourneys[orientedReadIdValue];
+            csv << orientedReadId << ",";
+            for(const edge_descriptor e: compressedJourney) {
+                csv << assemblyGraph[e].id << ",";
+            }
+            csv << "\n";
+        }
+    }
+
+    {
+        ofstream csv("AssemblyGraphJourneys.csv");
+        csv << "OrientedReadId,Segment,Step,PositionInJourneyA,PositionInJourneyB\n";
+        for(ReadId orientedReadIdValue=0; orientedReadIdValue<orientedReadCount; orientedReadIdValue++) {
+            const OrientedReadId orientedReadId = OrientedReadId::fromValue(orientedReadIdValue);
+            const vector<AssemblyGraphJourneyEntry>& assemblyGraphJourney = assemblyGraphJourneys[orientedReadIdValue];
+            for(const AssemblyGraphJourneyEntry& entry: assemblyGraphJourney) {
+                csv << orientedReadId << ",";
+                csv << assemblyGraph[entry.e].id << ",";
+                csv << entry.stepId << ",";
+                csv << entry.positionInJourneyA << ",";
+                csv << entry.positionInJourneyB << "\n";
+            }
         }
     }
 }
@@ -963,7 +1174,7 @@ void Shasta2AssemblyGraph::writeSuperbubbleChainsForBandage(
     }
 }
 
-uint64_t Shasta2AssemblyGraph::compressLinearChains()
+uint64_t Shasta2AssemblyGraph::compress()
 {
     Shasta2AssemblyGraph& assemblyGraph = *this;
     uint64_t compressCount = 0;
@@ -1243,9 +1454,140 @@ void Shasta2AssemblyGraph::connectAssemblyPaths(
     if(debug) {
         compressDebugLevel = 1;
     }
-    compressLinearChains();
+    compress();
     if(debug) {
         compressDebugLevel = oldCompressDebugLevel;
+    }
+}
+
+
+
+// The detangling process can generate empty edges (edges without steps).
+// This removes them by collapsing the vertices they join.
+void Shasta2AssemblyGraph::removeEmptyEdges()
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+    const bool debug = false;
+
+    // We need to find groups of vertices that need to be collapsed together.
+    // Usually it will be just two vertices to be collapsed together,
+    // but it could be larger groups if there are adjacent empty edges.
+    // So we need to find the connected components generated by the empty edges.
+
+    // Map vertices to integer.
+    std::map<vertex_descriptor, uint64_t> vertexIndexMap;
+    vector<vertex_descriptor> vertexTable;
+    uint64_t vertexIndex = 0;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        vertexIndexMap.insert(make_pair(v, vertexIndex++));
+        vertexTable.push_back(v);
+    }
+
+    // Initialize the disjoint sets data structure.
+    const uint64_t n = vertexIndexMap.size();
+    // Initialize the disjoint sets data structure.
+    vector<uint64_t> rank(n);
+    vector<uint64_t> parent(n);
+    boost::disjoint_sets<uint64_t*, uint64_t*> disjointSets(&rank[0], &parent[0]);
+    for(uint64_t i=0; i<n; i++) {
+        disjointSets.make_set(i);
+    }
+
+    // Loop over the empty edges.
+    vector<edge_descriptor> edgesToBeRemoved;
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        if(assemblyGraph[e].empty()) {
+            const vertex_descriptor v0 = source(e, assemblyGraph);
+            const vertex_descriptor v1 = target(e, assemblyGraph);
+            const uint64_t i0 = vertexIndexMap[v0];
+            const uint64_t i1 = vertexIndexMap[v1];
+            disjointSets.union_set(i0, i1);
+            edgesToBeRemoved.push_back(e);
+        }
+    }
+
+    // Gather the vertices in each connected component.
+    vector< vector<uint64_t> > groups(n);
+    for(uint64_t i=0; i<n; i++) {
+        groups[disjointSets.find_set(i)].push_back(i);
+    }
+
+    // Collapse each group into a single vertex.
+    for(const vector<uint64_t>& group: groups) {
+        if(group.size() < 2) {
+            continue;
+        }
+        if(debug) {
+            cout << "Found a group of " << group.size() << " vertices to be collapsed:";
+            for(const uint64_t vertexIndex: group) {
+                const vertex_descriptor v = vertexTable[vertexIndex];
+                cout << " " << assemblyGraph[v].id << "/" << shasta2AnchorIdToString(assemblyGraph[v].anchorId);
+            }
+            cout << endl;
+        }
+
+        // Create the collapsed vertex.
+        const Shasta2AnchorId anchorId = assemblyGraph[vertexTable[group.front()]].anchorId;
+        const vertex_descriptor vNew =
+            add_vertex(Shasta2AssemblyGraphVertex(anchorId, assemblyGraph.nextVertexId++), assemblyGraph);
+
+        // For each vertex in this group, reroute all incoming/outgoing non-empty edges
+        // to/from the new vertex.
+        for(const uint64_t vertexIndex: group) {
+            const vertex_descriptor v = vertexTable[vertexIndex];
+
+            // Loop over non-empty incoming edges.
+            BGL_FORALL_INEDGES(v, eOld, assemblyGraph, Shasta2AssemblyGraph) {
+                Shasta2AssemblyGraphEdge& oldEdge = assemblyGraph[eOld];
+                if(oldEdge.empty()) {
+                    continue;
+                }
+                const vertex_descriptor u = source(eOld, assemblyGraph);
+
+                // Create the new edge, with target vNew.
+                edge_descriptor eNew;
+                tie(eNew, ignore) = add_edge(u, vNew, assemblyGraph);
+                Shasta2AssemblyGraphEdge& newEdge = assemblyGraph[eNew];
+                newEdge.id = oldEdge.id;
+                newEdge.swapSteps(oldEdge);
+
+                edgesToBeRemoved.push_back(eOld);
+            }
+
+            // Loop over non-empty outgoing edges.
+            BGL_FORALL_OUTEDGES(v, eOld, assemblyGraph, Shasta2AssemblyGraph) {
+                Shasta2AssemblyGraphEdge& oldEdge = assemblyGraph[eOld];
+                if(oldEdge.empty()) {
+                    continue;
+                }
+                const vertex_descriptor u = target(eOld, assemblyGraph);
+
+                // Create the new edge, with source vNew.
+                edge_descriptor eNew;
+                tie(eNew, ignore) = add_edge(vNew, u, assemblyGraph);
+                Shasta2AssemblyGraphEdge& newEdge = assemblyGraph[eNew];
+                newEdge.id = oldEdge.id;
+                newEdge.swapSteps(oldEdge);
+
+                edgesToBeRemoved.push_back(eOld);
+            }
+        }
+    }
+
+    deduplicate(edgesToBeRemoved);
+    for(const edge_descriptor e: edgesToBeRemoved) {
+        boost::remove_edge(e, assemblyGraph);
+    }
+
+    // Remove any vertices that were left isolated.
+    vector<vertex_descriptor> verticesToBeRemoved;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        if((in_degree(v, assemblyGraph) == 0) and (out_degree(v, assemblyGraph) == 0)) {
+            verticesToBeRemoved.push_back(v);
+        }
+    }
+    for(const vertex_descriptor v: verticesToBeRemoved) {
+        boost::remove_vertex(v, assemblyGraph);
     }
 }
 

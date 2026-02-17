@@ -1,11 +1,19 @@
+// Shasta.
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2Anchors.hpp"
-#include "Shasta2Journeys.hpp"
-#include "MultithreadedObject.tpp"
 #include "Shasta2AnchorPair.hpp"
-#include "DINARA_ASSERT.hpp"
+#include "orderPairs.hpp"
+#include "performanceLog.hpp"
+#include "ReadId.hpp"
 #include "timestamp.hpp"
-#include "invalid.hpp"
+using namespace dinara;
+
+namespace {
+string anchorIdToString(Shasta2AnchorId anchorId)
+{
+    return shasta2AnchorIdToString(anchorId);
+}
+}
 
 // Boost libraries.
 #include <boost/archive/binary_oarchive.hpp>
@@ -19,32 +27,30 @@
 #include <boost/serialization/vector.hpp>
 
 // Standard library.
-#include <fstream>
+#include "fstream.hpp"
 #include <queue>
-#include <tuple>
-#include <sstream>
-
-using namespace std;
-using namespace dinara;
+#include "tuple.hpp"
 
 // Explicit instantiation.
-// #include "MultithreadedObject.tpp" // Dinara might not have this template file exposed easily. 
-// Assuming MultithreadedObject is header-only or already instantiated for relevant types.
-// If linker errors occur, we might need to verify MultithreadedObject usage. 
-// For now, assume it works as inherited.
+#include "MultithreadedObject.tpp"
+namespace dinara {
+    template class MultithreadedObject<Shasta2AnchorGraph>;
+}
 
-// Construct the AnchorGraph from the Journeys (inside Anchors).
+
+
+// Construct the Shasta2AnchorGraph from the Shasta2Journeys.
 // Only include edges with at least the specified minCoverage.
 Shasta2AnchorGraph::Shasta2AnchorGraph(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
     uint64_t minEdgeCoverage) :
-    MappedMemoryOwner(anchors), 
+    MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
     Shasta2AnchorGraph& anchorGraph = *this;
 
-    // Create the vertices, one for each Shasta2AnchorId.
+    // Create the vertices, one for each AnchorId.
     // In the AnchorGraph, vertex_descriptors are AnchorIds.
     const uint64_t anchorCount = anchors.size();
     for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; anchorId++) {
@@ -55,8 +61,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     nextEdgeId = 0;
     vector<Shasta2AnchorPair> anchorPairs;
     for(Shasta2AnchorId anchorIdA=0; anchorIdA<anchorCount; anchorIdA++) {
-        // Shasta2AnchorPair::createChildren uses anchors.findChildren internally
-        // Now passing journeys.
         Shasta2AnchorPair::createChildren(anchors, journeys, anchorIdA, 0, anchorPairs);
         for(const Shasta2AnchorPair& anchorPair: anchorPairs) {
             if(anchorPair.size() >= minEdgeCoverage) {
@@ -221,8 +225,7 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
     const vertex_descriptor v0 = source(e, anchorGraph);
     const vertex_descriptor v1 = target(e, anchorGraph);
 
-    // Debugging logic removed or simplified
-    const bool debug = false; 
+    const bool debug = ((anchorIdToString(v0) == "45549+") and (anchorIdToString(v1) == "78505-"));
 
     // Do a forward BFS starting at v0, using edges
     // still marked as "use for assembly"
@@ -291,41 +294,4 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
             " not flagged by transitive reduction." << endl;
     }
     return false;
-}
-
-void Shasta2AnchorGraph::writeGfa(const string& fileName) const
-{
-    ofstream gfa(fileName);
-    if (!gfa) {
-        throw runtime_error("Cannot open " + fileName + " for writing.");
-    }
-    gfa << "H\tVN:Z:1.0\n";
-
-    // Write vertices (Anchors)
-    BGL_FORALL_VERTICES(v, *this, Shasta2AnchorGraph) {
-         // Use '*' for sequence, assign length = 1 as placeholder
-         gfa << "S\t" << v << "\t*\tLN:i:1\n";
-    }
-
-    // Write edges
-    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
-        const auto& edge = (*this)[e];
-        if(!edge.useForAssembly) {
-            continue;
-        }
-
-        // Determine orientation from the first supporting read.
-        string sourceOrientation = "+";
-        string targetOrientation = "+";
-        
-        if (!edge.anchorPair.orientedReadIds.empty()) {
-            if (edge.anchorPair.orientedReadIds[0].getStrand() == 1) {
-                sourceOrientation = "-";
-                targetOrientation = "-";
-            }
-        }
-        
-        gfa << "L\t" << source(e, *this) << "\t" << sourceOrientation << "\t" 
-            << target(e, *this) << "\t" << targetOrientation << "\t0M\n";
-    }
 }

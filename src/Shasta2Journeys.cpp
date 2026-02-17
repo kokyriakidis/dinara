@@ -1,17 +1,24 @@
 #include "Shasta2Journeys.hpp"
 #include "Shasta2Anchors.hpp"
-#include "DINARA_ASSERT.hpp"
 #include "orderPairs.hpp"
-#include "MultithreadedObject.tpp"
+#include "performanceLog.hpp"
+#include "ReadId.hpp"
 #include "Reads.hpp"
-
-#include <algorithm>
-#include <iostream>
-#include <vector>
-
+#include "timestamp.hpp"
 using namespace dinara;
-using namespace std;
 
+// Explicit instantiation.
+#include "MultithreadedObject.tpp"
+namespace dinara {
+    template class MultithreadedObject<Shasta2Journeys>;
+}
+
+
+
+// Initial creation.
+// This sets the positionInJourney for every AnchorMarkerInfo
+// stored in the Anchors, and for this reason the Anchors
+// are not passed in as const.
 Shasta2Journeys::Shasta2Journeys(
     uint64_t orientedReadCount,
     shared_ptr<Shasta2Anchors> anchorsPointer,
@@ -20,163 +27,154 @@ Shasta2Journeys::Shasta2Journeys(
     MultithreadedObject<Shasta2Journeys>(*this),
     MappedMemoryOwner(mappedMemoryOwner),
     anchorsPointer(anchorsPointer)
+
 {
-    // Pass 1: count occurrences to determine sizes for temporary storage.
-    // Use journeysWithOrdinals to store (Shasta2AnchorId, ordinal) for each oriented read.
-    // We need to size it properly.
-    // VectorOfVectors needs 2 passes: 1 to count, 2 to fill.
-    // journeysWithOrdinals is VectorOfVectors<pair<uint64_t, uint32_t>, uint64_t>
-    
-    journeysWithOrdinals.createNew(
-        largeDataName("Shasta2Journeys-WithOrdinals"), 
-        largeDataPageSize);
-        
-    // Pass 1: count how many anchors each oriented read visits.
-    journeysWithOrdinals.beginPass1(orientedReadCount);
-    
+    performanceLog << timestamp << "Journeys creation begins." << endl;
+
+    // Adjust the numbers of threads, if necessary.
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
     const uint64_t anchorCount = anchorsPointer->size();
-    const uint64_t batchSize = 1000;
-    
-    setupLoadBalancing(anchorCount, batchSize);
+    const uint64_t anchorBatchCount = 1000;
+    const uint64_t orientedReadBatchCount = 1000;
+
+    // Pass1: make space for the journeysWithOrdinals.
+    journeysWithOrdinals.createNew(largeDataName("tmp-JourneysWithOrdinals"), largeDataPageSize);
+    journeysWithOrdinals.beginPass1(orientedReadCount);
+    setupLoadBalancing(anchorCount, anchorBatchCount);
     runThreads(&Shasta2Journeys::threadFunction1, threadCount);
-    
-    // Pass 2: store (Shasta2AnchorId, ordinal)
+
+    // Pass2: store the unsorted journeysWithOrdinals.
     journeysWithOrdinals.beginPass2();
-    setupLoadBalancing(anchorCount, batchSize);
+    setupLoadBalancing(anchorCount, anchorBatchCount);
     runThreads(&Shasta2Journeys::threadFunction2, threadCount);
     journeysWithOrdinals.endPass2();
-    
-    // Pass 3: Sort each vector in journeysWithOrdinals and size 'journeys'.
-    journeys.createNew(
-        largeDataName("Shasta2Journeys-Journeys"),
-        largeDataPageSize);
-        
+
+    // Pass 3:sort the journeysWithOrdinals and make space for the journeys
+    journeys.createNew(largeDataName("Journeys"), largeDataPageSize);
     journeys.beginPass1(orientedReadCount);
-    setupLoadBalancing(orientedReadCount, batchSize);
-    runThreads(&Shasta2Journeys::threadFunction3, threadCount); // This sorts and counts for next stage.
-    
-    // Pass 4: Copy sorted AnchorIds to 'journeys' and update Anchors.
+    setupLoadBalancing(orientedReadCount, orientedReadBatchCount);
+    runThreads(&Shasta2Journeys::threadFunction3, threadCount);
+
+    // Pass 4: copy the sorted journeysWithOrdinals to the journeys.
     journeys.beginPass2();
-    setupLoadBalancing(orientedReadCount, batchSize); 
+    setupLoadBalancing(orientedReadCount, orientedReadBatchCount);
     runThreads(&Shasta2Journeys::threadFunction4, threadCount);
-    journeys.endPass2(false, true); // (optimize, hugepages)
-    
+    journeys.endPass2(false, true);
+
     journeysWithOrdinals.remove();
+
+    performanceLog << timestamp << "Journeys creation ends." << endl;
 }
 
-Shasta2Journeys::Shasta2Journeys(const MappedMemoryOwner& mappedMemoryOwner) :
-    MultithreadedObject<Shasta2Journeys>(*this),
-    MappedMemoryOwner(mappedMemoryOwner)
+
+
+void Shasta2Journeys::threadFunction1(uint64_t /* threadId */)
 {
-    journeys.accessExistingReadOnly(largeDataName("Shasta2Journeys-Journeys"));
-}
-
-
-void Shasta2Journeys::threadFunction1(uint64_t threadId) {
     threadFunction12(1);
 }
 
-void Shasta2Journeys::threadFunction2(uint64_t threadId) {
+
+
+void Shasta2Journeys::threadFunction2(uint64_t /* threadId */)
+{
     threadFunction12(2);
 }
 
-void Shasta2Journeys::threadFunction12(uint64_t pass) {
-    Shasta2Anchors& anchors = *anchorsPointer; // non-const access? 
-    // Actually we only read from anchors here.
-    
+
+
+void Shasta2Journeys::threadFunction12(uint64_t pass)
+{
+    const Shasta2Anchors& anchors = *anchorsPointer;
+
+    // Loop over all batches assigned to this thread.
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
+
+        // Loop over all AnchorIds in this batch.
         for(Shasta2AnchorId anchorId=begin; anchorId!=end; anchorId++) {
-            // Iterate over markers in this anchor.
-            // Accessing anchors[anchorId] gives Shasta2Anchor which is span<const Shasta2AnchorMarkerInfo>.
-            // We need to know orientedReadId and ordinal.
-            
-            const auto anchor = anchors[anchorId];
-            for(const auto& info : anchor) {
-                uint64_t orientedReadIdValue = info.orientedReadId.getValue();
-                
+            Shasta2Anchor anchor = anchors[anchorId];
+
+            // Loop over the marker intervals of this Anchor.
+            for(const auto& anchorMarkerInterval: anchor) {
+                const auto orientedReadIdValue = anchorMarkerInterval.orientedReadId.getValue();
+
                 if(pass == 1) {
                     journeysWithOrdinals.incrementCountMultithreaded(orientedReadIdValue);
                 } else {
                     journeysWithOrdinals.storeMultithreaded(
-                        orientedReadIdValue, 
-                        make_pair(uint64_t(anchorId), info.ordinal));
+                        orientedReadIdValue, {anchorId, anchorMarkerInterval.ordinal});
                 }
             }
         }
     }
 }
 
-void Shasta2Journeys::threadFunction3(uint64_t threadId) {
+
+
+void Shasta2Journeys::threadFunction3(uint64_t /* threadId */)
+{
+    // Loop over all batches assigned to this thread.
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
-        for(uint64_t orVal=begin; orVal!=end; orVal++) {
-            // Sort the vector for this oriented read.
-            // journeysWithOrdinals gives access to a mutable span?
-            // VectorOfVectors::operator[] returns span.
-            // But we need to toggle write access? it is open for write/modify?
-            // "journeysWithOrdinals" is just created.
-            // Wait, VectorOfVectors only gives const span via operator[] usually?
-            // Need to check if we can modify elements in place.
-            // Shasta2 uses `auto v = journeysWithOrdinals[orientedReadValue];` and calls `sort`.
-            // So `operator[]` returns a span that allows modification if the underlying data is mutable.
-            // Since we created it, it should be mutable.
-            
-            auto v = journeysWithOrdinals[orVal];
-            
-            // Sort by ordinal (second element of pair).
-            // Using lambda if orderPairs.hpp not usable directly or different types to Shasta2.
-            std::sort(v.begin(), v.end(), [](const pair<uint64_t, uint32_t>& a, const pair<uint64_t, uint32_t>& b) {
-                return a.second < b.second;
-            });
-            
-            // Count for journeys (size matches).
-            journeys.incrementCountMultithreaded(orVal, v.size());
+
+        // Loop over all oriented reads assigned to this thread.
+        for(uint64_t orientedReadValue=begin; orientedReadValue!=end; orientedReadValue++) {
+            auto v = journeysWithOrdinals[orientedReadValue];
+            sort(v.begin(), v.end(), OrderPairsBySecondOnly<uint64_t, uint32_t>());
+            journeys.incrementCountMultithreaded(orientedReadValue, v.size());
         }
     }
 }
 
-void Shasta2Journeys::threadFunction4(uint64_t threadId) {
+
+
+void Shasta2Journeys::threadFunction4(uint64_t /* threadId */)
+{
     Shasta2Anchors& anchors = *anchorsPointer;
-    
+
+    // Loop over all batches assigned to this thread.
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
-        for(uint64_t orVal=begin; orVal!=end; orVal++) {
-            const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(orVal));
-            
-            const auto src = journeysWithOrdinals[orVal]; // sorted
-            auto dest = journeys[orVal]; // span for writing (journeys is in pass 2)
-            
-            // Copy AnchorIds (first of pair) to dest.
-            for(size_t i=0; i<src.size(); i++) {
-                dest[i] = Shasta2AnchorId(src[i].first); // Cast to Shasta2AnchorId
+
+        // Loop over all oriented reads assigned to this thread.
+        for(uint64_t orientedReadValue=begin; orientedReadValue!=end; orientedReadValue++) {
+            const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(orientedReadValue));
+
+            // Copy the journeysWithOrdinals to the journeys.
+            const auto v = journeysWithOrdinals[orientedReadValue];
+            const auto journey = journeys[orientedReadValue];
+            DINARA_ASSERT(journey.size() == v.size());
+            for(uint64_t i=0; i<v.size(); i++) {
+                journey[i] = v[i].first;
             }
-            
-            // Update positionInJourney in Anchors.
-            // We iterate through the journey we just built.
-            for(size_t position=0; position<dest.size(); position++) {
-                Shasta2AnchorId anchorId = dest[position];
-                
-                // We need to modify the Shasta2AnchorMarkerInfo in anchors.
-                // anchors[anchorId] returns Shasta2Anchor (const span).
-                // We need mutable access to anchors.anchorMarkerInfos[anchorId].
-                // anchors.anchorMarkerInfos is accessible (public in Shasta2Anchors).
-                
-                auto markerInfos = anchors.anchorMarkerInfos[anchorId]; // returns mutable span? 
-                // Checks MemoryMappedVectorOfVectors.hpp for non-const operator[].
-                // Assuming yes.
-                
+
+            // Store journey information for this oriented read in the marker interval.
+            for(uint64_t position=0; position<journey.size(); position++) {
+                const Shasta2AnchorId anchorId = journey[position];
+                span<Shasta2AnchorMarkerInfo> markerInfos = anchors.anchorMarkerInfos[anchorId];
                 bool found = false;
-                for(auto& markerInfo : markerInfos) {
+                for(Shasta2AnchorMarkerInfo& markerInfo: markerInfos) {
                     if(markerInfo.orientedReadId == orientedReadId) {
                         markerInfo.positionInJourney = uint32_t(position);
                         found = true;
                         break;
                     }
                 }
-                // Assert found?
                 DINARA_ASSERT(found);
             }
         }
     }
+}
+
+
+
+// Access from binary data.
+Shasta2Journeys::Shasta2Journeys(const MappedMemoryOwner& mappedMemoryOwner) :
+    MultithreadedObject<Shasta2Journeys>(*this),
+    MappedMemoryOwner(mappedMemoryOwner)
+{
+    journeys.accessExistingReadOnly(largeDataName("Journeys"));
 }
