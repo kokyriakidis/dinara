@@ -118,25 +118,14 @@ void Shasta2Anchors::constructThreadFunctionPass1(uint64_t threadId)
             
             orientedReadIds.clear();
 
-            // Markers on Strand 0 come from this vertex.
+            // This anchor corresponds exactly to the MarkerGraph vertex.
+            // Do not mix in the reverse complement vertex.
             for(const MarkerId markerId : markerGraph.getVertexMarkerIds(vertexId)) {
-                OrientedReadId sourceOrientedReadId;
-                uint32_t sourceOrdinal;
-                tie(sourceOrientedReadId, sourceOrdinal) = findMarkerId(markerId, markers);
-                (void)sourceOrdinal;
-                orientedReadIds.push_back(OrientedReadId(sourceOrientedReadId.getReadId(), 0));
-            }
-            
-            // Markers on Strand 1 come from the reverse complement vertex.
-            const MarkerGraph::VertexId rcVertexId = markerGraph.reverseComplementVertex[vertexId];
-            if(rcVertexId != MarkerGraph::invalidVertexId) {
-                for(const MarkerId markerId : markerGraph.getVertexMarkerIds(rcVertexId)) {
-                    OrientedReadId sourceOrientedReadId;
-                    uint32_t sourceOrdinal;
-                    tie(sourceOrientedReadId, sourceOrdinal) = findMarkerId(markerId, markers);
-                    (void)sourceOrdinal;
-                    orientedReadIds.push_back(OrientedReadId(sourceOrientedReadId.getReadId(), 1));
-                }
+                OrientedReadId orientedReadId;
+                uint32_t ordinal;
+                tie(orientedReadId, ordinal) = findMarkerId(markerId, markers);
+                (void)ordinal;
+                orientedReadIds.push_back(orientedReadId);
             }
 
             // Deduplicate orientedReadIds to get unique count.
@@ -161,37 +150,13 @@ void Shasta2Anchors::constructThreadFunctionPass2(uint64_t threadId)
             
             buffer.clear();
             
-            // 1. Add markers from this vertex (Strand 0).
+            // Add markers from this vertex only.
+            // Keep the OrientedReadId and ordinal exactly as stored in markers.
             for(const MarkerId markerId : markerGraph.getVertexMarkerIds(vertexId)) {
-                OrientedReadId sourceOrientedReadId;
-                uint32_t sourceOrdinal;
-                tie(sourceOrientedReadId, sourceOrdinal) = findMarkerId(markerId, markers);
-                const ReadId readId = sourceOrientedReadId.getReadId();
-                const uint64_t readMarkerCount = markers.size(OrientedReadId(readId, 0).getValue());
-                const uint32_t ordinal =
-                    (sourceOrientedReadId.getStrand() == 0) ?
-                    sourceOrdinal :
-                    uint32_t(readMarkerCount - 1 - sourceOrdinal);
-                
-                buffer.emplace_back(OrientedReadId(readId, 0), ordinal);
-            }
-            
-            // 2. Add markers from RC vertex (Strand 1).
-            const MarkerGraph::VertexId rcVertexId = markerGraph.reverseComplementVertex[vertexId];
-            if(rcVertexId != MarkerGraph::invalidVertexId) {
-                for(const MarkerId markerId : markerGraph.getVertexMarkerIds(rcVertexId)) {
-                    OrientedReadId sourceOrientedReadId;
-                    uint32_t sourceOrdinal;
-                    tie(sourceOrientedReadId, sourceOrdinal) = findMarkerId(markerId, markers);
-                    const ReadId readId = sourceOrientedReadId.getReadId();
-                    const uint64_t readMarkerCount = markers.size(OrientedReadId(readId, 0).getValue());
-                    const uint32_t ordinal1 =
-                        (sourceOrientedReadId.getStrand() == 1) ?
-                        sourceOrdinal :
-                        uint32_t(readMarkerCount - 1 - sourceOrdinal);
-                    
-                    buffer.emplace_back(OrientedReadId(readId, 1), ordinal1);
-                }
+                OrientedReadId orientedReadId;
+                uint32_t ordinal;
+                tie(orientedReadId, ordinal) = findMarkerId(markerId, markers);
+                buffer.emplace_back(orientedReadId, ordinal);
             }
             
             // Sort by OrientedReadId to ensure canonical order for the Anchor.

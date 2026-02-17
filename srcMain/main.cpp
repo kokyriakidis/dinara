@@ -1574,7 +1574,7 @@ void dinara::main::assemble(
     Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
     shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
     shasta2AssemblyGraphOptions.threadCount = threadCount;
-    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = false;
+    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
     assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
         *shasta2Anchors,
         *shasta2Journeys,

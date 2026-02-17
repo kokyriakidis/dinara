@@ -113,7 +113,7 @@ class dinara::Shasta2AssemblyGraphOptions {
 public:
     uint64_t simplifyMaxIterationCount = 3;
     uint64_t threadCount = 1;
-    bool writeIntermediateAssemblyStages = false;
+    bool writeIntermediateAssemblyStages = true;
     uint64_t bubbleCleanupMaxBubbleLength = 10000;
     uint64_t bubbleCleanupMinCommonCount = 6;
     uint64_t phasingDistance = 12;
