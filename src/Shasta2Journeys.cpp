@@ -41,7 +41,7 @@ Shasta2Journeys::Shasta2Journeys(
     const uint64_t orientedReadBatchCount = 1000;
 
     // Pass1: make space for the journeysWithOrdinals.
-    journeysWithOrdinals.createNew(largeDataName("tmp-JourneysWithOrdinals"), largeDataPageSize);
+    journeysWithOrdinals.createNew(largeDataName("tmp-Shasta2JourneysWithOrdinals"), largeDataPageSize);
     journeysWithOrdinals.beginPass1(orientedReadCount);
     setupLoadBalancing(anchorCount, anchorBatchCount);
     runThreads(&Shasta2Journeys::threadFunction1, threadCount);
@@ -53,7 +53,7 @@ Shasta2Journeys::Shasta2Journeys(
     journeysWithOrdinals.endPass2();
 
     // Pass 3:sort the journeysWithOrdinals and make space for the journeys
-    journeys.createNew(largeDataName("Journeys"), largeDataPageSize);
+    journeys.createNew(largeDataName("Shasta2Journeys"), largeDataPageSize);
     journeys.beginPass1(orientedReadCount);
     setupLoadBalancing(orientedReadCount, orientedReadBatchCount);
     runThreads(&Shasta2Journeys::threadFunction3, threadCount);
@@ -176,5 +176,5 @@ Shasta2Journeys::Shasta2Journeys(const MappedMemoryOwner& mappedMemoryOwner) :
     MultithreadedObject<Shasta2Journeys>(*this),
     MappedMemoryOwner(mappedMemoryOwner)
 {
-    journeys.accessExistingReadOnly(largeDataName("Journeys"));
+    journeys.accessExistingReadOnly(largeDataName("Shasta2Journeys"));
 }
