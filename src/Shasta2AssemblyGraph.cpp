@@ -5,7 +5,7 @@
 #include "Shasta2AreSimilarSequences.hpp"
 #include "Shasta2RestrictedAnchorGraph.hpp"
 #include "Shasta2DisjointSets.hpp"
-#include "Shasta2LocalAssembly3.hpp"
+#include "Shasta2LocalAssembly4.hpp"
 #include "Shasta2Superbubble.hpp"
 #include "Shasta2SuperbubbleChain.hpp"
 #include "Shasta2TangleMatrix1.hpp"
@@ -184,6 +184,30 @@ uint64_t Shasta2AssemblyGraphEdge::sequenceLength() const
 uint64_t Shasta2AssemblyGraphEdge::length() const
 {
     return wasAssembled ? sequenceLength() : offset();
+}
+
+double Shasta2AssemblyGraphEdge::averageCoverage() const
+{
+    uint64_t sum = 0;
+    for(const Shasta2AssemblyGraphEdgeStep& step: *this) {
+        sum += step.anchorPair.orientedReadIds.size();
+    }
+
+    return double(sum) / double(size());
+}
+
+double Shasta2AssemblyGraphEdge::lengthWeightedAverageCoverage() const
+{
+    uint64_t sum0 = 0;
+    uint64_t sum1 = 0;
+    for(const Shasta2AssemblyGraphEdgeStep& step: *this) {
+        const uint64_t length = wasAssembled ? step.sequence.size() : step.offset;
+        const uint64_t coverage = step.anchorPair.orientedReadIds.size();
+        sum0 += length;
+        sum1 += length * coverage;
+    }
+
+    return double(sum1) / double(sum0);
 }
 
 double Shasta2AssemblyGraphEdgeAverageCoverage(const Shasta2AssemblyGraphEdge& edge)
@@ -1786,7 +1810,7 @@ void Shasta2AssemblyGraph::assembleStep(edge_descriptor e, uint64_t i)
     deduplicate(additionalOrientedReadIds);
 
     ostream html(0);
-    Shasta2LocalAssembly3 localAssembly(
+    Shasta2LocalAssembly4 localAssembly(
         *anchorsPointer,
         options.abpoaMaxLength,
         html,

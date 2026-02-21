@@ -280,6 +280,19 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Anchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorPair);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorPair2);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Journey);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2LocalAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2LocalReadAnchorGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2LocalReadGraph);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Segments);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SegmentSequence);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SegmentSteps);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SegmentStepSupport);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SegmentStep);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2TangleMatrix);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SegmentPair);
+    DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2SimilarSequences);
 
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
@@ -643,6 +656,22 @@ void Assembler::writeNavigation(ostream& html) const
         writeNavigation(html, "Shasta2 Anchors", {
             {"Anchor", "exploreShasta2Anchor"},
             {"Anchor Pair", "exploreShasta2AnchorPair"},
+            {"Anchor Pair 2", "exploreShasta2AnchorPair2"},
+            {"Journey", "exploreShasta2Journey"},
+            {"Local anchor graph", "exploreShasta2LocalAnchorGraph"},
+            {"Local read-anchor graph", "exploreShasta2LocalReadAnchorGraph"},
+            {"Local read graph", "exploreShasta2LocalReadGraph"},
+            });
+
+        writeNavigation(html, "Shasta2 Assembly", {
+            {"Segments", "exploreShasta2Segments"},
+            {"Segment sequence", "exploreShasta2SegmentSequence"},
+            {"Segment steps", "exploreShasta2SegmentSteps"},
+            {"Step support", "exploreShasta2SegmentStepSupport"},
+            {"Step local assembly", "exploreShasta2SegmentStep"},
+            {"Tangle matrix", "exploreShasta2TangleMatrix"},
+            {"Segment pair", "exploreShasta2SegmentPair"},
+            {"Similar sequences", "exploreShasta2SimilarSequences"},
             });
 
 #if DINARA_ENABLE_VARIANT_CLUSTERING

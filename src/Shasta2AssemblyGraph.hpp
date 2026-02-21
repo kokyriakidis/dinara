@@ -87,6 +87,8 @@ public:
     uint64_t sequenceLength() const;
     void getSequence(vector<Base>&) const;
     uint64_t length() const;
+    double averageCoverage() const;
+    double lengthWeightedAverageCoverage() const;
     void swapSteps(Shasta2AssemblyGraphEdge& that)
     {
         vector<Shasta2AssemblyGraphEdgeStep>::swap(that);

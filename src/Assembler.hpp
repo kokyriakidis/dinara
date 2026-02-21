@@ -90,6 +90,8 @@ namespace dinara {
     class Shasta2Journeys;
     class Shasta2AnchorGraph;
     class Shasta2AssemblyGraph;
+    class Shasta2AssemblyGraphOptions;
+    class Shasta2AssemblyGraphPostprocessor;
 
     // VariantPositionContext is defined in mode3-Anchor.hpp
 
@@ -3546,6 +3548,7 @@ public:
     std::shared_ptr<Shasta2Journeys> shasta2Journeys;
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
     std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
+    std::map<string, std::shared_ptr<Shasta2AssemblyGraphPostprocessor> > shasta2AssemblyGraphTable;
 
     // Use a separate mapped-memory prefix for Shasta2 objects so we can
     // keep upstream shasta2 object names ("Journeys", "AnchorGraph", ...)
@@ -3562,6 +3565,24 @@ public:
     void exploreShasta2AnchorGraph(const vector<string>& request, ostream& html);
     void exploreShasta2Anchor(const vector<string>& request, ostream& html);
     void exploreShasta2AnchorPair(const vector<string>& request, ostream& html);
+    void exploreShasta2AnchorPair2(const vector<string>& request, ostream& html);
+    void exploreShasta2Journey(const vector<string>& request, ostream& html);
+    void exploreShasta2LocalAnchorGraph(const vector<string>& request, ostream& html);
+    void exploreShasta2LocalReadAnchorGraph(const vector<string>& request, ostream& html);
+    void exploreShasta2LocalReadGraph(const vector<string>& request, ostream& html);
+
+    void exploreShasta2Segments(const vector<string>& request, ostream& html);
+    void exploreShasta2SegmentSequence(const vector<string>& request, ostream& html);
+    void exploreShasta2SegmentSteps(const vector<string>& request, ostream& html);
+    void exploreShasta2SegmentStepSupport(const vector<string>& request, ostream& html);
+    void exploreShasta2SegmentStep(const vector<string>& request, ostream& html);
+    void exploreShasta2TangleMatrix(const vector<string>& request, ostream& html);
+    void exploreShasta2SegmentPair(const vector<string>& request, ostream& html);
+    void exploreShasta2SimilarSequences(const vector<string>& request, ostream& html);
+
+    Shasta2AssemblyGraphPostprocessor& getShasta2AssemblyGraph(
+        const string& assemblyStage,
+        const Shasta2AssemblyGraphOptions&);
 
     // Global AnchorGraph (created for all anchors, not per-component).
     shared_ptr<mode3::AnchorGraph> anchorGraph;

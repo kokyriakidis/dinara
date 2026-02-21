@@ -270,7 +270,7 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
             const vertex_descriptor vB = target(eAB, anchorGraph);
             if(vB == v1) {
                 if(debug) {
-                    cout << "Edge " << shasta2AnchorIdToString(v0) << " " << shasta2AnchorIdToString(v1) <<
+                    cout << "Edge " << anchorIdToString(v0) << " " << anchorIdToString(v1) <<
                         " flagged by transitive reduction." << endl;
                 }
                 return true;
@@ -290,7 +290,7 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
 
     // If getting here we did not encounter v1 in the BFS loop.
     if(debug) {
-        cout << "Edge " << shasta2AnchorIdToString(v0) << " " << shasta2AnchorIdToString(v1) <<
+        cout << "Edge " << anchorIdToString(v0) << " " << anchorIdToString(v1) <<
             " not flagged by transitive reduction." << endl;
     }
     return false;

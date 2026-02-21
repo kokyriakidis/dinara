@@ -24,6 +24,33 @@ namespace {
     }
 }
 
+string dinara::shasta2AnchorIdToString(Shasta2AnchorId anchorId)
+{
+    return std::to_string(anchorId);
+}
+
+dinara::Shasta2AnchorId dinara::shasta2AnchorIdFromString(const string& s)
+{
+    if(s.empty()) {
+        return invalid<Shasta2AnchorId>;
+    }
+
+    string t = s;
+    if(t.back() == '+' || t.back() == '-') {
+        t.pop_back();
+    }
+    try {
+        size_t used = 0;
+        const uint64_t x = std::stoull(t, &used);
+        if(used != t.size()) {
+            return invalid<Shasta2AnchorId>;
+        }
+        return Shasta2AnchorId(x);
+    } catch(...) {
+        return invalid<Shasta2AnchorId>;
+    }
+}
+
 
 Shasta2Anchors::Shasta2Anchors(
     const MappedMemoryOwner& mappedMemoryOwner,
