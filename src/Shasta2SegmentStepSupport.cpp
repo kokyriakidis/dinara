@@ -149,6 +149,48 @@ void Shasta2SegmentStepSupport::keepFirst(vector<Shasta2SegmentStepSupport>& v)
     v.resize(out - v.begin());
 }
 
+void Shasta2SegmentStepSupport::writeHtml(
+    ostream& html,
+    const Shasta2AssemblyGraph& assemblyGraph,
+    const vector<Shasta2SegmentStepSupport>& v)
+{
+    html <<
+        "<table>"
+        "<tr>"
+        "<th>Oriented<br>read id"
+        "<th>Step"
+        "<th>Journey<br>position A"
+        "<th>Ordinal A"
+        "<th>Position A"
+        "<th>Journey<br>position B"
+        "<th>Ordinal B"
+        "<th>Position B"
+        "<th>Journey<br>offset"
+        "<th>Ordinal<br>offset"
+        "<th>Position<br>offset"
+        "<th>Read length";
+
+    for(const Shasta2SegmentStepSupport& s: v) {
+        const uint32_t readLength = uint32_t(
+            assemblyGraph.getAnchorsPointer()->reads.getRead(s.orientedReadId.getReadId()).baseCount);
+        html <<
+            "<tr>"
+            "<td class=centered>" << s.orientedReadId <<
+            "<td class=centered>" << s.stepId <<
+            "<td class=centered>" << s.positionInJourneyA <<
+            "<td class=centered>" << s.ordinalA <<
+            "<td class=centered>" << s.positionA <<
+            "<td class=centered>" << s.positionInJourneyB <<
+            "<td class=centered>" << s.ordinalB <<
+            "<td class=centered>" << s.positionB <<
+            "<td class=centered>" << s.positionInJourneyOffset() <<
+            "<td class=centered>" << s.ordinalOffset() <<
+            "<td class=centered>" << s.positionOffset() <<
+            "<td class=centered>" << readLength;
+    }
+    html << "</table>";
+}
+
 Shasta2SegmentPairInformation Shasta2SegmentStepSupport::analyzeSegmentPair(
     ostream& html,
     const Shasta2AssemblyGraph& assemblyGraph,

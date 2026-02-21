@@ -30,6 +30,7 @@ namespace dinara {
 
     using Shasta2AnchorBaseClass = span<const Shasta2AnchorMarkerInfo>;
     string shasta2AnchorIdToString(Shasta2AnchorId);
+    Shasta2AnchorId shasta2AnchorIdFromString(const string&);
 }
 
 

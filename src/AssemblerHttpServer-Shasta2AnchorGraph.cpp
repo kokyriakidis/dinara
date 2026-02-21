@@ -78,6 +78,7 @@ void Assembler::exploreShasta2AnchorGraph(const vector<string>& request, ostream
 // Shasta2 Anchor Details
 // ============================================================================
 
+#if 0
 void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& html)
 {
     try {
@@ -203,6 +204,7 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
     html << "</table>";
 
 }
+#endif
 
 
 // ============================================================================

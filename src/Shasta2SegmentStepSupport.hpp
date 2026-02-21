@@ -80,6 +80,12 @@ public:
     static void keepLast(vector<Shasta2SegmentStepSupport>&);
     static void keepFirst(vector<Shasta2SegmentStepSupport>&);
 
+    // Output a vector of Shasta2SegmentStepSupport to a html table.
+    static void writeHtml(
+        ostream& html,
+        const Shasta2AssemblyGraph&,
+        const vector<Shasta2SegmentStepSupport>&);
+
     static Shasta2SegmentPairInformation analyzeSegmentPair(
         ostream& html,
         const Shasta2AssemblyGraph&,
