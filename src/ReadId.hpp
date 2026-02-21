@@ -148,6 +148,10 @@ public:
     {
         return value > that.value;
     }
+    bool operator>=(const OrientedReadId& that) const
+    {
+        return value >= that.value;
+    }
 
     using Int = ReadId;
 

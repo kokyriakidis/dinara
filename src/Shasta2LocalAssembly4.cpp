@@ -1,6 +1,7 @@
 // Dinara.
 #include "Shasta2LocalAssembly4.hpp"
 #include "Shasta2Anchors.hpp"
+#include "Shasta2AnchorPair.hpp"
 #include "Shasta2LocalAssembly5.hpp"
 #include "Marker.hpp"
 #include "Shasta2PoastaWrapper.hpp"
@@ -97,8 +98,8 @@ void Shasta2LocalAssembly4::fillMarkerInfos()
     const Kmer rightKmer = anchors.anchorKmer(rightAnchorId);
 
     // Get the MarkerInfos.
-    anchors.markerKmers.get(leftKmer, leftMarkerInfos);
-    anchors.markerKmers.get(rightKmer, rightMarkerInfos);
+    anchors.getMarkerKmers()->get(leftKmer, leftMarkerInfos);
+    anchors.getMarkerKmers()->get(rightKmer, rightMarkerInfos);
 }
 
 
