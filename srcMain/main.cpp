@@ -1483,6 +1483,10 @@ void dinara::main::assemble(
     // This reduces unreliable anchors and artifacts in repetitive regions.
     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
 
+    // Filter marker graph vertices whose marker k-mers have low sequence complexity
+    // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
+    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+
     // Find the reverse complement of each marker graph vertex.
     // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
@@ -1521,7 +1525,7 @@ void dinara::main::assemble(
     // // const uint64_t minPrimaryCoverage = 2;
     // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
     const uint64_t minPrimaryCoverage = 4;
-    const uint64_t maxPrimaryCoverage = 60;
+    const uint64_t maxPrimaryCoverage = 40;
     cout << "Using Shasta-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
 
