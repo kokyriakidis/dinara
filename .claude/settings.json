@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"MISSING\" grep -l \"MarkerInfo\" /home/kokyriakidis/Downloads/dinara/src/*.hpp)",
+      "Bash(head -10 grep -l \"MarkerInfo\" /home/kokyriakidis/Downloads/shasta2/src/*.hpp)",
+      "Bash(/home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly4.hpp:*)",
+      "Bash(/home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly5.hpp:*)",
+      "Read(//tmp/**)",
+      "Bash(for f in /home/kokyriakidis/Downloads/dinara/src/findReachableVertices.hpp /home/kokyriakidis/Downloads/dinara/src/tmpDirectory.hpp /home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly4.hpp /home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly4.cpp /home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly5.hpp /home/kokyriakidis/Downloads/dinara/src/Shasta2LocalAssembly5.cpp)",
+      "Bash(__NEW_LINE_1f5991e8258617de__ echo \"\")",
+      "Bash(__NEW_LINE_b8c32cd4b3f75fdf__ echo \"\")",
+      "Bash(__NEW_LINE_786aaae960d9d82a__ echo \"\")"
+    ],
+    "additionalDirectories": [
+      "/home/kokyriakidis/Downloads/shasta2/src",
+      "/home/kokyriakidis/Downloads/hifiasm/",
+      "/home/kokyriakidis/Downloads/verkko/",
+      "/home/kokyriakidis/Downloads/MBG/",
+      "/tmp"
+    ]
+  }
+}

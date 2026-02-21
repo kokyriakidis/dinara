@@ -8,10 +8,12 @@
 // Standard library.
 #include "algorithm.hpp"
 #include "array.hpp"
+#include "deduplicate.hpp"
 #include "iostream.hpp"
 #include <limits>
 #include "stdexcept.hpp"
 #include "string.hpp"
+#include "vector.hpp"
 
 
 
@@ -265,6 +267,55 @@ public:
         }
 
         return maxOffset / N ;
+    }
+
+
+
+    // Count the number of distinct sub-k-mers of length N in the first k bases.
+    // Used to assess sequence complexity (low-complexity sequences have fewer distinct sub-k-mers).
+    template<uint64_t N> uint64_t count(uint64_t k) const
+    {
+        // Handle trivial cases.
+        if(N > k) {
+            return 0;
+        }
+        if(N == k) {
+            return 1;
+        }
+
+        // Gather the bases.
+        array<Base, capacity> sequence;
+        for(uint64_t i=0; i<k; i++) {
+            sequence[i] = (*this)[i];
+        }
+
+        // Gather N-mers starting at each position.
+        vector<array<Base, N>> nMers;
+        nMers.reserve(k + 1 - N);
+        for(uint64_t i=0; i <= k-N; i++) {
+            array<Base, N>& nMer = nMers.emplace_back();
+            for(uint64_t j=0; j<N; j++) {
+                nMer[j] = sequence[i+j];
+            }
+        }
+
+        // Return the number of distinct N-mers.
+        deduplicate(nMers);
+        return nMers.size();
+    }
+
+    // Non-templated dispatch version.
+    uint64_t count(uint64_t N, uint64_t k) const
+    {
+        switch(N) {
+        case 1: return count<1>(k);
+        case 2: return count<2>(k);
+        case 3: return count<3>(k);
+        case 4: return count<4>(k);
+        case 5: return count<5>(k);
+        case 6: return count<6>(k);
+        default: DINARA_ASSERT(0);
+        }
     }
 
 

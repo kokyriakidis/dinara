@@ -622,6 +622,12 @@ public:
     // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
     void filterMarkerGraphVerticesByRepeatKmers(uint64_t threadCount);
 
+    // Filter marker graph vertices whose marker k-mer has low sequence complexity,
+    // assessed by counting distinct sub-k-mers of lengths 1, 2, 3, ...
+    // Uses the same criterion as Shasta2's --min-anchor-distinct-subkmer-count option.
+    // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
+    void filterMarkerGraphVerticesByDistinctSubkmerCount(uint64_t threadCount);
+
     // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
     // overlap start/end events on each oriented read (using read-graph overlaps).
     // This produces fewer anchors than using all marker graph vertices, while preserving
