@@ -137,8 +137,8 @@ void Shasta2LocalAssembly5::fillMarkerInfos()
     rightKmer = anchors.anchorKmer(rightAnchorId);
 
     // Get the MarkerInfos.
-    anchors.markerKmers.get(leftKmer, leftMarkerInfos);
-    anchors.markerKmers.get(rightKmer, rightMarkerInfos);
+    anchors.getMarkerKmers()->get(leftKmer, leftMarkerInfos);
+    anchors.getMarkerKmers()->get(rightKmer, rightMarkerInfos);
 }
 
 
@@ -306,7 +306,7 @@ void Shasta2LocalAssembly5::OrientedReadInfo::fillLocalRegion(
     // Fill in the LocalRegion Kmers.
     for(uint32_t ordinal = localRegion.firstOrdinal;
         ordinal <= localRegion.lastOrdinal; ordinal++) {
-        localRegion.kmers.push_back(anchors.markers.getKmer(orientedReadId, ordinal));
+        localRegion.kmers.push_back(anchors.getKmer(orientedReadId, ordinal));
     }
 
     // Fill in nonUniqueKmers.
