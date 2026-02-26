@@ -93,8 +93,6 @@ namespace dinara {
     class Shasta2AssemblyGraphOptions;
     class Shasta2AssemblyGraphPostprocessor;
 
-    // VariantPositionContext is defined in mode3-Anchor.hpp
-
     namespace mode0 {
         class AssemblyGraph;
     }
@@ -1752,101 +1750,6 @@ private:
 	    // Rebuild read graph (and optionally directed read graph) from a provided keep vector.
 	    // This removes the existing read graph data structures before recreating them.
 	    void rebuildReadGraphUsingSelectedAlignments(vector<bool> keepAlignment, bool rebuildDirectedReadGraph = false);
-
-#if DINARA_ENABLE_VARIANT_CLUSTERING
-	    // Temporary or permanent member
-	    uint64_t minAlleleCoverage = 5; // Threshold from main.cpp
-	    void computeClusterValidityThreadFunction(uint64_t threadId);
-
-    // Storage for position pairs collected during alignment computation
-    MemoryMapped::Vector< pair<OrientedReadId, uint32_t> > variantClusteringPositionPairs;
-    void accessVariantClusteringPositionPairsReadOnly();
-    void accessVariantClusteringPositionPairsReadWrite();
-    void checkVariantClusteringPositionPairsIsOpen() const;
-
-    // Access functions for variant clustering data (for explore mode)
-    void accessVariantClusteringData();
-
-    void collectVariantClusteringPositionPairs(
-        const ProjectedAlignment& projectedAlignment,
-        const array<OrientedReadId, 2>& orientedReadIds,
-        MemoryMapped::Vector< pair<OrientedReadId, uint32_t> >& positionPairs);
-
-    void storeVariantClusteringPositionPairs(
-        uint64_t threadCount,
-        ComputeAlignmentsData& data);
-
-    // Data structures for variant clustering compatibility check.
-    MemoryMapped::Vector<uint8_t> variantClusteringValidClusters;
-    MemoryMapped::Vector<uint8_t> variantClusteringValidClustersCompatible;
-    MemoryMapped::VectorOfVectors<OrientedReadId, uint64_t> haplotypeReads;
-    MemoryMapped::VectorOfVectors<uint64_t, uint64_t> variantClusteringMembersByRepIdx;
-
-    void performGlobalVariantClustering(
-        uint64_t minCoverage,
-        uint64_t maxCoverage,
-        uint64_t threadCount = 0);
-
-    MemoryMapped::Vector<__uint128_t> variantClusteringDisjointSetTable;
-    MemoryMapped::Vector<uint8_t> variantClusteringPositionPairAlleles;
-    MemoryMapped::Vector<VariantPositionContext> variantClusteringPositionPairContexts;
-    std::shared_ptr<DisjointSets> variantClusteringDisjointSets;
-
-    // Mutex to protect the global haplotype graph during parallel edge addition
-    std::mutex haplotypeGraphMutex;
-
-    // Global Haplotype Graph (Boost Adjacency List)
-    // Undirected graph where vertices are OrientedReadId values
-    // Edge property: weight (uint32_t) representing the number of sites that were compatible and were used to cast votes
-    using HaplotypeGraph = boost::adjacency_list<
-        boost::setS,           // OutEdgeList = set (no duplicate edges)
-        boost::vecS,           // VertexList = vector (indexed by OrientedReadId value)
-        boost::bidirectionalS, // Bidirectional graph (access to in-edges and out-edges)
-        boost::no_property,    // Vertex properties
-        boost::property<boost::edge_weight_t, uint32_t> // Edge properties: weight
-    >;
-    std::shared_ptr<HaplotypeGraph> globalHaplotypeGraph;
-
-    // Status of each member (PositionPair) in the clusters.
-    // 0 = Good/Keep
-    // 1 = Stray/Filter
-    MemoryMapped::Vector<uint8_t> variantClusteringMemberStatus;
-
-    void refineClustersThreadFunction(uint64_t threadId);
-
-    std::vector<uint64_t> variantClusteringClusterRepresentatives;
-    std::vector<uint64_t> variantClusteringLinkCounts;  // Per-thread counters: [thread*4+0]=forward links, [thread*4+1]=RC links, [thread*4+2]=mismatches found, [thread*4+3]=mismatches skipped
-    
-    // Timing for variant clustering phases (wall-clock time in seconds)
-    double variantClusteringProjectedAlignmentTime = 0.0;
-    double variantClusteringCollectionTime = 0.0;
-    double variantClusteringStorageTime = 0.0;
-
-    void linkVariantClustersThreadFunction(uint64_t threadId);  // Phase 2: Link pairs with disjoint sets
-
-    // ClusterGraph: A graph where vertices are valid clusters and edges
-    // represent connectivity between clusters based on read paths.
-    std::shared_ptr<ClusterGraph> clusterGraph;
-    
-    // Create the ClusterGraph from variant clustering data and save it.
-    void createClusterGraph(uint64_t minEdgeCoverage = 0);
-    
-    // Load the ClusterGraph from binary file.
-    void loadClusterGraph();
-    
-    // Access the ClusterGraph (load if not exists).
-    ClusterGraph& getClusterGraph();
-    
-    // HTTP server function to explore the cluster graph.
-    void exploreClusterGraph(const vector<string>& request, ostream& html);
-    
-    // HTTP server function to explore a single variant cluster (shows reads and alleles).
-    void exploreVariantCluster(const vector<string>& request, ostream& html);
-    
-    // HTTP server function to explore multiple variant clusters together.
-    void exploreVariantClusters(const vector<string>& request, ostream& html);
-#endif
-
 
     // Triangle and least square analysis of the read graph
     // to flag inconsistent alignments.

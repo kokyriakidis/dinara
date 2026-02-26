@@ -37,15 +37,9 @@ message(STATUS "CMAKE_SYSTEM_NAME is " ${CMAKE_SYSTEM_NAME})
 option(BUILD_EXECUTABLE "Build the executable." ON)
 option(BUILD_PYTHON_MODULE "Build the Python module." ON)
 
-# Variant clustering / ClusterGraph / het-site anchors.
-# This feature pulls in additional data structures and large-memory mapped vectors.
-option(DINARA_ENABLE_VARIANT_CLUSTERING "Enable variant clustering, cluster graph, and het-site anchors." OFF)
-
-
 # Write out what we will actually build.
 message(STATUS "BUILD_EXECUTABLE is " ${BUILD_EXECUTABLE})
 message(STATUS "BUILD_PYTHON_MODULE is " ${BUILD_PYTHON_MODULE})
-message(STATUS "DINARA_ENABLE_VARIANT_CLUSTERING is " ${DINARA_ENABLE_VARIANT_CLUSTERING})
 
 
 
