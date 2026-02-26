@@ -14,12 +14,7 @@ add_definitions(-ggdb3 -O0)
 # Enable test-only hooks in dinara sources.
 add_definitions(-DDINARA_TESTING)
 
-# Variant clustering / ClusterGraph / het-site anchors.
-if(DINARA_ENABLE_VARIANT_CLUSTERING)
-    add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=1)
-else()
-    add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
-endif()
+add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 
 # Include directories
 include_directories(${DINARA_ROOT}/src)
@@ -56,12 +51,10 @@ file(GLOB DINARA_SRC_FILES CONFIGURE_DEPENDS
 )
 # Remove main.cpp (it has its own main())
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*main\\.cpp$")
-if(NOT DINARA_ENABLE_VARIANT_CLUSTERING)
-    list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
-    list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
-    list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
-    list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
-endif()
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
 
 # Find required libraries
 find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
