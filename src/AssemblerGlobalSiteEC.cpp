@@ -2,6 +2,7 @@
 #include "Assembler.hpp"
 #include "Reads.hpp"
 #include "chrono.hpp"
+#include "hifiasmECInternals.hpp"
 #include "timestamp.hpp"
 
 // Standard library.
@@ -26,8 +27,11 @@ struct GlobalReadSite {
 };
 
 struct GlobalReadSiteIndex {
+    // Global het sites per read, sorted by position in the read's forward coordinate space.
+    // Used to iterate over sites within an alignment's [qs, qe) window.
+    // The target-side concordance check no longer needs a second per-site index:
+    // it is done by querying the pre-computed alignedEvidenceStore SNP streams directly.
     vector< vector<GlobalReadSite> > sitesByReadPos;
-    vector< vector<GlobalReadSite> > sitesByReadSite;
     uint64_t keptSiteCount = 0;
 };
 
@@ -58,7 +62,6 @@ inline GlobalReadSiteIndex buildGlobalReadSiteIndexFromClusters(
     const Reads& reads = assembler.getReads();
     const uint64_t readCount = reads.readCount();
     out.sitesByReadPos.assign(readCount, vector<GlobalReadSite>{});
-    out.sitesByReadSite.assign(readCount, vector<GlobalReadSite>{});
 
     const uint32_t siteCount = clusters.clusterMemberOffsets.empty() ?
         0U :
@@ -180,10 +183,6 @@ inline GlobalReadSiteIndex buildGlobalReadSiteIndexFromClusters(
     for (uint64_t rid = 0; rid < readCount; rid++) {
         auto& byPos = out.sitesByReadPos[rid];
         sort(byPos.begin(), byPos.end(), positionOrder);
-
-        auto& bySite = out.sitesByReadSite[rid];
-        bySite = byPos;
-        sort(bySite.begin(), bySite.end(), siteOrder);
     }
 
     return out;
@@ -220,8 +219,6 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
     if (threadCount == 0) {
         threadCount = 1;
     }
-
-    const bool debugCheckBases = (::getenv("DINARA_EC_GLOBALSITE_ASSERT_BASES") != nullptr);
 
     AlignOptions clusteringAlignOptions{};
     clusteringAlignOptions.maxErrorRate = 1.0;
@@ -268,6 +265,26 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
             const uint64_t end = (t == threadCount - 1) ? readCount : min<uint64_t>((t + 1) * chunkSize, readCount);
             Timing& timing = timings[t];
 
+            // Per-thread scratch pad reused across reads.
+            HifiasmECScratchPad scratch;
+
+            // Temp per-site accumulators (reused across reads).
+            struct SiteAcc {
+                uint32_t occ_0 = 1;       // starts at 1 (query itself counts as ref)
+                uint32_t fwd_ref_cov = 1;  // starts at 1 (query is fwd)
+                std::array<uint32_t, 4> altCount{};
+            };
+            struct TempEv {
+                uint32_t overlapID;
+                uint32_t ri;       // index into querySitesByPos
+                uint8_t  type;     // 0=ref, 1=alt
+                uint8_t  misBase;  // alt base index (0-3); 4 = unknown
+            };
+            vector<SiteAcc> siteAcc;
+            vector<TempEv>  tempEvidence;
+            vector<int32_t> siteToRow;
+            vector<uint8_t> siteDominantAlt;
+
             for (uint64_t readId = start; readId < end; readId++) {
                 timing.readsVisited++;
 
@@ -281,13 +298,16 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                 }
                 timing.readsWithAlignments++;
 
-                vector<CandidateGlobal> candidates;
-                candidates.reserve(alignments.size());
-
+                // ------------------------------------------------------------------
+                // Phase 1: gather candidates (unchanged from old code).
+                // ------------------------------------------------------------------
                 const auto tGatherBegin = steady_clock::now();
+                scratch.clear();
+                scratch.candidates.reserve(alignments.size());
+
                 for (const uint32_t alignmentId : alignments) {
                     const AlignmentData& ad = alignmentData[alignmentId];
-                    if (ad.isDeleted()) {
+                    if (!ad.keptByBothSides()) {
                         continue;
                     }
 
@@ -348,124 +368,198 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
                         teFwd = tLen - tsCoreOriented;
                     }
 
-                    CandidateGlobal c;
-                    c.alignmentId = alignmentId;
-                    c.qs = qsCore;
-                    c.qe = qeCore;
-                    c.ts = tsFwd;
-                    c.te = teFwd;
-                    c.targetId = uint32_t(o1.getReadId());
-                    c.targetIsRc = (o1.getStrand() != 0);
-                    c.isMatch = 1;
-                    candidates.push_back(c);
+                    CandidateEC ce;
+                    ce.alignmentId = alignmentId;
+                    ce.qs = qsCore;
+                    ce.qe = qeCore;
+                    ce.ts = tsFwd;
+                    ce.te = teFwd;
+                    ce.targetId = uint32_t(o1.getReadId());
+                    ce.isRev = (o1.getStrand() != 0);
+                    ce.is_match = 1;
+                    ce.strong = 0;
+                    scratch.candidates.push_back(ce);
                 }
                 timing.gatherCandidates += seconds(steady_clock::now() - tGatherBegin);
 
-                if (candidates.empty()) {
+                if (scratch.candidates.empty()) {
                     continue;
                 }
                 timing.readsWithCandidates++;
 
+                // ------------------------------------------------------------------
+                // Phase 2: build snpStats + hapEvidence from global het sites.
+                //
+                // For each global het site at position p (in query's forward coords):
+                //   - Query the pre-computed SNP stream for each candidate that covers p.
+                //   - A hit means the candidate carries an alt base → type=1, misBase=base.
+                //   - No hit means concordant → type=0.
+                //   - After iterating all candidates, pick the dominant alt base and emit
+                //     one SnpStats row per site (occ_1 >= 2 required, same as detectHetSites).
+                //   - fwd_ref_cov = concordant FW-strand overlaps + 1 (for the query itself).
+                // ------------------------------------------------------------------
+                const auto tPhaseBegin = steady_clock::now();
+
                 const vector<GlobalReadSite>& querySitesByPos = globalIndex.sitesByReadPos[readId];
                 const bool isInformativeRead = querySitesByPos.size() >= minInformativeSitesPerRead;
-                vector<uint32_t> informativeCountByCandidate(candidates.size(), 0);
 
-                const auto tPhaseBegin = steady_clock::now();
-                for (size_t c = 0; c < candidates.size(); c++) {
-                    CandidateGlobal& candidate = candidates[c];
-                    if (candidate.qe <= candidate.qs || candidate.te <= candidate.ts) {
-                        continue;
+                if (querySitesByPos.empty() || !isInformativeRead) {
+                    // No het sites for this read; nothing to phase — write back cis.
+                    const ReadId queryReadId = ReadId(readId);
+                    for (const CandidateEC& ce : scratch.candidates) {
+                        alignmentData[ce.alignmentId].clearDeleteReasonsFromReadPerspective(
+                            queryReadId, AlignmentData::DeleteReasonPhase);
                     }
-                    if (querySitesByPos.empty()) {
-                        continue;
-                    }
-                    if (candidate.targetId >= globalIndex.sitesByReadSite.size()) {
-                        continue;
-                    }
-                    const auto& targetSitesBySite = globalIndex.sitesByReadSite[candidate.targetId];
-                    if (targetSitesBySite.empty()) {
-                        continue;
-                    }
+                    continue;
+                }
+
+                const size_t nSites = querySitesByPos.size();
+                const size_t nCands = scratch.candidates.size();
+
+                siteAcc.assign(nSites, SiteAcc{});
+                tempEvidence.clear();
+                tempEvidence.reserve(nSites * 4);
+
+                for (size_t c = 0; c < nCands; c++) {
+                    const CandidateEC& ce = scratch.candidates[c];
+                    if (ce.qe <= ce.qs) continue;
+
+                    const AlignmentData& ad = alignmentData[ce.alignmentId];
+                    const size_t evidenceId = ad.info.alignmentId;
+                    if (evidenceId == invalid<size_t>) continue;
+                    const uint32_t evidenceId32 = uint32_t(evidenceId);
+                    const bool rIsQuery = (ad.readIds[0] == ReadId(readId));
 
                     const auto qBeginIt = lower_bound(
-                        querySitesByPos.begin(),
-                        querySitesByPos.end(),
-                        candidate.qs,
+                        querySitesByPos.begin(), querySitesByPos.end(),
+                        uint32_t(ce.qs),
                         [](const GlobalReadSite& a, uint32_t pos) { return a.position < pos; });
                     const auto qEndIt = lower_bound(
-                        querySitesByPos.begin(),
-                        querySitesByPos.end(),
-                        candidate.qe,
+                        querySitesByPos.begin(), querySitesByPos.end(),
+                        uint32_t(ce.qe),
                         [](const GlobalReadSite& a, uint32_t pos) { return a.position < pos; });
 
-                    uint32_t sharedSites = 0;
-                    uint32_t concordantAlleles = 0;
-                    uint32_t discordantAlleles = 0;
-
-                    static const uint8_t complementBase[4] = {3, 2, 1, 0};
                     for (auto it = qBeginIt; it != qEndIt; ++it) {
-                        const uint32_t siteId = it->siteId;
-                        const auto tIt = lower_bound(
-                            targetSitesBySite.begin(),
-                            targetSitesBySite.end(),
-                            siteId,
-                            [](const GlobalReadSite& a, uint32_t s) { return a.siteId < s; });
-                        if (tIt == targetSitesBySite.end() || tIt->siteId != siteId) {
-                            continue;
-                        }
-                        if (tIt->position < candidate.ts || tIt->position >= candidate.te) {
-                            continue;
-                        }
+                        const size_t ri = size_t(it - querySitesByPos.begin());
+                        const uint32_t p = it->position;
 
-                        if (debugCheckBases) {
-                            const uint8_t qBase = reads->getOrientedReadBase(
-                                OrientedReadId(ReadId(readId), 0), it->position).value;
-                            if (qBase < 4) {
-                                DINARA_ASSERT(qBase == it->allele);
-                            }
-                            const uint8_t tBase = reads->getOrientedReadBase(
-                                OrientedReadId(ReadId(candidate.targetId), 0), tIt->position).value;
-                            if (tBase < 4) {
-                                DINARA_ASSERT(tBase == tIt->allele);
-                            }
-                        }
-
-                        sharedSites++;
-                        uint8_t targetAllele = tIt->allele;
-                        if (candidate.targetIsRc && targetAllele < 4) {
-                            targetAllele = complementBase[targetAllele];
-                        }
-                        if (targetAllele == it->allele) {
-                            concordantAlleles++;
+                        uint8_t altBase = 4;
+                        bool hasMismatch = false;
+                        auto snpCb = [&](uint32_t, uint8_t base) {
+                            hasMismatch = true;
+                            altBase = base;
+                        };
+                        if (rIsQuery) {
+                            alignedEvidenceStore.forEachSnp1InRange(evidenceId32, p, p + 1, snpCb);
                         } else {
-                            discordantAlleles++;
+                            alignedEvidenceStore.forEachSnp0InRange(evidenceId32, p, p + 1, snpCb);
                         }
-                    }
 
-                    informativeCountByCandidate[c] = sharedSites;
-                    if (
-                        isInformativeRead &&
-                        sharedSites >= minSharedSitesForDecision &&
-                        discordantAlleles > concordantAlleles) {
-                        candidate.isMatch = 2;
+                        if (hasMismatch && altBase < 4) {
+                            siteAcc[ri].altCount[altBase]++;
+                            tempEvidence.push_back({uint32_t(c), uint32_t(ri), 1, altBase});
+                        } else {
+                            siteAcc[ri].occ_0++;
+                            if (!ce.isRev) siteAcc[ri].fwd_ref_cov++;
+                            tempEvidence.push_back({uint32_t(c), uint32_t(ri), 0, 4});
+                        }
                     }
                 }
+
+                // Build SnpStats rows (one per site with dominant alt occ_1 >= 2).
+                siteToRow.assign(nSites, -1);
+                siteDominantAlt.assign(nSites, 4);
+                scratch.snpStats.clear();
+
+                for (size_t ri = 0; ri < nSites; ri++) {
+                    const SiteAcc& acc = siteAcc[ri];
+                    uint8_t bestBase = 4;
+                    uint32_t bestCount = 0;
+                    for (uint8_t b = 0; b < 4; b++) {
+                        if (acc.altCount[b] > bestCount) {
+                            bestCount = acc.altCount[b];
+                            bestBase = b;
+                        }
+                    }
+                    if (bestCount < 2) continue;  // require occ_1 >= 2
+
+                    siteToRow[ri] = int32_t(scratch.snpStats.size());
+                    siteDominantAlt[ri] = bestBase;
+
+                    SnpStats stat;
+                    stat.site        = querySitesByPos[ri].position;
+                    stat.occ_0       = acc.occ_0;
+                    stat.occ_1       = bestCount;
+                    stat.fwd_ref_cov = acc.fwd_ref_cov;
+                    stat.refBase     = 'N';  // not used by gen_rphase_dp
+                    stat.altBase     = "ACGT"[bestBase];
+                    stat.is_homopolymer = 0;
+                    stat.score       = -1;
+                    stat.dpScore     = 0;
+                    scratch.snpStats.push_back(stat);
+                }
+
+                if (scratch.snpStats.empty()) {
+                    // No sites with enough alt support; write back cis.
+                    const ReadId queryReadId = ReadId(readId);
+                    for (const CandidateEC& ce : scratch.candidates) {
+                        alignmentData[ce.alignmentId].clearDeleteReasonsFromReadPerspective(
+                            queryReadId, AlignmentData::DeleteReasonPhase);
+                    }
+                    continue;
+                }
+
+                // Build hapEvidence remapped to row indices.
+                scratch.hapEvidence.clear();
+                scratch.hapEvidence.reserve(tempEvidence.size());
+                for (const TempEv& te : tempEvidence) {
+                    const int32_t row = siteToRow[te.ri];
+                    if (row < 0) continue;
+                    // For alt entries keep only the dominant base.
+                    if (te.type == 1 && te.misBase != siteDominantAlt[te.ri]) continue;
+
+                    HaplotypeEvidence ev;
+                    ev.overlapID   = te.overlapID;
+                    ev.site        = querySitesByPos[te.ri].position;
+                    ev.overlapSite = uint32_t(row);
+                    ev.type        = te.type;
+                    ev.misBase     = te.misBase < 4 ? te.misBase : 0;
+                    ev.hp          = false;
+                    scratch.hapEvidence.push_back(ev);
+                }
+                sort(scratch.hapEvidence.begin(), scratch.hapEvidence.end());
+
+                // No insertion holes — DP will skip hole processing.
+                scratch.insertionOffsets.clear();
+                scratch.insertionIntervals.clear();
+                scratch.insertionBaseCount.clear();
+
                 timing.phaseUsingGlobalSites += seconds(steady_clock::now() - tPhaseBegin);
 
+                // ------------------------------------------------------------------
+                // Phase 3: run the hifiasm DP + transitive-closure pipeline.
+                // ------------------------------------------------------------------
+                gen_rphase_dp(*this, scratch);
+                generate_haplotypes_naive_HiFi(*this, scratch);
+
+                // ------------------------------------------------------------------
+                // Phase 4: write back DeleteReasonPhase flags.
+                // ------------------------------------------------------------------
                 const auto tFinalizeBegin = steady_clock::now();
                 const ReadId queryReadId = ReadId(readId);
-                for (size_t c = 0; c < candidates.size(); c++) {
-                    const CandidateGlobal& candidate = candidates[c];
-                    AlignmentData& ad = alignmentData[candidate.alignmentId];
+                for (size_t c = 0; c < scratch.candidates.size(); c++) {
+                    const CandidateEC& ce = scratch.candidates[c];
+                    AlignmentData& ad = alignmentData[ce.alignmentId];
 
-                    const bool keep = !isInformativeRead || (candidate.isMatch == 1);
+                    const bool keep = (ce.is_match == 1);
                     if (keep) {
                         ad.clearDeleteReasonsFromReadPerspective(queryReadId, AlignmentData::DeleteReasonPhase);
                     } else {
                         ad.addDeleteReasonsFromReadPerspective(queryReadId, AlignmentData::DeleteReasonPhase);
                     }
 
-                    const uint32_t informativeCount = informativeCountByCandidate[c];
+                    // Track how many DP-retained sites were shared with this candidate.
+                    const uint32_t informativeCount = uint32_t(scratch.snpStats.size());
                     if (ad.readIds[0] == queryReadId) {
                         ad.informativeHetSiteCount0 = informativeCount;
                     } else if (ad.readIds[1] == queryReadId) {
@@ -479,6 +573,179 @@ void Assembler::performGlobalSiteECParity(uint64_t threadCount)
 
     for (auto& th : threads) {
         th.join();
+    }
+
+    // =========================================================================
+    // Transitive phasing via BFS 2-coloring of the phasing graph.
+    //
+    // The per-thread direct pass labeled each alignment cis or trans from each
+    // read's perspective via DeleteReasonPhase flags. Here we build a graph
+    // over reads with those edge labels and propagate haplotype assignments
+    // (color 0 / color 1) by BFS so that reads never directly aligned can
+    // still be phased through intermediate reads.
+    //
+    // Edge label from a read's perspective (using that side's flags):
+    //   isTrans{0,1}    — read voted this alignment trans (DeleteReasonPhase set)
+    //   hasCisEvidence  — voted cis with enough shared sites (not trans,
+    //                     but informativeHetSiteCount >= minSharedSitesForDecision)
+    //   unknown         — insufficient shared sites → skip edge in BFS
+    //
+    // After 2-coloring, apply the color result to every alignment where both
+    // endpoints have a consistent (non-contradicted) color:
+    //   same color  → cis  → clear DeleteReasonPhase from both sides
+    //   diff color  → trans → set   DeleteReasonPhase on both sides
+    // =========================================================================
+    const auto tBfsBegin = steady_clock::now();
+    {
+        // Whether an alignment was deleted for reasons OTHER than phasing
+        // (containment, chemical, etc.). Such alignments are excluded from the
+        // BFS entirely; they were not candidates in the direct pass and must
+        // not participate in color propagation.
+        auto deletedForNonPhaseReasons = [](const AlignmentData& ad) -> bool {
+            constexpr AlignmentData::DeleteReasonMask nonPhase =
+                ~AlignmentData::DeleteReasonPhase;
+            return ((ad.deleteReasons0 & nonPhase) != 0) ||
+                   ((ad.deleteReasons1 & nonPhase) != 0);
+        };
+
+        // Edge label helpers from each side's perspective.
+        auto isTrans0 = [](const AlignmentData& ad) -> bool {
+            return (ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) != 0;
+        };
+        auto hasCisEvidence0 = [&](const AlignmentData& ad) -> bool {
+            return !isTrans0(ad) &&
+                   (ad.informativeHetSiteCount0 >= minSharedSitesForDecision);
+        };
+        auto isTrans1 = [](const AlignmentData& ad) -> bool {
+            return (ad.deleteReasons1 & AlignmentData::DeleteReasonPhase) != 0;
+        };
+        auto hasCisEvidence1 = [&](const AlignmentData& ad) -> bool {
+            return !isTrans1(ad) &&
+                   (ad.informativeHetSiteCount1 >= minSharedSitesForDecision);
+        };
+
+        static constexpr uint8_t NO_COLOR = 255;
+        vector<uint8_t> readColor(readCount, NO_COLOR);
+        vector<bool>    inconsistent(readCount, false);
+
+        // BFS using a vector as a queue (index-based, safe across push_back).
+        // Each entry stores (readId, depth).  We propagate at most 2 hops
+        // (depth 0 = seed, depth 1 = direct neighbours, depth 2 = neighbours
+        // of neighbours).  Reads at depth 2 get a colour but do NOT enqueue
+        // their own neighbours, so nothing beyond hop 2 is coloured.
+        vector<pair<uint32_t, uint8_t>> bfsQueue;
+        bfsQueue.reserve(4096);
+
+        for (uint32_t seed = 0; seed < uint32_t(readCount); ++seed) {
+            if (readColor[seed] != NO_COLOR || inconsistent[seed]) continue;
+
+            // Only start a component from a read that has at least one labeled
+            // edge; reads with no phasing signal stay uncolored.
+            const OrientedReadId seedOriented(ReadId(seed), 0);
+            if (seedOriented.getValue() >= alignmentTable.size()) continue;
+            const span<const uint32_t> seedAlns =
+                alignmentTable[seedOriented.getValue()];
+
+            bool hasLabeledEdge = false;
+            for (const uint32_t alnId : seedAlns) {
+                const AlignmentData& ad = alignmentData[alnId];
+                if (deletedForNonPhaseReasons(ad)) continue;
+                const bool seedIsR0 = (ad.readIds[0] == ReadId(seed));
+                if (seedIsR0 ? (isTrans0(ad) || hasCisEvidence0(ad))
+                             : (isTrans1(ad) || hasCisEvidence1(ad))) {
+                    hasLabeledEdge = true;
+                    break;
+                }
+            }
+            if (!hasLabeledEdge) continue;
+
+            // Seed this component with color 0 and BFS outward (max 2 hops).
+            readColor[seed] = 0;
+            bfsQueue.clear();
+            bfsQueue.push_back({seed, 0});
+
+            for (size_t qi = 0; qi < bfsQueue.size(); ++qi) {
+                const uint32_t cur   = bfsQueue[qi].first;
+                const uint8_t  depth = bfsQueue[qi].second;
+                if (inconsistent[cur]) continue;
+                const uint8_t curColor = readColor[cur];
+
+                // At depth 2 we already have the neighbour-of-neighbour
+                // coloured; don't go any deeper.
+                if (depth >= 2) continue;
+
+                const OrientedReadId curOriented(ReadId(cur), 0);
+                if (curOriented.getValue() >= alignmentTable.size()) continue;
+                const span<const uint32_t> curAlns =
+                    alignmentTable[curOriented.getValue()];
+
+                for (const uint32_t alnId : curAlns) {
+                    const AlignmentData& ad = alignmentData[alnId];
+                    if (deletedForNonPhaseReasons(ad)) continue;
+
+                    const bool curIsR0 = (ad.readIds[0] == ReadId(cur));
+                    const uint32_t neighbor = curIsR0 ?
+                        uint32_t(ad.readIds[1]) : uint32_t(ad.readIds[0]);
+
+                    // Determine edge label from cur's perspective.
+                    bool edgeIsTrans, edgeHasLabel;
+                    if (curIsR0) {
+                        edgeIsTrans  = isTrans0(ad);
+                        edgeHasLabel = edgeIsTrans || hasCisEvidence0(ad);
+                    } else {
+                        edgeIsTrans  = isTrans1(ad);
+                        edgeHasLabel = edgeIsTrans || hasCisEvidence1(ad);
+                    }
+                    if (!edgeHasLabel) continue;
+
+                    // trans edge flips the color; cis edge preserves it.
+                    const uint8_t neighborExpected =
+                        edgeIsTrans ? uint8_t(1u - curColor) : curColor;
+
+                    if (readColor[neighbor] == NO_COLOR) {
+                        readColor[neighbor] = neighborExpected;
+                        // Only enqueue if we haven't yet reached depth 2.
+                        bfsQueue.push_back({neighbor, uint8_t(depth + 1)});
+                    } else if (readColor[neighbor] != neighborExpected) {
+                        // Contradiction: two paths assign different colors.
+                        // Mark the read inconsistent; do not change its color
+                        // and do not propagate further from it.
+                        inconsistent[neighbor] = true;
+                    }
+                }
+            }
+        }
+
+        // Apply transitive coloring: override direct-pass flags for every
+        // alignment where both endpoints have a consistent, non-NO_COLOR color.
+        uint64_t transitivelyPhased = 0;
+        for (AlignmentData& ad : alignmentData) {
+            if (deletedForNonPhaseReasons(ad)) continue;
+            const uint32_t r0 = uint32_t(ad.readIds[0]);
+            const uint32_t r1 = uint32_t(ad.readIds[1]);
+            if (readColor[r0] == NO_COLOR || readColor[r1] == NO_COLOR) continue;
+            if (inconsistent[r0] || inconsistent[r1]) continue;
+
+            ++transitivelyPhased;
+            if (readColor[r0] == readColor[r1]) {
+                // Cis: same haplotype — clear trans flags from both sides.
+                ad.clearDeleteReasonsBoth(AlignmentData::DeleteReasonPhase);
+            } else {
+                // Trans: opposite haplotypes — set trans flags on both sides.
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonPhase);
+            }
+        }
+
+        uint64_t colored = 0, inconsistentCount = 0;
+        for (uint32_t r = 0; r < uint32_t(readCount); ++r) {
+            if (readColor[r] != NO_COLOR) ++colored;
+            if (inconsistent[r])          ++inconsistentCount;
+        }
+        const double tBfs = seconds(steady_clock::now() - tBfsBegin);
+        cout << timestamp << "  transitive 2-color: " << tBfs << " s"
+             << " (colored=" << colored
+             << ", inconsistent=" << inconsistentCount
+             << ", transitivelyPhased=" << transitivelyPhased << ")" << endl;
     }
 
     for (AlignmentData& ad : alignmentData) {

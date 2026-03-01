@@ -986,7 +986,7 @@ public:
         overlapCandidatesOptions.driftRateTolerance = 0.1;
         overlapCandidatesOptions.minChainMarkerCount = 4;
         withSilencedIoInDir(testDir, [&] {
-            assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 0, 1);
+            assembler->findAlignmentCandidatesInvertedIndex(0.1, 100, overlapCandidatesOptions, 1);
         });
     }
 
@@ -1001,7 +1001,7 @@ public:
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
         overlapCandidatesOptions.minChainMarkerCount = 4;
         withSilencedIoInDir(testDir, [&] {
-            assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 0, 1);
+            assembler->chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, 1);
         });
     }
     
@@ -1069,13 +1069,12 @@ public:
         OverlapCandidatesOptions overlapCandidatesOptions;
         overlapCandidatesOptions.method = "InvertedIndex";
         overlapCandidatesOptions.driftRateTolerance = maxDriftRate;
-        overlapCandidatesOptions.minChainMarkerCount = 4;
+        overlapCandidatesOptions.minChainMarkerCount = int(minChainedMarkerCount);
         withSilencedIoInDir(testDir, [&] {
             assembler->chainPafCandidates(
                 maxDriftRate,
                 maxChainLimit,
                 overlapCandidatesOptions,
-                minChainedMarkerCount,
                 1);
         });
     }
@@ -4418,7 +4417,7 @@ TEST_CASE("Integration: StringGraph drop-short-overlaps prunes weak overlaps by 
         fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
 
         // Drop with ratio 0.5: threshold ~ 450 => ol=300 should be deleted.
-        fixture.assembler->cleanStringGraphDropShortOverlaps(0.5, /*minOverlapLen*/0);
+        fixture.assembler->cleanStringGraphDropShortOverlaps(0.5, /*minOverlapLen*/0, /*maxShortTipReads*/3);
     });
 
     // alignmentId=1 creates arcId=2 and twin arcId=3.

@@ -2937,9 +2937,8 @@ public:
         MemoryMapped::Vector<OrientedReadPair>& candidates,
         MemoryMapped::Vector<Alignment>& precomputedAlignments,
         uint64_t maxChainLimit,
-        uint32_t minChainedMarkerCount,
         uint64_t threadCount
-    ) : 
+    ) :
         MultithreadedObject(*this),
         reads(reads),
         markers(markers),
@@ -2947,9 +2946,6 @@ public:
         invertedIndexData(invertedIndexData),
         maxChainLimit(maxChainLimit)
     {
-        // Kept for API compatibility. In strict hifiasm ONT parity mode, `chain_cutoff` is fixed
-        // (2) and we do not apply an additional per-read-pair minimum here.
-        (void)minChainedMarkerCount;
 
         const ReadId readCount = ReadId(markers.size() / 2); // Indexed by strand 0
         const size_t perThreadReserve = std::max<size_t>(
@@ -3588,13 +3584,21 @@ private:
                             }
                         }
 
-                        // Optional: reject internal overlaps requiring large end extension.
+                        // Optional: reject overlaps with large softclips.
+                        // Two complementary checks:
+                        // 1. Per-read: reject if a read is "internal" (both its clips exceed maxEndFuzz).
+                        // 2. Joint: reject if neither read reaches a given side (min of both clips exceeds maxEndFuzz).
                         if(invertedIndexData.maxEndFuzz > 0) {
+                            const uint32_t qRightClip = uint32_t(std::max<int64_t>(int64_t(readLenA) - int64_t(qE), 0));
+                            const uint32_t tRightClip = uint32_t(std::max<int64_t>(int64_t(readLenB) - int64_t(tE), 0));
+                            // if(qS > invertedIndexData.maxEndFuzz && qRightClip > invertedIndexData.maxEndFuzz) {
+                            //     continue;
+                            // }
+                            // if(tS > invertedIndexData.maxEndFuzz && tRightClip > invertedIndexData.maxEndFuzz) {
+                            //     continue;
+                            // }
                             const uint32_t leftNeed = std::min(qS, tS);
-                            const int64_t qRight = int64_t(readLenA) - int64_t(qE);
-                            const int64_t tRight = int64_t(readLenB) - int64_t(tE);
-                            const uint32_t rightNeed = uint32_t(std::min<int64_t>(
-                                std::max<int64_t>(qRight, 0), std::max<int64_t>(tRight, 0)));
+                            const uint32_t rightNeed = std::min(qRightClip, tRightClip);
                             if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
                                 continue;
                             }
@@ -3968,7 +3972,6 @@ void Assembler::chainAlignmentCandidates(
     double maxDriftRate,
     uint64_t maxChainLimit,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
-    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     if(threadCount == 0) {
@@ -4020,7 +4023,6 @@ void Assembler::chainAlignmentCandidates(
         alignmentCandidates.candidates,
         alignmentCandidatesAlignmentsData.alignments,
         maxChainLimit,
-        minChainedMarkerCount,
         threadCount
     );
 
@@ -4043,11 +4045,10 @@ void Assembler::findAlignmentCandidatesInvertedIndex(
     double maxDriftRate,
     uint64_t maxChainLimit,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
-    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     buildInvertedIndex(threadCount);
-    chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, minChainedMarkerCount, threadCount);
+    chainAlignmentCandidates(maxDriftRate, maxChainLimit, overlapCandidatesOptions, threadCount);
 }
 
 // =============================================================================
@@ -4092,12 +4093,13 @@ void Assembler::chainPafCandidates(
     double maxDriftRate,
     uint64_t maxChainLimit,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
-    uint32_t minChainedMarkerCount,
     uint64_t threadCount
 ) {
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
+    const uint32_t minChainedMarkerCount =
+        uint32_t(std::max(0, overlapCandidatesOptions.minChainMarkerCount));
 
     const auto startTime = std::chrono::steady_clock::now();
     performanceLog << timestamp << "Starting DP chaining for PAF-imported candidates." << endl;
@@ -5137,21 +5139,28 @@ void Assembler::chainPafCandidates(
                             }
                         }
 
-                        // Optional: reject internal overlaps requiring large end extension.
+                        // Optional: reject overlaps with large softclips.
+                        // Two complementary checks:
+                        // 1. Per-read: reject if a read is "internal" (both its clips exceed maxEndFuzz).
+                        // 2. Joint: reject if neither read reaches a given side (min of both clips exceeds maxEndFuzz).
                         if(invertedIndexData.maxEndFuzz > 0) {
-                            const int64_t qRight = int64_t(readLenA) - int64_t(al.qe);
-                            const uint32_t qRightNeed = uint32_t(std::max<int64_t>(qRight, 0));
-                            uint32_t tLeftNeed, tRightNeed;
+                            const uint32_t qRightClip = uint32_t(std::max<int64_t>(int64_t(readLenA) - int64_t(al.qe), 0));
+                            uint32_t tLeftClip, tRightClip;
                             if(useSameStrand) {
-                                tLeftNeed = al.ts;
-                                tRightNeed = uint32_t(std::max<int64_t>(int64_t(readLenB) - int64_t(al.te), 0));
+                                tLeftClip = al.ts;
+                                tRightClip = uint32_t(std::max<int64_t>(int64_t(readLenB) - int64_t(al.te), 0));
                             } else {
-                                // Reverse overlap: forward-stored [ts, te) maps to RC target.
-                                tLeftNeed = uint32_t(readLenB) - al.te;
-                                tRightNeed = al.ts;
+                                tLeftClip = uint32_t(readLenB) - al.te;
+                                tRightClip = al.ts;
                             }
-                            const uint32_t leftNeed = std::min(al.qs, tLeftNeed);
-                            const uint32_t rightNeed = std::min(qRightNeed, tRightNeed);
+                            if(al.qs > invertedIndexData.maxEndFuzz && qRightClip > invertedIndexData.maxEndFuzz) {
+                                continue;
+                            }
+                            if(tLeftClip > invertedIndexData.maxEndFuzz && tRightClip > invertedIndexData.maxEndFuzz) {
+                                continue;
+                            }
+                            const uint32_t leftNeed = std::min(al.qs, tLeftClip);
+                            const uint32_t rightNeed = std::min(qRightClip, tRightClip);
                             if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
                                 continue;
                             }

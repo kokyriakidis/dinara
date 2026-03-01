@@ -786,6 +786,13 @@ public:
     
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
+    // Experimental: EC parity using induced alignments through marker graph vertices.
+    // Requires marker graph vertices to be already created.
+    // Replaces the SNP/SV detection pipeline with vertex-ordering consistency.
+    void performHifiasmECParityWithMarkerGraph(uint64_t threadCount);
+    // Debug: run het-site detection for one read and print all SNP/SV sites.
+    // Call after computeAlignmentsWithEvidence().
+    void debugPrintHetSitesForRead(uint64_t readId);
     // Experimental global-site based phasing/EC pass.
     void performGlobalSiteECParity(uint64_t threadCount);
 
@@ -1198,7 +1205,6 @@ public:
         double maxDriftRate,
         uint64_t maxChainLimit,
         const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 
@@ -1874,22 +1880,36 @@ public:
         double maxDropRate,
         uint32_t maxShortTipReads);
     void cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads);
-    void cleanStringGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
-    void cleanStringGraphDropOverlapRoundsHifiasm(
-        uint32_t cleanRounds,
-        double minDropRate,
-        double maxDropRate,
-        uint32_t maxShortTipReads,
-        uint32_t finalMinOverlapLen);
+    void cleanStringGraphDropShortOverlaps(double lenRatio, uint32_t minOverlapLen, uint32_t maxShortTipReads);
+	    void cleanStringGraphDropOverlapRoundsHifiasm(
+	        uint32_t cleanRounds,
+	        double minDropRate,
+	        double maxDropRate,
+	        uint32_t maxShortTipReads,
+	        uint32_t finalMinOverlapLen);
 
-    // ONT-only hifiasm parity: weak arc cutting (ul_clean_gfa: asg_arc_cut_weak) on the StringGraph.
-    uint64_t cutStringGraphWeakArcsOntHifiasm(uint32_t maxExtReads, double lenRatio, uint32_t minDiff);
-    uint64_t cleanStringGraphBreakShortCycles(uint32_t maxCycleReads);
+		    // ONT-only hifiasm parity: weak arc cutting (ul_clean_gfa: asg_arc_cut_weak) on the StringGraph.
+		    uint64_t cutStringGraphWeakArcsOntHifiasm(uint32_t maxExtReads, double lenRatio, uint32_t minDiff);
+		    // Hifiasm parity: `asg_iterative_semi_circ` (semi-circular edge cutting, plus optional chimeric-bubble cut).
+		    // `limLen` corresponds to hifiasm's LIM_LEN (100).
+		    // `normalLen` corresponds to hifiasm's `normal_len` / `max_tip` (typically maxShortTipReads).
+		    uint64_t cleanStringGraphBreakShortCycles(uint32_t limLen);
+		    uint64_t cleanStringGraphBreakShortCycles(uint32_t limLen, uint32_t normalLen);
+		    uint64_t cleanStringGraphRemoveSingleNodeBubbles(uint32_t maxShortTipReads);
+		    uint64_t cleanStringGraphChimericReads();
+		    uint64_t cleanStringGraphInexactOverlaps(uint32_t maxShortTipReads, uint32_t minDiff);
+		    uint64_t cleanStringGraphBubbleLinks(double lenRat, double secLenRat, uint32_t maxShortTipReads);
+		    uint64_t cleanStringGraphComplexBubbleLinks(double lenRat);
+		    uint64_t cleanStringGraphLargeIndelArcs(uint32_t maxShortTipReads, uint32_t minDiff);
+		    uint64_t cutStringGraphSemiCircular(uint32_t limLen);
 
-    void cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs);
-    void cleanUnitigGraphPreCleanHifiasm(uint32_t maxShortTipUnitigs);
-    void cleanUnitigGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
-    void cleanUnitigGraphDropOverlapRoundsHifiasm(
+	    uint64_t transitiveReduceUnitigGraph(uint32_t gapFuzz);
+	    uint64_t cutUnitigGraphTips(uint32_t maxShortTipUnitigs);
+	    uint64_t removeUnitigGraphOneStepBubbles();
+	    void cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs);
+	    void cleanUnitigGraphPreCleanHifiasm(uint32_t maxShortTipUnitigs);
+	    void cleanUnitigGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
+	    void cleanUnitigGraphDropOverlapRoundsHifiasm(
         uint32_t cleanRounds,
         double minDropRate,
         double maxDropRate,
@@ -2471,7 +2491,6 @@ public:
         double maxDriftRate,
         uint64_t maxChainLimit,
         const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 
@@ -2480,7 +2499,6 @@ public:
         double maxDriftRate,
         uint64_t maxChainLimit,
         const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint32_t minChainedMarkerCount,
         uint64_t threadCount
     );
 private:

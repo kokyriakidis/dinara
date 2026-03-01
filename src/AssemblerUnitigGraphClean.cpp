@@ -146,10 +146,12 @@ static void rebuildUnitigGraphAdjacency(Assembler& assembler, uint64_t vertexCou
 
 
 
-static uint64_t unitigGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz, uint32_t vertexCount)
+uint64_t Assembler::transitiveReduceUnitigGraph(uint32_t gapFuzz)
 {
-    UnitigGraph& g = assembler.unitigGraph;
-    rebuildUnitigGraphAdjacency(assembler, vertexCount);
+    checkUnitigGraphIsOpen();
+    UnitigGraph& g = unitigGraph;
+    const uint32_t vertexCount = uint32_t(2 * g.unitigs.size());
+    rebuildUnitigGraphAdjacency(*this, vertexCount);
 
     vector<uint8_t> mark(vertexCount, 0);
     uint64_t reduced = 0;
@@ -169,7 +171,7 @@ static uint64_t unitigGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz,
             mark[g.arcs[arcId].to] = 1;
         }
 
-        const uint32_t L = g.arcs[out.back()].len + fuzz;
+        const uint32_t L = g.arcs[out.back()].len + gapFuzz;
         for (const uint32_t arcIdVw : out) {
             const uint32_t w = g.arcs[arcIdVw].to;
             if (mark[w] != 1) continue;
@@ -198,23 +200,25 @@ static uint64_t unitigGraphTransitiveReduce(Assembler& assembler, uint32_t fuzz,
 
     if (reduced) {
         symmetrizeArcDeletion(g);
-        rebuildUnitigGraphAdjacency(assembler, vertexCount);
+        rebuildUnitigGraphAdjacency(*this, vertexCount);
     }
     return reduced;
 }
 
 
 
-static uint64_t unitigGraphCutTips(Assembler& assembler, uint32_t maxShortTipUnitigs, uint32_t vertexCount)
+uint64_t Assembler::cutUnitigGraphTips(uint32_t maxShortTipUnitigs)
 {
-    UnitigGraph& g = assembler.unitigGraph;
+    checkUnitigGraphIsOpen();
+    UnitigGraph& g = unitigGraph;
+    const uint32_t vertexCount = uint32_t(2 * g.unitigs.size());
     if (maxShortTipUnitigs == 0) return 0;
 
     uint64_t cutCount = 0;
     vector<uint32_t> path;
     path.reserve(maxShortTipUnitigs + 4);
 
-    rebuildUnitigGraphAdjacency(assembler, vertexCount);
+    rebuildUnitigGraphAdjacency(*this, vertexCount);
 
     for (uint32_t v = 0; v < vertexCount; ++v) {
         if (g.unitigDeleted.isOpen && g.unitigDeleted[v >> 1U]) continue;
@@ -242,17 +246,19 @@ static uint64_t unitigGraphCutTips(Assembler& assembler, uint32_t maxShortTipUni
 
     if (cutCount) {
         symmetrizeArcDeletion(g);
-        rebuildUnitigGraphAdjacency(assembler, vertexCount);
+        rebuildUnitigGraphAdjacency(*this, vertexCount);
     }
     return cutCount;
 }
 
 
 
-static uint64_t unitigGraphRemoveOneStepBubbles(Assembler& assembler, uint32_t vertexCount)
+uint64_t Assembler::removeUnitigGraphOneStepBubbles()
 {
-    UnitigGraph& g = assembler.unitigGraph;
-    rebuildUnitigGraphAdjacency(assembler, vertexCount);
+    checkUnitigGraphIsOpen();
+    UnitigGraph& g = unitigGraph;
+    const uint32_t vertexCount = uint32_t(2 * g.unitigs.size());
+    rebuildUnitigGraphAdjacency(*this, vertexCount);
 
     vector<uint32_t> inDegree(vertexCount, 0);
     for (uint32_t v = 0; v < vertexCount; ++v) {
@@ -307,7 +313,7 @@ static uint64_t unitigGraphRemoveOneStepBubbles(Assembler& assembler, uint32_t v
 
     if (removed) {
         symmetrizeArcDeletion(g);
-        rebuildUnitigGraphAdjacency(assembler, vertexCount);
+        rebuildUnitigGraphAdjacency(*this, vertexCount);
     }
     return removed;
 }
@@ -390,14 +396,11 @@ uint64_t Assembler::cleanUnitigGraphBreakShortCycles(uint32_t maxCycleUnitigs)
 
 void Assembler::cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs)
 {
-    checkUnitigGraphIsOpen();
-    const uint32_t vertexCount = uint32_t(2 * unitigGraph.unitigs.size());
-
     cout << timestamp << "Unitig graph clean begins." << endl;
     const auto t0 = steady_clock::now();
 
-    const uint64_t reduced = unitigGraphTransitiveReduce(*this, gapFuzz, vertexCount);
-    const uint64_t cut = unitigGraphCutTips(*this, maxShortTipUnitigs, vertexCount);
+    const uint64_t reduced = transitiveReduceUnitigGraph(gapFuzz);
+    const uint64_t cut = cutUnitigGraphTips(maxShortTipUnitigs);
 
     cout << timestamp << "Unitig graph clean complete in " << seconds(steady_clock::now() - t0)
          << " s (transReduced=" << reduced << ", cutTips=" << cut << ")" << endl;
@@ -407,17 +410,14 @@ void Assembler::cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxSho
 
 void Assembler::cleanUnitigGraphPreCleanHifiasm(uint32_t maxShortTipUnitigs)
 {
-    checkUnitigGraphIsOpen();
-    const uint32_t vertexCount = uint32_t(2 * unitigGraph.unitigs.size());
-
     cout << timestamp << "Unitig graph pre-clean begins." << endl;
     const auto t0 = steady_clock::now();
 
     uint64_t total = 0;
     for (uint32_t round = 0; round < 10; ++round) {
         const uint64_t broken = cleanUnitigGraphBreakShortCycles(10);
-        const uint64_t bubbles = unitigGraphRemoveOneStepBubbles(*this, vertexCount);
-        const uint64_t tips = unitigGraphCutTips(*this, maxShortTipUnitigs, vertexCount);
+        const uint64_t bubbles = removeUnitigGraphOneStepBubbles();
+        const uint64_t tips = cutUnitigGraphTips(maxShortTipUnitigs);
         const uint64_t changed = broken + bubbles + tips;
         total += changed;
         if (changed == 0) break;

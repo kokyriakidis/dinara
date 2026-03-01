@@ -213,6 +213,7 @@ void Assembler::createStringGraphUsingSelectedAlignments(const vector<bool>& kee
         a.overlapLen = arc.overlapLen;
         a.alignmentId = alignmentId;
         a.del = 0;
+        a.el = ad.hasLargeIndel ? 0 : 1;   // ≡ hifiasm asg_arc_t::el
         stringGraph.arcs.push_back(a);
 
         StringGraphArc b;
@@ -222,6 +223,7 @@ void Assembler::createStringGraphUsingSelectedAlignments(const vector<bool>& kee
         b.overlapLen = a.overlapLen;
         b.alignmentId = alignmentId;
         b.del = 0;
+        b.el = a.el;   // twin inherits the same el value
         stringGraph.arcs.push_back(b);
     }
 

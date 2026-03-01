@@ -871,7 +871,6 @@ void dinara::main::assemble(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
             assemblerOptions.overlapCandidatesOptions,
-            uint32_t(std::max(0, assemblerOptions.overlapCandidatesOptions.minChainMarkerCount)),
             threadCount
         );
     } else {
@@ -880,7 +879,6 @@ void dinara::main::assemble(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
             assemblerOptions.overlapCandidatesOptions,
-            uint32_t(std::max(0, assemblerOptions.overlapCandidatesOptions.minChainMarkerCount)),
             threadCount
         );
     }
@@ -900,6 +898,32 @@ void dinara::main::assemble(
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
+
+    assembler.performGlobalSiteECParity(threadCount);
+    assembler.debugPrintHetSitesForRead(0);
+
+    return;
+
+    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
+    assembler.createMarkerGraphVertices(
+        2,                                              // minVertexCoverage
+        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+        0,                                              // minVertexCoveragePerStrand
+        false,                                          // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
+        invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
+        threadCount);
+    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+    // Run marker-graph-projected EC parity (updates delete flags on alignments).
+    assembler.performHifiasmECParityWithMarkerGraph(threadCount);
+
+    // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
+    assembler.debugPrintHetSitesForRead(0);
+
+    return;
 
     // // =========================================================================
     // // Overlap Filtering + Clean ReadGraph
@@ -1503,6 +1527,43 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
+    // // const uint64_t minPrimaryCoverage = 2;
+    // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    const uint64_t minPrimaryCoverage = 4;
+    const uint64_t maxPrimaryCoverage = 60;
+    cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
+        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+
+    // // Declare anchors pointer here to avoid scope issues
+    shared_ptr<mode3::Anchors> anchors;
+    anchors = make_shared<mode3::Anchors>(
+        MappedMemoryOwner(assembler),
+        assembler.getReads(),
+        assembler.assemblerInfo->k,
+        *assembler.markers,
+        assembler.markerGraph,
+        minPrimaryCoverage,
+        maxPrimaryCoverage,
+        threadCount,
+        true); // createFromVertices
+
+    // Compute oriented read journeys.
+    anchors->computeJourneys(threadCount);
+
+    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+    return;
+
+
+
+
+
+
+
+
+
+
+
     // Shasta2 default (--min-anchor-graph-edge-coverage).
     const uint64_t minEdgeCoverage = 6;
 
@@ -1522,12 +1583,7 @@ void dinara::main::assemble(
     // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
 
-    // // const uint64_t minPrimaryCoverage = 2;
-    // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
-    const uint64_t minPrimaryCoverage = 4;
-    const uint64_t maxPrimaryCoverage = 40;
-    cout << "Using Shasta-style anchor coverage: minAnchorCoverage = " << minPrimaryCoverage <<
-        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    
 
     const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
     
