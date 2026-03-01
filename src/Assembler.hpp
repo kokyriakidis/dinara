@@ -1610,7 +1610,8 @@ private:
     // orientation (this may involve a swap and/or reverse complement
     // of the AlignmentInfo stored in the alignmentTable).
     vector< pair<OrientedReadId, AlignmentInfo> >
-        findOrientedAlignments(OrientedReadId, bool inReadGraphOnly) const;
+        findOrientedAlignments(OrientedReadId, bool inReadGraphOnly,
+            vector<uint32_t>* alignmentIds = nullptr) const;
 
 public:
     // Like findOrientedAlignments, but returns alignment ids sorted by the number of informative
@@ -3265,7 +3266,8 @@ public:
         OrientedReadId,
         const vector< pair<OrientedReadId, AlignmentInfo> >&,
         bool showIsInReadGraphFlag,
-        ostream&) const;
+        ostream&,
+        const vector<uint32_t>* alignmentIds = nullptr) const;
     void displayAlignment(
         OrientedReadId orientedReadId0,
         OrientedReadId orientedReadId1,

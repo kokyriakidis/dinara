@@ -730,13 +730,14 @@ void Assembler::exploreAlignments(
 
 
     // Loop over the alignments that this oriented read is involved in, with the proper orientation.
+    vector<uint32_t> alignmentIds;
     const vector< pair<OrientedReadId, AlignmentInfo> > alignments =
-        findOrientedAlignments(orientedReadId0, whichAlignments=="ReadGraphAlignments");
+        findOrientedAlignments(orientedReadId0, whichAlignments=="ReadGraphAlignments", &alignmentIds);
     if(alignments.empty()) {
         html << "<p>No alignments found.";
     } else {
         html << "<p>Found " << alignments.size() << " alignments.";
-        displayAlignments(orientedReadId0, alignments, true, html);
+        displayAlignments(orientedReadId0, alignments, true, html, &alignmentIds);
     }
 
 }
@@ -851,7 +852,8 @@ void Assembler::displayAlignments(
     OrientedReadId orientedReadId0,
     const vector< pair<OrientedReadId, AlignmentInfo> >& alignments,
     bool showIsInReadGraphFlag,
-    ostream& html) const
+    ostream& html,
+    const vector<uint32_t>* alignmentIds) const
 {
     const ReadId readId0 = orientedReadId0.getReadId();
     const Strand strand0 = orientedReadId0.getStrand();
@@ -935,6 +937,7 @@ void Assembler::displayAlignments(
     }
     html <<
         "<th rowspan=2>Alignment sketch"
+        "<th rowspan=2>Delete<br>reasons"
         "<tr>"
         "<th>Min"
         "<th>Ave"
@@ -1047,6 +1050,35 @@ void Assembler::displayAlignments(
             "background-color:white;height:6px;width:" << double(maxRightHang+rightTrim0-rightTrim1)/markersPerPixel <<
             "px;'></div>"
              ;
+
+        // Write the delete reasons cell.
+        html << "<td class=centered style='font-size:80%;color:red'>";
+        if(alignmentIds && i < alignmentIds->size()) {
+            const uint32_t id = (*alignmentIds)[i];
+            const AlignmentData& ad = alignmentData[id];
+            const auto r0 = ad.deleteReasons0;
+            const auto r1 = ad.deleteReasons1;
+            const auto r = r0 | r1;
+            if(r == AlignmentData::DeleteReasonNone) {
+                html << "<span style='color:green'>&#10003;</span>";
+            } else {
+                bool first = true;
+                auto bit = [&](AlignmentData::DeleteReasonMask mask, const char* name) {
+                    if(r & mask) { if(!first) html << "<br>"; html << name; first = false; }
+                };
+                bit(AlignmentData::DeleteReasonPhase,          "Phase");
+                bit(AlignmentData::DeleteReasonSecondary,      "Secondary");
+                bit(AlignmentData::DeleteReasonChemical,       "Chemical");
+                bit(AlignmentData::DeleteReasonChimeric,       "Chimeric");
+                bit(AlignmentData::DeleteReasonLocal,          "Local");
+                bit(AlignmentData::DeleteReasonCoverageCut,    "CoverageCut");
+                bit(AlignmentData::DeleteReasonHanging,        "Hanging");
+                bit(AlignmentData::DeleteReasonContained,      "Contained");
+                bit(AlignmentData::DeleteReasonPalindromic,    "Palindromic");
+                bit(AlignmentData::DeleteReasonContainedPrune, "ContainedPrune");
+                bit(AlignmentData::DeleteReasonClique,         "Clique");
+            }
+        }
     }
 
     html << "</table>";

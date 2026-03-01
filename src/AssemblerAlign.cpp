@@ -1643,7 +1643,8 @@ void Assembler::checkAlignmentDataAreOpen() const
 vector< pair<OrientedReadId, dinara::AlignmentInfo> >
     Assembler::findOrientedAlignments(
         OrientedReadId orientedReadId0Argument,
-        bool inReadGraphOnly) const
+        bool inReadGraphOnly,
+        vector<uint32_t>* alignmentIds) const
 {
     const ReadId readId0 = orientedReadId0Argument.getReadId();
     const ReadId strand0 = orientedReadId0Argument.getStrand();
@@ -1684,6 +1685,9 @@ vector< pair<OrientedReadId, dinara::AlignmentInfo> >
         DINARA_ASSERT(orientedReadId0 == orientedReadId0Argument);
 
         result.push_back(make_pair(orientedReadId1, alignmentInfo));
+        if(alignmentIds) {
+            alignmentIds->push_back(i);
+        }
     }
     return result;
 }
