@@ -968,6 +968,7 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
     const uint64_t maxHang = this->hangingFilterMaxHang;
     const double maxHangRate = this->hangingFilterMaxHangRate;
     const uint64_t minOvlp = this->hangingFilterMinOverlap;
+    const uint32_t k = assemblerInfo.isOpen ? uint32_t(assemblerInfo->k) : 0U;
 
     while (getNextBatch(begin, end)) {
         for (uint64_t i = begin; i != end; i++) {
@@ -979,7 +980,36 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
             const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qn));
             const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(tn));
 
-            const uint32_t qs = ad.qs, qe = ad.qe, ts = ad.ts, te = ad.te;
+            // Use marker-based coordinates for accurate hang calculation.
+            // Falls back to raw ad.qs/qe/ts/te if markers are unavailable.
+            uint32_t qs, qe, ts, te;
+            bool usedMarkers = false;
+            if(markers && assemblerInfo.isOpen && k > 0) {
+                const OrientedReadId o0(qn, 0);
+                const OrientedReadId o1(tn, ad.isSameStrand ? 0 : 1);
+                const auto m0 = (*markers)[o0.getValue()];
+                const auto m1 = (*markers)[o1.getValue()];
+                if(!m0.empty() && !m1.empty() &&
+                   ad.info.data[0].lastOrdinal < m0.size() &&
+                   ad.info.data[1].lastOrdinal < m1.size()) {
+                    qs = m0[ad.info.data[0].firstOrdinal].position;
+                    qe = m0[ad.info.data[0].lastOrdinal].position + k;
+                    const uint32_t tsCoreOriented = m1[ad.info.data[1].firstOrdinal].position;
+                    const uint32_t teCoreOriented = m1[ad.info.data[1].lastOrdinal].position + k;
+                    if(o1.getStrand() != 0) {
+                        ts = tLen - teCoreOriented;
+                        te = tLen - tsCoreOriented;
+                    } else {
+                        ts = tsCoreOriented;
+                        te = teCoreOriented;
+                    }
+                    usedMarkers = true;
+                }
+            }
+            if(!usedMarkers) {
+                qs = ad.qs; qe = ad.qe; ts = ad.ts; te = ad.te;
+            }
+
             if (qe <= qs || te <= ts) continue;
 
             const int result = ma_hit2arc_containment(
