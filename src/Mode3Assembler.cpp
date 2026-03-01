@@ -43,6 +43,14 @@ Mode3Assembler::Mode3Assembler(
     options(options)
 {
     DINARA_ASSERT(anchorsPointer);
+
+    // Mode 3 assembly and the diagnostic writers below require oriented-read journeys.
+    // Some call sites construct Anchors but forget to call Anchors::computeJourneys.
+    // Make this constructor robust by computing journeys on-demand.
+    if(!anchors().journeys.isOpen()) {
+        anchors().computeJourneys(threadCount);
+    }
+
     anchors().writeCoverageHistogram();
     anchors().writeAnchorGapsByRead();
     anchors().writeJourneyEndpoints();

@@ -15,7 +15,11 @@ This is intentionally distinct from `ReadGraph`:
 #include "MemoryMappedVector.hpp"
 #include "ReadId.hpp"
 
+#include <iosfwd>
+#include <string>
+
 namespace dinara {
+    class Reads;
     class StringGraph;
     class StringGraphArc;
 }
@@ -37,6 +41,10 @@ public:
 
     // Reserved for later cleaning stages (transitive reduction, etc).
     uint8_t del = 0;
+
+    // 1 if the alignment has no large indel (≡ hifiasm asg_arc_t::el).
+    // Set from AlignmentData::hasLargeIndel during createStringGraphUsingSelectedAlignments.
+    uint8_t el = 0;
 };
 
 
@@ -57,6 +65,10 @@ public:
     MemoryMapped::Vector<uint8_t> readDeleted;
 
     uint64_t getReverseComplementArcId(uint64_t arcId) const;
+    void writeGfa(const std::string& fileName) const;
+    void writeGfa(std::ostream& gfa) const;
+    void writeGfa(const std::string& fileName, const Reads& reads) const;
+    void writeGfa(std::ostream& gfa, const Reads& reads) const;
     void unreserve();
     void remove();
 };

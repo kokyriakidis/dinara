@@ -97,6 +97,7 @@ Testing:
 #include "LongBaseSequence.hpp"
 #include "Reads.hpp"
 #include "chrono.hpp"
+#include "hifiasmECInternals.hpp"
 #include "timestamp.hpp"
 #include <algorithm>
 #include <atomic>
@@ -146,206 +147,8 @@ namespace dinara::hifiasmEcTestHooks {
 }
 #endif
 
-/*
-Candidate overlap descriptor for a single query read.
-
-All coordinates are stored in the query’s coordinate system:
-  - qs/qe: query interval covered by this overlap (half-open).
-  - ts/te: target interval in the other read (half-open).
-
-The flags mirror hifiasm’s overlap_region bookkeeping:
-  - is_match == 1 means the overlap is currently kept (cis).
-  - is_match == 2 means the overlap is marked trans and should be filtered for this query.
-  - strong mirrors hifiasm’s “strong” flag (kept for parity naming/telemetry).
-*/
-struct CandidateEC {
-    uint32_t alignmentId;
-    uint64_t qs, qe, ts, te;
-    uint32_t targetId;
-    bool isRev;
-    uint8_t is_match = 1;
-    uint8_t strong = 0;
-};
-
-/*
-Per-allele statistics for a single SNP row.
-
-Hifiasm models multi-allelic sites as multiple “rows” sharing the same genomic position,
-one row per alternative base. We match that shape because downstream DP and trans-closure
-logic is written in “row space”, not “site space”.
-
-The occ_0/occ_1 counters are defined on the query read:
-  - occ_1 is the number of overlaps supporting this specific alternative base at this site.
-  - occ_0 is the number of overlaps supporting the query base (ref) at this site, plus 1 for
-    the query read itself.
-*/
-struct SnpStats {
-    uint32_t site;
-    uint32_t occ_0;
-    uint32_t occ_1;
-    uint32_t fwd_ref_cov;
-    char refBase; 
-    char altBase; 
-    uint8_t is_homopolymer;
-    int score;
-    int dpScore;
-    
-    SnpStats() {
-        site = (uint32_t)-1;
-        occ_0 = occ_1 = 0;
-        fwd_ref_cov = 0;
-        refBase = altBase = 0;
-        is_homopolymer = 0;
-        score = 0;
-        dpScore = 0;
-    }
-};
-
-/*
-Per-overlap evidence entry for a single site.
-
-This is the compact representation used by downstream phases:
-  - overlapID indexes into the per-query candidates[] array.
-  - site is the query-coordinate position of the event.
-  - overlapSite is the SNP-row index (row in snpStats/svStats) for quick lookups.
-  - type encodes the evidence kind:
-      0 -> ref/supports query base at this site
-      1 -> alt/mismatch base at this site
-      2 -> SV/indel support (used in SV stage)
-  - misBase stores the alt base for type==1.
-  - hp is a homopolymer-suspect flag (parity with hifiasm’s hh_hp tagging).
-*/
-struct HaplotypeEvidence {
-    uint32_t overlapID;
-    uint32_t site;
-    uint32_t overlapSite;
-    uint8_t type;
-    uint8_t misBase;
-    bool hp;
-
-    bool operator<(const HaplotypeEvidence& other) const {
-        if(site != other.site) return site < other.site;
-        return overlapID < other.overlapID;
-    }
-};
-
-/*
-Sweep-line event for coverage computation.
-
-We compute per-site coverage across potentially many overlaps by turning overlap intervals into
-start/end events in site-index space. Sorting these events lets us maintain an active set size
-while iterating sites in increasing order.
-*/
-struct SweepEvent {
-    size_t siteIdx;
-    uint32_t candIdx;
-    bool isEnd;
-    bool operator<(const SweepEvent& other) const {
-        if(siteIdx != other.siteIdx) return siteIdx < other.siteIdx;
-        return isEnd < other.isEnd;
-    }
-};
-
-struct RawSV {
-    uint32_t overlapID;
-    uint32_t site; 
-    int64_t size; 
-};
-
-struct RphaseDpTiming {
-    double buildAltAnyBits = 0.;
-    double buildRefBits = 0.;
-    double buildHpBits = 0.;
-    double transitions = 0.;
-    double extractPaths = 0.;
-};
-
-/*
-Thread-local scratchpad for the parity EC pipeline.
-
-The pipeline creates many temporary arrays (sites, events, bitsets, per-overlap groupings).
-Reallocating them per read is expensive, so each worker thread keeps one scratchpad and reuses
-storage across reads.
-
-Most vectors are multi-purpose buffers that are “reinterpreted” at different phases. This is
-intentional to reduce peak memory and allocation churn.
-*/
-struct HifiasmECScratchPad {
-    struct GapInterval {
-        uint32_t begin;
-        uint32_t end;
-    };
-
-    vector<CandidateEC> candidates;
-    vector<SnpStats> snpStats;
-    vector<HaplotypeEvidence> hapEvidence;
-    vector<SnpStats> svStats;
-    vector<HaplotypeEvidence> svEvidence;
-
-    vector<uint32_t> uniqueSites;
-    vector<int32_t> diffTotal;
-    vector<int32_t> diffFwd;
-    vector<uint32_t> siteTotalCov;
-    vector<uint32_t> siteFwdCov;
-
-    vector<uint32_t> insertionOffsets;
-    vector<GapInterval> insertionIntervals;
-    vector<uint32_t> insertionBaseCount;
-
-    vector<int> validIndices;
-    vector<int64_t> f;
-    vector<int> p;
-    vector<int> indexMap;
-    vector<uint64_t> flatBits;
-    vector<uint64_t> flatAnyBits;
-    vector<uint64_t> flatHpBits;
-    vector<SweepEvent> events;
-    vector<SweepEvent> gapEvents;
-    vector<uint64_t> active;
-    vector<uint64_t> gapped;
-
-    vector<RawSV> rawSVs;
-    vector<size_t> svIndices;
-    vector<uint8_t> unpackedRead;
-    vector<uint8_t> covered;
-    vector<uint32_t> path;
-    vector<uint64_t> supportBits;
-    vector<uint64_t> conflictBits;
-
-    void clear() {
-        candidates.clear();
-        snpStats.clear();
-        hapEvidence.clear();
-        svStats.clear();
-        svEvidence.clear();
-        uniqueSites.clear();
-        diffTotal.clear();
-        diffFwd.clear();
-        siteTotalCov.clear();
-        siteFwdCov.clear();
-        insertionOffsets.clear();
-        insertionIntervals.clear();
-        insertionBaseCount.clear();
-        validIndices.clear();
-        f.clear();
-        p.clear();
-        indexMap.clear();
-        flatBits.clear();
-        flatAnyBits.clear();
-        flatHpBits.clear();
-        events.clear();
-        gapEvents.clear();
-        active.clear();
-        gapped.clear();
-        rawSVs.clear();
-        svIndices.clear();
-        unpackedRead.clear();
-        covered.clear();
-        path.clear();
-        supportBits.clear();
-        conflictBits.clear();
-    }
-};
+// CandidateEC, SnpStats, HaplotypeEvidence, SweepEvent, RawSV, RphaseDpTiming,
+// and HifiasmECScratchPad are defined in hifiasmECInternals.hpp (included above).
 
 /*
 Return the base character at position pos in a read, with bounds checking.
@@ -681,7 +484,7 @@ static void detectHetSites(
 
         const uint32_t evidenceId32 = uint32_t(evidenceId);
         auto addEv = [&](uint32_t currentPos, uint8_t base) {
-            if (currentPos < unpacked.size() && base == unpacked[currentPos]) {
+            if (currentPos >= unpacked.size() || base == unpacked[currentPos]) {
                 return;
             }
             HaplotypeEvidence ev;
@@ -1274,10 +1077,10 @@ WHY THIS MATTERS:
   Singleton paths require extra validation (cc threshold, HP check) to avoid
   false positives. Getting this right determines error correction accuracy.
 */
-static void gen_rphase_dp(
+void gen_rphase_dp(
     Assembler& assembler,
     HifiasmECScratchPad& scratch,
-    RphaseDpTiming* timing = nullptr
+    RphaseDpTiming* timing
 ) {
     auto& snpStats = scratch.snpStats;
     auto& hapEvidence = scratch.hapEvidence;
@@ -2367,7 +2170,7 @@ DOWNSTREAM IMPACT:
 
   This is the final and most impactful stage of the EC pipeline.
 */
-static void generate_haplotypes_naive_HiFi(
+void generate_haplotypes_naive_HiFi(
     Assembler& /* assembler */,
     HifiasmECScratchPad& scratch
 ) {
@@ -4232,4 +4035,592 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 void Assembler::performHifiasmECFinalFilteringParity(uint64_t /* threadCount */)
 {
     cout << timestamp << "=== Hifiasm Parity EC Final Filtering (ha_ec_ff) ===" << endl;
+}
+
+
+
+// Experimental EC parity using induced alignments through marker graph vertices.
+//
+// Instead of the SNP/SV detection + DP chaining pipeline, this function uses the
+// *ordering consistency* of shared marker graph vertices between each pair of
+// overlapping reads as the cis/trans phasing signal.
+//
+// For each read R (forward strand = strand 0):
+//   For each overlapping candidate read R2:
+//     Induced alignment = sequence of (R_ordinal_i, R2_ordinal_j) pairs at each
+//     marker graph vertex shared between R and R2.
+//   A candidate is "consistent" (cis) if the R2 ordinals are monotonically
+//   non-decreasing when sorted by R ordinals — i.e., the shared vertices appear
+//   in the same relative order in both reads.
+//   A candidate is "inconsistent" (trans) if there is at least one ordinal inversion.
+//
+// A read is "informative" (analogous to having het SNP sites) if ANY of its
+// candidates show an ordering inconsistency.  When informative, we keep only
+// consistent candidates that also meet the minimum shared-vertex threshold.
+// When not informative, all candidates are kept (no phasing signal available).
+//
+// Prerequisite: marker graph vertices must have been created before calling this.
+// The function is a drop-in replacement for performHifiasmECParity in main.cpp.
+void Assembler::performHifiasmECParityWithMarkerGraph(uint64_t threadCount)
+{
+    cout << timestamp << "=== Marker Graph Projected EC Parity ===" << endl;
+
+    DINARA_ASSERT(markers && markers->isOpen());
+    DINARA_ASSERT(markerGraph.vertices().isOpen());
+
+    const uint64_t readCount = reads->readCount();
+    const auto tBeginAll = steady_clock::now();
+
+    // Minimum shared vertices required to label a candidate as cis.
+    // Candidates with fewer shared vertices are kept regardless (insufficient evidence).
+    const uint32_t minSharedVertices = 3;
+
+    // Per-candidate bookkeeping.
+    struct MgCandidate {
+        uint32_t alignmentId  = 0;
+        uint32_t targetReadId = 0;
+        bool     isRev        = false;   // true = different-strand (RC) overlap
+        // Induced alignment: (R_ordinal_i, target_ordinal_j) at shared vertices.
+        // Populated during Stage 2; sorted by R_ordinal in Stage 3.
+        vector<pair<uint32_t, uint32_t>> induced;
+        bool     consistent   = true;    // no ordinal inversion found
+        uint32_t sharedCount  = 0;       // |induced| after dedup
+    };
+
+    atomic<uint64_t> totalReads{0};
+    atomic<uint64_t> readsWithCandidates{0};
+    atomic<uint64_t> readsInformative{0};
+    atomic<uint64_t> transMarkedNew{0};
+
+    vector<thread> threads;
+    const uint64_t chunkSize = max(uint64_t(1), readCount / threadCount);
+
+    for (uint64_t t = 0; t < threadCount; ++t) {
+        threads.emplace_back([&, t]() {
+            const uint64_t tStart = t * chunkSize;
+            const uint64_t tEnd   = (t == threadCount - 1) ? readCount : (t + 1) * chunkSize;
+
+            // Thread-local scratch to avoid per-read heap allocations.
+            vector<MgCandidate> candidates;
+            // Sorted (key, candidateIdx) for O(log n) lookup during vertex traversal.
+            // key = (readId << 1) | strand, where strand encodes isRev.
+            vector<pair<uint64_t, uint32_t>> candLookup;
+
+            uint64_t localReads = 0, localWithCandidates = 0;
+            uint64_t localInformative = 0, localTransMarked = 0;
+
+            for (uint64_t readId = tStart; readId < tEnd; ++readId) {
+                ++localReads;
+                const OrientedReadId orientedReadId(ReadId(readId), 0);
+                if (orientedReadId.getValue() >= alignmentTable.size()) continue;
+
+                const auto& alignments = alignmentTable[orientedReadId.getValue()];
+                if (alignments.empty()) continue;
+
+                // ----------------------------------------------------------------
+                // Stage 1: gather non-deleted candidates.
+                // Normalize so R is always in the strand-0 (forward) frame.
+                // Same normalization logic as performHifiasmECParity.
+                // ----------------------------------------------------------------
+                candidates.clear();
+                candLookup.clear();
+
+                for (const uint32_t alignmentId : alignments) {
+                    const AlignmentData& ad = alignmentData[alignmentId];
+                    if (!ad.keptByBothSides()) continue;
+
+                    OrientedReadId o0(ad.readIds[0], 0);
+                    OrientedReadId o1(ad.readIds[1], ad.isSameStrand ? 0 : 1);
+
+                    // Swap so that o0 is always R.
+                    if (o0.getReadId() != ReadId(readId)) {
+                        swap(o0, o1);
+                    }
+                    DINARA_ASSERT(o0.getReadId() == ReadId(readId));
+
+                    // Flip if R ended up in strand-1 after the swap.
+                    if (o0.getStrand() != 0) {
+                        o0.flipStrand();
+                        o1.flipStrand();
+                    }
+                    DINARA_ASSERT(o0.getStrand() == 0);
+
+                    MgCandidate cand;
+                    cand.alignmentId  = alignmentId;
+                    cand.targetReadId = uint32_t(o1.getReadId());
+                    cand.isRev        = (o1.getStrand() != 0);
+
+                    // Encode (readId, strand) into a uint64 key.
+                    // isRev=false -> strand=0 ; isRev=true -> strand=1.
+                    const uint64_t key =
+                        (uint64_t(cand.targetReadId) << 1) | (cand.isRev ? 1U : 0U);
+                    candLookup.emplace_back(key, uint32_t(candidates.size()));
+                    candidates.push_back(move(cand));
+                }
+
+                if (candidates.empty()) continue;
+                ++localWithCandidates;
+
+                sort(candLookup.begin(), candLookup.end());
+
+                // ----------------------------------------------------------------
+                // Stage 2: build induced alignments via shared marker graph vertices.
+                //
+                // For each marker ordinal i in R (strand=0):
+                //   vi = vertexTable[markerId]
+                //   for each other marker at vi → (otherOriented, otherOrdinal):
+                //     strand convention:
+                //       isRev=false candidate → we want otherOriented.strand == 0
+                //       isRev=true  candidate → we want otherOriented.strand == 1
+                //     if found in candLookup: record (i, otherOrdinal) for that candidate.
+                //
+                // Ordinal monotonicity holds in both same-strand and RC overlaps:
+                //   as R's ordinal i increases, the target ordinal j also increases
+                //   (both iterate left-to-right in their respective oriented frames).
+                // ----------------------------------------------------------------
+                const MarkerId firstMkR =
+                    MarkerId(markers->begin(orientedReadId.getValue()) - markers->begin());
+                const uint32_t mkCountR =
+                    uint32_t(markers->size(orientedReadId.getValue()));
+
+                for (uint32_t i = 0; i < mkCountR; ++i) {
+                    const MarkerId mkId = firstMkR + i;
+                    const auto vi = markerGraph.vertexTable[mkId];
+                    if (vi == MarkerGraph::invalidCompressedVertexId) continue;
+
+                    for (const MarkerId otherMkId : markerGraph.getVertexMarkerIds(vi)) {
+                        if (otherMkId == mkId) continue;   // skip R's own marker
+
+                        OrientedReadId otherOriented;
+                        uint32_t otherOrdinal;
+                        tie(otherOriented, otherOrdinal) = findMarkerId(otherMkId);
+
+                        // Lookup by (readId << 1 | strand).
+                        const uint64_t key =
+                            (uint64_t(otherOriented.getReadId()) << 1) |
+                            uint64_t(otherOriented.getStrand());
+                        const auto lo = lower_bound(
+                            candLookup.begin(), candLookup.end(),
+                            make_pair(key, uint32_t(0)));
+                        if (lo == candLookup.end() || lo->first != key) continue;
+
+                        candidates[lo->second].induced.emplace_back(i, otherOrdinal);
+                        ++candidates[lo->second].sharedCount;
+                    }
+                }
+
+                // ----------------------------------------------------------------
+                // Stage 3: check ordering consistency for each candidate.
+                //   Sort induced alignment by R ordinal.
+                //   Deduplicate ties at the same R ordinal (keep first).
+                //   Check if target ordinals are non-decreasing → consistent.
+                // ----------------------------------------------------------------
+                bool anyInconsistency = false;
+
+                for (auto& cand : candidates) {
+                    if (cand.sharedCount < 2) continue;   // need ≥2 points to check order
+
+                    sort(cand.induced.begin(), cand.induced.end());   // sort by R ordinal
+
+                    // Deduplicate: at equal R ordinals keep only the first entry.
+                    {
+                        uint32_t w = 0;
+                        for (uint32_t r = 0; r < uint32_t(cand.induced.size()); ++r) {
+                            if (w == 0 || cand.induced[r].first != cand.induced[w - 1].first) {
+                                cand.induced[w++] = cand.induced[r];
+                            }
+                        }
+                        cand.induced.resize(w);
+                        cand.sharedCount = w;
+                    }
+
+                    if (cand.sharedCount < 2) continue;
+
+                    // Monotone check: target ordinals non-decreasing as R ordinal increases.
+                    bool mono = true;
+                    for (uint32_t k = 1; k < uint32_t(cand.induced.size()); ++k) {
+                        if (cand.induced[k].second < cand.induced[k - 1].second) {
+                            mono = false;
+                            break;
+                        }
+                    }
+                    cand.consistent = mono;
+                    if (!mono) anyInconsistency = true;
+                }
+
+                // "Informative" = at least one candidate has an ordering violation,
+                // analogous to having validated het SNP/SV sites.
+                const bool isInformative = anyInconsistency;
+                if (isInformative) ++localInformative;
+
+                // ----------------------------------------------------------------
+                // Stage 4: phase decision and flag write-back.
+                //   If informative : keep only consistent candidates with sufficient
+                //                    shared-vertex evidence.
+                //   If not informative : keep all (no signal to filter on).
+                //
+                // Same flag semantics as performHifiasmECParity:
+                //   keep  → clear DeleteReasonPhase for this read's side
+                //   trans → set   DeleteReasonPhase for this read's side
+                // ----------------------------------------------------------------
+                for (const auto& cand : candidates) {
+                    AlignmentData& ad = alignmentData[cand.alignmentId];
+
+                    bool keep;
+                    if (!isInformative) {
+                        keep = true;
+                    } else {
+                        keep = cand.consistent && (cand.sharedCount >= minSharedVertices);
+                    }
+
+                    if (keep) {
+                        ad.clearDeleteReasonsFromReadPerspective(
+                            ReadId(readId), AlignmentData::DeleteReasonPhase);
+                        ad.info.isInReadGraph = 1;
+                    } else {
+                        ad.addDeleteReasonsFromReadPerspective(
+                            ReadId(readId), AlignmentData::DeleteReasonPhase);
+                        ++localTransMarked;
+                    }
+                }
+            }
+
+            totalReads          += localReads;
+            readsWithCandidates += localWithCandidates;
+            readsInformative    += localInformative;
+            transMarkedNew      += localTransMarked;
+        });
+    }
+
+    for (auto& th : threads) th.join();
+
+    // Recompute the combined informative-site overlap score (now vertex-based).
+    for (AlignmentData& ad : alignmentData) {
+        ad.updateInformativeHetSiteScore();
+    }
+
+    const double tAll = seconds(steady_clock::now() - tBeginAll);
+    uint64_t keptByBoth = 0;
+    for (const AlignmentData& ad : alignmentData) {
+        if (ad.keptByBothSides()) ++keptByBoth;
+    }
+
+    cout << timestamp
+         << "Marker Graph EC wall time: " << tAll << " s"
+         << "  reads=" << totalReads
+         << "  withCandidates=" << readsWithCandidates
+         << "  informative=" << readsInformative
+         << "  transMarked=" << transMarkedNew
+         << "  keptByBoth=" << keptByBoth
+         << endl;
+    cout << timestamp << "Marker Graph EC Complete." << endl;
+}
+
+
+
+// Debug helper: run het-site detection for a single read and print all SNP/SV sites
+// together with the per-overlap evidence, so they can be inspected interactively.
+//
+// Call this after computeAlignmentsWithEvidence() (which populates alignmentTable,
+// alignmentData and alignedEvidenceStore).
+void Assembler::debugPrintHetSitesForRead(uint64_t readId)
+{
+    using std::setw;
+    using std::left;
+    using std::right;
+
+    const OrientedReadId orientedReadId(ReadId(readId), 0);
+    if (orientedReadId.getValue() >= alignmentTable.size()) {
+        cout << "[HetDebug] readId=" << readId << " not in alignmentTable (size="
+             << alignmentTable.size() << ")\n";
+        return;
+    }
+    const auto& alignments = alignmentTable[orientedReadId.getValue()];
+    const uint32_t readLen = uint32_t(reads->getRead(ReadId(readId)).baseCount);
+
+    cout << "\n";
+    cout << "╔══════════════════════════════════════════════════════════════════╗\n";
+    cout << "║  Het-site debug  read=" << readId << "-0   len=" << readLen << " bp\n";
+    cout << "╚══════════════════════════════════════════════════════════════════╝\n";
+    cout << "  Alignments in table : " << alignments.size() << "\n";
+
+    // -----------------------------------------------------------------------
+    // Gather candidates (exact copy of the logic in performHifiasmECParity).
+    // -----------------------------------------------------------------------
+    HifiasmECScratchPad scratch;
+    scratch.clear();
+    auto& candidates = scratch.candidates;
+    candidates.reserve(alignments.size());
+
+    for (uint32_t alignmentId : alignments) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        // Include reads deleted only for phase reasons (trans) so that
+        // detectHetSites can still see both allele groups.  Only exclude reads
+        // deleted for other reasons (containment, chemistry, etc.).
+        constexpr AlignmentData::DeleteReasonMask nonPhase =
+            ~AlignmentData::DeleteReasonPhase;
+        if ((ad.deleteReasons0 & nonPhase) || (ad.deleteReasons1 & nonPhase)) continue;
+
+        CandidateEC candidate;
+        candidate.alignmentId = alignmentId;
+
+        const OrientedReadId queryOriented(ReadId(readId), 0);
+        OrientedReadId o0(ad.readIds[0], 0);
+        OrientedReadId o1(ad.readIds[1], ad.isSameStrand ? 0 : 1);
+        AlignmentInfo orientedInfo = ad.info;
+
+        if (o0.getReadId() != queryOriented.getReadId()) {
+            swap(o0, o1);
+            orientedInfo.swap();
+        }
+        if (o0.getStrand() != queryOriented.getStrand()) {
+            o0.flipStrand();
+            o1.flipStrand();
+            orientedInfo.reverseComplement();
+        }
+
+        uint32_t qsCore = 0, qeCore = 0, tsCoreOriented = 0, teCoreOriented = 0;
+        bool coordinatesFromMarkers = false;
+        const uint32_t kmerLen = assemblerInfo.isOpen ? uint32_t(assemblerInfo->k) : 0U;
+        if (markers && assemblerInfo.isOpen) {
+            const auto m0 = (*markers)[o0.getValue()];
+            const auto m1 = (*markers)[o1.getValue()];
+            if (!m0.empty() && !m1.empty()) {
+                qsCore = m0[orientedInfo.data[0].firstOrdinal].position;
+                qeCore = m0[orientedInfo.data[0].lastOrdinal].position + kmerLen;
+                tsCoreOriented = m1[orientedInfo.data[1].firstOrdinal].position;
+                teCoreOriented = m1[orientedInfo.data[1].lastOrdinal].position + kmerLen;
+                coordinatesFromMarkers = true;
+            }
+        }
+        if (!coordinatesFromMarkers) {
+            if (ad.readIds[0] == ReadId(readId)) {
+                qsCore = ad.qs; qeCore = ad.qe;
+                tsCoreOriented = ad.ts; teCoreOriented = ad.te;
+            } else {
+                qsCore = ad.ts; qeCore = ad.te;
+                tsCoreOriented = ad.qs; teCoreOriented = ad.qe;
+            }
+        }
+        const uint32_t tLen = uint32_t(reads->getRead(o1.getReadId()).baseCount);
+        uint32_t tsFwd = tsCoreOriented, teFwd = teCoreOriented;
+        if (coordinatesFromMarkers && o1.getStrand() != 0) {
+            tsFwd = tLen - teCoreOriented;
+            teFwd = tLen - tsCoreOriented;
+        }
+
+        candidate.qs       = qsCore;
+        candidate.qe       = qeCore;
+        candidate.ts       = tsFwd;
+        candidate.te       = teFwd;
+        candidate.targetId = uint32_t(o1.getReadId());
+        candidate.isRev    = (o1.getStrand() != 0);
+        candidate.is_match = 1;
+        candidate.strong   = 0;
+        candidates.push_back(candidate);
+    }
+
+    cout << "  Kept candidates     : " << candidates.size() << "\n\n";
+    if (candidates.empty()) {
+        cout << "  (no candidates after keptByBothSides filter)\n";
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Run SNP detection.
+    // -----------------------------------------------------------------------
+    detectHetSites(*this, *reads, readId, alignmentData, scratch);
+
+    // -----------------------------------------------------------------------
+    // Print candidate summary.
+    // -----------------------------------------------------------------------
+    cout << "  Candidates (qs..qe in query-forward coords):\n";
+    cout << "  " << left << setw(6) << "#"
+         << setw(8) << "tgtRead"
+         << setw(5) << "str"
+         << setw(8) << "qs"
+         << setw(8) << "qe"
+         << setw(8) << "span"
+         << setw(8) << "ts"
+         << setw(8) << "te"
+         << "alignId\n";
+    cout << "  " << std::string(59, '-') << "\n";
+    for (size_t ci = 0; ci < candidates.size(); ++ci) {
+        const auto& c = candidates[ci];
+        cout << "  " << left << setw(6) << ci
+             << setw(8) << c.targetId
+             << setw(5) << (c.isRev ? "RC" : "FW")
+             << setw(8) << c.qs
+             << setw(8) << c.qe
+             << setw(8) << (c.qe - c.qs)
+             << setw(8) << c.ts
+             << setw(8) << c.te
+             << c.alignmentId << "\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // Print SNP sites table.
+    // -----------------------------------------------------------------------
+    const auto& snpStats = scratch.snpStats;
+    // Count how many sites pass the alt>=3 filter.
+    size_t snpAlt3Count = 0;
+    for (const auto& s : snpStats) { if (s.occ_1 >= 3) ++snpAlt3Count; }
+    cout << "\n  SNP sites with alt>=3 (" << snpAlt3Count
+         << " of " << snpStats.size() << " total):\n";
+
+    // Build row → [overlapIdx list] from hapEvidence (needed for printing and
+    // for the alt-supporter set used to filter the cis read list below).
+    vector<vector<uint32_t>> rowToOverlaps(snpStats.size());
+    for (const auto& ev : scratch.hapEvidence) {
+        if (ev.type == 1 && ev.overlapSite != invalid<uint32_t>
+                && ev.overlapSite < snpStats.size()) {
+            rowToOverlaps[ev.overlapSite].push_back(ev.overlapID);
+        }
+    }
+
+    // Collect reads that support the alt allele at any SNP with occ_1 >= 3.
+    // These are expected to be on the opposite haplotype from readId.
+    std::unordered_set<uint32_t> altSupporters;
+    for (size_t ri = 0; ri < snpStats.size(); ++ri) {
+        if (snpStats[ri].occ_1 < 3) continue;
+        for (const uint32_t oi : rowToOverlaps[ri]) {
+            if (oi < candidates.size())
+                altSupporters.insert(candidates[oi].targetId);
+        }
+    }
+
+    if (!snpStats.empty()) {
+        cout << "  " << left
+             << setw(5)  << "row"
+             << setw(9)  << "pos"
+             << setw(5)  << "ref"
+             << setw(5)  << "alt"
+             << setw(7)  << "occ0"
+             << setw(7)  << "occ1"
+             << setw(6)  << "HP"
+             << setw(8)  << "fwdRef"
+             << "score\n";
+        cout << "  " << std::string(52, '-') << "\n";
+        for (size_t ri = 0; ri < snpStats.size(); ++ri) {
+            const auto& s = snpStats[ri];
+            if (s.occ_1 < 3) continue;
+            cout << "  " << left
+                 << setw(5)  << ri
+                 << setw(9)  << s.site
+                 << setw(5)  << s.refBase
+                 << setw(5)  << s.altBase
+                 << setw(7)  << s.occ_0
+                 << setw(7)  << s.occ_1
+                 << setw(6)  << (s.is_homopolymer ? "yes" : "no")
+                 << setw(8)  << s.fwd_ref_cov
+                 << s.score << "\n";
+        }
+
+        // Per-overlap support breakdown for each SNP row.
+        cout << "\n  Per-overlap alt evidence (row → overlap, alt>=3 only):\n";
+        for (size_t ri = 0; ri < snpStats.size(); ++ri) {
+            const auto& s = snpStats[ri];
+            if (s.occ_1 < 3) continue;
+            const auto& ovList = rowToOverlaps[ri];
+            cout << "    row " << ri << " pos=" << s.site
+                 << " " << s.refBase << "->" << s.altBase
+                 << " | alt supported by " << ovList.size() << " overlap(s): ";
+            for (uint32_t oi : ovList) {
+                if (oi < candidates.size()) {
+                    cout << "read" << candidates[oi].targetId
+                         << "(" << (candidates[oi].isRev ? "RC" : "FW") << ") ";
+                }
+            }
+            cout << "\n";
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Run and print SV (large indel) sites.
+    // -----------------------------------------------------------------------
+    detectSVSites(*this, *reads, readId, alignmentData, scratch);
+
+    const auto& svStats = scratch.svStats;
+    cout << "\n  SV sites (" << svStats.size() << " rows after emission filters):\n";
+    if (!svStats.empty()) {
+        cout << "  " << left
+             << setw(5)  << "row"
+             << setw(9)  << "pos"
+             << setw(7)  << "occ0"
+             << setw(7)  << "occ1" << "\n";
+        cout << "  " << std::string(28, '-') << "\n";
+        for (size_t ri = 0; ri < svStats.size(); ++ri) {
+            const auto& s = svStats[ri];
+            cout << "  " << left
+                 << setw(5)  << ri
+                 << setw(9)  << s.site
+                 << setw(7)  << s.occ_0
+                 << setw(7)  << s.occ_1 << "\n";
+        }
+        // Per-overlap SV support.
+        cout << "\n  Per-overlap SV evidence (row → overlap):\n";
+        vector<vector<uint32_t>> svRowToOverlaps(svStats.size());
+        for (const auto& ev : scratch.svEvidence) {
+            if (ev.overlapSite != invalid<uint32_t>
+                    && ev.overlapSite < svStats.size()) {
+                svRowToOverlaps[ev.overlapSite].push_back(ev.overlapID);
+            }
+        }
+        for (size_t ri = 0; ri < svStats.size(); ++ri) {
+            const auto& s = svStats[ri];
+            const auto& ovList = svRowToOverlaps[ri];
+            cout << "    row " << ri << " pos=" << s.site
+                 << " | supported by " << ovList.size() << " overlap(s): ";
+            for (uint32_t oi : ovList) {
+                if (oi < candidates.size()) {
+                    cout << "read" << candidates[oi].targetId
+                         << "(" << (candidates[oi].isRev ? "RC" : "FW") << ") ";
+                }
+            }
+            cout << "\n";
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Print cis reads: neighbours of readId whose side has no DeleteReasonPhase
+    // AND are not alt-supporters at any confident SNP (occ_1 >= 3).
+    // -----------------------------------------------------------------------
+    cout << "\n  Cis reads (no DeleteReasonPhase, not an alt-supporter at occ_1>=3 SNP):\n";
+    {
+        vector<uint32_t> cisReads;
+        for (const uint32_t alnId : alignments) {
+            const AlignmentData& ad = alignmentData[alnId];
+            const bool isR0 = (ad.readIds[0] == ReadId(readId));
+            const AlignmentData::DeleteReasonMask ourReasons =
+                isR0 ? ad.deleteReasons0 : ad.deleteReasons1;
+            if (ourReasons & AlignmentData::DeleteReasonPhase) continue;
+            const uint32_t partner = isR0 ? uint32_t(ad.readIds[1])
+                                          : uint32_t(ad.readIds[0]);
+            if (altSupporters.count(partner)) continue;
+            cisReads.push_back(partner);
+        }
+        std::sort(cisReads.begin(), cisReads.end());
+        cisReads.erase(std::unique(cisReads.begin(), cisReads.end()), cisReads.end());
+        cout << "  count: " << cisReads.size() << "\n";
+        for (const uint32_t r : cisReads) {
+            cout << "    read" << r << "\n";
+        }
+
+        // Subset: cis reads that also appear as a candidate (valid coordinate entry).
+        std::unordered_set<uint32_t> candidateTargets;
+        for (const CandidateEC& c : candidates) {
+            candidateTargets.insert(c.targetId);
+        }
+        cout << "\n  Cis direct-overlap reads (also in candidates):\n";
+        uint32_t directCisCount = 0;
+        for (const uint32_t r : cisReads) {
+            if (candidateTargets.count(r)) {
+                cout << "    read" << r << "\n";
+                ++directCisCount;
+            }
+        }
+        cout << "  count: " << directCisCount << "\n";
+    }
+
+    cout << "\n[HetDebug] done for read " << readId << "-0.\n\n";
 }

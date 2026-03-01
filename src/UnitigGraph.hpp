@@ -14,6 +14,9 @@ This follows hifiasm's `ma_ug_gen` construction:
 #include "MemoryMappedVectorOfVectors.hpp"
 #include "ReadId.hpp"
 
+#include <iosfwd>
+#include <string>
+
 namespace dinara {
     class UnitigGraph;
     class UnitigGraphArc;
@@ -68,6 +71,9 @@ public:
 
     void remove();
     void unreserve();
+
+    void writeGfa(const std::string& fileName) const;
+    void writeGfa(std::ostream& gfa) const;
 };
 
 #endif
