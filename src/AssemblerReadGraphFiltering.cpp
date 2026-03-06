@@ -843,18 +843,13 @@ those overlaps with DeleteReasonContained.
 
 Uses extended coordinates (ad.qs/qe/ts/te) from chaining.
 */
-void Assembler::deleteContainmentOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+void Assembler::deleteContainmentOverlaps(uint64_t threadCount)
 {
-    cout << timestamp << "Deleting containment overlaps (maxHang=" << maxHang
-         << ", maxHangRate=" << maxHangRate << ", minOverlapLength=" << minOverlapLength << ")." << endl;
+    cout << timestamp << "Deleting containment overlaps." << endl;
 
     if (threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
-
-    hangingFilterMaxHang = maxHang;
-    hangingFilterMaxHangRate = maxHangRate;
-    hangingFilterMinOverlap = minOverlapLength;
 
     uint64_t containmentBefore = 0;
     for (const auto& ad : alignmentData) {
@@ -883,9 +878,6 @@ void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
 {
     static_cast<void>(threadId);
     uint64_t begin, end;
-    const uint64_t maxHang = this->hangingFilterMaxHang;
-    const double maxHangRate = this->hangingFilterMaxHangRate;
-    const uint64_t minOvlp = this->hangingFilterMinOverlap;
 
     while (getNextBatch(begin, end)) {
         for (uint64_t i = begin; i != end; i++) {
@@ -904,9 +896,7 @@ void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
                 (int32_t)qs, (int32_t)qe, (int32_t)qLen,
                 (int32_t)ts, (int32_t)te, (int32_t)tLen,
                 !ad.isSameStrand,
-                (int32_t)maxHang,
-                maxHangRate,
-                (int32_t)minOvlp);
+                INT32_MAX, 0.0, 0);
 
             // result 1 = QCONT, 2 = TCONT: delete this overlap
             if (result == 1 || result == 2) {

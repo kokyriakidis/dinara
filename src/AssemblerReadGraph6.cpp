@@ -165,10 +165,10 @@ void Assembler::createReadGraph6(uint64_t threadCount)
          << ", isDeleted1=" << initDel1 
          << ", active=" << countActiveAlignments() << endl;
     
-    // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
-    // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
-    // DeleteReasonChemical so later steps can avoid them.
-    applyOntChemicalArcMask(threadCount);
+    // // ONT-only parity step: chemical arc masking runs before overlap rescue and clean_graph.
+    // // It uses all overlaps (independent of EC/phasing) and annotates affected overlaps with
+    // // DeleteReasonChemical so later steps can avoid them.
+    // applyOntChemicalArcMask(threadCount);
 
     // Hifiasm parity: Full pre-graph filtering pipeline
     // Order matches Hifiasm's clean_graph / gen_init_sg flow
@@ -352,14 +352,14 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // or any vertex along the candidate tip-unitig is telomere-marked (`te->hh[readId]`), to avoid trimming
     // true chromosome ends. Dinara's `StringGraph` currently has only `readDeleted` (no telomere state), so
     // `cutStringGraphTips()` cannot implement this "don't cut if telomeric" rule yet.
-    // TODO(hifiasm-parity): UL/ONT mode in hifiasm uses `asg_arc_cut_tips(..., is_ou, R_to_U* ru, ...)` and
-    // consults per-arc `asg_arc_t.ou` along the candidate path (tracking `mm_ou = MIN(ou)` and adjusting the
-    // effective extension length before deciding if it is "short"), plus an additional deletion pass using
-    // `R_to_U` when `ru && is_ou`. Dinara's `StringGraphArc` does not store `ou` and the pipeline does not
-    // provide `is_ou/ru`, so `cutStringGraphTips()` currently matches only the non-OU/non-ru logic.
-    cutStringGraphTips(/*maxShortTipReads*/3);
+    // // TODO(hifiasm-parity): UL/ONT mode in hifiasm uses `asg_arc_cut_tips(..., is_ou, R_to_U* ru, ...)` and
+    // // consults per-arc `asg_arc_t.ou` along the candidate path (tracking `mm_ou = MIN(ou)` and adjusting the
+    // // effective extension length before deciding if it is "short"), plus an additional deletion pass using
+    // // `R_to_U` when `ru && is_ou`. Dinara's `StringGraphArc` does not store `ou` and the pipeline does not
+    // // provide `is_ou/ru`, so `cutStringGraphTips()` currently matches only the non-OU/non-ru logic.
+    // cutStringGraphTips(/*maxShortTipReads*/3);
 
-    stringGraph.writeGfa("ReadGraph6-StringGraph-CutTips.gfa", *reads);
+    // stringGraph.writeGfa("ReadGraph6-StringGraph-CutTips.gfa", *reads);
 
     // Step 11a: Sync read graph after tip cutting.
     rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
@@ -368,7 +368,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // Run each sub-step explicitly so we can observe its effect in isolation.
     // Round drop ratios: 0.2 → 0.4 → 0.6 → 0.8 (hifiasm defaults).
     {
-        const uint32_t cleanRounds = 0;
+        const uint32_t cleanRounds = 4;
         const double minDropRate = 0.2;
         const double maxDropRate = 0.8;
         const uint32_t maxShortTipReads = 3;

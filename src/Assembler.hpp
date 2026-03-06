@@ -1087,7 +1087,7 @@ public:
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     /// Delete overlaps where one read is contained in the other (ma_hit2arc containment).
     /// Runs early (e.g. after computeAlignmentsWithEvidence) to remove containment overlaps.
-    void deleteContainmentOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
+    void deleteContainmentOverlaps(uint64_t threadCount);
     /// Delete internal overlaps (ma_hit2arc result -1/-2: excessive overhangs or too short).
     /// Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);

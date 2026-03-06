@@ -889,41 +889,40 @@ void dinara::main::assemble(
         threadCount);
 
     // Delete overlaps where one read is contained in the other.
-    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+    assembler.deleteContainmentOverlaps(threadCount);
 
     // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
-
+    assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
 
-    assembler.performGlobalSiteECParity(threadCount);
-    assembler.debugPrintHetSitesForRead(0);
+    // assembler.performGlobalSiteECParity(threadCount);
+    // assembler.debugPrintHetSitesForRead(0);
 
-    return;
+    // return;
 
-    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
-    assembler.createMarkerGraphVertices(
-        2,                                              // minVertexCoverage
-        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-        0,                                              // minVertexCoveragePerStrand
-        false,                                          // allowDuplicateMarkers
-        std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
-        invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
-        threadCount);
-    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+    // // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
+    // assembler.createMarkerGraphVertices(
+    //     2,                                              // minVertexCoverage
+    //     std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+    //     0,                                              // minVertexCoveragePerStrand
+    //     false,                                          // allowDuplicateMarkers
+    //     std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
+    //     invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
+    //     threadCount);
+    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    // assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
-    // Run marker-graph-projected EC parity (updates delete flags on alignments).
-    assembler.performHifiasmECParityWithMarkerGraph(threadCount);
+    // // Run marker-graph-projected EC parity (updates delete flags on alignments).
+    // assembler.performHifiasmECParityWithMarkerGraph(threadCount);
 
-    // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
-    assembler.debugPrintHetSitesForRead(0);
+    // // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
+    // assembler.debugPrintHetSitesForRead(0);
 
-    return;
+    // return;
 
     // // =========================================================================
     // // Overlap Filtering + Clean ReadGraph
@@ -958,32 +957,32 @@ void dinara::main::assemble(
     // Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics)
     assembler.performHifiasmECParity(threadCount);
 
-    // Delete overlaps where one read is contained in the other.
-    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete overlaps where one read is contained in the other.
+    // assembler.deleteContainmentOverlaps(threadCount);
 
-    // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete internal overlaps (excessive overhangs or too short).
+    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
 
     // Second round: re-phase using only overlaps kept by both sides (cis set from round 1).
     assembler.performHifiasmECParity(threadCount);
 
-    // Delete overlaps where one read is contained in the other.
-    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete overlaps where one read is contained in the other.
+    // assembler.deleteContainmentOverlaps(threadCount);
 
-    // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete internal overlaps (excessive overhangs or too short).
+    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
 
     // Third round: re-phase using only overlaps kept by both sides (cis set from round 2).
     assembler.performHifiasmECParity(threadCount);
 
-    // Delete overlaps where one read is contained in the other.
-    assembler.deleteContainmentOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete overlaps where one read is contained in the other.
+    // assembler.deleteContainmentOverlaps(threadCount);
 
-    // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
+    // // Delete internal overlaps (excessive overhangs or too short).
+    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
 
-    // Fourth round: re-phase using only overlaps kept by both sides (cis set from round 3).
-    assembler.performHifiasmECParity(threadCount);
+    // // Fourth round: re-phase using only overlaps kept by both sides (cis set from round 3).
+    // assembler.performHifiasmECParity(threadCount);
 
     // // Region-aware interval clique filtering: for each read (longest first),
     // // greedily accept overlaps by DP score (dovetails first), checking that each
@@ -1529,8 +1528,8 @@ void dinara::main::assemble(
 
     // // const uint64_t minPrimaryCoverage = 2;
     // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
-    const uint64_t minPrimaryCoverage = 4;
-    const uint64_t maxPrimaryCoverage = 60;
+    const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
+    const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
     cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
 
