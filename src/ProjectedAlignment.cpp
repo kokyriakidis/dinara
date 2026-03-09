@@ -215,7 +215,7 @@ void ProjectedAlignment::constructQuickRaw()
     hasLargeIndel = false;
     maxIndelSize = 0;
 
-    // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults).
+    // Hifiasm current overlap scoring uses single-affine parameters.
     // For identical segments we only need the match reward.
     const int64_t dpMatch = dpMatchScore;
 
@@ -297,7 +297,7 @@ void ProjectedAlignment::constructQuickRawSparse()
     hasLargeIndel = false;
     maxIndelSize = 0;
 
-    // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults).
+    // Hifiasm current overlap scoring uses single-affine parameters.
     // For identical segments we only need the match reward.
     const int64_t dpMatch = dpMatchScore;
 
@@ -381,7 +381,7 @@ void ProjectedAlignment::constructQuickRawSparse()
         bool segHasLargeIndel = false;
         uint32_t segMaxIndelSize = 0;
 
-        // Hifiasm/minimap2-style two-piece affine parameters (HiFi defaults):
+        // Hifiasm current overlap scoring uses single-affine parameters:
         // match=+2, mismatch=-4, gapCost(L)=min(O1+E1*L, O2+E2*L) with (O1,E1)=(4,2), (O2,E2)=(24,1).
         const int64_t match = dpMatchScore;
         const int64_t mismatch = dpMismatchScore;
@@ -392,10 +392,11 @@ void ProjectedAlignment::constructQuickRawSparse()
         auto gapPenalty = [&](uint64_t length) -> int64_t {
             const int64_t l = int64_t(length);
             DINARA_ASSERT(l >= 1);
-            // Minimap2/ksw2 convention: a gap of length k costs O + k*E.
-            const int64_t c1 = gapOpen1 + gapExtend1 * l;
-            const int64_t c2 = gapOpen2 + gapExtend2 * l;
-            return std::min(c1, c2);
+            // KSW2 single-affine convention used by hifiasm overlap scoring:
+            // a gap of length k costs O + k*E.
+            (void)gapOpen2;
+            (void)gapExtend2;
+            return gapOpen1 + gapExtend1 * l;
         };
 
         // Parse CIGAR and collect sparse differences.
@@ -759,10 +760,11 @@ void ProjectedAlignmentSegment::computeAlignmentSparse(
     auto gapPenalty = [&](uint64_t length) -> int64_t {
         const int64_t l = int64_t(length);
         DINARA_ASSERT(l >= 1);
-        // Minimap2/ksw2 convention: a gap of length k costs O + k*E.
-        const int64_t c1 = gapOpen1 + gapExtend1 * l;
-        const int64_t c2 = gapOpen2 + gapExtend2 * l;
-        return std::min(c1, c2);
+        // KSW2 single-affine convention used by hifiasm overlap scoring:
+        // a gap of length k costs O + k*E.
+        (void)gapOpen2;
+        (void)gapExtend2;
+        return gapOpen1 + gapExtend1 * l;
     };
 
     size_t currentVal = 0;

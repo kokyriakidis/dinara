@@ -127,8 +127,8 @@ public:
     // The number of gap events (indels).
     uint64_t gapEventCount = invalid<uint64_t>;
 
-    // Base-level DP alignment score computed from the CIGAR using a two-piece affine model.
-    // Parameters are chosen to match hifiasm/minimap2 defaults for HiFi overlaps.
+    // Base-level DP alignment score computed from the CIGAR using hifiasm's current
+    // single-affine overlap scoring model.
     int64_t dpScore = invalid<int64_t>;
 
     // Flag for large indel (>= 6 bases)
@@ -207,7 +207,10 @@ public:
     const int64_t mismatchScore = -1;
     const int64_t gapScore = -1;
 
-    // Scoring scheme for overlap DP score (2-piece affine).
+    // Scoring scheme for overlap DP score.
+    // Hifiasm's current overlap path uses single-affine scoring (gapo/gape).
+    // We keep the second gap parameter pair in the API for compatibility with
+    // existing option plumbing, but overlap DP scoring ignores it.
     const int64_t dpMatchScore;
     const int64_t dpMismatchScore;
     const int64_t dpGapOpen1;
