@@ -669,22 +669,22 @@ void AssemblerOptions::addConfigurableOptions()
         ("Align.overlapDp.gapOpen1",
         value<int64_t>(&alignOptions.overlapDpGapOpen1)->
         default_value(4),
-        "First gap-open penalty O1 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+        "Gap-open penalty for overlap DP scoring. Current hifiasm overlap scoring uses gap cost O1+k*E1.")
 
         ("Align.overlapDp.gapExtend1",
         value<int64_t>(&alignOptions.overlapDpGapExtend1)->
         default_value(2),
-        "First gap-extend penalty E1 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+        "Gap-extend penalty for overlap DP scoring. Current hifiasm overlap scoring uses gap cost O1+k*E1.")
 
         ("Align.overlapDp.gapOpen2",
         value<int64_t>(&alignOptions.overlapDpGapOpen2)->
         default_value(24),
-        "Second gap-open penalty O2 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+        "Unused for current overlap DP scoring. Retained for backward-compatible configuration plumbing.")
 
         ("Align.overlapDp.gapExtend2",
         value<int64_t>(&alignOptions.overlapDpGapExtend2)->
         default_value(1),
-        "Second gap-extend penalty E2 for overlap DP scoring. Gap cost is min(O1+k*E1, O2+k*E2).")
+        "Unused for current overlap DP scoring. Retained for backward-compatible configuration plumbing.")
 
         ("Align.matchScore",
         value<int>(&alignOptions.matchScore)->

@@ -237,8 +237,8 @@ public:
 
     uint32_t gapEventCount = invalid<uint32_t>; // Total gap EVENTS
 
-    // Base-level DP score computed from the base CIGAR using a two-piece affine model
-    // (hifiasm/minimap2 HiFi defaults). Populated when ProjectedAlignment is computed.
+    // Base-level DP score computed from the base CIGAR using hifiasm's current
+    // single-affine overlap scoring model. Populated when ProjectedAlignment is computed.
     int64_t dpScore = invalid<int64_t>;
 
     // Hifiasm minimizer-chain DP score (`overlap_region.shared_seed`) for this overlap.
@@ -292,7 +292,8 @@ public:
         return int64_t(markerCount);
     }
 
-    // Return the stored base-level DP score (computed from the base CIGAR using a two-piece affine model).
+    // Return the stored base-level DP score (computed from the base CIGAR using
+    // hifiasm's current single-affine overlap scoring model).
     // This is a separate quantity from hifiasm's overlap_region.shared_seed (chain DP score).
     int64_t baseDpScoreOrThrow() const
     {

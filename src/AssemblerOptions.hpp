@@ -290,8 +290,9 @@ public:
     double maxErrorRate;
 
     // Overlap/base DP scoring parameters (used to compute AlignmentInfo::dpScore from a base-level CIGAR).
-    // These should be configured to match the scoring model used by hifiasm for overlap alignment.
-    // The gap model is 2-piece affine: gapCost(k) = min(O1 + k*E1, O2 + k*E2).
+    // These should be configured to match hifiasm's overlap-alignment scoring model.
+    // Current hifiasm overlap scoring is single-affine: gapCost(k) = O1 + k*E1.
+    // O2/E2 are retained for backward-compatible configuration plumbing but are ignored.
     int64_t overlapDpMatchScore;
     int64_t overlapDpMismatchScore;
     int64_t overlapDpGapOpen1;
