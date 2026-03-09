@@ -843,6 +843,9 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                         uint32_t mCount0 = uint32_t((*markers)[orientedReadIds[0].getValue()].size());
                         uint32_t mCount1 = uint32_t((*markers)[orientedReadIds[1].getValue()].size());
                         alignmentInfo.create(alignment, mCount0, mCount1);
+                        if(i < alignmentCandidatesAlignmentsData.sharedSeedScores.size()) {
+                            alignmentInfo.sharedSeedScore = alignmentCandidatesAlignmentsData.sharedSeedScores[i];
+                        }
                         precomputedUsed = true;
                     }
                 }

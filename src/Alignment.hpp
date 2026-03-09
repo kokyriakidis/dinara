@@ -241,6 +241,12 @@ public:
     // (hifiasm/minimap2 HiFi defaults). Populated when ProjectedAlignment is computed.
     int64_t dpScore = invalid<int64_t>;
 
+    // Hifiasm minimizer-chain DP score (`overlap_region.shared_seed`) for this overlap.
+    // This is populated when the overlap originated from the inverted-index chaining path.
+    // It remains invalid when a given alignment-generation path did not compute a hifiasm-style
+    // chaining score.
+    int32_t sharedSeedScore = invalid<int32_t>;
+
     // Evidence ID (APES/TASSD index)
     size_t alignmentId = invalid<size_t>;
 
@@ -275,12 +281,14 @@ public:
     //   alignment DP score computed from a base CIGAR.
     // - When shared_seed ties, hifiasm prefers the *smaller* overlapLen.
     //
-    // Dinara currently does not compute/store hifiasm's minimizer-chain DP (`shared_seed`) for each overlap.
-    // For hifiasm-style redundant-overlap filtering we therefore use a deterministic proxy that correlates
-    // with "chain strength": the number of aligned markers in the marker alignment.
+    // Return hifiasm's stored minimizer-chain DP (`shared_seed`) when available.
+    // Otherwise fall back to a deterministic proxy that correlates with chain strength:
+    // the number of aligned markers in the marker alignment.
     int64_t hifiasmSharedSeedScoreProxy() const
     {
-        // Guaranteed non-zero for a valid alignment (see markerCount doc).
+        if(sharedSeedScore != invalid<int32_t>) {
+            return int64_t(sharedSeedScore);
+        }
         return int64_t(markerCount);
     }
 

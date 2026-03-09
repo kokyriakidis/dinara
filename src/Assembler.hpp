@@ -937,6 +937,7 @@ private:
     class AlignmentCandidatesAlignmentsData {
     public:
         MemoryMapped::Vector<Alignment> alignments;
+        MemoryMapped::Vector<int32_t> sharedSeedScores;
     };
 public:
     AlignmentCandidatesAlignmentsData alignmentCandidatesAlignmentsData;
