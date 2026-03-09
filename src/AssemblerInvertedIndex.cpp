@@ -2936,6 +2936,7 @@ public:
         const Assembler::AlignmentCandidatesInvertedIndexData& invertedIndexData,
         MemoryMapped::Vector<OrientedReadPair>& candidates,
         MemoryMapped::Vector<Alignment>& precomputedAlignments,
+        MemoryMapped::Vector<int32_t>& precomputedSharedSeedScores,
         uint64_t maxChainLimit,
         uint64_t threadCount
     ) :
@@ -2957,6 +2958,8 @@ public:
         for(auto& v : threadCandidates) v.reserve(perThreadReserve);
         threadAlignments.resize(threadCount);
         for(auto& v : threadAlignments) v.reserve(perThreadReserve);
+        threadSharedSeedScores.resize(threadCount);
+        for(auto& v : threadSharedSeedScores) v.reserve(perThreadReserve);
         threadScratchpads.resize(threadCount);
 
         // 2. Setup parallel workload partitioning
@@ -2975,15 +2978,20 @@ public:
         candidates.resize(candidateWritePos + totalCandidatesFound);
         size_t alignmentWritePos = precomputedAlignments.size();
         precomputedAlignments.resize(alignmentWritePos + totalCandidatesFound);
+        size_t sharedSeedWritePos = precomputedSharedSeedScores.size();
+        precomputedSharedSeedScores.resize(sharedSeedWritePos + totalCandidatesFound);
         
         for(size_t i = 0; i < threadCount; i++) {
             const auto& v = threadCandidates[i];
             const auto& a = threadAlignments[i];
+            const auto& s = threadSharedSeedScores[i];
             if(!v.empty()) {
                 std::copy(v.begin(), v.end(), candidates.begin() + candidateWritePos);
                 candidateWritePos += v.size();
                 std::copy(a.begin(), a.end(), precomputedAlignments.begin() + alignmentWritePos);
                 alignmentWritePos += a.size();
+                std::copy(s.begin(), s.end(), precomputedSharedSeedScores.begin() + sharedSeedWritePos);
+                sharedSeedWritePos += s.size();
             }
         }
     }
@@ -2997,11 +3005,13 @@ private:
 
     vector<vector<OrientedReadPair>> threadCandidates;
     vector<vector<Alignment>> threadAlignments;
+    vector<vector<int32_t>> threadSharedSeedScores;
     vector<ThreadScratchpad> threadScratchpads;
 
     void threadFunction(size_t threadId) {
         vector<OrientedReadPair>& localCandidates = threadCandidates[threadId];
         vector<Alignment>& localAlignments = threadAlignments[threadId];
+        vector<int32_t>& localSharedSeedScores = threadSharedSeedScores[threadId];
         ThreadScratchpad& scratch = threadScratchpads[threadId];
         struct EmittedChainedCandidate {
             OrientedReadPair candidate;
@@ -3651,6 +3661,7 @@ private:
 	                for(auto& e : emittedForRead) {
 	                    localCandidates.push_back(e.candidate);
 	                    localAlignments.push_back(std::move(e.alignment));
+                        localSharedSeedScores.push_back(e.score);
 	                }
             }
         }
@@ -4000,11 +4011,13 @@ void Assembler::chainAlignmentCandidates(
     // =========================================================================
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
     alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize); 
+    alignmentCandidatesAlignmentsData.sharedSeedScores.createNew(largeDataName("AlignmentCandidatesInvertedIndexSharedSeed"), largeDataPageSize);
     
     // Safety reserve for performance
     const ReadId readCount = ReadId(markers->size() / 2);
     alignmentCandidates.candidates.reserve(size_t(readCount) * 50);
     alignmentCandidatesAlignmentsData.alignments.reserve(size_t(readCount) * 50); 
+    alignmentCandidatesAlignmentsData.sharedSeedScores.reserve(size_t(readCount) * 50);
 
     // Keep all tuning parameters synchronized with the PAF chaining path.
     configureInvertedIndexDataForChaining(
@@ -4022,12 +4035,14 @@ void Assembler::chainAlignmentCandidates(
         invertedIndexData,
         alignmentCandidates.candidates,
         alignmentCandidatesAlignmentsData.alignments,
+        alignmentCandidatesAlignmentsData.sharedSeedScores,
         maxChainLimit,
         threadCount
     );
 
     alignmentCandidates.candidates.unreserve();
     alignmentCandidatesAlignmentsData.alignments.unreserve();
+    alignmentCandidatesAlignmentsData.sharedSeedScores.unreserve();
     
     // --- Final Cleanup ---
     // The index is a one-shot structure for this pass; release it aggressively.
@@ -4136,6 +4151,8 @@ void Assembler::chainPafCandidates(
     // Create output storage for chained alignments
     alignmentCandidatesAlignmentsData.alignments.createNew(largeDataName("AlignmentCandidatesInvertedIndex"), largeDataPageSize);
     alignmentCandidatesAlignmentsData.alignments.reserve(alignmentCandidates.candidates.size());
+    alignmentCandidatesAlignmentsData.sharedSeedScores.createNew(largeDataName("AlignmentCandidatesInvertedIndexSharedSeed"), largeDataPageSize);
+    alignmentCandidatesAlignmentsData.sharedSeedScores.reserve(alignmentCandidates.candidates.size());
 
     // Store original candidates before we modify them
     vector<OrientedReadPair> originalCandidates;
@@ -5454,11 +5471,13 @@ void Assembler::chainPafCandidates(
     for(auto& r : mergedResults) {
         alignmentCandidates.candidates.push_back(r.candidate);
         alignmentCandidatesAlignmentsData.alignments.push_back(std::move(r.alignment));
+        alignmentCandidatesAlignmentsData.sharedSeedScores.push_back(r.score);
     }
 
     // Release over-reserved capacity now that final size is known.
     alignmentCandidates.candidates.unreserve();
     alignmentCandidatesAlignmentsData.alignments.unreserve();
+    alignmentCandidatesAlignmentsData.sharedSeedScores.unreserve();
 
     // Free high-memory transient buffers (hash table, compact occurrences, etc.)
     // that are no longer needed after chaining is complete.

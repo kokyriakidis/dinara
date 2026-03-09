@@ -228,6 +228,7 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
     auto& threadAlignmentData = data.threadAlignmentData[threadId];
     const auto& candidates = alignmentCandidates.candidates;
     const auto& precomputedAlignments = alignmentCandidatesAlignmentsData.alignments;
+    const auto& precomputedSharedSeedScores = alignmentCandidatesAlignmentsData.sharedSeedScores;
     const uint32_t markerK = uint32_t(assemblerInfo->k);
     const bool collectProjectedTiming = (assemblerInfo->readGraphCreationMethod == 5);
     const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
@@ -314,6 +315,9 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
                 uint32_t(markerSpans[0].size()),
                 uint32_t(markerSpans[1].size())
             );
+            if(candidateIndex < precomputedSharedSeedScores.size()) {
+                alignmentInfo.sharedSeedScore = precomputedSharedSeedScores[candidateIndex];
+            }
             
             alignmentInfo.errorRate = float(projectedErrorRate);
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);

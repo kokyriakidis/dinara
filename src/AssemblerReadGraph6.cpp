@@ -331,13 +331,13 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // Step 9a: make readGraph match the just-built stringGraph immediately.
     rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
 
-    // Step 10 (hifiasm `asg_arc_del_trans`): pure transitive reduction (no tip cutting here).
-    reduceStringGraphTransitiveHifiasm(/*gapFuzz*/1000);
+    // // Step 10 (hifiasm `asg_arc_del_trans`): pure transitive reduction (no tip cutting here).
+    // reduceStringGraphTransitiveHifiasm(/*gapFuzz*/1000);
 
-    stringGraph.writeGfa("ReadGraph6-StringGraph-TransitiveReduction.gfa", *reads);
+    // stringGraph.writeGfa("ReadGraph6-StringGraph-TransitiveReduction.gfa", *reads);
 
-    // Step 10a: Reflect string-graph deletions in the read graph so changes are visible there.
-    rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
+    // // Step 10a: Reflect string-graph deletions in the read graph so changes are visible there.
+    // rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);
 
     // // Step 10b (hifiasm `ul_clean_gfa` ONT): cut weak arcs before the initial tip cut.
     // // Hifiasm does this only when `asm_opt.is_ont`.
@@ -368,7 +368,7 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // Run each sub-step explicitly so we can observe its effect in isolation.
     // Round drop ratios: 0.2 → 0.4 → 0.6 → 0.8 (hifiasm defaults).
     {
-        const uint32_t cleanRounds = 4;
+        const uint32_t cleanRounds = 0;
         const double minDropRate = 0.2;
         const double maxDropRate = 0.8;
         const uint32_t maxShortTipReads = 3;
