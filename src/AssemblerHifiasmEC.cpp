@@ -3810,6 +3810,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
 	                        } else {
 	                            ad.addDeleteReasonsFromReadPerspective(ReadId(readId), AlignmentData::DeleteReasonPhase);
 	                        }
+                            ad.setHifiasmEcMatchStateFromReadPerspective(ReadId(readId), cand.is_match);
 
 	                        /*
 	                        Update assembly flags.
