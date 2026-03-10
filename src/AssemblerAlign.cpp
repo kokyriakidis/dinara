@@ -965,6 +965,7 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             
             alignmentInfo.errorRate = float(projectedAlignment.errorRate());
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
+            alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount); // Transfer gap events

@@ -321,6 +321,7 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             
             alignmentInfo.errorRate = float(projectedErrorRate);
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
+            alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             const double projectedGapErrorRate = projectedAlignment.errorRateGaps();
             alignmentInfo.errorRateGaps = float(projectedGapErrorRate);
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
@@ -906,15 +907,15 @@ void Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t)
  *
  * ## Algorithm Equivalence
  *
- * ✅ **VERIFIED EQUIVALENT** to hifiasm dedup_chains logic:
+ * Close to hifiasm's dedup_chains logic, but not byte-for-byte identical.
  *
  * | Aspect | Hifiasm | Dinara | Equivalent? |
  * |--------|---------|--------|-------------|
  * | **Grouping** | By y_id | By readIds[1] (partner) | ✅ Same |
- * | **Priority 1** | Minimize is_match | Minimize isMatchRank | ✅ Same (cis=1, trans=2) |
- * | **Priority 2** | Maximize (span - 12*errors) | Maximize (span - 12*errors) | ✅ Same |
+ * | **Priority 1** | Minimize is_match | Minimize stored EC match state | Near-parity |
+ * | **Priority 2** | Maximize (span - 12*errors) | Maximize (span - 12*errors) | Approximate |
  * | **Priority 3** | Maximize span | Maximize span | ✅ Same |
- * | **Deletion** | In-place compaction | Mark DeleteReasonSecondary | ✅ Equivalent (lazy) |
+ * | **Deletion** | In-place compaction | Mark DeleteReasonSecondary | Behaviorally similar |
  *
  * ### Field Mappings:
  *
@@ -922,22 +923,14 @@ void Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t)
  * |---------------|--------------|-------|
  * | `y_id` | `ad.readIds[1]` | Partner read ID |
  * | `x_pos_s, x_pos_e` | `ad.qs, ad.qe` | Query span (when readIds[0] = r0) |
- * | `is_match` | `DeleteReasonPhase` | Cis/trans phasing (0=cis→isMatchRank=1, non-zero=trans→isMatchRank=2) |
- * | `non_homopolymer_errors` | `mismatchCount + gapCount` | Total edit errors (from base-level CIGAR) |
+ * | `is_match` | `hifiasmEcMatchState{0,1}` | Stored per read perspective |
+ * | `non_homopolymer_errors` | `nonHomopolymerErrorCount` | Stored from ProjectedAlignment when available |
  *
- * ### Why errorCount = mismatchCount + gapCount?
+ * ### Current limitation
  *
- * Hifiasm's `non_homopolymer_errors` field is populated after base-level refinement
- * (see ecovlp.cpp:2996) and represents the total number of edit operations:
- * - Mismatches (substitutions)
- * - Gap bases (insertions + deletions, **not** gap opens)
- *
- * Dinara's AlignmentData stores the same quantities:
- * - `mismatchCount`: Number of mismatches in the base-level CIGAR
- * - `gapCount`: Total gap **bases** (sum of insertion + deletion lengths)
- *
- * Therefore: `errorCount = mismatchCount + gapCount` is **exactly equivalent** to
- * hifiasm's `non_homopolymer_errors`.
+ * Dinara now stores `nonHomopolymerErrorCount` from ProjectedAlignment's
+ * hifiasm-style homopolymer-aware CIGAR accounting. If that field is missing,
+ * we fall back to `mismatchCount + gapCount`.
  *
  * ## Why Deduplication is Necessary
  *
@@ -1010,9 +1003,9 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
     struct CandidateInfo {
         uint32_t alignmentId = 0;
         ReadId partner = invalidReadId;
-        uint32_t errorCount = 0; // mismatchCount + gapCount (gap bases)
+        uint32_t errorCount = 0; // hifiasm-style non-homopolymer error count
         uint32_t span = 0;       // qe - qs (query span)
-        uint8_t isMatchRank = 2; // 1=cis, 2=trans (matches hifiasm preference for smaller is_match)
+        uint8_t isMatchRank = 1; // Stored hifiasm-style EC state for this query perspective
         int64_t score = std::numeric_limits<int64_t>::min(); // span - 12*errorCount
     };
     vector<CandidateInfo> group;
@@ -1022,7 +1015,7 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
     // Lambda: Select Best Overlap Per Partner Group (Hifiasm Logic)
     // =========================================================================
     // Implements hifiasm ecovlp.cpp:2994-3014 selection logic:
-    //   - Priority 1: Minimize isMatchRank (cis=1, trans=2)
+    //   - Priority 1: Minimize stored hifiasm-style match state
     //   - Priority 2: Maximize score (span - 12*errors)
     //   - Priority 3: Maximize span (tie-breaker)
     //   - Priority 4: Minimize alignmentId (Dinara's determinism tie-breaker)
@@ -1039,8 +1032,7 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
             const auto& a = group[i];
             const auto& b = group[best];
 
-            // Priority 1: Prefer cis over trans (smaller isMatchRank)
-            // Matches hifiasm: if(z->is_match < mm_m) sf = 1;
+            // Priority 1: Prefer smaller hifiasm-style match state.
             if(a.isMatchRank != b.isMatchRank) {
                 if(a.isMatchRank < b.isMatchRank) best = i;
                 continue;
@@ -1060,8 +1052,8 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
                 continue;
             }
 
-            // Priority 4: Minimize alignmentId (Dinara's determinism tie-breaker)
-            // Not present in hifiasm (undefined behavior for perfect ties)
+            // Priority 4: Minimize alignmentId (Dinara determinism tie-breaker;
+            // hifiasm leaves perfect ties iteration-order dependent).
             if(a.alignmentId < b.alignmentId) {
                 best = i;
             }
@@ -1158,16 +1150,15 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
                 // -----------------------------------------------------------------
                 const uint32_t span = ad.qe - ad.qs;  // Matches hifiasm: x_pos_e + 1 - x_pos_s
 
-                // Error count = mismatchCount + gapCount (gap bases, not opens)
-                // Matches hifiasm: non_homopolymer_errors (see ecovlp.cpp:2996)
-                const uint32_t mism = (ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount;
-                const uint32_t gaps = (ad.info.gapCount == invalid<uint32_t>) ? 0U : ad.info.gapCount;
-                const uint32_t err = mism + gaps;
+                const uint32_t err =
+                    (ad.info.nonHomopolymerErrorCount != invalid<uint32_t>) ?
+                    ad.info.nonHomopolymerErrorCount :
+                    ((ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount) +
+                    ((ad.info.gapCount == invalid<uint32_t>) ? 0U : ad.info.gapCount);
 
-                // Cis/trans phasing: isMatchRank=1 for cis, =2 for trans
-                // Matches hifiasm: is_match (1=cis, 2=trans after phasing)
-                const bool isCisFromQuery = ((ad.deleteReasons0 & AlignmentData::DeleteReasonPhase) == 0);
-                const uint8_t isMatchRank = isCisFromQuery ? uint8_t(1) : uint8_t(2);
+                // Use the stored hifiasm-style EC match state for this query perspective
+                // instead of reconstructing it from DeleteReasonPhase.
+                const uint8_t isMatchRank = ad.getHifiasmEcMatchStateFromReadPerspective(r0);
 
                 // Score formula: span - 12*errors
                 // Matches hifiasm: sc = plus - minus (ecovlp.cpp:2997)

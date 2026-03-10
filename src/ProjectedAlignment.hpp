@@ -120,6 +120,10 @@ public:
 
     // The number of mismatches in the raw alignment.
     uint64_t mismatchCount = invalid<uint64_t>;
+
+    // Total errors excluding those attributed to homopolymer-repeat context
+    // using hifiasm's if_is_homopolymer_repeat-style accounting.
+    uint64_t nonHomopolymerErrorCount = invalid<uint64_t>;
     
     // The number of deletions in the raw alignment.
     uint64_t deletionCount = invalid<uint64_t>;
@@ -254,6 +258,9 @@ public:
 
     // The number of mismatches in the raw alignment.
     uint64_t mismatchCount;
+
+    // Total errors excluding homopolymer-repeat-associated errors.
+    uint64_t nonHomopolymerErrorCount;
     
     // The number of deletions in the raw alignment.
     uint64_t totalDeletionCount; // Total bases in deletions

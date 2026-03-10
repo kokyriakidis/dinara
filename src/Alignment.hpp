@@ -232,6 +232,7 @@ public:
     uint32_t mismatchCountRle = invalid<uint32_t>;
     float errorRate = invalid<float>;
     uint32_t mismatchCount = invalid<uint32_t>;
+    uint32_t nonHomopolymerErrorCount = invalid<uint32_t>;
     float errorRateGaps = invalid<float>;
     uint32_t gapCount = invalid<uint32_t>;      // Total gap BASES
 
@@ -559,6 +560,13 @@ public:
     // informativeHetSiteCount0 corresponds to readIds[0]'s view, informativeHetSiteCount1 to readIds[1]'s view.
     uint32_t informativeHetSiteCount0 = 0;
     uint32_t informativeHetSiteCount1 = 0;
+    // Hifiasm-style per-read overlap state produced by the EC/phasing pipeline.
+    // Stored separately for each read perspective to preserve the original state
+    // machine instead of inferring it later from DeleteReasonPhase alone.
+    // Current Dinara EC populates 1 (cis/kept) and 2 (trans/filtered); 0 can be
+    // represented as well if an upstream ONT parity stage starts emitting it.
+    uint8_t hifiasmEcMatchState0 = 1;
+    uint8_t hifiasmEcMatchState1 = 1;
     // Informative-site score for this overlap.
     // This is computed as max(informativeHetSiteCount0, informativeHetSiteCount1) after both sides
     // have been populated by performHifiasmECParity.
@@ -586,6 +594,24 @@ public:
     void updateInformativeHetSiteScore()
     {
         informativeHetSiteScore = std::max(informativeHetSiteCount0, informativeHetSiteCount1);
+    }
+    uint8_t getHifiasmEcMatchStateFromReadPerspective(ReadId queryReadId) const
+    {
+        if(readIds[0] == queryReadId) {
+            return hifiasmEcMatchState0;
+        } else if(readIds[1] == queryReadId) {
+            return hifiasmEcMatchState1;
+        } else {
+            return 1;
+        }
+    }
+    void setHifiasmEcMatchStateFromReadPerspective(ReadId queryReadId, uint8_t state)
+    {
+        if(readIds[0] == queryReadId) {
+            hifiasmEcMatchState0 = state;
+        } else if(readIds[1] == queryReadId) {
+            hifiasmEcMatchState1 = state;
+        }
     }
     
     // Directional deletion reason bitmasks.
