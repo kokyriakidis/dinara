@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <iostream>
+#include <limits>
 
 namespace dinara {
     using Shasta2AnchorId = uint64_t;
@@ -110,7 +111,9 @@ public:
         uint64_t k,
         const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
         const MarkerGraph& markerGraph,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        uint64_t minAnchorCoverage = 0,
+        uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max());
 
     // Access existing.
     Shasta2Anchors(
@@ -181,6 +184,7 @@ private:
         uint64_t maxAnchorCoverage;
         // vector<uint64_t> maxAnchorRepeatLength;
         MemoryMapped::Vector<uint64_t> coverage;
+        vector<MarkerGraphVertexId> selectedVertexIds;
     };
     ConstructData constructData;
     void constructThreadFunctionPass1(uint64_t threadId);

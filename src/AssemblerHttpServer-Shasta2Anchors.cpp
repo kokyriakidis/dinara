@@ -45,9 +45,15 @@ void accessShasta2HttpData(Assembler& assembler)
         try {
             assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
                 shasta2Owner,
-                "Shasta2AnchorGraph");
+                "Shasta2AnchorGraphAfterTransitiveReduction");
         } catch(const exception&) {
-            assembler.shasta2AnchorGraph.reset();
+            try {
+                assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+                    shasta2Owner,
+                    "Shasta2AnchorGraph");
+            } catch(const exception&) {
+                assembler.shasta2AnchorGraph.reset();
+            }
         }
     }
 }
@@ -162,7 +168,10 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
         }
         html <<
             "<a href='exploreShasta2Anchor?anchorIdString=" << HttpServer::urlEncode(parentAnchorIdString) << "'>" <<
-            parentAnchorIdString << "</a> coverage " << parentsCoverage[i];
+            parentAnchorIdString << "</a> coverage " << parentsCoverage[i] <<
+            " <a href='exploreShasta2AnchorPair2?anchorIdAString=" << HttpServer::urlEncode(parentAnchorIdString) <<
+            "&anchorIdBString=" << HttpServer::urlEncode(anchorIdString) <<
+            "&adjacentInJourney=on'>pair</a>";
 
     }
 
@@ -176,7 +185,10 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
         }
         html <<
             "<a href='exploreShasta2Anchor?anchorIdString=" << HttpServer::urlEncode(childAnchorIdString) << "'>" <<
-            childAnchorIdString << "</a> coverage " << childrenCoverage[i];
+            childAnchorIdString << "</a> coverage " << childrenCoverage[i] <<
+            " <a href='exploreShasta2AnchorPair2?anchorIdAString=" << HttpServer::urlEncode(anchorIdString) <<
+            "&anchorIdBString=" << HttpServer::urlEncode(childAnchorIdString) <<
+            "&adjacentInJourney=on'>pair</a>";
 
     }
     html << "</table>";
@@ -270,6 +282,7 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
         "<th>Position<br>in<br>journey"
         "<th>Ordinal"
         "<th>Position"
+        "<th>Journey"
         "<th>Previous<br>anchor<br>in journey"
         "<th>Next<br>anchor<br>in journey";
 
@@ -305,6 +318,12 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
             "&strand=" + to_string(orientedReadId.getStrand()) +
             "&beginPosition=" + to_string((position > 2 * k) ? (position - 2 * k) : 0) +
             "&endPosition=" + to_string(position + 3 * k - 1);
+        const string journeyUrl =
+            "exploreShasta2Journey?"
+            "readId=" + to_string(orientedReadId.getReadId()) +
+            "&strand=" + to_string(orientedReadId.getStrand()) +
+            "&beginPosition=" + to_string((position > 10 * k) ? (position - 10 * k) : 0) +
+            "&endPosition=" + to_string(position + 11 * k);
         html <<
             "<td class=centered>" <<
             "<a href='" << url << "'>" <<
@@ -313,18 +332,25 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
        html <<
             "<td class=centered>" << markerInfo.positionInJourney <<
             "<td class=centered>" << ordinal <<
-            "<td class=centered>" << position;
+            "<td class=centered>" << position <<
+            "<td class=centered><a href='" << journeyUrl << "'>journey</a>";
 
        // Previous anchor in journey.
        html << "<td class=centered>";
        if(previousAnchorInJourney != invalid<Shasta2AnchorId>) {
-           html << shasta2AnchorIdToString(previousAnchorInJourney);
+           const string previousAnchorIdString = shasta2AnchorIdToString(previousAnchorInJourney);
+           html << "<a href='exploreShasta2Anchor?anchorIdString=" <<
+               HttpServer::urlEncode(previousAnchorIdString) << "'>" <<
+               previousAnchorIdString << "</a>";
        }
 
        // Next anchor in journey.
        html << "<td class=centered>";
        if(nextAnchorInJourney != invalid<Shasta2AnchorId>) {
-           html << shasta2AnchorIdToString(nextAnchorInJourney);
+           const string nextAnchorIdString = shasta2AnchorIdToString(nextAnchorInJourney);
+           html << "<a href='exploreShasta2Anchor?anchorIdString=" <<
+               HttpServer::urlEncode(nextAnchorIdString) << "'>" <<
+               nextAnchorIdString << "</a>";
        }
 
        auto it = tangleMatrix.find(make_pair(previousAnchorInJourney, nextAnchorInJourney));
@@ -576,7 +602,9 @@ void Assembler::exploreShasta2Journey(const vector<string>& request, ostream& ht
         "<th>Shasta2Anchor"
         "<th>Shasta2Anchor<br>coverage"
         "<th>Marker<br>ordinal"
-        "<th>Marker<br>position";
+        "<th>Marker<br>position"
+        "<th>Previous<br>anchor"
+        "<th>Next<br>anchor";
 
     // Loop over the anchors in the journey of this oriented read.
     for(uint64_t positionInJourney=0; positionInJourney<journey.size(); positionInJourney++) {
@@ -588,6 +616,10 @@ void Assembler::exploreShasta2Journey(const vector<string>& request, ostream& ht
 
         const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
         const uint32_t position = orientedReadMarkers[ordinal].position;
+        const Shasta2AnchorId previousAnchorId =
+            (positionInJourney > 0) ? journey[positionInJourney - 1] : invalid<Shasta2AnchorId>;
+        const Shasta2AnchorId nextAnchorId =
+            ((positionInJourney + 1) < journey.size()) ? journey[positionInJourney + 1] : invalid<Shasta2AnchorId>;
 
         if(position < beginPosition) {
             continue;
@@ -605,6 +637,22 @@ void Assembler::exploreShasta2Journey(const vector<string>& request, ostream& ht
             "<td class=centered>" << anchorCoverage <<
             "<td class=centered>" << ordinal <<
             "<td class=centered>" << position;
+
+        html << "<td class=centered>";
+        if(previousAnchorId != invalid<Shasta2AnchorId>) {
+            const string previousAnchorIdString = shasta2AnchorIdToString(previousAnchorId);
+            html << "<a href='exploreShasta2Anchor?anchorIdString=" <<
+                HttpServer::urlEncode(previousAnchorIdString) << "'>" <<
+                previousAnchorIdString << "</a>";
+        }
+
+        html << "<td class=centered>";
+        if(nextAnchorId != invalid<Shasta2AnchorId>) {
+            const string nextAnchorIdString = shasta2AnchorIdToString(nextAnchorId);
+            html << "<a href='exploreShasta2Anchor?anchorIdString=" <<
+                HttpServer::urlEncode(nextAnchorIdString) << "'>" <<
+                nextAnchorIdString << "</a>";
+        }
     }
 
     html << "</table>";
