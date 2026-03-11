@@ -220,7 +220,7 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
         s << "[";
 
         // URL
-        s << "URL=\"exploreAnchor?anchorIdString=" << HttpServer::urlEncode(anchorIdString) << "\"";
+        s << "URL=\"exploreShasta2Anchor?anchorIdString=" << HttpServer::urlEncode(anchorIdString) << "\"";
 
         // Tooltip.
         s << " tooltip=\"" << anchorIdString << " " << coverage;
@@ -333,6 +333,8 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
 
         const uint64_t coverage = anchorPair.orientedReadIds.size();
         const uint64_t offset = edgeG.offset;
+        Shasta2AnchorPairInfo info;
+        anchors.analyzeAnchorPair(anchorId0, anchorId1, info);
 
         string color = "Black";
 
@@ -366,12 +368,16 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
             "\"" << anchorId0String << " to "
             << anchorId1String <<
             ", coverage " << coverage <<
+            ", common " << info.common <<
+            ", J' " << info.correctedJaccard() <<
             ", offset " << offset << "\"";
 
         // Label.
         if(options.edgeLabels) {
             s << " label=\"" <<
                 coverage <<
+                "\\n" << info.common <<
+                "\\n" << info.correctedJaccard() <<
                 "\\nOffset " << offset << "\"";
         }
 

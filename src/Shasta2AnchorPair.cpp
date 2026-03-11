@@ -540,13 +540,31 @@ void Shasta2AnchorPair::writeAllHtml(
 
 void Shasta2AnchorPair::writeSummaryHtml(ostream& html, const Shasta2Anchors& anchors) const
 {
-    const uint64_t offset = getAverageOffset(anchors);
+    Shasta2AnchorPairInfo info;
+    anchors.analyzeAnchorPair(anchorIdA, anchorIdB, info);
+
     html <<
         "<table>"
         "<tr><th>Shasta2Anchor A<td class=centered>" << shasta2AnchorIdToString(anchorIdA) <<
         "<tr><th>Shasta2Anchor B<td class=centered>" << shasta2AnchorIdToString(anchorIdB) <<
         "<tr><th>Coverage<td class=centered>" << size() <<
-        "<tr><th>Average offset<td class=centered>" << offset <<
+        "<tr><th>Total A<td class=centered>" << info.totalA <<
+        "<tr><th>Total B<td class=centered>" << info.totalB <<
+        "<tr><th>Common<td class=centered>" << info.common <<
+        "<tr><th>Only A<td class=centered>" << info.onlyA <<
+        "<tr><th>Only B<td class=centered>" << info.onlyB;
+
+    if(info.common != 0) {
+        html <<
+            "<tr><th>Only A, short<td class=centered>" << info.onlyAShort <<
+            "<tr><th>Only B, short<td class=centered>" << info.onlyBShort <<
+            "<tr><th>Jaccard<td class=centered>" << info.jaccard() <<
+            "<tr><th>Corrected Jaccard<td class=centered>" << info.correctedJaccard() <<
+            "<tr><th>Offset in markers<td class=centered>" << info.offsetInMarkers <<
+            "<tr><th>Offset in bases<td class=centered>" << info.offsetInBases;
+    }
+
+    html <<
         "</table>";
 }
 

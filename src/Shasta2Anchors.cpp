@@ -59,7 +59,9 @@ Shasta2Anchors::Shasta2Anchors(
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
 
     const MarkerGraph& markerGraph,
-    uint64_t threadCount) :
+    uint64_t threadCount,
+    uint64_t minAnchorCoverage,
+    uint64_t maxAnchorCoverage) :
     MultithreadedObject<Shasta2Anchors>(*this),
     MappedMemoryOwner(mappedMemoryOwner),
     reads(reads),
@@ -77,31 +79,58 @@ Shasta2Anchors::Shasta2Anchors(
         threadCount);
 
     // Pass 1: compute coverage for each anchor (VertexId).
-    // The number of anchors is determined by the number of vertices in the markerGraph.
     const uint64_t vertexCount = markerGraph.vertexCount();
+    auto& data = constructData;
+    data.minAnchorCoverage = minAnchorCoverage;
+    data.maxAnchorCoverage = maxAnchorCoverage;
+    data.selectedVertexIds.clear();
+    data.selectedVertexIds.reserve(vertexCount);
+
+    vector<OrientedReadId> orientedReadIds;
+    for(MarkerGraphVertexId vertexId=0; vertexId<vertexCount; ++vertexId) {
+        orientedReadIds.clear();
+        for(const MarkerId markerId : markerGraph.getVertexMarkerIds(vertexId)) {
+            OrientedReadId orientedReadId;
+            uint32_t ordinal;
+            tie(orientedReadId, ordinal) = findMarkerId(markerId, markers);
+            (void)ordinal;
+            orientedReadIds.push_back(orientedReadId);
+        }
+        std::sort(orientedReadIds.begin(), orientedReadIds.end());
+        auto last = std::unique(orientedReadIds.begin(), orientedReadIds.end());
+        const uint64_t coverage = uint64_t(std::distance(orientedReadIds.begin(), last));
+        if(coverage >= minAnchorCoverage && coverage <= maxAnchorCoverage) {
+            data.selectedVertexIds.push_back(vertexId);
+        }
+    }
+
+    cout << "Selected " << data.selectedVertexIds.size() << " Shasta2 anchors from "
+         << vertexCount << " markerGraph vertices using coverage range ["
+         << minAnchorCoverage << ", " << maxAnchorCoverage << "]." << endl;
 
     anchorMarkerInfos.createNew(
         largeDataName("Shasta2Anchors-AnchorMarkerInfos"),
         largeDataPageSize);
     
     // Initialize Pass 1 for VectorOfVectors
-    anchorMarkerInfos.beginPass1(vertexCount);
+    anchorMarkerInfos.beginPass1(data.selectedVertexIds.size());
     
     const uint64_t batchSize = 1000;
 
     // Run Pass 1 in parallel to count entries.
-    setupLoadBalancing(vertexCount, batchSize);
+    setupLoadBalancing(data.selectedVertexIds.size(), batchSize);
     runThreads(&Shasta2Anchors::constructThreadFunctionPass1, threadCount);
     
     // Initialize Pass 2
     anchorMarkerInfos.beginPass2();
     
     // Run Pass 2 in parallel to fill entries.
-    setupLoadBalancing(vertexCount, batchSize);
+    setupLoadBalancing(data.selectedVertexIds.size(), batchSize);
     runThreads(&Shasta2Anchors::constructThreadFunctionPass2, threadCount);
     
     // Finalize VectorOfVectors
     anchorMarkerInfos.endPass2();
+    data.selectedVertexIds.clear();
 }
 
 Shasta2Anchors::Shasta2Anchors(
@@ -141,7 +170,8 @@ void Shasta2Anchors::constructThreadFunctionPass1(uint64_t threadId)
     vector<OrientedReadId> orientedReadIds;
 
     while(getNextBatch(begin, end)) {
-        for(uint64_t vertexId=begin; vertexId!=end; vertexId++) {
+        for(uint64_t anchorId=begin; anchorId!=end; anchorId++) {
+            const MarkerGraphVertexId vertexId = constructData.selectedVertexIds[anchorId];
             
             orientedReadIds.clear();
 
@@ -161,7 +191,7 @@ void Shasta2Anchors::constructThreadFunctionPass1(uint64_t threadId)
             auto last = std::unique(orientedReadIds.begin(), orientedReadIds.end());
             uint64_t count = std::distance(orientedReadIds.begin(), last);
             
-            anchorMarkerInfos.incrementCount(vertexId, count);
+            anchorMarkerInfos.incrementCount(anchorId, count);
         }
     }
 }
@@ -173,7 +203,8 @@ void Shasta2Anchors::constructThreadFunctionPass2(uint64_t threadId)
     vector<Shasta2AnchorMarkerInfo> buffer;
 
     while(getNextBatch(begin, end)) {
-        for(uint64_t vertexId=begin; vertexId!=end; vertexId++) {
+        for(uint64_t anchorId=begin; anchorId!=end; anchorId++) {
+            const MarkerGraphVertexId vertexId = constructData.selectedVertexIds[anchorId];
             
             buffer.clear();
             
@@ -199,7 +230,7 @@ void Shasta2Anchors::constructThreadFunctionPass2(uint64_t threadId)
             // Store in reverse because store() fills each vector from end to begin.
             // This preserves ascending OrientedReadId order in final storage.
             for(auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
-                anchorMarkerInfos.store(vertexId, *it);
+                anchorMarkerInfos.store(anchorId, *it);
             }
         }
     }
@@ -330,9 +361,114 @@ void Shasta2Anchors::findParents(
 void Shasta2Anchors::analyzeAnchorPair(
     Shasta2AnchorId anchorId0, Shasta2AnchorId anchorId1, Shasta2AnchorPairInfo& info) const 
 {
-    info.totalA = (*this)[anchorId0].size();
-    info.totalB = (*this)[anchorId1].size();
-    info.common = countCommon(anchorId0, anchorId1);
+    const Shasta2Anchor anchor0 = (*this)[anchorId0];
+    const Shasta2Anchor anchor1 = (*this)[anchorId1];
+
+    const auto begin0 = anchor0.begin();
+    const auto begin1 = anchor1.begin();
+    const auto end0 = anchor0.end();
+    const auto end1 = anchor1.end();
+
+    info.totalA = end0 - begin0;
+    info.totalB = end1 - begin1;
+
+    info.common = 0;
+    int64_t sumMarkerOffsets = 0;
+    int64_t sumBaseOffsets = 0;
+
+    auto it0 = begin0;
+    auto it1 = begin1;
+    while(it0 != end0 && it1 != end1) {
+        if(it0->orientedReadId < it1->orientedReadId) {
+            ++it0;
+            continue;
+        }
+        if(it1->orientedReadId < it0->orientedReadId) {
+            ++it1;
+            continue;
+        }
+
+        ++info.common;
+        const OrientedReadId orientedReadId = it0->orientedReadId;
+        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+
+        const uint32_t ordinal0 = it0->ordinal;
+        const uint32_t ordinal1 = it1->ordinal;
+        sumMarkerOffsets += int64_t(ordinal1) - int64_t(ordinal0);
+
+        const int64_t basePosition0 = int64_t(orientedReadMarkers[ordinal0].position) + int64_t(kHalf);
+        const int64_t basePosition1 = int64_t(orientedReadMarkers[ordinal1].position) + int64_t(kHalf);
+        sumBaseOffsets += basePosition1 - basePosition0;
+
+        ++it0;
+        ++it1;
+    }
+
+    info.onlyA = info.totalA - info.common;
+    info.onlyB = info.totalB - info.common;
+
+    if(info.common == 0) {
+        info.offsetInMarkers = invalid<int64_t>;
+        info.offsetInBases = invalid<int64_t>;
+        info.onlyAShort = invalid<uint64_t>;
+        info.onlyBShort = invalid<uint64_t>;
+        return;
+    }
+
+    info.offsetInMarkers = int64_t(std::llround(double(sumMarkerOffsets) / double(info.common)));
+    info.offsetInBases = int64_t(std::llround(double(sumBaseOffsets) / double(info.common)));
+
+    it0 = begin0;
+    it1 = begin1;
+    uint64_t onlyACheck = 0;
+    uint64_t onlyBCheck = 0;
+    info.onlyAShort = 0;
+    info.onlyBShort = 0;
+    while(true) {
+        if(it0 == end0 && it1 == end1) {
+            break;
+        }
+
+        if(it1 == end1 || ((it0 != end0) && (it0->orientedReadId < it1->orientedReadId))) {
+            ++onlyACheck;
+            const OrientedReadId orientedReadId = it0->orientedReadId;
+            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
+
+            const uint32_t ordinal0 = it0->ordinal;
+            const int64_t basePosition0 = int64_t(orientedReadMarkers[ordinal0].position) + int64_t(kHalf);
+            const int64_t hypotheticalPosition1 = basePosition0 + info.offsetInBases;
+            if(hypotheticalPosition1 < 0 || hypotheticalPosition1 >= lengthInBases) {
+                ++info.onlyAShort;
+            }
+
+            ++it0;
+            continue;
+        }
+
+        if(it0 == end0 || ((it1 != end1) && (it1->orientedReadId < it0->orientedReadId))) {
+            ++onlyBCheck;
+            const OrientedReadId orientedReadId = it1->orientedReadId;
+            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
+            const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
+
+            const uint32_t ordinal1 = it1->ordinal;
+            const int64_t basePosition1 = int64_t(orientedReadMarkers[ordinal1].position) + int64_t(kHalf);
+            const int64_t hypotheticalPosition0 = basePosition1 - info.offsetInBases;
+            if(hypotheticalPosition0 < 0 || hypotheticalPosition0 >= lengthInBases) {
+                ++info.onlyBShort;
+            }
+
+            ++it1;
+            continue;
+        }
+
+        ++it0;
+        ++it1;
+    }
+
+    DINARA_ASSERT(onlyACheck == info.onlyA);
+    DINARA_ASSERT(onlyBCheck == info.onlyB);
 }
 
 uint64_t Shasta2Anchors::countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId anchorId1) const

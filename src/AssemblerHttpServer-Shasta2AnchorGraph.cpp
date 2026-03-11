@@ -6,6 +6,9 @@
 #include "HttpServer.hpp"
 #include "invalid.hpp"
 
+// Boost libraries.
+#include <boost/graph/iteration_macros.hpp>
+
 using namespace dinara;
 using namespace std;
 
@@ -60,6 +63,12 @@ void Assembler::exploreShasta2AnchorGraph(const vector<string>& request, ostream
     }
 
     const auto& graph = *shasta2AnchorGraph;
+    uint64_t useForAssemblyCount = 0;
+    BGL_FORALL_EDGES(e, graph, Shasta2AnchorGraph) {
+        if(graph[e].useForAssembly) {
+            ++useForAssemblyCount;
+        }
+    }
 
     html << "<h1>Shasta2 Anchor Graph Summary</h1>";
 
@@ -67,9 +76,19 @@ void Assembler::exploreShasta2AnchorGraph(const vector<string>& request, ostream
         "<table>"
         "<tr><th class=left>Vertices<td class=centered>" << num_vertices(graph) <<
         "<tr><th class=left>Edges<td class=centered>" << num_edges(graph) <<
+        "<tr><th class=left>Edges marked for assembly<td class=centered>" << useForAssemblyCount <<
         "</table>";
-
-    // Add degree distribution later if needed.
+    html <<
+        "<p>Use <a href='exploreShasta2LocalAnchorGraph'>Local anchor graph</a> to visualize a neighborhood "
+        "around one or more Shasta2 anchors.";
+    html <<
+        "<h2>Explore</h2>"
+        "<ul>"
+        "<li><a href='exploreShasta2Anchor'>Anchor</a></li>"
+        "<li><a href='exploreShasta2AnchorPair'>Anchor pair</a></li>"
+        "<li><a href='exploreShasta2Journey'>Journey</a></li>"
+        "<li><a href='exploreShasta2LocalAnchorGraph'>Local anchor graph</a></li>"
+        "</ul>";
 }
 
 
@@ -218,8 +237,8 @@ void Assembler::exploreShasta2AnchorPair(const vector<string>& request, ostream&
     } catch(const exception&) {
     }
 
-    if(!shasta2Anchors) {
-         html << "<p>Shasta2 Anchors not available.";
+    if(!shasta2Anchors || !shasta2Journeys) {
+         html << "<p>Shasta2 anchors/journeys not available.";
          return;
     }
 
@@ -250,10 +269,23 @@ void Assembler::exploreShasta2AnchorPair(const vector<string>& request, ostream&
     html << "<tr><th class=left>Total Reads in Anchor " << anchorId0 << "<td class=centered>" << info.totalA;
     html << "<tr><th class=left>Total Reads in Anchor " << anchorId1 << "<td class=centered>" << info.totalB;
     html << "<tr><th class=left>Common Reads<td class=centered>" << info.common;
-    html << "<tr><th class=left>Only in " << anchorId0 << "<td class=centered>" << (info.totalA - info.common);
-    html << "<tr><th class=left>Only in " << anchorId1 << "<td class=centered>" << (info.totalB - info.common);
+    html << "<tr><th class=left>Only in " << anchorId0 << "<td class=centered>" << info.onlyA;
+    html << "<tr><th class=left>Only in " << anchorId1 << "<td class=centered>" << info.onlyB;
     html << "<tr><th class=left>Jaccard<td class=centered>" << info.jaccard();
+    if(info.common != 0) {
+        html << "<tr><th class=left>Only " << anchorId0 << ", short<td class=centered>" << info.onlyAShort;
+        html << "<tr><th class=left>Only " << anchorId1 << ", short<td class=centered>" << info.onlyBShort;
+        html << "<tr><th class=left>Corrected Jaccard<td class=centered>" << info.correctedJaccard();
+        html << "<tr><th class=left>Offset in markers<td class=centered>" << info.offsetInMarkers;
+        html << "<tr><th class=left>Offset in bases<td class=centered>" << info.offsetInBases;
+    }
     html << "</table>";
-
-    // Could show list of common reads here if needed.
+    html << "<p><a href='exploreShasta2AnchorPair2?anchorIdAString=" << anchorId0 <<
+        "&anchorIdBString=" << anchorId1 <<
+        "&adjacentInJourney=on'>Open detailed Shasta2 anchor-pair view</a>";
+    const Shasta2Anchors& anchors = *shasta2Anchors;
+    const Shasta2Journeys& journeys = *shasta2Journeys;
+    const Shasta2AnchorPair anchorPair(anchors, Shasta2AnchorId(anchorId0), Shasta2AnchorId(anchorId1), false);
+    html << "<h2>Detailed pair view</h2>";
+    anchorPair.writeAllHtml(html, anchors, journeys);
 }

@@ -891,8 +891,8 @@ void dinara::main::assemble(
     // Delete overlaps where one read is contained in the other.
     assembler.deleteContainmentOverlaps(threadCount);
 
-    // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
+    // // Delete internal overlaps (excessive overhangs or too short).
+    // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
@@ -1526,30 +1526,72 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
-    // // const uint64_t minPrimaryCoverage = 2;
-    // // const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
-    const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
-    const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
+    const uint64_t minPrimaryCoverage = 2;
+    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
+    // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
     cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
         ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
 
-    // // Declare anchors pointer here to avoid scope issues
-    shared_ptr<mode3::Anchors> anchors;
-    anchors = make_shared<mode3::Anchors>(
-        MappedMemoryOwner(assembler),
-        assembler.getReads(),
-        assembler.assemblerInfo->k,
-        *assembler.markers,
-        assembler.markerGraph,
-        minPrimaryCoverage,
-        maxPrimaryCoverage,
+    // // // Declare anchors pointer here to avoid scope issues
+    // shared_ptr<mode3::Anchors> anchors;
+    // anchors = make_shared<mode3::Anchors>(
+    //     MappedMemoryOwner(assembler),
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     *assembler.markers,
+    //     assembler.markerGraph,
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     true); // createFromVertices
+
+    // // Compute oriented read journeys.
+    // anchors->computeJourneys(threadCount);
+
+    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+    //
+
+
+
+    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
+    
+    // Create Shasta2Anchors
+    // We use the markerGraph structure to define anchors.
+    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
+            shasta2Owner,
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            *assembler.markers,
+            assembler.markerGraph,
+            threadCount,
+            minPrimaryCoverage,
+            maxPrimaryCoverage);
+    auto& shasta2Anchors = assembler.shasta2Anchors;
+
+    // Compute journeys.
+    cout << timestamp << "Creating Shasta2Journeys..." << endl;
+    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
+        2 * assembler.getReads().readCount(),
+        shasta2Anchors,
         threadCount,
-        true); // createFromVertices
+        shasta2Owner);
+    auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // Compute oriented read journeys.
-    anchors->computeJourneys(threadCount);
+    // Create the Shasta2AnchorGraph.
+    const uint64_t minEdgeCoverage = 1;
+    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
+    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        minEdgeCoverage);
+    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+    // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
+    // can load and visualize it even when we return before later assembly stages.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
     return;
 
@@ -1563,8 +1605,7 @@ void dinara::main::assemble(
 
 
 
-    // Shasta2 default (--min-anchor-graph-edge-coverage).
-    const uint64_t minEdgeCoverage = 6;
+    
 
 
     // // // Declare anchors pointer here to avoid scope issues
@@ -1584,36 +1625,7 @@ void dinara::main::assemble(
 
     
 
-    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
     
-    // Create Shasta2Anchors
-    // We use the markerGraph structure to define anchors.
-    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
-            shasta2Owner,
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            *assembler.markers,
-            assembler.markerGraph,
-            threadCount);
-    auto& shasta2Anchors = assembler.shasta2Anchors;
-
-    // Compute journeys.
-    cout << timestamp << "Creating Shasta2Journeys..." << endl;
-    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
-        2 * assembler.getReads().readCount(),
-        shasta2Anchors,
-        threadCount,
-        shasta2Owner);
-    auto& shasta2Journeys = assembler.shasta2Journeys;
-
-    // Create the Shasta2AnchorGraph.
-    // const uint64_t minEdgeCoverage = 4; // Already defined above as 3 or 4. Using existing value.
-    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
-    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        minEdgeCoverage);
-    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
     
     // Transitive reduction.
     // Shared parameters for local path-based simplification steps.
