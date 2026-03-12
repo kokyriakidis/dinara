@@ -1604,9 +1604,20 @@ void dinara::main::assemble(
         transitiveReductionMaxEdgeCoverage,
         transitiveReductionMaxDistance);
 
-    // Shasta2 logic parity: save AnchorGraph after transitive reduction.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
+
+    // Post-transitive-reduction cleanup:
+    // cut low-read linear stalks that start at a tip and reach a branch point
+    // before involving more than 3 distinct oriented reads across all anchors
+    // in the traversed chain.
+    const uint64_t maxWeakTipReadCount = 3;
+    shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
+        *shasta2Anchors,
+        maxWeakTipReadCount);
+
+    // Save the final assembly-enabled state used by the HTTP server.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
 
 
     return;
