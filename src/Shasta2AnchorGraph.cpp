@@ -5,6 +5,7 @@
 #include "orderPairs.hpp"
 #include "performanceLog.hpp"
 #include "ReadId.hpp"
+#include "deduplicate.hpp"
 #include "timestamp.hpp"
 using namespace dinara;
 
@@ -27,8 +28,12 @@ string anchorIdToString(Shasta2AnchorId anchorId)
 #include <boost/serialization/vector.hpp>
 
 // Standard library.
+#include <algorithm>
 #include "fstream.hpp"
+#include <limits>
+#include <map>
 #include <queue>
+#include <set>
 #include "tuple.hpp"
 
 // Explicit instantiation.
@@ -39,16 +44,21 @@ namespace dinara {
 
 
 
-// Construct the Shasta2AnchorGraph from the Shasta2Journeys.
-// Only include edges with at least the specified minCoverage.
+// Construct the Shasta2AnchorGraph from the Shasta2Journeys using
+// the same edge creation rule as mode3::AnchorGraph:
+// for each anchor, call Shasta2Anchors::findChildren and create one edge
+// per child that satisfies minEdgeCoverage.
+// The threadCount parameter is accepted for API compatibility but is not used here.
 Shasta2AnchorGraph::Shasta2AnchorGraph(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
-    uint64_t minEdgeCoverage) :
+    uint64_t minEdgeCoverage,
+    uint64_t threadCount) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
     Shasta2AnchorGraph& anchorGraph = *this;
+    static_cast<void>(threadCount);
 
     // Create the vertices, one for each AnchorId.
     // In the AnchorGraph, vertex_descriptors are AnchorIds.
@@ -57,19 +67,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         add_vertex(anchorGraph);
     }
 
-    // Loop over possible source vertices to create edges.
     nextEdgeId = 0;
-    vector<Shasta2AnchorPair> anchorPairs;
+    vector<Shasta2AnchorId> children;
+    vector<uint64_t> counts;
     for(Shasta2AnchorId anchorIdA=0; anchorIdA<anchorCount; anchorIdA++) {
-        Shasta2AnchorPair::createChildren(anchors, journeys, anchorIdA, 0, anchorPairs);
-        for(const Shasta2AnchorPair& anchorPair: anchorPairs) {
-            if(anchorPair.size() >= minEdgeCoverage) {
-                const uint64_t offset = anchorPair.getAverageOffset(anchors);
-                edge_descriptor e;
-                tie(e, ignore) = add_edge(anchorIdA, anchorPair.anchorIdB,
-                    Shasta2AnchorGraphEdge(anchorPair, offset, nextEdgeId++), anchorGraph);
-                anchorGraph[e].useForAssembly = true;
+        anchors.findChildren(journeys, anchorIdA, children, counts, minEdgeCoverage);
+        DINARA_ASSERT(children.size() == counts.size());
+        for(uint64_t i=0; i<children.size(); i++) {
+            const Shasta2AnchorId anchorIdB = children[i];
+            Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, true);
+            DINARA_ASSERT(anchorPair.size() == counts[i]);
+            if(anchorPair.orientedReadIds.empty()) {
+                continue;
             }
+            edge_descriptor e;
+            tie(e, ignore) = add_edge(
+                anchorPair.anchorIdA,
+                anchorPair.anchorIdB,
+                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[e].useForAssembly = true;
         }
     }
 
@@ -157,13 +174,6 @@ void Shasta2AnchorGraph::transitiveReduction(
     Shasta2AnchorGraph& anchorGraph = *this;
     cout << "AnchorGraph transitive reduction begins." << endl;
 
-    // Initially make sure all edges are flag as "useForAssembly".
-    // The transitive reduction process sets useForAssembly to false
-    // for edges removed by transitive reduction.
-    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-        anchorGraph[e].useForAssembly = true;
-    }
-
     // Loop over edge coverage.
     // At each iteration we only consider edges with this coverage.
     vector<edge_descriptor> edgesToProcess;
@@ -173,7 +183,7 @@ void Shasta2AnchorGraph::transitiveReduction(
         // Gather edges with this coverage.
         edgesToProcess.clear();
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-            if(anchorGraph[e].coverage() == edgeCoverage) {
+            if(anchorGraph[e].useForAssembly and anchorGraph[e].coverage() == edgeCoverage) {
                 edgesToProcess.push_back(e);
             }
         }

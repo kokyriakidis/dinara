@@ -28,6 +28,10 @@ void accessShasta2HttpData(Assembler& assembler)
             *assembler.markers);
     }
 
+    if(!assembler.shasta2Journeys) {
+        assembler.shasta2Journeys = make_shared<Shasta2Journeys>(shasta2Owner);
+    }
+
     // Load the graph on demand if needed.
     if(!assembler.shasta2AnchorGraph) {
         try {

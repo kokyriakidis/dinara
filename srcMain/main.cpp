@@ -1551,7 +1551,7 @@ void dinara::main::assemble(
 
     // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
 
-    //
+    
 
 
 
@@ -1580,18 +1580,34 @@ void dinara::main::assemble(
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
     // Create the Shasta2AnchorGraph.
-    const uint64_t minEdgeCoverage = 1;
+    const uint64_t minEdgeCoverage = 2;
     cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
     assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
         *shasta2Anchors,
         *shasta2Journeys,
-        minEdgeCoverage);
+        minEdgeCoverage,
+        threadCount);
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
     // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
     // can load and visualize it even when we return before later assembly stages.
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+
+
+    // Transitive reduction.
+    // Shared parameters for local path-based simplification steps.
+    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    const uint64_t transitiveReductionMaxDistance = 10;
+
+    shasta2AnchorGraph->transitiveReduction(
+        transitiveReductionMaxEdgeCoverage,
+        transitiveReductionMaxDistance);
+
+    // Shasta2 logic parity: save AnchorGraph after transitive reduction.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
+
 
     return;
 
@@ -1627,36 +1643,25 @@ void dinara::main::assemble(
 
     
     
-    // Transitive reduction.
-    // Shared parameters for local path-based simplification steps.
-    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
-    const uint64_t transitiveReductionMaxDistance = 10;
+    
 
-    shasta2AnchorGraph->transitiveReduction(
-        transitiveReductionMaxEdgeCoverage,
-        transitiveReductionMaxDistance);
+    // // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
+    // cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    // Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    // shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
+    // shasta2AssemblyGraphOptions.threadCount = threadCount;
+    // shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
+    // assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+    //     *shasta2Anchors,
+    //     *shasta2Journeys,
+    //     *shasta2AnchorGraph,
+    //     shasta2AssemblyGraphOptions);
+    // auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
 
-    // Shasta2 logic parity: save AnchorGraph after transitive reduction.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
+    // shasta2AssemblyGraph->simplifyAndAssemble();
 
-    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
-    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
-    shasta2AssemblyGraphOptions.threadCount = threadCount;
-    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
-    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        *shasta2AnchorGraph,
-        shasta2AssemblyGraphOptions);
-    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
-
-    cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
-    shasta2AssemblyGraph->simplifyAndAssemble();
-
-    return;
+    // return;
 
     // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
 

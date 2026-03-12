@@ -40,13 +40,9 @@ public:
         Shasta2AnchorId anchorIdB,
         bool adjacentInJourney);
 
-    Shasta2AnchorPair() {}
-
-    Shasta2AnchorPair(const Shasta2AnchorPair& that) :
-        anchorIdA(that.anchorIdA),
-        anchorIdB(that.anchorIdB),
-        orientedReadIds(that.orientedReadIds)
-    {}
+    Shasta2AnchorPair() = default;
+    Shasta2AnchorPair(const Shasta2AnchorPair&) = default;
+    Shasta2AnchorPair& operator=(const Shasta2AnchorPair&) = default;
 
     // This finds AnchorPairs as follows:
     // - anchorIdA is as specified.

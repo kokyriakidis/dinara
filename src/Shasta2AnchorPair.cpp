@@ -11,6 +11,7 @@ using namespace dinara;
 
 // Standard library.
 #include <cmath>
+#include <iomanip>
 
 
 
@@ -558,8 +559,10 @@ void Shasta2AnchorPair::writeSummaryHtml(ostream& html, const Shasta2Anchors& an
         html <<
             "<tr><th>Only A, short<td class=centered>" << info.onlyAShort <<
             "<tr><th>Only B, short<td class=centered>" << info.onlyBShort <<
-            "<tr><th>Jaccard<td class=centered>" << info.jaccard() <<
-            "<tr><th>Corrected Jaccard<td class=centered>" << info.correctedJaccard() <<
+            "<tr><th>Only A, missing<td class=centered>" << (info.onlyA - info.onlyAShort) <<
+            "<tr><th>Only B, missing<td class=centered>" << (info.onlyB - info.onlyBShort) <<
+            "<tr><th>Jaccard<td class=centered>" << std::fixed << std::setprecision(2) << info.jaccard() <<
+            "<tr><th>Corrected Jaccard<td class=centered>" << std::fixed << std::setprecision(2) << info.correctedJaccard() <<
             "<tr><th>Offset in markers<td class=centered>" << info.offsetInMarkers <<
             "<tr><th>Offset in bases<td class=centered>" << info.offsetInBases;
     }
@@ -572,39 +575,129 @@ void Shasta2AnchorPair::writeSummaryHtml(ostream& html, const Shasta2Anchors& an
 
 void Shasta2AnchorPair::writeOrientedReadIdsHtml(ostream& html, const Shasta2Anchors& anchors) const
 {
-    vector< pair<Positions, Positions> > positions;
-    get(anchors, positions);
+    Shasta2AnchorPairInfo info;
+    anchors.analyzeAnchorPair(anchorIdA, anchorIdB, info);
+
+    const Shasta2Anchor anchorA = anchors[anchorIdA];
+    const Shasta2Anchor anchorB = anchors[anchorIdB];
+    const auto beginA = anchorA.begin();
+    const auto beginB = anchorB.begin();
+    const auto endA = anchorA.end();
+    const auto endB = anchorB.end();
 
     html << "<h3>Oriented reads</h3>";
     html <<
-        "<p>"
+        "<p>In the following table, positions in red are hypothetical, based on the estimated base offset."
         "<table>"
-        "<tr><th>Oriented<br>read id"
-        "<th>Position<br>in journey<br>A<th>Position<br>in journey<br>B<th>Shasta2Journey<br>offset"
-        "<th>OrdinalA<th>OrdinalB<th>Ordinal<br>offset"
-        "<th>A middle<br>position"
-        "<th>B middle<br>position"
-        "<th>Sequence<br>length";
+        "<tr>"
+        "<th rowspan=2>Oriented<br>read id"
+        "<th colspan=2>Length"
+        "<th colspan=3>Anchor A"
+        "<th colspan=3>Anchor B"
+        "<th rowspan=2>Journey<br>offset"
+        "<th rowspan=2>Ordinal<br>offset"
+        "<th rowspan=2>Base<br>offset"
+        "<th rowspan=2>Classification"
+        "<tr>"
+        "<th>Markers"
+        "<th>Bases"
+        "<th>Journey<br>position"
+        "<th>Ordinal"
+        "<th>Middle<br>position"
+        "<th>Journey<br>position"
+        "<th>Ordinal"
+        "<th>Middle<br>position";
 
-    for(uint64_t i=0; i<size(); i++) {
-        const OrientedReadId orientedReadId = orientedReadIds[i];
-        const auto& positionsAB = positions[i];
+    auto itA = beginA;
+    auto itB = beginB;
+    while(true) {
+        if(itA == endA and itB == endB) {
+            break;
+        }
 
-        const auto& positionsA = positionsAB.first;
-        const auto& positionsB = positionsAB.second;
+        if(itB == endB or ((itA != endA) and (itA->orientedReadId < itB->orientedReadId))) {
+            const OrientedReadId orientedReadId = itA->orientedReadId;
+            const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
+            const int64_t lengthInBases = int64_t(anchors.reads.getReadRawSequenceLength(orientedReadId.getReadId()));
+            const uint32_t positionInJourneyA = itA->positionInJourney;
+            const uint32_t ordinalA = itA->ordinal;
+            const int64_t positionA = int64_t(orientedReadMarkers[ordinalA].position) + int64_t(anchors.k / 2);
+
+            const int64_t positionB = positionA + info.offsetInBases;
+            const bool isShort = positionB < 0 or positionB >= lengthInBases;
+
+            html <<
+                "<tr><td class=centered><a href='exploreRead?readId=" << orientedReadId.getReadId() <<
+                "&strand=" << orientedReadId.getStrand() << "'>" << orientedReadId << "</a>" <<
+                "<td class=centered>" << orientedReadMarkers.size() <<
+                "<td class=centered>" << lengthInBases <<
+                "<td class=centered>" << positionInJourneyA <<
+                "<td class=centered>" << ordinalA <<
+                "<td class=centered>" << positionA <<
+                "<td><td><td class=centered style='color:Red'>" << positionB <<
+                "<td><td><td>" <<
+                "<td class=centered>OnlyA, " << (isShort ? "short" : "missing");
+
+            ++itA;
+            continue;
+        }
+
+        if(itA == endA or ((itB != endB) and (itB->orientedReadId < itA->orientedReadId))) {
+            const OrientedReadId orientedReadId = itB->orientedReadId;
+            const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
+            const int64_t lengthInBases = int64_t(anchors.reads.getReadRawSequenceLength(orientedReadId.getReadId()));
+            const uint32_t positionInJourneyB = itB->positionInJourney;
+            const uint32_t ordinalB = itB->ordinal;
+            const int64_t positionB = int64_t(orientedReadMarkers[ordinalB].position) + int64_t(anchors.k / 2);
+
+            const int64_t positionA = positionB - info.offsetInBases;
+            const bool isShort = positionA < 0 or positionA >= lengthInBases;
+
+            html <<
+                "<tr><td class=centered><a href='exploreRead?readId=" << orientedReadId.getReadId() <<
+                "&strand=" << orientedReadId.getStrand() << "'>" << orientedReadId << "</a>" <<
+                "<td class=centered>" << orientedReadMarkers.size() <<
+                "<td class=centered>" << lengthInBases <<
+                "<td><td><td class=centered style='color:Red'>" << positionA <<
+                "<td class=centered>" << positionInJourneyB <<
+                "<td class=centered>" << ordinalB <<
+                "<td class=centered>" << positionB <<
+                "<td><td><td>" <<
+                "<td class=centered>OnlyB, " << (isShort ? "short" : "missing");
+
+            ++itB;
+            continue;
+        }
+
+        const OrientedReadId orientedReadId = itA->orientedReadId;
+        DINARA_ASSERT(orientedReadId == itB->orientedReadId);
+        const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
+        const int64_t lengthInBases = int64_t(anchors.reads.getReadRawSequenceLength(orientedReadId.getReadId()));
+        const uint32_t positionInJourneyA = itA->positionInJourney;
+        const uint32_t positionInJourneyB = itB->positionInJourney;
+        const uint32_t ordinalA = itA->ordinal;
+        const uint32_t ordinalB = itB->ordinal;
+        const int64_t positionA = int64_t(orientedReadMarkers[ordinalA].position) + int64_t(anchors.k / 2);
+        const int64_t positionB = int64_t(orientedReadMarkers[ordinalB].position) + int64_t(anchors.k / 2);
 
         html <<
-            "<tr>"
-            "<td class=centered>" << orientedReadId <<
-            "<td class=centered>" << positionsA.positionInJourney <<
-            "<td class=centered>" << positionsB.positionInJourney <<
-            "<td class=centered>" << positionsB.positionInJourney - positionsA.positionInJourney <<
-            "<td class=centered>" << positionsA.ordinal <<
-            "<td class=centered>" << positionsB.ordinal <<
-            "<td class=centered>" << positionsB.ordinal - positionsA.ordinal <<
-            "<td class=centered>" << positionsA.basePosition <<
-            "<td class=centered>" << positionsB.basePosition <<
-            "<td class=centered>" << positionsB.basePosition - positionsA.basePosition;
+            "<tr><td class=centered><a href='exploreRead?readId=" << orientedReadId.getReadId() <<
+            "&strand=" << orientedReadId.getStrand() << "'>" << orientedReadId << "</a>" <<
+            "<td class=centered>" << orientedReadMarkers.size() <<
+            "<td class=centered>" << lengthInBases <<
+            "<td class=centered>" << positionInJourneyA <<
+            "<td class=centered>" << ordinalA <<
+            "<td class=centered>" << positionA <<
+            "<td class=centered>" << positionInJourneyB <<
+            "<td class=centered>" << ordinalB <<
+            "<td class=centered>" << positionB <<
+            "<td class=centered>" << (positionInJourneyB - positionInJourneyA) <<
+            "<td class=centered>" << (ordinalB - ordinalA) <<
+            "<td class=centered>" << (positionB - positionA) <<
+            "<td class=centered>Common";
+
+        ++itA;
+        ++itB;
     }
     html << "</table>";
 

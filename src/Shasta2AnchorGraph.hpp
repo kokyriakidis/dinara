@@ -13,6 +13,7 @@
 #include <boost/serialization/base_object.hpp>
 
 // Standard library.
+#include <map>
 #include "utility.hpp"
 #include "vector.hpp"
 
@@ -61,13 +62,18 @@ class dinara::Shasta2AnchorGraph :
     public MappedMemoryOwner,
     public MultithreadedObject<Shasta2AnchorGraph> {
 public:
+    using AnchorPairKey = std::pair<Shasta2AnchorId, Shasta2AnchorId>;
 
-    // Construct the AnchorGraph from the Journeys.
-    // Only include edges with at least the specified minCoverage.
+    // Construct the AnchorGraph from the Journeys using the same edge
+    // creation rule as mode3::AnchorGraph: for each anchor, call
+    // Shasta2Anchors::findChildren and create one edge per child that
+    // satisfies minEdgeCoverage. The threadCount parameter is accepted
+    // for API compatibility but is not used.
     Shasta2AnchorGraph(
         const Shasta2Anchors&,
         const Shasta2Journeys&,
-        uint64_t minEdgeCoverage);
+        uint64_t minEdgeCoverage,
+        uint64_t threadCount);
 
     // Constructor from binary data.
     Shasta2AnchorGraph(const MappedMemoryOwner&, const string& name);
