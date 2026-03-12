@@ -34,6 +34,7 @@ string anchorIdToString(Shasta2AnchorId anchorId)
 #include <map>
 #include <queue>
 #include <set>
+#include <unordered_set>
 #include "tuple.hpp"
 
 // Explicit instantiation.
@@ -221,6 +222,221 @@ void Shasta2AnchorGraph::transitiveReduction(
     cout << useForAssemblyCount << " flagged for use in assembly out of " <<
         num_edges(anchorGraph) << " total." << endl;
 
+}
+
+
+
+uint64_t Shasta2AnchorGraph::cutWeakStalksLeadingToBranch(
+    const Shasta2Anchors& anchors,
+    uint64_t maxTipReadCount)
+{
+    // -----------------------------------------------------------------------
+    // Post-transitive-reduction weak-stalk cutting on the assembly subgraph.
+    //
+    // We operate only on edges currently marked useForAssembly=true.
+    //
+    // A candidate stalk must:
+    //   1. start at a tip in either directed orientation:
+    //        - source-tip orientation: in-degree 0, walked forward
+    //        - sink-tip orientation:   out-degree 0, walked backward
+    //   2. follow a linear chain in that orientation until one of three stop conditions:
+    //        a. the traversed chain reaches a branch point,
+    //        b. the chain reaches a dead end,
+    //        c. the union of oriented reads across all anchors seen so far
+    //           exceeds maxTipReadCount.
+    //
+    // Cut rule agreed with the user:
+    //   - If we hit a branch point while the union of supporting reads across
+    //     the traversed stalk (excluding the terminal branch/merge anchor)
+    //     is still <= maxTipReadCount, cut the whole chain.
+    //   - If we hit a dead end, do not cut.
+    //   - If the read union exceeds maxTipReadCount before reaching a branch
+    //     point, stop and do not cut.
+    //
+    // "Cut the whole chain" means: mark all assembly edges in the traversed
+    // prefix useForAssembly=false. Anchors themselves are not deleted.
+    //
+    // Important detail:
+    //   The terminal branch/merge anchor is intentionally excluded from the
+    //   read-union threshold. Otherwise, a weak low-read stalk that attaches
+    //   into a high-coverage branch anchor would almost never satisfy the
+    //   <= maxTipReadCount rule.
+    // -----------------------------------------------------------------------
+
+    Shasta2AnchorGraph& graph = *this;
+    cout << "AnchorGraph weak-stalk branch cutting begins." << endl;
+
+    auto inAssemblyDegree = [&](vertex_descriptor v) -> uint64_t {
+        uint64_t degree = 0;
+        BGL_FORALL_INEDGES(v, e, graph, Shasta2AnchorGraph) {
+            if(graph[e].useForAssembly) {
+                ++degree;
+            }
+        }
+        return degree;
+    };
+
+    auto outAssemblyEdges = [&](vertex_descriptor v, vector<edge_descriptor>& edges) {
+        edges.clear();
+        BGL_FORALL_OUTEDGES(v, e, graph, Shasta2AnchorGraph) {
+            if(graph[e].useForAssembly) {
+                edges.push_back(e);
+            }
+        }
+    };
+
+    auto inAssemblyEdges = [&](vertex_descriptor v, vector<edge_descriptor>& edges) {
+        edges.clear();
+        BGL_FORALL_INEDGES(v, e, graph, Shasta2AnchorGraph) {
+            if(graph[e].useForAssembly) {
+                edges.push_back(e);
+            }
+        }
+    };
+
+    auto readUnionWithinThreshold = [&](
+        const vector<vertex_descriptor>& chainVertices,
+        uint64_t threshold) -> bool {
+        std::unordered_set<uint64_t> orientedReadValues;
+        orientedReadValues.reserve(threshold + 1);
+        for(const vertex_descriptor v: chainVertices) {
+            const Shasta2Anchor anchor = anchors[Shasta2AnchorId(v)];
+            for(const auto& markerInfo: anchor) {
+                orientedReadValues.insert(markerInfo.orientedReadId.getValue());
+                if(orientedReadValues.size() > threshold) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    auto tryCollectWeakStalk = [&](
+        vertex_descriptor vStart,
+        bool forward,
+        vector<edge_descriptor>& candidateEdgesToCut)
+    {
+        vector<edge_descriptor> assemblyOutEdges;
+        vector<edge_descriptor> assemblyInEdges;
+        vector<vertex_descriptor> chainVertices;
+        vector<edge_descriptor> chainEdges;
+
+        if(forward) {
+            if(inAssemblyDegree(vStart) != 0) {
+                return;
+            }
+            outAssemblyEdges(vStart, assemblyOutEdges);
+            if(assemblyOutEdges.size() != 1) {
+                return;
+            }
+        } else {
+            outAssemblyEdges(vStart, assemblyOutEdges);
+            if(!assemblyOutEdges.empty()) {
+                return;
+            }
+            inAssemblyEdges(vStart, assemblyInEdges);
+            if(assemblyInEdges.size() != 1) {
+                return;
+            }
+        }
+
+        chainVertices.clear();
+        chainEdges.clear();
+        chainVertices.push_back(vStart);
+
+        vertex_descriptor current = vStart;
+        bool shouldCut = false;
+
+        while(true) {
+            if(forward) {
+                outAssemblyEdges(current, assemblyOutEdges);
+
+                if(assemblyOutEdges.empty()) {
+                    break;
+                }
+                if(assemblyOutEdges.size() > 1) {
+                    shouldCut = !chainEdges.empty() && readUnionWithinThreshold(chainVertices, maxTipReadCount);
+                    break;
+                }
+
+                const edge_descriptor e = assemblyOutEdges.front();
+                const vertex_descriptor next = target(e, graph);
+                const uint64_t nextInDegree = inAssemblyDegree(next);
+                if(nextInDegree > 1) {
+                    chainEdges.push_back(e);
+                    shouldCut = true;
+                    break;
+                }
+
+                chainEdges.push_back(e);
+                chainVertices.push_back(next);
+
+                if(!readUnionWithinThreshold(chainVertices, maxTipReadCount)) {
+                    shouldCut = false;
+                    break;
+                }
+
+                current = next;
+            } else {
+                inAssemblyEdges(current, assemblyInEdges);
+
+                if(assemblyInEdges.empty()) {
+                    break;
+                }
+                if(assemblyInEdges.size() > 1) {
+                    shouldCut = !chainEdges.empty() && readUnionWithinThreshold(chainVertices, maxTipReadCount);
+                    break;
+                }
+
+                const edge_descriptor e = assemblyInEdges.front();
+                const vertex_descriptor previous = source(e, graph);
+                vector<edge_descriptor> previousOutEdges;
+                outAssemblyEdges(previous, previousOutEdges);
+                if(previousOutEdges.size() > 1) {
+                    chainEdges.push_back(e);
+                    shouldCut = true;
+                    break;
+                }
+
+                chainEdges.push_back(e);
+                chainVertices.push_back(previous);
+
+                if(!readUnionWithinThreshold(chainVertices, maxTipReadCount)) {
+                    shouldCut = false;
+                    break;
+                }
+
+                current = previous;
+            }
+        }
+
+        if(shouldCut) {
+            candidateEdgesToCut.insert(
+                candidateEdgesToCut.end(),
+                chainEdges.begin(),
+                chainEdges.end());
+        }
+    };
+
+    vector<edge_descriptor> candidateEdgesToCut;
+
+    BGL_FORALL_VERTICES(vStart, graph, Shasta2AnchorGraph) {
+        tryCollectWeakStalk(vStart, true, candidateEdgesToCut);
+        tryCollectWeakStalk(vStart, false, candidateEdgesToCut);
+    }
+
+    uint64_t cutCount = 0;
+    for(const edge_descriptor e: candidateEdgesToCut) {
+        if(graph[e].useForAssembly) {
+            graph[e].useForAssembly = false;
+            ++cutCount;
+        }
+    }
+
+    cout << "AnchorGraph weak-stalk branch cutting ends. Cut "
+         << cutCount
+         << " assembly edges (maxTipReadCount=" << maxTipReadCount << ")." << endl;
+    return cutCount;
 }
 
 

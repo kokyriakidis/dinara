@@ -357,9 +357,9 @@ void Assembler::createReadGraph6(uint64_t threadCount)
     // // effective extension length before deciding if it is "short"), plus an additional deletion pass using
     // // `R_to_U` when `ru && is_ou`. Dinara's `StringGraphArc` does not store `ou` and the pipeline does not
     // // provide `is_ou/ru`, so `cutStringGraphTips()` currently matches only the non-OU/non-ru logic.
-    // cutStringGraphTips(/*maxShortTipReads*/3);
+    cutStringGraphTips(/*maxShortTipReads*/3);
 
-    // stringGraph.writeGfa("ReadGraph6-StringGraph-CutTips.gfa", *reads);
+    stringGraph.writeGfa("ReadGraph6-StringGraph-CutTips.gfa", *reads);
 
     // Step 11a: Sync read graph after tip cutting.
     rebuildReadGraphFromCurrentStringGraph(/*rebuildDirectedReadGraph*/false);

@@ -83,6 +83,9 @@ public:
     void transitiveReduction(
         uint64_t transitiveReductionMaxEdgeCoverage,
         uint64_t maxDistance);
+    uint64_t cutWeakStalksLeadingToBranch(
+        const Shasta2Anchors& anchors,
+        uint64_t maxTipReadCount);
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
 public:
