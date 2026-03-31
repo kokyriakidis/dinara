@@ -1570,6 +1570,23 @@ void dinara::main::assemble(
             maxPrimaryCoverage);
     auto& shasta2Anchors = assembler.shasta2Anchors;
 
+    // double kmerDensity = 1.0;
+    // cout << timestamp << "Filtering Shasta2Anchors with Shasta2 hashed k-mer checker..." << endl;
+    // // shasta2Anchors->filterByShasta2HashedKmerChecker(
+    // //     assemblerOptions.kmersOptions.probability);
+    // shasta2Anchors->filterByShasta2HashedKmerChecker(
+    //     kmerDensity);
+
+    const string externalAnchorsName =
+        std::filesystem::absolute("Shasta2ExternalAnchors").string();
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
+
     // Compute journeys.
     cout << timestamp << "Creating Shasta2Journeys..." << endl;
     assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
@@ -1593,6 +1610,7 @@ void dinara::main::assemble(
     // can load and visualize it even when we return before later assembly stages.
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
 
 
     // Transitive reduction.
@@ -1618,6 +1636,20 @@ void dinara::main::assemble(
     // Save the final assembly-enabled state used by the HTTP server.
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
+    // shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.graph");
+
+    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
+    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
+    shasta2AssemblyGraphOptions.threadCount = threadCount;
+    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
+    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        *shasta2AnchorGraph,
+        shasta2AssemblyGraphOptions);
+    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
 
 
     return;
@@ -1656,18 +1688,7 @@ void dinara::main::assemble(
     
     
 
-    // // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
-    // cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    // Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    // shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
-    // shasta2AssemblyGraphOptions.threadCount = threadCount;
-    // shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
-    // assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-    //     *shasta2Anchors,
-    //     *shasta2Journeys,
-    //     *shasta2AnchorGraph,
-    //     shasta2AssemblyGraphOptions);
-    // auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+    
 
     // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
     // shasta2AssemblyGraph->simplifyAndAssemble();

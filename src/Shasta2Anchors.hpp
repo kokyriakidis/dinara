@@ -136,6 +136,8 @@ public:
     {
         return markerKmers.get();
     }
+    uint64_t filterByShasta2HashedKmerChecker(double markerDensity);
+    uint64_t writeExternalAnchors(const string& name, bool canonicalOnly = true) const;
 
 
     // Read composition analysis.
@@ -176,6 +178,7 @@ public:
 
 private:
     shared_ptr<MarkerKmers> markerKmers;
+    vector<MarkerGraphVertexId> anchorVertexIds;
    
     // Data and functions used when constructing the Anchors.
     class ConstructData {

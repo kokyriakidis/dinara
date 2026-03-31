@@ -105,6 +105,7 @@ public:
 
     // Write the graph to GFA format.
     void writeGfa(const string& fileName) const;
+    void writeBubbleFinderGraph(const string& fileName, bool useForAssemblyOnly = true) const;
 
     // Save binary data (Shasta2 compatibility).
     void saveAnchorGraph(const string& name = "Shasta2AnchorGraph") const { save(name); }

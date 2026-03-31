@@ -820,6 +820,10 @@ private:
     {
         kmerChecker = inputKmerChecker;
     }
+    const shared_ptr<KmerChecker>& getKmerChecker() const
+    {
+        return kmerChecker;
+    }
     void accessKmerChecker();
 
     // This one should eventually go away, but there are several scripts

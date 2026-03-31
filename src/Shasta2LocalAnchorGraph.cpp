@@ -941,7 +941,7 @@ void Shasta2LocalAnchorGraph::writeVertices(
 
 
         // Hyperlink.
-        html << "\n<a href='exploreAnchor?anchorIdString=" <<
+        html << "\n<a href='exploreShasta2Anchor?anchorIdString=" <<
             HttpServer::urlEncode(anchorIdString) << "'>";
 
         // Write the vertex.
