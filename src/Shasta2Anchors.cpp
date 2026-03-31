@@ -1,9 +1,11 @@
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
+#include "MurmurHash2.hpp"
 #include "deduplicate.hpp"
 #include "findMarkerId.hpp"
 #include "MultithreadedObject.tpp"
 #include "Reads.hpp"
+#include "shasta2/ShortBaseSequence.hpp"
 
 #include "Marker.hpp"
 #include "MarkerGraph.hpp"
@@ -21,6 +23,45 @@ namespace {
     {
         static const MarkerGraph dummy;
         return dummy;
+    }
+
+    class ExternalAnchorOrientedRead {
+    public:
+        OrientedReadId orientedReadId;
+        uint32_t position;
+
+        ExternalAnchorOrientedRead() {}
+
+        ExternalAnchorOrientedRead(
+            OrientedReadId orientedReadId,
+            uint32_t position) :
+            orientedReadId(orientedReadId),
+            position(position)
+        {}
+    };
+
+    using Shasta2StyleKmer = shasta2::ShortBaseSequence128;
+
+    uint32_t computeShasta2HashThreshold(double markerDensity)
+    {
+        if(markerDensity < 0. || markerDensity > 1.) {
+            throw runtime_error("Invalid marker density " +
+                to_string(markerDensity) + " requested.");
+        }
+
+        const double p = 1. - std::sqrt(1. - markerDensity);
+        const double hashMax = std::numeric_limits<uint32_t>::max();
+        return uint32_t(std::round(double(hashMax) * p));
+    }
+
+    bool isShasta2Marker(const Shasta2StyleKmer& kmer, uint64_t k, uint32_t hashThreshold)
+    {
+        if(MurmurHash2(&kmer, sizeof(Shasta2StyleKmer), 267457831) < hashThreshold) {
+            return true;
+        }
+
+        const Shasta2StyleKmer kmerRc = kmer.reverseComplement(k);
+        return MurmurHash2(&kmerRc, sizeof(Shasta2StyleKmer), 267457831) < hashThreshold;
     }
 }
 
@@ -130,7 +171,7 @@ Shasta2Anchors::Shasta2Anchors(
     
     // Finalize VectorOfVectors
     anchorMarkerInfos.endPass2();
-    data.selectedVertexIds.clear();
+    anchorVertexIds = std::move(data.selectedVertexIds);
 }
 
 Shasta2Anchors::Shasta2Anchors(
@@ -310,6 +351,151 @@ Kmer Shasta2Anchors::anchorKmer(Shasta2AnchorId anchorId) const
     }
     const Shasta2AnchorMarkerInfo& markerInfo = anchor.front();
     return getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+}
+
+
+uint64_t Shasta2Anchors::filterByShasta2HashedKmerChecker(double markerDensity)
+{
+    const uint32_t hashThreshold = computeShasta2HashThreshold(markerDensity);
+    const uint64_t anchorCount = size();
+    vector<vector<Shasta2AnchorMarkerInfo> > keptAnchors;
+    keptAnchors.reserve(anchorCount);
+
+    uint64_t removedCount = 0;
+    for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; ++anchorId) {
+        const Shasta2Anchor anchor = (*this)[anchorId];
+        if(anchor.empty()) {
+            ++removedCount;
+            continue;
+        }
+
+        const uint32_t position0 =
+            markers[anchor.front().orientedReadId.getValue()][anchor.front().ordinal].position;
+        Shasta2StyleKmer shasta2Kmer;
+        for(uint64_t i=0; i<k; i++) {
+            shasta2Kmer.set(
+                i,
+                shasta2::Base::fromInteger(
+                    reads.getOrientedReadBase(
+                        anchor.front().orientedReadId,
+                        uint32_t(position0 + i)).value));
+        }
+        if(!isShasta2Marker(shasta2Kmer, k, hashThreshold)) {
+            ++removedCount;
+            continue;
+        }
+
+        keptAnchors.emplace_back(anchor.begin(), anchor.end());
+    }
+
+    cout << "Shasta2 hashed k-mer checker retained " << keptAnchors.size() << " / "
+         << anchorCount << " Shasta2 anchors." << endl;
+    if(removedCount == 0) {
+        return 0;
+    }
+
+    vector<MarkerGraphVertexId> keptAnchorVertexIds;
+    if(!anchorVertexIds.empty()) {
+        keptAnchorVertexIds.reserve(keptAnchors.size());
+        for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; ++anchorId) {
+            const Shasta2Anchor anchor = (*this)[anchorId];
+            if(anchor.empty()) {
+                continue;
+            }
+
+            const uint32_t position0 =
+                markers[anchor.front().orientedReadId.getValue()][anchor.front().ordinal].position;
+            Shasta2StyleKmer shasta2Kmer;
+            for(uint64_t i=0; i<k; i++) {
+                shasta2Kmer.set(
+                    i,
+                    shasta2::Base::fromInteger(
+                        reads.getOrientedReadBase(
+                            anchor.front().orientedReadId,
+                            uint32_t(position0 + i)).value));
+            }
+            if(isShasta2Marker(shasta2Kmer, k, hashThreshold)) {
+                keptAnchorVertexIds.push_back(anchorVertexIds[anchorId]);
+            }
+        }
+    }
+
+    anchorMarkerInfos.clear();
+    for(const auto& anchor : keptAnchors) {
+        anchorMarkerInfos.appendVector(anchor);
+    }
+    if(!anchorVertexIds.empty()) {
+        anchorVertexIds = std::move(keptAnchorVertexIds);
+    }
+
+    return removedCount;
+}
+
+
+uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonicalOnly) const
+{
+    MemoryMapped::VectorOfVectors<ExternalAnchorOrientedRead, uint64_t> data;
+    MemoryMapped::VectorOfVectors<char, uint64_t> names;
+    data.createNew(name, 4096);
+    names.createNew(name + "-Names", 4096);
+
+    uint64_t exportedCount = 0;
+
+    for(Shasta2AnchorId anchorId=0; anchorId<size(); ++anchorId) {
+        const Shasta2Anchor anchor = (*this)[anchorId];
+        if(anchor.empty()) {
+            continue;
+        }
+
+        if(canonicalOnly) {
+            bool skip = false;
+            if(!anchorVertexIds.empty() && markerGraph.reverseComplementVertex.isOpen) {
+                const MarkerGraphVertexId vertexId = anchorVertexIds[anchorId];
+                const MarkerGraphVertexId vertexIdRc = markerGraph.reverseComplementVertex[vertexId];
+                skip = vertexIdRc < vertexId;
+            } else {
+                const Kmer kmerValue = anchorKmer(anchorId);
+                const Kmer kmerRc = kmerValue.reverseComplement(k);
+                skip = kmerRc.id(k) < kmerValue.id(k);
+            }
+            if(skip) {
+                continue;
+            }
+        }
+
+        const Kmer expectedKmer = getKmer(anchor.front().orientedReadId, anchor.front().ordinal);
+        vector<ReadId> readIds;
+        readIds.reserve(anchor.size());
+        for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const Kmer kmerValue = getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+            if(kmerValue != expectedKmer) {
+                throw runtime_error(
+                    "Shasta2 external-anchor export failed: anchor " +
+                    shasta2AnchorIdToString(anchorId) +
+                    " contains inconsistent marker k-mers.");
+            }
+
+            const ReadId readId = markerInfo.orientedReadId.getReadId();
+            if(std::find(readIds.begin(), readIds.end(), readId) != readIds.end()) {
+                throw runtime_error(
+                    "Shasta2 external-anchor export failed: anchor " +
+                    shasta2AnchorIdToString(anchorId) +
+                    " contains the same ReadId on both strands.");
+            }
+            readIds.push_back(readId);
+        }
+
+        const string anchorName = "anchor-" + shasta2AnchorIdToString(anchorId);
+        data.appendVector();
+        names.appendVector(anchorName.begin(), anchorName.end());
+        for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const uint32_t position = markers[markerInfo.orientedReadId.getValue()][markerInfo.ordinal].position;
+            data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, position));
+        }
+        ++exportedCount;
+    }
+
+    return exportedCount;
 }
 
 
