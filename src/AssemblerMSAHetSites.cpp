@@ -521,6 +521,73 @@ void Assembler::computeMSAHetSites(ReadId focalReadId, uint32_t strand)
                 // Keep only events where BOTH alleles have at least 3 supporting reads.
                 if (ev.refReads.size() < 3 || ev.altReads.size() < 3) continue;
 
+                // --- Filter 1b: short tandem repeat (STR) snarl filter ---
+                // A snarl is a repeat-unit artifact if the two allele paths differ
+                // only in the number of full copies of a repeat unit of period 1–4.
+                // Period 1 = homopolymer (AAAA vs AA), period 2 = dinucleotide (ACAC vs AC),
+                // period 3 = trinucleotide (AGCAGC vs AGC), period 4 = tetranucleotide.
+                // Matches hpc_mask_ff's hpc_min=4 scan range.
+                //
+                // Rule for each period r (1..4):
+                //   1. Length difference must be a non-zero multiple of r.
+                //   2. The longer allele must equal the shorter allele with one or more
+                //      copies of the repeat unit prepended OR appended.
+                //   3. The repeat unit must match the corresponding prefix or suffix of
+                //      the shorter allele (confirms the unit is consistent across both).
+                //
+                // Examples filtered (period shown):
+                //   ref=A,      alt=AAA      period=1: extra "AA"    ✓
+                //   ref=AC,     alt=ACAC     period=2: extra "AC"    ✓
+                //   ref=AGC,    alt=AGCAGC   period=3: extra "AGC"   ✓
+                //   ref=ACGT,   alt=ACGTACGT period=4: extra "ACGT"  ✓
+                //   ref=ACACAC, alt=ACAC     period=2: extra "AC"    ✓
+                // Examples NOT filtered:
+                //   ref=A,  alt=G   → same length (SNP)
+                //   ref=AC, alt=AG  → same length, different bases (SNP/MNP)
+                //   ref=AC, alt=AAC → extra 'A'; unit "A" does NOT match suffix of "AC" ('C')
+                //                     NOR prefix of "AC" ('A') at the abutting end → NOT filtered
+                //   ref=AA, alt=AAC → extra 'C'; unit "C" ≠ 'A' at abutting end   → NOT filtered
+                {
+                    auto isStrSnarl = [](const string& a, const string& b) -> bool {
+                        const size_t na = a.size(), nb = b.size();
+
+                        // Strip common prefix.
+                        size_t p = 0;
+                        while (p < na && p < nb && a[p] == b[p]) ++p;
+
+                        // Strip common suffix (must not overlap with stripped prefix).
+                        size_t s = 0;
+                        const size_t ra = na - p, rb = nb - p;
+                        while (s < ra && s < rb && a[na - 1 - s] == b[nb - 1 - s]) ++s;
+
+                        // Trimmed lengths (no allocation — just lengths).
+                        const size_t ta = ra - s, tb = rb - s;
+
+                        // Exactly one trimmed string must be empty (pure ins or del).
+                        if (ta != 0 && tb != 0) return false;
+                        if (ta == 0 && tb == 0) return false;
+
+                        // Pointer into the non-empty trimmed region; n = its length.
+                        const char* tl = (ta == 0) ? b.data() + p : a.data() + p;
+                        const size_t n  = (ta == 0) ? tb : ta;
+
+                        // Must be k≥2 copies of a period-1..4 unit.
+                        // tl[i] == tl[i-r] (no modulo) is equivalent to tl[i] == tl[i%r]
+                        // by induction and is division-free.
+                        for (size_t r = 1; r <= 4; r++) {
+                            if (n % r != 0) continue;
+                            if (n / r < 2) continue;
+                            bool ok = true;
+                            for (size_t i = r; i < n && ok; i++)
+                                if (tl[i] != tl[i - r]) ok = false;
+                            if (ok) return true;
+                        }
+                        return false;
+                    };
+
+                    if (isStrSnarl(ev.refAllele, ev.altAllele)) continue;
+                }
+
                 // --- Filter 2: strand bias ---
                 // Port of the hifiasm is_st_bs check (st_rate=0.05, st_max=2).
                 // An allele is strand-biased when ≥95% of its supporting reads are
@@ -558,9 +625,54 @@ void Assembler::computeMSAHetSites(ReadId focalReadId, uint32_t strand)
         }
     }
 
+    // --- Filter 3: drop adjacent-position events (distance == 1 bp) ---
+    // Port of hifiasm's Step 0 adjacent-site removal. Events at consecutive
+    // positions (vcfPos_i and vcfPos_j differ by exactly 1) are likely MNP
+    // decomposition noise or sequencing-error clusters. Drop any event that
+    // has a neighbour (same segmentIndex, sorted by vcfPos) at distance 1.
+    // Applied globally across all segments for this read.
+    {
+        auto& evs = shasta2VariantEvents[readSlot];
+
+        // Sort by (segmentIndex, vcfPos) for adjacency detection.
+        std::sort(evs.begin(), evs.end(),
+            [](const VariantEvent& a, const VariantEvent& b) {
+                if (a.segmentIndex != b.segmentIndex)
+                    return a.segmentIndex < b.segmentIndex;
+                return a.vcfPos < b.vcfPos;
+            });
+
+        // Mark events to drop: any event whose vcfPos is within 1 of a neighbour
+        // in the same segment.
+        std::vector<bool> drop(evs.size(), false);
+        for (size_t i = 0; i < evs.size(); i++) {
+            // Check previous event in same segment
+            if (i > 0 &&
+                evs[i].segmentIndex == evs[i-1].segmentIndex &&
+                evs[i].vcfPos <= evs[i-1].vcfPos + 1) {
+                drop[i]   = true;
+                drop[i-1] = true;
+            }
+            // Check next event in same segment
+            if (i + 1 < evs.size() &&
+                evs[i].segmentIndex == evs[i+1].segmentIndex &&
+                evs[i+1].vcfPos <= evs[i].vcfPos + 1) {
+                drop[i]   = true;
+                drop[i+1] = true;
+            }
+        }
+
+        // Compact: remove dropped events.
+        size_t write = 0;
+        for (size_t i = 0; i < evs.size(); i++)
+            if (!drop[i]) evs[write++] = std::move(evs[i]);
+        evs.resize(write);
+        eventsTotal = (uint32_t)evs.size();
+    }
+
     // --- Summary ---
     std::cout << "  Written " << segmentsWritten << " GFAs, "
-              << eventsTotal << " variant event(s)\n";
+              << eventsTotal << " variant event(s) (after all filters)\n";
 
     for (const auto& ev : shasta2VariantEvents[readSlot]) {
         const char* typeStr = [&]() -> const char* {
