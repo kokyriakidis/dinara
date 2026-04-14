@@ -170,6 +170,21 @@ void Assembler::createReadGraph(
 
 
 
+// Create a read graph keeping all alignments, with no filtering.
+// Used for the marker-graph + journeys pipeline, where alignment
+// selection is deferred to coverage thresholds on marker graph vertices
+// rather than done up-front per read.
+void Assembler::createReadGraphAllAlignments()
+{
+    const uint64_t n = alignmentData.size();
+    cout << timestamp << "createReadGraphAllAlignments: keeping all " << n << " alignments." << endl;
+    vector<bool> keepAlignment(n, true);
+    createReadGraphUsingSelectedAlignments(keepAlignment);
+    createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
+}
+
+
+
 // This is called for ReadGraph.creationMethod 0 and 2.
 void Assembler::createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment)
 {

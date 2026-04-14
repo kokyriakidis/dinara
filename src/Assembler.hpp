@@ -1740,6 +1740,12 @@ private:
     void createReadGraph6();
     void createReadGraph6(uint64_t threadCount);
 
+    // Create a read graph keeping all alignments without any filtering.
+    // Use this together with marker graph vertex coverage thresholds
+    // (minCoverage/maxCoverage in createMarkerGraphVertices) to filter
+    // instead of pre-filtering per read.
+    void createReadGraphAllAlignments();
+
     // Create a read graph using only the cis/trans (phasing) decisions produced by
     // performHifiasmECParity. This ignores all non-phasing deletion reasons.
     // An overlap is kept iff neither read marked it with DeleteReasonPhase.
@@ -3480,6 +3486,60 @@ public:
     // Shasta2-style Anchors for Mode 3.
     std::shared_ptr<Shasta2Anchors> shasta2Anchors;
     std::shared_ptr<Shasta2Journeys> shasta2Journeys;
+    // Non-overlapping journeys derived from shasta2Journeys.
+    // Indexed by OrientedReadId.getValue(). Computed after journey creation.
+    // AnchorId is uint64_t (shasta2::AnchorId).
+    std::vector<std::vector<uint64_t>> shasta2LinearJourneys;
+
+    // MSA het-site variant events (AssemblerMSAHetSites.cpp).
+    // Produced by vg deconstruct on per-anchor-pair POA GFAs with embedded read paths.
+    // Each event corresponds to one VCF record (one snarl, one alt allele).
+    // Nested snarls are linked via parentSiteId / level fields.
+
+    enum class MSAVariantType : uint8_t { SNP, INSERTION, DELETION, MNP, COMPLEX };
+
+    struct VariantEvent {
+        // Anchor-pair context
+        uint32_t    segmentIndex;   // jPos in linear journey
+        uint32_t    focalPosStart;  // base position of anchor[jPos]   in focal read
+        uint32_t    focalPosEnd;    // base position of anchor[jPos+1] in focal read + k
+
+        // VCF coordinates (relative to focal read as reference path)
+        uint32_t    vcfPos;         // 1-based POS in focal read
+        std::string vcfId;          // snarl ID from vg (e.g. ">2>5")
+
+        // Alleles
+        std::string refAllele;      // REF (focal-read allele)
+        std::string altAllele;      // ALT (one alt; multi-allelic sites produce multiple events)
+        MSAVariantType varType;
+
+        // Snarl-tree linkage (from vg deconstruct -n LV/PS/PA/RS/RD tags)
+        int         level;          // 0 = top-level; >0 = nested
+        std::string parentSiteId;   // PS: ID of parent snarl (empty if level==0)
+        int         parentAllele;   // PA: which allele of parent contains this site's ref path.
+                                    //     0 = focal read passes through this nested site
+                                    //     (it is inside the parent's REF branch).
+                                    //     >0 = focal read does NOT enter this site
+                                    //     (it is inside a parent ALT branch).
+                                    //     -1 = not set (level==0).
+        uint32_t    topLevelPosStart; // RS: start of top-level containing site on focal read
+        uint32_t    topLevelPosEnd;   // RD: end   of top-level containing site on focal read
+
+        // Spanning reads assigned by vg deconstruct GT column.
+        // Star-allele reads (GT=*) are excluded — they carry no evidence at this level.
+        std::vector<OrientedReadId> refReads;  // GT == 0
+        std::vector<OrientedReadId> altReads;  // GT == altIdx for this event
+    };
+
+    // All variant events for a given oriented read, across all anchor-pair segments.
+    // Indexed by OrientedReadId.getValue().
+    // Ordered by (segmentIndex, vcfPos, level) — top-level events before children.
+    // This is the primary input for het-site phasing.
+    std::vector<std::vector<VariantEvent>> shasta2VariantEvents;
+
+    // Per-anchor-pair POA-MSA for het-site detection (AssemblerMSAHetSites.cpp).
+    // Writes one GFA per inter-anchor segment of the given read's linear journey.
+    void computeMSAHetSites(ReadId focalReadId, uint32_t strand);
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
     std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
     std::map<string, std::shared_ptr<Shasta2AssemblyGraphPostprocessor> > shasta2AssemblyGraphTable;

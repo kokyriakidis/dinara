@@ -96,7 +96,7 @@ else()
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
         -Wl,--start-group
-        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
+        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
         ZLIB::ZLIB
         -Wl,--end-group
     )

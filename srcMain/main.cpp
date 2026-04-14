@@ -954,72 +954,12 @@ void dinara::main::assemble(
 
 
 
-    // Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics)
-    assembler.performHifiasmECParity(threadCount);
-
-    // // Delete overlaps where one read is contained in the other.
-    // assembler.deleteContainmentOverlaps(threadCount);
-
-    // // Delete internal overlaps (excessive overhangs or too short).
-    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
-
-    // Second round: re-phase using only overlaps kept by both sides (cis set from round 1).
-    assembler.performHifiasmECParity(threadCount);
-
-    // // Delete overlaps where one read is contained in the other.
-    // assembler.deleteContainmentOverlaps(threadCount);
-
-    // // Delete internal overlaps (excessive overhangs or too short).
-    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
-
-    // Third round: re-phase using only overlaps kept by both sides (cis set from round 2).
-    assembler.performHifiasmECParity(threadCount);
-
-    // // Delete overlaps where one read is contained in the other.
-    // assembler.deleteContainmentOverlaps(threadCount);
-
-    // // Delete internal overlaps (excessive overhangs or too short).
-    // assembler.deleteInternalOverlaps(1000, 0.8, 50, threadCount);
-
-    // // Fourth round: re-phase using only overlaps kept by both sides (cis set from round 3).
-    // assembler.performHifiasmECParity(threadCount);
-
-    // // Region-aware interval clique filtering: for each read (longest first),
-    // // greedily accept overlaps by DP score (dovetails first), checking that each
-    // // new candidate overlaps a sufficient fraction of already-accepted reads
-    // // covering the same interval. Spurious overlaps are flagged with DeleteReasonClique.
-    // const uint64_t minIntervalOverlap = 50; // bases of interval overlap on R to be "same region"
-    // const uint64_t minRegionSize = 0;         // min accepted reads before clique check enforced
-    // const double minCliqueFraction = 1.0;     // fraction of region reads candidate must overlap (0.5 = diploid-safe)
-    // assembler.filterOverlapsByRegionalCliques(minIntervalOverlap, minRegionSize, minCliqueFraction, threadCount);
-
-
     // =========================================================================
-    // ONT Chain Deduplication: Keep One Overlap Per Partner (Hifiasm Parity)
+    // New approach: skip EC parity and per-read filtering entirely.
+    // Use all alignments to build the read graph; filtering is deferred to
+    // marker graph vertex coverage thresholds (minCoverage / maxCoverage).
     // =========================================================================
-    // Hifiasm ONT EC (`--ont`) uses lchain+mcopy to discover multiple chains per
-    // read pair, then deduplicates to one overlap per partner after base-level
-    // alignment and phasing (see `dedup_chains`, ecovlp.cpp:2984).
-    //
-    // Selection criteria (priority order):
-    //   1. Prefer cis over trans (minimize is_match)
-    //   2. Maximize score = span - 12*errors
-    //   3. Maximize span (tie-breaker)
-    //
-    // Dinara's inverted-index lchain+mcopy can also emit multiple candidates
-    // per (readIds[0], readIds[1]). This deduplication runs after:
-    //   ✅ computeAlignmentsWithEvidence() - base alignment computed
-    //   ✅ performHifiasmECParity() - phasing marks cis/trans
-    //
-    // It marks non-best as DeleteReasonSecondary for lazy deletion.
-    //
-    // ✅ VERIFIED EQUIVALENT to hifiasm dedup_chains logic (see function docs)
-    assembler.deduplicateOntChainsPerPartnerReadHifiasmLike(threadCount);
-
-
-    // Clean overlap filtering (ma_hit_sub/cut/flt/contained + chimera detection) and read graph creation.
-    // This uses conservative AND parity semantics (both reads must keep the overlap).
-    assembler.createReadGraph6(threadCount);
+    assembler.createReadGraphAllAlignments();
 
     
 
@@ -1595,6 +1535,48 @@ void dinara::main::assemble(
         threadCount,
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
+
+    // --- Remove overlapping anchors from journeys ---
+    // Two consecutive anchors on the same oriented read overlap when the base
+    // position of anchor i+1 is less than position(anchor_i) + k, i.e. the
+    // k-mers share bases. We greedily keep the first anchor of any overlapping
+    // pair (anchors are already in ordinal order so the first has the smaller
+    // position). The result is stored as a plain vector so the memory-mapped
+    // journeys are not modified.
+    cout << timestamp << "Removing overlapping anchors from journeys..." << endl;
+    {
+        const uint64_t k = assembler.assemblerInfo->k;
+        const auto& mkrs = *assembler.markers;
+        const uint64_t orientedReadCount = 2 * assembler.getReads().readCount();
+
+        assembler.shasta2LinearJourneys.resize(orientedReadCount);
+        uint64_t totalRemoved = 0;
+
+        for (uint64_t i = 0; i < orientedReadCount; i++) {
+            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(i));
+            const Shasta2Journey journey = (*shasta2Journeys)[oid];
+            std::vector<Shasta2AnchorId>& linear = assembler.shasta2LinearJourneys[i];
+            linear.clear();
+            linear.reserve(journey.size());
+
+            uint32_t prevEnd = 0; // end base position of the last kept anchor
+            for (const Shasta2AnchorId anchorId : journey) {
+                const uint32_t ordinal = shasta2Anchors->getOrdinal(anchorId, oid);
+                const uint32_t pos = uint32_t(mkrs[i][ordinal].position);
+                if (linear.empty() || pos >= prevEnd) {
+                    linear.push_back(anchorId);
+                    prevEnd = pos + uint32_t(k);
+                } else {
+                    ++totalRemoved;
+                }
+            }
+        }
+        cout << timestamp << "  Removed " << totalRemoved << " overlapping anchors." << endl;
+    }
+
+#ifdef DINARA_HAVE_THESEUS
+    assembler.computeMSAHetSites(ReadId(0), 0);
+#endif
 
     // Create the Shasta2AnchorGraph.
     const uint64_t minEdgeCoverage = 2;

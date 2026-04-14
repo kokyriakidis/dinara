@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
+import json
 
 # Define the local build directory
 HOME = os.path.expanduser("~")
@@ -558,12 +560,19 @@ def installBubbleFinder():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
 
-        if os.path.exists(sourceDir):
+        if os.path.isdir(sourceDir):
             print("Updating existing BubbleFinder source at", sourceDir)
             runCommand("git -C " + sourceDir + " pull --ff-only")
         else:
+            if os.path.exists(sourceDir):
+                # A non-directory file exists at the source path (e.g. an old binary).
+                # Remove it so git clone can create the directory.
+                os.remove(sourceDir)
             print("Cloning BubbleFinder source to", sourceDir)
             runCommand("git clone https://github.com/algbio/BubbleFinder.git " + sourceDir)
+
+        # BubbleFinder requires several git submodules (gbz, sdsl-lite, etc.).
+        runCommand("git -C " + sourceDir + " submodule update --init --recursive")
 
         buildDir = os.path.join(sourceDir, "build")
         if os.path.exists(buildDir):
@@ -797,6 +806,198 @@ def installShasta2():
         os.chdir(oldDirectory)
 
 
+def installTheseusLib():
+    print("Installing theseus-lib...")
+
+    installPath = os.path.join(INCLUDE_DIR, "theseus")
+    libPath = os.path.join(LIB_DIR, "libtheseus.a")
+
+    if os.path.exists(installPath) and os.path.exists(libPath):
+        print("theseus headers and library found. Skipping installation.")
+        return
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building theseus-lib using temporary directory", temporaryDirectory)
+
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+
+        # Clone repo
+        runCommand("git clone https://github.com/albertjimenezbl/theseus-lib.git")
+        os.chdir("theseus-lib")
+
+        # Patch graph.h: POA-built vertices never have their name field set,
+        # so print_as_gfa() writes empty names -> invalid GFA (Bandage shows nothing).
+        # Fix: fall back to 1-based index when name is empty.
+        graphH = "theseus/graph.h"
+        with open(graphH, "r") as f:
+            src = f.read()
+
+        old_gfa = (
+            "            // Print all nodes as segments\n"
+            "            for (const auto &vtx : _vertices)\n"
+            "            {\n"
+            "                gfa_output << \"S\\t\" << vtx.name << \"\\t\" << vtx.value << \"\\n\";\n"
+            "            }\n"
+            "\n"
+            "            // Print all edges as links\n"
+            "            for (const auto &vtx : _vertices)\n"
+            "            {\n"
+            "                // Go through all incoming vertices (with this you cover all possible edges,\n"
+            "                // since the graph is directed)\n"
+            "                for (const auto &edge : vtx.in_edges)\n"
+            "                {\n"
+            "                    gfa_output << \"L\\t\" << _vertices[edge.from_vertex].name << \"\\t+\\t\"\n"
+            "                        << vtx.name << \"\\t+\\t\"\n"
+            "                        << edge.overlap << \"M\\n\";\n"
+            "                }\n"
+            "            }"
+        )
+        new_gfa = (
+            "            // Build a per-vertex name: use the stored name if present,\n"
+            "            // otherwise fall back to the 1-based vertex index.\n"
+            "            // (POA-built graphs never set vtx.name, so it is always empty.)\n"
+            "            auto vtx_name = [&](size_t idx) -> std::string {\n"
+            "                return _vertices[idx].name.empty()\n"
+            "                    ? std::to_string(idx + 1)\n"
+            "                    : _vertices[idx].name;\n"
+            "            };\n"
+            "\n"
+            "            // Print all nodes as segments (skip empty sentinel nodes)\n"
+            "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
+            "            {\n"
+            "                if (_vertices[i].value.empty()) continue;\n"
+            "                gfa_output << \"S\\t\" << vtx_name(i) << \"\\t\" << _vertices[i].value << \"\\n\";\n"
+            "            }\n"
+            "\n"
+            "            // Print all edges as links (skip any link touching an empty sentinel)\n"
+            "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
+            "            {\n"
+            "                if (_vertices[i].value.empty()) continue;\n"
+            "                for (const auto &edge : _vertices[i].in_edges)\n"
+            "                {\n"
+            "                    if (_vertices[edge.from_vertex].value.empty()) continue;\n"
+            "                    gfa_output << \"L\\t\" << vtx_name(edge.from_vertex) << \"\\t+\\t\"\n"
+            "                        << vtx_name(i) << \"\\t+\\t\"\n"
+            "                        << edge.overlap << \"M\\n\";\n"
+            "                }\n"
+            "            }"
+        )
+        if old_gfa not in src:
+            print("Warning: could not apply theseus GFA patch (source may have changed). Continuing anyway.")
+        else:
+            src = src.replace(old_gfa, new_gfa)
+            with open(graphH, "w") as f:
+                f.write(src)
+            print("Applied theseus GFA name patch.")
+
+        # Build and install static library into DINARA_BUILD_DIR
+        os.mkdir("build")
+        os.chdir("build")
+        runCommand(
+            "cmake .. "
+            "-DCMAKE_BUILD_TYPE=Release "
+            "-DBUILD_SHARED_LIBS=OFF "
+            f"-DCMAKE_INSTALL_PREFIX={DINARA_BUILD_DIR}"
+        )
+        runCommand("cmake --build . -j")
+        runCommand("cmake --install .")
+
+        os.chdir(oldDirectory)
+
+    print("theseus-lib installed.")
+
+
+def installVg():
+    print("Installing vg (variation graph toolkit)...")
+
+    installBinDir = os.path.join(HOME, ".local", "bin")
+    installBinary = os.path.join(installBinDir, "vg")
+
+    os.makedirs(installBinDir, exist_ok=True)
+
+    if os.path.exists(installBinary) and os.access(installBinary, os.X_OK):
+        print("vg binary found at " + installBinary + ". Skipping installation.")
+        return
+
+    # Fetch the latest release asset URL from the GitHub API.
+    apiUrl = "https://api.github.com/repos/vgteam/vg/releases/latest"
+    req = urllib.request.Request(apiUrl, headers={"Accept": "application/vnd.github+json",
+                                                   "User-Agent": "dinara-install"})
+    with urllib.request.urlopen(req) as response:
+        release = json.loads(response.read().decode())
+
+    tag = release["tag_name"]
+    print("Latest vg release: " + tag)
+
+    # The prebuilt static Linux x86_64 binary is always named "vg" in the release assets.
+    assetUrl = None
+    for asset in release["assets"]:
+        if asset["name"] == "vg":
+            assetUrl = asset["browser_download_url"]
+            break
+
+    if assetUrl is None:
+        raise Exception("Could not find the 'vg' static binary asset in release " + tag)
+
+    print("Downloading vg from " + assetUrl + " ...")
+    urllib.request.urlretrieve(assetUrl, installBinary)
+    os.chmod(installBinary, 0o755)
+
+    print("vg " + tag + " installed at " + installBinary)
+
+
+def installMinipoa():
+    print("Installing minipoa (fast SIMD POA MSA tool)...")
+
+    installBinDir = os.path.join(HOME, ".local", "bin")
+    installBinary = os.path.join(installBinDir, "minipoa")
+
+    os.makedirs(installBinDir, exist_ok=True)
+
+    if os.path.exists(installBinary) and os.access(installBinary, os.X_OK):
+        print("minipoa binary found at " + installBinary + ". Skipping installation.")
+        return
+
+    sourceDir = os.path.join(HOME, "Downloads", "minipoa")
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building minipoa using temporary directory", temporaryDirectory)
+
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+
+        if os.path.isdir(sourceDir):
+            print("Updating existing minipoa source at", sourceDir)
+            runCommand("git -C " + sourceDir + " pull --ff-only")
+        else:
+            if os.path.exists(sourceDir):
+                os.remove(sourceDir)
+            print("Cloning minipoa source to", sourceDir)
+            runCommand("git clone https://github.com/NCl3-lhd/minipoa.git " + sourceDir)
+
+        buildDir = os.path.join(sourceDir, "build")
+        if os.path.exists(buildDir):
+            shutil.rmtree(buildDir)
+
+        runCommand("cmake -S " + sourceDir + " -B " + buildDir +
+                   " -DCMAKE_BUILD_TYPE=Release")
+        runCommand("cmake --build " + buildDir + " -j")
+
+        # The binary is placed in the build directory.
+        builtBinary = os.path.join(buildDir, "minipoa")
+        if not os.path.exists(builtBinary):
+            # Some CMake setups put it directly in the source tree build dir.
+            raise Exception("minipoa binary not found after build. Check build output.")
+
+        runCommand("cp " + builtBinary + " " + installBinary)
+        os.chmod(installBinary, 0o755)
+
+        os.chdir(oldDirectory)
+
+    print("minipoa installed at " + installBinary)
+
+
 # Install all Rust libraries
 installAstarpa()
 installPoasta()
@@ -805,7 +1006,13 @@ installBubbleFinder()
 
 # Install shasta2 (and abpoa via shasta2 scripts)
 installShasta2()
-  
+
+# Install theseus-lib (C++23 POA / sequence-to-graph aligner)
+installTheseusLib()
+
+installVg()
+installMinipoa()
+
 # Make sure the newly created libraries are immediately visible to the loader.
 # For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable
 # runCommand("sudo ldconfig")
