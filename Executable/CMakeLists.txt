@@ -89,6 +89,16 @@ if(NOT SHASTA2_LIB)
     message(FATAL_ERROR "shasta2 library not found. Please install it.")
 endif()
 
+# Find theseus library (optional — enables journey MSA experiment)
+find_library(THESEUS_LIB theseus)
+if(THESEUS_LIB)
+    add_definitions(-DDINARA_HAVE_THESEUS)
+    message(STATUS "theseus found: journey MSA experiment enabled.")
+else()
+    message(WARNING "theseus library not found. Run InstallPrerequisites to enable journey MSA experiment.")
+    set(THESEUS_LIB "")
+endif()
+
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})
 set_target_properties(dinaraExecutable PROPERTIES OUTPUT_NAME "dinara")
@@ -107,7 +117,7 @@ if(APPLE)
         dinaraExecutable
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
-        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB})
+        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB})
 else()
     # For arcane reasons, statically linking with the pthread
     # library on Linux requires "--whole-archive".
@@ -117,15 +127,15 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} z m)
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} z m)
-    endif(X86_64) 
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} z m)
+    endif(X86_64)
 endif()
   
 # The static executable goes to the bin directory.
