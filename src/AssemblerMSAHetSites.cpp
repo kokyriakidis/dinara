@@ -522,31 +522,33 @@ void Assembler::computeMSAHetSites(ReadId focalReadId, uint32_t strand)
                 if (ev.refReads.size() < 3 || ev.altReads.size() < 3) continue;
 
                 // --- Filter 1b: short tandem repeat (STR) snarl filter ---
-                // A snarl is a repeat-unit artifact if the two allele paths differ
-                // only in the number of full copies of a repeat unit of period 1–4.
-                // Period 1 = homopolymer (AAAA vs AA), period 2 = dinucleotide (ACAC vs AC),
-                // period 3 = trinucleotide (AGCAGC vs AGC), period 4 = tetranucleotide.
-                // Matches hpc_mask_ff's hpc_min=4 scan range.
+                // Strip the common prefix and suffix from both alleles to obtain the
+                // net inserted or deleted sequence.  A snarl is classified as an STR
+                // artifact when:
+                //   (a) exactly one trimmed string is empty (pure insertion or deletion), AND
+                //   (b) for period r = 1..4:
+                //       • k≥2 (n = k×r): the trimmed sequence is k copies of a period-r unit
+                //                        (verified by tl[i] == tl[i-r]).
+                //       • k=1 (n = r, r≥2): the unit matches the r bases immediately
+                //                        flanking the insertion/deletion site (prefix or
+                //                        suffix context), confirming it extends a real repeat.
+                //         (k=1, r=1 is never filtered — single-base indels are too short
+                //          to verify periodicity without broader context.)
                 //
-                // Rule for each period r (1..4):
-                //   1. Length difference must be a non-zero multiple of r.
-                //   2. The longer allele must equal the shorter allele with one or more
-                //      copies of the repeat unit prepended OR appended.
-                //   3. The repeat unit must match the corresponding prefix or suffix of
-                //      the shorter allele (confirms the unit is consistent across both).
-                //
-                // Examples filtered (period shown):
-                //   ref=A,      alt=AAA      period=1: extra "AA"    ✓
-                //   ref=AC,     alt=ACAC     period=2: extra "AC"    ✓
-                //   ref=AGC,    alt=AGCAGC   period=3: extra "AGC"   ✓
-                //   ref=ACGT,   alt=ACGTACGT period=4: extra "ACGT"  ✓
-                //   ref=ACACAC, alt=ACAC     period=2: extra "AC"    ✓
+                // Examples filtered:
+                //   ref=A,    alt=AAA      → trimmed "AA"   = 2×A  (r=1, k=2)            ✓
+                //   ref=AC,   alt=ACACAC   → trimmed "ACAC" = 2×AC (r=2, k=2)            ✓
+                //   ref=AC,   alt=ACAC     → trimmed "AC"   = 1×AC (r=2, k=1), prefix "AC"
+                //                            matches unit → extends AC repeat              ✓
+                //   ref=TAGC, alt=TAGCAGCAGC → trimmed "AGCAGC" = 2×AGC (r=3, k=2)       ✓
+                //   ref=AGC,  alt=AGCAGC   → trimmed "AGC"  = 1×AGC (r=3, k=1), prefix
+                //                            "AGC" matches unit                            ✓
                 // Examples NOT filtered:
-                //   ref=A,  alt=G   → same length (SNP)
-                //   ref=AC, alt=AG  → same length, different bases (SNP/MNP)
-                //   ref=AC, alt=AAC → extra 'A'; unit "A" does NOT match suffix of "AC" ('C')
-                //                     NOR prefix of "AC" ('A') at the abutting end → NOT filtered
-                //   ref=AA, alt=AAC → extra 'C'; unit "C" ≠ 'A' at abutting end   → NOT filtered
+                //   ref=A,  alt=G      → both trimmed non-empty (SNP)                → skip
+                //   ref=AC, alt=AG     → both trimmed non-empty (MNP)                → skip
+                //   ref=AT, alt=ATCG   → trimmed "CG"; prefix "AT" ≠ "CG" (k=1,r=2) → skip
+                //   ref=AC, alt=AAC    → trimmed "A" (r=1, k=1 — never filtered)     → skip
+                //   ref=AA, alt=AAC    → trimmed "C" (r=1, k=1 — never filtered)     → skip
                 {
                     auto isStrSnarl = [](const string& a, const string& b) -> bool {
                         const size_t na = a.size(), nb = b.size();
@@ -571,16 +573,40 @@ void Assembler::computeMSAHetSites(ReadId focalReadId, uint32_t strand)
                         const char* tl = (ta == 0) ? b.data() + p : a.data() + p;
                         const size_t n  = (ta == 0) ? tb : ta;
 
-                        // Must be k≥2 copies of a period-1..4 unit.
-                        // tl[i] == tl[i-r] (no modulo) is equivalent to tl[i] == tl[i%r]
-                        // by induction and is division-free.
+                        // Check periods r = 1..4.
+                        // tl[i] == tl[i-r] is division-free and equivalent to tl[i%r] by induction.
                         for (size_t r = 1; r <= 4; r++) {
                             if (n % r != 0) continue;
-                            if (n / r < 2) continue;
-                            bool ok = true;
-                            for (size_t i = r; i < n && ok; i++)
-                                if (tl[i] != tl[i - r]) ok = false;
-                            if (ok) return true;
+                            const size_t k = n / r;
+
+                            if (k >= 2) {
+                                // Verify tl is exactly k copies of tl[0..r-1].
+                                bool ok = true;
+                                for (size_t i = r; i < n && ok; i++)
+                                    if (tl[i] != tl[i - r]) ok = false;
+                                if (ok) return true;
+
+                            } else if (r >= 2) {
+                                // k == 1: inner loop would be empty (vacuously true for any
+                                // r-length sequence).  Require instead that the repeat unit
+                                // tl[0..r-1] matches the r bases immediately flanking the
+                                // insertion/deletion site, confirming it extends a real repeat.
+                                // Check prefix flank (last r chars before insertion site).
+                                if (p >= r) {
+                                    bool match = true;
+                                    for (size_t j = 0; j < r && match; j++)
+                                        if (a[p - r + j] != tl[j]) match = false;
+                                    if (match) return true;
+                                }
+                                // Check suffix flank (first r chars after insertion site).
+                                if (s >= r) {
+                                    bool match = true;
+                                    for (size_t j = 0; j < r && match; j++)
+                                        if (a[na - s + j] != tl[j]) match = false;
+                                    if (match) return true;
+                                }
+                            }
+                            // k == 1, r == 1: single-base indel — never filtered alone.
                         }
                         return false;
                     };
