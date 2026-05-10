@@ -44,6 +44,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
@@ -105,16 +106,10 @@ if(NOT SHASTA2_LIB)
     message(FATAL_ERROR "shasta2 library not found. Please install it.")
 endif()
 
-# Find theseus library (optional)
-find_library(THESEUS_LIB theseus)
-if(NOT THESEUS_LIB)
-    set(THESEUS_LIB "")
-endif()
-
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${THESEUS_LIB})
+    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)

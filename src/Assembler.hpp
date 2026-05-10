@@ -338,6 +338,15 @@ public:
         uint64_t threadCount
     );
 
+    // Lightweight marker-chain materialization for marker-graph prototypes.
+    // Populates alignmentData, compressedAlignments, and alignmentTable from
+    // precomputed chained marker alignments, but skips projected banded/base
+    // alignment and sparse evidence generation.
+    void computeAlignmentDataFromChainedCandidatesOnly(
+        const AlignOptions&,
+        uint64_t threadCount
+    );
+
     class GlobalMismatchSiteClusters {
     public:
         // Unique nodes, each a (readId, position) pair in read forward coordinates.
@@ -793,6 +802,12 @@ public:
     // Debug: run het-site detection for one read and print all SNP/SV sites.
     // Call after computeAlignmentsWithEvidence().
     void debugPrintHetSitesForRead(uint64_t readId);
+    // Debug: dump all raw SNP/indel evidence for one read across its overlaps.
+    // Call after computeAlignmentsWithEvidence().
+    void debugDumpAlignedEvidenceForRead(uint64_t readId);
+    // Debug: aggregate SNP sites for one read; print only positions where both
+    // ref and alt alleles have at least minSupport supporting alignments.
+    void debugDumpSnpSitesForRead(uint64_t readId, uint32_t minSupport = 3);
     // Experimental global-site based phasing/EC pass.
     void performGlobalSiteECParity(uint64_t threadCount);
 
@@ -2047,6 +2062,7 @@ public:
 
 
     AlignedEvidenceStore alignedEvidenceStore;
+    AlignedEvidenceStore chainedFastgaEvidenceStore;
 
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
 
@@ -3540,6 +3556,15 @@ public:
     // Per-anchor-pair POA-MSA for het-site detection (AssemblerMSAHetSites.cpp).
     // Writes one GFA per inter-anchor segment of the given read's linear journey.
     void computeMSAHetSites(ReadId focalReadId, uint32_t strand);
+    void computeTheseusMarkerGraphMSAPrototype(
+        uint64_t maxAnchorPairs,
+        uint64_t maxReadsPerPair,
+        uint64_t threadCount);
+    void computeTheseusTargetBackboneMSAPrototype(
+        uint64_t maxReads,
+        uint64_t threadCount);
+    void benchmarkFastGAOnChainedReadPairs(ReadId focalReadId, uint32_t strand);
+    void alignChainedCandidatesWithFastGA(uint64_t threadCount);
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
     std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
     std::map<string, std::shared_ptr<Shasta2AssemblyGraphPostprocessor> > shasta2AssemblyGraphTable;

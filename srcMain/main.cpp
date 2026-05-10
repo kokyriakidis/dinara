@@ -883,46 +883,81 @@ void dinara::main::assemble(
         );
     }
 
-    // Compute alignments with variant evidence storage.
-    assembler.computeAlignmentsWithEvidence(
+    // // Experimental path: run FASTGA directly on the chained candidate spans
+    // // and store sparse differences keyed by candidate index.
+    // assembler.alignChainedCandidatesWithFastGA(threadCount);
+    // return;
+
+    // Lightweight marker-chain materialization.
+    // The marker graph vertex builder needs alignmentData/compressedAlignments,
+    // but this prototype does not need projected banded/base alignments or evidence.
+    assembler.computeAlignmentDataFromChainedCandidatesOnly(
         assemblerOptions.alignOptions,
         threadCount);
 
-    // Delete overlaps where one read is contained in the other.
-    assembler.deleteContainmentOverlaps(threadCount);
-
-    // // Delete internal overlaps (excessive overhangs or too short).
-    // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
-
-    // For http server and debugging/development purposes, generate an exhaustive table of candidates.
-    // This can be done after alignment computation (it depends only on the candidate list).
-    assembler.computeCandidateTable();
-
-    // assembler.performGlobalSiteECParity(threadCount);
-    // assembler.debugPrintHetSitesForRead(0);
-
-    // return;
-
-    // // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
-    // assembler.createMarkerGraphVertices(
-    //     2,                                              // minVertexCoverage
-    //     std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-    //     0,                                              // minVertexCoveragePerStrand
-    //     false,                                          // allowDuplicateMarkers
-    //     std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
-    //     invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
+    // Previous full evidence path. Use this instead of the lightweight path
+    // when base-level projected alignments and SNP/indel evidence are needed.
+    // assembler.computeAlignmentsWithEvidence(
+    //     assemblerOptions.alignOptions,
     //     threadCount);
-    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
-    // assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
-    // // Run marker-graph-projected EC parity (updates delete flags on alignments).
-    // assembler.performHifiasmECParityWithMarkerGraph(threadCount);
+    // The marker graph vertex builder iterates readGraph edges. For this
+    // diagnostic prototype, keep all chained alignments and let marker-graph
+    // coverage/repeat/complexity filters do the pruning.
+    assembler.createReadGraphAllAlignments();
 
-    // // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
-    // assembler.debugPrintHetSitesForRead(0);
+    // // Delete overlaps where one read is contained in the other.
+    // assembler.deleteContainmentOverlaps(threadCount);
 
+    // // // Delete internal overlaps (excessive overhangs or too short).
+    // // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
+
+    // // For http server and debugging/development purposes, generate an exhaustive table of candidates.
+    // // This can be done after alignment computation (it depends only on the candidate list).
+    // assembler.computeCandidateTable();
+
+    // assembler.debugDumpSnpSitesForRead(0, 3);
     // return;
+
+
+    
+
+    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
+    assembler.createMarkerGraphVertices(
+        6,                                              // minVertexCoverage
+        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+        0,                                              // minVertexCoveragePerStrand
+        false,                                          // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
+        invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
+        threadCount);
+    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+    // Diagnostic prototype: run Theseus MSAs over consecutive marker-graph
+    // journey vertices for oriented read 0-0 and print variation sites.
+    assembler.computeTheseusMarkerGraphMSAPrototype(
+        10000,    // maxAnchorPairs
+        12800,    // maxReadsPerPair
+        threadCount);
+    // assembler.computeTheseusTargetBackboneMSAPrototype(
+    //     12800,    // maxReads
+    //     threadCount);
+    return;
+
+    // Run marker-graph-projected EC parity (updates delete flags on alignments).
+    assembler.performHifiasmECParityWithMarkerGraph(threadCount);
+
+    // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
+    assembler.debugPrintHetSitesForRead(0);
+
+    return;
+
+
+
+
+
 
     // // =========================================================================
     // // Overlap Filtering + Clean ReadGraph
@@ -941,25 +976,31 @@ void dinara::main::assemble(
     //      << " nodes=" << preEcGlobalHetClusters.nodes.size()
     //      << endl;
 
-    // // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
-    // // Optional path: experimental global-site phasing/parity.
-    // // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
-    // const bool useGlobalSiteEcParity = false;
-    // if (useGlobalSiteEcParity) {
-    //     cout << timestamp << "Using experimental global-site EC parity path." << endl;
-    //     assembler.performGlobalSiteECParity(threadCount);
-    // } else {
-    //     assembler.performHifiasmECParity(threadCount);
-    // }
+    // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
+    // Optional path: experimental global-site phasing/parity.
+    // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
+    const bool useGlobalSiteEcParity = false;
+    if (useGlobalSiteEcParity) {
+        cout << timestamp << "Using experimental global-site EC parity path." << endl;
+        assembler.performGlobalSiteECParity(threadCount);
+    } else {
+        assembler.performHifiasmECParity(threadCount);
+    }
+
+    // return;
 
 
 
     // =========================================================================
-    // New approach: skip EC parity and per-read filtering entirely.
-    // Use all alignments to build the read graph; filtering is deferred to
-    // marker graph vertex coverage thresholds (minCoverage / maxCoverage).
+    // Read graph construction — two alternatives:
+    //   (A) All alignments: skip EC parity filtering entirely; defer to
+    //       marker graph vertex coverage thresholds (minCoverage / maxCoverage).
+    //   (B) Phased alignments: keep only overlaps where BOTH sides passed the
+    //       phasing step of performHifiasmECParity (DeleteReasonPhase not set
+    //       on either side).
     // =========================================================================
-    assembler.createReadGraphAllAlignments();
+    // assembler.createReadGraphAllAlignments();       // (A)
+    assembler.createReadGraphFromEcParityCisOverlaps(); // (B)
 
     
 
@@ -1536,47 +1577,43 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // --- Remove overlapping anchors from journeys ---
-    // Two consecutive anchors on the same oriented read overlap when the base
-    // position of anchor i+1 is less than position(anchor_i) + k, i.e. the
-    // k-mers share bases. We greedily keep the first anchor of any overlapping
-    // pair (anchors are already in ordinal order so the first has the smaller
-    // position). The result is stored as a plain vector so the memory-mapped
-    // journeys are not modified.
-    cout << timestamp << "Removing overlapping anchors from journeys..." << endl;
-    {
-        const uint64_t k = assembler.assemblerInfo->k;
-        const auto& mkrs = *assembler.markers;
-        const uint64_t orientedReadCount = 2 * assembler.getReads().readCount();
+    // // --- Remove overlapping anchors from journeys ---
+    // // Two consecutive anchors on the same oriented read overlap when the base
+    // // position of anchor i+1 is less than position(anchor_i) + k, i.e. the
+    // // k-mers share bases. We greedily keep the first anchor of any overlapping
+    // // pair (anchors are already in ordinal order so the first has the smaller
+    // // position). The result is stored as a plain vector so the memory-mapped
+    // // journeys are not modified.
+    // cout << timestamp << "Removing overlapping anchors from journeys..." << endl;
+    // {
+    //     const uint64_t k = assembler.assemblerInfo->k;
+    //     const auto& mkrs = *assembler.markers;
+    //     const uint64_t orientedReadCount = 2 * assembler.getReads().readCount();
 
-        assembler.shasta2LinearJourneys.resize(orientedReadCount);
-        uint64_t totalRemoved = 0;
+    //     assembler.shasta2LinearJourneys.resize(orientedReadCount);
+    //     uint64_t totalRemoved = 0;
 
-        for (uint64_t i = 0; i < orientedReadCount; i++) {
-            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(i));
-            const Shasta2Journey journey = (*shasta2Journeys)[oid];
-            std::vector<Shasta2AnchorId>& linear = assembler.shasta2LinearJourneys[i];
-            linear.clear();
-            linear.reserve(journey.size());
+    //     for (uint64_t i = 0; i < orientedReadCount; i++) {
+    //         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(i));
+    //         const Shasta2Journey journey = (*shasta2Journeys)[oid];
+    //         std::vector<Shasta2AnchorId>& linear = assembler.shasta2LinearJourneys[i];
+    //         linear.clear();
+    //         linear.reserve(journey.size());
 
-            uint32_t prevEnd = 0; // end base position of the last kept anchor
-            for (const Shasta2AnchorId anchorId : journey) {
-                const uint32_t ordinal = shasta2Anchors->getOrdinal(anchorId, oid);
-                const uint32_t pos = uint32_t(mkrs[i][ordinal].position);
-                if (linear.empty() || pos >= prevEnd) {
-                    linear.push_back(anchorId);
-                    prevEnd = pos + uint32_t(k);
-                } else {
-                    ++totalRemoved;
-                }
-            }
-        }
-        cout << timestamp << "  Removed " << totalRemoved << " overlapping anchors." << endl;
-    }
-
-#ifdef DINARA_HAVE_THESEUS
-    assembler.computeMSAHetSites(ReadId(0), 0);
-#endif
+    //         uint32_t prevEnd = 0; // end base position of the last kept anchor
+    //         for (const Shasta2AnchorId anchorId : journey) {
+    //             const uint32_t ordinal = shasta2Anchors->getOrdinal(anchorId, oid);
+    //             const uint32_t pos = uint32_t(mkrs[i][ordinal].position);
+    //             if (linear.empty() || pos >= prevEnd) {
+    //                 linear.push_back(anchorId);
+    //                 prevEnd = pos + uint32_t(k);
+    //             } else {
+    //                 ++totalRemoved;
+    //             }
+    //         }
+    //     }
+    //     cout << timestamp << "  Removed " << totalRemoved << " overlapping anchors." << endl;
+    // }
 
     // Create the Shasta2AnchorGraph.
     const uint64_t minEdgeCoverage = 2;

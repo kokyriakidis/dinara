@@ -222,6 +222,113 @@ void Assembler::computeAlignmentsWithEvidence(
     cout << timestamp << "Done computing alignments. Elapsed time: " << elapsedSeconds << " s." << endl;
 }
 
+
+
+void Assembler::computeAlignmentDataFromChainedCandidatesOnly(
+    const AlignOptions& alignOptions,
+    uint64_t threadCount)
+{
+    const auto tBegin = steady_clock::now();
+    const size_t candidateCount = alignmentCandidates.candidates.size();
+
+    cout << timestamp << "Begin lightweight alignmentData materialization for "
+         << candidateCount << " chained candidates." << endl;
+
+    reads->checkReadsAreOpen();
+    checkMarkersAreOpen();
+    checkAlignmentCandidatesAreOpen();
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+    (void)threadCount; // This path is intentionally simple; no base DP is run.
+
+    const auto& candidates = alignmentCandidates.candidates;
+    const auto& precomputedAlignments = alignmentCandidatesAlignmentsData.alignments;
+    const auto& precomputedSharedSeedScores = alignmentCandidatesAlignmentsData.sharedSeedScores;
+    const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
+        size_t(alignOptions.minAlignedMarkerCount) : 0;
+
+    alignmentData.createNew(
+        largeDataName("AlignmentData"),
+        largeDataPageSize,
+        0,
+        candidateCount);
+    compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
+    alignedEvidenceStore.clear();
+
+    string compressedAlignment;
+    uint64_t skippedEmpty = 0;
+    uint64_t skippedShort = 0;
+
+    for(uint64_t candidateIndex=0; candidateIndex<candidateCount; candidateIndex++) {
+        const Alignment& alignment = precomputedAlignments[candidateIndex];
+        if(alignment.ordinals.empty()) {
+            ++skippedEmpty;
+            continue;
+        }
+        if(minAlignedMarkerCount > 0 &&
+            alignment.ordinals.size() < minAlignedMarkerCount) {
+            ++skippedShort;
+            continue;
+        }
+
+        const OrientedReadPair& candidate = candidates[candidateIndex];
+        const array<OrientedReadId, 2> orientedReadIds = {
+            OrientedReadId(candidate.readIds[0], 0),
+            OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1)
+        };
+        const array<span<const CompressedMarker>, 2> markerSpans = {
+            (*markers)[orientedReadIds[0].getValue()],
+            (*markers)[orientedReadIds[1].getValue()]
+        };
+
+        AlignmentInfo alignmentInfo(
+            alignment,
+            uint32_t(markerSpans[0].size()),
+            uint32_t(markerSpans[1].size()));
+        if(candidateIndex < precomputedSharedSeedScores.size()) {
+            alignmentInfo.sharedSeedScore = precomputedSharedSeedScores[candidateIndex];
+        }
+
+        AlignmentData thisAlignmentData(candidate, alignmentInfo);
+        thisAlignmentData.qs = alignment.qs;
+        thisAlignmentData.qe = alignment.qe;
+        thisAlignmentData.ts = alignment.ts;
+        thisAlignmentData.te = alignment.te;
+        thisAlignmentData.hasLargeIndel = false;
+        thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
+        thisAlignmentData.informativeHetSiteCount0 = 0;
+        thisAlignmentData.informativeHetSiteCount1 = 0;
+        thisAlignmentData.informativeHetSiteScore = 0;
+        thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
+        thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
+
+        alignmentData.push_back(thisAlignmentData);
+
+        dinara::compress(alignment, compressedAlignment);
+        compressedAlignments.appendVector(
+            compressedAlignment.begin(),
+            compressedAlignment.end());
+    }
+
+    alignmentData.unreserve();
+    compressedAlignments.unreserve();
+
+    performanceLog << timestamp << "Creating alignment table." << endl;
+    computeAlignmentTable();
+
+    const auto tEnd = steady_clock::now();
+    const double elapsedSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "Done lightweight alignmentData materialization. "
+         << "kept=" << alignmentData.size()
+         << " skippedEmpty=" << skippedEmpty
+         << " skippedShort=" << skippedShort
+         << " elapsed=" << elapsedSeconds << " s." << endl;
+}
+
+
+
 void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
     auto& data = computeAlignmentsData;
     const AlignOptions& alignOptions = *data.alignOptions;
