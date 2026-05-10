@@ -185,6 +185,7 @@ void Assembler::createReadGraphAllAlignments()
 
 
 
+
 // This is called for ReadGraph.creationMethod 0 and 2.
 void Assembler::createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment)
 {

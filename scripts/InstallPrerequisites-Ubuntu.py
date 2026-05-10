@@ -254,6 +254,7 @@ def installAptPackages():
     "gnuplot",
     "python3-dev", 
     "libsimde-dev",
+    "zlib1g-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
 
@@ -807,14 +808,12 @@ def installShasta2():
 
 
 def installTheseusLib():
-    print("Installing theseus-lib...")
-
-    installPath = os.path.join(INCLUDE_DIR, "theseus")
-    libPath = os.path.join(LIB_DIR, "libtheseus.a")
-
-    if os.path.exists(installPath) and os.path.exists(libPath):
-        print("theseus headers and library found. Skipping installation.")
-        return
+    # Pericles: POA / consensus-oriented branch (TheseusMSA, weighted voting, etc.).
+    # See https://github.com/albertjimenezbl/theseus-lib/tree/pericles
+    #
+    # Always clone and build: each run pulls the current tip of `pericles` (shallow
+    # clone) so installs stay up to date without tracking a commit hash here.
+    print("Installing theseus-lib (branch pericles, latest)...")
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building theseus-lib using temporary directory", temporaryDirectory)
@@ -822,74 +821,92 @@ def installTheseusLib():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
 
-        # Clone repo
-        runCommand("git clone https://github.com/albertjimenezbl/theseus-lib.git")
+        # Shallow clone of current branch tip — enough to build; fresh each run.
+        runCommand(
+            "git clone -b pericles --depth 1 "
+            "https://github.com/albertjimenezbl/theseus-lib.git"
+        )
         os.chdir("theseus-lib")
 
-        # Patch graph.h: POA-built vertices never have their name field set,
-        # so print_as_gfa() writes empty names -> invalid GFA (Bandage shows nothing).
-        # Fix: fall back to 1-based index when name is empty.
-        graphH = "theseus/graph.h"
-        with open(graphH, "r") as f:
-            src = f.read()
-
-        old_gfa = (
-            "            // Print all nodes as segments\n"
-            "            for (const auto &vtx : _vertices)\n"
-            "            {\n"
-            "                gfa_output << \"S\\t\" << vtx.name << \"\\t\" << vtx.value << \"\\n\";\n"
-            "            }\n"
-            "\n"
-            "            // Print all edges as links\n"
-            "            for (const auto &vtx : _vertices)\n"
-            "            {\n"
-            "                // Go through all incoming vertices (with this you cover all possible edges,\n"
-            "                // since the graph is directed)\n"
-            "                for (const auto &edge : vtx.in_edges)\n"
-            "                {\n"
-            "                    gfa_output << \"L\\t\" << _vertices[edge.from_vertex].name << \"\\t+\\t\"\n"
-            "                        << vtx.name << \"\\t+\\t\"\n"
-            "                        << edge.overlap << \"M\\n\";\n"
-            "                }\n"
-            "            }"
-        )
-        new_gfa = (
-            "            // Build a per-vertex name: use the stored name if present,\n"
-            "            // otherwise fall back to the 1-based vertex index.\n"
-            "            // (POA-built graphs never set vtx.name, so it is always empty.)\n"
-            "            auto vtx_name = [&](size_t idx) -> std::string {\n"
-            "                return _vertices[idx].name.empty()\n"
-            "                    ? std::to_string(idx + 1)\n"
-            "                    : _vertices[idx].name;\n"
-            "            };\n"
-            "\n"
-            "            // Print all nodes as segments (skip empty sentinel nodes)\n"
-            "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
-            "            {\n"
-            "                if (_vertices[i].value.empty()) continue;\n"
-            "                gfa_output << \"S\\t\" << vtx_name(i) << \"\\t\" << _vertices[i].value << \"\\n\";\n"
-            "            }\n"
-            "\n"
-            "            // Print all edges as links (skip any link touching an empty sentinel)\n"
-            "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
-            "            {\n"
-            "                if (_vertices[i].value.empty()) continue;\n"
-            "                for (const auto &edge : _vertices[i].in_edges)\n"
-            "                {\n"
-            "                    if (_vertices[edge.from_vertex].value.empty()) continue;\n"
-            "                    gfa_output << \"L\\t\" << vtx_name(edge.from_vertex) << \"\\t+\\t\"\n"
-            "                        << vtx_name(i) << \"\\t+\\t\"\n"
-            "                        << edge.overlap << \"M\\n\";\n"
-            "                }\n"
-            "            }"
-        )
-        if old_gfa not in src:
-            print("Warning: could not apply theseus GFA patch (source may have changed). Continuing anyway.")
+        # Legacy main-branch layout put print_as_gfa in graph.h with empty vtx.name
+        # for POA graphs. Pericles emits GFA segment names as numeric node ids from
+        # TheseusAlignerImpl::print_as_gfa_internal (no patch needed).
+        legacyGraphH = "theseus/graph.h"
+        includeGraphH = "include/theseus/graph.h"
+        if os.path.isfile(legacyGraphH):
+            graphH = legacyGraphH
+        elif os.path.isfile(includeGraphH):
+            graphH = includeGraphH
         else:
-            src = src.replace(old_gfa, new_gfa)
-            with open(graphH, "w") as f:
-                f.write(src)
-            print("Applied theseus GFA name patch.")
+            graphH = None
+
+        if graphH is None:
+            print("Warning: theseus graph.h not found; skipping GFA patch.")
+        else:
+            with open(graphH, "r", encoding="utf-8") as f:
+                src = f.read()
+
+            old_gfa = (
+                "            // Print all nodes as segments\n"
+                "            for (const auto &vtx : _vertices)\n"
+                "            {\n"
+                "                gfa_output << \"S\\t\" << vtx.name << \"\\t\" << vtx.value << \"\\n\";\n"
+                "            }\n"
+                "\n"
+                "            // Print all edges as links\n"
+                "            for (const auto &vtx : _vertices)\n"
+                "            {\n"
+                "                // Go through all incoming vertices (with this you cover all possible edges,\n"
+                "                // since the graph is directed)\n"
+                "                for (const auto &edge : vtx.in_edges)\n"
+                "                {\n"
+                "                    gfa_output << \"L\\t\" << _vertices[edge.from_vertex].name << \"\\t+\\t\"\n"
+                "                        << vtx.name << \"\\t+\\t\"\n"
+                "                        << edge.overlap << \"M\\n\";\n"
+                "                }\n"
+                "            }"
+            )
+            new_gfa = (
+                "            // Build a per-vertex name: use the stored name if present,\n"
+                "            // otherwise fall back to the 1-based vertex index.\n"
+                "            // (POA-built graphs never set vtx.name, so it is always empty.)\n"
+                "            auto vtx_name = [&](size_t idx) -> std::string {\n"
+                "                return _vertices[idx].name.empty()\n"
+                "                    ? std::to_string(idx + 1)\n"
+                "                    : _vertices[idx].name;\n"
+                "            };\n"
+                "\n"
+                "            // Print all nodes as segments (skip empty sentinel nodes)\n"
+                "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
+                "            {\n"
+                "                if (_vertices[i].value.empty()) continue;\n"
+                "                gfa_output << \"S\\t\" << vtx_name(i) << \"\\t\" << _vertices[i].value << \"\\n\";\n"
+                "            }\n"
+                "\n"
+                "            // Print all edges as links (skip any link touching an empty sentinel)\n"
+                "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
+                "            {\n"
+                "                if (_vertices[i].value.empty()) continue;\n"
+                "                for (const auto &edge : _vertices[i].in_edges)\n"
+                "                {\n"
+                "                    if (_vertices[edge.from_vertex].value.empty()) continue;\n"
+                "                    gfa_output << \"L\\t\" << vtx_name(edge.from_vertex) << \"\\t+\\t\"\n"
+                "                        << vtx_name(i) << \"\\t+\\t\"\n"
+                "                        << edge.overlap << \"M\\n\";\n"
+                "                }\n"
+                "            }"
+            )
+            if old_gfa not in src:
+                if graphH == legacyGraphH:
+                    print(
+                        "Warning: could not apply theseus GFA patch "
+                        "(legacy graph.h layout changed). Continuing anyway."
+                    )
+            else:
+                src = src.replace(old_gfa, new_gfa)
+                with open(graphH, "w", encoding="utf-8") as f:
+                    f.write(src)
+                print("Applied theseus GFA name patch.")
 
         # Build and install static library into DINARA_BUILD_DIR
         os.mkdir("build")
@@ -998,6 +1015,44 @@ def installMinipoa():
     print("minipoa installed at " + installBinary)
 
 
+def installFastGA():
+    print("Installing FastGA...")
+
+    installBinDir = os.path.join(HOME, ".local", "bin")
+    installBinary = os.path.join(installBinDir, "FastGA")
+    sourceDir = os.path.join(HOME, "Downloads", "FASTGA")
+
+    os.makedirs(installBinDir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Building FastGA using temporary directory", temporaryDirectory)
+
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+
+        if os.path.isdir(sourceDir):
+            print("Updating existing FASTGA source at", sourceDir)
+            runCommand("git -C " + sourceDir + " pull --ff-only")
+        else:
+            if os.path.exists(sourceDir):
+                os.remove(sourceDir)
+            print("Cloning FASTGA source to", sourceDir)
+            runCommand("git clone https://github.com/thegenemyers/FASTGA.git " + sourceDir)
+
+        runCommand("make -C " + sourceDir + " FastGA")
+
+        builtBinary = os.path.join(sourceDir, "FastGA")
+        if not os.path.exists(builtBinary):
+            raise Exception("FastGA binary not found after build. Check build output.")
+
+        runCommand("cp " + builtBinary + " " + installBinary)
+        os.chmod(installBinary, 0o755)
+
+        os.chdir(oldDirectory)
+
+    print("FastGA installed at " + installBinary)
+
+
 # Install all Rust libraries
 installAstarpa()
 installPoasta()
@@ -1012,6 +1067,7 @@ installTheseusLib()
 
 installVg()
 installMinipoa()
+installFastGA()
 
 # Make sure the newly created libraries are immediately visible to the loader.
 # For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable

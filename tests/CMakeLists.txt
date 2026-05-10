@@ -62,6 +62,10 @@ find_library(POASTA_LIB poasta_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SHASTA2_LIB shasta2 PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(ABPOA_LIB abpoa PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+find_library(THESEUS_LIB theseus PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
+if(NOT THESEUS_LIB)
+    set(THESEUS_LIB "")
+endif()
 find_package(ZLIB REQUIRED)
 
 # Integration test executable

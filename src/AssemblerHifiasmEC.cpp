@@ -3537,6 +3537,30 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                     compactPhasedSites(scratch);
                     timing.compact += seconds(steady_clock::now() - tCompactBegin);
 
+                    if(readId == 0 && strand == 0) {
+                        std::lock_guard<std::mutex> lock(ecCoutMutex);
+                        cout << timestamp << "[EC-DBG] Surviving SNP sites for read 0-0 after compact: "
+                             << scratch.snpStats.size() << " row(s)" << endl;
+                        if(scratch.snpStats.empty()) {
+                            cout << timestamp << "[EC-DBG]   (none)" << endl;
+                        } else {
+                            for(size_t snpRow = 0; snpRow < scratch.snpStats.size(); ++snpRow) {
+                                const auto& s = scratch.snpStats[snpRow];
+                                cout << timestamp << "[EC-DBG]   row=" << snpRow
+                                     << " site=" << s.site
+                                     << " ref=" << s.refBase
+                                     << " alt=" << s.altBase
+                                     << " occ0=" << s.occ_0
+                                     << " occ1=" << s.occ_1
+                                     << " fwdRef=" << s.fwd_ref_cov
+                                     << " hp=" << int(s.is_homopolymer)
+                                     << " score=" << s.score
+                                     << " dpScore=" << s.dpScore
+                                     << endl;
+                            }
+                        }
+                    }
+
 	                    /*
 	                    Stage 4: SV (large indel) detection + overlap marking.
 	                    */
@@ -4624,4 +4648,315 @@ void Assembler::debugPrintHetSitesForRead(uint64_t readId)
     }
 
     cout << "\n[HetDebug] done for read " << readId << "-0.\n\n";
+}
+
+
+
+void Assembler::debugDumpAlignedEvidenceForRead(uint64_t readId)
+{
+    const OrientedReadId orientedReadId(ReadId(readId), 0);
+    if (orientedReadId.getValue() >= alignmentTable.size()) {
+        cout << "[EvidenceDump] readId=" << readId << " not in alignmentTable (size="
+             << alignmentTable.size() << ")\n";
+        return;
+    }
+    if (alignedEvidenceStore.index.empty()) {
+        cout << "[EvidenceDump] alignedEvidenceStore is empty. "
+             << "Run computeAlignmentsWithEvidence() first.\n";
+        return;
+    }
+
+    const auto& alignments = alignmentTable[orientedReadId.getValue()];
+    const uint32_t readLen = uint32_t(reads->getRead(ReadId(readId)).baseCount);
+    constexpr uint32_t svMinLen = 20;
+
+    cout << "\n";
+    cout << "╔══════════════════════════════════════════════════════════════════╗\n";
+    cout << "║  Evidence dump  read=" << readId << "-0   len=" << readLen << " bp\n";
+    cout << "╚══════════════════════════════════════════════════════════════════╝\n";
+    cout << "  Alignments in table : " << alignments.size() << "\n";
+
+    uint64_t totalSnps = 0;
+    uint64_t totalIndels = 0;
+    uint64_t totalSvCandidates = 0;
+
+    for (const uint32_t alignmentId : alignments) {
+        if (alignmentId >= alignmentData.size()) {
+            continue;
+        }
+        const AlignmentData& ad = alignmentData[alignmentId];
+        const size_t evidenceId = ad.info.alignmentId;
+        if (evidenceId == invalid<size_t> || evidenceId >= alignedEvidenceStore.index.size()) {
+            continue;
+        }
+
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(readId));
+        const uint32_t partnerReadId = queryIsRead0 ? uint32_t(ad.readIds[1]) : uint32_t(ad.readIds[0]);
+        const bool partnerIsRev = queryIsRead0 ? (!ad.isSameStrand) : false;
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        const uint32_t ts = queryIsRead0 ? ad.ts : ad.qs;
+        const uint32_t te = queryIsRead0 ? ad.te : ad.qe;
+
+        vector<pair<uint32_t, uint8_t> > snps;
+        snps.reserve(32);
+        auto collectSnp = [&](uint32_t pos, uint8_t base) {
+            snps.emplace_back(pos, base);
+        };
+        const uint32_t evidenceId32 = uint32_t(evidenceId);
+        if (queryIsRead0) {
+            alignedEvidenceStore.forEachSnp1InRange(evidenceId32, qs, qe, collectSnp);
+        } else {
+            alignedEvidenceStore.forEachSnp0InRange(evidenceId32, qs, qe, collectSnp);
+        }
+
+        span<const IndelEvidence> indels =
+            queryIsRead0 ?
+            alignedEvidenceStore.getIndels1(evidenceId32) :
+            alignedEvidenceStore.getIndels0(evidenceId32);
+
+        vector<IndelEvidence> localIndels;
+        localIndels.reserve(indels.size());
+        for (const IndelEvidence& indel : indels) {
+            if (indel.pos() >= qs && indel.pos() < qe) {
+                localIndels.push_back(indel);
+            }
+        }
+
+        uint64_t localSvCount = 0;
+        for (const IndelEvidence& indel : localIndels) {
+            if (indel.len() >= svMinLen) {
+                ++localSvCount;
+            }
+        }
+
+        totalSnps += snps.size();
+        totalIndels += localIndels.size();
+        totalSvCandidates += localSvCount;
+
+        cout << "\n";
+        cout << "[EvidenceDump] alignmentId=" << alignmentId
+             << " evidenceId=" << evidenceId
+             << " partner=read" << partnerReadId
+             << "-" << (partnerIsRev ? 1 : 0)
+             << " qs=" << qs
+             << " qe=" << qe
+             << " ts=" << ts
+             << " te=" << te
+             << " kept=" << (ad.keptByBothSides() ? "yes" : "no")
+             << "\n";
+
+        cout << "  SNPs (" << snps.size() << "):";
+        if (snps.empty()) {
+            cout << " none\n";
+        } else {
+            cout << "\n";
+            for (const auto& [pos, base] : snps) {
+                cout << "    pos=" << pos
+                     << " ref=" << reads->getOrientedReadBase(orientedReadId, pos).character()
+                     << " alt=" << Base::fromInteger(base).character()
+                     << "\n";
+            }
+        }
+
+        cout << "  Indels (" << localIndels.size() << "):";
+        if (localIndels.empty()) {
+            cout << " none\n";
+        } else {
+            cout << "\n";
+            for (const IndelEvidence& indel : localIndels) {
+                cout << "    pos=" << indel.pos()
+                     << " type=" << (indel.isInsertion() ? "INS" : "DEL")
+                     << " len=" << indel.len();
+                if (indel.len() >= svMinLen) {
+                    cout << "  [SV]";
+                }
+                cout << "\n";
+            }
+        }
+    }
+
+    cout << "\n";
+    cout << "[EvidenceDump] summary for read " << readId << "-0:\n";
+    cout << "  total SNP observations   : " << totalSnps << "\n";
+    cout << "  total indel observations : " << totalIndels << "\n";
+    cout << "  total SV candidates      : " << totalSvCandidates
+         << " (indel len >= " << svMinLen << ")\n\n";
+}
+
+// ---------------------------------------------------------------------------
+// debugDumpSnpSitesForRead
+//
+// Aggregates SNP evidence from all alignments involving the focal read
+// (strand 0) and prints one line per (position, alt-base) pair where both
+// the ref allele and the alt allele have at least minSupport supporting reads.
+//
+// ref_support at pos = alignments covering pos that show no mismatch there
+// alt_support at pos = alignments covering pos that show a specific alt base
+// ---------------------------------------------------------------------------
+void Assembler::debugDumpSnpSitesForRead(uint64_t readId, uint32_t minSupport)
+{
+    const OrientedReadId orientedReadId(ReadId(readId), 0);
+    if (orientedReadId.getValue() >= alignmentTable.size()) {
+        cout << "[SnpSites] readId=" << readId << " not in alignmentTable\n";
+        return;
+    }
+    if (alignedEvidenceStore.index.empty()) {
+        cout << "[SnpSites] alignedEvidenceStore is empty. "
+             << "Run computeAlignmentsWithEvidence() first.\n";
+        return;
+    }
+
+    const auto& alignments = alignmentTable[orientedReadId.getValue()];
+
+    constexpr uint32_t svMinLen = 20;
+
+    // Per alignment: span [qs, qe) on focal read + SNPs + SVs observed there.
+    struct AlignSpan {
+        uint32_t qs, qe;
+        vector<pair<uint32_t, uint8_t>> snps; // {pos on focal read, alt base index}
+        vector<IndelEvidence>           svs;  // indels with len >= svMinLen
+    };
+    vector<AlignSpan> spans;
+    spans.reserve(alignments.size());
+
+    for (const uint32_t alignmentId : alignments) {
+        if (alignmentId >= alignmentData.size()) continue;
+        const AlignmentData& ad = alignmentData[alignmentId];
+        const size_t evidenceId = ad.info.alignmentId;
+        if (evidenceId == invalid<size_t> || evidenceId >= alignedEvidenceStore.index.size()) continue;
+
+        const bool queryIsRead0 = (ad.readIds[0] == ReadId(readId));
+        const uint32_t qs = queryIsRead0 ? ad.qs : ad.ts;
+        const uint32_t qe = queryIsRead0 ? ad.qe : ad.te;
+        const uint32_t evidenceId32 = uint32_t(evidenceId);
+
+        AlignSpan span;
+        span.qs = qs;
+        span.qe = qe;
+
+        auto collectSnp = [&](uint32_t pos, uint8_t base) {
+            span.snps.emplace_back(pos, base);
+        };
+        if (queryIsRead0)
+            alignedEvidenceStore.forEachSnp1InRange(evidenceId32, qs, qe, collectSnp);
+        else
+            alignedEvidenceStore.forEachSnp0InRange(evidenceId32, qs, qe, collectSnp);
+
+        const dinara::span<const IndelEvidence> indels =
+            queryIsRead0 ?
+            alignedEvidenceStore.getIndels1(evidenceId32) :
+            alignedEvidenceStore.getIndels0(evidenceId32);
+        for (const IndelEvidence& indel : indels)
+            if (indel.pos() >= qs && indel.pos() < qe && indel.len() >= svMinLen)
+                span.svs.push_back(indel);
+
+        spans.push_back(std::move(span));
+    }
+
+    // Aggregate: for each (pos, altBase) count alt-supporting alignments.
+    // Also build a set of SNP positions so we can compute ref support.
+    map<uint32_t, map<uint8_t, uint32_t>> altCount; // pos → baseIdx → count
+    for (const auto& sp : spans)
+        for (const auto& [pos, base] : sp.snps)
+            altCount[pos][base]++;
+
+    // Ref support at pos = alignments covering pos with no SNP at pos.
+    // Build a fast lookup: per alignment, which positions have a SNP.
+    // Then for each candidate position, count spans that cover it without a SNP.
+    auto refSupport = [&](uint32_t pos) -> uint32_t {
+        uint32_t n = 0;
+        for (const auto& sp : spans) {
+            if (pos < sp.qs || pos >= sp.qe) continue;
+            bool hasMismatch = false;
+            for (const auto& [spos, sbase] : sp.snps)
+                if (spos == pos) { hasMismatch = true; break; }
+            if (!hasMismatch) ++n;
+        }
+        return n;
+    };
+
+    // Print header.
+    cout << "\n[SnpSites] read=" << readId << "-0"
+         << "  alignments=" << spans.size()
+         << "  minSupport=" << minSupport << "\n";
+    cout << "  " << string(60, '-') << "\n";
+    cout << "  pos       ref  alt  refSupport  altSupport\n";
+    cout << "  " << string(60, '-') << "\n";
+
+    using std::setw;
+    uint32_t printed = 0;
+    for (const auto& [pos, baseCounts] : altCount) {
+        const char refBase = reads->getOrientedReadBase(orientedReadId, pos).character();
+        const uint32_t refSup = refSupport(pos);
+        for (const auto& [baseIdx, altSup] : baseCounts) {
+            if (altSup < minSupport || refSup < minSupport) continue;
+            const char altBase = Base::fromInteger(baseIdx).character();
+            cout << "  " << setw(8) << pos
+                 << "  " << refBase
+                 << "    " << altBase
+                 << "    " << setw(10) << refSup
+                 << "  " << setw(10) << altSup
+                 << "\n";
+            ++printed;
+        }
+    }
+    if (printed == 0)
+        cout << "  (no SNP sites with both alleles >= " << minSupport << " support)\n";
+    cout << "  " << string(60, '-') << "\n";
+    cout << "  Total SNP sites printed: " << printed << "\n";
+
+    // ---- SV aggregation ----
+    // Key: (pos, type, len); value: support count (alt-supporting alignments).
+    // ref_support at pos = alignments covering pos with no SV of the same type+len there.
+    struct SvKey {
+        uint32_t pos;
+        uint8_t  type; // 0=INS, 1=DEL
+        uint32_t len;
+        bool operator<(const SvKey& o) const {
+            if (pos  != o.pos)  return pos  < o.pos;
+            if (type != o.type) return type < o.type;
+            return len < o.len;
+        }
+    };
+    map<SvKey, uint32_t> svAltCount;
+    for (const auto& sp : spans)
+        for (const IndelEvidence& sv : sp.svs)
+            svAltCount[{sv.pos(), sv.type(), sv.len()}]++;
+
+    auto svRefSupport = [&](uint32_t pos, uint8_t type, uint32_t len) -> uint32_t {
+        uint32_t n = 0;
+        for (const auto& sp : spans) {
+            if (pos < sp.qs || pos >= sp.qe) continue;
+            bool hasSv = false;
+            for (const IndelEvidence& sv : sp.svs)
+                if (sv.pos() == pos && sv.type() == type && sv.len() == len)
+                    { hasSv = true; break; }
+            if (!hasSv) ++n;
+        }
+        return n;
+    };
+
+    cout << "\n";
+    cout << "  " << string(60, '-') << "\n";
+    cout << "  SV sites (indel len >= " << svMinLen << ")\n";
+    cout << "  " << string(60, '-') << "\n";
+    cout << "  pos       type  len   refSupport  altSupport\n";
+    cout << "  " << string(60, '-') << "\n";
+
+    uint32_t svPrinted = 0;
+    for (const auto& [key, altSup] : svAltCount) {
+        const uint32_t refSup = svRefSupport(key.pos, key.type, key.len);
+        cout << "  " << setw(8) << key.pos
+             << "  " << (key.type == 0 ? "INS" : "DEL")
+             << "  " << setw(5) << key.len
+             << "  " << setw(10) << refSup
+             << "  " << setw(10) << altSup
+             << "\n";
+        ++svPrinted;
+    }
+    if (svPrinted == 0)
+        cout << "  (no SV sites found)\n";
+    cout << "  " << string(60, '-') << "\n";
+    cout << "  Total SV sites printed: " << svPrinted << "\n\n";
 }
