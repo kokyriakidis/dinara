@@ -45,6 +45,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)

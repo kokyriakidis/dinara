@@ -935,12 +935,14 @@ void dinara::main::assemble(
     assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
-    // Diagnostic prototype: run Theseus MSAs over consecutive marker-graph
-    // journey vertices for oriented read 0-0 and print variation sites.
-    assembler.computeTheseusMarkerGraphMSAPrototype(
-        10000,    // maxAnchorPairs
-        12800,    // maxReadsPerPair
-        threadCount);
+
+    // Diagnostic prototype: partition reads into disjoint overlap windows,
+    // then run one whole-read Theseus MSA per window.
+    assembler.computeTheseusReadWindowMSAPrototype(threadCount);
+    // assembler.computeTheseusMarkerGraphMSAPrototype(
+    //     std::numeric_limits<uint64_t>::max(),    // maxAnchorPairs
+    //     std::numeric_limits<uint64_t>::max(),    // maxReadsPerPair
+    //     threadCount);
     // assembler.computeTheseusTargetBackboneMSAPrototype(
     //     12800,    // maxReads
     //     threadCount);

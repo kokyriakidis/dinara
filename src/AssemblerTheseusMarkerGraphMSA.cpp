@@ -45,6 +45,11 @@ constexpr uint64_t minSnpRefSupport = 3;
 constexpr uint64_t minSnpAltSupport = 3;
 constexpr uint64_t minReportedAltLength = 16;
 constexpr uint64_t minFilteredHomopolymerRunLength = 3;
+constexpr bool writeSiteMsaFiles = false;
+constexpr bool logSites = false;
+constexpr bool logPairSummaries = false;
+constexpr bool logRecruitmentAudit = false;
+constexpr bool logDebugMsa = false;
 const string siteMsaOutputDirectory = "TheseusMGMSA-sites";
 constexpr AnchorId debugMsaLeftAnchor = 64014;
 constexpr AnchorId debugMsaRightAnchor = 64016;
@@ -427,60 +432,71 @@ void printVariationSitesFromMsa(
             continue;
         }
 
-        cout << "[TheseusMGMSA] SITE"
-             << " pair=" << pairIndex
-             << " anchors=" << left << "->" << right
-             << " pos=" << targetPos
-             << " ref=" << displayAllele(ref)
-             << " refN=" << refReads.size()
-             << " refReads=" << orientedReadList(refReads, sequenceInfos);
+        if(logSites) {
+            cout << "[TheseusMGMSA] SITE"
+                 << " pair=" << pairIndex
+                 << " anchors=" << left << "->" << right
+                 << " focal=" << sequenceInfos.front().oid
+                 << " pos=" << targetPos
+                 << " ref=" << displayAllele(ref)
+                 << " refN=" << refReads.size()
+                 << " refReads=" << orientedReadList(refReads, sequenceInfos);
+            for(const auto& [key, altReads]: reportableAltReadsByAllele) {
+                const auto& [type, ref, alt] = key;
+                cout << " alt=" << type << ":" << displayAllele(ref) << ">"
+                     << displayAllele(alt)
+                     << ":N=" << altReads.size()
+                     << ":reads=" << orientedReadList(altReads, sequenceInfos);
+            }
+            cout << endl;
+        }
         for(const auto& [key, altReads]: reportableAltReadsByAllele) {
+            (void) altReads;
             const auto& [type, ref, alt] = key;
             ++eventCount;
             ++typeCounts[type];
-            cout << " alt=" << type << ":" << displayAllele(ref) << ">"
-                 << displayAllele(alt)
-                 << ":N=" << altReads.size()
-                 << ":reads=" << orientedReadList(altReads, sequenceInfos);
         }
-        cout << endl;
 
-        filesystem::create_directories(siteMsaOutputDirectory);
-        const string fileName = siteMsaFileName(pairIndex, left, right, targetPos);
-        const string tmpFileName = fileName + ".tmp";
-        {
-            ofstream file(tmpFileName, ios::binary);
-            file << msaText;
-            file.close();
-        }
-        error_code ec;
-        filesystem::rename(tmpFileName, fileName, ec);
-        if(!ec) {
-            cout << "[TheseusMGMSA] SITE_MSA"
-                 << " pair=" << pairIndex
-                 << " anchors=" << left << "->" << right
-                 << " pos=" << targetPos
-                 << " file=" << fileName
-                 << endl;
-        } else {
-            cout << timestamp << "[TheseusMGMSA] failed to write site MSA file "
-                 << fileName
-                 << " error=" << ec.message()
-                 << endl;
+        if(writeSiteMsaFiles) {
+            filesystem::create_directories(siteMsaOutputDirectory);
+            const string fileName = siteMsaFileName(pairIndex, left, right, targetPos);
+            const string tmpFileName = fileName + ".tmp";
+            {
+                ofstream file(tmpFileName, ios::binary);
+                file << msaText;
+                file.close();
+            }
+            error_code ec;
+            filesystem::rename(tmpFileName, fileName, ec);
+            if(!ec) {
+                cout << "[TheseusMGMSA] SITE_MSA"
+                     << " pair=" << pairIndex
+                     << " anchors=" << left << "->" << right
+                     << " pos=" << targetPos
+                     << " file=" << fileName
+                     << endl;
+            } else {
+                cout << timestamp << "[TheseusMGMSA] failed to write site MSA file "
+                     << fileName
+                     << " error=" << ec.message()
+                     << endl;
+            }
         }
         beginOffset = endOffset + 1;
     }
 
-    cout << timestamp << "[TheseusMGMSA] pair=" << pairIndex
-         << " anchors=" << left << "->" << right
-         << " focalRange=" << focalBegin << "-" << focalEnd
-         << " sequences=" << sequenceInfos.size()
-         << " events=" << eventCount
-         << " seconds=" << fixed << setprecision(6) << msaSeconds;
-    for(const auto& [type, count]: typeCounts) {
-        cout << " " << type << "=" << count;
+    if(logPairSummaries) {
+        cout << timestamp << "[TheseusMGMSA] pair=" << pairIndex
+             << " anchors=" << left << "->" << right
+             << " focalRange=" << focalBegin << "-" << focalEnd
+             << " sequences=" << sequenceInfos.size()
+             << " events=" << eventCount
+             << " seconds=" << fixed << setprecision(6) << msaSeconds;
+        for(const auto& [type, count]: typeCounts) {
+            cout << " " << type << "=" << count;
+        }
+        cout << defaultfloat << endl;
     }
-    cout << defaultfloat << endl;
 }
 
 Segment extractSegmentFromOrdinals(
@@ -615,7 +631,8 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
     uint64_t maxReadsPerPair,
     uint64_t threadCount)
 {
-    cout << timestamp << "[TheseusMGMSA] Prototype begins for oriented read 0-0." << endl;
+    cout << timestamp << "[TheseusMGMSA] Prototype begins for all oriented reads." << endl;
+    const auto prototypeBegin = chrono::steady_clock::now();
 
     reads->checkReadsAreOpen();
     checkMarkersAreOpen();
@@ -642,96 +659,15 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
         true);
     anchors->computeJourneys(threadCount);
 
-    const OrientedReadId focalOid(ReadId(0), 0);
-    if(focalOid.getValue() >= anchors->journeys.size()) {
-        cout << timestamp << "[TheseusMGMSA] oriented read 0-0 has no journey storage." << endl;
-        return;
-    }
-
-    const auto focalJourney = anchors->journeys[focalOid.getValue()];
-    cout << timestamp << "[TheseusMGMSA] read 0-0 journey length: "
-         << focalJourney.size() << endl;
-    if(focalJourney.size() < 2) {
-        cout << timestamp << "[TheseusMGMSA] read 0-0 journey too short." << endl;
-        return;
-    }
-
-    vector<AnchorId> filteredFocalJourney;
-    vector<uint32_t> filteredFocalJourneyPositions;
-    filteredFocalJourney.reserve(focalJourney.size());
-    filteredFocalJourneyPositions.reserve(focalJourney.size());
-    for(uint32_t i=0; i<focalJourney.size(); i++) {
-        const AnchorId anchorId = focalJourney[i];
-        const Anchor anchor = (*anchors)[anchorId];
-        if(anchor.size() >= minAnchorCoverageForMsa) {
-            filteredFocalJourney.push_back(anchorId);
-            filteredFocalJourneyPositions.push_back(i);
-        }
-    }
-    cout << timestamp << "[TheseusMGMSA] read 0-0 filtered journey length: "
-         << filteredFocalJourney.size()
-         << " minAnchorCoverage=" << minAnchorCoverageForMsa << endl;
-    if(filteredFocalJourney.size() < 2) {
-        cout << timestamp << "[TheseusMGMSA] read 0-0 filtered journey too short." << endl;
-        return;
-    }
-
-    uint64_t journeyPairCountWithMoreThanTwoReads = 0;
-    uint64_t maxJourneyPairUnionReads = 0;
-    uint64_t maxJourneyPairLeftReads = 0;
-    uint64_t maxJourneyPairRightReads = 0;
-    uint64_t maxJourneyPairCommonReads = 0;
-    uint64_t firstJourneyPairWithMoreThanTwoReads = invalid<uint64_t>;
-    for(uint64_t i=0; i+1<filteredFocalJourney.size(); i++) {
-        const Anchor leftAnchor = (*anchors)[filteredFocalJourney[i]];
-        const Anchor rightAnchor = (*anchors)[filteredFocalJourney[i + 1]];
-        unordered_set<uint64_t> leftReads;
-        unordered_set<uint64_t> unionReads;
-        for(const AnchorMarkerInterval& interval: leftAnchor) {
-            leftReads.insert(interval.orientedReadId.getValue());
-            unionReads.insert(interval.orientedReadId.getValue());
-        }
-        uint64_t commonReads = 0;
-        for(const AnchorMarkerInterval& interval: rightAnchor) {
-            const uint64_t oidValue = interval.orientedReadId.getValue();
-            if(leftReads.contains(oidValue)) {
-                ++commonReads;
-            }
-            unionReads.insert(oidValue);
-        }
-
-        if(unionReads.size() > 2) {
-            ++journeyPairCountWithMoreThanTwoReads;
-            if(firstJourneyPairWithMoreThanTwoReads == invalid<uint64_t>) {
-                firstJourneyPairWithMoreThanTwoReads = i;
-            }
-        }
-        if(unionReads.size() > maxJourneyPairUnionReads) {
-            maxJourneyPairUnionReads = unionReads.size();
-            maxJourneyPairLeftReads = leftAnchor.size();
-            maxJourneyPairRightReads = rightAnchor.size();
-            maxJourneyPairCommonReads = commonReads;
-        }
-    }
-    cout << timestamp << "[TheseusMGMSA] read 0-0 journey endpoint coverage summary:"
-         << " pairs=" << (filteredFocalJourney.size() - 1)
-         << " pairsWithUnionReadsGt2=" << journeyPairCountWithMoreThanTwoReads
-         << " firstPairWithUnionReadsGt2=";
-    if(firstJourneyPairWithMoreThanTwoReads == invalid<uint64_t>) {
-        cout << "none";
-    } else {
-        cout << firstJourneyPairWithMoreThanTwoReads;
-    }
-    cout << " maxUnionReads=" << maxJourneyPairUnionReads
-         << " maxLeftReads=" << maxJourneyPairLeftReads
-         << " maxRightReads=" << maxJourneyPairRightReads
-         << " maxCommonReads=" << maxJourneyPairCommonReads
-         << endl;
-
-    const uint64_t orientedReadCount = 2 * reads->readCount();
+    const uint64_t readCount = reads->readCount();
+    const uint64_t orientedReadCount = 2 * readCount;
     unordered_set<AnchorPairKey, AnchorPairKeyHash> processedPairs;
 
     uint64_t processedPairCount = 0;
+    uint64_t processedReadCount = 0;
+    uint64_t skippedNoJourneyStorage = 0;
+    uint64_t skippedShortJourney = 0;
+    uint64_t skippedShortFilteredJourney = 0;
     uint64_t totalEventBearingPairs = 0;
     uint64_t skippedSingleSequencePairs = 0;
     uint64_t skippedReverseOrderBothAnchorReads = 0;
@@ -739,11 +675,38 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
     uint64_t rightOnlySequenceCount = 0;
     uint64_t failedLeftOnlyAnchorChecks = 0;
     uint64_t failedRightOnlyAnchorChecks = 0;
-    const auto prototypeBegin = chrono::steady_clock::now();
 
-    for(uint32_t focalJourneyPos=0;
-        focalJourneyPos + 1 < filteredFocalJourney.size() && processedPairCount < maxAnchorPairs;
-        focalJourneyPos++) {
+    for(uint64_t readId=0; readId<readCount && processedPairCount<maxAnchorPairs; readId++) {
+        const OrientedReadId focalOid(ReadId(readId), 0);
+        if(focalOid.getValue() >= anchors->journeys.size()) {
+            ++skippedNoJourneyStorage;
+            continue;
+        }
+
+        const auto focalJourney = anchors->journeys[focalOid.getValue()];
+        if(focalJourney.size() < 2) {
+            ++skippedShortJourney;
+            continue;
+        }
+
+        vector<AnchorId> filteredFocalJourney;
+        filteredFocalJourney.reserve(focalJourney.size());
+        for(uint32_t i=0; i<focalJourney.size(); i++) {
+            const AnchorId anchorId = focalJourney[i];
+            const Anchor anchor = (*anchors)[anchorId];
+            if(anchor.size() >= minAnchorCoverageForMsa) {
+                filteredFocalJourney.push_back(anchorId);
+            }
+        }
+        if(filteredFocalJourney.size() < 2) {
+            ++skippedShortFilteredJourney;
+            continue;
+        }
+        ++processedReadCount;
+
+        for(uint32_t focalJourneyPos=0;
+            focalJourneyPos + 1 < filteredFocalJourney.size() && processedPairCount < maxAnchorPairs;
+            focalJourneyPos++) {
 
         const AnchorId left = filteredFocalJourney[focalJourneyPos];
         const AnchorId right = filteredFocalJourney[focalJourneyPos + 1];
@@ -978,7 +941,8 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
                 anchorSide});
         }
 
-        if(focalWindowSegment.begin <= auditRecruitmentTargetPosition &&
+        if(logRecruitmentAudit &&
+           focalWindowSegment.begin <= auditRecruitmentTargetPosition &&
            auditRecruitmentTargetPosition < focalWindowSegment.end) {
             unordered_set<uint64_t> addedValues;
             for(const SequenceInfo& info: sequenceInfos) {
@@ -1054,7 +1018,7 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
         const double msaSeconds = chrono::duration<double>(msaEnd - msaBegin).count();
 
         const vector<string> alignedSequences = parseMsaFasta(msaText);
-        if(left == debugMsaLeftAnchor && right == debugMsaRightAnchor) {
+        if(logDebugMsa && left == debugMsaLeftAnchor && right == debugMsaRightAnchor) {
             cout << "[TheseusMGMSA] DEBUG_MSA_BEGIN"
                  << " pair=" << processedPairCount
                  << " anchors=" << left << "->" << right
@@ -1097,10 +1061,16 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
         ++totalEventBearingPairs;
         ++processedPairCount;
     }
+    }
 
     const auto prototypeEnd = chrono::steady_clock::now();
     const double prototypeSeconds = chrono::duration<double>(prototypeEnd - prototypeBegin).count();
     cout << timestamp << "[TheseusMGMSA] Prototype ends."
+         << " reads=" << readCount
+         << " processedReads=" << processedReadCount
+         << " skippedNoJourneyStorage=" << skippedNoJourneyStorage
+         << " skippedShortJourney=" << skippedShortJourney
+         << " skippedShortFilteredJourney=" << skippedShortFilteredJourney
          << " processedPairs=" << processedPairCount
          << " skippedSingleSequencePairs=" << skippedSingleSequencePairs
          << " skippedReverseOrderBothAnchorReads=" << skippedReverseOrderBothAnchorReads
@@ -1110,6 +1080,8 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
          << " failedRightOnlyAnchorChecks=" << failedRightOnlyAnchorChecks
          << " reportedPairs=" << totalEventBearingPairs
          << " seconds=" << fixed << setprecision(6) << prototypeSeconds
+         << " avgSecondsPerRead=" << (readCount ? prototypeSeconds / double(readCount) : 0.)
+         << " avgSecondsPerProcessedRead=" << (processedReadCount ? prototypeSeconds / double(processedReadCount) : 0.)
          << defaultfloat << endl;
 }
 

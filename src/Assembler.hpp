@@ -3563,6 +3563,8 @@ public:
     void computeTheseusTargetBackboneMSAPrototype(
         uint64_t maxReads,
         uint64_t threadCount);
+    void computeTheseusReadWindowMSAPrototype(
+        uint64_t threadCount);
     void benchmarkFastGAOnChainedReadPairs(ReadId focalReadId, uint32_t strand);
     void alignChainedCandidatesWithFastGA(uint64_t threadCount);
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
