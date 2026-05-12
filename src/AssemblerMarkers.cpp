@@ -1508,20 +1508,19 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
                 const KmerId kmerId = oldKmerIds[i];
                 const Kmer kmer(kmerId, k);
                 const KmerId rcKmerId = kmer.reverseComplement(k).id(k);
-                const KmerId canonical = std::min(kmerId, rcKmerId);
 
-                // O(1) frequency lookup.
+                // Palindromic k-mers can cause ambiguity in directed graph construction
+                // because their forward and reverse orientations are identical. They are
+                // rejected before the frequency lookup because their frequency cannot
+                // change the filtering decision.
+                if(applyKmerCountFilterData.filterPalindromes && kmerId == rcKmerId) {
+                    continue;
+                }
+
+                const KmerId canonical = std::min(kmerId, rcKmerId);
                 const uint64_t freq = kmerCounter->getFrequencyFast(canonical);
                 
                 if(freq >= minF && freq <= maxF) {
-                    
-                    // Palindrome check: if requested, skip markers where kmerId == rcKmerId.
-                    // Palindromic k-mers can cause ambiguity in directed graph construction 
-                    // because their forward and reverse orientations are identical.
-                    if(applyKmerCountFilterData.filterPalindromes && kmerId == rcKmerId) {
-                        continue;
-                    }
-
                     // Set validity bit using bitwise ops (>> 3 = /8, & 7 = %8).
                     validityBits[i >> 3] |= (uint8_t(1) << (i & 7));
                     // Cache rcKmerId for Pass 2 (avoids recomputing reverseComplement).
