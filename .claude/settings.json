@@ -10,14 +10,28 @@
       "Bash(__NEW_LINE_1f5991e8258617de__ echo \"\")",
       "Bash(__NEW_LINE_b8c32cd4b3f75fdf__ echo \"\")",
       "Bash(__NEW_LINE_786aaae960d9d82a__ echo \"\")",
-      "Bash(find /home/kokyriakidis/Downloads/hifiasm -name *chain* -o -name *anchor*)"
+      "Bash(find /home/kokyriakidis/Downloads/hifiasm -name *chain* -o -name *anchor*)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(mkdir -p ~/.dinaraBuild/include/shasta2)",
+      "Bash(cp ~/Downloads/shasta2/src/*.hpp ~/.dinaraBuild/include/shasta2/)",
+      "Bash(nm -C ~/.dinaraBuild/lib/libtheseus.a)",
+      "Bash(cmake -S ~/Downloads/minipoa -B ~/Downloads/minipoa/build -DCMAKE_BUILD_TYPE=Release)",
+      "Bash(cp ~/Downloads/minipoa/build/bin/minipoa ~/.local/bin/minipoa)",
+      "Bash(chmod +x ~/.local/bin/minipoa)",
+      "Bash(minipoa --version)",
+      "Bash(minipoa --help)",
+      "Bash(vg snarls:*)",
+      "Bash(vg view:*)",
+      "Bash(vg deconstruct:*)",
+      "Bash(vg version:*)"
     ],
     "additionalDirectories": [
       "/home/kokyriakidis/Downloads/shasta2/src",
       "/home/kokyriakidis/Downloads/hifiasm/",
       "/home/kokyriakidis/Downloads/verkko/",
       "/home/kokyriakidis/Downloads/MBG/",
-      "/tmp"
+      "/tmp",
+      "/home/kokyriakidis/.shasta2Build/abpoa/abPOA/lib"
     ]
   }
 }
