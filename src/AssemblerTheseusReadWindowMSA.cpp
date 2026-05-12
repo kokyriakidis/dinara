@@ -6,7 +6,8 @@
 
 #include "Assembler.hpp"
 #include "Reads.hpp"
-#include "mode3-Anchor.hpp"
+#include "Shasta2Anchors.hpp"
+#include "Shasta2Journeys.hpp"
 #include "timestamp.hpp"
 
 #if 0
@@ -29,7 +30,6 @@
 #include <vector>
 
 using namespace dinara;
-using namespace dinara::mode3;
 using namespace std;
 
 namespace {
@@ -177,6 +177,42 @@ string extractWholeOrientedReadSequence(const Reads& reads, OrientedReadId oid)
 
 void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
 {
+    checkMarkersAreOpen();
+    checkMarkerGraphVerticesAreAvailable();
+    DINARA_ASSERT(markerGraph.reverseComplementVertex.isOpen);
+    DINARA_ASSERT(assemblerInfo.isOpen);
+    DINARA_ASSERT((assemblerInfo->k % 2) == 0);
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+    threadCount = max<uint64_t>(1, threadCount);
+
+    const MappedMemoryOwner shasta2Owner = shasta2MappedMemoryOwner();
+    auto shasta2AnchorsLocal = make_shared<Shasta2Anchors>(
+        shasta2Owner,
+        getReads(),
+        assemblerInfo->k,
+        *markers,
+        markerGraph,
+        threadCount,
+        2,
+        numeric_limits<uint64_t>::max());
+    auto shasta2JourneysLocal = make_shared<Shasta2Journeys>(
+        2 * getReads().readCount(),
+        shasta2AnchorsLocal,
+        threadCount,
+        shasta2Owner);
+    computeTheseusReadWindowMSAPrototype(shasta2AnchorsLocal, shasta2JourneysLocal, threadCount);
+}
+
+
+
+void Assembler::computeTheseusReadWindowMSAPrototype(
+    shared_ptr<Shasta2Anchors> shasta2Anchors,
+    shared_ptr<Shasta2Journeys> shasta2Journeys,
+    uint64_t threadCount)
+{
     cout << timestamp << "[TheseusReadWindowMSA] Prototype begins." << endl;
     const auto totalBegin = chrono::steady_clock::now();
 
@@ -189,6 +225,9 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
     DINARA_ASSERT(assemblerInfo.isOpen);
     DINARA_ASSERT((assemblerInfo->k % 2) == 0);
     DINARA_ASSERT(reads->readCount() > 0);
+    DINARA_ASSERT(shasta2Anchors);
+    DINARA_ASSERT(shasta2Journeys);
+    DINARA_ASSERT(shasta2Journeys->isOpen());
 
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
@@ -199,18 +238,6 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
     const uint64_t orientedReadCount = 2 * readCount;
     const uint32_t invalidAlignmentId = numeric_limits<uint32_t>::max();
 
-    auto anchors = make_shared<Anchors>(
-        MappedMemoryOwner(*this),
-        getReads(),
-        assemblerInfo->k,
-        *markers,
-        markerGraph,
-        2,
-        numeric_limits<uint64_t>::max(),
-        threadCount,
-        true);
-    anchors->computeJourneys(threadCount);
-
     {
     // Anchor-interval window prototype.
     // Claim anchor ids, not whole reads. Each accepted window is seeded by a
@@ -218,7 +245,7 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
     // to contiguous unclaimed intervals on reads touching the seed anchors.
     constexpr uint32_t minBackboneWindowAnchors = 2;
     const uint32_t anchorUnclaimed = numeric_limits<uint32_t>::max();
-    const uint64_t anchorCount = anchors->size();
+    const uint64_t anchorCount = shasta2Anchors->size();
     vector<uint32_t> anchorOwner(anchorCount, anchorUnclaimed);
     vector<AnchorWindowTask> anchorWindows;
     vector<uint32_t> touchedEpoch(orientedReadCount, 0);
@@ -249,6 +276,8 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
         });
 
     uint64_t anchorWindowClaimedAnchors = 0;
+    uint64_t backboneClaimedAnchors = 0;
+    uint64_t nonBackboneClaimedAnchors = 0;
     uint64_t anchorWindowReadIntervals = 0;
     uint64_t anchorWindowSkippedNoJourney = 0;
     uint64_t anchorWindowSkippedShortRuns = 0;
@@ -272,14 +301,17 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
             return uint64_t(end - begin);
         }
 
-        const AnchorId leftAnchor = journey[begin];
-        const AnchorId rightAnchor = journey[end - 1];
-        uint64_t leftOrdinal = anchors->getFirstOrdinal(leftAnchor, oid);
-        uint64_t rightOrdinal = uint64_t(anchors->getFirstOrdinal(rightAnchor, oid)) +
-            anchors->ordinalOffset(rightAnchor);
+        const Shasta2AnchorId leftAnchorId = journey[begin];
+        const Shasta2AnchorId rightAnchorId = journey[end - 1];
+        const uint32_t leftOrdinal = shasta2Anchors->getOrdinal(leftAnchorId, oid);
+        const uint32_t rightOrdinal = shasta2Anchors->getOrdinal(rightAnchorId, oid);
+        if(leftOrdinal == invalid<uint32_t> || rightOrdinal == invalid<uint32_t>) {
+            return uint64_t(end - begin);
+        }
 
-        leftOrdinal = min<uint64_t>(leftOrdinal, orientedReadMarkers.size() - 1);
-        const uint64_t leftPosition = orientedReadMarkers[leftOrdinal].position;
+        const uint64_t leftOrdClamped =
+            min<uint64_t>(leftOrdinal, orientedReadMarkers.size() - 1);
+        const uint64_t leftPosition = orientedReadMarkers[leftOrdClamped].position;
         uint64_t rightPosition = reads->getRead(oid.getReadId()).baseCount;
         if(rightOrdinal < orientedReadMarkers.size()) {
             rightPosition = orientedReadMarkers[rightOrdinal].position;
@@ -303,11 +335,11 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
     };
 
     auto pushCurrentUnclaimedIntervals = [&](OrientedReadId oid) {
-        if(oid.getValue() >= anchors->journeys.size()) {
+        if(oid.getValue() >= shasta2Journeys->size()) {
             ++anchorWindowSkippedNoJourney;
             return;
         }
-        const auto journey = anchors->journeys[oid.getValue()];
+        const auto journey = (*shasta2Journeys)[oid];
         if(journey.empty()) {
             ++anchorWindowSkippedNoJourney;
             return;
@@ -344,21 +376,22 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
             seedEnd,
             uint32_t(seedEnd - seedBegin)});
 
-        const auto backboneJourney = anchors->journeys[backboneOid.getValue()];
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
         for(uint32_t position=seedBegin; position<seedEnd; position++) {
-            const AnchorId anchorId = backboneJourney[position];
+            const Shasta2AnchorId anchorId = backboneJourney[position];
             if(anchorOwner[uint64_t(anchorId)] == anchorUnclaimed) {
                 anchorOwner[uint64_t(anchorId)] = windowId;
                 ++task.claimedAnchorCount;
+                ++backboneClaimedAnchors;
             }
         }
 
         ++epoch;
         touchedOrientedReads.clear();
         for(uint32_t position=seedBegin; position<seedEnd; position++) {
-            const AnchorId anchorId = backboneJourney[position];
-            const Anchor anchor = (*anchors)[anchorId];
-            for(const AnchorMarkerInterval& ami: anchor) {
+            const Shasta2AnchorId anchorId = backboneJourney[position];
+            const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
+            for(const Shasta2AnchorMarkerInfo& ami: anchor) {
                 const OrientedReadId oid = ami.orientedReadId;
                 if(oid == backboneOid || ami.positionInJourney == invalid<uint32_t>) {
                     continue;
@@ -381,10 +414,10 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
 
         for(const uint32_t oidValue: touchedOrientedReads) {
             const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
-            if(oid.getValue() >= anchors->journeys.size()) {
+            if(oid.getValue() >= shasta2Journeys->size()) {
                 continue;
             }
-            const auto journey = anchors->journeys[oid.getValue()];
+            const auto journey = (*shasta2Journeys)[oid];
             if(journey.empty()) {
                 continue;
             }
@@ -399,6 +432,7 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
                 while(position < end && anchorOwner[uint64_t(journey[position])] == anchorUnclaimed) {
                     anchorOwner[uint64_t(journey[position])] = windowId;
                     ++task.claimedAnchorCount;
+                    ++nonBackboneClaimedAnchors;
                     ++position;
                 }
                 if(runBegin != position) {
@@ -426,11 +460,11 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
     // Initialize the heap with one complete strand-0 journey candidate per read.
     for(const ReadId readId: anchorReadsByLength) {
         const OrientedReadId backboneOid(readId, 0);
-        if(backboneOid.getValue() >= anchors->journeys.size()) {
+        if(backboneOid.getValue() >= shasta2Journeys->size()) {
             ++anchorWindowSkippedNoJourney;
             continue;
         }
-        const auto journey = anchors->journeys[backboneOid.getValue()];
+        const auto journey = (*shasta2Journeys)[backboneOid];
         if(journey.empty()) {
             ++anchorWindowSkippedNoJourney;
             continue;
@@ -448,11 +482,11 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
             ++discardedOldGenerationCandidates;
             continue;
         }
-        if(candidate.backboneOrientedReadId.getValue() >= anchors->journeys.size()) {
+        if(candidate.backboneOrientedReadId.getValue() >= shasta2Journeys->size()) {
             ++anchorWindowSkippedNoJourney;
             continue;
         }
-        const auto journey = anchors->journeys[candidate.backboneOrientedReadId.getValue()];
+        const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
         if(journey.empty() || candidate.end > journey.size()) {
             ++anchorWindowSkippedNoJourney;
             continue;
@@ -499,14 +533,18 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
         const OrientedReadId oid(readId, 0);
         uint64_t journeyAnchorCount = 0;
         uint64_t claimedJourneyAnchors = 0;
+        uint64_t journeyBaseSpan = 0;
         uint64_t claimedRuns = 0;
         uint64_t unclaimedRuns = 0;
-        if(oid.getValue() < anchors->journeys.size()) {
-            const auto journey = anchors->journeys[oid.getValue()];
+        if(oid.getValue() < shasta2Journeys->size()) {
+            const auto journey = (*shasta2Journeys)[oid];
             journeyAnchorCount = journey.size();
+            if(!journey.empty()) {
+                journeyBaseSpan = intervalBaseSpan(oid, journey, 0, uint32_t(journey.size()));
+            }
             bool previousClaimed = false;
             bool previousUnclaimed = false;
-            for(const AnchorId anchorId: journey) {
+            for(const Shasta2AnchorId anchorId: journey) {
                 const bool isClaimed = anchorOwner[uint64_t(anchorId)] != anchorUnclaimed;
                 if(isClaimed) {
                     ++claimedJourneyAnchors;
@@ -524,6 +562,7 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
              << " readId=" << readId
              << " length=" << reads->getRead(readId).baseCount
              << " journeyAnchors=" << journeyAnchorCount
+             << " journeyBaseSpan=" << journeyBaseSpan
              << " claimedJourneyAnchors=" << claimedJourneyAnchors
              << " unclaimedJourneyAnchors=" << (journeyAnchorCount - claimedJourneyAnchors)
              << " claimedFraction=" << (journeyAnchorCount == 0 ? 0. : double(claimedJourneyAnchors) / double(journeyAnchorCount))
@@ -543,6 +582,8 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
          << " windows=" << anchorWindows.size()
          << " minBackboneWindowAnchors=" << minBackboneWindowAnchors
          << " claimedAnchors=" << anchorWindowClaimedAnchors
+         << " backboneClaimedAnchors=" << backboneClaimedAnchors
+         << " nonBackboneClaimedAnchors=" << nonBackboneClaimedAnchors
          << " unclaimedAnchors=" << unclaimedAnchorCount
          << " backboneIntervals=" << anchorWindowBackboneIntervals
          << " candidateIntervalsPushed=" << candidateIntervalsPushed
@@ -674,21 +715,21 @@ void Assembler::computeTheseusReadWindowMSAPrototype(uint64_t threadCount)
 
     for(ReadWindowTask& task: windows) {
         const OrientedReadId backboneOid(task.backboneReadId, 0);
-        if(backboneOid.getValue() >= anchors->journeys.size()) {
+        if(backboneOid.getValue() >= shasta2Journeys->size()) {
             ++anchorRescueSkippedNoJourney;
             continue;
         }
 
-        const auto journey = anchors->journeys[backboneOid.getValue()];
+        const auto journey = (*shasta2Journeys)[backboneOid];
         if(journey.empty()) {
             ++anchorRescueSkippedNoJourney;
             continue;
         }
 
         touchedOrientedReads.clear();
-        for(const AnchorId anchorId: journey) {
-            const Anchor anchor = (*anchors)[anchorId];
-            for(const AnchorMarkerInterval& ami: anchor) {
+        for(const Shasta2AnchorId anchorId: journey) {
+            const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
+            for(const Shasta2AnchorMarkerInfo& ami: anchor) {
                 const OrientedReadId oid = ami.orientedReadId;
                 if(oid == backboneOid) {
                     continue;

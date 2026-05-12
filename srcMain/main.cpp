@@ -791,14 +791,135 @@ void dinara::main::assemble(
         const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
         const uint64_t minFreq = 2;
         const uint64_t maxFreq = 5 * coveragePeak;
-        const uint64_t distinctKmerCount = assembler.kmerCounter->kmerIdFrequencies.size();
+        const bool removePalindromicKmers = true;
+        uint64_t distinctKmerCount = 0;
+        for(uint64_t bucketId=0; bucketId<assembler.kmerCounter->kmerIdFrequencies.size(); bucketId++) {
+            distinctKmerCount += assembler.kmerCounter->kmerIdFrequencies[bucketId].size();
+        }
 
         cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
         cout << "Filtering minimizers: Peak coverage is " << coveragePeak << "." << endl;
-        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "] and excluding palindromic k-mers." << endl;
+        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "]";
+        if(removePalindromicKmers) {
+            cout << " and excluding palindromic k-mers";
+        }
+        cout << "." << endl;
+
+        [[maybe_unused]]
+        auto writeReadMarkerGapDiagnostic = [&assembler](const string& label, ReadId readId) {
+            const OrientedReadId oid(readId, 0);
+            const auto read = assembler.getReads().getRead(readId);
+            const auto readMarkers = (*assembler.markers)[oid.getValue()];
+            const auto readKmerIds = (*assembler.markerKmerIds)[oid.getValue()];
+            const uint64_t k = assembler.assemblerInfo->k;
+
+            class GapInfo {
+            public:
+                string type;
+                uint32_t begin = 0;
+                uint32_t end = 0;
+                uint64_t markerStartDistance = 0;
+                uint64_t noMarkerBases = 0;
+                uint64_t leftFrequency = 0;
+                uint64_t rightFrequency = 0;
+            };
+
+            auto frequency = [&](KmerId kmerId) {
+                const Kmer kmer(kmerId, k);
+                const KmerId rcKmerId = kmer.reverseComplement(k).id(k);
+                return assembler.kmerCounter->getFrequencyFast(min(kmerId, rcKmerId));
+            };
+
+            vector<GapInfo> gaps;
+            if(readMarkers.empty()) {
+                gaps.push_back(GapInfo{
+                    "wholeRead",
+                    0,
+                    uint32_t(read.baseCount),
+                    read.baseCount,
+                    read.baseCount,
+                    0,
+                    0});
+            } else {
+                const uint32_t firstPosition = readMarkers.front().position;
+                if(firstPosition != 0) {
+                    gaps.push_back(GapInfo{
+                        "prefix",
+                        0,
+                        firstPosition,
+                        firstPosition,
+                        firstPosition,
+                        0,
+                        frequency(readKmerIds.front())});
+                }
+                for(uint64_t i=1; i<readMarkers.size(); i++) {
+                    const uint32_t previousPosition = readMarkers[i - 1].position;
+                    const uint32_t nextPosition = readMarkers[i].position;
+                    const uint64_t markerStartDistance = nextPosition > previousPosition ?
+                        nextPosition - previousPosition : 0;
+                    const uint64_t previousEnd = uint64_t(previousPosition) + k;
+                    const uint64_t noMarkerBases = uint64_t(nextPosition) > previousEnd ?
+                        uint64_t(nextPosition) - previousEnd : 0;
+                    gaps.push_back(GapInfo{
+                        "internal",
+                        previousPosition,
+                        nextPosition,
+                        markerStartDistance,
+                        noMarkerBases,
+                        frequency(readKmerIds[i - 1]),
+                        frequency(readKmerIds[i])});
+                }
+                const uint64_t lastEnd = uint64_t(readMarkers.back().position) + k;
+                if(read.baseCount > lastEnd) {
+                    gaps.push_back(GapInfo{
+                        "suffix",
+                        uint32_t(lastEnd),
+                        uint32_t(read.baseCount),
+                        read.baseCount - lastEnd,
+                        read.baseCount - lastEnd,
+                        frequency(readKmerIds.back()),
+                        0});
+                }
+            }
+
+            sort(gaps.begin(), gaps.end(),
+                [](const GapInfo& a, const GapInfo& b) {
+                    if(a.noMarkerBases != b.noMarkerBases) {
+                        return a.noMarkerBases > b.noMarkerBases;
+                    }
+                    return a.markerStartDistance > b.markerStartDistance;
+                });
+
+            cout << timestamp << "[MarkerGapDiagnostic] " << label
+                 << " readId=" << readId
+                 << " readLength=" << read.baseCount
+                 << " markerCount=" << readMarkers.size()
+                 << endl;
+            for(uint64_t i=0; i<min<uint64_t>(10, gaps.size()); i++) {
+                const GapInfo& gap = gaps[i];
+                cout << timestamp << "  rank=" << i
+                     << " type=" << gap.type
+                     << " begin=" << gap.begin
+                     << " end=" << gap.end
+                     << " markerStartDistance=" << gap.markerStartDistance
+                     << " noMarkerBases=" << gap.noMarkerBases
+                     << " leftFrequency=" << gap.leftFrequency
+                     << " rightFrequency=" << gap.rightFrequency
+                     << endl;
+            }
+        };
+
+        // writeReadMarkerGapDiagnostic("beforeFrequencyFilter", ReadId(3729));
              
-        // Prune the existing markers in-place using the KmerCounter and markerKmerIds.
-        assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount);
+        // Prune the existing minimizer markers in-place.
+        // applyKmerCountFilter keeps a marker only if:
+        // - its canonical k-mer frequency is in the inclusive range [minFreq, maxFreq],
+        // - and, by default, the k-mer is not palindromic/self-reverse-complementary.
+        // The function rebuilds both markers and markerKmerIds from the pre-filtered
+        // arrays, preserving only marker positions whose matching k-mer id passes.
+        assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount, removePalindromicKmers);
+        
+        // writeReadMarkerGapDiagnostic("afterFrequencyFilter", ReadId(3729));
 
         // Initialize KmerChecker for HttpServer diagnostics (optional).
         cout << "Initializing KmerChecker for diagnostics." << endl;
@@ -924,7 +1045,7 @@ void dinara::main::assemble(
 
     // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
     assembler.createMarkerGraphVertices(
-        6,                                              // minVertexCoverage
+        2,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
@@ -936,9 +1057,37 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    // Diagnostic prototype: partition reads into disjoint overlap windows,
-    // then run one whole-read Theseus MSA per window.
-    assembler.computeTheseusReadWindowMSAPrototype(threadCount);
+    {
+    // Same Shasta2 anchor/journey coverage as the main assembly path (see shasta2 block
+    // later in this file): reuse these objects when wiring Theseus to Shasta2.
+    const uint64_t minPrimaryCoverage = 2;
+    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    const MappedMemoryOwner shasta2OwnerEarly = assembler.shasta2MappedMemoryOwner();
+    cout << timestamp << "Creating Shasta2Anchors for Theseus read-window prototype..." << endl;
+    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
+        shasta2OwnerEarly,
+        assembler.getReads(),
+        assembler.assemblerInfo->k,
+        *assembler.markers,
+        assembler.markerGraph,
+        threadCount,
+        minPrimaryCoverage,
+        maxPrimaryCoverage);
+
+    
+    cout << timestamp << "Creating Shasta2Journeys for Theseus read-window prototype..." << endl;
+    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
+        2 * assembler.getReads().readCount(),
+        assembler.shasta2Anchors,
+        threadCount,
+        shasta2OwnerEarly);
+
+    // Diagnostic prototype: partition Shasta2 anchor journeys into windows, then later
+    // run one Theseus MSA per anchor-window interval.
+    assembler.computeTheseusReadWindowMSAPrototype(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        threadCount);
     // assembler.computeTheseusMarkerGraphMSAPrototype(
     //     std::numeric_limits<uint64_t>::max(),    // maxAnchorPairs
     //     std::numeric_limits<uint64_t>::max(),    // maxReadsPerPair
@@ -947,6 +1096,7 @@ void dinara::main::assemble(
     //     12800,    // maxReads
     //     threadCount);
     return;
+    }
 
     // Run marker-graph-projected EC parity (updates delete flags on alignments).
     assembler.performHifiasmECParityWithMarkerGraph(threadCount);

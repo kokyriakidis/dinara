@@ -206,6 +206,30 @@ Expected verification checks:
 - Every stored `AnchorWindowReadInterval` is contiguous in its oriented read journey.
 - The MSA block remains disabled until interval extraction and het-site mapping are validated.
 
+## Current Observations
+On the current test dataset:
+
+- The heap/base-span priority is behaving as intended. A read can have fewer anchors but a much larger sequence span than another read with many dense anchors. For example, one run showed:
+  - `readId=3729`: `journeyAnchors=493`, `journeyBaseSpan=298921`.
+  - `readId=16296`: `journeyAnchors=1368`, `journeyBaseSpan=47192`.
+  This supports using base span as the main priority score and anchor count only as a tie-breaker.
+- Anchor coverage is essentially complete:
+  - `claimedAnchors=782717`
+  - `unclaimedAnchors=85`
+  - `anchors=782802`
+- Most claimed anchors come from accepted backbone intervals, with bounded expansion adding supporting context:
+  - `backboneClaimedAnchors=621898`
+  - `nonBackboneClaimedAnchors=160819`
+  This suggests windows are driven primarily by coherent backbone intervals rather than by uncontrolled expansion.
+- The heap/lazy-revalidation churn is visible but acceptable:
+  - many candidates can become stale after windows claim anchors,
+  - old-generation candidates are discarded cheaply,
+  - planning still takes about a quarter second on this dataset.
+- Window sizes look manageable for an MSA dry run:
+  - most windows have at most 128 read intervals,
+  - only a small number reach 257-512 read intervals,
+  - no current window exceeds 512 read intervals.
+
 ## Integration Points
 - Add a new method in `src/Assembler.hpp`:
 
