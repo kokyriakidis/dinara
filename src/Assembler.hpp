@@ -3502,6 +3502,13 @@ public:
     // Shasta2-style Anchors for Mode 3.
     std::shared_ptr<Shasta2Anchors> shasta2Anchors;
     std::shared_ptr<Shasta2Journeys> shasta2Journeys;
+
+    // Early structural layer before het detection / phasing: per-strand-0-read CSR of
+    // oriented reads that co-occur on any Shasta2 journey anchor (marker-graph collapse;
+    // can exceed alignmentTable neighbors). Use to scope windows, anchor separation, evidence.
+    MemoryMapped::VectorOfVectors<uint32_t, uint32_t> strand0JourneyCoReads;
+    void computeStrand0JourneyCoReadsTable();
+
     // Non-overlapping journeys derived from shasta2Journeys.
     // Indexed by OrientedReadId.getValue(). Computed after journey creation.
     // AnchorId is uint64_t (shasta2::AnchorId).
