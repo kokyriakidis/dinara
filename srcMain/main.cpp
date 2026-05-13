@@ -1042,7 +1042,7 @@ void dinara::main::assemble(
 
 
     // coveragePeak already defined above (line ~979).
-    const uint64_t minFreq = 6;
+    const uint64_t minFreq = 8;
     const uint64_t maxFreq = 5 * coveragePeak;
 
 
@@ -1055,16 +1055,16 @@ void dinara::main::assemble(
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
-    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
     {
     // Same Shasta2 anchor/journey coverage as the main assembly path (see shasta2 block
     // later in this file): reuse these objects when wiring Theseus to Shasta2.
-    const uint64_t minPrimaryCoverage = 2;
-    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
+    const uint64_t minPrimaryCoverage = 8;
+    const uint64_t maxPrimaryCoverage = 5 * coveragePeak;
     const MappedMemoryOwner shasta2OwnerEarly = assembler.shasta2MappedMemoryOwner();
     cout << timestamp << "Creating Shasta2Anchors for Theseus read-window prototype..." << endl;
     assembler.shasta2Anchors = make_shared<Shasta2Anchors>(

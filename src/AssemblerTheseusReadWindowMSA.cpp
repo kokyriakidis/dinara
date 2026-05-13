@@ -849,7 +849,10 @@ void prepareBackbonePairMsaJob(
         false,
         'B'});
 
-    // candidateValues contains only both-anchor reads (filtered above).
+    const uint32_t kHalf = uint32_t(k / 2);
+
+    // B reads: present in both anchors. Must come first so the POA graph is fully built
+    // before ends-free (L/R) sequences are added (Theseus still_end_to_end constraint).
     for(const uint64_t oidValue64: candidateValues) {
         if(sequenceInfos.size() >= maxReadsPerWindowAnchorPair) {
             break;
@@ -868,7 +871,6 @@ void prepareBackbonePairMsaJob(
             continue;
         }
 
-        const uint32_t kHalf = uint32_t(k / 2);
         const uint32_t windowBegin = readMarkers[leftOrdinal].position + kHalf;
         const uint32_t windowEnd   = readMarkers[rightOrdinal].position + kHalf;
         if(windowEnd <= windowBegin) {
@@ -886,6 +888,71 @@ void prepareBackbonePairMsaJob(
         sequenceInfos.push_back(MsaSequenceInfo{
             oid, segment.sequence, segment.begin, segment.end,
             true, false, 'B'});
+    }
+
+    // L reads: present in left anchor only. Aligned ends-free on the right.
+    for(const auto& [oidValue, leftOrdinal]: leftOrdinals) {
+        if(sequenceInfos.size() >= maxReadsPerWindowAnchorPair) {
+            break;
+        }
+        if(oidValue == focalOid.getValue() || oidValue >= orientedReadCount) {
+            continue;
+        }
+        if(rightOrdinals.contains(oidValue)) {
+            continue; // already added as B-read
+        }
+
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto readMarkers = markers[oid.getValue()];
+        if(leftOrdinal >= readMarkers.size()) {
+            continue;
+        }
+
+        const uint32_t leftPos = readMarkers[leftOrdinal].position + kHalf;
+        const MsaSegment segment = extractMsaSegmentFromBases(
+            reads, oid,
+            (leftPos > alignmentPadding) ? (leftPos - alignmentPadding) : 0,
+            leftPos + approximateSpan + alignmentPadding);
+        if(segment.sequence.empty()) {
+            continue;
+        }
+
+        sequenceInfos.push_back(MsaSequenceInfo{
+            oid, segment.sequence, segment.begin, segment.end,
+            false, false, 'L'});
+    }
+
+    // R reads: present in right anchor only. Aligned reversed + ends-free on the left.
+    for(const auto& [oidValue, rightOrdinal]: rightOrdinals) {
+        if(sequenceInfos.size() >= maxReadsPerWindowAnchorPair) {
+            break;
+        }
+        if(oidValue == focalOid.getValue() || oidValue >= orientedReadCount) {
+            continue;
+        }
+        if(leftOrdinals.contains(oidValue)) {
+            continue; // already added as B-read
+        }
+
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto readMarkers = markers[oid.getValue()];
+        if(rightOrdinal >= readMarkers.size()) {
+            continue;
+        }
+
+        const uint32_t rightPos = readMarkers[rightOrdinal].position + kHalf;
+        const MsaSegment segment = extractMsaSegmentFromBases(
+            reads, oid,
+            (rightPos > approximateSpan + alignmentPadding) ?
+                (rightPos - approximateSpan - alignmentPadding) : 0,
+            rightPos + alignmentPadding);
+        if(segment.sequence.empty()) {
+            continue;
+        }
+
+        sequenceInfos.push_back(MsaSequenceInfo{
+            oid, segment.sequence, segment.begin, segment.end,
+            false, false, 'R'});
     }
 
     if(sequenceInfos.size() < 2) {
