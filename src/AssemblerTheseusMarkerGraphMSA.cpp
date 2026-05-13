@@ -12,6 +12,7 @@
 #include "findMarkerId.hpp"
 #include "mode3-Anchor.hpp"
 #include "timestamp.hpp"
+#include "TheseusAlignMutex.hpp"
 
 #include <theseus/heuristics.h>
 #include <theseus/penalties.h>
@@ -26,6 +27,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -998,21 +1000,27 @@ void Assembler::computeTheseusMarkerGraphMSAPrototype(
         }
 
         const auto msaBegin = chrono::steady_clock::now();
-        theseus::Penalties penalties(0, 2, 3, 1);
-        theseus::Heuristics heuristics(false, false);
-        theseus::TheseusMSA aligner(
-            penalties,
-            heuristics,
-            sequenceInfos.front().sequence,
-            1,
-            false);
-
-        for(size_t i=1; i<sequenceInfos.size(); i++) {
-            aligner.align(sequenceInfos[i].sequence, 1, false, sequenceInfos[i].isEndsFree);
-        }
-
         ostringstream msaOut;
-        aligner.print_as_msa(msaOut);
+        {
+            lock_guard<std::mutex> lock{theseusAlignMutex()};
+            theseus::Penalties penalties(0, 2, 3, 1);
+            theseus::Heuristics heuristics(false, false);
+            theseus::TheseusMSA aligner(
+                penalties,
+                heuristics,
+                sequenceInfos.front().sequence,
+                1,
+                false);
+
+            for(size_t i=1; i<sequenceInfos.size(); i++) {
+                const auto ends = theseusAlignEndsFreeFlags(
+                    sequenceInfos[i].hasBothAnchors,
+                    sequenceInfos[i].anchorSide);
+                aligner.align(sequenceInfos[i].sequence, 1, ends.first, ends.second);
+            }
+
+            aligner.print_as_msa(msaOut);
+        }
         const string msaText = msaOut.str();
         const auto msaEnd = chrono::steady_clock::now();
         const double msaSeconds = chrono::duration<double>(msaEnd - msaBegin).count();
@@ -1285,21 +1293,27 @@ void Assembler::computeTheseusTargetBackboneMSAPrototype(
          << endl;
 
     const auto msaBegin = chrono::steady_clock::now();
-    theseus::Penalties penalties(0, 2, 3, 1);
-    theseus::Heuristics heuristics(false, false);
-    theseus::TheseusMSA aligner(
-        penalties,
-        heuristics,
-        sequenceInfos.front().sequence,
-        1,
-        false);
-
-    for(size_t i=1; i<sequenceInfos.size(); i++) {
-        aligner.align(sequenceInfos[i].sequence, 1, false, true);
-    }
-
     ostringstream msaOut;
-    aligner.print_as_msa(msaOut);
+    {
+        lock_guard<std::mutex> lock{theseusAlignMutex()};
+        theseus::Penalties penalties(0, 2, 3, 1);
+        theseus::Heuristics heuristics(false, false);
+        theseus::TheseusMSA aligner(
+            penalties,
+            heuristics,
+            sequenceInfos.front().sequence,
+            1,
+            false);
+
+        for(size_t i=1; i<sequenceInfos.size(); i++) {
+            const auto ends = theseusAlignEndsFreeFlags(
+                sequenceInfos[i].hasBothAnchors,
+                sequenceInfos[i].anchorSide);
+            aligner.align(sequenceInfos[i].sequence, 1, ends.first, ends.second);
+        }
+
+        aligner.print_as_msa(msaOut);
+    }
     const string msaText = msaOut.str();
     const auto msaEnd = chrono::steady_clock::now();
     const double msaSeconds = chrono::duration<double>(msaEnd - msaBegin).count();

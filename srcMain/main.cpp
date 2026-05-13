@@ -1041,12 +1041,15 @@ void dinara::main::assemble(
     // return;
 
 
-    
+    // coveragePeak already defined above (line ~979).
+    const uint64_t minFreq = 6;
+    const uint64_t maxFreq = 5 * coveragePeak;
+
 
     // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
     assembler.createMarkerGraphVertices(
-        6,                                              // minVertexCoverage
-        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
+        minFreq,                                              // minVertexCoverage
+        maxFreq,                                              // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)

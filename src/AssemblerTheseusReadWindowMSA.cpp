@@ -10,6 +10,7 @@
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
 #include "timestamp.hpp"
+#include "TheseusAlignMutex.hpp"
 #include "invalid.hpp"
 
 #include <theseus/heuristics.h>
@@ -53,12 +54,26 @@ constexpr bool runAnchorWindowBackbonePairTheseusMsa = true;
 constexpr uint32_t minSharedAnchorsForRescue = 4;
 constexpr uint64_t minAnchorCoverageForWindowPairMsa = 6;
 constexpr uint64_t maxReadsPerWindowAnchorPair = 1024;
+// Skip anchor pairs where the focal (padded) sequence exceeds this length.
+// Pairs with 100k+ bp focal sequences are pathological (coincident repetitive k-mers far apart
+// on the backbone read) and cause heap corruption inside Theseus's wavefront allocator.
+constexpr uint32_t maxFocalSequenceLength = 5000;
 constexpr uint64_t oneSidedOffsetRatioNumerator = 11;
 constexpr uint64_t oneSidedOffsetRatioDenominator = 10;
 
 // Restrict anchor-window planning to one strand-0 backbone read (diagnostic).
-constexpr bool restrictAnchorWindowPlannerToSingleBackboneReadId = true;
+constexpr bool restrictAnchorWindowPlannerToSingleBackboneReadId = false;
 constexpr ReadId anchorWindowPlannerOnlyBackboneReadId = ReadId(3729);
+
+// Per-pair SITE lines from printReadWindowVariationSitesFromMsa (expensive cout + parsing).
+// Set false for full-dataset timing without SITE spam.
+constexpr bool logBackbonePairVariationSitesToStdout = false;
+
+// Diagnostic overrides: limit parallelism and window count to isolate crashes.
+// 0 = use caller-supplied threadCount; N>0 = clamp to N threads.
+constexpr uint64_t msaThreadCountOverride = 0;
+// 0 = no limit; N>0 = process at most the first N windows.
+constexpr uint32_t msaMaxWindows = 0;
 
 // Variation sites: same thresholds as AssemblerTheseusMarkerGraphMSA (ref and alt support >= 3).
 constexpr uint64_t rwMinSnpRefSupport = 3;
@@ -303,7 +318,7 @@ struct BackbonePairJob {
     uint32_t backboneJ = 0;
 };
 
-// Built on worker threads (recruitment + sequence extraction). Theseus runs serially.
+// Per-job data built in prepareBackbonePairMsaJob, then passed to Theseus.
 struct PreparedBackbonePairMsaJob {
     bool ready = false;
     BackbonePairJob job;
@@ -321,6 +336,7 @@ struct BackbonePairMsaCounters {
     uint64_t skippedCoverage = 0;
     uint64_t skippedOrdinal = 0;
     uint64_t skippedEmptyFocalWindow = 0;
+    uint64_t skippedLongFocalSequence = 0;
     uint64_t skippedSingleSequence = 0;
     uint64_t skippedReverseOrderBothAnchorReads = 0;
     uint64_t msasRun = 0;
@@ -330,21 +346,6 @@ struct BackbonePairMsaCounters {
     uint64_t failedRightOnlyAnchorChecks = 0;
     double msaCpuSeconds = 0.;
 };
-
-void mergeBackbonePairMsaCounters(BackbonePairMsaCounters& total, const BackbonePairMsaCounters& part)
-{
-    total.skippedCoverage += part.skippedCoverage;
-    total.skippedOrdinal += part.skippedOrdinal;
-    total.skippedEmptyFocalWindow += part.skippedEmptyFocalWindow;
-    total.skippedSingleSequence += part.skippedSingleSequence;
-    total.skippedReverseOrderBothAnchorReads += part.skippedReverseOrderBothAnchorReads;
-    total.msasRun += part.msasRun;
-    total.leftOnlySequences += part.leftOnlySequences;
-    total.rightOnlySequences += part.rightOnlySequences;
-    total.failedLeftOnlyAnchorChecks += part.failedLeftOnlyAnchorChecks;
-    total.failedRightOnlyAnchorChecks += part.failedRightOnlyAnchorChecks;
-    total.msaCpuSeconds += part.msaCpuSeconds;
-}
 
 string rwDisplayAllele(const string& allele)
 {
@@ -725,11 +726,6 @@ void prepareBackbonePairMsaJob(
     const Shasta2AnchorId rightId = journey[j + 1];
     const Shasta2Anchor leftAnchor = shasta2Anchors[leftId];
     const Shasta2Anchor rightAnchor = shasta2Anchors[rightId];
-    if(leftAnchor.size() < minAnchorCoverageForWindowPairMsa ||
-        rightAnchor.size() < minAnchorCoverageForWindowPairMsa) {
-        ++c.skippedCoverage;
-        return;
-    }
 
     const uint32_t focalLeftOrdinal = shasta2Anchors.getOrdinal(leftId, focalOid);
     const uint32_t focalRightOrdinal = shasta2Anchors.getOrdinal(rightId, focalOid);
@@ -754,32 +750,38 @@ void prepareBackbonePairMsaJob(
         rightOrdinals.try_emplace(info.orientedReadId.getValue(), info.ordinal);
     }
 
+    // One-sided reads cause Theseus crashes (reverse+ends_free OOB on grown graphs;
+    // Paolo confirmed single-thread crash when right-anchor-only read is present).
+    // Build candidateValues with both-anchor reads only; count one-sided for diagnostics.
     vector<uint64_t> candidateValues;
-    candidateValues.reserve(leftOrdinals.size() + rightOrdinals.size());
+    candidateValues.reserve(min(leftOrdinals.size(), rightOrdinals.size()));
     for(const auto& [oidValue, ordinal]: leftOrdinals) {
-        (void) ordinal;
-        if(oidValue != focalOid.getValue()) {
+        (void)ordinal;
+        if(oidValue == focalOid.getValue() || oidValue >= orientedReadCount) {
+            continue;
+        }
+        if(rightOrdinals.contains(oidValue)) {
             candidateValues.push_back(oidValue);
+        } else {
+            ++c.leftOnlySequences;
         }
     }
     for(const auto& [oidValue, ordinal]: rightOrdinals) {
-        (void) ordinal;
-        if(oidValue != focalOid.getValue() && !leftOrdinals.contains(oidValue)) {
-            candidateValues.push_back(oidValue);
+        (void)ordinal;
+        if(oidValue == focalOid.getValue() || oidValue >= orientedReadCount) {
+            continue;
+        }
+        if(!leftOrdinals.contains(oidValue)) {
+            ++c.rightOnlySequences;
         }
     }
     sort(candidateValues.begin(), candidateValues.end());
-    stable_sort(candidateValues.begin(), candidateValues.end(),
-        [&](uint64_t oidValueA, uint64_t oidValueB) {
-            const bool aHasBoth =
-                leftOrdinals.contains(oidValueA) && rightOrdinals.contains(oidValueA);
-            const bool bHasBoth =
-                leftOrdinals.contains(oidValueB) && rightOrdinals.contains(oidValueB);
-            if(aHasBoth != bHasBoth) {
-                return aHasBoth;
-            }
-            return oidValueA < oidValueB;
-        });
+
+    // Require at least N oriented reads present in both anchors (focal + candidates).
+    if(candidateValues.size() + 1 < minAnchorCoverageForWindowPairMsa) {
+        ++c.skippedCoverage;
+        return;
+    }
 
     uint64_t approximateSpanSum = 0;
     uint64_t approximateSpanCount = 0;
@@ -831,6 +833,10 @@ void prepareBackbonePairMsaJob(
         ++c.skippedEmptyFocalWindow;
         return;
     }
+    if(focalSegment.sequence.size() > maxFocalSequenceLength) {
+        ++c.skippedLongFocalSequence;
+        return;
+    }
 
     vector<MsaSequenceInfo> sequenceInfos;
     sequenceInfos.reserve(size_t(maxReadsPerWindowAnchorPair));
@@ -843,99 +849,43 @@ void prepareBackbonePairMsaJob(
         false,
         'B'});
 
+    // candidateValues contains only both-anchor reads (filtered above).
     for(const uint64_t oidValue64: candidateValues) {
         if(sequenceInfos.size() >= maxReadsPerWindowAnchorPair) {
             break;
         }
-        if(oidValue64 >= orientedReadCount) {
+
+        const uint32_t leftOrdinal  = leftOrdinals[oidValue64];
+        const uint32_t rightOrdinal = rightOrdinals[oidValue64];
+        if(leftOrdinal >= rightOrdinal) {
+            ++c.skippedReverseOrderBothAnchorReads;
             continue;
         }
 
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue64));
-        const bool hasLeft = leftOrdinals.contains(oidValue64);
-        const bool hasRight = rightOrdinals.contains(oidValue64);
-        MsaSegment segment;
-        bool hasBothAnchors = false;
-        bool isEndsFree = true;
-        char anchorSide = 'B';
-
-        if(hasLeft && hasRight) {
-            if(leftOrdinals[oidValue64] >= rightOrdinals[oidValue64]) {
-                ++c.skippedReverseOrderBothAnchorReads;
-                continue;
-            }
-            const auto readMarkers = markers[oid.getValue()];
-            const uint32_t leftOrdinal = leftOrdinals[oidValue64];
-            const uint32_t rightOrdinal = rightOrdinals[oidValue64];
-            if(leftOrdinal < readMarkers.size() && rightOrdinal < readMarkers.size()) {
-                const uint32_t kHalf = uint32_t(k / 2);
-                const uint32_t windowBegin = readMarkers[leftOrdinal].position + kHalf;
-                const uint32_t windowEnd = readMarkers[rightOrdinal].position + kHalf;
-                if(windowEnd > windowBegin) {
-                    segment = extractMsaSegmentFromBases(
-                        reads,
-                        oid,
-                        (windowBegin > alignmentPadding) ? (windowBegin - alignmentPadding) : 0,
-                        windowEnd + alignmentPadding);
-                }
-            }
-            hasBothAnchors = true;
-            isEndsFree = false;
-            anchorSide = 'B';
+        const auto readMarkers = markers[oid.getValue()];
+        if(leftOrdinal >= readMarkers.size() || rightOrdinal >= readMarkers.size()) {
+            continue;
         }
 
-        if(segment.sequence.empty() && hasLeft) {
-            const auto readMarkers = markers[oid.getValue()];
-            const uint32_t leftOrdinal = leftOrdinals[oidValue64];
-            if(leftOrdinal < readMarkers.size()) {
-                const uint32_t begin =
-                    readMarkers[leftOrdinal].position + uint32_t(k / 2);
-                segment = extractMsaSegmentFromBases(
-                    reads, oid, begin, begin + approximateSpan);
-            }
-            anchorSide = 'L';
+        const uint32_t kHalf = uint32_t(k / 2);
+        const uint32_t windowBegin = readMarkers[leftOrdinal].position + kHalf;
+        const uint32_t windowEnd   = readMarkers[rightOrdinal].position + kHalf;
+        if(windowEnd <= windowBegin) {
+            continue;
         }
 
-        if(segment.sequence.empty() && hasRight) {
-            const uint32_t rightOrdinal = rightOrdinals[oidValue64];
-            const auto readMarkers = markers[oid.getValue()];
-            if(rightOrdinal < readMarkers.size()) {
-                const uint32_t end =
-                    readMarkers[rightOrdinal].position + uint32_t(k / 2);
-                const uint32_t begin = (end > approximateSpan) ? (end - approximateSpan) : 0;
-                segment = extractMsaSegmentFromBases(reads, oid, begin, end);
-            }
-            anchorSide = 'R';
-        }
-
+        const MsaSegment segment = extractMsaSegmentFromBases(
+            reads, oid,
+            (windowBegin > alignmentPadding) ? (windowBegin - alignmentPadding) : 0,
+            windowEnd + alignmentPadding);
         if(segment.sequence.empty()) {
             continue;
         }
 
-        if(anchorSide == 'L') {
-            if(!msaSegmentContainsMarkerAtLeft(
-                segment, markers, k, oid, leftOrdinals[oidValue64])) {
-                ++c.failedLeftOnlyAnchorChecks;
-                continue;
-            }
-            ++c.leftOnlySequences;
-        } else if(anchorSide == 'R') {
-            if(!msaSegmentContainsMarkerAtRight(
-                segment, markers, k, oid, rightOrdinals[oidValue64])) {
-                ++c.failedRightOnlyAnchorChecks;
-                continue;
-            }
-            ++c.rightOnlySequences;
-        }
-
         sequenceInfos.push_back(MsaSequenceInfo{
-            oid,
-            segment.sequence,
-            segment.begin,
-            segment.end,
-            hasBothAnchors,
-            isEndsFree,
-            anchorSide});
+            oid, segment.sequence, segment.begin, segment.end,
+            true, false, 'B'});
     }
 
     if(sequenceInfos.size() < 2) {
@@ -966,44 +916,62 @@ void runTheseusBackbonePairOnPrepared(
     const vector<MsaSequenceInfo>& sequenceInfos = prep.sequenceInfos;
 
     const auto msaBegin = chrono::steady_clock::now();
-    theseus::Penalties penalties(0, 2, 3, 1);
-    theseus::Heuristics heuristics(false, false);
-    theseus::TheseusMSA aligner(
-        penalties,
-        heuristics,
-        sequenceInfos.front().sequence,
-        1,
-        false);
 
-    for(size_t i=1; i<sequenceInfos.size(); i++) {
-        aligner.align(sequenceInfos[i].sequence, 1, false, sequenceInfos[i].isEndsFree);
-    }
-
+    // print_as_msa runs a recursive DFS on the POA graph.  Only call it
+    // when the output is actually consumed.
     ostringstream msaOut;
-    aligner.print_as_msa(msaOut);
+    {
+        // No global mutex needed: each anchor pair owns its TheseusMSA instance.
+        // Theseus has no global/static state — concurrent instances are safe.
+        theseus::Penalties penalties(0, 2, 3, 1);
+        theseus::Heuristics heuristics(false, false);
+        theseus::TheseusMSA aligner(
+            penalties,
+            heuristics,
+            sequenceInfos.front().sequence,
+            1,
+            false);
+
+        for(size_t i=1; i<sequenceInfos.size(); i++) {
+            const auto ends = theseusAlignEndsFreeFlags(
+                sequenceInfos[i].hasBothAnchors,
+                sequenceInfos[i].anchorSide);
+            aligner.align(sequenceInfos[i].sequence, 1, ends.first, ends.second);
+        }
+
+        if constexpr(logBackbonePairVariationSitesToStdout) {
+            aligner.print_as_msa(msaOut);
+        }
+    }
 
     const auto msaEnd = chrono::steady_clock::now();
     const double msaSecondsOne = chrono::duration<double>(msaEnd - msaBegin).count();
     c.msaCpuSeconds += msaSecondsOne;
     ++c.msasRun;
 
-    const string msaText = msaOut.str();
-    const vector<string> alignedSequences = rwParseMsaFasta(msaText);
-    const uint64_t pairLabel =
-        (uint64_t(task.windowId) << 32) | uint64_t(prep.job.backboneJ);
-    printReadWindowVariationSitesFromMsa(
-        pairLabel,
-        prep.leftId,
-        prep.rightId,
-        sequenceInfos,
-        alignedSequences,
-        prep.focalPaddedBegin,
-        prep.focalPaddedEnd,
-        prep.focalWindowBegin,
-        prep.focalWindowEnd,
-        msaSecondsOne);
+    if constexpr(logBackbonePairVariationSitesToStdout) {
+        const string msaText = msaOut.str();
+        const vector<string> alignedSequences = rwParseMsaFasta(msaText);
+        const uint64_t pairLabel =
+            (uint64_t(task.windowId) << 32) | uint64_t(prep.job.backboneJ);
+        printReadWindowVariationSitesFromMsa(
+            pairLabel,
+            prep.leftId,
+            prep.rightId,
+            sequenceInfos,
+            alignedSequences,
+            prep.focalPaddedBegin,
+            prep.focalPaddedEnd,
+            prep.focalWindowBegin,
+            prep.focalWindowEnd,
+            msaSecondsOne);
+    }
 }
 
+// Run all backbone-pair MSA jobs in parallel, optionally restricted to a single
+// window (singleWindowIndex != invalid<uint32_t>) for targeted testing.
+// Each thread owns its TheseusMSA instance and private counters — no shared
+// mutable state outside of the atomic work index.
 void runShasta2BackbonePairTheseusMsas(
     const Assembler& assembler,
     const vector<AnchorWindowTask>& anchorWindows,
@@ -1011,65 +979,102 @@ void runShasta2BackbonePairTheseusMsas(
     const Shasta2Journeys& shasta2Journeys,
     uint64_t threadCount,
     uint64_t orientedReadCount,
-    BackbonePairMsaCounters& total)
+    BackbonePairMsaCounters& total,
+    uint32_t singleWindowIndex = invalid<uint32_t>,
+    uint32_t maxWindows = 0)
 {
-    vector<BackbonePairJob> jobs;
-    for(uint32_t wi=0; wi<uint32_t(anchorWindows.size()); wi++) {
+    if(msaThreadCountOverride > 0) {
+        threadCount = min(threadCount, msaThreadCountOverride);
+    }
+    const uint32_t wiBegin = (singleWindowIndex != invalid<uint32_t>) ? singleWindowIndex : 0;
+    uint32_t wiEnd = (singleWindowIndex != invalid<uint32_t>)
+                     ? min(singleWindowIndex + 1, uint32_t(anchorWindows.size()))
+                     : uint32_t(anchorWindows.size());
+    const uint32_t effectiveMaxWindows = (maxWindows > 0) ? maxWindows
+                                       : (msaMaxWindows > 0) ? msaMaxWindows : 0;
+    if(effectiveMaxWindows > 0) {
+        wiEnd = min(wiEnd, wiBegin + effectiveMaxWindows);
+    }
+
+    // Helper: count valid pairs for one window.
+    const auto windowPairCount = [&](uint32_t wi) -> uint32_t {
         const AnchorWindowTask& task = anchorWindows[wi];
         if(task.backboneBegin + 1 >= task.backboneEnd) {
-            continue;
+            return 0;
         }
         const auto journey = shasta2Journeys[task.backboneOrientedReadId];
         if(journey.size() < 2) {
-            continue;
+            return 0;
         }
-        const uint32_t pairEndExclusive =
-            min(task.backboneEnd - 1, uint32_t(journey.size() - 1));
-        for(uint32_t j=task.backboneBegin; j<pairEndExclusive; j++) {
-            jobs.push_back(BackbonePairJob{wi, j});
-        }
-    }
+        const uint32_t pairEnd = min(task.backboneEnd - 1, uint32_t(journey.size() - 1));
+        return (pairEnd > task.backboneBegin) ? (pairEnd - task.backboneBegin) : 0;
+    };
 
-    total.pairJobsScheduled = jobs.size();
-    if(jobs.empty()) {
+    // Pre-count for exact reserve, then build job list.
+    uint64_t totalJobs = 0;
+    for(uint32_t wi = wiBegin; wi < wiEnd; wi++) {
+        totalJobs += windowPairCount(wi);
+    }
+    total = BackbonePairMsaCounters{};
+    total.pairJobsScheduled = totalJobs;
+    if(totalJobs == 0) {
         return;
     }
 
-    // Each thread owns a disjoint subset of consecutive-pair jobs (strided by thread id)
-    // and runs prepare + Theseus for every job in that subset (full job per thread).
-    threadCount = max<uint64_t>(1, threadCount);
-    const uint64_t workerCount = min<uint64_t>(threadCount, jobs.size());
-    vector<BackbonePairMsaCounters> threadTotals(workerCount);
-    vector<thread> workers;
-    workers.reserve(workerCount);
+    vector<BackbonePairJob> allJobs;
+    allJobs.reserve(totalJobs);
+    for(uint32_t wi = wiBegin; wi < wiEnd; wi++) {
+        const uint32_t pairs = windowPairCount(wi);
+        if(pairs == 0) {
+            continue;
+        }
+        const uint32_t jBegin = anchorWindows[wi].backboneBegin;
+        for(uint32_t j = jBegin; j < jBegin + pairs; j++) {
+            allJobs.push_back({wi, j});
+        }
+    }
 
-    for(uint64_t t=0; t<workerCount; t++) {
-        workers.emplace_back([&, t]() {
-            BackbonePairMsaCounters local;
-            for(uint64_t i=t; i<jobs.size(); i+=workerCount) {
+    // Parallel work queue: each thread steals jobs via an atomic index.
+    atomic<uint64_t> nextJob(0);
+    vector<BackbonePairMsaCounters> perThread(threadCount);
+
+    vector<thread> threads;
+    threads.reserve(threadCount);
+    for(uint64_t tid = 0; tid < threadCount; tid++) {
+        threads.emplace_back([&, tid]() {
+            BackbonePairMsaCounters& c = perThread[tid];
+            while(true) {
+                const uint64_t idx = nextJob.fetch_add(1, memory_order_relaxed);
+                if(idx >= allJobs.size()) {
+                    break;
+                }
                 PreparedBackbonePairMsaJob prep;
                 prepareBackbonePairMsaJob(
-                    assembler,
-                    anchorWindows,
-                    shasta2Anchors,
-                    shasta2Journeys,
-                    jobs[i],
-                    orientedReadCount,
-                    prep,
-                    local);
+                    assembler, anchorWindows, shasta2Anchors, shasta2Journeys,
+                    allJobs[idx], orientedReadCount, prep, c);
                 if(prep.ready) {
-                    runTheseusBackbonePairOnPrepared(prep, anchorWindows, local);
+                    runTheseusBackbonePairOnPrepared(prep, anchorWindows, c);
                 }
             }
-            threadTotals[t] = std::move(local);
         });
     }
-    for(thread& th: workers) {
-        th.join();
+    for(thread& t: threads) {
+        t.join();
     }
 
-    for(uint64_t t=0; t<workerCount; t++) {
-        mergeBackbonePairMsaCounters(total, threadTotals[t]);
+    for(const BackbonePairMsaCounters& c: perThread) {
+        total.skippedCoverage                    += c.skippedCoverage;
+        total.skippedOrdinal                     += c.skippedOrdinal;
+        total.skippedEmptyFocalWindow            += c.skippedEmptyFocalWindow;
+        total.skippedLongFocalSequence           += c.skippedLongFocalSequence;
+        total.skippedSingleSequence              += c.skippedSingleSequence;
+        total.skippedReverseOrderBothAnchorReads += c.skippedReverseOrderBothAnchorReads;
+        total.msasRun                            += c.msasRun;
+        total.leftOnlySequences                  += c.leftOnlySequences;
+        total.rightOnlySequences                 += c.rightOnlySequences;
+        total.failedLeftOnlyAnchorChecks         += c.failedLeftOnlyAnchorChecks;
+        total.failedRightOnlyAnchorChecks        += c.failedRightOnlyAnchorChecks;
+        total.msaCpuSeconds                      += c.msaCpuSeconds;
     }
 }
 
@@ -1542,6 +1547,7 @@ void Assembler::computeTheseusReadWindowMSAPrototype(
              << " skippedCoverage=" << pairMsaCounters.skippedCoverage
              << " skippedOrdinal=" << pairMsaCounters.skippedOrdinal
              << " skippedEmptyFocalWindow=" << pairMsaCounters.skippedEmptyFocalWindow
+             << " skippedLongFocalSequence=" << pairMsaCounters.skippedLongFocalSequence
              << " skippedSingleSequence=" << pairMsaCounters.skippedSingleSequence
              << " skippedReverseOrderBothAnchorReads="
              << pairMsaCounters.skippedReverseOrderBothAnchorReads
@@ -1914,19 +1920,22 @@ void Assembler::computeTheseusReadWindowMSAPrototype(
                 }
 
                 const auto begin = chrono::steady_clock::now();
-                theseus::TheseusMSA aligner(
-                    penalties,
-                    heuristics,
-                    sequences.front(),
-                    1,
-                    false);
-                for(size_t i=1; i<sequences.size(); i++) {
-                    if(!sequences[i].empty()) {
-                        aligner.align(sequences[i], 1, false, true);
-                    }
-                }
                 ostringstream discard;
-                aligner.print_as_msa(discard);
+                {
+                    lock_guard<std::mutex> lock{theseusAlignMutex()};
+                    theseus::TheseusMSA aligner(
+                        penalties,
+                        heuristics,
+                        sequences.front(),
+                        1,
+                        false);
+                    for(size_t i=1; i<sequences.size(); i++) {
+                        if(!sequences[i].empty()) {
+                            aligner.align(sequences[i], 1, false, true);
+                        }
+                    }
+                    aligner.print_as_msa(discard);
+                }
                 const auto end = chrono::steady_clock::now();
 
                 ++counters.windows;
