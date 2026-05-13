@@ -1,5 +1,18 @@
 # Anchor-Interval Theseus Window Prototype
 
+## Structure before het detection and phasing
+Het-site calling and phasing need a **consistent notion of which reads and anchors belong together** along a locus. Collapsed marker-graph vertices already encode transitive co-occupancy, but **overlap tables** (`alignmentTable` / `readGraph`) only list **explicit** pairs, so they are an incomplete view for partitioning.
+
+The planned early pipeline is:
+
+1. **Shasta2 anchors + journeys** — canonical marker-graph–derived anchors per vertex and ordered journeys per oriented read.
+2. **`strand0JourneyCoReads`** — a flat CSR of **journey co-reads** per physical read (strand 0 focal): every oriented read that meets the focal read on **any** journey anchor. This is the first **structural** artifact: it scopes “who can share anchor-defined sequence context” without requiring a stored alignment edge.
+3. **Anchor-interval windows** (`AnchorWindowTask` / `readIntervals`) — disjoint anchor claims and local MSA units derived from journeys (and optionally constrained or validated using the co-read table).
+4. **Het detection** — local MSA / variant evidence inside each window, mapped through intervals.
+5. **Phasing** — uses windows, intervals, and cross-read consistency; the early structure avoids mixing unrelated anchors or reads that only meet through transitivity in ways overlap lists miss.
+
+So the co-read table and window planner are **not** the variant caller; they are **upstream scaffolding** to separate anchors, bound evidence, and keep phasing inputs coherent.
+
 ## Goal
 Replace repeated marker-pair MSAs with windows defined directly on anchor journeys:
 
@@ -107,6 +120,8 @@ assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
     2 * assembler.getReads().readCount(),
     assembler.shasta2Anchors, threadCount, shasta2Owner);
 
+assembler.computeStrand0JourneyCoReadsTable();
+
 assembler.computeTheseusReadWindowMSAPrototype(
     assembler.shasta2Anchors, assembler.shasta2Journeys, threadCount);
 ```
@@ -116,6 +131,19 @@ Important data:
 - `(*shasta2Journeys)[orientedReadId]`: ordered `Shasta2AnchorId`s on that oriented read (`span<const Shasta2AnchorId>`).
 - `(*shasta2Anchors)[anchorId]`: anchor as `span<const Shasta2AnchorMarkerInfo>`.
 - `Shasta2AnchorMarkerInfo::orientedReadId`, `::ordinal`, `::positionInJourney` (filled by journeys).
+
+## Strand-0 journey co-read table (marker graph via Shasta2)
+Collapsed marker-graph vertices group reads that may **never** share a direct `alignmentTable` entry. **`strand0JourneyCoReads`** is the **initial structural layer** (before het detection and phasing): a mmap CSR neighbor list keyed by **physical `ReadId`** with focal orientation **strand 0**, used to **separate / scope** which oriented reads participate in the same anchor-defined neighborhood as a focal read.
+
+- **`assembler.strand0JourneyCoReads`**: `MemoryMapped::VectorOfVectors<uint32_t,uint32_t>` — row `readId` holds sorted unique `OrientedReadId::getValue()` for every oriented read that appears on **any Shasta2 anchor** visited along **`OrientedReadId(readId,0)`’s journey**.
+- **`computeStrand0JourneyCoReadsTable()`** in `src/AssemblerStrand0JourneyCoReads.cpp`: run **after** `Shasta2Journeys` exist (journey defines which **selected** vertices apply; vertices filtered out of Shasta2 are excluded). Wired on the diagnostic path in `main.cpp` immediately after journey creation.
+
+Downstream uses (incremental):
+
+- Restrict or annotate window expansion / MSA row sets so evidence stays within marker-graph–consistent read sets.
+- Split or label anchors when co-read sets imply disjoint haplotype support (future).
+
+This is intentionally “flat” mmap storage like `alignmentTable`, but the semantics are **journey co-occupancy**, not stored overlaps.
 
 ## Window Identity
 Each window gets a stable deterministic id:
@@ -241,7 +269,7 @@ Representative run (~25k reads, ~1.06M Shasta2 anchors):
   - `void computeTheseusReadWindowMSAPrototype(uint64_t threadCount);` — builds local Shasta2 anchors + journeys, then calls the overload below.
   - `void computeTheseusReadWindowMSAPrototype(shared_ptr<Shasta2Anchors>, shared_ptr<Shasta2Journeys>, uint64_t threadCount);`
 - `src/AssemblerTheseusReadWindowMSA.cpp`: planner implementation.
-- `srcMain/main.cpp`: diagnostic path creates `assembler.shasta2Anchors` / `shasta2Journeys`, then calls the two-argument overload (nested scope avoids duplicate coverage constant names with the full assembly path).
+- `srcMain/main.cpp`: diagnostic path creates Shasta2 objects, **`computeStrand0JourneyCoReadsTable()`**, then calls the two-argument read-window overload (nested scope avoids duplicate coverage constant names with the full assembly path).
 - Marker-pair and target-backbone Theseus prototypes remain available for comparison.
 
 ## Efficiency Notes

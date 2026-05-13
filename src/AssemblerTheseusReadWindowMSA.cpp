@@ -1,20 +1,20 @@
 // AssemblerTheseusReadWindowMSA.cpp
 //
-// Diagnostic prototype: partition physical reads into disjoint one-hop overlap
-// windows. The Theseus MSA execution block is currently disabled while we
-// verify window creation.
+// Diagnostic prototype: partition physical reads into disjoint Shasta2 anchor
+// windows, then (optionally) run Theseus MSAs on consecutive backbone anchor
+// pairs using marker-graph MSA recruitment rules.
 
 #include "Assembler.hpp"
+#include "Marker.hpp"
 #include "Reads.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
 #include "timestamp.hpp"
+#include "invalid.hpp"
 
-#if 0
 #include <theseus/heuristics.h>
 #include <theseus/penalties.h>
 #include <theseus/theseus_msa_aligner.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -23,10 +23,14 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <sstream>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 using namespace dinara;
@@ -34,13 +38,33 @@ using namespace std;
 
 namespace {
 
+// Serializes SITE / diagnostic lines from printReadWindowVariationSitesFromMsa when
+// backbone-pair MSAs run on multiple threads.
+mutex readWindowVariationSiteLogMutex;
+
 constexpr array<uint64_t, 14> histogramUpperBounds = {
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
     numeric_limits<uint64_t>::max()
 };
 
 constexpr bool runTheseusMsa = false;
+// Backbone-only consecutive Shasta2 anchor pairs per window (recruitment matches TheseusMGMSA).
+constexpr bool runAnchorWindowBackbonePairTheseusMsa = true;
 constexpr uint32_t minSharedAnchorsForRescue = 4;
+constexpr uint64_t minAnchorCoverageForWindowPairMsa = 6;
+constexpr uint64_t maxReadsPerWindowAnchorPair = 1024;
+constexpr uint64_t oneSidedOffsetRatioNumerator = 11;
+constexpr uint64_t oneSidedOffsetRatioDenominator = 10;
+
+// Restrict anchor-window planning to one strand-0 backbone read (diagnostic).
+constexpr bool restrictAnchorWindowPlannerToSingleBackboneReadId = true;
+constexpr ReadId anchorWindowPlannerOnlyBackboneReadId = ReadId(3729);
+
+// Variation sites: same thresholds as AssemblerTheseusMarkerGraphMSA (ref and alt support >= 3).
+constexpr uint64_t rwMinSnpRefSupport = 3;
+constexpr uint64_t rwMinSnpAltSupport = 3;
+constexpr uint64_t rwMinReportedAltLength = 16;
+constexpr uint64_t rwMinFilteredHomopolymerRunLength = 3;
 
 struct ReadWindowTask {
     uint32_t windowId = 0;
@@ -169,6 +193,884 @@ string extractWholeOrientedReadSequence(const Reads& reads, OrientedReadId oid)
         sequence.push_back(reads.getOrientedReadBase(oid, pos).character());
     }
     return sequence;
+}
+
+struct MsaSegment {
+    string sequence;
+    uint32_t begin = 0;
+    uint32_t end = 0;
+};
+
+struct MsaSequenceInfo {
+    OrientedReadId oid;
+    string sequence;
+    uint32_t begin = 0;
+    uint32_t end = 0;
+    bool hasBothAnchors = false;
+    bool isEndsFree = false;
+    char anchorSide = 'B';
+};
+
+MsaSegment extractMsaSegmentFromOrdinals(
+    const Reads& reads,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    uint64_t k,
+    OrientedReadId oid,
+    uint32_t ordinalA,
+    uint32_t ordinalB)
+{
+    MsaSegment segment;
+    if(ordinalA == ordinalB) {
+        return segment;
+    }
+
+    const uint32_t ord0 = min(ordinalA, ordinalB);
+    const uint32_t ord1 = max(ordinalA, ordinalB);
+    const auto readMarkers = markers[oid.getValue()];
+    if(ord1 >= readMarkers.size()) {
+        return segment;
+    }
+
+    const uint32_t kHalf = uint32_t(k / 2);
+    segment.begin = readMarkers[ord0].position + kHalf;
+    segment.end = readMarkers[ord1].position + kHalf;
+    if(segment.end <= segment.begin) {
+        return MsaSegment{};
+    }
+
+    segment.sequence.reserve(segment.end - segment.begin);
+    for(uint32_t pos=segment.begin; pos<segment.end; pos++) {
+        segment.sequence.push_back(reads.getOrientedReadBase(oid, pos).character());
+    }
+    return segment;
+}
+
+MsaSegment extractMsaSegmentFromBases(
+    const Reads& reads,
+    OrientedReadId oid,
+    uint32_t begin,
+    uint32_t end)
+{
+    MsaSegment segment;
+    const uint32_t readLength = uint32_t(reads.getRead(oid.getReadId()).baseCount);
+    begin = min(begin, readLength);
+    end = min(end, readLength);
+    if(end <= begin) {
+        return segment;
+    }
+
+    segment.begin = begin;
+    segment.end = end;
+    segment.sequence.reserve(end - begin);
+    for(uint32_t pos=begin; pos<end; pos++) {
+        segment.sequence.push_back(reads.getOrientedReadBase(oid, pos).character());
+    }
+    return segment;
+}
+
+bool msaSegmentContainsMarkerAtLeft(
+    const MsaSegment& segment,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    uint64_t k,
+    OrientedReadId oid,
+    uint32_t ordinal)
+{
+    const auto readMarkers = markers[oid.getValue()];
+    if(ordinal >= readMarkers.size()) {
+        return false;
+    }
+    const uint32_t anchorPosition = readMarkers[ordinal].position + uint32_t(k / 2);
+    return segment.begin == anchorPosition && segment.end > anchorPosition;
+}
+
+bool msaSegmentContainsMarkerAtRight(
+    const MsaSegment& segment,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    uint64_t k,
+    OrientedReadId oid,
+    uint32_t ordinal)
+{
+    const auto readMarkers = markers[oid.getValue()];
+    if(ordinal >= readMarkers.size()) {
+        return false;
+    }
+    const uint32_t anchorPosition = readMarkers[ordinal].position + uint32_t(k / 2);
+    return segment.begin < anchorPosition && segment.end == anchorPosition;
+}
+
+struct BackbonePairJob {
+    uint32_t windowIndex = 0;
+    uint32_t backboneJ = 0;
+};
+
+// Built on worker threads (recruitment + sequence extraction). Theseus runs serially.
+struct PreparedBackbonePairMsaJob {
+    bool ready = false;
+    BackbonePairJob job;
+    Shasta2AnchorId leftId = 0;
+    Shasta2AnchorId rightId = 0;
+    vector<MsaSequenceInfo> sequenceInfos;
+    uint32_t focalWindowBegin = 0;
+    uint32_t focalWindowEnd = 0;
+    uint32_t focalPaddedBegin = 0;
+    uint32_t focalPaddedEnd = 0;
+};
+
+struct BackbonePairMsaCounters {
+    uint64_t pairJobsScheduled = 0;
+    uint64_t skippedCoverage = 0;
+    uint64_t skippedOrdinal = 0;
+    uint64_t skippedEmptyFocalWindow = 0;
+    uint64_t skippedSingleSequence = 0;
+    uint64_t skippedReverseOrderBothAnchorReads = 0;
+    uint64_t msasRun = 0;
+    uint64_t leftOnlySequences = 0;
+    uint64_t rightOnlySequences = 0;
+    uint64_t failedLeftOnlyAnchorChecks = 0;
+    uint64_t failedRightOnlyAnchorChecks = 0;
+    double msaCpuSeconds = 0.;
+};
+
+void mergeBackbonePairMsaCounters(BackbonePairMsaCounters& total, const BackbonePairMsaCounters& part)
+{
+    total.skippedCoverage += part.skippedCoverage;
+    total.skippedOrdinal += part.skippedOrdinal;
+    total.skippedEmptyFocalWindow += part.skippedEmptyFocalWindow;
+    total.skippedSingleSequence += part.skippedSingleSequence;
+    total.skippedReverseOrderBothAnchorReads += part.skippedReverseOrderBothAnchorReads;
+    total.msasRun += part.msasRun;
+    total.leftOnlySequences += part.leftOnlySequences;
+    total.rightOnlySequences += part.rightOnlySequences;
+    total.failedLeftOnlyAnchorChecks += part.failedLeftOnlyAnchorChecks;
+    total.failedRightOnlyAnchorChecks += part.failedRightOnlyAnchorChecks;
+    total.msaCpuSeconds += part.msaCpuSeconds;
+}
+
+string rwDisplayAllele(const string& allele)
+{
+    constexpr size_t maxShown = 24;
+    if(allele.empty()) {
+        return "-";
+    }
+    if(allele.size() <= maxShown) {
+        return allele;
+    }
+    return allele.substr(0, maxShown) + "...(" + to_string(allele.size()) + "bp)";
+}
+
+bool rwIsCanonicalBase(char c)
+{
+    return c == 'A' || c == 'C' || c == 'G' || c == 'T';
+}
+
+vector<string> rwParseMsaFasta(const string& text)
+{
+    vector<string> sequences;
+    string current;
+    istringstream in(text);
+    string line;
+    while(getline(in, line)) {
+        if(line.empty()) {
+            continue;
+        }
+        if(line[0] == '>') {
+            if(!current.empty()) {
+                sequences.push_back(current);
+                current.clear();
+            }
+        } else {
+            current += line;
+        }
+    }
+    if(!current.empty()) {
+        sequences.push_back(current);
+    }
+    return sequences;
+}
+
+string rwOrientedReadList(const vector<uint64_t>& indexes, const vector<MsaSequenceInfo>& sequenceInfos)
+{
+    string s;
+    for(size_t i=0; i<indexes.size(); i++) {
+        if(i) {
+            s += ",";
+        }
+        s += sequenceInfos[indexes[i]].oid.getString();
+    }
+    return s;
+}
+
+void rwAddReadIndex(vector<uint64_t>& indexes, uint64_t index)
+{
+    if(find(indexes.begin(), indexes.end(), index) == indexes.end()) {
+        indexes.push_back(index);
+    }
+}
+
+string rwAlleleType(const string& ref, const string& alt)
+{
+    if(ref.size() == 1 && alt.size() == 1) {
+        return "SNP";
+    }
+    if(ref.size() == alt.size()) {
+        return "MNP";
+    }
+    if(ref.size() < alt.size()) {
+        return "INS";
+    }
+    if(ref.size() > alt.size()) {
+        return "DEL";
+    }
+    return "COMPLEX";
+}
+
+bool rwShouldReportAllele(const string& type, const string& alt)
+{
+    return type == "SNP" || alt.size() >= rwMinReportedAltLength;
+}
+
+bool rwIsHomopolymerAt(const string& seq, uint32_t pos)
+{
+    if(pos >= seq.size()) {
+        return false;
+    }
+
+    const size_t p = size_t(pos);
+    const char base = seq[p];
+    if(!rwIsCanonicalBase(base)) {
+        return false;
+    }
+
+    size_t begin = p;
+    while(begin > 0 && seq[begin - 1] == base) {
+        --begin;
+    }
+    size_t end = p + 1;
+    while(end < seq.size() && seq[end] == base) {
+        ++end;
+    }
+    return end - begin >= rwMinFilteredHomopolymerRunLength;
+}
+
+bool rwSnpTouchesHomopolymer(const string& focalTargetSequence, uint32_t pos, char altBase)
+{
+    if(rwIsHomopolymerAt(focalTargetSequence, pos)) {
+        return true;
+    }
+    if(pos >= focalTargetSequence.size() || !rwIsCanonicalBase(altBase)) {
+        return false;
+    }
+    string altTargetSequence = focalTargetSequence;
+    altTargetSequence[pos] = altBase;
+    return rwIsHomopolymerAt(altTargetSequence, pos);
+}
+
+void printReadWindowVariationSitesFromMsa(
+    uint64_t pairLabel,
+    Shasta2AnchorId leftAnchorId,
+    Shasta2AnchorId rightAnchorId,
+    const vector<MsaSequenceInfo>& sequenceInfos,
+    const vector<string>& alignedSequences,
+    uint32_t focalBegin,
+    uint32_t focalEnd,
+    uint32_t reportBegin,
+    uint32_t reportEnd,
+    double msaSeconds)
+{
+    if(focalEnd <= focalBegin) {
+        return;
+    }
+
+    if(alignedSequences.size() != sequenceInfos.size() || alignedSequences.empty()) {
+        lock_guard<mutex> lock(readWindowVariationSiteLogMutex);
+        cout << timestamp << "[TheseusReadWindowMSA] pairLabel=" << pairLabel
+             << " skipped: MSA sequence count mismatch." << endl;
+        return;
+    }
+
+    const size_t columnCount = alignedSequences.front().size();
+    for(const string& s: alignedSequences) {
+        if(s.size() != columnCount) {
+            lock_guard<mutex> lock(readWindowVariationSiteLogMutex);
+            cout << timestamp << "[TheseusReadWindowMSA] pairLabel=" << pairLabel
+                 << " skipped: MSA rows have inconsistent lengths." << endl;
+            return;
+        }
+    }
+
+    if(columnCount == 0) {
+        return;
+    }
+
+    vector<size_t> firstNonGap(alignedSequences.size(), columnCount);
+    vector<size_t> lastNonGap(alignedSequences.size(), 0);
+    vector<uint8_t> hasBase(alignedSequences.size(), 0);
+    for(size_t r=0; r<alignedSequences.size(); r++) {
+        for(size_t c=0; c<columnCount; c++) {
+            if(alignedSequences[r][c] != '-') {
+                firstNonGap[r] = min(firstNonGap[r], c);
+                lastNonGap[r] = max(lastNonGap[r], c);
+                hasBase[r] = 1;
+            }
+        }
+    }
+
+    vector<uint32_t> targetPosByColumn(columnCount, invalid<uint32_t>);
+    vector<size_t> columnByTargetOffset;
+    columnByTargetOffset.reserve(focalEnd - focalBegin);
+    uint32_t focalPos = focalBegin;
+    for(size_t c=0; c<columnCount; c++) {
+        const char refBase = alignedSequences[0][c];
+        if(refBase == '-') {
+            continue;
+        }
+        targetPosByColumn[c] = focalPos++;
+        columnByTargetOffset.push_back(c);
+    }
+
+    vector<size_t> targetOffsetByColumn(columnCount, invalid<size_t>);
+    for(size_t offset=0; offset<columnByTargetOffset.size(); offset++) {
+        targetOffsetByColumn[columnByTargetOffset[offset]] = offset;
+    }
+    string focalTargetSequence;
+    focalTargetSequence.reserve(columnByTargetOffset.size());
+    for(const size_t c: columnByTargetOffset) {
+        const char base = alignedSequences[0][c];
+        focalTargetSequence.push_back(rwIsCanonicalBase(base) ? base : 'N');
+    }
+
+    vector<uint8_t> isDirtyTargetOffset(columnByTargetOffset.size(), 0);
+    for(size_t offset=0; offset<columnByTargetOffset.size(); offset++) {
+        const size_t c = columnByTargetOffset[offset];
+        const char refBase = alignedSequences[0][c];
+        if(!rwIsCanonicalBase(refBase)) {
+            continue;
+        }
+        for(size_t r=1; r<alignedSequences.size(); r++) {
+            if(!hasBase[r] || c < firstNonGap[r] || c > lastNonGap[r]) {
+                continue;
+            }
+            const char base = alignedSequences[r][c];
+            if(base == '-') {
+                isDirtyTargetOffset[offset] = 1;
+            } else if(rwIsCanonicalBase(base) && base != refBase) {
+                isDirtyTargetOffset[offset] = 1;
+            }
+        }
+    }
+
+    size_t gapRunBegin = invalid<size_t>;
+    for(size_t c=0; c<=columnCount; c++) {
+        const bool isFocalGap = (c < columnCount && alignedSequences[0][c] == '-');
+        if(isFocalGap && gapRunBegin == invalid<size_t>) {
+            gapRunBegin = c;
+        }
+        if((!isFocalGap || c == columnCount) && gapRunBegin != invalid<size_t>) {
+            const size_t gapRunEnd = c;
+            size_t anchorColumn = invalid<size_t>;
+            for(size_t j=gapRunBegin; j>0; --j) {
+                if(alignedSequences[0][j - 1] != '-') {
+                    anchorColumn = j - 1;
+                    break;
+                }
+            }
+            if(anchorColumn != invalid<size_t> &&
+               targetPosByColumn[anchorColumn] != invalid<uint32_t> &&
+               targetOffsetByColumn[anchorColumn] != invalid<size_t>) {
+                for(size_t r=1; r<alignedSequences.size(); r++) {
+                    if(!hasBase[r] || anchorColumn < firstNonGap[r] || anchorColumn > lastNonGap[r]) {
+                        continue;
+                    }
+                    for(size_t j=gapRunBegin; j<gapRunEnd; j++) {
+                        if(rwIsCanonicalBase(alignedSequences[r][j])) {
+                            isDirtyTargetOffset[targetOffsetByColumn[anchorColumn]] = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            gapRunBegin = invalid<size_t>;
+        }
+    }
+
+    using AlleleKey = tuple<string, string, string>;
+    for(size_t beginOffset=0; beginOffset<isDirtyTargetOffset.size();) {
+        if(!isDirtyTargetOffset[beginOffset]) {
+            ++beginOffset;
+            continue;
+        }
+        size_t endOffset = beginOffset;
+        while(endOffset + 1 < isDirtyTargetOffset.size() &&
+              isDirtyTargetOffset[endOffset + 1]) {
+            ++endOffset;
+        }
+        const uint32_t targetPos = focalBegin + uint32_t(beginOffset);
+        const uint32_t targetEnd = focalBegin + uint32_t(endOffset + 1);
+        if(targetPos < reportBegin || targetEnd > reportEnd) {
+            beginOffset = endOffset + 1;
+            continue;
+        }
+
+        const size_t beginColumn = columnByTargetOffset[beginOffset];
+        size_t endColumn = columnByTargetOffset[endOffset];
+        for(size_t c=endColumn + 1; c<columnCount && alignedSequences[0][c] == '-'; c++) {
+            endColumn = c;
+        }
+
+        string ref;
+        for(size_t c=beginColumn; c<=endColumn; c++) {
+            const char base = alignedSequences[0][c];
+            if(rwIsCanonicalBase(base)) {
+                ref.push_back(base);
+            }
+        }
+        if(ref.empty()) {
+            beginOffset = endOffset + 1;
+            continue;
+        }
+
+        vector<uint64_t> refReads;
+        map<AlleleKey, vector<uint64_t>> altReadsByAllele;
+        for(size_t r=0; r<alignedSequences.size(); r++) {
+            if(!hasBase[r] || beginColumn < firstNonGap[r] || endColumn > lastNonGap[r]) {
+                continue;
+            }
+            string allele;
+            for(size_t c=beginColumn; c<=endColumn; c++) {
+                const char base = alignedSequences[r][c];
+                if(rwIsCanonicalBase(base)) {
+                    allele.push_back(base);
+                }
+            }
+            if(allele == ref) {
+                refReads.push_back(r);
+            } else {
+                const AlleleKey key{rwAlleleType(ref, allele), ref, allele};
+                rwAddReadIndex(altReadsByAllele[key], r);
+            }
+        }
+
+        uint64_t maxAltSupport = 0;
+        map<AlleleKey, vector<uint64_t>> reportableAltReadsByAllele;
+        for(const auto& [key, altReads]: altReadsByAllele) {
+            const auto& [type, refA, alt] = key;
+            (void) refA;
+            if(!rwShouldReportAllele(type, alt)) {
+                continue;
+            }
+            if(type == "SNP" &&
+               rwSnpTouchesHomopolymer(focalTargetSequence, uint32_t(beginOffset), alt[0])) {
+                continue;
+            }
+            reportableAltReadsByAllele[key] = altReads;
+            maxAltSupport = max<uint64_t>(maxAltSupport, altReads.size());
+        }
+        if(refReads.size() < rwMinSnpRefSupport || maxAltSupport < rwMinSnpAltSupport) {
+            beginOffset = endOffset + 1;
+            continue;
+        }
+
+        {
+            lock_guard<mutex> lock(readWindowVariationSiteLogMutex);
+            cout << timestamp << "[TheseusReadWindowMSA] SITE"
+                 << " pairLabel=" << pairLabel
+                 << " anchors=" << leftAnchorId << "->" << rightAnchorId
+                 << " focal=" << sequenceInfos.front().oid
+                 << " pos=" << targetPos
+                 << " ref=" << rwDisplayAllele(ref)
+                 << " refN=" << refReads.size()
+                 << " refReads=" << rwOrientedReadList(refReads, sequenceInfos)
+                 << " msaSeconds=" << fixed << setprecision(6) << msaSeconds;
+            for(const auto& [key, altReads]: reportableAltReadsByAllele) {
+                const auto& [type, refK, alt] = key;
+                (void) refK;
+                cout << " alt=" << type << ":" << rwDisplayAllele(ref) << ">"
+                     << rwDisplayAllele(alt)
+                     << ":N=" << altReads.size()
+                     << ":reads=" << rwOrientedReadList(altReads, sequenceInfos);
+            }
+            cout << defaultfloat << endl;
+        }
+
+        beginOffset = endOffset + 1;
+    }
+}
+
+void prepareBackbonePairMsaJob(
+    const Assembler& assembler,
+    const vector<AnchorWindowTask>& anchorWindows,
+    const Shasta2Anchors& shasta2Anchors,
+    const Shasta2Journeys& shasta2Journeys,
+    const BackbonePairJob& job,
+    uint64_t orientedReadCount,
+    PreparedBackbonePairMsaJob& prep,
+    BackbonePairMsaCounters& c)
+{
+    prep = PreparedBackbonePairMsaJob{};
+    DINARA_ASSERT(assembler.markers);
+    const Reads& reads = assembler.getReads();
+    const auto& markers = *assembler.markers;
+    const uint64_t k = assembler.assemblerInfo->k;
+
+    const AnchorWindowTask& task = anchorWindows[job.windowIndex];
+    const OrientedReadId focalOid = task.backboneOrientedReadId;
+    const auto journey = shasta2Journeys[focalOid];
+    const uint32_t j = job.backboneJ;
+    if(j + 1 >= journey.size()) {
+        ++c.skippedOrdinal;
+        return;
+    }
+
+    const Shasta2AnchorId leftId = journey[j];
+    const Shasta2AnchorId rightId = journey[j + 1];
+    const Shasta2Anchor leftAnchor = shasta2Anchors[leftId];
+    const Shasta2Anchor rightAnchor = shasta2Anchors[rightId];
+    if(leftAnchor.size() < minAnchorCoverageForWindowPairMsa ||
+        rightAnchor.size() < minAnchorCoverageForWindowPairMsa) {
+        ++c.skippedCoverage;
+        return;
+    }
+
+    const uint32_t focalLeftOrdinal = shasta2Anchors.getOrdinal(leftId, focalOid);
+    const uint32_t focalRightOrdinal = shasta2Anchors.getOrdinal(rightId, focalOid);
+    if(focalLeftOrdinal == invalid<uint32_t> || focalRightOrdinal == invalid<uint32_t>) {
+        ++c.skippedOrdinal;
+        return;
+    }
+
+    MsaSegment focalWindowSegment = extractMsaSegmentFromOrdinals(
+        reads, markers, k, focalOid, focalLeftOrdinal, focalRightOrdinal);
+    if(focalWindowSegment.sequence.empty()) {
+        ++c.skippedEmptyFocalWindow;
+        return;
+    }
+
+    unordered_map<uint64_t, uint32_t> leftOrdinals;
+    unordered_map<uint64_t, uint32_t> rightOrdinals;
+    for(const Shasta2AnchorMarkerInfo& info: leftAnchor) {
+        leftOrdinals.try_emplace(info.orientedReadId.getValue(), info.ordinal);
+    }
+    for(const Shasta2AnchorMarkerInfo& info: rightAnchor) {
+        rightOrdinals.try_emplace(info.orientedReadId.getValue(), info.ordinal);
+    }
+
+    vector<uint64_t> candidateValues;
+    candidateValues.reserve(leftOrdinals.size() + rightOrdinals.size());
+    for(const auto& [oidValue, ordinal]: leftOrdinals) {
+        (void) ordinal;
+        if(oidValue != focalOid.getValue()) {
+            candidateValues.push_back(oidValue);
+        }
+    }
+    for(const auto& [oidValue, ordinal]: rightOrdinals) {
+        (void) ordinal;
+        if(oidValue != focalOid.getValue() && !leftOrdinals.contains(oidValue)) {
+            candidateValues.push_back(oidValue);
+        }
+    }
+    sort(candidateValues.begin(), candidateValues.end());
+    stable_sort(candidateValues.begin(), candidateValues.end(),
+        [&](uint64_t oidValueA, uint64_t oidValueB) {
+            const bool aHasBoth =
+                leftOrdinals.contains(oidValueA) && rightOrdinals.contains(oidValueA);
+            const bool bHasBoth =
+                leftOrdinals.contains(oidValueB) && rightOrdinals.contains(oidValueB);
+            if(aHasBoth != bHasBoth) {
+                return aHasBoth;
+            }
+            return oidValueA < oidValueB;
+        });
+
+    uint64_t approximateSpanSum = 0;
+    uint64_t approximateSpanCount = 0;
+    for(const auto& [oidValue, leftOrdinal]: leftOrdinals) {
+        auto itRight = rightOrdinals.find(oidValue);
+        if(itRight == rightOrdinals.end()) {
+            continue;
+        }
+        if(oidValue >= orientedReadCount) {
+            continue;
+        }
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto readMarkers = markers[oid.getValue()];
+        const uint32_t rightOrdinal = itRight->second;
+        if(leftOrdinal >= readMarkers.size() || rightOrdinal >= readMarkers.size()) {
+            continue;
+        }
+        if(leftOrdinal >= rightOrdinal) {
+            continue;
+        }
+        const uint32_t kHalf = uint32_t(k / 2);
+        const uint32_t begin = readMarkers[leftOrdinal].position + kHalf;
+        const uint32_t end = readMarkers[rightOrdinal].position + kHalf;
+        if(end > begin) {
+            approximateSpanSum += (end - begin);
+            ++approximateSpanCount;
+        }
+    }
+    if(approximateSpanCount == 0) {
+        approximateSpanSum = focalWindowSegment.end - focalWindowSegment.begin;
+        approximateSpanCount = 1;
+    }
+    const uint64_t averageSpan = max<uint64_t>(1, approximateSpanSum / approximateSpanCount);
+    const uint32_t approximateSpan = uint32_t(max<uint64_t>(
+        1,
+        (averageSpan * oneSidedOffsetRatioNumerator +
+            oneSidedOffsetRatioDenominator - 1) /
+            oneSidedOffsetRatioDenominator));
+    const uint32_t focalWindowLength = focalWindowSegment.end - focalWindowSegment.begin;
+    const uint32_t alignmentPadding =
+        (approximateSpan > focalWindowLength) ? (approximateSpan - focalWindowLength) : 0;
+    MsaSegment focalSegment = extractMsaSegmentFromBases(
+        reads,
+        focalOid,
+        (focalWindowSegment.begin > alignmentPadding) ?
+            (focalWindowSegment.begin - alignmentPadding) : 0,
+        focalWindowSegment.end + alignmentPadding);
+    if(focalSegment.sequence.empty()) {
+        ++c.skippedEmptyFocalWindow;
+        return;
+    }
+
+    vector<MsaSequenceInfo> sequenceInfos;
+    sequenceInfos.reserve(size_t(maxReadsPerWindowAnchorPair));
+    sequenceInfos.push_back(MsaSequenceInfo{
+        focalOid,
+        focalSegment.sequence,
+        focalSegment.begin,
+        focalSegment.end,
+        true,
+        false,
+        'B'});
+
+    for(const uint64_t oidValue64: candidateValues) {
+        if(sequenceInfos.size() >= maxReadsPerWindowAnchorPair) {
+            break;
+        }
+        if(oidValue64 >= orientedReadCount) {
+            continue;
+        }
+
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue64));
+        const bool hasLeft = leftOrdinals.contains(oidValue64);
+        const bool hasRight = rightOrdinals.contains(oidValue64);
+        MsaSegment segment;
+        bool hasBothAnchors = false;
+        bool isEndsFree = true;
+        char anchorSide = 'B';
+
+        if(hasLeft && hasRight) {
+            if(leftOrdinals[oidValue64] >= rightOrdinals[oidValue64]) {
+                ++c.skippedReverseOrderBothAnchorReads;
+                continue;
+            }
+            const auto readMarkers = markers[oid.getValue()];
+            const uint32_t leftOrdinal = leftOrdinals[oidValue64];
+            const uint32_t rightOrdinal = rightOrdinals[oidValue64];
+            if(leftOrdinal < readMarkers.size() && rightOrdinal < readMarkers.size()) {
+                const uint32_t kHalf = uint32_t(k / 2);
+                const uint32_t windowBegin = readMarkers[leftOrdinal].position + kHalf;
+                const uint32_t windowEnd = readMarkers[rightOrdinal].position + kHalf;
+                if(windowEnd > windowBegin) {
+                    segment = extractMsaSegmentFromBases(
+                        reads,
+                        oid,
+                        (windowBegin > alignmentPadding) ? (windowBegin - alignmentPadding) : 0,
+                        windowEnd + alignmentPadding);
+                }
+            }
+            hasBothAnchors = true;
+            isEndsFree = false;
+            anchorSide = 'B';
+        }
+
+        if(segment.sequence.empty() && hasLeft) {
+            const auto readMarkers = markers[oid.getValue()];
+            const uint32_t leftOrdinal = leftOrdinals[oidValue64];
+            if(leftOrdinal < readMarkers.size()) {
+                const uint32_t begin =
+                    readMarkers[leftOrdinal].position + uint32_t(k / 2);
+                segment = extractMsaSegmentFromBases(
+                    reads, oid, begin, begin + approximateSpan);
+            }
+            anchorSide = 'L';
+        }
+
+        if(segment.sequence.empty() && hasRight) {
+            const uint32_t rightOrdinal = rightOrdinals[oidValue64];
+            const auto readMarkers = markers[oid.getValue()];
+            if(rightOrdinal < readMarkers.size()) {
+                const uint32_t end =
+                    readMarkers[rightOrdinal].position + uint32_t(k / 2);
+                const uint32_t begin = (end > approximateSpan) ? (end - approximateSpan) : 0;
+                segment = extractMsaSegmentFromBases(reads, oid, begin, end);
+            }
+            anchorSide = 'R';
+        }
+
+        if(segment.sequence.empty()) {
+            continue;
+        }
+
+        if(anchorSide == 'L') {
+            if(!msaSegmentContainsMarkerAtLeft(
+                segment, markers, k, oid, leftOrdinals[oidValue64])) {
+                ++c.failedLeftOnlyAnchorChecks;
+                continue;
+            }
+            ++c.leftOnlySequences;
+        } else if(anchorSide == 'R') {
+            if(!msaSegmentContainsMarkerAtRight(
+                segment, markers, k, oid, rightOrdinals[oidValue64])) {
+                ++c.failedRightOnlyAnchorChecks;
+                continue;
+            }
+            ++c.rightOnlySequences;
+        }
+
+        sequenceInfos.push_back(MsaSequenceInfo{
+            oid,
+            segment.sequence,
+            segment.begin,
+            segment.end,
+            hasBothAnchors,
+            isEndsFree,
+            anchorSide});
+    }
+
+    if(sequenceInfos.size() < 2) {
+        ++c.skippedSingleSequence;
+        return;
+    }
+
+    prep.ready = true;
+    prep.job = job;
+    prep.leftId = leftId;
+    prep.rightId = rightId;
+    prep.sequenceInfos = std::move(sequenceInfos);
+    prep.focalWindowBegin = focalWindowSegment.begin;
+    prep.focalWindowEnd = focalWindowSegment.end;
+    prep.focalPaddedBegin = focalSegment.begin;
+    prep.focalPaddedEnd = focalSegment.end;
+}
+
+void runTheseusBackbonePairOnPrepared(
+    const PreparedBackbonePairMsaJob& prep,
+    const vector<AnchorWindowTask>& anchorWindows,
+    BackbonePairMsaCounters& c)
+{
+    if(!prep.ready) {
+        return;
+    }
+    const AnchorWindowTask& task = anchorWindows[prep.job.windowIndex];
+    const vector<MsaSequenceInfo>& sequenceInfos = prep.sequenceInfos;
+
+    const auto msaBegin = chrono::steady_clock::now();
+    theseus::Penalties penalties(0, 2, 3, 1);
+    theseus::Heuristics heuristics(false, false);
+    theseus::TheseusMSA aligner(
+        penalties,
+        heuristics,
+        sequenceInfos.front().sequence,
+        1,
+        false);
+
+    for(size_t i=1; i<sequenceInfos.size(); i++) {
+        aligner.align(sequenceInfos[i].sequence, 1, false, sequenceInfos[i].isEndsFree);
+    }
+
+    ostringstream msaOut;
+    aligner.print_as_msa(msaOut);
+
+    const auto msaEnd = chrono::steady_clock::now();
+    const double msaSecondsOne = chrono::duration<double>(msaEnd - msaBegin).count();
+    c.msaCpuSeconds += msaSecondsOne;
+    ++c.msasRun;
+
+    const string msaText = msaOut.str();
+    const vector<string> alignedSequences = rwParseMsaFasta(msaText);
+    const uint64_t pairLabel =
+        (uint64_t(task.windowId) << 32) | uint64_t(prep.job.backboneJ);
+    printReadWindowVariationSitesFromMsa(
+        pairLabel,
+        prep.leftId,
+        prep.rightId,
+        sequenceInfos,
+        alignedSequences,
+        prep.focalPaddedBegin,
+        prep.focalPaddedEnd,
+        prep.focalWindowBegin,
+        prep.focalWindowEnd,
+        msaSecondsOne);
+}
+
+void runShasta2BackbonePairTheseusMsas(
+    const Assembler& assembler,
+    const vector<AnchorWindowTask>& anchorWindows,
+    const Shasta2Anchors& shasta2Anchors,
+    const Shasta2Journeys& shasta2Journeys,
+    uint64_t threadCount,
+    uint64_t orientedReadCount,
+    BackbonePairMsaCounters& total)
+{
+    vector<BackbonePairJob> jobs;
+    for(uint32_t wi=0; wi<uint32_t(anchorWindows.size()); wi++) {
+        const AnchorWindowTask& task = anchorWindows[wi];
+        if(task.backboneBegin + 1 >= task.backboneEnd) {
+            continue;
+        }
+        const auto journey = shasta2Journeys[task.backboneOrientedReadId];
+        if(journey.size() < 2) {
+            continue;
+        }
+        const uint32_t pairEndExclusive =
+            min(task.backboneEnd - 1, uint32_t(journey.size() - 1));
+        for(uint32_t j=task.backboneBegin; j<pairEndExclusive; j++) {
+            jobs.push_back(BackbonePairJob{wi, j});
+        }
+    }
+
+    total.pairJobsScheduled = jobs.size();
+    if(jobs.empty()) {
+        return;
+    }
+
+    // Each thread owns a disjoint subset of consecutive-pair jobs (strided by thread id)
+    // and runs prepare + Theseus for every job in that subset (full job per thread).
+    threadCount = max<uint64_t>(1, threadCount);
+    const uint64_t workerCount = min<uint64_t>(threadCount, jobs.size());
+    vector<BackbonePairMsaCounters> threadTotals(workerCount);
+    vector<thread> workers;
+    workers.reserve(workerCount);
+
+    for(uint64_t t=0; t<workerCount; t++) {
+        workers.emplace_back([&, t]() {
+            BackbonePairMsaCounters local;
+            for(uint64_t i=t; i<jobs.size(); i+=workerCount) {
+                PreparedBackbonePairMsaJob prep;
+                prepareBackbonePairMsaJob(
+                    assembler,
+                    anchorWindows,
+                    shasta2Anchors,
+                    shasta2Journeys,
+                    jobs[i],
+                    orientedReadCount,
+                    prep,
+                    local);
+                if(prep.ready) {
+                    runTheseusBackbonePairOnPrepared(prep, anchorWindows, local);
+                }
+            }
+            threadTotals[t] = std::move(local);
+        });
+    }
+    for(thread& th: workers) {
+        th.join();
+    }
+
+    for(uint64_t t=0; t<workerCount; t++) {
+        mergeBackbonePairMsaCounters(total, threadTotals[t]);
+    }
 }
 
 } // namespace
@@ -457,19 +1359,33 @@ void Assembler::computeTheseusReadWindowMSAPrototype(
         anchorWindows.push_back(std::move(task));
     };
 
-    // Initialize the heap with one complete strand-0 journey candidate per read.
-    for(const ReadId readId: anchorReadsByLength) {
-        const OrientedReadId backboneOid(readId, 0);
+    // Initialize the heap: all strand-0 reads, or a single diagnostic backbone only.
+    if(restrictAnchorWindowPlannerToSingleBackboneReadId) {
+        const OrientedReadId backboneOid(anchorWindowPlannerOnlyBackboneReadId, 0);
         if(backboneOid.getValue() >= shasta2Journeys->size()) {
             ++anchorWindowSkippedNoJourney;
-            continue;
+        } else {
+            const auto journey = (*shasta2Journeys)[backboneOid];
+            if(journey.empty()) {
+                ++anchorWindowSkippedNoJourney;
+            } else {
+                pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
+            }
         }
-        const auto journey = (*shasta2Journeys)[backboneOid];
-        if(journey.empty()) {
-            ++anchorWindowSkippedNoJourney;
-            continue;
+    } else {
+        for(const ReadId readId: anchorReadsByLength) {
+            const OrientedReadId backboneOid(readId, 0);
+            if(backboneOid.getValue() >= shasta2Journeys->size()) {
+                ++anchorWindowSkippedNoJourney;
+                continue;
+            }
+            const auto journey = (*shasta2Journeys)[backboneOid];
+            if(journey.empty()) {
+                ++anchorWindowSkippedNoJourney;
+                continue;
+            }
+            pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
         }
-        pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
     }
 
     while(!candidateHeap.empty()) {
@@ -605,6 +1521,39 @@ void Assembler::computeTheseusReadWindowMSAPrototype(
          << " anchorWindowSeconds=" << fixed << setprecision(6) << anchorWindowSeconds
          << " totalSeconds=" << totalAnchorPrototypeSeconds
          << defaultfloat << endl;
+
+    if(runAnchorWindowBackbonePairTheseusMsa) {
+        BackbonePairMsaCounters pairMsaCounters;
+        const auto pairMsaBegin = chrono::steady_clock::now();
+        runShasta2BackbonePairTheseusMsas(
+            *this,
+            anchorWindows,
+            *shasta2Anchors,
+            *shasta2Journeys,
+            threadCount,
+            orientedReadCount,
+            pairMsaCounters);
+        const auto pairMsaEnd = chrono::steady_clock::now();
+        const double pairWallSeconds =
+            chrono::duration<double>(pairMsaEnd - pairMsaBegin).count();
+        cout << timestamp << "[TheseusReadWindowMSA] Backbone-pair Theseus MSA ends."
+             << " pairJobsScheduled=" << pairMsaCounters.pairJobsScheduled
+             << " msasRun=" << pairMsaCounters.msasRun
+             << " skippedCoverage=" << pairMsaCounters.skippedCoverage
+             << " skippedOrdinal=" << pairMsaCounters.skippedOrdinal
+             << " skippedEmptyFocalWindow=" << pairMsaCounters.skippedEmptyFocalWindow
+             << " skippedSingleSequence=" << pairMsaCounters.skippedSingleSequence
+             << " skippedReverseOrderBothAnchorReads="
+             << pairMsaCounters.skippedReverseOrderBothAnchorReads
+             << " leftOnlySequences=" << pairMsaCounters.leftOnlySequences
+             << " rightOnlySequences=" << pairMsaCounters.rightOnlySequences
+             << " failedLeftOnlyAnchorChecks=" << pairMsaCounters.failedLeftOnlyAnchorChecks
+             << " failedRightOnlyAnchorChecks=" << pairMsaCounters.failedRightOnlyAnchorChecks
+             << " msaCpuSeconds=" << fixed << setprecision(6) << pairMsaCounters.msaCpuSeconds
+             << " wallSeconds=" << pairWallSeconds
+             << defaultfloat
+             << endl;
+    }
     return;
     }
 

@@ -1045,7 +1045,7 @@ void dinara::main::assemble(
 
     // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
     assembler.createMarkerGraphVertices(
-        2,                                              // minVertexCoverage
+        6,                                              // minVertexCoverage
         std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
@@ -1081,6 +1081,9 @@ void dinara::main::assemble(
         assembler.shasta2Anchors,
         threadCount,
         shasta2OwnerEarly);
+
+    // Structural scaffold before het detection / phasing: journey co-read CSR (marker graph).
+    assembler.computeStrand0JourneyCoReadsTable();
 
     // Diagnostic prototype: partition Shasta2 anchor journeys into windows, then later
     // run one Theseus MSA per anchor-window interval.
