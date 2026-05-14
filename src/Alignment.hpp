@@ -251,8 +251,11 @@ public:
     // Evidence ID (APES/TASSD index)
     size_t alignmentId = invalid<size_t>;
 
-    // Packed CIGAR ID (index into OverlapCigarStore).
-    uint32_t cigarId = uint32_t(-1);
+    // Packed CIGAR location in the OverlapCigarStore arena.
+    // cigarOffset is the start index into the arena; cigarTokenCount is the
+    // number of uint16_t tokens.  Both are uint32_t(-1) when no CIGAR is stored.
+    uint32_t cigarOffset     = uint32_t(-1);
+    uint32_t cigarTokenCount = uint32_t(-1);
 
     void clearFlags()
     {
