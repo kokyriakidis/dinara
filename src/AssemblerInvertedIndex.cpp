@@ -1,116 +1,16 @@
 /**
  * @file AssemblerInvertedIndex.cpp
- * @brief High-performance alignment candidate discovery using an Inverted Index.
+ * @brief Overlap candidate discovery via inverted index + hifiasm-parity chaining.
  *
- * This file implements a Hifiasm-compatible chaining algorithm for finding
- * potential read overlaps. It is Dinara's largest algorithmic module (~4900 lines),
- * serving as the heart of the overlap-detection pipeline. Every scoring formula,
- * tie-break rule, and pruning heuristic is deliberately kept at step-parity with
- * hifiasm v0.25.0-r726 (ec9a8b2) so that the two programs produce identical
- * overlap graphs given equivalent input.
+ * Pipeline: index construction -> hit collection -> frequency-based weighting ->
+ * high-freq downsampling -> per-partner DP chaining -> mcopy extraction ->
+ * postfilter (max_n_chain + COV_W rescue + R485 suppression).
  *
- * ┌─────────────────────────────────────────────────────────────────────┐
- * │                  HIGH-LEVEL DATA-FLOW DIAGRAM                      │
- * │                                                                     │
- * │  Reads (FASTA/Q)                                                    │
- * │       │                                                             │
- * │       ▼                                                             │
- * │  ┌──────────────────────────────────────────────┐                   │
- * │  │ Phase 1: INVERTED INDEX CONSTRUCTION         │                   │
- * │  │  • Extract marker k-mers from every read     │                   │
- * │  │  • Emit (kmerId, readId, position) triples   │                   │
- * │  │  • Build parallel occurrence table            │                   │
- * │  └─────────────────────┬────────────────────────┘                   │
- * │                        ▼                                            │
- * │  ┌──────────────────────────────────────────────┐                   │
- * │  │ Phase 2: LSD RADIX SORT                      │                   │
- * │  │  • O(N) sort on 64-bit packed keys            │                   │
- * │  │  • Groups identical k-mers contiguously       │                   │
- * │  └─────────────────────┬────────────────────────┘                   │
- * │                        ▼                                            │
- * │  ┌──────────────────────────────────────────────┐                   │
- * │  │ Phase 3: HASH TABLE BUILD                    │                   │
- * │  │  • Power-of-2 open-addressing table           │                   │
- * │  │  • O(1) lookup of any k-mer's occurrence list │                   │
- * │  └─────────────────────┬────────────────────────┘                   │
- * │                        ▼                                            │
- * │  ┌──────────────────────────────────────────────┐                   │
- * │  │ Phase 4: COMPACTION & WEIGHT PRE-COMPUTATION │                   │
- * │  │  • Remove self-pairs and singletons           │                   │
- * │  │  • Compute frequency-based hit weights (LUT)  │                   │
- * │  └─────────────────────┬────────────────────────┘                   │
- * │                        ▼                                            │
- * │  ┌──────────────────────────────────────────────┐                   │
- * │  │ Phase 5: PARALLEL DP CHAINING (per read)     │                   │
- * │  │  • Collect shared k-mer hits vs every partner │                   │
- * │  │  • High-freq marker downsampling              │                   │
- * │  │  • Quick-check O(N) prefix on collinear runs  │                   │
- * │  │  • Full O(N·maxIter) DP with gap+skip penalty │                   │
- * │  │  • Backtrack → chain → overlap region         │                   │
- * │  │  • Multi-copy (mcopy) secondary extraction    │                   │
- * │  │  • Post-filter: max_n_chain + COV_W + R485    │                   │
- * │  └─────────────────────┬────────────────────────┘                   │
- * │                        ▼                                            │
- * │  Output: AlignmentCandidates (scored overlap graph)                 │
- * └─────────────────────────────────────────────────────────────────────┘
+ * Scoring, tie-breaking, and filtering match hifiasm v0.25.0-r726 (ec9a8b2).
  *
- * ## Two Entry Points
- *
- * The module supports two distinct usage paths:
- *
- *   1. **Discovery Path** (`findAlignmentCandidatesInvertedIndex`):
- *      Builds the inverted index from scratch and discovers all candidate
- *      overlaps. This is the primary entry point during assembly.
- *
- *   2. **PAF Path** (`chainPafCandidates`):
- *      Receives pre-computed read pairs (from an external PAF file) and
- *      re-chains them using the same DP scoring. Skips index construction
- *      but runs identical chaining + post-filtering.
- *
- * ## Key Design Principles
- *
- *   - **Hifiasm Parity**: Scoring, tie-breaking, and filtering are step-for-step
- *     identical to hifiasm. Variable names in the "strict port" sections
- *     intentionally mirror the original C source for auditability.
- *   - **SoA Layout**: Per-thread scratch uses Structure-of-Arrays for cache
- *     efficiency during the O(N²) DP inner loop.
- *   - **Two Scoring Modes**: `comput_sc_ch` (HiFi / default) and
- *     `comput_sc_ch_ec` (ONT error-correction) differ only in how they
- *     choose between linear and adaptive gap penalties.
- *   - **Multi-Copy Extraction**: Repetitive genomic regions produce multiple
- *     valid chains per read pair; mcopy-fast extracts up to `mcopyNum`
- *     independent chains by greedy node exclusion.
- *   - **Post-Filtering Stack**: Three successive filters mirror hifiasm:
- *     (a) `max_n_chain` per-overlap-type cap, (b) COV_W window saturation
- *      for type-3 overlaps, (c) R485 weak-chain suppression.
- *
- * ## Section Index
- *
- *   Lines ~59-80 .... InvertedIndexTempHit (AoS hit for sorting)
- *   Lines ~82-117 ... radixSortFlatHitsByPartnerReadIdAndPosA (LSD radix sort)
- *   Lines ~119-166 .. getOverlapType (overlap classification for COV_W)
- *   Lines ~167-250 .. HifiasmLchainDpOptions (DP configuration)
- *   Lines ~251-340 .. ThreadScratchpad (per-thread SoA scratch)
- *   Lines ~342-390 .. Hash / reverse-complement utility functions
- *   Lines ~392-530 .. runQuickLinearChainPrefix (O(N) fast path)
- *   Lines ~533-656 .. applyMcopyFastSelection (multi-copy extraction)
- *   Lines ~656-698 .. Hifiasm scoring constants + normal_w
- *   Lines ~700-785 .. HifiasmKmerHit + sortHifiasmHitsBySelfOffsetThenOffsetRuns
- *   Lines ~787-875 .. HifiasmOverlapRegion + HifiasmChainDataScratch
- *   Lines ~875-1040 . hifiasm_cal_bw + hifiasm_comput_sc_ch_ec (scoring)
- *   Lines ~1042-1098  hifiasm_get_chainLen (chain length normalization)
- *   Lines ~1098-1190  hifiasm_push_ovlp_chain_qgen (overlap construction)
- *   Lines ~1192-1310  hifiasm_quick_ck_lchain (strict port)
- *   Lines ~1310-1460  lchain_qdp_mcopy_fast docstring + run_main_dp_loop
- *   Lines ~1461-1700  backtrack_best_chain + emit_best_chain_as_overlap
- *   Lines ~1700-2060  hifiasm_lchain_qdp_mcopy_fast (full pipeline)
- *   Lines ~2060-2290  hifiasm_ha_ov_type + postfilter
- *   Lines ~2290-2470  mapHitPositionsToMarkerOrdinals + weight/config
- *   Lines ~2470-3180  InvertedIndexFinder (parallel worker)
- *   Lines ~3186-3582  buildInvertedIndex + chainAlignmentCandidates
- *   Lines ~3583-4902  chainPafCandidates (PAF chaining path)
- *
- * @note All scoring and tie-breaking rules are strictly Hifiasm-compatible.
+ * Two entry points:
+ *   - Discovery path: findAlignmentCandidatesInvertedIndex (all-vs-all)
+ *   - PAF path: chainPafCandidates (re-chain imported pairs)
  */
 
 #include "Assembler.hpp"
@@ -438,9 +338,9 @@ struct ThreadScratchpad {
     };
 
     // ---- Stage 1: Hit Collection (AoS format for sorting) ----
-	    vector<InvertedIndexTempHit> flatHits;     ///< Collected k-mer hits before DP.
-	    vector<InvertedIndexTempHit> flatHitsTmp;   ///< Auxiliary buffer for radix sort.
-    
+    vector<InvertedIndexTempHit> flatHits;     ///< Collected k-mer hits before DP.
+    vector<InvertedIndexTempHit> flatHitsTmp;   ///< Auxiliary buffer for radix sort.
+
     // ---- Stage 2: SoA Unpacking (cache-efficient DP layout) ----
     vector<uint32_t> hitPosA, hitPosB, hitOrdinalA, hitOrdinalB;
     vector<uint32_t> hitOrderByPosB;   ///< Permutation array: indices sorted by posB.
@@ -497,14 +397,13 @@ struct ThreadScratchpad {
     vector<uint32_t> currentChainPath;             ///< Backtracked anchor indices for current chain.
 
     /// @brief Reset all vectors without releasing memory (amortized O(1) per read).
-    /// Called at the start of each new read pair to prepare for reuse.
-	    void clear() {
-	        flatHits.clear();
-	        flatHitsTmp.clear();
-	        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear(); hitOrderByPosB.clear(); hitWeights.clear();
-	        dpSame.clear(); dpDiff.clear();
-	        parentSame.clear(); parentDiff.clear();
-	        backtrackVisitSame.clear(); backtrackVisitDiff.clear();
+    void clear() {
+        flatHits.clear();
+        flatHitsTmp.clear();
+        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear(); hitOrderByPosB.clear(); hitWeights.clear();
+        dpSame.clear(); dpDiff.clear();
+        parentSame.clear(); parentDiff.clear();
+        backtrackVisitSame.clear(); backtrackVisitDiff.clear();
         chainOccurrencesSame.clear(); chainOccurrencesDiff.clear();
         chainCandidates.clear();
         filteredCandidates.clear();
@@ -523,6 +422,105 @@ struct ThreadScratchpad {
         currentChainPath.clear();
     }
 };
+
+// ============================================================================
+// HIGH-FREQUENCY MARKER DOWNSAMPLING SUPPORT
+// ============================================================================
+// Shared data structures and logic for downsampling consecutive high-frequency
+// markers. Used by both the discovery path (all-vs-all) and the PAF path
+// (pair-specific) to avoid duplicating the streak selection algorithm.
+//
+// Hifiasm reference: sketch.cpp hf_select + select_mz_h
+//
+// The algorithm buffers consecutive high-frequency markers into a "streak",
+// then selects up to `keep = round(span / sampleDistance)` markers (capped at
+// MAX_MAX_HIGH_OCC=16) using a (count, hash) ordering that prefers rarer,
+// more informative markers. Markers whose occurrence count exceeds the streak
+// span are discarded entirely (hifiasm's `rid < pe - ps` guard).
+// ============================================================================
+
+/// Buffered high-frequency marker awaiting streak-level downsampling.
+struct PendingHighFrequencyMarker {
+    uint64_t startIdx = 0;   ///< Start offset in the compact occurrence array.
+    uint32_t count = 0;      ///< Genome-wide occurrence count of this k-mer.
+    uint64_t hashKey = 0;    ///< Deterministic tie-break key (yak_hash64_64).
+    uint32_t posA = 0;       ///< Base position on the query read.
+    uint32_t ordinalA = 0;   ///< Marker ordinal on the query read.
+    uint32_t weight = 1;     ///< Frequency-based weight (packed into cnt>>8).
+    uint8_t isRcA = 0;       ///< 1 if the observed k-mer is the RC of canonical.
+};
+
+/// @brief Downsample a streak of consecutive high-frequency markers.
+///
+/// Selects up to `keep = round(span / sampleDistance)` markers from the streak,
+/// preferring those with the lowest occurrence count (ties broken by hash).
+/// Markers with `count >= span` are discarded (too repetitive for the local
+/// context). When `keep == 0` (streak too short), all markers are discarded
+/// (hifiasm parity: select_mz_h skips hf_select when max_high_occ==0).
+///
+/// @param streak           Buffered high-frequency markers.
+/// @param workspace        Reusable index buffer (avoids allocation).
+/// @param lastNonHighPos   Position of the last non-high-freq marker (-1 if none).
+/// @param rightBoundaryPos Right boundary of the streak (next non-high pos or read end).
+/// @param sampleDistance    Spacing between retained markers (hifiasm: 500bp).
+/// @param maxPerStreak     Hard cap on retained markers (hifiasm: MAX_MAX_HIGH_OCC=16).
+/// @param emitFn           Callback invoked for each retained marker.
+template<typename EmitFn>
+static inline void flushHighFrequencyStreak(
+    vector<PendingHighFrequencyMarker>& streak,
+    vector<size_t>& workspace,
+    int64_t lastNonHighPos,
+    uint32_t rightBoundaryPos,
+    uint32_t sampleDistance,
+    uint32_t maxPerStreak,
+    EmitFn&& emitFn)
+{
+    if (streak.empty()) return;
+
+    const uint32_t leftPos = (lastNonHighPos >= 0) ? uint32_t(lastNonHighPos) : 0U;
+    const uint32_t span = (rightBoundaryPos > leftPos) ? (rightBoundaryPos - leftPos) : 0U;
+    uint32_t keep = uint32_t(double(span) / double(sampleDistance) + 0.499);
+    if (keep > maxPerStreak) keep = maxPerStreak;
+
+    // Hifiasm parity: when keep==0 (streak shorter than ~sampleDistance/2),
+    // all high-freq markers in this streak are discarded. In hifiasm's
+    // select_mz_h, max_high_occ==0 means hf_select is never called, so
+    // the markers keep their non-zero rid and get squeezed out.
+    if (keep == 0) {
+        streak.clear();
+        return;
+    }
+
+    const size_t selectedCount = std::min<size_t>(streak.size(), keep);
+    if (selectedCount >= streak.size()) {
+        for (const auto& m : streak) emitFn(m, span);
+        streak.clear();
+        return;
+    }
+
+    // Select top-k by (count asc, hashKey asc) using nth_element (O(n) average).
+    // This matches hifiasm's heap-based selection in hf_select.
+    workspace.clear();
+    workspace.reserve(streak.size());
+    for (size_t i = 0; i < streak.size(); ++i) workspace.push_back(i);
+
+    std::nth_element(
+        workspace.begin(),
+        workspace.begin() + static_cast<ptrdiff_t>(selectedCount),
+        workspace.end(),
+        [&](size_t a, size_t b) {
+            if (streak[a].count != streak[b].count) return streak[a].count < streak[b].count;
+            return streak[a].hashKey < streak[b].hashKey;
+        });
+    workspace.resize(selectedCount);
+
+    // Emit in posA order so downstream radix sort sees monotonic query positions.
+    std::sort(workspace.begin(), workspace.end(),
+        [&](size_t a, size_t b) { return streak[a].posA < streak[b].posA; });
+
+    for (const size_t idx : workspace) emitFn(streak[idx], span);
+    streak.clear();
+}
 
 // ============================================================================
 // K-MER UTILITY FUNCTIONS
@@ -1720,28 +1718,10 @@ static inline void hifiasm_lchain_qgen_mcopy_fast_postfilter(
 // 1) one sort of hit indices by target position, then
 // 2) one forward scan over marker positions.
 // This avoids O(n log m) repeated binary searches on the hot path.
+/// Map base positions on Read B to marker ordinals via a linear tandem scan.
+/// Hits are sorted by posB so markers can be walked once. Returns false if
+/// any hit position has no corresponding marker.
 template<class MarkerContainer>
-// ============================================================================
-// MARKER ORDINAL RESOLUTION
-// ============================================================================
-// The inverted index stores hits by base position, but Dinara's Alignment
-// structure needs marker ordinals (sequential index into the marker array).
-// This function bridges the two representations by binary-searching the
-// sorted marker array for each hit's base position on Read B.
-//
-// Why not resolve during hit collection?
-//   Read A ordinals are known at collection time (we iterate A's markers).
-//   But Read B ordinals require looking up each B-position in B's marker
-//   array, which is cheaper to batch after sorting hits by posB.
-//
-// Algorithm:
-//   1. Sort hit indices by posB → enables a single linear scan.
-//   2. Walk through sorted markers and sorted hits in tandem.
-//   3. For each hit, advance the marker cursor until position matches.
-//   4. Record the matching marker ordinal.
-//
-// Returns false if any hit position has no corresponding marker (data error).
-// ============================================================================
 static inline bool mapHitPositionsToMarkerOrdinals(
     const vector<uint32_t>& hitPosB,
     const MarkerContainer& markersB,
@@ -1756,73 +1736,29 @@ static inline bool mapHitPositionsToMarkerOrdinals(
         return false;
     }
 
-    // Step 1: Create an index permutation sorted by posB.
-    // This lets us scan markers linearly instead of binary-searching each hit.
     orderByPosB.resize(n);
     std::iota(orderByPosB.begin(), orderByPosB.end(), uint32_t(0));
     std::sort(orderByPosB.begin(), orderByPosB.end(),
-        [&](const uint32_t a, const uint32_t b) {
-            if (hitPosB[a] != hitPosB[b]) {
-                return hitPosB[a] < hitPosB[b];
-            }
-            return a < b;
+        [&](uint32_t a, uint32_t b) {
+            return (hitPosB[a] != hitPosB[b]) ? hitPosB[a] < hitPosB[b] : a < b;
         });
 
-    // Step 2: Linear tandem scan — advance marker cursor and hit cursor together.
     size_t markerIdx = 0;
     for (const uint32_t hitIdx : orderByPosB) {
         const uint32_t pos = hitPosB[hitIdx];
-
-        // Advance marker cursor past positions smaller than this hit's position.
         while (markerIdx < markersB.size() && markersB[markerIdx].position < pos) {
             ++markerIdx;
         }
-
-        // The marker at markerIdx should now have position == pos.
-        // If not, the hit references a position that doesn't exist as a marker.
         if (markerIdx >= markersB.size() || markersB[markerIdx].position != pos) {
-            return false;  // Data integrity error — position not found.
+            return false;
         }
         hitOrdinalB[hitIdx] = uint32_t(markerIdx);
     }
     return true;
 }
 
-// ============================================================================
-// MARKER FREQUENCY WEIGHTING (Hifiasm K-mer Frequency Stratification)
-// ============================================================================
-// Reference: Hifiasm anchor.cpp:11, anchor.cpp:99
-//
-// Purpose: Weight shared markers (k-mers) based on their genome-wide frequency
-// to balance specificity vs coverage in overlap detection.
-//
-// Three Frequency Tiers:
-// 1. **Low-frequency (Rare/Informative)**: count <= lowFreqThreshold
-//    - These are highly specific markers (e.g., unique or near-unique in genome)
-//    - Weight: rareKmerWeight = 2 (hifiasm default)
-//    - Threshold: coveragePeak * 0.333 (HA_KMER_GOOD_RATIO)
-//
-// 2. **Normal-frequency**: lowFreqThreshold < count < highFreqThreshold
-//    - These are standard, reliable markers
-//    - Weight: 1 (baseline)
-//    - Middle of the coverage distribution
-//
-// 3. **High-frequency (Repetitive)**: count >= highFreqThreshold
-//    - These are repetitive elements (e.g., transposons, tandem repeats)
-//    - Weight: pow(1 + (count / highFreqWeightUnit), 1.1)
-//    - Threshold: coveragePeak * 1.667 (hom_cov * (2.0 - HA_KMER_GOOD_RATIO))
-//    - Normalized by highFreqWeightUnit = highFreqThreshold * 2
-//    - Higher exponent (1.1) allows better discrimination in repeat-dense regions
-//
-// Rationale:
-// - Rare markers get bonus weight because they're highly informative
-// - Normal markers get standard weight (1) as baseline
-// - Repetitive markers get frequency-dependent weight to maintain signal
-//   in repeat-rich regions while not overwhelming the alignment
-//
-// This implements hifiasm's HIFIASM_NORMAL_W macro behavior for robust
-// overlap detection across diverse genomic contexts.
-// ============================================================================
+/// Frequency-based hit weight (hifiasm anchor.cpp:11 HA_KMER_GOOD_RATIO).
+/// Three tiers: rare (weight=2), normal (weight=1), repetitive (pow-scaled).
 static inline uint32_t computeInvertedIndexHitWeight(
     const uint32_t count,
     const uint64_t lowFreqThreshold,
@@ -1847,25 +1783,8 @@ static inline uint32_t computeInvertedIndexHitWeight(
     return uint32_t(1);
 }
 
-// ============================================================================
-// CHAINING CONFIGURATION INITIALIZATION
-// ============================================================================
-// Populate chaining parameters that are shared by discovery and PAF paths.
-// Keeping this in one place avoids accidental drift between the two entry points.
-//
-// This function transfers all inverted-index-related options from the global
-// OverlapCandidatesOptions into the InvertedIndexData structure that will be
-// used by worker threads during parallel chaining.
-//
-// Parameters configured:
-// - Frequency weighting: lowFreqMultiplier, highFreqMultiplier, weightExponent, rareKmerWeight
-// - High-frequency downsampling: downsampleHighFrequencyMarkers, highFrequencySampleDistance, maxHighFrequencyPerStreak
-// - Chain selection: highFactor, minNChain (for max_n_chain calculation)
-// - DP chaining: lchainIsAccurate, useEcScoring
-// - Mcopy extraction: enableMcopyFast, mcopyNum, mcopyRate, mcopyKhitCutoff
-// - COV_W control: mcopyOcvWindow, mcopyOcvWeakKeepRatio
-// - Overlap validation: nonRedundantOverlapFraction
-// ============================================================================
+/// Transfer chaining parameters from OverlapCandidatesOptions into the
+/// InvertedIndexData used by worker threads. Shared by discovery and PAF paths.
 template<class InvertedIndexData>
 static inline void configureInvertedIndexDataForChaining(
     InvertedIndexData& data,
@@ -2055,21 +1974,12 @@ private:
             ReadId partnerReadId = invalidReadId;
             uint32_t querySpan = 0; // pre-extension span on the query read (bases)
         };
-	        vector<EmittedChainedCandidate> emittedForRead;
-	        vector<EmittedChainedCandidate> filteredForRead;
-		        struct PendingHighFrequencyMarker {
-		            uint64_t startIdx = 0;
-		            uint32_t count = 0;
-		            uint64_t hashKey = 0; // tie-break key for high-frequency streak selection (hifiasm-like)
-		            uint32_t posA = 0;
-		            uint32_t ordinalA = 0;
-		            uint32_t weight = 1;
-		            uint8_t isRcA = 0;
-		        };
-	        vector<PendingHighFrequencyMarker> highFrequencyStreak;
-	        highFrequencyStreak.reserve(64);
-	        vector<size_t> highFrequencyStreakWorkspace;
-	        highFrequencyStreakWorkspace.reserve(64);
+        vector<EmittedChainedCandidate> emittedForRead;
+        vector<EmittedChainedCandidate> filteredForRead;
+        vector<PendingHighFrequencyMarker> highFrequencyStreak;
+        highFrequencyStreak.reserve(64);
+        vector<size_t> highFrequencyStreakWorkspace;
+        highFrequencyStreakWorkspace.reserve(64);
 
         // Scratch storage for the strict hifiasm lchain_qdp_mcopy_fast port.
         HifiasmChainDataScratch hifiasmChainDpScratch;
@@ -2087,17 +1997,14 @@ private:
         const uint64_t coveragePeak = invertedIndexData.coveragePeak;
         const double weightExponent = invertedIndexData.weightExponent;
         const double lowFreqMultiplier = invertedIndexData.lowFreqMultiplier;
-	        const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
-	        const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
-	        const uint64_t lowFreqThreshold = std::max<uint64_t>(2ULL, uint64_t(double(coveragePeak) * lowFreqMultiplier));
-	        const uint64_t highFreqThreshold = std::max<uint64_t>(1ULL, uint64_t(double(coveragePeak) * highFreqMultiplier));
-	        // Hifiasm's high-occ minimizer suppression is driven by its filter table + minimizer selection,
-	        // not by this (hom_cov-derived) high-occ threshold directly. In very-low-coverage/synthetic
-	        // situations `highFreqThreshold` can be 1, which would incorrectly treat almost every kmer
-	        // as "high-frequency" and cause aggressive downsampling. We gate downsampling behind a small
-	        // absolute minimum so only genuinely repetitive markers are downsampled.
-	        const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
-	        const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
+        const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
+        const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
+        const uint64_t lowFreqThreshold = std::max<uint64_t>(2ULL, uint64_t(double(coveragePeak) * lowFreqMultiplier));
+        const uint64_t highFreqThreshold = std::max<uint64_t>(1ULL, uint64_t(double(coveragePeak) * highFreqMultiplier));
+        // Gate downsampling behind an absolute minimum (3) to avoid treating
+        // nearly all k-mers as high-frequency in low-coverage datasets.
+        const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
+        const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
         const bool downsampleHighFrequencyMarkers =
             invertedIndexData.downsampleHighFrequencyMarkers &&
             invertedIndexData.highFrequencySampleDistance > 0 &&
@@ -2108,33 +2015,31 @@ private:
         const bool enableMcopyFast = invertedIndexData.enableMcopyFast;
         const uint32_t mcopyNum = std::max<uint32_t>(1U, invertedIndexData.mcopyNum);
         const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
-	        const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
-	        const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
-	        // Dinara only supports the strict hifiasm ONT lchain+mcopy path for inverted-index chaining.
-
+        const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
+        const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
 
         uint64_t startBatch, endBatch;
         while(getNextBatch(startBatch, endBatch)) {
             for(ReadId readIdA = ReadId(startBatch); readIdA != ReadId(endBatch); ++readIdA) {
-                
+
                 const OrientedReadId orientedReadIdA(readIdA, 0);
                 const auto& markersA = markers[orientedReadIdA.getValue()];
-	                const bool haveCanonicalCache =
-	                    (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
-	                const KmerId* canonicalIdsA = nullptr;
-	                const uint8_t* canonicalIsRcA = nullptr;
-	                size_t canonicalCountA = 0;
-	                if(haveCanonicalCache) {
-	                    const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
-	                    const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
-	                    if(e >= b &&
-	                       e <= invertedIndexData.strand0CanonicalKmerIds.size() &&
-	                       e <= invertedIndexData.strand0CanonicalIsRc.size()) {
-	                        canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
-	                        canonicalIsRcA = invertedIndexData.strand0CanonicalIsRc.data() + b;
-	                        canonicalCountA = size_t(e - b);
-	                    }
-	                }
+                const bool haveCanonicalCache =
+                    (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
+                const KmerId* canonicalIdsA = nullptr;
+                const uint8_t* canonicalIsRcA = nullptr;
+                size_t canonicalCountA = 0;
+                if(haveCanonicalCache) {
+                    const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
+                    const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
+                    if(e >= b &&
+                       e <= invertedIndexData.strand0CanonicalKmerIds.size() &&
+                       e <= invertedIndexData.strand0CanonicalIsRc.size()) {
+                        canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
+                        canonicalIsRcA = invertedIndexData.strand0CanonicalIsRc.data() + b;
+                        canonicalCountA = size_t(e - b);
+                    }
+                }
                 const auto& kmerIdsA = markerKmerIds[orientedReadIdA.getValue()];
                 const size_t numMarkersA = canonicalIdsA ?
                     std::min(markersA.size(), canonicalCountA) :
@@ -2148,192 +2053,57 @@ private:
                 highFrequencyStreak.clear();
                 int64_t lastNonHighBoundaryPos = -1;
 
-	                auto computeHitWeight = [&](const uint32_t count) -> uint32_t {
-	                    return computeInvertedIndexHitWeight(
-	                        count,
-	                        lowFreqThreshold,
-	                        highFreqThreshold,
-	                        highFreqWeightUnit,
-	                        rareKmerWeight,
-	                        invertedIndexData.weightLut,
-	                        weightExponent);
-	                };
-
-	                auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
-	                    const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
-	                    for (uint32_t j = 0; j < markerInfo.count; ++j) {
-	                        if (compactOccs[j].readId != readIdA) {
-	                            const uint32_t posBEncoded = compactOccs[j].position;
-	                            const uint32_t posB = posBEncoded & 0x7fffffffU;
-	                            const uint8_t isRcB = uint8_t(posBEncoded >> 31);
-	                            scratch.flatHits.push_back(
-	                                {compactOccs[j].readId, markerInfo.posA, posB, markerInfo.ordinalA, markerInfo.weight, markerInfo.isRcA, isRcB});
-	                        }
-	                    }
-	                };
-
-                // ================================================================
-                // HIGH-FREQUENCY MARKER DOWNSAMPLING (Hifiasm Repeat Handling)
-                // ================================================================
-                // Reference: Hifiasm sketch.cpp:12 (MAX_MAX_HIGH_OCC)
-                //
-                // Purpose: Prevent memory explosion and computational overhead from
-                // consecutive high-frequency (repetitive) markers by intelligently
-                // downsampling long stretches while preserving alignment signal.
-                //
-                // Strategy:
-                // 1. When we encounter a "streak" of consecutive high-frequency markers,
-                //    we buffer them instead of immediately processing all occurrences
-                // 2. When the streak ends (encounter non-high-freq or end-of-read),
-                //    we downsample the buffered markers:
-                //    - Calculate span = rightBoundary - leftBoundary
-                //    - keep = span / highFrequencySampleDistance (typically 500bp)
-                //    - Cap at maxHighFrequencyPerStreak (hifiasm: MAX_MAX_HIGH_OCC = 16)
-                // 3. Select 'keep' markers from the streak using hifiasm's ordering:
-                //    - Prefer smallest genome-wide occurrence count (more informative)
-                //    - Tie-break by a deterministic hash key
-                //    Then emit the selected markers in increasing posA order.
-                //
-                // Hifiasm detail (sketch.cpp hf_select):
-                // It only selects a marker if `count < (pe-ps)` (where pe-ps is the streak span),
-                // which effectively discards extremely high-occ kmers that are "too repetitive" even
-                // relative to the local span. We replicate that guard as `count < span`.
-                //
-                // Parameters (from hifiasm):
-                // - highFrequencySampleDistance: 500bp (sample density)
-                // - maxHighFrequencyPerStreak: 16 (MAX_MAX_HIGH_OCC, absolute cap)
-                //
-                // Why this works:
-                // - Preserves positional signal (markers are evenly spaced)
-                // - Drastically reduces memory for tandem repeats and transposons
-                // - Still maintains enough signal for proper alignment in repeat regions
-                //
-                // Example: A 5kb tandem repeat with 100 high-freq markers
-                // → Sample 5000/500 = 10 markers → Keep 10 evenly-spaced markers
-                // ================================================================
-                // Hifiasm sketch.cpp: for a streak of high-occ minimizers, choose up to
-                // `max_high_occ = round((pe-ps)/sample_dist)` (capped) using the smallest (count, hash) keys.
-                auto flushHighFrequencyStreak = [&](const uint32_t rightBoundaryPos) {
-                    if (highFrequencyStreak.empty()) {
-                        return;
-                    }
-
-                    // Safety: Validate sample distance to prevent division by zero
-                    if (highFrequencySampleDistance == 0) {
-                        // Should never happen (protected by max(1U, ...) at initialization)
-                        // But if config is corrupt, keep all markers as fallback
-                        for(const auto& m : highFrequencyStreak) {
-                            appendMarkerHits(m);
-                        }
-                        highFrequencyStreak.clear();
-                        return;
-                    }
-
-                    const uint32_t leftBoundaryPos = (lastNonHighBoundaryPos >= 0) ? uint32_t(lastNonHighBoundaryPos) : 0U;
-                    const uint32_t span = (rightBoundaryPos > leftBoundaryPos) ? (rightBoundaryPos - leftBoundaryPos) : 0U;
-                    uint32_t keep = uint32_t(double(span) / double(highFrequencySampleDistance) + 0.499);
-                    if (keep > maxHighFrequencyPerStreak) {
-                        keep = maxHighFrequencyPerStreak;
-                    }
-                    if (keep == 0) {
-                        // Hifiasm sketch.cpp: if `max_high_occ = round((pe-ps)/sample_dist)` is 0,
-                        // it treats this as "no high-frequency streak worth downsampling".
-                        // In that case, do not drop evidence; keep all markers in this streak.
-                        for(const auto& m : highFrequencyStreak) {
-                            appendMarkerHits(m);
-                        }
-                        highFrequencyStreak.clear();
-                        return;
-                    }
-                        auto appendIfUseful = [&](const PendingHighFrequencyMarker& m) {
-                            // Hifiasm guard: keep only if `count < span`.
-                            if (span > 0 && m.count >= span) {
-                                return;
-                            }
-                            appendMarkerHits(m);
-                        };
-
-                        const size_t selectedCount = std::min<size_t>(highFrequencyStreak.size(), keep);
-                        if(selectedCount >= highFrequencyStreak.size()) {
-                            for(const auto& m : highFrequencyStreak) {
-                                appendIfUseful(m);
-                            }
-                            highFrequencyStreak.clear();
-                            return;
-                        }
-
-                    highFrequencyStreakWorkspace.clear();
-                    highFrequencyStreakWorkspace.reserve(highFrequencyStreak.size());
-                    for(size_t i = 0; i < highFrequencyStreak.size(); ++i) {
-                        highFrequencyStreakWorkspace.push_back(i);
-                    }
-
-                    auto better = [&](const size_t a, const size_t b) {
-                        const auto& ma = highFrequencyStreak[a];
-                        const auto& mb = highFrequencyStreak[b];
-                        if(ma.count != mb.count) {
-                            return ma.count < mb.count;
-                        }
-                        return ma.hashKey < mb.hashKey;
-                    };
-                    std::nth_element(
-                        highFrequencyStreakWorkspace.begin(),
-                        highFrequencyStreakWorkspace.begin() + selectedCount,
-                        highFrequencyStreakWorkspace.end(),
-                        better);
-                    highFrequencyStreakWorkspace.resize(selectedCount);
-                        std::sort(
-                            highFrequencyStreakWorkspace.begin(),
-                            highFrequencyStreakWorkspace.end(),
-                            [&](const size_t a, const size_t b) {
-                                return highFrequencyStreak[a].posA < highFrequencyStreak[b].posA;
-                            });
-                        for(const size_t idx : highFrequencyStreakWorkspace) {
-                            appendIfUseful(highFrequencyStreak[idx]);
-                        }
-                        highFrequencyStreak.clear();
+                auto computeHitWeight = [&](uint32_t count) -> uint32_t {
+                    return computeInvertedIndexHitWeight(
+                        count, lowFreqThreshold, highFreqThreshold,
+                        highFreqWeightUnit, rareKmerWeight,
+                        invertedIndexData.weightLut, weightExponent);
                 };
 
-                // ================================================================
-                // STEP 1: HIT COLLECTION & FREQUENCY-BASED WEIGHTING
-                // ================================================================
-                // Reference: Hifiasm anchor.cpp:1476-1540 (get_candidates)
-                //
-                // Purpose: Find all shared markers between read A and the genome-wide index
-                // - Query the inverted index with each k-mer from read A
-                // - Collect all partner reads that share this k-mer
-                // - Apply frequency-based weighting to balance specificity vs coverage
-                // - Downsample high-frequency (repetitive) markers to control memory
-                //
-                // Process:
-                // 1. For each marker in read A:
-                //    - Canonicalize the k-mer (min of forward and RC)
-                //    - Look up in hash table to find all occurrences across reads
-                //    - Count = genome-wide frequency of this k-mer
-                // 2. Compute weight based on frequency tier:
-                //    - Rare (count ≤ lowFreqThreshold): weight = 2 (informative)
-                //    - Normal (lowFreq < count < highFreq): weight = 1 (baseline)
-                //    - Repetitive (count ≥ highFreqThreshold): weight = pow(normalized_count, 1.1)
-                // 3. If high-frequency marker:
-                //    - Buffer it for potential downsampling (prevent memory explosion)
-                // 4. Otherwise:
-                //    - Flush any buffered streak and append this marker's hits
-                //
-                // Output: flatHits array containing (readIdB, posA, posB, ordinalA, weight)
-                // for all shared markers, ready for DP chaining.
-                // ================================================================
+                // Discovery path: emit hits for all partners (readId != readIdA).
+                auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
+                    const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
+                    for (uint32_t j = 0; j < markerInfo.count; ++j) {
+                        if (compactOccs[j].readId != readIdA) {
+                            const uint32_t posBEncoded = compactOccs[j].position;
+                            const uint32_t posB = posBEncoded & 0x7fffffffU;
+                            const uint8_t isRcB = uint8_t(posBEncoded >> 31);
+                            scratch.flatHits.push_back(
+                                {compactOccs[j].readId, markerInfo.posA, posB,
+                                 markerInfo.ordinalA, markerInfo.weight,
+                                 markerInfo.isRcA, isRcB});
+                        }
+                    }
+                };
+
+                // Flush buffered high-frequency markers through the shared
+                // downsampling logic, emitting surviving hits via appendMarkerHits.
+                auto doFlushStreak = [&](uint32_t rightBoundaryPos) {
+                    flushHighFrequencyStreak(
+                        highFrequencyStreak, highFrequencyStreakWorkspace,
+                        lastNonHighBoundaryPos, rightBoundaryPos,
+                        highFrequencySampleDistance, maxHighFrequencyPerStreak,
+                        [&](const PendingHighFrequencyMarker& m, uint32_t span) {
+                            // Hifiasm guard: discard markers whose count >= streak span.
+                            if (span > 0 && m.count >= span) return;
+                            appendMarkerHits(m);
+                        });
+                };
+
+                // Hit collection: query each marker against the inverted index,
+                // apply frequency-based weighting, and buffer high-freq streaks.
                 for(size_t i = 0; i < numMarkersA; ++i) {
-	                    KmerId canonicalKId;
-	                    uint8_t isRcA = 0;
-	                    if(canonicalIdsA) {
-	                        canonicalKId = canonicalIdsA[i];
-	                        isRcA = canonicalIsRcA ? canonicalIsRcA[i] : uint8_t(0);
-	                    } else {
-	                        KmerId currentKId = kmerIdsA[i];
-	                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
-	                        canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
-	                        isRcA = uint8_t(currentKId > rcKId);
-	                    }
+                    KmerId canonicalKId;
+                    uint8_t isRcA = 0;
+                    if(canonicalIdsA) {
+                        canonicalKId = canonicalIdsA[i];
+                        isRcA = canonicalIsRcA ? canonicalIsRcA[i] : uint8_t(0);
+                    } else {
+                        KmerId currentKId = kmerIdsA[i];
+                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                        canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                        isRcA = uint8_t(currentKId > rcKId);
+                    }
 
                     const uint32_t posA = markersA[i].position;
                     uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
@@ -2341,7 +2111,6 @@ private:
                     uint32_t count = 0;
                     bool found = false;
 
-                    // Search for the K-mer in the direct-addressing hash table
                     while(!hashTablePtr[slotIdx].empty) {
                         if(hashTablePtr[slotIdx].key == canonicalKId) {
                             startIdx = hashTablePtr[slotIdx].start;
@@ -2354,50 +2123,36 @@ private:
 
                     if(!found) {
                         if(downsampleHighFrequencyMarkers) {
-                            flushHighFrequencyStreak(posA);
+                            doFlushStreak(posA);
                             lastNonHighBoundaryPos = posA;
                         }
                         continue;
                     }
 
-		                    const uint32_t hitWeight = computeHitWeight(count);
-		                    const uint64_t kmerHashKey = hifiasmYakHash64_64(foldKmerIdToUint64(canonicalKId));
-		                    if(downsampleHighFrequencyMarkers && count > highFreqDownsampleThreshold) {
-		                        highFrequencyStreak.push_back({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
-		                        continue;
-		                    }
+                    const uint32_t hitWeight = computeHitWeight(count);
+                    const uint64_t kmerHashKey = hifiasmYakHash64_64(foldKmerIdToUint64(canonicalKId));
+                    if(downsampleHighFrequencyMarkers && count > highFreqDownsampleThreshold) {
+                        highFrequencyStreak.push_back({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
+                        continue;
+                    }
 
                     if(downsampleHighFrequencyMarkers) {
-                        flushHighFrequencyStreak(posA);
+                        doFlushStreak(posA);
                     }
-		                    appendMarkerHits({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
-	                    lastNonHighBoundaryPos = posA;
-	                }
+                    appendMarkerHits({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
+                    lastNonHighBoundaryPos = posA;
+                }
                 if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
                     const uint32_t readLenABoundary = uint32_t(std::min<uint64_t>(
                         readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
-                    flushHighFrequencyStreak(readLenABoundary);
+                    doFlushStreak(readLenABoundary);
                 }
-                
-	                if(scratch.flatHits.empty()) continue;
-	                radixSortFlatHitsByPartnerReadIdAndPosA(scratch.flatHits, scratch.flatHitsTmp);
 
-	                {
-	                    // ================================================================
-	                    // STEP 2 (HIFIASM ONT PARITY): lchain_qdp_mcopy_fast + mcopy + ocv_w
-	                    // ================================================================
-	                    // Reference:
-	                    // - anchor.cpp:1920-2100 lchain_qgen_mcopy_fast
-	                    // - Hash_Table.cpp:2007-2095 quick_ck_lchain
-	                    // - Hash_Table.cpp:2097-2284 lchain_qdp_mcopy_fast
-                    //
-                    // Strict parity choices:
-                    // - Build a hifiasm-like `k_mer_hit` array per partner read B that includes both strands.
-                    // - Sort by (strand, self_offset, offset) like minimizers_qgen0.
-                    // - Run the strict lchain_qdp_mcopy_fast port to emit best chain + optional mcopy alternates.
-                    // - Apply strict max_n_chain + ocv_w rescue + r485 suppression on the aggregated overlap list.
-                    // - Then convert surviving overlaps into Dinara `Alignment` objects.
+                if(scratch.flatHits.empty()) continue;
+                radixSortFlatHitsByPartnerReadIdAndPosA(scratch.flatHits, scratch.flatHitsTmp);
 
+                // Per-partner chaining: build k_mer_hit array, run DP, apply postfilter.
+                // Ref: anchor.cpp:1920 lchain_qgen_mcopy_fast
                     const HifiasmLchainDpOptions dpOpt =
                         getHifiasmLchainDpOptions(lchainIsAccurate, uint32_t(kmerLen));
                     const uint8_t span = uint8_t(std::min<uint64_t>(kmerLen, 255ULL));
@@ -2433,11 +2188,7 @@ private:
                             continue;
                         }
 
-                        // Hifiasm ONT EC parity: `chain_cutoff` is passed as a constant 2
-                        // (ecovlp.cpp:3274) and is applied inside minimizers_qgen_input(...)
-                        // (anchor.cpp:1489) as a per-(readIdB, rev) minimum bucket size.
-                        // In other words, a pair can be kept if (rev==0 has >=2 hits) OR (rev==1 has >=2 hits),
-                        // and the smaller bucket is dropped entirely.
+                        // Per-strand minimum hit count (hifiasm ecovlp.cpp:3274 chain_cutoff=2).
                         static constexpr uint32_t hifiasmChainCutoff = 2;
                         size_t revCount[2] = {0, 0};
                         for(size_t k = 0; k < numHits; ++k) {
@@ -2479,12 +2230,10 @@ private:
                                 continue;
                             }
 
-                            // Hifiasm uses minimizer end positions; Dinara stores marker start positions.
-                            // Convert start -> end by adding span-1.
+                            // Convert start positions to end positions (hifiasm convention).
                             const uint32_t seedSpan = uint32_t(span);
                             const uint32_t selfOff = h.posA + (seedSpan - 1U);
                             const uint32_t offSame = h.posB + (seedSpan - 1U);
-                            // anchor.cpp:1062-1064 simplifies to offset = tl - start - 1 for strand==1.
                             const uint32_t offDiff = uint32_t(readLenB - 1ULL - uint64_t(h.posB));
 
                             HifiasmKmerHit kh{};
@@ -2663,40 +2412,15 @@ private:
                             overlapType,
                             (cand0 == readIdA) ? cand1 : cand0,
                             0});
-	                    }
+                        }
 
-		                } // end lchain path
-
-	                // ============================================================
-	                // HIFIASM MAX_N_CHAIN PER-READ FILTERING
-	                // ============================================================
-                // Reference: Hifiasm anchor.cpp:1804-1833, 191-220
-                //
-                // Apply quality-based filtering at the PER-READ level:
-                // - This happens AFTER chaining ALL read pairs
-                // - NOT during per-pair DP chaining
-                //
-                // Algorithm:
-                // 1. Sort all overlaps for this read by score (descending)
-                // 2. Group by overlap type (0-3): Internal, Left, Right, Contained
-                // 3. For each type, if count exceeds maxChainLimit:
-                //    - Record threshold score at position maxChainLimit
-                //    - Keep only overlaps with score >= threshold
-                //
-                // Example: maxChainLimit=150, coverage=30x
-                // - Type 0 (internal): 200 overlaps → keep top 150 by score
-                // - Type 1 (left): 50 overlaps → keep all (< 150)
-                // - Type 2 (right): 180 overlaps → keep top 150 by score
-                // - Type 3 (contained): 300 overlaps → keep top 150 + weak rescue
-                //
-	                // Note: max_n_chain + ocv_w rescue + r485 suppression were already applied in the lchain stage
-	                // (hifiasm_lchain_qgen_mcopy_fast_postfilter), so do not filter again here.
-
-	                for(auto& e : emittedForRead) {
-	                    localCandidates.push_back(e.candidate);
-	                    localAlignments.push_back(std::move(e.alignment));
-                        localSharedSeedScores.push_back(e.score);
-	                }
+                // Postfilter (max_n_chain + ocv_w rescue + r485 suppression) was
+                // already applied in hifiasm_lchain_qgen_mcopy_fast_postfilter.
+                for(auto& e : emittedForRead) {
+                    localCandidates.push_back(e.candidate);
+                    localAlignments.push_back(std::move(e.alignment));
+                    localSharedSeedScores.push_back(e.score);
+                }
             }
         }
     }
@@ -2929,13 +2653,13 @@ void Assembler::chainPafCandidates(
     const auto* hashTablePtr = invertedIndexData.hashTable.data();
     const uint64_t kmerLen = invertedIndexData.k;
     const double maxDriftRateLocal = invertedIndexData.maxDriftRate;
-	    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
-	    const uint64_t lowFreqThreshold = std::max<uint64_t>(
-	        2ULL, uint64_t(double(coveragePeak) * invertedIndexData.lowFreqMultiplier));
-	    const uint64_t highFreqThreshold = std::max<uint64_t>(
-	        1ULL, uint64_t(double(coveragePeak) * invertedIndexData.highFreqMultiplier));
-	    const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
-	    const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
+    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+    const uint64_t lowFreqThreshold = std::max<uint64_t>(
+        2ULL, uint64_t(double(coveragePeak) * invertedIndexData.lowFreqMultiplier));
+    const uint64_t highFreqThreshold = std::max<uint64_t>(
+        1ULL, uint64_t(double(coveragePeak) * invertedIndexData.highFreqMultiplier));
+    const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
+    const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
     const bool downsampleHighFrequencyMarkers =
         invertedIndexData.downsampleHighFrequencyMarkers &&
         invertedIndexData.highFrequencySampleDistance > 0 &&
@@ -2976,23 +2700,14 @@ void Assembler::chainPafCandidates(
     setupLoadBalancing(originalCandidates.size(), batchSize);
 
     vector<std::thread> threads;
-	    for(size_t tid = 0; tid < threadCount; tid++) {
-	        threads.emplace_back([&, tid]() {
-	            ThreadScratchpad scratch;
-	            vector<PafChainedCandidate>& localResults = threadResults[tid];
-	            struct PendingHighFrequencyMarker {
-	                uint64_t startIdx = 0;
-	                uint32_t count = 0;
-	                uint64_t hashKey = 0; // hifiasm sketch.cpp: tie-break key (count, hash)
-	                uint32_t posA = 0;
-	                uint32_t ordinalA = 0;
-	                uint32_t weight = 1;
-	                uint8_t isRcA = 0;
-	            };
-	            vector<PendingHighFrequencyMarker> highFrequencyStreak;
-	            highFrequencyStreak.reserve(64);
-	            vector<size_t> highFrequencyStreakWorkspace;
-	            highFrequencyStreakWorkspace.reserve(64);
+    for(size_t tid = 0; tid < threadCount; tid++) {
+        threads.emplace_back([&, tid]() {
+            ThreadScratchpad scratch;
+            vector<PafChainedCandidate>& localResults = threadResults[tid];
+            vector<PendingHighFrequencyMarker> highFrequencyStreak;
+            highFrequencyStreak.reserve(64);
+            vector<size_t> highFrequencyStreakWorkspace;
+            highFrequencyStreakWorkspace.reserve(64);
 
             uint64_t startBatch, endBatch;
             while(getNextBatch(startBatch, endBatch)) {
@@ -3004,166 +2719,95 @@ void Assembler::chainPafCandidates(
                     const ReadId readIdB = pair.readIds[1];
                     const bool pafSameStrand = pair.isSameStrand;
 
-	                    const OrientedReadId orientedReadIdA(readIdA, 0);
-	                    const OrientedReadId orientedReadIdB(readIdB, 0);
-	                    const auto& markersA = (*markers)[orientedReadIdA.getValue()];
-	                    const auto& markersB = (*markers)[orientedReadIdB.getValue()];
-	                    const bool haveCanonicalCache =
-	                        (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
-	                    const KmerId* canonicalIdsA = nullptr;
-	                    const uint8_t* canonicalIsRcA = nullptr;
-	                    size_t canonicalCountA = 0;
-	                    if(haveCanonicalCache) {
-	                        const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
-	                        const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
-	                        if(e >= b &&
-	                           e <= invertedIndexData.strand0CanonicalKmerIds.size() &&
-	                           e <= invertedIndexData.strand0CanonicalIsRc.size()) {
-	                            canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
-	                            canonicalIsRcA = invertedIndexData.strand0CanonicalIsRc.data() + b;
-	                            canonicalCountA = size_t(e - b);
-	                        }
-	                    }
+                    const OrientedReadId orientedReadIdA(readIdA, 0);
+                    const OrientedReadId orientedReadIdB(readIdB, 0);
+                    const auto& markersA = (*markers)[orientedReadIdA.getValue()];
+                    const auto& markersB = (*markers)[orientedReadIdB.getValue()];
+                    const bool haveCanonicalCache =
+                        (size_t(readIdA) + 1 < invertedIndexData.strand0CanonicalOffsets.size());
+                    const KmerId* canonicalIdsA = nullptr;
+                    const uint8_t* canonicalIsRcA = nullptr;
+                    size_t canonicalCountA = 0;
+                    if(haveCanonicalCache) {
+                        const uint64_t b = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA)];
+                        const uint64_t e = invertedIndexData.strand0CanonicalOffsets[size_t(readIdA) + 1];
+                        if(e >= b &&
+                           e <= invertedIndexData.strand0CanonicalKmerIds.size() &&
+                           e <= invertedIndexData.strand0CanonicalIsRc.size()) {
+                            canonicalIdsA = invertedIndexData.strand0CanonicalKmerIds.data() + b;
+                            canonicalIsRcA = invertedIndexData.strand0CanonicalIsRc.data() + b;
+                            canonicalCountA = size_t(e - b);
+                        }
+                    }
                     const auto& kmerIdsA = (*markerKmerIds)[orientedReadIdA.getValue()];
-                    
+
                     const size_t numMarkersA = canonicalIdsA ?
                         std::min(markersA.size(), canonicalCountA) :
                         std::min(markersA.size(), kmerIdsA.size());
                     const size_t numMarkersB = markersB.size();
-                    
-                    // Without markers on either side, no anchor chain is possible.
+
                     if(numMarkersA == 0 || numMarkersB == 0) continue;
 
                     const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
                     const uint64_t readLenB = reads->getReadRawSequenceLength(readIdB);
 
-                    // Collect k-mer matches between the pair
                     scratch.clear();
                     scratch.flatHits.reserve(numMarkersA);
-	                    highFrequencyStreak.clear();
-	                    int64_t lastNonHighBoundaryPos = -1;
+                    highFrequencyStreak.clear();
+                    int64_t lastNonHighBoundaryPos = -1;
 
-	                    auto computeHitWeight = [&](const uint32_t count) -> uint32_t {
-	                        return computeInvertedIndexHitWeight(
-	                            count,
-	                            lowFreqThreshold,
-	                            highFreqThreshold,
-	                            highFreqWeightUnit,
-	                            invertedIndexData.rareKmerWeight,
-	                            invertedIndexData.weightLut,
-	                            invertedIndexData.weightExponent);
-	                    };
+                    auto computeHitWeight = [&](uint32_t count) -> uint32_t {
+                        return computeInvertedIndexHitWeight(
+                            count, lowFreqThreshold, highFreqThreshold,
+                            highFreqWeightUnit, invertedIndexData.rareKmerWeight,
+                            invertedIndexData.weightLut, invertedIndexData.weightExponent);
+                    };
 
-		                    auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
-		                        const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
-		                        for (uint32_t j = 0; j < markerInfo.count; ++j) {
-		                            if (compactOccs[j].readId == readIdB) {
-		                                const uint32_t posBEncoded = compactOccs[j].position;
-		                                const uint32_t posB = posBEncoded & 0x7fffffffU;
-		                                const uint8_t isRcB = uint8_t(posBEncoded >> 31);
-		                                scratch.flatHits.push_back(
-		                                    {readIdB, markerInfo.posA, posB, markerInfo.ordinalA, markerInfo.weight, markerInfo.isRcA, isRcB});
-		                            }
-		                        }
-		                    };
+                    // PAF path: emit only hits matching the specific partner readIdB.
+                    auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
+                        const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
+                        for (uint32_t j = 0; j < markerInfo.count; ++j) {
+                            if (compactOccs[j].readId == readIdB) {
+                                const uint32_t posBEncoded = compactOccs[j].position;
+                                const uint32_t posB = posBEncoded & 0x7fffffffU;
+                                const uint8_t isRcB = uint8_t(posBEncoded >> 31);
+                                scratch.flatHits.push_back(
+                                    {readIdB, markerInfo.posA, posB, markerInfo.ordinalA,
+                                     markerInfo.weight, markerInfo.isRcA, isRcB});
+                            }
+                        }
+                    };
 
-	                    auto flushHighFrequencyStreak = [&](const uint32_t rightBoundaryPos) {
-	                        if (highFrequencyStreak.empty()) {
-	                            return;
-	                        }
+                    auto doFlushStreak = [&](uint32_t rightBoundaryPos) {
+                        flushHighFrequencyStreak(
+                            highFrequencyStreak, highFrequencyStreakWorkspace,
+                            lastNonHighBoundaryPos, rightBoundaryPos,
+                            highFrequencySampleDistance, maxHighFrequencyPerStreak,
+                            [&](const PendingHighFrequencyMarker& m, uint32_t span) {
+                                if (span > 0 && m.count >= span) return;
+                                appendMarkerHits(m);
+                            });
+                    };
 
-	                        // Safety: Validate sample distance to prevent division by zero
-	                        if (highFrequencySampleDistance == 0) {
-	                            // Should never happen (protected by max(1U, ...) at initialization)
-	                            // But if config is corrupt, keep all markers as fallback
-	                            for(const auto& m : highFrequencyStreak) {
-	                                appendMarkerHits(m);
-	                            }
-	                            highFrequencyStreak.clear();
-	                            return;
-	                        }
+                    for(size_t i = 0; i < numMarkersA; i++) {
+                        KmerId canonicalKId;
+                        uint8_t isRcA = 0;
+                        if(canonicalIdsA) {
+                            canonicalKId = canonicalIdsA[i];
+                            isRcA = canonicalIsRcA ? canonicalIsRcA[i] : uint8_t(0);
+                        } else {
+                            KmerId currentKId = kmerIdsA[i];
+                            KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                            canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
+                            isRcA = uint8_t(currentKId > rcKId);
+                        }
 
-	                        const uint32_t leftBoundaryPos = (lastNonHighBoundaryPos >= 0) ? uint32_t(lastNonHighBoundaryPos) : 0U;
-	                        const uint32_t span = (rightBoundaryPos > leftBoundaryPos) ? (rightBoundaryPos - leftBoundaryPos) : 0U;
-	                        uint32_t keep = uint32_t(double(span) / double(highFrequencySampleDistance) + 0.499);
-	                        if (keep > maxHighFrequencyPerStreak) {
-	                            keep = maxHighFrequencyPerStreak;
-	                        }
-	                        if (keep == 0) {
-	                            for(const auto& m : highFrequencyStreak) {
-	                                appendMarkerHits(m);
-	                            }
-	                            highFrequencyStreak.clear();
-	                            return;
-	                        }
-	                        auto appendIfUseful = [&](const PendingHighFrequencyMarker& m) {
-	                            if (span > 0 && m.count >= span) {
-	                                return;
-	                            }
-	                            appendMarkerHits(m);
-	                        };
+                        const uint32_t posA = markersA[i].position;
+                        uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
+                        uint64_t startIdx = 0;
+                        uint32_t count = 0;
+                        bool found = false;
 
-	                        const size_t selectedCount = std::min<size_t>(highFrequencyStreak.size(), keep);
-	                        if(selectedCount >= highFrequencyStreak.size()) {
-	                            for(const auto& m : highFrequencyStreak) {
-	                                appendIfUseful(m);
-	                            }
-	                            highFrequencyStreak.clear();
-	                            return;
-	                        }
-
-	                        highFrequencyStreakWorkspace.clear();
-	                        highFrequencyStreakWorkspace.reserve(highFrequencyStreak.size());
-	                        for(size_t i = 0; i < highFrequencyStreak.size(); ++i) {
-	                            highFrequencyStreakWorkspace.push_back(i);
-	                        }
-
-	                        auto better = [&](const size_t a, const size_t b) {
-	                            const auto& ma = highFrequencyStreak[a];
-	                            const auto& mb = highFrequencyStreak[b];
-	                            if(ma.count != mb.count) {
-	                                return ma.count < mb.count;
-	                            }
-	                            return ma.hashKey < mb.hashKey;
-	                        };
-	                        std::nth_element(
-	                            highFrequencyStreakWorkspace.begin(),
-	                            highFrequencyStreakWorkspace.begin() + selectedCount,
-	                            highFrequencyStreakWorkspace.end(),
-	                            better);
-	                        highFrequencyStreakWorkspace.resize(selectedCount);
-	                        std::sort(
-	                            highFrequencyStreakWorkspace.begin(),
-	                            highFrequencyStreakWorkspace.end(),
-	                            [&](const size_t a, const size_t b) {
-	                                return highFrequencyStreak[a].posA < highFrequencyStreak[b].posA;
-	                            });
-	                        for(const size_t idx : highFrequencyStreakWorkspace) {
-	                            appendIfUseful(highFrequencyStreak[idx]);
-	                        }
-	                        highFrequencyStreak.clear();
-	                    };
-
-	                    for(size_t i = 0; i < numMarkersA; i++) {
-	                        KmerId canonicalKId;
-	                        uint8_t isRcA = 0;
-	                        if(canonicalIdsA) {
-	                            canonicalKId = canonicalIdsA[i];
-	                            isRcA = canonicalIsRcA ? canonicalIsRcA[i] : uint8_t(0);
-	                        } else {
-	                            KmerId currentKId = kmerIdsA[i];
-	                            KmerId rcKId = getRcKmerId(currentKId, kmerLen);
-	                            canonicalKId = (currentKId < rcKId) ? currentKId : rcKId;
-	                            isRcA = uint8_t(currentKId > rcKId);
-	                        }
-	                        
-	                        const uint32_t posA = markersA[i].position;
-	                        uint64_t slotIdx = hashKmer(canonicalKId) & hashMask;
-	                        uint64_t startIdx = 0;
-	                        uint32_t count = 0;
-	                        bool found = false;
-
-                        // Search hash table for this k-mer
                         while(!hashTablePtr[slotIdx].empty) {
                             if(hashTablePtr[slotIdx].key == canonicalKId) {
                                 startIdx = hashTablePtr[slotIdx].start;
@@ -3176,29 +2820,29 @@ void Assembler::chainPafCandidates(
 
                         if(!found) {
                             if(downsampleHighFrequencyMarkers) {
-                                flushHighFrequencyStreak(posA);
+                                doFlushStreak(posA);
                                 lastNonHighBoundaryPos = posA;
                             }
                             continue;
-	                        }
+                        }
 
-	                        const uint32_t hitWeight = computeHitWeight(count);
-	                        const uint64_t kmerHashKey = hifiasmYakHash64_64(foldKmerIdToUint64(canonicalKId));
-		                        if(downsampleHighFrequencyMarkers && count > highFreqDownsampleThreshold) {
-		                            highFrequencyStreak.push_back({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
-		                            continue;
-		                        }
+                        const uint32_t hitWeight = computeHitWeight(count);
+                        const uint64_t kmerHashKey = hifiasmYakHash64_64(foldKmerIdToUint64(canonicalKId));
+                        if(downsampleHighFrequencyMarkers && count > highFreqDownsampleThreshold) {
+                            highFrequencyStreak.push_back({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
+                            continue;
+                        }
 
-	                        if(downsampleHighFrequencyMarkers) {
-	                            flushHighFrequencyStreak(posA);
-	                        }
-	                        appendMarkerHits({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
-	                        lastNonHighBoundaryPos = posA;
-	                    }
+                        if(downsampleHighFrequencyMarkers) {
+                            doFlushStreak(posA);
+                        }
+                        appendMarkerHits({startIdx, count, kmerHashKey, posA, uint32_t(i), hitWeight, isRcA});
+                        lastNonHighBoundaryPos = posA;
+                    }
                     if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
                         const uint32_t readLenABoundary = uint32_t(std::min<uint64_t>(
                             readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
-                        flushHighFrequencyStreak(readLenABoundary);
+                        doFlushStreak(readLenABoundary);
                     }
 
                     if(scratch.flatHits.empty()) {
