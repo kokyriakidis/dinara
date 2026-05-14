@@ -297,8 +297,9 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Reads.minReadLength",
         value<int>(&readsOptions.minReadLength)->
-        default_value(10000),
-        "Read length cutoff. Shorter reads are discarded.")
+        default_value(1000),
+        "Read length cutoff. Shorter reads are discarded. "
+        "Hifiasm default: 1000 (min_read_len).")
 
         ("Reads.desiredCoverage",
         value<string>(&readsOptions.desiredCoverageString)->
