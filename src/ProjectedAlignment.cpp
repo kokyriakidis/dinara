@@ -302,7 +302,7 @@ void ProjectedAlignment::constructQuickRawSparse()
     // Begin a new CIGAR entry in the store if requested.
     const bool storeCigar = (cigarStore != nullptr);
     if(storeCigar) {
-        cigarId = cigarStore->beginAlignment();
+        cigarOffset = cigarStore->beginAlignment();
     }
 
     // Scoring parameters (hoisted out of the per-segment loop).
@@ -477,11 +477,12 @@ void ProjectedAlignment::constructQuickRawSparse()
         DINARA_ASSERT(position1 == asciiSequence1.size());
     }
 
-    // Verify CIGAR consistency: consumed bases must match totalLength.
-    if(storeCigar && cigarId != uint32_t(-1)) {
+    // Finalize CIGAR and verify consistency.
+    if(storeCigar && cigarOffset != uint32_t(-1)) {
+        cigarTokenCount = cigarStore->tokensSince(cigarOffset);
         uint64_t cigarConsumed0 = 0;
         uint64_t cigarConsumed1 = 0;
-        cigarStore->forEachOp(cigarId, [&](uint8_t op, uint32_t len) {
+        cigarStore->forEachOp(cigarOffset, cigarTokenCount, [&](uint8_t op, uint32_t len) {
             switch(op) {
                 case 0: case 1: cigarConsumed0 += len; cigarConsumed1 += len; break;
                 case 2: cigarConsumed1 += len; break;

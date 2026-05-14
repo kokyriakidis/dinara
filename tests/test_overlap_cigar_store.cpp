@@ -19,10 +19,10 @@ using namespace dinara;
 
 // Helper: walk a CIGAR and return (consumed_read0, consumed_read1).
 static std::pair<uint64_t, uint64_t> consumedBases(
-    const OverlapCigarStore& store, uint32_t cigarId)
+    const OverlapCigarStore& store, uint32_t offset, uint32_t count)
 {
     uint64_t c0 = 0, c1 = 0;
-    store.forEachOp(cigarId, [&](uint8_t op, uint32_t len) {
+    store.forEachOp(offset, count, [&](uint8_t op, uint32_t len) {
         switch(op) {
             case 0: // match
             case 1: // mismatch
@@ -38,10 +38,10 @@ static std::pair<uint64_t, uint64_t> consumedBases(
 
 // Helper: collect all (op, len) pairs from forEachOp.
 static std::vector<std::pair<uint8_t, uint32_t>> collectOps(
-    const OverlapCigarStore& store, uint32_t cigarId)
+    const OverlapCigarStore& store, uint32_t offset, uint32_t count)
 {
     std::vector<std::pair<uint8_t, uint32_t>> ops;
-    store.forEachOp(cigarId, [&](uint8_t op, uint32_t len) {
+    store.forEachOp(offset, count, [&](uint8_t op, uint32_t len) {
         ops.emplace_back(op, len);
     });
     return ops;
@@ -75,15 +75,15 @@ TEST_CASE("CigarToken encoding and decoding", "[CigarStore]") {
 
 TEST_CASE("Segment case 1: len0=0, len1=0 — no tokens emitted", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Simulate: both sides empty, nothing emitted (just like the code does).
     // No pushOp calls.
 
-    auto tokens = store.getTokens(id);
+    auto tokens = store.getTokens(off, store.tokensSince(off));
     REQUIRE(tokens.size() == 0);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 0);
     REQUIRE(c1 == 0);
 }
@@ -94,17 +94,17 @@ TEST_CASE("Segment case 1: len0=0, len1=0 — no tokens emitted", "[CigarStore]"
 
 TEST_CASE("Segment case 2: len0>0, len1=0 — deletion", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     uint32_t len0 = 42;
     store.pushDeletion(len0);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0].first == 3);  // deletion
     REQUIRE(ops[0].second == 42);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 42);
     REQUIRE(c1 == 0);
 }
@@ -115,17 +115,17 @@ TEST_CASE("Segment case 2: len0>0, len1=0 — deletion", "[CigarStore]") {
 
 TEST_CASE("Segment case 3: len0=0, len1>0 — insertion", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     uint32_t len1 = 37;
     store.pushInsertion(len1);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0].first == 2);  // insertion
     REQUIRE(ops[0].second == 37);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 0);
     REQUIRE(c1 == 37);
 }
@@ -136,17 +136,17 @@ TEST_CASE("Segment case 3: len0=0, len1>0 — insertion", "[CigarStore]") {
 
 TEST_CASE("Segment case 4: identical sequences — match run", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     uint32_t len = 1000;
     store.pushMatch(len);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0].first == 0);  // match
     REQUIRE(ops[0].second == 1000);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 1000);
     REQUIRE(c1 == 1000);
 }
@@ -159,19 +159,19 @@ TEST_CASE("Segment case 5: same length, with mismatches", "[CigarStore]") {
     // Simulate: ACGTACGT vs ACGAACGT (mismatch at position 3)
     // The code would emit: match(3), mismatch(1), match(4)
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     store.pushMatch(3);
     store.pushMismatch(1);
     store.pushMatch(4);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 3);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(3)));
     REQUIRE(ops[1] == std::make_pair(uint8_t(1), uint32_t(1)));
     REQUIRE(ops[2] == std::make_pair(uint8_t(0), uint32_t(4)));
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 8);
     REQUIRE(c1 == 8);
 }
@@ -184,14 +184,14 @@ TEST_CASE("Segment case 6: different lengths, with indels", "[CigarStore]") {
     // Simulate A*PA2 CIGAR: 50M 2I 3D 45M (len0=98, len1=97)
     // M block with all matches for simplicity.
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     store.pushMatch(50);
     store.pushInsertion(2);
     store.pushDeletion(3);
     store.pushMatch(45);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 4);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(50)));
     REQUIRE(ops[1] == std::make_pair(uint8_t(2), uint32_t(2)));
@@ -200,7 +200,7 @@ TEST_CASE("Segment case 6: different lengths, with indels", "[CigarStore]") {
 
     // read0 consumes: 50 (match) + 3 (del) + 45 (match) = 98
     // read1 consumes: 50 (match) + 2 (ins) + 45 (match) = 97
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 98);
     REQUIRE(c1 == 97);
 }
@@ -211,7 +211,7 @@ TEST_CASE("Segment case 6: different lengths, with indels", "[CigarStore]") {
 
 TEST_CASE("Multi-segment stitching: identical + aligned + identical", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Segment 0: identical, 500 bases
     store.pushMatch(500);
@@ -231,7 +231,7 @@ TEST_CASE("Multi-segment stitching: identical + aligned + identical", "[CigarSto
 
     // forEachOp should coalesce the match at end of seg0 with match at start of seg1,
     // and the match at end of seg1 with match at start of seg2.
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
 
     // Expected after coalescing:
     // match(500+30=530), mismatch(1), match(39), mismatch(1), match(29),
@@ -246,14 +246,14 @@ TEST_CASE("Multi-segment stitching: identical + aligned + identical", "[CigarSto
     REQUIRE(ops[6] == std::make_pair(uint8_t(0), uint32_t(397)));
 
     // Total: read0 = 530+1+39+1+29+397 = 997, read1 = 997+3 = 1000
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 997);
     REQUIRE(c1 == 1000);
 }
 
 TEST_CASE("Multi-segment: deletion segment between two match segments", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Segment 0: identical, 200 bases
     store.pushMatch(200);
@@ -264,13 +264,13 @@ TEST_CASE("Multi-segment: deletion segment between two match segments", "[CigarS
     // Segment 2: identical, 200 bases
     store.pushMatch(200);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 3);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(200)));
     REQUIRE(ops[1] == std::make_pair(uint8_t(3), uint32_t(5)));
     REQUIRE(ops[2] == std::make_pair(uint8_t(0), uint32_t(200)));
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 405);
     REQUIRE(c1 == 400);
 }
@@ -281,13 +281,13 @@ TEST_CASE("Multi-segment: deletion segment between two match segments", "[CigarS
 
 TEST_CASE("Long match run exceeding MAX_LEN is split and coalesced", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     uint32_t longLen = 20000; // > 16383
     store.pushMatch(longLen);
 
     // Raw tokens should be split.
-    auto tokens = store.getTokens(id);
+    auto tokens = store.getTokens(off, store.tokensSince(off));
     REQUIRE(tokens.size() == 2);
     REQUIRE(tokens[0].op() == 0);
     REQUIRE(tokens[0].len() == CigarToken::MAX_LEN);
@@ -295,26 +295,26 @@ TEST_CASE("Long match run exceeding MAX_LEN is split and coalesced", "[CigarStor
     REQUIRE(tokens[1].len() == longLen - CigarToken::MAX_LEN);
 
     // forEachOp should coalesce back.
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(20000)));
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 20000);
     REQUIRE(c1 == 20000);
 }
 
 TEST_CASE("Very long run: 50000 bases", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     store.pushMatch(50000);
 
     // Should need ceil(50000/16383) = 4 tokens.
-    auto tokens = store.getTokens(id);
+    auto tokens = store.getTokens(off, store.tokensSince(off));
     REQUIRE(tokens.size() == 4);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0].second == 50000);
 }
@@ -327,11 +327,11 @@ TEST_CASE("Merge two thread-local stores", "[CigarStore]") {
     OverlapCigarStore store0, store1;
 
     // Thread 0: one alignment with match(100)
-    uint32_t id0 = store0.beginAlignment();
+    uint32_t off0 = store0.beginAlignment();
     store0.pushMatch(100);
 
     // Thread 1: one alignment with match(50), ins(3), match(47)
-    uint32_t id1 = store1.beginAlignment();
+    uint32_t off1 = store1.beginAlignment();
     store1.pushMatch(50);
     store1.pushInsertion(3);
     store1.pushMatch(47);
@@ -343,15 +343,14 @@ TEST_CASE("Merge two thread-local stores", "[CigarStore]") {
 
     REQUIRE(base0 == 0);
     REQUIRE(base1 == 1);
-    REQUIRE(global.alignmentCount() == 2);
-
+    
     // Verify alignment 0 (from thread 0).
-    auto ops0 = collectOps(global, base0 + id0);
+    auto ops0 = collectOps(global, base0 + off0, store0.tokensSince(off0));
     REQUIRE(ops0.size() == 1);
     REQUIRE(ops0[0] == std::make_pair(uint8_t(0), uint32_t(100)));
 
     // Verify alignment 1 (from thread 1).
-    auto ops1 = collectOps(global, base1 + id1);
+    auto ops1 = collectOps(global, base1 + off1, store1.tokensSince(off1));
     REQUIRE(ops1.size() == 3);
     REQUIRE(ops1[0] == std::make_pair(uint8_t(0), uint32_t(50)));
     REQUIRE(ops1[1] == std::make_pair(uint8_t(2), uint32_t(3)));
@@ -379,12 +378,11 @@ TEST_CASE("Merge multiple threads with multiple alignments each", "[CigarStore]"
     uint32_t base0 = global.merge(t0);
     uint32_t base1 = global.merge(t1);
 
-    REQUIRE(global.alignmentCount() == 5);
-    REQUIRE(base0 == 0);
+        REQUIRE(base0 == 0);
     REQUIRE(base1 == 2);
 
     // Spot-check: thread1's third alignment (global id = 2 + 2 = 4)
-    auto ops = collectOps(global, base1 + t1_a2);
+    auto ops = collectOps(global, base1 + t1_a2, t1.tokensSince(t1_a2));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(20)));
 }
@@ -395,40 +393,40 @@ TEST_CASE("Merge multiple threads with multiple alignments each", "[CigarStore]"
 
 TEST_CASE("Coalescing: consecutive match segments merge", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // 5 consecutive identical segments of 100 bases each.
     for(int i = 0; i < 5; i++) {
         store.pushMatch(100);
     }
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(500)));
 }
 
 TEST_CASE("Coalescing: consecutive deletions from adjacent empty segments", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Two adjacent segments where read1 is empty.
     store.pushDeletion(10);
     store.pushDeletion(15);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
     REQUIRE(ops[0] == std::make_pair(uint8_t(3), uint32_t(25)));
 }
 
 TEST_CASE("No coalescing across different ops", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     store.pushMatch(100);
     store.pushMismatch(1);
     store.pushMatch(100);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 3);
 }
 
@@ -438,17 +436,17 @@ TEST_CASE("No coalescing across different ops", "[CigarStore]") {
 
 TEST_CASE("Single-base mismatch", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMismatch(1);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 1);
     REQUIRE(c1 == 1);
 }
 
 TEST_CASE("Alternating match/mismatch (worst case for token count)", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // 100 bases, alternating match/mismatch.
     for(int i = 0; i < 100; i++) {
@@ -457,32 +455,32 @@ TEST_CASE("Alternating match/mismatch (worst case for token count)", "[CigarStor
     }
 
     // No coalescing possible — all ops alternate.
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 100);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 100);
     REQUIRE(c1 == 100);
 }
 
 TEST_CASE("Empty alignment (no segments)", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
-    auto tokens = store.getTokens(id);
+    auto tokens = store.getTokens(off, store.tokensSince(off));
     REQUIRE(tokens.size() == 0);
 
-    auto ops = collectOps(store, id);
+    auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 0);
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 0);
     REQUIRE(c1 == 0);
 }
 
-TEST_CASE("getTokens with invalid cigarId returns empty", "[CigarStore]") {
+TEST_CASE("getTokens with invalid offset returns empty", "[CigarStore]") {
     OverlapCigarStore store;
-    auto tokens = store.getTokens(999);
+    auto tokens = store.getTokens(uint32_t(-1), uint32_t(-1));
     REQUIRE(tokens.size() == 0);
 }
 
@@ -492,11 +490,11 @@ TEST_CASE("getTokens with invalid cigarId returns empty", "[CigarStore]") {
 
 TEST_CASE("forEachOpWithPositions: simple match", "[CigarStore][Positions]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
 
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.forEachOpWithPositions(id, 1000, 2000, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.forEachOpWithPositions(off, store.tokensSince(off), 1000, 2000, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -509,13 +507,13 @@ TEST_CASE("forEachOpWithPositions: simple match", "[CigarStore][Positions]") {
 
 TEST_CASE("forEachOpWithPositions: match + ins + match", "[CigarStore][Positions]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushInsertion(3);
     store.pushMatch(50);
 
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.forEachOpWithPositions(id, 100, 200, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.forEachOpWithPositions(off, store.tokensSince(off), 100, 200, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -541,13 +539,13 @@ TEST_CASE("forEachOpWithPositions: match + ins + match", "[CigarStore][Positions
 
 TEST_CASE("forEachOpWithPositions: match + del + match", "[CigarStore][Positions]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(40);
     store.pushDeletion(5);
     store.pushMatch(40);
 
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.forEachOpWithPositions(id, 0, 0, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.forEachOpWithPositions(off, store.tokensSince(off), 0, 0, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -575,83 +573,83 @@ TEST_CASE("forEachOpWithPositions: match + del + match", "[CigarStore][Positions
 
 TEST_CASE("queryToTarget: positions in match region", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
 
     // read0 starts at 1000, read1 starts at 5000.
-    REQUIRE(store.queryToTarget(id, 1000, 5000, 1000) == 5000);
-    REQUIRE(store.queryToTarget(id, 1000, 5000, 1050) == 5050);
-    REQUIRE(store.queryToTarget(id, 1000, 5000, 1099) == 5099);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 1000, 5000, 1000) == 5000);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 1000, 5000, 1050) == 5050);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 1000, 5000, 1099) == 5099);
 }
 
 TEST_CASE("queryToTarget: position in deletion returns -1", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushDeletion(10);
     store.pushMatch(50);
 
     // Position 55 is inside the deletion (read0 positions 50..59).
-    REQUIRE(store.queryToTarget(id, 0, 0, 55) == uint64_t(-1));
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 55) == uint64_t(-1));
     // Position 60 is in the second match block.
-    REQUIRE(store.queryToTarget(id, 0, 0, 60) == 50);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 60) == 50);
     // Position 70 maps to 60.
-    REQUIRE(store.queryToTarget(id, 0, 0, 70) == 60);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 70) == 60);
 }
 
 TEST_CASE("queryToTarget: insertion shifts target positions", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushInsertion(5);
     store.pushMatch(50);
 
     // Before insertion: 1:1 mapping.
-    REQUIRE(store.queryToTarget(id, 0, 0, 25) == 25);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 25) == 25);
     // After insertion: target is shifted by 5.
-    REQUIRE(store.queryToTarget(id, 0, 0, 50) == 55);
-    REQUIRE(store.queryToTarget(id, 0, 0, 75) == 80);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 50) == 55);
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 75) == 80);
 }
 
 TEST_CASE("targetToQuery: positions in match region", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
 
-    REQUIRE(store.targetToQuery(id, 0, 0, 0) == 0);
-    REQUIRE(store.targetToQuery(id, 0, 0, 50) == 50);
-    REQUIRE(store.targetToQuery(id, 0, 0, 99) == 99);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 0) == 0);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 50) == 50);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 99) == 99);
 }
 
 TEST_CASE("targetToQuery: position in insertion returns -1", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushInsertion(10);
     store.pushMatch(50);
 
     // Position 55 is inside the insertion (read1 positions 50..59).
-    REQUIRE(store.targetToQuery(id, 0, 0, 55) == uint64_t(-1));
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 55) == uint64_t(-1));
     // Position 60 is in the second match block.
-    REQUIRE(store.targetToQuery(id, 0, 0, 60) == 50);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 60) == 50);
 }
 
 TEST_CASE("targetToQuery: deletion shifts query positions", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushDeletion(5);
     store.pushMatch(50);
 
-    REQUIRE(store.targetToQuery(id, 0, 0, 25) == 25);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 25) == 25);
     // After deletion: query is shifted by 5.
-    REQUIRE(store.targetToQuery(id, 0, 0, 50) == 55);
-    REQUIRE(store.targetToQuery(id, 0, 0, 75) == 80);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 50) == 55);
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 75) == 80);
 }
 
 TEST_CASE("queryToTarget and targetToQuery are inverses", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
     store.pushMismatch(5);
     store.pushMatch(200);
@@ -664,9 +662,9 @@ TEST_CASE("queryToTarget and targetToQuery are inverses", "[CigarStore][CoordMap
     // targetToQuery(queryToTarget(pos)) should return pos.
     uint64_t r0 = 500, r1 = 1000;
     for(uint64_t qpos = r0; qpos < r0 + 100 + 5 + 200; qpos++) {
-        uint64_t tpos = store.queryToTarget(id, r0, r1, qpos);
+        uint64_t tpos = store.queryToTarget(off, store.tokensSince(off), r0, r1, qpos);
         REQUIRE(tpos != uint64_t(-1));
-        uint64_t back = store.targetToQuery(id, r0, r1, tpos);
+        uint64_t back = store.targetToQuery(off, store.tokensSince(off), r0, r1, tpos);
         REQUIRE(back == qpos);
     }
 }
@@ -677,19 +675,19 @@ TEST_CASE("queryToTarget and targetToQuery are inverses", "[CigarStore][CoordMap
 
 TEST_CASE("walkRange: full range equals forEachOpWithPositions", "[CigarStore][WalkRange]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushMismatch(2);
     store.pushMatch(48);
 
     // Walk the full range [0, 100).
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> rangeOps;
-    store.walkRange(id, 0, 0, 0, 100, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, store.tokensSince(off), 0, 0, 0, 100, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         rangeOps.emplace_back(op, len, r0, r1);
     });
 
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> fullOps;
-    store.forEachOpWithPositions(id, 0, 0, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.forEachOpWithPositions(off, store.tokensSince(off), 0, 0, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         fullOps.emplace_back(op, len, r0, r1);
     });
 
@@ -698,7 +696,7 @@ TEST_CASE("walkRange: full range equals forEachOpWithPositions", "[CigarStore][W
 
 TEST_CASE("walkRange: sub-range clips ops", "[CigarStore][WalkRange]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
     store.pushMismatch(10);
     store.pushMatch(100);
@@ -706,7 +704,7 @@ TEST_CASE("walkRange: sub-range clips ops", "[CigarStore][WalkRange]") {
     // Walk [90, 115) — clips into the first match, all of the mismatch,
     // and the start of the second match.
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.walkRange(id, 0, 0, 90, 115, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, store.tokensSince(off), 0, 0, 90, 115, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -732,7 +730,7 @@ TEST_CASE("walkRange: sub-range clips ops", "[CigarStore][WalkRange]") {
 
 TEST_CASE("walkRange: insertion within range is reported", "[CigarStore][WalkRange]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushInsertion(5);
     store.pushMatch(50);
@@ -740,7 +738,7 @@ TEST_CASE("walkRange: insertion within range is reported", "[CigarStore][WalkRan
     // Walk [40, 60) — should see tail of first match, the insertion, and
     // start of second match.
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.walkRange(id, 0, 0, 40, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, store.tokensSince(off), 0, 0, 40, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -765,14 +763,14 @@ TEST_CASE("walkRange: insertion within range is reported", "[CigarStore][WalkRan
 
 TEST_CASE("walkRange: deletion within range", "[CigarStore][WalkRange]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushDeletion(5);
     store.pushMatch(50);
 
     // Walk [45, 60) — tail of first match, deletion, start of second match.
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.walkRange(id, 0, 0, 45, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, store.tokensSince(off), 0, 0, 45, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -813,10 +811,10 @@ static std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> collectCur
 
 // Helper: collect ops from walkRange (non-cursor).
 static std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> collectWalkRangeOps(
-    const OverlapCigarStore& store, uint32_t id, uint64_t r0s, uint64_t r1s, uint64_t qs, uint64_t qe)
+    const OverlapCigarStore& store, uint32_t off, uint32_t cnt, uint64_t r0s, uint64_t r1s, uint64_t qs, uint64_t qe)
 {
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.walkRange(id, r0s, r1s, qs, qe, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, cnt, r0s, r1s, qs, qe, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
     return ops;
@@ -824,7 +822,7 @@ static std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> collectWal
 
 TEST_CASE("OverlapCigarStore::Cursor: matches walkRange for full range", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushMismatch(2);
     store.pushInsertion(3);
@@ -833,16 +831,16 @@ TEST_CASE("OverlapCigarStore::Cursor: matches walkRange for full range", "[Cigar
     store.pushMatch(50);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     auto cursorOps = collectCursorOps(store, cur, 0, 155);
-    auto walkOps = collectWalkRangeOps(store, id, 0, 0, 0, 155);
+    auto walkOps = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 0, 155);
     REQUIRE(cursorOps == walkOps);
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: sliding window forward", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     // 500 bases: match(200), mismatch(5), match(100), ins(3), match(192)
     store.pushMatch(200);
     store.pushMismatch(5);
@@ -851,7 +849,7 @@ TEST_CASE("OverlapCigarStore::Cursor: sliding window forward", "[CigarStore][Cur
     store.pushMatch(192);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     // Slide a 100-base window across the CIGAR.
     for(uint64_t s = 0; s < 497; s += 50) {
@@ -859,108 +857,108 @@ TEST_CASE("OverlapCigarStore::Cursor: sliding window forward", "[CigarStore][Cur
         if(e > 497) e = 497;
 
         auto cursorOps = collectCursorOps(store, cur, s, e);
-        auto walkOps = collectWalkRangeOps(store, id, 0, 0, s, e);
+        auto walkOps = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, s, e);
         REQUIRE(cursorOps == walkOps);
     }
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: backward seek for overlapping windows", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
     store.pushMismatch(10);
     store.pushMatch(100);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     // Walk [50, 150) first.
     auto ops1 = collectCursorOps(store, cur, 50, 150);
-    auto expected1 = collectWalkRangeOps(store, id, 0, 0, 50, 150);
+    auto expected1 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 50, 150);
     REQUIRE(ops1 == expected1);
 
     // Now walk [30, 130) — overlaps and starts before the cursor.
     auto ops2 = collectCursorOps(store, cur, 30, 130);
-    auto expected2 = collectWalkRangeOps(store, id, 0, 0, 30, 130);
+    auto expected2 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 30, 130);
     REQUIRE(ops2 == expected2);
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: with non-zero start positions", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(100);
     store.pushDeletion(5);
     store.pushMatch(100);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 1000, 5000, store);
+    cur.reset(off, store.tokensSince(off), 1000, 5000, store);
 
     // Walk [1050, 1150).
     auto cursorOps = collectCursorOps(store, cur, 1050, 1150);
-    auto walkOps = collectWalkRangeOps(store, id, 1000, 5000, 1050, 1150);
+    auto walkOps = collectWalkRangeOps(store, off, store.tokensSince(off), 1000, 5000, 1050, 1150);
     REQUIRE(cursorOps == walkOps);
 
     // Walk [1100, 1200).
     auto cursorOps2 = collectCursorOps(store, cur, 1100, 1200);
-    auto walkOps2 = collectWalkRangeOps(store, id, 1000, 5000, 1100, 1200);
+    auto walkOps2 = collectWalkRangeOps(store, off, store.tokensSince(off), 1000, 5000, 1100, 1200);
     REQUIRE(cursorOps2 == walkOps2);
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: sliding window across insertion", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushInsertion(10);
     store.pushMatch(50);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     // Window [0, 40) — before insertion.
     auto ops1 = collectCursorOps(store, cur, 0, 40);
-    auto exp1 = collectWalkRangeOps(store, id, 0, 0, 0, 40);
+    auto exp1 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 0, 40);
     REQUIRE(ops1 == exp1);
 
     // Window [40, 80) — spans the insertion point.
     auto ops2 = collectCursorOps(store, cur, 40, 80);
-    auto exp2 = collectWalkRangeOps(store, id, 0, 0, 40, 80);
+    auto exp2 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 40, 80);
     REQUIRE(ops2 == exp2);
 
     // Window [60, 100) — after insertion.
     auto ops3 = collectCursorOps(store, cur, 60, 100);
-    auto exp3 = collectWalkRangeOps(store, id, 0, 0, 60, 100);
+    auto exp3 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 60, 100);
     REQUIRE(ops3 == exp3);
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: sliding window across deletion", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(50);
     store.pushDeletion(10);
     store.pushMatch(50);
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     // Window [0, 40).
     auto ops1 = collectCursorOps(store, cur, 0, 40);
-    auto exp1 = collectWalkRangeOps(store, id, 0, 0, 0, 40);
+    auto exp1 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 0, 40);
     REQUIRE(ops1 == exp1);
 
     // Window [40, 80) — spans the deletion.
     auto ops2 = collectCursorOps(store, cur, 40, 80);
-    auto exp2 = collectWalkRangeOps(store, id, 0, 0, 40, 80);
+    auto exp2 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 40, 80);
     REQUIRE(ops2 == exp2);
 
     // Window [70, 110) — after deletion.
     auto ops3 = collectCursorOps(store, cur, 70, 110);
-    auto exp3 = collectWalkRangeOps(store, id, 0, 0, 70, 110);
+    auto exp3 = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, 70, 110);
     REQUIRE(ops3 == exp3);
 }
 
 TEST_CASE("OverlapCigarStore::Cursor: many small windows (phasing-like pattern)", "[CigarStore][Cursor]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Realistic-ish CIGAR: ~5000 bases with scattered variants.
     store.pushMatch(800);
@@ -979,7 +977,7 @@ TEST_CASE("OverlapCigarStore::Cursor: many small windows (phasing-like pattern)"
     // Total read0: 800+1+400+600+3+500+1+700+300+1+690 = 3996
 
     OverlapCigarStore::Cursor cur;
-    cur.reset(id, 0, 0, store);
+    cur.reset(off, store.tokensSince(off), 0, 0, store);
 
     // Slide 200-base windows with 100-base step.
     for(uint64_t s = 0; s < 3996; s += 100) {
@@ -988,18 +986,18 @@ TEST_CASE("OverlapCigarStore::Cursor: many small windows (phasing-like pattern)"
         if(s >= e) break;
 
         auto cursorOps = collectCursorOps(store, cur, s, e);
-        auto walkOps = collectWalkRangeOps(store, id, 0, 0, s, e);
+        auto walkOps = collectWalkRangeOps(store, off, store.tokensSince(off), 0, 0, s, e);
         REQUIRE(cursorOps == walkOps);
     }
 }
 
 TEST_CASE("walkRange: range entirely within one op", "[CigarStore][WalkRange]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
     store.pushMatch(1000);
 
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
-    store.walkRange(id, 0, 0, 400, 600, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
+    store.walkRange(off, store.tokensSince(off), 0, 0, 400, 600, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
@@ -1016,7 +1014,7 @@ TEST_CASE("walkRange: range entirely within one op", "[CigarStore][WalkRange]") 
 
 TEST_CASE("Realistic overlap: 10 segments with mixed cases", "[CigarStore]") {
     OverlapCigarStore store;
-    uint32_t id = store.beginAlignment();
+    uint32_t off = store.beginAlignment();
 
     // Simulate a realistic overlap with 10 segments between 11 aligned markers.
     // Track expected consumed bases manually.
@@ -1066,7 +1064,7 @@ TEST_CASE("Realistic overlap: 10 segments with mixed cases", "[CigarStore]") {
     store.pushMatch(500);
     expected0 += 500; expected1 += 500;
 
-    auto [c0, c1] = consumedBases(store, id);
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == expected0);
     REQUIRE(c1 == expected1);
 
