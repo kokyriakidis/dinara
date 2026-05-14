@@ -26,6 +26,7 @@ namespace dinara {
     class CompressedMarker;
     class LongBaseSequenceView;
     class OrientedReadId;
+    class OverlapCigarStore;
 
     struct ProjectedAlignmentSparseMismatch {
         uint32_t position0;
@@ -80,28 +81,12 @@ public:
     int64_t editDistance = invalid<int64_t>;
     vector< pair<bool, bool> > alignment;
     void computeAlignment(
-        int64_t matchScore,
-        int64_t mismatchScore,
-        int64_t gapScore,
         int64_t dpMatchScore,
         int64_t dpMismatchScore,
         int64_t dpGapOpen1,
         int64_t dpGapExtend1,
         int64_t dpGapOpen2,
         int64_t dpGapExtend2);
-    void computeAlignmentSparse(
-        int64_t matchScore,
-        int64_t mismatchScore,
-        int64_t gapScore,
-        int64_t dpMatchScore,
-        int64_t dpMismatchScore,
-        int64_t dpGapOpen1,
-        int64_t dpGapExtend1,
-        int64_t dpGapOpen2,
-        int64_t dpGapExtend2,
-        vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
-        vector<ProjectedAlignmentSparseIndel>& sparseIndels);
-
     // The Base sequences in RLE represenation.
     array<vector<Base>, 2> rleSequences;
     void fillRleSequences();
@@ -110,10 +95,7 @@ public:
     // See seqan.hpp for its meaning.
     int64_t rleEditDistance = invalid<int64_t>;
     vector< pair<bool, bool> > rleAlignment;
-    void computeRleAlignment(
-        int64_t matchScore,
-        int64_t mismatchScore,
-        int64_t gapScore);
+    void computeRleAlignment();
 
     // The number of mismatches in the RLE alignment.
     uint64_t mismatchCountRle = invalid<uint64_t>;
@@ -161,7 +143,6 @@ public:
 
     enum class Method {
         All,        // Do both RLE and raw alignments, store all segments.
-        QuickRle,   // Only do RLE alignments, only store segments where the two RLE sequences differ.
         QuickRaw,   // Only do raw alignments, only store segments where the two raw sequences differ.
         QuickRawSparse, // Only do raw alignments, store sparse diffs (no full alignment trace).
     };
@@ -190,26 +171,18 @@ public:
         int64_t dpGapOpen1,
         int64_t dpGapExtend1,
         int64_t dpGapOpen2,
-        int64_t dpGapExtend2);
+        int64_t dpGapExtend2,
+        OverlapCigarStore* cigarStore = nullptr);
 
     void constructAll();
-    void constructQuickRle();
     void constructQuickRaw();
     void constructQuickRawSparse();
-    
-    // Flag to indicate if the projected alignment touches the ends of the markers.
-    bool touchesMarkerEnds = false;
 
 
 
     // Marker length and its half.
     uint32_t k;
     uint32_t kHalf;
-
-    // Scoring scheme for edit distance.
-    const int64_t matchScore = 0;
-    const int64_t mismatchScore = -1;
-    const int64_t gapScore = -1;
 
     // Scoring scheme for overlap DP score.
     // Hifiasm's current overlap path uses single-affine scoring (gapo/gape).
@@ -274,9 +247,6 @@ public:
     // Flag for large indel (>= 6 bases)
     bool hasLargeIndel = false;
 
-    // Largest indel size
-    uint32_t maxIndelSize = 0;
-
     void computeStatistics();
     double errorRate() const;
     double errorRateGaps() const;
@@ -289,4 +259,12 @@ public:
 
     // Find pairs of mismatching positions in the raw alignments.
     void getMismatchPositions(vector< array<uint32_t, 2> >&) const;
+
+    // When non-null, constructQuickRawSparse() packs the full per-overlap
+    // CIGAR into this store (hifiasm-style uint16_t tokens).
+    OverlapCigarStore* cigarStore = nullptr;
+
+    // The cigar ID assigned by the store for this alignment's CIGAR.
+    // Only valid when cigarStore is non-null after construction.
+    uint32_t cigarId = uint32_t(-1);
 };
