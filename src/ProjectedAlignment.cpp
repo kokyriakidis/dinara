@@ -87,9 +87,7 @@ ProjectedAlignment::ProjectedAlignment(
     int64_t dpMatchScore,
     int64_t dpMismatchScore,
     int64_t dpGapOpen1,
-    int64_t dpGapExtend1,
-    int64_t dpGapOpen2,
-    int64_t dpGapExtend2) :
+    int64_t dpGapExtend1) :
 
     ProjectedAlignment(
         uint32_t(assembler.assemblerInfo->k),
@@ -107,9 +105,7 @@ ProjectedAlignment::ProjectedAlignment(
         dpMatchScore,
         dpMismatchScore,
         dpGapOpen1,
-        dpGapExtend1,
-        dpGapOpen2,
-        dpGapExtend2)
+        dpGapExtend1)
 {
 }
 
@@ -126,8 +122,6 @@ ProjectedAlignment::ProjectedAlignment(
     int64_t dpMismatchScore,
     int64_t dpGapOpen1,
     int64_t dpGapExtend1,
-    int64_t dpGapOpen2,
-    int64_t dpGapExtend2,
     OverlapCigarStore* cigarStore) :
     k(k),
     kHalf(k / 2),
@@ -135,8 +129,6 @@ ProjectedAlignment::ProjectedAlignment(
     dpMismatchScore(dpMismatchScore),
     dpGapOpen1(dpGapOpen1),
     dpGapExtend1(dpGapExtend1),
-    dpGapOpen2(dpGapOpen2),
-    dpGapExtend2(dpGapExtend2),
     orientedReadIds(orientedReadIds),
     sequences(sequences),
     alignment(alignment),
@@ -187,7 +179,7 @@ void ProjectedAlignment::constructAll()
         // Align them.
         segment.computeAlignment(
             dpMatchScore, dpMismatchScore,
-            dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
+            dpGapOpen1, dpGapExtend1);
 
         // Same, in RLE.
         segment.fillRleSequences();
@@ -220,7 +212,7 @@ void ProjectedAlignment::constructQuickRaw()
     totalEditDistance = 0;
     mismatchCount = 0;
     nonHomopolymerErrorCount = 0;
-    totalDeletionCount = 0;
+    totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
@@ -260,13 +252,13 @@ void ProjectedAlignment::constructQuickRaw()
         // Align them.
         segment.computeAlignment(
             dpMatchScore, dpMismatchScore,
-            dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
+            dpGapOpen1, dpGapExtend1);
 
         // Accumulate statistics
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
         nonHomopolymerErrorCount += segment.nonHomopolymerErrorCount;
-        totalDeletionCount += segment.deletionCount;
+        totalIndelBaseCount += segment.indelBaseCount;
         totalGapEventCount += segment.gapEventCount;
         totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
@@ -294,7 +286,7 @@ void ProjectedAlignment::constructQuickRawSparse()
     totalEditDistance = 0;
     mismatchCount = 0;
     nonHomopolymerErrorCount = 0;
-    totalDeletionCount = 0;
+    totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
@@ -440,7 +432,7 @@ void ProjectedAlignment::constructQuickRawSparse()
                 const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
                                 ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position0 += currentVal;
-                totalDeletionCount += currentVal;
+                totalIndelBaseCount += currentVal;
                 ++totalGapEventCount;
                 nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(currentVal));
@@ -456,7 +448,7 @@ void ProjectedAlignment::constructQuickRawSparse()
                 const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
                                 ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position1 += currentVal;
-                totalDeletionCount += currentVal;
+                totalIndelBaseCount += currentVal;
                 ++totalGapEventCount;
                 nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(currentVal));
@@ -516,9 +508,7 @@ void ProjectedAlignmentSegment::computeAlignment(
     int64_t dpMatchScore,
     int64_t dpMismatchScore,
     int64_t dpGapOpen1,
-    int64_t dpGapExtend1,
-    int64_t dpGapOpen2,
-    int64_t dpGapExtend2)
+    int64_t dpGapExtend1)
 {
     const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(sequences[0]);
     const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(sequences[1]);
@@ -529,7 +519,7 @@ void ProjectedAlignmentSegment::computeAlignment(
         fill(alignment.begin(), alignment.end(), make_pair(true, true));
         mismatchCount = 0;
         nonHomopolymerErrorCount = 0;
-        deletionCount = 0;
+        indelBaseCount = 0;
         gapEventCount = 0;
         // Hifiasm/minimap2-style match reward (HiFi defaults).
         dpScore = dpMatchScore * int64_t(sequence0.size());
@@ -597,7 +587,7 @@ void ProjectedAlignmentSegment::computeAlignment(
         uint64_t position1 = 0;
         mismatchCount = 0;
         nonHomopolymerErrorCount = 0;
-        deletionCount = 0;
+        indelBaseCount = 0;
         gapEventCount = 0;
         dpScore = 0;
         hasLargeIndel = false;
@@ -605,18 +595,9 @@ void ProjectedAlignmentSegment::computeAlignment(
 
         const int64_t match = dpMatchScore;
         const int64_t mismatch = dpMismatchScore;
-        const int64_t gapOpen1 = dpGapOpen1;
-        const int64_t gapExtend1 = dpGapExtend1;
-        const int64_t gapOpen2 = dpGapOpen2;
-        const int64_t gapExtend2 = dpGapExtend2;
-        auto gapPenalty = [&](uint64_t length) -> int64_t {
-            const int64_t l = int64_t(length);
-            DINARA_ASSERT(l >= 1);
-            // Hifiasm overlap scoring currently uses the single-affine ksw_extz2_sse path:
-            // a gap of length k costs O + k*E.
-            (void)gapOpen2;
-            (void)gapExtend2;
-            return gapOpen1 + gapExtend1 * l;
+        auto gapPenalty = [gapOpen1 = dpGapOpen1, gapExtend1 = dpGapExtend1](uint64_t length) -> int64_t {
+            // Single-affine gap penalty: O + k*E.
+            return gapOpen1 + gapExtend1 * int64_t(length);
         };
 
         for(size_t i=0; i<cigarLen; i++) {
@@ -666,7 +647,7 @@ void ProjectedAlignmentSegment::computeAlignment(
                             ifIsHomopolymerRepeat(sequence0, position0) ||
                             ifIsHomopolymerRepeat(sequence1, position1);
                         position0 += currentVal;
-                        deletionCount += currentVal;
+                        indelBaseCount += currentVal;
                         gapEventCount++;
                         nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
                         dpScore -= gapPenalty(uint64_t(currentVal));
@@ -677,7 +658,7 @@ void ProjectedAlignmentSegment::computeAlignment(
                             ifIsHomopolymerRepeat(sequence0, position0) ||
                             ifIsHomopolymerRepeat(sequence1, position1);
                         position1 += currentVal;
-                        deletionCount += currentVal;
+                        indelBaseCount += currentVal;
                         gapEventCount++; // ONE gap event
                         nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
                         dpScore -= gapPenalty(uint64_t(currentVal));
@@ -1091,14 +1072,14 @@ void ProjectedAlignment::computeStatistics()
     totalEditDistanceRle = 0;
     mismatchCount = 0;
     nonHomopolymerErrorCount = 0;
-    totalDeletionCount = 0;
+    totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
     for(const ProjectedAlignmentSegment& segment: segments) {
         totalEditDistance += segment.editDistance;
         totalEditDistanceRle += segment.rleEditDistance;
-        totalDeletionCount += segment.deletionCount;
+        totalIndelBaseCount += segment.indelBaseCount;
         totalGapEventCount += segment.gapEventCount;
         mismatchCount += segment.mismatchCount;
         nonHomopolymerErrorCount += segment.nonHomopolymerErrorCount;
@@ -1121,7 +1102,7 @@ double ProjectedAlignment::errorRate() const
 double ProjectedAlignment::errorRateGaps() const
 {
     // One-sided denominator, consistent with errorRate().
-    return double(totalDeletionCount) / double(totalLength[0]);
+    return double(totalIndelBaseCount) / double(totalLength[0]);
 }
 
 
