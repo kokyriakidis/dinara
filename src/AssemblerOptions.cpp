@@ -522,6 +522,13 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
         "Deprecated alias for OverlapCandidates.maxEndFuzz.")
 
+        ("OverlapCandidates.invertedIndexMaxKmerCount",
+        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMaxKmerCount)->
+        default_value(2000),
+        "Hard cutoff: k-mers occurring more than this many times are excluded from markers. "
+        "Hifiasm default: 2000 (max_kmer_cnt). K-mers between 5*coveragePeak and this threshold "
+        "are kept but downsampled during chaining.")
+
         ("OverlapCandidates.invertedIndexWeightExponent",
         value<double>(&overlapCandidatesOptions.invertedIndexWeightExponent)->
         default_value(1.1),
@@ -1664,6 +1671,7 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minChainMarkerCount = " << minChainMarkerCount << "\n";
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
+    s << "invertedIndexMaxKmerCount = " << invertedIndexMaxKmerCount << "\n";
     s << "invertedIndexWeightExponent = " << invertedIndexWeightExponent << "\n";
     s << "invertedIndexLowFreqMultiplier = " << invertedIndexLowFreqMultiplier << "\n";
     s << "invertedIndexHighFreqMultiplier = " << invertedIndexHighFreqMultiplier << "\n";
