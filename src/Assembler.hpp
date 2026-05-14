@@ -2068,7 +2068,8 @@ public:
 
     // Per-overlap packed CIGARs (hifiasm-style uint16_t tokens).
     // Populated during computeAlignmentsWithEvidence.
-    // Indexed by cigarId stored in AlignmentInfo::cigarId.
+    // Token arena; each overlap's (cigarOffset, cigarTokenCount) in AlignmentInfo
+    // points directly into this arena.
     OverlapCigarStore overlapCigarStore;
 
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
