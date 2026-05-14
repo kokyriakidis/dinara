@@ -251,6 +251,9 @@ public:
     // Evidence ID (APES/TASSD index)
     size_t alignmentId = invalid<size_t>;
 
+    // Packed CIGAR ID (index into OverlapCigarStore).
+    uint32_t cigarId = uint32_t(-1);
+
     void clearFlags()
     {
         isInReadGraph = 0;

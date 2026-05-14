@@ -4,8 +4,8 @@
 #include "Base.hpp"
 #include "LongBaseSequence.hpp"
 #include "Marker.hpp"
+#include "OverlapCigarStore.hpp"
 #include "Reads.hpp"
-#include "seqan.hpp"
 using namespace dinara;
 
 #include "algorithm.hpp"
@@ -127,7 +127,8 @@ ProjectedAlignment::ProjectedAlignment(
     int64_t dpGapOpen1,
     int64_t dpGapExtend1,
     int64_t dpGapOpen2,
-    int64_t dpGapExtend2) :
+    int64_t dpGapExtend2,
+    OverlapCigarStore* cigarStore) :
     k(k),
     kHalf(k / 2),
     dpMatchScore(dpMatchScore),
@@ -139,16 +140,14 @@ ProjectedAlignment::ProjectedAlignment(
     orientedReadIds(orientedReadIds),
     sequences(sequences),
     alignment(alignment),
-    markers(markers)
+    markers(markers),
+    cigarStore(cigarStore)
 {
     DINARA_ASSERT((k % 2) == 0);
 
     switch(method) {
         case Method::All:
             constructAll();
-            break;
-        case Method::QuickRle:
-            constructQuickRle();
             break;
         case Method::QuickRaw:
             constructQuickRaw();
@@ -187,13 +186,12 @@ void ProjectedAlignment::constructAll()
 
         // Align them.
         segment.computeAlignment(
-            matchScore, mismatchScore, gapScore,
             dpMatchScore, dpMismatchScore,
             dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
 
         // Same, in RLE.
         segment.fillRleSequences();
-        segment.computeRleAlignment(matchScore, mismatchScore, gapScore);
+        segment.computeRleAlignment();
         mismatchCountRle += segment.mismatchCountRle;
     }
 
@@ -208,60 +206,6 @@ void ProjectedAlignment::constructAll()
 // - RLE sequences and RLE alignments for segments for which the RLE sequences
 //   of the two oriented reads are different.
 // - Total RLE edit distance and total RLE lengths.
-void ProjectedAlignment::constructQuickRle()
-{
-    // Create the segment outside the loop and reuse it to reduce
-    // memory allocation activity.
-    ProjectedAlignmentSegment segment;
-
-    totalLengthRle = {0, 0};
-    totalEditDistanceRle = 0;
-    mismatchCountRle = 0;
-
-    // Loop over pairs of consecutive aligned markers (A, B).
-    for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
-        const uint64_t iA = iB - 1;
-
-        // Store in the segment the ordinals of these pair of consecutive aligned markers.
-        segment.ordinalsA = alignment.ordinals[iA];
-        segment.ordinalsB = alignment.ordinals[iB];
-
-        // Store the corresponding positions.
-        for(uint64_t i=0; i<2; i++) {
-            segment.positionsA[i] = markers[i][segment.ordinalsA[i]].position + kHalf;
-            segment.positionsB[i] = markers[i][segment.ordinalsB[i]].position + kHalf;
-        }
-
-        // Store RLE sequences, without going through the raw sequences for speed.
-        // Also increment the total RLE lengths.
-        for(uint64_t i=0; i<2; i++) {
-            vector<Base>& rleSequence = segment.rleSequences[i];
-            rleSequence.clear();
-            for(uint32_t position=segment.positionsA[i]; position!=segment.positionsB[i]; position++) {
-                const Base b = getBase(i, position);
-                if(rleSequence.empty() or b != rleSequence.back()) {
-                    rleSequence.push_back(b);
-                }
-            }
-            totalLengthRle[i] += rleSequence.size();
-        }
-
-        // If the RLE sequences are the same, there is no contribution to RLE edit distance,
-        // and we don't store the segment.
-        if(segment.rleSequences[0] == segment.rleSequences[1]) {
-            continue;
-        }
-
-        // Otherwise, we compute the RLE alignment and store this segment.
-        segment.computeRleAlignment(matchScore, mismatchScore, gapScore);
-        totalEditDistanceRle += segment.rleEditDistance;
-        mismatchCountRle += segment.mismatchCountRle;
-        segments.push_back(segment);
-    }
-}
-
-
-
 // This stores only the raw sequences and alignments for segments for which the raw sequences
 // of the two oriented reads are different. Even though it only stores segments with mismatches, 
 // the computed total length includes all segments.
@@ -280,17 +224,12 @@ void ProjectedAlignment::constructQuickRaw()
     totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
-    maxIndelSize = 0;
 
     // Hifiasm current overlap scoring uses single-affine parameters.
     // For identical segments we only need the match reward.
     const int64_t dpMatch = dpMatchScore;
 
     // Loop over pairs of consecutive aligned markers (A, B).
-    // Prepend the initial kHalf match (Left Tail)
-    // Note: CIGAR generation moved to AlignedEvidenceStore (AssemblerAlign.cpp). Removed here.
-
-
     for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
         const uint64_t iA = iB - 1;
 
@@ -320,7 +259,6 @@ void ProjectedAlignment::constructQuickRaw()
 
         // Align them.
         segment.computeAlignment(
-            matchScore, mismatchScore, gapScore,
             dpMatchScore, dpMismatchScore,
             dpGapOpen1, dpGapExtend1, dpGapOpen2, dpGapExtend2);
 
@@ -332,14 +270,10 @@ void ProjectedAlignment::constructQuickRaw()
         totalGapEventCount += segment.gapEventCount;
         totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
-        if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
 
         // Store the segment.
         segments.push_back(segment);
     }
-
-    // Append the final kHalf match (Right Tail)
-    // Removed.
 }
 
 
@@ -347,11 +281,11 @@ void ProjectedAlignment::constructQuickRaw()
 // Similar to constructQuickRaw, but does not store per-base alignment traces.
 // Instead, it stores sparse mismatch and indel events that are sufficient to
 // populate AlignedEvidenceStore efficiently.
+//
+// When cigarStore is non-null, also packs the full per-overlap CIGAR into
+// the store using hifiasm-style uint16_t tokens (2-bit op + 14-bit length).
 void ProjectedAlignment::constructQuickRawSparse()
 {
-    // Reuse a single segment object to reduce allocations.
-    ProjectedAlignmentSegment segment;
-
     sparseMismatches.clear();
     sparseIndels.clear();
 
@@ -364,25 +298,27 @@ void ProjectedAlignment::constructQuickRawSparse()
     totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
-    maxIndelSize = 0;
 
-    // Hifiasm current overlap scoring uses single-affine parameters.
-    // For identical segments we only need the match reward.
-    const int64_t dpMatch = dpMatchScore;
+    // Begin a new CIGAR entry in the store if requested.
+    const bool storeCigar = (cigarStore != nullptr);
+    if(storeCigar) {
+        cigarId = cigarStore->beginAlignment();
+    }
 
-    // Thread-local buffers to avoid repeated allocations/conversions.
-    // We fill these directly from the oriented read views (via getBase),
-    // avoiding the intermediate vector<Base> in ProjectedAlignmentSegment.
+    // Scoring parameters (hoisted out of the per-segment loop).
+    const int64_t match = dpMatchScore;
+    const int64_t mismatch = dpMismatchScore;
+    auto gapPenalty = [gapOpen1 = dpGapOpen1, gapExtend1 = dpGapExtend1](uint64_t length) -> int64_t {
+        return gapOpen1 + gapExtend1 * int64_t(length);
+    };
+
+    // Thread-local buffers for ASCII sequences.
     static thread_local vector<uint8_t> asciiSequence0;
     static thread_local vector<uint8_t> asciiSequence1;
     static constexpr uint8_t baseToAscii[4] = {'A', 'C', 'G', 'T'};
-    static constexpr array<uint8_t, 256> asciiToBase = []() constexpr {
+    static constexpr auto asciiToBase = []() constexpr {
         array<uint8_t, 256> m{};
-        for(size_t i = 0; i < 256; ++i) m[i] = 0;
-        m[uint8_t('A')] = 0;
-        m[uint8_t('C')] = 1;
-        m[uint8_t('G')] = 2;
-        m[uint8_t('T')] = 3;
+        m['A'] = 0; m['C'] = 1; m['G'] = 2; m['T'] = 3;
         return m;
     }();
 
@@ -390,29 +326,23 @@ void ProjectedAlignment::constructQuickRawSparse()
     for(uint64_t iB=1; iB<alignment.ordinals.size(); iB++) {
         const uint64_t iA = iB - 1;
 
-        // Store in the segment the ordinals of these pair of consecutive aligned markers.
-        segment.ordinalsA = alignment.ordinals[iA];
-        segment.ordinalsB = alignment.ordinals[iB];
-
-        // Store the corresponding positions.
-        for(uint64_t i=0; i<2; i++) {
-            segment.positionsA[i] = markers[i][segment.ordinalsA[i]].position + kHalf;
-            segment.positionsB[i] = markers[i][segment.ordinalsB[i]].position + kHalf;
-        }
-
-        const uint32_t begin0 = segment.positionsA[0];
-        const uint32_t end0 = segment.positionsB[0];
-        const uint32_t begin1 = segment.positionsA[1];
-        const uint32_t end1 = segment.positionsB[1];
+        // Compute segment positions directly (no ProjectedAlignmentSegment needed).
+        const uint32_t begin0 = markers[0][alignment.ordinals[iA][0]].position + kHalf;
+        const uint32_t end0   = markers[0][alignment.ordinals[iB][0]].position + kHalf;
+        const uint32_t begin1 = markers[1][alignment.ordinals[iA][1]].position + kHalf;
+        const uint32_t end1   = markers[1][alignment.ordinals[iB][1]].position + kHalf;
         const uint32_t len0 = end0 - begin0;
         const uint32_t len1 = end1 - begin1;
 
-        // Accumulate total lengths (even for identical sequences).
         totalLength[0] += len0;
         totalLength[1] += len1;
 
-        // Empty segments should not happen, but tolerate.
+        // Empty segments: emit indel for CIGAR consistency if needed.
         if(len0 == 0 || len1 == 0) {
+            if(storeCigar) {
+                if(len0 > 0) cigarStore->pushDeletion(len0);
+                else if(len1 > 0) cigarStore->pushInsertion(len1);
+            }
             continue;
         }
 
@@ -420,21 +350,20 @@ void ProjectedAlignment::constructQuickRawSparse()
         asciiSequence0.resize(len0);
         asciiSequence1.resize(len1);
         for(uint32_t j = 0; j < len0; ++j) {
-            const uint8_t b = getBase(0, begin0 + j).value;
-            asciiSequence0[j] = baseToAscii[b];
+            asciiSequence0[j] = baseToAscii[getBase(0, begin0 + j).value];
         }
         for(uint32_t j = 0; j < len1; ++j) {
-            const uint8_t b = getBase(1, begin1 + j).value;
-            asciiSequence1[j] = baseToAscii[b];
+            asciiSequence1[j] = baseToAscii[getBase(1, begin1 + j).value];
         }
 
-        // If the raw sequences are the same, there is no contribution.
-        if(asciiSequence0 == asciiSequence1) {
-            totalDpScore += dpMatch * int64_t(len0);
+        // Identical segments: fast path.
+        if(len0 == len1 && memcmp(asciiSequence0.data(), asciiSequence1.data(), len0) == 0) {
+            totalDpScore += match * int64_t(len0);
+            if(storeCigar) cigarStore->pushMatch(len0);
             continue;
         }
 
-        // Align them and collect sparse diffs.
+        // Align with A*PA2.
         char* cigar = nullptr;
         size_t cigarLen = 0;
         const int64_t cost = astarpa2_simple(
@@ -442,126 +371,100 @@ void ProjectedAlignment::constructQuickRawSparse()
             asciiSequence1.data(), asciiSequence1.size(),
             (unsigned char**)&cigar, &cigarLen);
 
-        const int64_t segEditDistance = cost;
-        uint64_t segMismatchCount = 0;
-        uint64_t segNonHomopolymerErrorCount = 0;
-        uint64_t segDeletionCount = 0;
-        uint64_t segGapEventCount = 0;
-        int64_t segDpScore = 0;
-        bool segHasLargeIndel = false;
-        uint32_t segMaxIndelSize = 0;
+        totalEditDistance += cost;
 
-        // Hifiasm current overlap scoring uses single-affine parameters.
-        const int64_t match = dpMatchScore;
-        const int64_t mismatch = dpMismatchScore;
-        const int64_t gapOpen1 = dpGapOpen1;
-        const int64_t gapExtend1 = dpGapExtend1;
-        const int64_t gapOpen2 = dpGapOpen2;
-        const int64_t gapExtend2 = dpGapExtend2;
-        auto gapPenalty = [&](uint64_t length) -> int64_t {
-            const int64_t l = int64_t(length);
-            DINARA_ASSERT(l >= 1);
-            // KSW2 single-affine convention used by hifiasm overlap scoring:
-            // a gap of length k costs O + k*E.
-            (void)gapOpen2;
-            (void)gapExtend2;
-            return gapOpen1 + gapExtend1 * l;
-        };
-
-        // Parse CIGAR and collect sparse differences.
         uint64_t position0 = 0;
         uint64_t position1 = 0;
         size_t currentVal = 0;
         for(size_t i=0; i<cigarLen; i++) {
             const char c = cigar[i];
-            if(isdigit(c)) {
+            if(c >= '0' && c <= '9') {
                 currentVal = currentVal * 10 + size_t(c - '0');
                 continue;
             }
-
-            if(currentVal == 0) {
-                currentVal = 1;
-            }
+            if(currentVal == 0) currentVal = 1;
 
             if(c == 'M' || c == '=' || c == 'X') {
-                // Match/mismatch block: record mismatches.
                 uint64_t mismatchHere = 0;
+                uint32_t runStart = 0;
+                bool runIsMismatch = false;
+
                 for(size_t k=0; k<currentVal; ++k) {
                     const uint8_t a0 = asciiSequence0[position0 + k];
                     const uint8_t a1 = asciiSequence1[position1 + k];
-                    if(a0 != a1) {
+                    const bool isMismatch = (a0 != a1);
+
+                    if(isMismatch) {
                         sparseMismatches.push_back(ProjectedAlignmentSparseMismatch{
                             uint32_t(begin0 + uint32_t(position0 + k)),
                             uint32_t(begin1 + uint32_t(position1 + k)),
                             asciiToBase[a0],
                             asciiToBase[a1]
                         });
-                        ++segMismatchCount;
                         ++mismatchHere;
-                        if(
-                            !ifIsHomopolymerRepeat(asciiSequence0, position0 + k) &&
-                            !ifIsHomopolymerRepeat(asciiSequence1, position1 + k)
-                        ) {
-                            ++segNonHomopolymerErrorCount;
+                        if(!ifIsHomopolymerRepeat(asciiSequence0, position0 + k) &&
+                           !ifIsHomopolymerRepeat(asciiSequence1, position1 + k)) {
+                            ++nonHomopolymerErrorCount;
+                        }
+                    }
+
+                    // Accumulate match/mismatch runs for CIGAR tokens.
+                    if(storeCigar) {
+                        if(k == 0) {
+                            runIsMismatch = isMismatch;
+                            runStart = 0;
+                        } else if(isMismatch != runIsMismatch) {
+                            cigarStore->pushOp(runIsMismatch ? 1 : 0, uint32_t(k) - runStart);
+                            runIsMismatch = isMismatch;
+                            runStart = uint32_t(k);
                         }
                     }
                 }
-                const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
-                segDpScore += match * int64_t(matchHere) + mismatch * int64_t(mismatchHere);
+
+                if(storeCigar) {
+                    cigarStore->pushOp(runIsMismatch ? 1 : 0, uint32_t(currentVal) - runStart);
+                }
+
+                mismatchCount += mismatchHere;
+                totalDpScore += match * int64_t(currentVal - mismatchHere) + mismatch * int64_t(mismatchHere);
                 position0 += currentVal;
                 position1 += currentVal;
 
             } else if(c == 'D') {
-                // Gap in sequence1 (target).
                 sparseIndels.push_back(ProjectedAlignmentSparseIndel{
                     uint32_t(begin0 + uint32_t(position0)),
                     uint32_t(begin1 + uint32_t(position1)),
-                    uint32_t(currentVal),
-                    'D'
+                    uint32_t(currentVal), 'D'
                 });
-                const bool isHomopolymerGap =
-                    ifIsHomopolymerRepeat(asciiSequence0, position0) ||
-                    ifIsHomopolymerRepeat(asciiSequence1, position1);
+                if(storeCigar) cigarStore->pushDeletion(uint32_t(currentVal));
+                const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
+                                ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position0 += currentVal;
-                segDeletionCount += currentVal;
-                ++segGapEventCount;
-                segNonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
-                segDpScore -= gapPenalty(uint64_t(currentVal));
-                if(currentVal >= 6) {
-                    segHasLargeIndel = true;
-                }
-                if(currentVal > segMaxIndelSize) {
-                    segMaxIndelSize = uint32_t(currentVal);
-                }
+                totalDeletionCount += currentVal;
+                ++totalGapEventCount;
+                nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
+                totalDpScore -= gapPenalty(uint64_t(currentVal));
+                if(currentVal >= 6) hasLargeIndel = true;
 
             } else if(c == 'I') {
-                // Gap in sequence0 (query).
                 sparseIndels.push_back(ProjectedAlignmentSparseIndel{
                     uint32_t(begin0 + uint32_t(position0)),
                     uint32_t(begin1 + uint32_t(position1)),
-                    uint32_t(currentVal),
-                    'I'
+                    uint32_t(currentVal), 'I'
                 });
-                const bool isHomopolymerGap =
-                    ifIsHomopolymerRepeat(asciiSequence0, position0) ||
-                    ifIsHomopolymerRepeat(asciiSequence1, position1);
+                if(storeCigar) cigarStore->pushInsertion(uint32_t(currentVal));
+                const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
+                                ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position1 += currentVal;
-                segDeletionCount += currentVal;
-                ++segGapEventCount;
-                segNonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
-                segDpScore -= gapPenalty(uint64_t(currentVal));
-                if(currentVal >= 6) {
-                    segHasLargeIndel = true;
-                }
-                if(currentVal > segMaxIndelSize) {
-                    segMaxIndelSize = uint32_t(currentVal);
-                }
+                totalDeletionCount += currentVal;
+                ++totalGapEventCount;
+                nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
+                totalDpScore -= gapPenalty(uint64_t(currentVal));
+                if(currentVal >= 6) hasLargeIndel = true;
 
             } else if(c == 'H') {
-                // Hard clips do not consume sequence.
-                // astarpa2_simple is not expected to generate these, but tolerate.
+                // Hard clips: tolerate but ignore.
             } else {
-                // Unexpected CIGAR op for A*PA2 simple alignment.
                 DINARA_ASSERT(0);
             }
 
@@ -572,20 +475,21 @@ void ProjectedAlignment::constructQuickRawSparse()
 
         DINARA_ASSERT(position0 == asciiSequence0.size());
         DINARA_ASSERT(position1 == asciiSequence1.size());
+    }
 
-        // Accumulate statistics.
-        totalEditDistance += segEditDistance;
-        mismatchCount += segMismatchCount;
-        nonHomopolymerErrorCount += segNonHomopolymerErrorCount;
-        totalDeletionCount += segDeletionCount;
-        totalGapEventCount += segGapEventCount;
-        totalDpScore += segDpScore;
-        if(segHasLargeIndel) {
-            hasLargeIndel = true;
-        }
-        if(segMaxIndelSize > maxIndelSize) {
-            maxIndelSize = segMaxIndelSize;
-        }
+    // Verify CIGAR consistency: consumed bases must match totalLength.
+    if(storeCigar && cigarId != uint32_t(-1)) {
+        uint64_t cigarConsumed0 = 0;
+        uint64_t cigarConsumed1 = 0;
+        cigarStore->forEachOp(cigarId, [&](uint8_t op, uint32_t len) {
+            switch(op) {
+                case 0: case 1: cigarConsumed0 += len; cigarConsumed1 += len; break;
+                case 2: cigarConsumed1 += len; break;
+                case 3: cigarConsumed0 += len; break;
+            }
+        });
+        DINARA_ASSERT(cigarConsumed0 == totalLength[0]);
+        DINARA_ASSERT(cigarConsumed1 == totalLength[1]);
     }
 }
 
@@ -608,9 +512,6 @@ ProjectedAlignmentSegment::ProjectedAlignmentSegment(
 
 
 void ProjectedAlignmentSegment::computeAlignment(
-    int64_t /* matchScore */,
-    int64_t /* mismatchScore */,
-    int64_t /* gapScore */,
     int64_t dpMatchScore,
     int64_t dpMismatchScore,
     int64_t dpGapOpen1,
@@ -797,187 +698,7 @@ void ProjectedAlignmentSegment::computeAlignment(
 
 
 
-void ProjectedAlignmentSegment::computeAlignmentSparse(
-    int64_t /* matchScore */,
-    int64_t /* mismatchScore */,
-    int64_t /* gapScore */,
-    int64_t dpMatchScore,
-    int64_t dpMismatchScore,
-    int64_t dpGapOpen1,
-    int64_t dpGapExtend1,
-    int64_t dpGapOpen2,
-    int64_t dpGapExtend2,
-    vector<ProjectedAlignmentSparseMismatch>& sparseMismatches,
-    vector<ProjectedAlignmentSparseIndel>& sparseIndels)
-{
-    const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(sequences[0]);
-    const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(sequences[1]);
-
-    // This is only called when the sequences differ.
-    DINARA_ASSERT(sequence0 != sequence1);
-
-    // Convert sequences to ASCII for A*PA2 using thread_local buffers to avoid allocations.
-    static thread_local vector<uint8_t> asciiSequence0;
-    static thread_local vector<uint8_t> asciiSequence1;
-    asciiSequence0.clear();
-    asciiSequence1.clear();
-    asciiSequence0.reserve(sequence0.size());
-    asciiSequence1.reserve(sequence1.size());
-
-    static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
-
-    for(uint8_t b : sequence0) {
-        asciiSequence0.push_back(b < 4 ? baseToAscii[b] : 'N');
-    }
-    for(uint8_t b : sequence1) {
-        asciiSequence1.push_back(b < 4 ? baseToAscii[b] : 'N');
-    }
-
-    char* cigar = nullptr;
-    size_t cigarLen = 0;
-    const int64_t cost = astarpa2_simple(
-        asciiSequence0.data(), asciiSequence0.size(),
-        asciiSequence1.data(), asciiSequence1.size(),
-        (unsigned char**)&cigar, &cigarLen);
-
-    editDistance = cost;
-
-    // Parse CIGAR and collect sparse differences.
-    uint64_t position0 = 0;
-    uint64_t position1 = 0;
-    mismatchCount = 0;
-    nonHomopolymerErrorCount = 0;
-    deletionCount = 0;
-    gapEventCount = 0;
-    dpScore = 0;
-    hasLargeIndel = false;
-    maxIndelSize = 0;
-
-    const int64_t match = dpMatchScore;
-    const int64_t mismatch = dpMismatchScore;
-    const int64_t gapOpen1 = dpGapOpen1;
-    const int64_t gapExtend1 = dpGapExtend1;
-    const int64_t gapOpen2 = dpGapOpen2;
-    const int64_t gapExtend2 = dpGapExtend2;
-    auto gapPenalty = [&](uint64_t length) -> int64_t {
-        const int64_t l = int64_t(length);
-        DINARA_ASSERT(l >= 1);
-        // KSW2 single-affine convention used by hifiasm overlap scoring:
-        // a gap of length k costs O + k*E.
-        (void)gapOpen2;
-        (void)gapExtend2;
-        return gapOpen1 + gapExtend1 * l;
-    };
-
-    size_t currentVal = 0;
-    for(size_t i=0; i<cigarLen; i++) {
-        const char c = cigar[i];
-        if(isdigit(c)) {
-            currentVal = currentVal * 10 + size_t(c - '0');
-            continue;
-        }
-
-        if(currentVal == 0) {
-            currentVal = 1;
-        }
-
-        if(c == 'M' || c == '=' || c == 'X') {
-            // Match/mismatch block: record mismatches.
-            uint64_t mismatchHere = 0;
-            for(size_t k=0; k<currentVal; ++k) {
-                const uint8_t b0 = sequence0[position0 + k];
-                const uint8_t b1 = sequence1[position1 + k];
-                if(b0 != b1) {
-                    sparseMismatches.push_back(ProjectedAlignmentSparseMismatch{
-                        uint32_t(positionsA[0] + uint32_t(position0 + k)),
-                        uint32_t(positionsA[1] + uint32_t(position1 + k)),
-                        b0,
-                        b1
-                    });
-                    ++mismatchCount;
-                    ++mismatchHere;
-                    if(
-                        !ifIsHomopolymerRepeat(sequence0, position0 + k) &&
-                        !ifIsHomopolymerRepeat(sequence1, position1 + k)
-                    ) {
-                        ++nonHomopolymerErrorCount;
-                    }
-                }
-            }
-            const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
-            dpScore += match * int64_t(matchHere) + mismatch * int64_t(mismatchHere);
-            position0 += currentVal;
-            position1 += currentVal;
-
-        } else if(c == 'D') {
-            // Gap in sequence1 (target).
-            sparseIndels.push_back(ProjectedAlignmentSparseIndel{
-                uint32_t(positionsA[0] + uint32_t(position0)),
-                uint32_t(positionsA[1] + uint32_t(position1)),
-                uint32_t(currentVal),
-                'D'
-            });
-            const bool isHomopolymerGap =
-                ifIsHomopolymerRepeat(sequence0, position0) ||
-                ifIsHomopolymerRepeat(sequence1, position1);
-            position0 += currentVal;
-            deletionCount += currentVal;
-            ++gapEventCount;
-            nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
-            dpScore -= gapPenalty(uint64_t(currentVal));
-            if(currentVal >= 6) {
-                hasLargeIndel = true;
-            }
-            if(currentVal > maxIndelSize) {
-                maxIndelSize = uint32_t(currentVal);
-            }
-
-        } else if(c == 'I') {
-            // Gap in sequence0 (query).
-            sparseIndels.push_back(ProjectedAlignmentSparseIndel{
-                uint32_t(positionsA[0] + uint32_t(position0)),
-                uint32_t(positionsA[1] + uint32_t(position1)),
-                uint32_t(currentVal),
-                'I'
-            });
-            const bool isHomopolymerGap =
-                ifIsHomopolymerRepeat(sequence0, position0) ||
-                ifIsHomopolymerRepeat(sequence1, position1);
-            position1 += currentVal;
-            deletionCount += currentVal;
-            ++gapEventCount;
-            nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
-            dpScore -= gapPenalty(uint64_t(currentVal));
-            if(currentVal >= 6) {
-                hasLargeIndel = true;
-            }
-            if(currentVal > maxIndelSize) {
-                maxIndelSize = uint32_t(currentVal);
-            }
-
-        } else if(c == 'H') {
-            // Hard clips do not consume sequence.
-            // astarpa2_simple is not expected to generate these, but tolerate.
-        } else {
-            // Unexpected CIGAR op for A*PA2 simple alignment.
-            DINARA_ASSERT(0);
-        }
-
-        currentVal = 0;
-    }
-
-    astarpa_free_cigar((unsigned char*)cigar);
-
-    DINARA_ASSERT(position0 == sequence0.size());
-    DINARA_ASSERT(position1 == sequence1.size());
-}
-
-
-
-void ProjectedAlignmentSegment::computeRleAlignment(
-    int64_t /* matchScore */,
-    int64_t /* mismatchScore */,
-    int64_t /* gapScore */)
+void ProjectedAlignmentSegment::computeRleAlignment()
 {
     const vector<uint8_t>& sequence0 = reinterpret_cast< const vector<uint8_t>& >(rleSequences[0]);
     const vector<uint8_t>& sequence1 = reinterpret_cast< const vector<uint8_t>& >(rleSequences[1]);
@@ -1370,20 +1091,18 @@ void ProjectedAlignment::computeStatistics()
     mismatchCount = 0;
     nonHomopolymerErrorCount = 0;
     totalDeletionCount = 0;
-    totalGapEventCount = 0; // Init
+    totalGapEventCount = 0;
     totalDpScore = 0;
     hasLargeIndel = false;
-    maxIndelSize = 0;
     for(const ProjectedAlignmentSegment& segment: segments) {
         totalEditDistance += segment.editDistance;
         totalEditDistanceRle += segment.rleEditDistance;
         totalDeletionCount += segment.deletionCount;
-        totalGapEventCount += segment.gapEventCount; // Sum
+        totalGapEventCount += segment.gapEventCount;
         mismatchCount += segment.mismatchCount;
         nonHomopolymerErrorCount += segment.nonHomopolymerErrorCount;
         totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
-        if (segment.maxIndelSize > maxIndelSize) maxIndelSize = segment.maxIndelSize;
     }
 }
 
@@ -1391,14 +1110,17 @@ void ProjectedAlignment::computeStatistics()
 
 double ProjectedAlignment::errorRate() const
 {
-    return double(totalEditDistance) / double(totalLength[0] + totalLength[1]);
+    // One-sided denominator (query/read0 length only), matching hifiasm's
+    // non_trim_error_rate which uses tErr/tLen where tLen = query x-length.
+    return double(totalEditDistance) / double(totalLength[0]);
 }
 
 
 
 double ProjectedAlignment::errorRateGaps() const
 {
-    return double(totalDeletionCount) / double(totalLength[0] + totalLength[1]);
+    // One-sided denominator, consistent with errorRate().
+    return double(totalDeletionCount) / double(totalLength[0]);
 }
 
 
