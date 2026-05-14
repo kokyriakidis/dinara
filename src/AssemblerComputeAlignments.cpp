@@ -113,7 +113,6 @@ void Assembler::computeAlignmentsWithEvidence(
     uint64_t totalIndel1 = 0;
     uint64_t totalSnpCheckpoints0 = 0;
     uint64_t totalSnpCheckpoints1 = 0;
-    uint64_t totalCigarIndex = 0;
     uint64_t totalCigarTokens = 0;
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         totalAlignments += data.threadAlignmentData[threadId].size();
@@ -126,7 +125,6 @@ void Assembler::computeAlignmentsWithEvidence(
         totalSnpCheckpoints0 += localStore.snpCheckpoints0.size();
         totalSnpCheckpoints1 += localStore.snpCheckpoints1.size();
         const OverlapCigarStore& localCigarStore = data.threadCigarStores[threadId];
-        totalCigarIndex += localCigarStore.alignmentCount();
         totalCigarTokens += localCigarStore.tokenCount();
     }
 
@@ -145,13 +143,16 @@ void Assembler::computeAlignmentsWithEvidence(
     );
 
     overlapCigarStore.clear();
-    overlapCigarStore.reserve(totalCigarIndex, totalCigarTokens);
+    overlapCigarStore.reserve(totalCigarTokens);
 
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         const vector<AlignmentData>& threadAlignmentData = data.threadAlignmentData[threadId];
         const size_t idShift = alignmentData.size(); // Current global count serves as offset.
         if(!threadAlignmentData.empty()) {
-            const uint32_t cigarIdShift = uint32_t(overlapCigarStore.alignmentCount());
+            // Merge thread-local packed CIGAR arena first to get the offset shift.
+            const uint32_t cigarOffsetShift = overlapCigarStore.merge(data.threadCigarStores[threadId]);
+            data.threadCigarStores[threadId].clear();
+
             alignmentData.resize(idShift + threadAlignmentData.size());
             std::copy(
                 threadAlignmentData.begin(),
@@ -159,14 +160,10 @@ void Assembler::computeAlignmentsWithEvidence(
                 alignmentData.begin() + idShift);
             for(size_t i = 0; i < threadAlignmentData.size(); ++i) {
                 alignmentData[idShift + i].info.alignmentId += idShift;
-                if(alignmentData[idShift + i].info.cigarId != uint32_t(-1)) {
-                    alignmentData[idShift + i].info.cigarId += cigarIdShift;
+                if(alignmentData[idShift + i].info.cigarOffset != uint32_t(-1)) {
+                    alignmentData[idShift + i].info.cigarOffset += cigarOffsetShift;
                 }
             }
-
-            // Merge thread-local packed CIGAR store.
-            overlapCigarStore.merge(data.threadCigarStores[threadId]);
-            data.threadCigarStores[threadId].clear();
         }
 
         const auto& threadCompressedAlignments = *data.threadCompressedAlignments[threadId];
@@ -238,9 +235,7 @@ void Assembler::computeAlignmentsWithEvidence(
 
     // Report memory usage for both storage mechanisms.
     {
-        const size_t cigarArenaBytes = overlapCigarStore.tokenCount() * sizeof(CigarToken);
-        const size_t cigarIndexBytes = overlapCigarStore.alignmentCount() * sizeof(OverlapCigarStore::IndexEntry);
-        const size_t cigarTotalBytes = cigarArenaBytes + cigarIndexBytes;
+        const size_t cigarTotalBytes = overlapCigarStore.memoryUsage();
 
         const size_t evidSnp0 = alignedEvidenceStore.snpStream0.size() * sizeof(SnpEvidence);
         const size_t evidSnp1 = alignedEvidenceStore.snpStream1.size() * sizeof(SnpEvidence);
@@ -266,11 +261,8 @@ void Assembler::computeAlignmentsWithEvidence(
              << ", index=" << kb(evidIdx) << " KB)." << endl;
 
         cout << timestamp << "OverlapCigarStore: "
-             << overlapCigarStore.alignmentCount() << " alignments, "
              << overlapCigarStore.tokenCount() << " tokens, "
-             << mb(cigarTotalBytes) << " MB total"
-             << " (arena=" << mb(cigarArenaBytes) << " MB"
-             << ", index=" << kb(cigarIndexBytes) << " KB)." << endl;
+             << mb(cigarTotalBytes) << " MB." << endl;
 
         cout << timestamp << "Memory ratio (CigarStore / EvidenceStore): "
              << (evidTotalBytes > 0 ? double(cigarTotalBytes) / double(evidTotalBytes) : 0.0)
@@ -523,7 +515,8 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             const uint32_t tRawLen = uint32_t(tView.baseCount);
 
             thisAlignmentData.info.alignmentId = store.beginAlignment();
-            thisAlignmentData.info.cigarId = projectedAlignment.cigarId;
+            thisAlignmentData.info.cigarOffset     = projectedAlignment.cigarOffset;
+            thisAlignmentData.info.cigarTokenCount = projectedAlignment.cigarTokenCount;
 
             static const uint8_t complementBase[4] = {3, 2, 1, 0};
 

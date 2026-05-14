@@ -264,7 +264,7 @@ public:
     // CIGAR into this store (hifiasm-style uint16_t tokens).
     OverlapCigarStore* cigarStore = nullptr;
 
-    // The cigar ID assigned by the store for this alignment's CIGAR.
-    // Only valid when cigarStore is non-null after construction.
-    uint32_t cigarId = uint32_t(-1);
+    // CIGAR location in the store's arena, populated when cigarStore is non-null.
+    uint32_t cigarOffset     = uint32_t(-1);
+    uint32_t cigarTokenCount = uint32_t(-1);
 };
