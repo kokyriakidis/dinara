@@ -653,8 +653,9 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Align.maxErrorRate",
         value<double>(&alignOptions.maxErrorRate)->
-        default_value(0.07),
-        "The maximum error rate (mismatches + gaps / length) for an alignment to be used.")
+        default_value(0.03),
+        "Maximum overlap error rate (edit distance / query length). "
+        "Matches hifiasm's max_ov_diff_final (0.03 for both HiFi and ONT).")
 
         ("Align.overlapDp.matchScore",
         value<int64_t>(&alignOptions.overlapDpMatchScore)->
