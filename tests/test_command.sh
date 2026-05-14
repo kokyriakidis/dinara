@@ -8,11 +8,12 @@
 --Kmers.syncmerS 11 \
 --Assembly.mode3.minAnchorCoverage 4 \
 --Assembly.mode3.maxAnchorCoverage 400 \
---Align.minAlignedMarkerCount 20 \
+--Align.minAlignedMarkerCount 2 \
+--Align.minAlignedFraction 0 \
 --OverlapCandidates.method InvertedIndex \
 --OverlapCandidates.driftRateTolerance 0.05 \
 --OverlapCandidates.maxEndFuzz 0 \
---OverlapCandidates.minOverlapLength 200 \
+--OverlapCandidates.minOverlapLength 0 \
 --MarkerGraph.alwaysSave \
 --memoryMode filesystem \
 --memoryBacking disk \
