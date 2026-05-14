@@ -28,6 +28,7 @@
 
 #include "ReadId.hpp"
 #include "AlignedEvidenceStore.hpp"
+#include "OverlapCigarStore.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
 #include "mode3-Anchor.hpp"
@@ -1614,8 +1615,9 @@ private:
         vector<uint64_t> threadFilteredByErrorRateGap; 
         vector<uint64_t> threadFilteredByGapCount;
 
-        // Thread-local accumulation of Phasing CIGARs
-
+        // Thread-local packed CIGAR stores (hifiasm-style uint16_t tokens).
+        // One store per thread to avoid locking.
+        vector<OverlapCigarStore> threadCigarStores;
 
         // Thread-local Evidence Stores (APES/TASSD)
         // One store per thread to avoid locking.
@@ -2063,6 +2065,11 @@ public:
 
     AlignedEvidenceStore alignedEvidenceStore;
     AlignedEvidenceStore chainedFastgaEvidenceStore;
+
+    // Per-overlap packed CIGARs (hifiasm-style uint16_t tokens).
+    // Populated during computeAlignmentsWithEvidence.
+    // Indexed by cigarId stored in AlignmentInfo::cigarId.
+    OverlapCigarStore overlapCigarStore;
 
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
 

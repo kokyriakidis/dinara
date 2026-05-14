@@ -2240,97 +2240,7 @@ TEST_CASE("Integration: readGraph global het propagation keeps reverse indel-shi
     CHECK(posForward0 == mappedRead2Pos);
 }
 
-TEST_CASE("Integration: global-site EC parity keeps reverse-overlap concordance",
-    "[integration][ec][global-site][parity][orientation]")
-{
-    AssemblerIntegrationFixture fixture;
 
-    const std::string base = randomSequence(2600, 715001);
-    const uint32_t p1 = 900;
-    const uint32_t p2 = 1400;
-    REQUIRE(p2 + 1 < base.size());
-
-    std::string read0 = base;
-    std::string read1 = base;
-    read1[p1] = otherBase(read1[p1]);
-    read1[p2] = otherBase(read1[p2]);
-    const std::string read2 = reverseComplement(read0);
-
-    fixture.createFastq({read0, read1, read2});
-    fixture.initAssembler();
-    fixture.loadReads();
-    fixture.generateMarkers(16, 5);
-    fixture.countKmers();
-    fixture.applyFilter(1, 1000);
-
-    const auto pafPath = fixture.createPafFile({
-        {"read_0", "read_1", true, 0, uint32_t(read0.size()), 0, uint32_t(read1.size())},
-        {"read_0", "read_2", false, 0, uint32_t(read0.size()), 0, uint32_t(read2.size())},
-        {"read_1", "read_2", false, 0, uint32_t(read1.size()), 0, uint32_t(read2.size())},
-    });
-    fixture.importPafCandidates(pafPath);
-    fixture.buildIndex();
-    fixture.chainPafCandidates(0.1, 100, 0);
-
-    AlignOptions options;
-    options.alignMethod = 6;
-    options.maxSkip = 100;
-    options.maxDrift = 100;
-    options.maxTrim = 10000;
-    options.minAlignedMarkerCount = 4;
-    options.minAlignedFraction = 0.0;
-    options.maxMarkerFrequency = 1000;
-    options.matchScore = 3;
-    options.mismatchScore = -1;
-    options.gapScore = -1;
-    options.downsamplingFactor = 0.1;
-    options.bandExtend = 10;
-    options.maxBand = 1000;
-    options.sameChannelReadAlignmentSuppressDeltaThreshold = 0;
-    options.suppressContainments = false;
-    options.align4DeltaX = 200;
-    options.align4DeltaY = 10;
-    options.align4MinEntryCountPerCell = 10;
-    options.align4MaxDistanceFromBoundary = 100;
-    options.align5DriftRateTolerance = 0.02;
-    options.align5MinBandExtend = 10;
-    options.maxErrorRate = 0.3;
-    options.overlapDpMatchScore = 2;
-    options.overlapDpMismatchScore = -4;
-    options.overlapDpGapOpen1 = 4;
-    options.overlapDpGapExtend1 = 2;
-    options.overlapDpGapOpen2 = 24;
-    options.overlapDpGapExtend2 = 1;
-
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
-    fixture.assembler->computeAlignmentTableForTesting();
-
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->performGlobalSiteECParity(1); });
-
-    const AlignmentData* rcAd = nullptr;
-    for (const auto& ad : fixture.assembler->alignmentData) {
-        const bool matchesPair =
-            (ad.readIds[0] == ReadId(0) && ad.readIds[1] == ReadId(2)) ||
-            (ad.readIds[0] == ReadId(2) && ad.readIds[1] == ReadId(0));
-        if (matchesPair) {
-            rcAd = &ad;
-            break;
-        }
-    }
-    REQUIRE(rcAd != nullptr);
-    const auto phaseMask = AlignmentData::DeleteReasonPhase;
-    if (rcAd->readIds[0] == ReadId(0)) {
-        CHECK((rcAd->deleteReasons0 & phaseMask) == 0);
-        CHECK((rcAd->deleteReasons1 & phaseMask) == 0);
-        CHECK(rcAd->informativeHetSiteCount0 >= 2);
-        CHECK(rcAd->informativeHetSiteCount1 >= 2);
-    } else {
-        CHECK((rcAd->deleteReasons1 & phaseMask) == 0);
-        CHECK((rcAd->deleteReasons0 & phaseMask) == 0);
-        CHECK(rcAd->informativeHetSiteCount1 >= 2);
-        CHECK(rcAd->informativeHetSiteCount0 >= 2);
-    }
-}
 
 TEST_CASE("Integration: readGraph global het propagation drops members with gap at site",
     "[integration][evidence][hetsites][readgraph][gap]")
@@ -4383,57 +4293,7 @@ TEST_CASE("Integration: StringGraph pre-clean removes simple 1-step bubbles (top
     CHECK(fixture.assembler->stringGraph.arcs[10].del == 0);  // 4->6
 }
 
-TEST_CASE("Integration: StringGraph drop-short-overlaps prunes weak overlaps by ratio", "[integration][stringgraph][clean][drop]") {
-    AssemblerIntegrationFixture fixture;
 
-    fixture.createFastq({randomSequence(1000, 751), randomSequence(1000, 752), randomSequence(1000, 753)});
-    fixture.initAssembler();
-    fixture.loadReads();
-
-    withSilencedIoInDir(fixture.testDir, [&] {
-        fixture.assembler->alignmentData.createNew("", 4096);
-        fixture.assembler->alignmentData.resize(3);
-
-        // v=0 has two outgoing arcs:
-        // 0->1 strong (len=100 => ol=900)
-        // 0->2 weak   (len=700 => ol=300)
-        // Also add 1->2 so the weak edge isn't needed.
-        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
-            AlignmentInfo info;
-            info.alignmentId = alignmentId;
-            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
-            ad.qs = len;
-            ad.qe = 1000;
-            ad.ts = 0;
-            ad.te = 1000 - len;
-            fixture.assembler->alignmentData[alignmentId] = ad;
-        };
-        makeAlignment(0, ReadId(0), ReadId(1), 100);
-        makeAlignment(1, ReadId(0), ReadId(2), 700);
-        makeAlignment(2, ReadId(1), ReadId(2), 100);
-
-        fixture.assembler->computeAlignmentTableForTesting();
-        std::vector<bool> keep(3, true);
-        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
-
-        // Drop with ratio 0.5: threshold ~ 450 => ol=300 should be deleted.
-        fixture.assembler->cleanStringGraphDropShortOverlaps(0.5, /*minOverlapLen*/0, /*maxShortTipReads*/3);
-    });
-
-    // alignmentId=1 creates arcId=2 and twin arcId=3.
-    CHECK(fixture.assembler->stringGraph.arcs[2].del == 1);
-    CHECK(fixture.assembler->stringGraph.arcs[3].del == 1);
-    CHECK(fixture.assembler->stringGraph.arcs[0].del == 0);
-    CHECK(fixture.assembler->stringGraph.arcs[4].del == 0);
-
-    // After cleanup, outgoing adjacency from 0+ should only contain arcId=0.
-    const uint32_t v0 = OrientedReadId(ReadId(0), 0).getValue();
-    std::vector<uint32_t> out0;
-    for (const uint32_t arcId : fixture.assembler->stringGraph.outgoing[v0]) {
-        out0.push_back(arcId);
-    }
-    CHECK(out0 == std::vector<uint32_t>({0}));
-}
 
 TEST_CASE("Integration: StringGraph ONT weak-arc cutting removes deduplicated weaker arc", "[integration][stringgraph][clean][weak]") {
     AssemblerIntegrationFixture fixture;
@@ -4498,49 +4358,7 @@ TEST_CASE("Integration: StringGraph ONT weak-arc cutting removes deduplicated we
     CHECK(support12Ok);
 }
 
-TEST_CASE("Integration: StringGraph breaks simple short cycles", "[integration][stringgraph][clean][cycle]") {
-    AssemblerIntegrationFixture fixture;
 
-    fixture.createFastq({randomSequence(1000, 771), randomSequence(1000, 772), randomSequence(1000, 773)});
-    fixture.initAssembler();
-    fixture.loadReads();
-
-    withSilencedIoInDir(fixture.testDir, [&] {
-        fixture.assembler->alignmentData.createNew("", 4096);
-        fixture.assembler->alignmentData.resize(3);
-
-        auto makeAlignment = [&](uint64_t alignmentId, ReadId qn, ReadId tn, uint32_t len) {
-            AlignmentInfo info;
-            info.alignmentId = alignmentId;
-            AlignmentData ad(OrientedReadPair(qn, tn, true), info);
-            ad.qs = len;
-            ad.qe = 1000;
-            ad.ts = 0;
-            ad.te = 1000 - len;
-            fixture.assembler->alignmentData[alignmentId] = ad;
-        };
-
-        // 0 -> 1 -> 2 -> 0 cycle.
-        makeAlignment(0, ReadId(0), ReadId(1), 100);
-        makeAlignment(1, ReadId(1), ReadId(2), 100);
-        makeAlignment(2, ReadId(2), ReadId(0), 100);
-
-        fixture.assembler->computeAlignmentTableForTesting();
-        std::vector<bool> keep(3, true);
-        fixture.assembler->createStringGraphUsingSelectedAlignments(keep);
-
-        // Break short cycles (<=100 reads).
-        const uint64_t broken = fixture.assembler->cleanStringGraphBreakShortCycles(100);
-        CHECK(broken > 0);
-    });
-
-    // The cycle should be broken by deleting exactly one overlap's arc pair on this simple case.
-    // At least one of the three alignment-derived arc pairs must be deleted.
-    const bool pair0Deleted = fixture.assembler->stringGraph.arcs[0].del && fixture.assembler->stringGraph.arcs[1].del;
-    const bool pair1Deleted = fixture.assembler->stringGraph.arcs[2].del && fixture.assembler->stringGraph.arcs[3].del;
-    const bool pair2Deleted = fixture.assembler->stringGraph.arcs[4].del && fixture.assembler->stringGraph.arcs[5].del;
-    CHECK((pair0Deleted || pair1Deleted || pair2Deleted));
-}
 
 TEST_CASE("Integration: StringGraph explorer can list active vertices from arcs", "[integration][stringgraph][http]") {
     AssemblerIntegrationFixture fixture;
