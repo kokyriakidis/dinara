@@ -71,6 +71,7 @@ find_package(ZLIB REQUIRED)
 # Integration test executable
 add_executable(test_integration
     test_integration.cpp
+    test_overlap_cigar_store.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )
