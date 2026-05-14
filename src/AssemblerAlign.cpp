@@ -958,16 +958,14 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
                 data.alignOptions->overlapDpMatchScore,
                 data.alignOptions->overlapDpMismatchScore,
                 data.alignOptions->overlapDpGapOpen1,
-                data.alignOptions->overlapDpGapExtend1,
-                data.alignOptions->overlapDpGapOpen2,
-                data.alignOptions->overlapDpGapExtend2);
+                data.alignOptions->overlapDpGapExtend1);
             const auto tProjEnd = steady_clock::now();
             
             alignmentInfo.errorRate = float(projectedAlignment.errorRate());
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
             alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
-            alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
+            alignmentInfo.gapCount = uint32_t(projectedAlignment.totalIndelBaseCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount); // Transfer gap events
             alignmentInfo.dpScore = projectedAlignment.totalDpScore;
             
@@ -978,14 +976,14 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             const uint64_t tl = projectedAlignment.totalLength[1];
             
             const double errorRateThreshold = 0.07;
-            const uint64_t totalErrors = uint64_t(projectedAlignment.mismatchCount) + uint64_t(projectedAlignment.totalDeletionCount);
+            const uint64_t totalErrors = uint64_t(projectedAlignment.mismatchCount) + uint64_t(projectedAlignment.totalIndelBaseCount);
             if ((totalErrors > (ql * errorRateThreshold)) || (totalErrors > (tl * errorRateThreshold))) {
                 data.threadFilteredByErrorRate[threadId]++;
                 continue;
             }
 
             // const double gapRateThreshold = 0.006;
-            // const uint64_t totalGapCount = uint64_t(projectedAlignment.totalDeletionCount);
+            // const uint64_t totalGapCount = uint64_t(projectedAlignment.totalIndelBaseCount);
             // if ((totalGapCount > (ql * gapRateThreshold)) || (totalGapCount > (tl * gapRateThreshold))) {
             //     data.threadFilteredByErrorRateGap[threadId]++;
             //     continue;

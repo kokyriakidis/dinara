@@ -334,7 +334,7 @@ public:
     );
 
     // New unified alignment flow with evidence storage.
-    void computeAlignmentsWithEvidence(
+    void computeBaseAlignmentsAndStore(
         const AlignOptions&,
         uint64_t threadCount
     );
@@ -801,10 +801,10 @@ public:
     // Replaces the SNP/SV detection pipeline with vertex-ordering consistency.
     void performHifiasmECParityWithMarkerGraph(uint64_t threadCount);
     // Debug: run het-site detection for one read and print all SNP/SV sites.
-    // Call after computeAlignmentsWithEvidence().
+    // Call after computeBaseAlignmentsAndStore().
     void debugPrintHetSitesForRead(uint64_t readId);
     // Debug: dump all raw SNP/indel evidence for one read across its overlaps.
-    // Call after computeAlignmentsWithEvidence().
+    // Call after computeBaseAlignmentsAndStore().
     void debugDumpAlignedEvidenceForRead(uint64_t readId);
     // Debug: aggregate SNP sites for one read; print only positions where both
     // ref and alt alleles have at least minSupport supporting alignments.
@@ -1107,7 +1107,7 @@ public:
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     /// Delete overlaps where one read is contained in the other (ma_hit2arc containment).
-    /// Runs early (e.g. after computeAlignmentsWithEvidence) to remove containment overlaps.
+    /// Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps.
     void deleteContainmentOverlaps(uint64_t threadCount);
     /// Delete internal overlaps (ma_hit2arc result -1/-2: excessive overhangs or too short).
     /// Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches.
@@ -1591,7 +1591,7 @@ private:
 
     // Private functions and data used by computeAlignments.
     void computeAlignmentsThreadFunction(size_t threadId);
-    void computeAlignmentsWithEvidenceThreadFunction(size_t threadId);
+    void computeBaseAlignmentsAndStoreThreadFunction(size_t threadId);
     class ComputeAlignmentsData {
     public:
 
@@ -2067,7 +2067,7 @@ public:
     AlignedEvidenceStore chainedFastgaEvidenceStore;
 
     // Per-overlap packed CIGARs (hifiasm-style uint16_t tokens).
-    // Populated during computeAlignmentsWithEvidence.
+    // Populated during computeBaseAlignmentsAndStore.
     // Token arena; each overlap's (cigarOffset, cigarTokenCount) in AlignmentInfo
     // points directly into this arena.
     OverlapCigarStore overlapCigarStore;
