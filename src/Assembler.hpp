@@ -2537,24 +2537,13 @@ public:
         const OverlapCandidatesOptions& overlapCandidatesOptions,
         uint64_t threadCount
     );
-private:
-    struct InvertedIndexOccurrence {
-        KmerId kmerId;
-        ReadId readId;
-        uint32_t position;
-        bool operator<(const InvertedIndexOccurrence& other) const {
-            return kmerId < other.kmerId;
-        }
-    };
-    
+public:
     // Compact Structure for Query Phase (8 bytes).
     struct CompactOccurrence {
         ReadId readId;
         uint32_t position;
     };
-    
 
-    
 	    class AlignmentCandidatesInvertedIndexData {
 	    public:
 	         double maxDriftRate;
@@ -2583,10 +2572,7 @@ private:
              uint32_t maxEndFuzz = 0;        // If >0, reject candidates needing more extension to read ends.
 	             vector<uint32_t> weightLut; // size 512 (pow(weightBase, weightExponent) truncated)
 	         
-	         // Phase 1: Heavy vector with Keys (for Sort/Group).
-	         vector<InvertedIndexOccurrence> occurrences; 
-         
-         // Phase 2: Compact vector for Query (8 bytes/hit).
+         // Compact vector for Query (8 bytes/hit).
          vector<CompactOccurrence> compactOccurrences;
 
 	         // Canonical k-mer ids for strand-0 markers, laid out read-contiguously.
@@ -2614,7 +2600,7 @@ private:
 
     AlignmentCandidatesInvertedIndexData invertedIndexData;
 
-
+private:
     void applyKmerCountFilterThreadFunctionPass1(size_t threadId);
     void applyKmerCountFilterThreadFunctionPass2(size_t threadId);
     class ApplyKmerCountFilterData {
