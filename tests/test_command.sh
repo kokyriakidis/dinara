@@ -1,0 +1,19 @@
+/home/kokyriakidis/Downloads/dinara-build/Executable/dinara \
+--input /home/kokyriakidis/Downloads/GIAB_HG002_TESTS/PAW70337.chr1_35_45Mb_subregion.fasta \
+--config Nanopore-r10.4.1_e8.2-400bps_sup-Herro-Jan2025 \
+--Reads.minReadLength 1000 \
+--threads 20 \
+--Kmers.k 50 \
+--Kmers.useSimdClosedSyncmers true \
+--Kmers.syncmerS 11 \
+--Assembly.mode3.minAnchorCoverage 4 \
+--Assembly.mode3.maxAnchorCoverage 400 \
+--Align.minAlignedMarkerCount 20 \
+--OverlapCandidates.method InvertedIndex \
+--OverlapCandidates.driftRateTolerance 0.05 \
+--OverlapCandidates.maxEndFuzz 0 \
+--OverlapCandidates.minOverlapLength 200 \
+--MarkerGraph.alwaysSave \
+--memoryMode filesystem \
+--memoryBacking disk \
+--assemblyDirectory /home/kokyriakidis/Downloads/PAW70337.chr1_35_45Mb_subregion.fasta
