@@ -380,7 +380,7 @@ void AssemblerOptions::addConfigurableOptions()
 
          ("Kmers.k",
          value<int>(&kmersOptions.k)->
-         default_value(10),
+         default_value(50),
          "Length of marker k-mers (in run-length space).")
 
          ("Kmers.probability",
@@ -418,7 +418,7 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Kmers.syncmerS",
         value<int>(&kmersOptions.syncmerS)->
-        default_value(32),
+        default_value(11),
         "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
 
         ("MinHash.version",
