@@ -4346,7 +4346,7 @@ void Assembler::performHifiasmECParityWithMarkerGraph(uint64_t threadCount)
 // Debug helper: run het-site detection for a single read and print all SNP/SV sites
 // together with the per-overlap evidence, so they can be inspected interactively.
 //
-// Call this after computeAlignmentsWithEvidence() (which populates alignmentTable,
+// Call this after computeBaseAlignmentsAndStore() (which populates alignmentTable,
 // alignmentData and alignedEvidenceStore).
 void Assembler::debugPrintHetSitesForRead(uint64_t readId)
 {
@@ -4662,7 +4662,7 @@ void Assembler::debugDumpAlignedEvidenceForRead(uint64_t readId)
     }
     if (alignedEvidenceStore.index.empty()) {
         cout << "[EvidenceDump] alignedEvidenceStore is empty. "
-             << "Run computeAlignmentsWithEvidence() first.\n";
+             << "Run computeBaseAlignmentsAndStore() first.\n";
         return;
     }
 
@@ -4803,7 +4803,7 @@ void Assembler::debugDumpSnpSitesForRead(uint64_t readId, uint32_t minSupport)
     }
     if (alignedEvidenceStore.index.empty()) {
         cout << "[SnpSites] alignedEvidenceStore is empty. "
-             << "Run computeAlignmentsWithEvidence() first.\n";
+             << "Run computeBaseAlignmentsAndStore() first.\n";
         return;
     }
 

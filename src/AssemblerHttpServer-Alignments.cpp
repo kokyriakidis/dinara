@@ -1525,9 +1525,7 @@ void Assembler::exploreAlignment(
             ao.overlapDpMatchScore,
             ao.overlapDpMismatchScore,
             ao.overlapDpGapOpen1,
-            ao.overlapDpGapExtend1,
-            ao.overlapDpGapOpen2,
-            ao.overlapDpGapExtend2);
+            ao.overlapDpGapExtend1);
 
         html << "<h2>Alignment projection to base space</h2>";
 

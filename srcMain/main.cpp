@@ -1022,7 +1022,7 @@ void dinara::main::assemble(
 
     // Previous full evidence path. Use this instead of the lightweight path
     // when base-level projected alignments and SNP/indel evidence are needed.
-    assembler.computeAlignmentsWithEvidence(
+    assembler.computeBaseAlignmentsAndStore(
         assemblerOptions.alignOptions,
         threadCount);
 
