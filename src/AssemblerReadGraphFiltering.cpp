@@ -836,7 +836,7 @@ void Assembler::filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint
 /*
 deleteContainmentOverlaps: Delete overlaps where one read is contained in the other.
 
-Runs early (e.g. after computeAlignmentsWithEvidence) to remove containment overlaps
+Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps
 without removing the contained reads themselves. Uses ma_hit2arc_containment to detect
 QCONT (query contained in target) or TCONT (target contained in query), and marks
 those overlaps with DeleteReasonContained.
