@@ -788,9 +788,13 @@ void dinara::main::assemble(
         assembler.countKmersFromMarkerKmerIds(threadCount);
         
         // Retrieve peak and set thresholds.
+        // Hifiasm hard-filters k-mers above max_kmer_cnt (default 2000) during
+        // sketching. K-mers between highFreqThreshold (coveragePeak * 1.667)
+        // and this cutoff are kept but downsampled per-streak during chaining.
         const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
         const uint64_t minFreq = 2;
-        const uint64_t maxFreq = 5 * coveragePeak;
+        const uint64_t maxFreq = uint64_t(
+            assemblerOptions.overlapCandidatesOptions.invertedIndexMaxKmerCount);
         const bool removePalindromicKmers = true;
         uint64_t distinctKmerCount = 0;
         for(uint64_t bucketId=0; bucketId<assembler.kmerCounter->kmerIdFrequencies.size(); bucketId++) {
