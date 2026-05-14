@@ -1009,18 +1009,21 @@ void dinara::main::assemble(
     // assembler.alignChainedCandidatesWithFastGA(threadCount);
     // return;
 
-    // Lightweight marker-chain materialization.
-    // The marker graph vertex builder needs alignmentData/compressedAlignments,
-    // but this prototype does not need projected banded/base alignments or evidence.
-    assembler.computeAlignmentDataFromChainedCandidatesOnly(
-        assemblerOptions.alignOptions,
-        threadCount);
+    // // Lightweight marker-chain materialization.
+    // // The marker graph vertex builder needs alignmentData/compressedAlignments,
+    // // but this prototype does not need projected banded/base alignments or evidence.
+    // assembler.computeAlignmentDataFromChainedCandidatesOnly(
+    //     assemblerOptions.alignOptions,
+    //     threadCount);
 
     // Previous full evidence path. Use this instead of the lightweight path
     // when base-level projected alignments and SNP/indel evidence are needed.
-    // assembler.computeAlignmentsWithEvidence(
-    //     assemblerOptions.alignOptions,
-    //     threadCount);
+    assembler.computeAlignmentsWithEvidence(
+        assemblerOptions.alignOptions,
+        threadCount);
+
+    return;
+    
 
     // The marker graph vertex builder iterates readGraph edges. For this
     // diagnostic prototype, keep all chained alignments and let marker-graph
