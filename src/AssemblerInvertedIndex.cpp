@@ -114,6 +114,7 @@
  */
 
 #include "Assembler.hpp"
+#include "InvertedIndexBuilder.hpp"
 #include "hifiasmCoordinateTransforms.hpp"
 #include "performanceLog.hpp"
 #include "OrientedReadPair.hpp"
@@ -121,7 +122,7 @@
 #include "Reads.hpp"
 #include <algorithm>
 #include <array>
-#include <barrier>
+
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -525,55 +526,9 @@ struct ThreadScratchpad {
 
 // ============================================================================
 // K-MER UTILITY FUNCTIONS
-// ============================================================================
-// These helpers support the canonical k-mer representation and hashing
-// used throughout the inverted index and hit-collection phases.
-//
-// Canonicalization: For each observed k-mer, we compute its reverse complement
-// and pick the lexicographically smaller of the two as the "canonical" form.
-// This ensures that overlapping reads match regardless of which strand they
-// came from, which is essential for detecting same-strand and diff-strand
-// overlaps uniformly.
-// ============================================================================
-
-/**
- * @brief Compute the reverse complement of a k-mer stored in a KmerId.
- *
- * KmerId packs a k-mer as two k-bit halves (LSB and MSB). The reverse
- * complement flips and reverses both halves, then swaps them.
- *
- * @param id  The k-mer ID whose RC is needed.
- * @param k   The number of bits per half (i.e., k-mer length in bases).
- * @return The reverse complement k-mer ID.
- */
-inline KmerId getRcKmerId(KmerId id, uint64_t k) {
-    const KmerId mask = (KmerId(1) << k) - 1;
-    const KmerId lsb = id & mask;
-    const KmerId msb = (id >> k) & mask;
-    
-    auto reverseBits = [&](KmerId x) -> KmerId {
-        if (sizeof(KmerId) <= 8) return bitReversal(uint64_t(x)) >> (64 - k);
-        else return bitReversal((__uint128_t)x) >> (128 - k);
-    };
-    
-    KmerId rc_lsb = (~reverseBits(lsb)) & mask;
-    KmerId rc_msb = (~reverseBits(msb)) & mask;
-    return (rc_msb << k) | rc_lsb;
-}
-
-/**
- * @brief Thread-safe hash function for K-mer IDs.
- *
- * Uses a Boost-style hash combine to fold 128-bit KmerId (or wider) into
- * a 64-bit hash. The golden ratio constant 0x9e3779b9 provides good
- * bit mixing. Used for hash-table construction in the inverted index.
- */
-static inline uint64_t hashKmer(KmerId k) {
-    const uint64_t* p = reinterpret_cast<const uint64_t*>(&k);
-    uint64_t k1 = p[0];
-    uint64_t k2 = sizeof(KmerId) > 8 ? p[1] : 0; 
-    return k1 ^ (k2 + 0x9e3779b9 + (k1<<6) + (k1>>2));
-}
+// K-mer canonicalization and hashing: defined in InvertedIndexBuilder.hpp.
+using dinara::getRcKmerId;
+using dinara::hashKmer;
 
 /**
  * @brief Hifiasm's yak_hash64_64 bijective integer hash (htab.h:150).
@@ -3675,6 +3630,8 @@ using namespace dinara;
 
 // =============================================================================
 // Phase 1-4: Build the inverted index for overlap candidate discovery.
+// Uses count-then-scatter (hifiasm-style) to avoid the 24-byte intermediate
+// array and radix sort. See InvertedIndexBuilder.hpp for implementation.
 // =============================================================================
 void Assembler::buildInvertedIndex(uint64_t threadCount) {
     if(threadCount == 0) {
@@ -3683,297 +3640,17 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
 
     performanceLog << timestamp << "Building Inverted Index..." << endl;
 
-    // =========================================================================
-    // Phase 1: Inverted Index Construction
-    // =========================================================================
-    // We build an index mapping each canonical K-mer to all of its occurrences
-    // (ReadId, Position). We only index Strand 0 because canonical K-mers are
-    // strand-symmetric, halving memory usage. RC matches are detected during
-    // the DP chaining phase by observing decreasing target positions.
-    // =========================================================================
     checkMarkersAreOpen();
     if(!markerKmerIds->isOpen()) {
         throw runtime_error("Marker KmerIds not available for Inverted Index.");
     }
-    invertedIndexData.k = assemblerInfo->k;
-    const uint64_t totalMarkers = markers->totalSize();
-    cout << "Building Inverted Index for " << totalMarkers << " markers." << endl;
 
-    // We use static load balancing (not dynamic getNextBatch) to ensure that
-    // each thread processes the exact same reads in both Pass 1 (Count) and
-    // Pass 2 (Fill). This prevents buffer overflows from mismatched counts.
-    const ReadId readCount = ReadId(markers->size() / 2);
-    vector<uint64_t> threadMarkerCounts(threadCount, 0);
-    vector<size_t> threadOffsets(threadCount, 0);
-    vector<uint64_t> readMarkerCounts(size_t(readCount), 0);
-
-    // Pass 1: Count markers per thread for memory allocation
-    auto countFunction = [&](size_t threadId) {
-        ReadId startRead = (ReadId)((uint64_t)readCount * threadId / threadCount);
-        ReadId endRead   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
-
-        uint64_t count = 0;
-        for(ReadId rId = startRead; rId != endRead; ++rId) {
-            const auto& rMarkers = (*markers)[size_t(rId) << 1];
-            const auto& rKmerIds = (*markerKmerIds)[size_t(rId) << 1];
-            const size_t n = std::min<size_t>(rMarkers.size(), rKmerIds.size());
-            readMarkerCounts[size_t(rId)] = uint64_t(n);
-            count += n;
-        }
-        threadMarkerCounts[threadId] = count;
-    };
-
-    vector<std::thread> threads;
-    for(size_t i = 0; i < threadCount; i++) threads.emplace_back(countFunction, i);
-    for(auto& t : threads) t.join();
-    threads.clear();
-
-    // Compute global offsets
-    size_t totalMarkersFound = 0;
-    for(size_t i = 0; i < threadCount; i++) {
-        threadOffsets[i] = totalMarkersFound;
-        totalMarkersFound += threadMarkerCounts[i];
-    }
-
-    invertedIndexData.strand0CanonicalOffsets.resize(size_t(readCount) + 1, 0);
-    for(size_t r = 0; r < size_t(readCount); ++r) {
-        invertedIndexData.strand0CanonicalOffsets[r + 1] =
-            invertedIndexData.strand0CanonicalOffsets[r] + readMarkerCounts[r];
-    }
-    if(invertedIndexData.strand0CanonicalOffsets.back() != totalMarkersFound) {
-        throw runtime_error("buildInvertedIndex: inconsistent marker counts for canonical cache.");
-    }
-    
-    invertedIndexData.occurrences.resize(totalMarkersFound);
-    invertedIndexData.strand0CanonicalKmerIds.resize(totalMarkersFound);
-    invertedIndexData.strand0CanonicalIsRc.resize(totalMarkersFound);
-    cout << "Index allocated for " << totalMarkersFound << " occurrences (Strand 0 only)." << endl;
-
-    // Pass 2: Fill the occurrence array
-    auto fillFunction = [&](size_t threadId) {
-        ReadId startRead = (ReadId)((uint64_t)readCount * threadId / threadCount);
-        ReadId endRead   = (ReadId)((uint64_t)readCount * (threadId + 1) / threadCount);
-        size_t writeOffset = threadOffsets[threadId];
-
-        for(ReadId rId = startRead; rId != endRead; ++rId) {
-            const auto& rMarkers = (*markers)[size_t(rId) << 1];
-            const auto& rKmerIds = (*markerKmerIds)[size_t(rId) << 1];
-            const size_t n = std::min<size_t>(rMarkers.size(), rKmerIds.size());
-            size_t canonicalWriteOffset = size_t(invertedIndexData.strand0CanonicalOffsets[size_t(rId)]);
-            for(size_t i = 0; i < n; ++i) {
-                KmerId kId = rKmerIds[i];
-                KmerId rcKId = getRcKmerId(kId, invertedIndexData.k);
-                KmerId canonicalKId = (kId < rcKId) ? kId : rcKId;
-                const uint8_t isRc = uint8_t(kId > rcKId);
-
-                // Encode the observed-orientation bit into the top bit of the stored position.
-                // Marker positions fit in 24 bits (Uint24), so this does not collide with real coordinates.
-                const uint32_t encodedPosition = uint32_t(rMarkers[i].position) | (uint32_t(isRc) << 31);
-                invertedIndexData.occurrences[writeOffset++] = {
-                    canonicalKId,
-                    rId,
-                    encodedPosition
-                };
-                invertedIndexData.strand0CanonicalKmerIds[canonicalWriteOffset++] = canonicalKId;
-                invertedIndexData.strand0CanonicalIsRc[canonicalWriteOffset - 1] = isRc;
-            }
-        }
-    };
-
-    // Run filling process in parallel
-    for(size_t i = 0; i < threadCount; i++) {
-        threads.emplace_back(fillFunction, i);
-    }
-    for(auto& t : threads) t.join();
-    threads.clear();
-
-    // =========================================================================
-    // Phase 2: Parallel LSD Radix Sort
-    // =========================================================================
-    // We sort the occurrences by K-mer ID to group all markers with the same
-    // K-mer together. This uses a parallel Least-Significant-Digit (LSD) radix
-    // sort, which is O(N * numBytes) and stable. The parallelization strategy:
-    //   1. Each thread computes a local histogram for its data partition.
-    //   2. Histograms are combined to compute global bucket offsets.
-    //   3. Each thread scatters its data to the correct output positions.
-    // =========================================================================
-    cout << "Sorting " << invertedIndexData.occurrences.size() << " occurrences..." << endl;
-    
-    if(!invertedIndexData.occurrences.empty()) {
-        const size_t n = invertedIndexData.occurrences.size();
-        // KmerId stores 2*k bits; higher bytes are always zero. Sorting only
-        // active bytes avoids redundant radix passes for wide KmerId types.
-        const size_t numBytes = std::max<size_t>(1, (2 * size_t(invertedIndexData.k) + 7) / 8);
-        constexpr size_t bucketCount = 256;
-        
-        vector<InvertedIndexOccurrence> buffer(n);
-        vector<InvertedIndexOccurrence>* src = &invertedIndexData.occurrences;
-        vector<InvertedIndexOccurrence>* dst = &buffer;
-        vector<size_t> threadHistograms(threadCount * bucketCount);
-        vector<size_t> globalBucketCounts(bucketCount);
-        vector<size_t> globalBucketOffsets(bucketCount);
-        vector<size_t> writeOffsets(threadCount * bucketCount);
-        uint8_t radixStage = 0; // 0=histogram, 1=scatter
-        bool stopWorkers = false;
-        size_t currentByteShift = 0;
-        std::barrier syncPoint(ptrdiff_t(threadCount + 1));
-        vector<thread> sortThreads;
-        sortThreads.reserve(threadCount);
-        for(size_t tid = 0; tid < threadCount; ++tid) {
-            sortThreads.emplace_back([&, tid]() {
-                const size_t start = (n * tid) / threadCount;
-                const size_t end = (n * (tid + 1)) / threadCount;
-                while(true) {
-                    syncPoint.arrive_and_wait();
-                    if(stopWorkers) {
-                        break;
-                    }
-                    if(radixStage == 0) {
-                        size_t* localHistogram = threadHistograms.data() + tid * bucketCount;
-                        std::fill_n(localHistogram, bucketCount, size_t(0));
-                        for(size_t i = start; i < end; ++i) {
-                            const uint8_t byteVal = uint8_t(((*src)[i].kmerId >> currentByteShift) & 0xFF);
-                            localHistogram[byteVal]++;
-                        }
-                    } else {
-                        size_t* localWriteOffsets = writeOffsets.data() + tid * bucketCount;
-                        for(size_t i = start; i < end; ++i) {
-                            const uint8_t byteVal = uint8_t(((*src)[i].kmerId >> currentByteShift) & 0xFF);
-                            (*dst)[localWriteOffsets[byteVal]++] = (*src)[i];
-                        }
-                    }
-                    syncPoint.arrive_and_wait();
-                }
-            });
-        }
-        
-        for (size_t byteIdx = 0; byteIdx < numBytes; ++byteIdx) {
-            currentByteShift = byteIdx * 8;
-            
-            // 2.1 Parallel Histogram Calculation
-            radixStage = 0;
-            syncPoint.arrive_and_wait();
-            syncPoint.arrive_and_wait();
-            
-            // 2.2 Global Offset Calculation
-            std::fill(globalBucketCounts.begin(), globalBucketCounts.end(), 0);
-            for(size_t b = 0; b < bucketCount; ++b) {
-                for(size_t tid = 0; tid < threadCount; ++tid) {
-                    globalBucketCounts[b] += threadHistograms[tid * bucketCount + b];
-                }
-            }
-            globalBucketOffsets[0] = 0;
-            for(size_t b = 1; b < bucketCount; ++b) {
-                globalBucketOffsets[b] = globalBucketOffsets[b - 1] + globalBucketCounts[b - 1];
-            }
-            
-            // 2.3 Individual Thread Starting Offsets
-            for(size_t b = 0; b < bucketCount; ++b) {
-                size_t current = globalBucketOffsets[b];
-                for(size_t tid = 0; tid < threadCount; tid++) {
-                    writeOffsets[tid * bucketCount + b] = current;
-                    current += threadHistograms[tid * bucketCount + b];
-                }
-            }
-            
-            // 2.4 Parallel Data Scattering
-            radixStage = 1;
-            syncPoint.arrive_and_wait();
-            syncPoint.arrive_and_wait();
-
-            std::swap(src, dst);
-        }
-
-        stopWorkers = true;
-        syncPoint.arrive_and_wait();
-        for(auto& t : sortThreads) {
-            t.join();
-        }
-        
-        if (src != &invertedIndexData.occurrences) {
-             invertedIndexData.occurrences = std::move(*src);
-        }
-    }
-
-    // =========================================================================
-    // Phase 3: Hash Table Construction (Open Addressing)
-    // =========================================================================
-    // Build a power-of-2 sized hash table for O(1) K-mer lookups. Each entry
-    // stores the starting index and count of occurrences for a single K-mer.
-    // We use linear probing for collision resolution. The load factor is ~50%
-    // to balance memory usage and probe length.
-    // =========================================================================
-    cout << "Allocating Direct Addressing Hash Table..." << endl;
-    
-    uint64_t numDistinctKmers = 0;
-    if(!invertedIndexData.occurrences.empty()) {
-        numDistinctKmers = 1;
-        KmerId lastKId = invertedIndexData.occurrences[0].kmerId;
-        for(size_t i = 1; i < invertedIndexData.occurrences.size(); ++i) {
-            if(invertedIndexData.occurrences[i].kmerId != lastKId) {
-                numDistinctKmers++;
-                lastKId = invertedIndexData.occurrences[i].kmerId;
-            }
-        }
-    }
-    cout << "Distinct K-mers found: " << numDistinctKmers << endl;
-
-    uint64_t tableSize = 1;
-    while(tableSize < numDistinctKmers * 2) tableSize *= 2; 
-    invertedIndexData.hashTable.resize(tableSize); 
-    
-    if(!invertedIndexData.occurrences.empty()) {
-        KmerId currentKmer = invertedIndexData.occurrences[0].kmerId;
-        uint64_t blockStart = 0;
-        uint64_t mask = tableSize - 1;
-
-        auto insertIntoTable = [&](KmerId key, uint64_t startIdx, uint32_t count) {
-            uint64_t slotIdx = hashKmer(key) & mask;
-            while(!invertedIndexData.hashTable[slotIdx].empty) {
-                slotIdx = (slotIdx + 1) & mask;
-            }
-            invertedIndexData.hashTable[slotIdx] = {key, startIdx, count, false};
-        };
-
-        for(uint64_t i = 1; i < invertedIndexData.occurrences.size(); ++i) {
-            if(invertedIndexData.occurrences[i].kmerId != currentKmer) {
-                insertIntoTable(currentKmer, blockStart, (uint32_t)(i - blockStart));
-                currentKmer = invertedIndexData.occurrences[i].kmerId;
-                blockStart = i;
-            }
-        }
-        insertIntoTable(currentKmer, blockStart, (uint32_t)(invertedIndexData.occurrences.size() - blockStart));
-    }
-
-    // =========================================================================
-    // Phase 4: Index Compaction
-    // =========================================================================
-    // The full occurrence struct contains the K-mer ID, but after building the
-    // hash table, we only need (ReadId, Position) for each occurrence. This
-    // compaction reduces the memory footprint by ~3x, which is critical for
-    // large datasets. We parallelize this trivially across all occurrences.
-    // =========================================================================
-    const size_t nMarkersTotal = invertedIndexData.occurrences.size();
-    invertedIndexData.compactOccurrences.resize(nMarkersTotal);
-    
-    auto compactFunction = [&](size_t tid) {
-        size_t start = (nMarkersTotal * tid) / threadCount;
-        size_t end = (nMarkersTotal * (tid + 1)) / threadCount;
-        for(size_t i = start; i < end; ++i) {
-            invertedIndexData.compactOccurrences[i] = {
-                invertedIndexData.occurrences[i].readId,
-                invertedIndexData.occurrences[i].position
-            };
-        }
-    };
-    vector<thread> compactThreads;
-    for(size_t i = 0; i < threadCount; i++) compactThreads.emplace_back(compactFunction, i);
-    for(auto& t : compactThreads) t.join();
-    
-    // Free high-memory intermediate vector
-    invertedIndexData.occurrences.clear();
-    invertedIndexData.occurrences.shrink_to_fit();
-    cout << "Index construction complete." << endl;
+    inverted_index_builder::build(
+        invertedIndexData,
+        *markers,
+        *markerKmerIds,
+        assemblerInfo->k,
+        threadCount);
 }
 
 // =============================================================================
