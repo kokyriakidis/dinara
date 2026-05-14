@@ -832,44 +832,24 @@ static inline void applyMcopyFastSelection(
     }
 }
 
-// ============================================================================
-// STRICT HIFIASM PORT: lchain_qdp_mcopy_fast + quick_ck_lchain
-// ============================================================================
-// Source of truth: hifiasm 0.25.0-r726 (ec9a8b2)
-// - Hash_Table.cpp:2007-2095 (quick_ck_lchain)
-// - Hash_Table.cpp:2097-2284 (lchain_qdp_mcopy_fast)
-// - Hash_Table.cpp:1475-1541 (cal_bw + comput_sc_ch_ec)
-// - Hash_Table.cpp:779-809 (get_chainLen)
-// - Hash_Table.cpp:1752-1780 (push_ovlp_chain_qgen)
+// Strict port of hifiasm 0.25.0-r726 (ec9a8b2) chaining pipeline.
+// Variable names and control flow match hifiasm for step-parity verification.
+// Coordinates use inclusive ends internally (hifiasm convention).
 //
-// Notes:
-// - This port is intentionally "mechanical": variable names and control flow match hifiasm
-//   so behavior is step-parity given identical hit sets.
-// - Dinara stores intervals as half-open, but hifiasm overlap_region uses inclusive end coords.
-//   The port keeps inclusive ends internally and converts when building `Alignment`.
-// ============================================================================
+// Source functions:
+//   Hash_Table.cpp:1475  cal_bw
+//   Hash_Table.cpp:1515  comput_sc_ch_ec
+//   Hash_Table.cpp:779   get_chainLen
+//   Hash_Table.cpp:1752  push_ovlp_chain_qgen
+//   Hash_Table.cpp:2007  quick_ck_lchain
+//   Hash_Table.cpp:2097  lchain_qdp_mcopy_fast
+//   anchor.cpp:86        ha_ov_type
+//   anchor.cpp:1920      lchain_qgen_mcopy_fast (postfilter)
 namespace {
 
-// ============================================================================
-// HIFIASM SCORING HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Normalize score by k-mer occurrence frequency (hifiasm weight normalization).
- *
- * Downweights common k-mers to prevent repetitive regions from dominating
- * the chaining score. If the k-mer occurs x times and has weight y:
- *   - If x >= y: score = x/y (downweight)
- *   - Otherwise: score = 1   (minimum score)
- *
- * @param x  Raw score (e.g., span or count)
- * @param y  K-mer occurrence/frequency weight
- * @return Normalized score (≥1)
- *
- * @complexity O(1)
- * @reference Hifiasm Hash_Table.cpp:20 (normal_w macro)
- */
-static inline int32_t hifiasm_normal_w(const int32_t x, const int32_t y) noexcept
+/// Downweight score by k-mer occurrence frequency.
+/// @reference Hifiasm Hash_Table.cpp:20 (normal_w macro)
+static inline int32_t hifiasm_normal_w(int32_t x, int32_t y) noexcept
 {
     return (x >= y) ? (x / y) : 1;
 }
@@ -1051,1500 +1031,622 @@ struct HifiasmChainDataScratch {
     }
 };
 
-/**
- * @brief Calculate adaptive bandwidth constraint for anchor chaining.
- *
- * This function computes the maximum allowed coordinate deviation (bandwidth)
- * between two anchors ai and aj. The bandwidth adapts based on the "alignable
- * region" - the portion of both sequences that can participate in the alignment
- * given the current anchor positions.
- *
- * ## Algorithm:
- *   1. Compute the alignable region by normalizing start/end coordinates
- *   2. The alignable span is the min of query and target remaining lengths
- *   3. Bandwidth = alignable_span * bw_rate
- *
- * ## Intuition:
- *   Near sequence ends, we allow more flexibility (larger bandwidth) because
- *   there's more opportunity for valid gaps. In the middle, we're stricter.
- *
- * @param ai      Later anchor (query position i)
- * @param aj      Earlier anchor (query position j < i)
- * @param bw_rate Bandwidth rate (typically 0.3-0.5, i.e., 30-50% deviation)
- * @param sf_l    Query sequence length (self)
- * @param ot_l    Target sequence length (other)
- * @return Maximum allowed bandwidth (coordinate deviation)
- *
- * @complexity O(1)
- * @reference Hifiasm Hash_Table.cpp:1475-1488 (cal_bw)
- */
+/// Compute adaptive bandwidth: the maximum allowed diagonal deviation between
+/// two anchors, scaled by the alignable span of the overlap region.
+/// Near sequence ends the bandwidth is larger (more room for indels).
+/// @reference Hifiasm Hash_Table.cpp:1475-1488 (cal_bw)
 static inline int32_t hifiasm_cal_bw(
     const HifiasmKmerHit* ai,
     const HifiasmKmerHit* aj,
-    const double bw_rate,
-    const int64_t sf_l,
-    const int64_t ot_l) noexcept
+    double bw_rate,
+    int64_t sf_l,
+    int64_t ot_l) noexcept
 {
-    // Extract anchor coordinates (half-open intervals)
-    int64_t query_start = static_cast<int64_t>(aj->self_offset);
-    int64_t query_end   = static_cast<int64_t>(ai->self_offset) + 1;
-    int64_t target_start = static_cast<int64_t>(aj->offset);
-    int64_t target_end   = static_cast<int64_t>(ai->offset) + 1;
+    int64_t sf_s = static_cast<int64_t>(aj->self_offset);
+    int64_t sf_e = static_cast<int64_t>(ai->self_offset) + 1;
+    int64_t ot_s = static_cast<int64_t>(aj->offset);
+    int64_t ot_e = static_cast<int64_t>(ai->offset) + 1;
+    int64_t sf_r = sf_l - sf_e;
+    int64_t ot_r = ot_l - ot_e;
 
-    // Remaining lengths after current anchors
-    const int64_t query_remaining = sf_l - query_end;
-    const int64_t target_remaining = ot_l - target_end;
+    // Left-normalize: shift query start to 0 or offset by target start.
+    if (sf_s <= ot_s) sf_s = 0;
+    else sf_s -= ot_s;
 
-    // Normalize starts: offset by the minimum to align coordinates
-    if (query_start <= target_start) {
-        query_start = 0;
-    } else {
-        query_start -= target_start;
-    }
+    // Right-extend: extend query end to sequence boundary or by target remainder.
+    if (sf_r <= ot_r) sf_e = sf_l;
+    else sf_e += ot_r;
 
-    // Normalize ends: extend to full length if one sequence is shorter
-    if (query_remaining <= target_remaining) {
-        query_end = sf_l;
-    } else {
-        query_end += target_remaining;
-    }
-
-    // Alignable span determines bandwidth
-    const int64_t alignable_span = query_end - query_start;
-    return static_cast<int32_t>(static_cast<double>(alignable_span) * bw_rate);
+    return static_cast<int32_t>(static_cast<double>(sf_e - sf_s) * bw_rate);
 }
 
-/**
- * @brief Compute chaining score between two anchors with gap penalties.
- *
- * This is the core scoring function for the DP chaining algorithm. It computes
- * the cost of connecting anchor aj to anchor ai, accounting for:
- *   1. Coordinate differences (query and target gaps)
- *   2. Bandwidth constraints (alignment feasibility)
- *   3. Gap penalties (indels and skipped bases)
- *
- * ## Scoring Formula:
- *   base_score = min(k-mer_span, min(query_gap, target_gap))
- *   normalized_score = base_score / occurrence_weight
- *   penalty = chn_pen_gap * |query_gap - target_gap| + chn_pen_skip * min_gap
- *   final_score = normalized_score - penalty
- *
- * ## Return Values:
- *   - INT32_MIN: Invalid connection (monotonicity violation or bandwidth exceeded)
- *   - ≥0: Valid score (higher is better)
- *
- * @param ai          Later anchor (position i in DP)
- * @param aj          Earlier anchor (position j < i in DP)
- * @param bw_rate     Bandwidth rate for adaptive penalty (typically 0.3-0.5)
- * @param chn_pen_gap Gap penalty coefficient (penalizes indels)
- * @param chn_pen_skip Skip penalty (penalizes large gaps between anchors)
- * @param sl          Query sequence length (self)
- * @param ol          Target sequence length (other)
- * @return Chaining score or INT32_MIN if invalid
- *
- * @complexity O(1) - Single cal_bw call
- * @reference Hifiasm Hash_Table.cpp:1515-1541 (comput_sc_ch_ec)
- */
+/// Compute chaining score between two anchors with gap penalties.
+///
+/// Returns INT32_MIN if the connection is invalid (monotonicity violation or
+/// bandwidth exceeded). Otherwise returns a score where higher is better:
+///   score = min(span, min(dq, dr)) / weight - gap_penalty - skip_penalty
+///
+/// The penalty uses a split strategy: small gaps (dd < 4) take the milder of
+/// linear vs adaptive penalty; large gaps take the harsher one.
+///
+/// @reference Hifiasm Hash_Table.cpp:1515-1541 (comput_sc_ch_ec)
 static inline int32_t hifiasm_comput_sc_ch_ec(
     const HifiasmKmerHit* ai,
     const HifiasmKmerHit* aj,
-    const double bw_rate,
-    const double chn_pen_gap,
-    const double chn_pen_skip,
-    const int64_t sl,
-    const int64_t ol) noexcept
+    double bw_rate,
+    double chn_pen_gap,
+    double chn_pen_skip,
+    int64_t sl,
+    int64_t ol) noexcept
 {
-    // -------------------------------------------------------------------------
-    // STEP 1: Check monotonicity (query and target must both advance)
-    // -------------------------------------------------------------------------
+    // Monotonicity: both query and target must advance.
     const int32_t dq = static_cast<int32_t>(
         static_cast<int64_t>(ai->self_offset) - static_cast<int64_t>(aj->self_offset));
-    if (dq <= 0) return INT32_MIN;  // Query must advance
+    if (dq <= 0) return INT32_MIN;
 
     const int32_t dr = static_cast<int32_t>(
         static_cast<int64_t>(ai->offset) - static_cast<int64_t>(aj->offset));
-    if (dr <= 0) return INT32_MIN;  // Target must advance
+    if (dr <= 0) return INT32_MIN;
 
-    // -------------------------------------------------------------------------
-    // STEP 2: Check bandwidth constraint (gap difference must be reasonable)
-    // -------------------------------------------------------------------------
-    const int32_t dd = std::abs(dr - dq);  // Gap difference (diagonal deviation)
-
-    // Reject if deviation exceeds bandwidth (with small constant allowance)
-    if ((dd > 16) && (dd > hifiasm_cal_bw(ai, aj, bw_rate, sl, ol))) {
+    // Diagonal deviation (gap difference).
+    const int32_t dd = std::abs(dr - dq);
+    if ((dd > 16) && (dd > hifiasm_cal_bw(ai, aj, bw_rate, sl, ol)))
         return INT32_MIN;
+
+    // Base score: min of k-mer span and effective step, normalized by weight.
+    const int32_t dg = std::min(dr, dq);
+    const int32_t q_span = static_cast<int32_t>(ai->cnt & 0xFFu);
+    int32_t sc = std::min(q_span, dg);
+    sc = hifiasm_normal_w(sc, static_cast<int32_t>(ai->cnt >> 8));
+
+    // Gap penalty: linear + adaptive, with split strategy by gap size.
+    if (dd || (dg > q_span && dg > 0)) {
+        double lin_pen = chn_pen_gap * static_cast<double>(dd);
+        const double a_pen =
+            static_cast<double>(sc) * (static_cast<double>(dd) / static_cast<double>(dg)) / bw_rate;
+
+        if (dd < 4) lin_pen = (lin_pen > a_pen) ? a_pen : lin_pen;
+        else         lin_pen = (lin_pen < a_pen) ? a_pen : lin_pen;
+
+        lin_pen += chn_pen_skip * static_cast<double>(dg);
+        sc -= static_cast<int32_t>(lin_pen);
     }
 
-    // -------------------------------------------------------------------------
-    // STEP 3: Compute base score from k-mer span and gap length
-    // -------------------------------------------------------------------------
-    const int32_t dg = std::min(dr, dq);  // Min gap (effective overlap)
-    const int32_t q_span = static_cast<int32_t>(ai->cnt & 0xFFu);  // K-mer span (low 8 bits)
-
-    // Base score is limited by both k-mer span and gap
-    int32_t score = std::min(q_span, dg);
-
-    // Normalize by occurrence weight (downweight common k-mers)
-    const int32_t occurrence_weight = static_cast<int32_t>(ai->cnt >> 8);
-    score = hifiasm_normal_w(score, occurrence_weight);
-
-    // -------------------------------------------------------------------------
-    // STEP 4: Apply gap penalties if there's a mismatch or large gap
-    // -------------------------------------------------------------------------
-    if (dd > 0 || (dg > q_span && dg > 0)) {
-        // Linear penalty: proportional to gap difference
-        double linear_penalty = chn_pen_gap * static_cast<double>(dd);
-
-        // Adaptive penalty: scales with score and gap ratio
-        // CRITICAL: Only compute adaptive penalty if dg > 0 and bw_rate > 0 to avoid division by zero
-        if (dg > 0 && bw_rate > 0.0) {
-            const double adaptive_penalty =
-                static_cast<double>(score) * (static_cast<double>(dd) / static_cast<double>(dg)) / bw_rate;
-
-            // Choose penalty based on gap size (small vs large gaps)
-            if (dd < 4) {
-                linear_penalty = std::min(linear_penalty, adaptive_penalty);
-            } else {
-                linear_penalty = std::max(linear_penalty, adaptive_penalty);
-            }
-        }
-
-        // Add skip penalty (penalizes bases between consecutive anchors)
-        linear_penalty += chn_pen_skip * static_cast<double>(dg);
-
-        score -= static_cast<int32_t>(linear_penalty);
-    }
-
-    return score;
+    return sc;
 }
 
-/**
- * @brief Calculate effective chain length after coordinate normalization.
- *
- * This function extends the chain coordinates to sequence boundaries and
- * computes the resulting alignment span. The extension ensures that:
- *   1. Both sequences start at coordinate 0 (left-normalized)
- *   2. Both sequences extend as far as possible to the right
- *
- * ## Algorithm:
- *   1. Left-normalize: Offset both sequences so the smaller start becomes 0
- *   2. Right-extend: Extend both ends until one reaches its sequence boundary
- *   3. Return: Final span of the normalized alignment
- *
- * This is used for tie-breaking when chains have identical scores: prefer
- * the chain with better coverage (longer effective length).
- *
- * @param x_beg Query start position
- * @param x_end Query end position
- * @param xLen  Query sequence length
- * @param y_beg Target start position
- * @param y_end Target end position
- * @param yLen  Target sequence length
- * @return Effective chain length after normalization
- *
- * @complexity O(1)
- * @reference Hifiasm Hash_Table.cpp:779-809 (get_chainLen)
- */
+/// Compute effective overlap length after left-normalizing and right-extending
+/// the chain coordinates to sequence boundaries. Used for tie-breaking when
+/// chains have identical scores (prefer shorter effective length = tighter fit).
+/// @reference Hifiasm Hash_Table.cpp:779-809 (get_chainLen)
 static inline int64_t hifiasm_get_chainLen(
-    int64_t x_beg, int64_t x_end, const int64_t xLen,
-    int64_t y_beg, int64_t y_end, const int64_t yLen) noexcept
+    int64_t x_beg, int64_t x_end, int64_t xLen,
+    int64_t y_beg, int64_t y_end, int64_t yLen) noexcept
 {
-    // Left-normalize: shift both sequences so the smaller start becomes 0
-    if (x_beg <= y_beg) {
-        y_beg -= x_beg;
-        x_beg = 0;
-    } else {
-        x_beg -= y_beg;
-        y_beg = 0;
-    }
+    if (x_beg <= y_beg) { y_beg -= x_beg; x_beg = 0; }
+    else                { x_beg -= y_beg; y_beg = 0; }
 
-    // Right-extend: extend until one sequence reaches its boundary
-    const int64_t x_remaining = xLen - x_end - 1;
-    const int64_t y_remaining = yLen - y_end - 1;
+    const int64_t xr = xLen - x_end - 1;
+    const int64_t yr = yLen - y_end - 1;
+    if (xr <= yr) { x_end = xLen - 1; y_end += xr; }
+    else          { x_end += yr; y_end = yLen - 1; }
 
-    if (x_remaining <= y_remaining) {
-        x_end = xLen - 1;
-        y_end += x_remaining;
-    } else {
-        x_end += y_remaining;
-        y_end = yLen - 1;
-    }
-
-    // Return effective span
     return x_end - x_beg + 1;
 }
 
-/**
- * @brief Convert a chained anchor path into an overlap region structure.
- *
- * This function takes the first and last anchors of a DP chain and constructs
- * a normalized overlap region, with coordinates extended to sequence boundaries.
- *
- * ## Coordinate Transformation:
- *   1. **Raw coordinates**: Exact anchor positions (saved for filtering)
- *   2. **Left-normalize**: Shift both sequences so smaller start becomes 0
- *   3. **Right-extend**: Extend to sequence ends (maximizes overlap span)
- *
- * This normalization mirrors hifiasm's overlap representation and ensures
- * consistent coordinate systems for downstream filtering and alignment.
- *
- * @param[out] o    Output overlap region structure
- * @param xid       Query read ID
- * @param xl        Query sequence length
- * @param yl        Target sequence length
- * @param sc        Chain score (shared_seed)
- * @param beg       First anchor in chain (earliest query position)
- * @param end       Last anchor in chain (latest query position)
- *
- * @complexity O(1)
- * @reference Hifiasm Hash_Table.cpp:1752-1780 (push_ovlp_chain_qgen)
- */
+/// Build a normalized overlap region from the first and last anchors of a chain.
+/// Coordinates are left-normalized (one start becomes 0) and right-extended
+/// (one end reaches its sequence boundary).
+/// @reference Hifiasm Hash_Table.cpp:1752-1780 (push_ovlp_chain_qgen)
 static inline void hifiasm_push_ovlp_chain_qgen(
     HifiasmOverlapRegion& o,
-    const uint32_t xid,
-    const int64_t xl,
-    const int64_t yl,
-    const int64_t sc,
+    uint32_t xid,
+    int64_t xl,
+    int64_t yl,
+    int64_t sc,
     const HifiasmKmerHit* beg,
     const HifiasmKmerHit* end) noexcept
 {
-    // -------------------------------------------------------------------------
-    // STEP 1: Initialize basic overlap metadata
-    // -------------------------------------------------------------------------
     o.x_id = xid;
     o.y_id = beg->readID;
-    o.x_pos_strand = 0;           // Query is always forward
-    o.y_pos_strand = beg->strand; // Target strand from chain
+    o.x_pos_strand = 0;
+    o.y_pos_strand = beg->strand;
 
-    // -------------------------------------------------------------------------
-    // STEP 2: Extract raw anchor coordinates (inclusive)
-    // -------------------------------------------------------------------------
-    o.x_pos_s = beg->self_offset;  // Query start
-    o.y_pos_s = beg->offset;       // Target start
-    o.x_pos_e = end->self_offset;  // Query end
-    o.y_pos_e = end->offset;       // Target end
+    o.x_pos_s = beg->self_offset;
+    o.y_pos_s = beg->offset;
+    o.x_pos_e = end->self_offset;
+    o.y_pos_e = end->offset;
 
+    // Left-normalize: shift so the smaller start becomes 0.
+    if (o.x_pos_s <= o.y_pos_s) { o.y_pos_s -= o.x_pos_s; o.x_pos_s = 0; }
+    else                        { o.x_pos_s -= o.y_pos_s; o.y_pos_s = 0; }
 
-    // -------------------------------------------------------------------------
-    // STEP 3: Left-normalize coordinates (shift to origin)
-    // -------------------------------------------------------------------------
-    if (o.x_pos_s <= o.y_pos_s) {
-        o.y_pos_s -= o.x_pos_s;
-        o.x_pos_s = 0;
-    } else {
-        o.x_pos_s -= o.y_pos_s;
-        o.y_pos_s = 0;
-    }
+    // Right-extend: extend until one sequence reaches its boundary.
+    const int64_t xr = xl - static_cast<int64_t>(o.x_pos_e) - 1;
+    const int64_t yr = yl - static_cast<int64_t>(o.y_pos_e) - 1;
+    if (xr <= yr) { o.x_pos_e = static_cast<uint32_t>(xl - 1); o.y_pos_e += static_cast<uint32_t>(xr); }
+    else          { o.y_pos_e = static_cast<uint32_t>(yl - 1); o.x_pos_e += static_cast<uint32_t>(yr); }
 
-    // -------------------------------------------------------------------------
-    // STEP 4: Right-extend to sequence boundaries
-    // -------------------------------------------------------------------------
-    const int64_t x_remaining = xl - static_cast<int64_t>(o.x_pos_e) - 1;
-    const int64_t y_remaining = yl - static_cast<int64_t>(o.y_pos_e) - 1;
-
-    // CRITICAL: Only extend if remaining distances are positive (avoid underflow)
-    if (x_remaining > 0 && y_remaining > 0) {
-        if (x_remaining <= y_remaining) {
-            o.x_pos_e = static_cast<uint32_t>(xl - 1);
-            o.y_pos_e += static_cast<uint32_t>(x_remaining);
-        } else {
-            o.y_pos_e = static_cast<uint32_t>(yl - 1);
-            o.x_pos_e += static_cast<uint32_t>(y_remaining);
-        }
-    } else if (x_remaining > 0) {
-        // Only x can be extended
-        o.x_pos_e = static_cast<uint32_t>(xl - 1);
-    } else if (y_remaining > 0) {
-        // Only y can be extended
-        o.y_pos_e = static_cast<uint32_t>(yl - 1);
-    }
-    // else: both already at or beyond boundaries, no extension needed
-
-    // -------------------------------------------------------------------------
-    // STEP 5: Set scoring and metadata
-    // -------------------------------------------------------------------------
-    o.shared_seed = static_cast<int32_t>(sc);  // Chain DP score
-    o.align_length = 0;                         // Set by caller (num anchors)
-    o.non_homopolymer_errors = 0;               // Set by caller (chain hit index)
+    o.shared_seed = static_cast<int32_t>(sc);
+    o.align_length = 0;
+    o.non_homopolymer_errors = 0;
 }
 
-// ============================================================================
-// HIFIASM QUICK CHECK LINEAR CHAIN (strict port)
-// ============================================================================
-// Reference: Hifiasm Hash_Table.cpp:2007-2095 (quick_ck_lchain)
-//
-// This function performs a fast O(N) pre-scan of the sorted anchor array,
-// looking for "runs" of consecutive same-strand hits that are perfectly
-// collinear (both query and target positions monotonically increase).
-//
-// ## How It Works:
-//
-//   The anchor array `a[0..a_n-1]` is sorted by (self_offset, offset) within
-//   each strand group. This function scans left-to-right and identifies maximal
-//   contiguous runs where:
-//     - All hits share the same strand (a[k].strand == a[l].strand)
-//     - Both coordinates are strictly increasing: a[k].self_offset > a[k-1].self_offset
-//       AND a[k].offset > a[k-1].offset
-//
-//   For each such monotonic run, it chains the hits greedily (each hit chains
-//   to its immediate predecessor) using the same comput_sc_ch scoring as the
-//   full DP. If the entire run qualifies, it updates the best known score/index.
-//
-// ## Outputs (passed by pointer, hifiasm-style interface):
-//
-//   - *msc:   Best chain score found by quick-check
-//   - *msc_i: Index of the terminal anchor of the best chain
-//   - *movl:  Normalized chain length (for tie-breaking)
-//   - *plus:  Minimum accumulated score (used as a "quality floor")
-//   - *si:    Start index for full DP (everything before was solved)
-//   - *ei:    End index for full DP (everything after was solved)
-//
-//   If quick-check solves the entire array, the full DP range [si, ei) may
-//   be empty or already complete, allowing the caller to skip expensive DP.
-//
-// ## Bandwidth Validation:
-//
-//   After building a candidate chain, the function checks whether its total
-//   diagonal drift (sum of |dr-dq| across all consecutive pairs) exceeds the
-//   bandwidth threshold. If so, the chain is invalidated to prevent chaining
-//   across structurally unrelated regions.
-//
-// ## Variable Naming (hifiasm parity):
-//
-//   - `a`: anchor array (HifiasmKmerHit*)
-//   - `f[]`: DP score array (int32_t)
-//   - `p[]`: predecessor array (int64_t)
-//   - `t[]`: workspace / visit marks (int64_t)
-//   - `ii[]`: workspace / chain flags (int32_t)
-//   - `l`, `k`: segment boundary and scanner
-//   - `is_srt`: flag indicating the current run is sorted
-//   - `z`: inner loop variable scanning within a strand-homogeneous segment
-// ============================================================================
+/// O(N) quick-check: greedily chain monotonic same-strand segments.
+///
+/// Scans the sorted anchor array for maximal contiguous runs where both
+/// coordinates strictly increase. Each such run is scored greedily (each
+/// anchor chains to its immediate predecessor). If a run spans an entire
+/// strand-homogeneous segment and passes cumulative bandwidth validation,
+/// it narrows the [si, ei) range that the full DP must cover.
+///
+/// @param[out] msc, msc_i  Best chain score and its terminal anchor index.
+/// @param[out] movl        Effective overlap length of best chain (tie-breaking).
+/// @param[out] plus        Minimum accumulated score (quality floor for mcopy).
+/// @param[out] si, ei      Unsolved DP range — full DP only runs over [si, ei).
+/// @reference Hifiasm Hash_Table.cpp:2007-2095 (quick_ck_lchain)
 static inline void hifiasm_quick_ck_lchain(
-    HifiasmKmerHit* a,
-    int64_t a_n,
-    int64_t xl,
-    int64_t yl,
-    double chn_pen_gap,
-    double chn_pen_skip,
-    double bw_rate,
-    int64_t* p,
-    int64_t* t,
-    int32_t* f,
-    int32_t* ii,
-    int64_t* plus,
-    int64_t* msc,
-    int64_t* msc_i,
-    int64_t* movl,
-    int64_t* si,
-    int64_t* ei)
+    HifiasmKmerHit* a, int64_t a_n,
+    int64_t xl, int64_t yl,
+    double chn_pen_gap, double chn_pen_skip, double bw_rate,
+    int64_t* p, int64_t* t, int32_t* f, int32_t* ii,
+    int64_t* plus, int64_t* msc, int64_t* msc_i, int64_t* movl,
+    int64_t* si, int64_t* ei)
 {
-    // Strict port of Hash_Table.cpp:2007-2095
     if (a_n <= 0) return;
 
-    // --- Local variables (hifiasm naming preserved) ---
-    int64_t l, k, is_srt = 1, z;  // l=segment start, k=scanner, is_srt=monotonic flag
-    HifiasmKmerHit *ai, *aj;       // Pointer pair for scoring
-    int64_t dq, dr, dd, dg, q_span, sc, csc, ddt;  // Scoring temporaries
-    int64_t plus0, msc0, msc_i0, movl0;  // Per-segment best-chain tracking
-    double lin_pen, a_pen;  // Gap penalty components
+    int64_t l, k, is_srt = 1, z;
+    HifiasmKmerHit *ai, *aj;
+    int64_t dq, dr, dd, dg, q_span, sc, csc, ddt;
+    int64_t plus0, msc0, msc_i0, movl0;
+    double lin_pen, a_pen;
 
-    // Initialize output accumulators to sentinel values.
-    // *msc = best score seen so far (start with worst possible).
-    // *movl = best chain length (start with largest to prefer shorter).
-    // *si/*ei = DP range that still needs full DP [si, ei).
     *plus = 0;
     *msc = *msc_i = INT32_MIN;
     *movl = INT32_MAX;
-    *si = 0;       // Start of unsolved range (grows as quick-check solves from left)
-    *ei = a_n;     // End of unsolved range (shrinks as quick-check solves from right)
+    *si = 0;
+    *ei = a_n;
 
-    // Outer loop: scan the anchor array and identify strand-homogeneous segments.
-    // A "segment" is a maximal contiguous range [l, k) where all anchors share
-    // the same strand. At segment boundaries (strand change or end-of-array),
-    // we attempt to score the segment as a single greedy chain.
-    //
-    // CRITICAL: Loop goes to k == a_n so we flush the final segment.
-    // When k == a_n, we do NOT access a[k] — the boundary check is k < a_n.
+    // Scan for strand-homogeneous segments. At each boundary (strand change or
+    // end-of-array), attempt greedy chaining if the segment was monotonic.
     for (k = 1, l = 0; k <= a_n; k++) {
-        // Detect segment boundary: strand changes or end of array.
-        if (k == a_n || (k < a_n && a[k].strand != a[l].strand)) {
-            // Clear workspace entries for end of segment.
+        if (k == a_n || a[k].strand != a[l].strand) {
             t[k - 1] = 0;
             ii[k - 1] = 0;
 
-            // Only attempt greedy chaining if the segment is monotonically sorted.
-            // `is_srt` is cleared to 0 if any inversion was detected (see bottom of loop).
             if (is_srt) {
-                // Per-segment accumulators.
-                plus0 = 0;             // Minimum score in this segment's chain.
-                msc0 = msc_i0 = INT32_MIN;  // Best score and its index.
-                movl0 = INT32_MAX;     // Best chain length (for tie-breaking).
-                ddt = 0;  // Accumulated diagonal drift across the chain.
+                plus0 = 0;
+                msc0 = msc_i0 = INT32_MIN;
+                movl0 = INT32_MAX;
+                ddt = 0;
 
-                // Initialize the first anchor in the segment as a standalone chain.
-                p[l] = -1;  // No predecessor for the first anchor.
-                f[l] = int32_t(a[l].cnt & 0xffu);  // Self-score = k-mer span.
+                p[l] = -1;
+                f[l] = static_cast<int32_t>(a[l].cnt & 0xffu);
                 if (f[l] >= msc0) { msc0 = f[l]; msc_i0 = l; }
                 if (f[l] < plus0) plus0 = f[l];
 
-                // Greedy forward scan: chain each anchor to its immediate predecessor.
-                // Unlike full DP (which considers all previous anchors), quick-check
-                // only links z → z-1, exploiting the fact that the run is sorted.
+                // Greedy forward scan: link each anchor to its immediate predecessor.
                 for (z = l + 1; z < k; z++) {
                     ai = &a[z];
                     aj = &a[z - 1];
 
-                    // Check strict monotonicity on the query axis.
-                    dq = int64_t(ai->self_offset) - int64_t(aj->self_offset);
-                    if (dq <= 0) break;  // Query must advance — monotonicity broken.
+                    dq = static_cast<int64_t>(ai->self_offset) - static_cast<int64_t>(aj->self_offset);
+                    if (dq <= 0) break;
+                    dr = static_cast<int64_t>(ai->offset) - static_cast<int64_t>(aj->offset);
+                    if (dr <= 0) break;
 
-                    // Check strict monotonicity on the target axis.
-                    dr = int64_t(ai->offset) - int64_t(aj->offset);
-                    if (dr <= 0) break;  // Target must advance — monotonicity broken.
-
-                    // Diagonal deviation (how far off-diagonal this step is).
                     dd = (dr > dq) ? (dr - dq) : (dq - dr);
+                    if ((dd > 16) && (dd > hifiasm_cal_bw(ai, aj, bw_rate, xl, yl))) break;
 
-                    // Bandwidth check: reject if diagonal drift is too large.
-                    if ((dd > 16) && (dd > hifiasm_cal_bw(&a[z], &a[z - 1], bw_rate, xl, yl))) break;
+                    dg = (dr < dq) ? dr : dq;
+                    q_span = static_cast<int64_t>(ai->cnt & 0xffu);
+                    sc = (q_span < dg) ? q_span : dg;
+                    sc = hifiasm_normal_w(static_cast<int32_t>(sc), static_cast<int32_t>(ai->cnt >> 8));
 
-                    // Score computation (identical to comput_sc_ch).
-                    dg = (dr < dq) ? dr : dq;  // Effective step size.
-                    q_span = int64_t(ai->cnt & 0xffu);  // K-mer span.
-                    sc = (q_span < dg) ? q_span : dg;    // Base score = min(span, step).
-                    sc = hifiasm_normal_w(int32_t(sc), int32_t(ai->cnt >> 8));  // Weight normalize.
-
-                    // Apply gap penalty if there's any diagonal deviation or a large gap.
                     if (dd || (dg > q_span && dg > 0)) {
-                        lin_pen = chn_pen_gap * double(dd);
-                        a_pen = double(sc) * (double(dd) / double(dg)) / bw_rate;
-                        // Small gaps (dd<4): use smaller penalty. Large gaps: use larger.
+                        lin_pen = chn_pen_gap * static_cast<double>(dd);
+                        a_pen = static_cast<double>(sc) * (static_cast<double>(dd) / static_cast<double>(dg)) / bw_rate;
                         if (dd < 4) lin_pen = (lin_pen > a_pen) ? a_pen : lin_pen;
-                        else lin_pen = (lin_pen < a_pen) ? a_pen : lin_pen;
-                        lin_pen += chn_pen_skip * double(dg);  // Skip penalty for gap length.
-                        sc -= int32_t(lin_pen);
+                        else        lin_pen = (lin_pen < a_pen) ? a_pen : lin_pen;
+                        lin_pen += chn_pen_skip * static_cast<double>(dg);
+                        sc -= static_cast<int32_t>(lin_pen);
                     }
 
-                    // Add predecessor's score to get cumulative chain score.
                     sc += f[z - 1];
+                    csc = static_cast<int64_t>(a[z].cnt & 0xffu);
+                    if (sc < csc) break;  // Starting fresh is better.
 
-                    // Bail out if chaining through predecessor is worse than starting fresh.
-                    csc = int64_t(a[z].cnt & 0xffu);  // Self-score of current anchor.
-                    if (sc < csc) break;  // Better to start a new chain here.
-
-                    // Accept this link: record predecessor and cumulative score.
                     p[z] = z - 1;
-                    f[z] = int32_t(sc);
-                    ddt += dd;  // Accumulate total diagonal drift.
+                    f[z] = static_cast<int32_t>(sc);
+                    ddt += dd;
                     if (f[z] >= msc0) { msc0 = f[z]; msc_i0 = z; }
                     if (f[z] < plus0) plus0 = f[z];
                 }
 
-                // If the entire segment was chained AND the best anchor is the last one,
-                // this segment is fully solved — update the global outputs.
+                // Segment fully chained and best anchor is the last one.
                 if ((z >= k) && (msc_i0 == (k - 1))) {
-                    // Validate that total diagonal drift doesn't exceed bandwidth.
-                    // This catches pathological cases where each step is small but
-                    // the cumulative drift across the whole chain is too large.
-                    bool chain_valid = true;
-                    if ((k - l >= 2) && (ddt > 16) && (ddt > hifiasm_cal_bw(&a[k - 1], &a[l], bw_rate, xl, yl))) {
-                        chain_valid = false;  // Invalidate chain - exceeds bandwidth
-                        msc_i0 = INT32_MIN;   // Sentinel value for invalid
-                    }
+                    // Invalidate if cumulative diagonal drift exceeds bandwidth.
+                    if ((k - l >= 2) && (ddt > 16) && (ddt > hifiasm_cal_bw(&a[k - 1], &a[l], bw_rate, xl, yl)))
+                        msc_i0 = INT32_MIN;
 
-                    // Only update global best if this chain passed validation.
-                    if (chain_valid && msc_i0 >= 0) {
+                    if (msc_i0 == (k - 1)) {
                         if (msc0 >= (*msc)) {
-                            // Compute normalized chain length for tie-breaking.
                             movl0 = hifiasm_get_chainLen(
                                 a[msc_i0].self_offset, a[msc_i0].self_offset, xl,
                                 a[msc_i0].offset, a[msc_i0].offset, yl);
-                            // Update best: prefer higher score, then shorter overlap.
                             if (msc0 > (*msc) || movl0 < (*movl)) {
-                                *msc = msc0;
-                                *msc_i = msc_i0;
-                                *movl = movl0;
+                                *msc = msc0; *msc_i = msc_i0; *movl = movl0;
                             }
                         }
-                        // Track minimum accumulated score for quality floor.
                         if (plus0 < (*plus)) *plus = plus0;
 
-                        // Narrow the DP range: if this solved segment is at the left
-                        // edge, advance *si past it; if at the right edge, retract *ei.
+                        // Narrow the unsolved DP range.
                         if ((*ei) > k) (*si) = k;
-                        else (*ei) = l;
+                        else           (*ei) = l;
                     }
                 }
             }
-            // Advance segment start to current position for the next segment.
             l = k;
-            is_srt = 1;  // Reset monotonicity flag for the new segment.
+            is_srt = 1;
         } else {
-            // Within a same-strand segment: check if monotonicity still holds.
-            // If either coordinate fails to increase, mark the segment as unsorted.
-            if ((a[k].self_offset <= a[k - 1].self_offset) || (a[k].offset <= a[k - 1].offset)) is_srt = 0;
+            if ((a[k].self_offset <= a[k - 1].self_offset) || (a[k].offset <= a[k - 1].offset))
+                is_srt = 0;
             t[k - 1] = 0;
             ii[k - 1] = 0;
         }
     }
 }
 
-// ============================================================================
-// CORE DP CHAINING ALGORITHM WITH MULTI-COPY EXTRACTION
-// ============================================================================
-
-/**
- * @brief Fast DP chaining with optional quick-check optimization and multi-copy extraction.
- *
- * This implements hifiasm's lchain_qdp_mcopy_fast algorithm (Hash_Table.cpp:2097-2284),
- * which finds optimal anchor chains using dynamic programming, with optional extraction
- * of secondary chains for repetitive regions.
- *
- * ## Algorithm Overview:
- *
- *   **Phase 1: Optional Quick Check** (if quick_check=true)
- *     - O(N) fast path for perfectly collinear hits
- *     - Identifies promising score range [si, ei] for full DP
- *     - Computes initial best score (msc, msc_i)
- *
- *   **Phase 2: Main DP** (O(N * max_iter) with pruning)
- *     ```
- *     For each anchor i:
- *       f[i] = max_{j < i} (score(i, j) + f[j])
- *       where j is within lookback window and passes bandwidth constraint
- *     ```
- *     - Pruning optimizations:
- *       * max_iter: Limit lookback window
- *       * max_skip: Stop after skipping too many ancestors
- *       * bandwidth: Reject connections with excessive coordinate deviation
- *
- *   **Phase 3: Backtracking**
- *     - Follow predecessor pointers from best anchor (msc_i)
- *     - Mark chain membership in ii[] array
- *
- *   **Phase 4: Multi-Copy Extraction** (optional, if mcopy_num > 1)
- *     - Extract up to mcopy_num high-scoring chains
- *     - Threshold: score >= mcopy_rate * best_score
- *     - Use radix sort for efficient top-k selection
- *     - Emit each chain as separate overlap region
- *
- * ## Complexity:
- *   - Time: O(N * max_iter) where N = number of anchors
- *     * Quick check adds O(N) preprocessing
- *     * Multi-copy adds O(N log N) sorting
- *   - Space: O(N) for DP arrays (reused scratch space)
- *
- * ## Key Optimizations:
- *   1. **Max-skip pruning**: Stop after skipping max_skip predecessors
- *   2. **Lookback window**: Only consider last max_iter anchors
- *   3. **Max_ii tracking**: Cache best score in distance window
- *   4. **Quick check**: O(N) fast path for collinear hits (ONT)
- *
- * ## Multi-Copy Extraction:
- *   For repetitive genomic regions, mcopy extracts multiple non-overlapping
- *   chains to capture alternative alignments. Useful for:
- *   - Segmental duplications
- *   - Tandem repeats
- *   - Paralogous genes
- *
- * @param[in]     a                   K-mer hit array (sorted by self_offset, offset)
- * @param[in,out] dp                  Reusable DP scratch space (resized internally)
- * @param[out]    res                 Output overlap regions (chains)
- * @param[out]    chainHitIndexFlat   Flattened chain hit indices (for Alignment construction)
- * @param max_skip       Max consecutive skipped predecessors before pruning
- * @param max_iter       Max lookback window (limits O(N²) to O(N*max_iter))
- * @param max_dis        Max coordinate distance for max_ii tracking
- * @param chn_pen_gap    Gap penalty coefficient (indel penalty)
- * @param chn_pen_skip   Skip penalty (bases between anchors)
- * @param bw_rate        Bandwidth rate (adaptive penalty, typically 0.3-0.5)
- * @param xid            Query read ID
- * @param xl             Query sequence length
- * @param yl             Target sequence length
- * @param quick_check    Enable O(N) quick check preprocessing (1=enable, 0=disable)
- * @param mcopy_num      Number of chains to extract (1=best only, >1=mcopy)
- * @param mcopy_rate     Score threshold for mcopy (fraction of best score, e.g., 0.2)
- * @param mcopy_khit_cutoff Minimum anchors required for mcopy extraction
- *
- * @complexity O(N * max_iter) + O(N log N) for mcopy, where N = number of anchors
- * @reference Hifiasm Hash_Table.cpp:2097-2284 (lchain_qdp_mcopy_fast)
- * @see hifiasm_quick_ck_lchain for quick check details
- * @see hifiasm_comput_sc_ch_ec for scoring function
- */
-
-// ============================================================================
-// EXTRACTED HELPER FUNCTIONS FOR HIFIASM CHAINING
-// ============================================================================
-// These functions extract distinct phases from the main chaining algorithm
-// to improve readability, testability, and maintainability. All functions
-// are marked 'inline' to ensure zero performance overhead.
-
-/**
- * @brief Run the main O(N*max_iter) dynamic programming loop to find optimal chains.
- *
- * This implements the core chaining DP with multiple optimizations to achieve
- * practical O(N*max_iter) complexity instead of O(N²).
- *
- * ## DP Recurrence:
- * ```
- * f[i] = max_{j < i, same_strand} (score(i, j) + f[j])
- * ```
- * Where:
- * - f[i]: Best chain score ending at anchor i
- * - score(i, j): Transition score from anchor j to i, accounting for:
- *   1. Anchor span (k-mer length)
- *   2. Gap penalties (linear and skip)
- *   3. Bandwidth constraints
- *   4. Occurrence weight normalization
- * - p[i]: Predecessor pointer (index j that maximized f[i])
- *
- * ## Optimizations:
- *
- * ### 1. Lookback Window (max_iter)
- * - Only consider last max_iter predecessors (typically 50-100)
- * - Prevents O(N²) blowup on long reads
- * - Trade-off: May miss distant optimal predecessors, but rare in practice
- *
- * ### 2. Max-Skip Pruning
- * - Stop searching after max_skip (typically 25) consecutive skipped anchors
- * - "Skip" = anchor j doesn't improve f[i] (score(i,j) + f[j] ≤ f[i])
- * - Implemented via t[] array marking visited predecessors
- *
- * ### 3. Sliding Distance Window (max_ii caching)
- * - Cache best anchor within distance threshold (max_dis, typically 5000bp)
- * - Exploits locality: nearby anchors more likely to be good predecessors
- * - Provides fallback after max-skip pruning
- *
- * ### 4. Strand Filtering
- * - Only connect same-strand anchors (can't chain + and - strand)
- * - Implemented via while loop advancing start pointer
- *
- * @param a Anchor array
- * @param si Start index (from quick check or 0)
- * @param ei End index (from quick check or a_n)
- * @param max_skip Max consecutive skipped predecessors before pruning
- * @param max_iter Max lookback window size
- * @param max_dis Max distance for max_ii caching
- * @param chn_pen_gap Gap penalty coefficient
- * @param chn_pen_skip Skip penalty coefficient
- * @param bw_rate Bandwidth rate
- * @param xl Query length
- * @param yl Target length
- * @param p[out] Predecessor pointers
- * @param f[out] DP scores
- * @param t[inout] Temporary workspace (for skip tracking)
- * @param ii[out] Chain membership flags (cleared)
- * @param msc[inout] Best chain score
- * @param msc_i[inout] Best chain ending index
- * @param movl[inout] Overlap length (tie-breaking)
- * @param plus[inout] Minimum score (for normalization)
- *
- * @complexity O(N * max_iter) amortized
- */
+/// Main O(N * max_iter) DP loop for anchor chaining.
+///
+/// Computes f[i] = max_{j < i, same_strand} (score(i,j) + f[j]) with three
+/// pruning strategies: lookback window (max_iter), max-skip (max_skip), and
+/// sliding distance window (max_ii). Updates msc/msc_i/movl/plus in place.
+///
+/// @reference Hifiasm Hash_Table.cpp:2097-2170 (main DP loop in lchain_qdp_mcopy_fast)
 static inline void run_main_dp_loop(
-    HifiasmKmerHit* a,
-    const int64_t si,
-    const int64_t ei,
-    const int64_t max_skip,
-    const int64_t max_iter,
-    const int64_t max_dis,
-    const double chn_pen_gap,
-    const double chn_pen_skip,
-    const double bw_rate,
-    const int64_t xl,
-    const int64_t yl,
-    int64_t* p,
-    int32_t* f,
-    int64_t* t,
-    int32_t* ii,
-    int64_t* msc,
-    int64_t* msc_i,
-    int64_t* movl,
-    int64_t* plus) noexcept
+    HifiasmKmerHit* a, int64_t si, int64_t ei,
+    int64_t max_skip, int64_t max_iter, int64_t max_dis,
+    double chn_pen_gap, double chn_pen_skip, double bw_rate,
+    int64_t xl, int64_t yl,
+    int64_t* p, int32_t* f, int64_t* t, int32_t* ii,
+    int64_t* msc, int64_t* msc_i, int64_t* movl, int64_t* plus) noexcept
 {
-    int64_t max_f, n_skip, st, max_j, end_j, sc;
-    int64_t max_ii = -1;
-    int64_t ovl;
+    int64_t max_f, n_skip, st, max_j, end_j, sc, max_ii = -1, ovl;
     int32_t max, tmp;
-    int64_t i, j;
 
-    // Main DP loop: compute best chain ending at each anchor
+    int64_t i, j;
     for (i = st = si; i < ei; ++i) {
-        // Initialize: base score is k-mer span (no predecessors yet)
-        max_f = static_cast<int64_t>(a[static_cast<size_t>(i)].cnt & 0xFFu);
+        max_f = a[i].cnt & 0xFFu;
         n_skip = 0;
         max_j = end_j = -1;
 
-        // -----------------------------------------------------------------
-        // Optimization 1: Limit lookback window to max_iter
-        // -----------------------------------------------------------------
-        if ((i - st) > max_iter) {
-            st = i - max_iter;
-        }
+        if ((i - st) > max_iter) st = i - max_iter;
+        while (a[i].strand != a[st].strand) ++st;
 
-        // -----------------------------------------------------------------
-        // Optimization 4: Ensure st points to same-strand anchor
-        // -----------------------------------------------------------------
-        // CRITICAL: Add bounds check to prevent infinite loop
-        while (st < i && a[static_cast<size_t>(i)].strand != a[static_cast<size_t>(st)].strand) {
-            ++st;
-        }
-
-        // If no matching strand found in lookback window, skip DP for this anchor
-        if (st >= i || a[static_cast<size_t>(i)].strand != a[static_cast<size_t>(st)].strand) {
-            // No valid predecessor with same strand - anchor stands alone
-            max_f = static_cast<int64_t>(a[static_cast<size_t>(i)].cnt & 0xFFu);
-            p[static_cast<size_t>(i)] = -1;
-            f[static_cast<size_t>(i)] = static_cast<int32_t>(max_f);
-            continue;
-        }
-
-        // -----------------------------------------------------------------
-        // Inner DP Loop: Find best predecessor j for anchor i
-        // -----------------------------------------------------------------
+        // Inner loop: find best predecessor j for anchor i.
         for (j = i - 1; j >= st; --j) {
-            // Compute transition score from j to i
-            sc = hifiasm_comput_sc_ch_ec(
-                &a[static_cast<size_t>(i)], &a[static_cast<size_t>(j)],
-                bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
-
-            // INT32_MIN means invalid connection (bandwidth or monotonicity violation)
+            sc = hifiasm_comput_sc_ch_ec(&a[i], &a[j], bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
             if (sc == INT32_MIN) continue;
+            sc += f[j];
 
-            // DP recurrence: total score = transition + predecessor score
-            sc += f[static_cast<size_t>(j)];
-
-            // Update best score and predecessor
             if (sc > max_f) {
-                max_f = sc;
-                max_j = j;
-                if (n_skip > 0) --n_skip;  // Reset skip counter on improvement
-            }
-            // -----------------------------------------------------------------
-            // Optimization 2: Max-skip pruning
-            // -----------------------------------------------------------------
-            // Stop if we've skipped too many consecutive ancestors
-            else if (t[static_cast<size_t>(j)] == static_cast<int32_t>(i)) {
+                max_f = sc; max_j = j;
+                if (n_skip > 0) --n_skip;
+            } else if (t[j] == static_cast<int32_t>(i)) {
                 if (++n_skip > max_skip) break;
             }
-
-            // Mark that j's predecessor was visited (for max-skip tracking)
-            if (p[static_cast<size_t>(j)] >= 0) {
-                t[static_cast<size_t>(p[static_cast<size_t>(j)])] = i;
-            }
+            if (p[j] >= 0) t[p[j]] = i;
         }
-        end_j = j;  // Remember where we stopped
+        end_j = j;
 
-        // -----------------------------------------------------------------
-        // Optimization 3: Sliding distance window (max_ii caching)
-        // -----------------------------------------------------------------
-        // max_ii tracks the anchor with the highest score within max_dis
-        // distance. This allows recovery from skipped predecessors (max-skip
-        // may have terminated early, but max_ii provides a fallback).
-
-        // Recompute max_ii if:
-        //   1. Not yet initialized (max_ii < 0)
-        //   2. Out of distance window (> max_dis)
-        //   3. Different strand (invalid connection)
+        // Sliding distance window: cache best score within max_dis.
+        // Recompute if stale (out of range, wrong strand, or uninitialized).
         if ((max_ii < 0) ||
-            (a[static_cast<size_t>(i)].self_offset >
-             a[static_cast<size_t>(max_ii)].self_offset + max_dis) ||
-            (a[static_cast<size_t>(i)].strand != a[static_cast<size_t>(max_ii)].strand)) {
-
-            // Scan backwards to find best score within distance window
-            max = INT32_MIN;
-            max_ii = -1;
-            for (j = i - 1;
-                 (j >= st) &&
-                 (a[static_cast<size_t>(i)].self_offset <=
-                  max_dis + a[static_cast<size_t>(j)].self_offset) &&
-                 (a[static_cast<size_t>(i)].strand == a[static_cast<size_t>(j)].strand);
+            (a[i].self_offset > a[max_ii].self_offset + max_dis) ||
+            (a[i].strand != a[max_ii].strand)) {
+            max = INT32_MIN; max_ii = -1;
+            for (int64_t j = i - 1;
+                 (j >= st) && (a[i].self_offset <= max_dis + a[j].self_offset) && (a[i].strand == a[j].strand);
                  --j) {
-                if (max < f[static_cast<size_t>(j)]) {
-                    max = f[static_cast<size_t>(j)];
-                    max_ii = j;
-                }
+                if (max < f[j]) { max = f[j]; max_ii = j; }
             }
         }
 
-        // If max_ii is valid and was skipped by max-skip pruning (j < end_j),
-        // try connecting to it as a fallback predecessor
-        if ((max_ii >= 0) && (max_ii < end_j) &&
-            (a[static_cast<size_t>(i)].strand == a[static_cast<size_t>(max_ii)].strand)) {
-
-            tmp = hifiasm_comput_sc_ch_ec(
-                &a[static_cast<size_t>(i)], &a[static_cast<size_t>(max_ii)],
-                bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
-
-            if (tmp != INT32_MIN && max_f < tmp + f[static_cast<size_t>(max_ii)]) {
-                max_f = tmp + f[static_cast<size_t>(max_ii)];
-                max_j = max_ii;
+        // Fallback: try max_ii if it was skipped by max-skip pruning.
+        if ((max_ii >= 0) && (max_ii < end_j) && (a[i].strand == a[max_ii].strand)) {
+            tmp = hifiasm_comput_sc_ch_ec(&a[i], &a[max_ii], bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
+            if (tmp != INT32_MIN && max_f < tmp + f[max_ii]) {
+                max_f = tmp + f[max_ii]; max_j = max_ii;
             }
         }
 
-        // -----------------------------------------------------------------
-        // Finalize DP for anchor i
-        // -----------------------------------------------------------------
-        f[static_cast<size_t>(i)] = static_cast<int32_t>(max_f);
-        p[static_cast<size_t>(i)] = max_j;
+        f[i] = static_cast<int32_t>(max_f);
+        p[i] = max_j;
 
-        // Update max_ii for next iteration if current anchor is better
         if ((max_ii < 0) ||
-            ((a[static_cast<size_t>(i)].self_offset <=
-              max_dis + a[static_cast<size_t>(max_ii)].self_offset) &&
-             (a[static_cast<size_t>(i)].strand == a[static_cast<size_t>(max_ii)].strand) &&
-             (f[static_cast<size_t>(max_ii)] < f[static_cast<size_t>(i)]))) {
+            ((a[i].self_offset <= max_dis + a[max_ii].self_offset) &&
+             (a[i].strand == a[max_ii].strand) && (f[max_ii] < f[i])))
             max_ii = i;
-        }
 
-        // Track best overall chain (msc = max score, msc_i = anchor index)
-        // Tie-break by overlap length (prefer longer coverage)
-        if (f[static_cast<size_t>(i)] >= (*msc)) {
-            ovl = hifiasm_get_chainLen(
-                a[static_cast<size_t>(i)].self_offset, a[static_cast<size_t>(i)].self_offset, xl,
-                a[static_cast<size_t>(i)].offset, a[static_cast<size_t>(i)].offset, yl);
-
-            if (f[static_cast<size_t>(i)] > (*msc) || ovl < (*movl)) {
-                (*msc) = f[static_cast<size_t>(i)];
-                (*msc_i) = i;
-                (*movl) = ovl;
+        // Track global best chain (tie-break by overlap length).
+        if (f[i] >= (*msc)) {
+            ovl = hifiasm_get_chainLen(a[i].self_offset, a[i].self_offset, xl, a[i].offset, a[i].offset, yl);
+            if (f[i] > (*msc) || ovl < (*movl)) {
+                *msc = f[i]; *msc_i = i; *movl = ovl;
             }
         }
-
-        // Track minimum score (for mcopy score normalization)
-        if (f[static_cast<size_t>(i)] < (*plus)) {
-            (*plus) = f[static_cast<size_t>(i)];
-        }
-
-        // Clear chain membership flag (used in backtracking)
-        ii[static_cast<size_t>(i)] = 0;
+        if (f[i] < (*plus)) *plus = f[i];
+        ii[i] = 0;
     }
 }
 
-/**
- * @brief Backtrack from best chain anchor to extract the full chain.
- *
- * After the DP loop, we have:
- * - f[]: Best chain scores ending at each anchor
- * - p[]: Predecessor pointers for each anchor
- * - msc_i: Index of anchor with best chain score
- *
- * This function follows the predecessor pointers from msc_i backwards
- * to reconstruct the optimal chain.
- *
- * ## Algorithm:
- * ```
- * Start at best anchor (msc_i)
- * While current anchor has a predecessor:
- *   1. Mark anchor as part of best chain (ii[i] = 1)
- *   2. Store anchor index in t[] (reverse order)
- *   3. Follow predecessor: i = p[i]
- *   4. Increment chain length: cL++
- * ```
- *
- * ## Output Format:
- * - t[0..cL-1]: Chain anchor indices in **reverse order**
- *   - t[0] = last anchor (highest query position)
- *   - t[cL-1] = first anchor (lowest query position)
- * - ii[i] = 1: Anchor i is in the best chain
- * - ii[i] = 0: Anchor i is not in the best chain
- *
- * @param msc_i Best chain ending index
- * @param p Predecessor pointers
- * @param t[out] Chain indices in reverse order
- * @param ii[out] Chain membership flags
- *
- * @return Chain length cL (number of anchors in the chain)
- *
- * @complexity O(cL) where cL = chain length (typically << N)
- */
+/// Follow predecessor pointers from msc_i to reconstruct the best chain.
+/// Stores indices in t[] in reverse order (t[0] = last anchor, t[cL-1] = first).
+/// Marks chain membership in ii[] (1 = in chain).
+/// @return Chain length cL.
 static inline int64_t backtrack_best_chain(
-    const int64_t msc_i,
-    int64_t* p,
-    int64_t* t,
-    int32_t* ii) noexcept
+    int64_t msc_i, int64_t* p, int64_t* t, int32_t* ii) noexcept
 {
     int64_t cL = 0;
-    int64_t i;
-
-    // Follow predecessor pointers backwards
-    // Store chain in reverse order: t[0] = last anchor, t[cL-1] = first anchor
-    for (i = msc_i; i >= 0; i = p[static_cast<size_t>(i)]) {
-        ii[static_cast<size_t>(i)] = 1;  // Mark as part of best chain
-        t[static_cast<size_t>(cL++)] = i; // Store index (reverse order)
+    for (int64_t i = msc_i; i >= 0; i = p[i]) {
+        ii[i] = 1;
+        t[cL++] = i;
     }
-
     return cL;
 }
 
-/**
- * @brief Convert the backtracked chain into a HifiasmOverlapRegion and emit it.
- *
- * This function takes the chain anchor indices (from backtracking) and:
- * 1. Computes overlap region coordinates (query and target spans)
- * 2. Normalizes coordinates to sequence boundaries
- * 3. Stores chain hit indices for alignment construction
- * 4. Appends the overlap region to the result vector
- *
- * ## Input Format (from backtracking):
- * - t[0..cL-1]: Chain anchor indices in **reverse order**
- *   - t[cL-1] = first anchor (beg)
- *   - t[0] = last anchor (end)
- * - cL: Chain length (number of anchors)
- *
- * ## Coordinate System:
- * - Query (x): Always forward strand
- * - Target (y): May be forward (strand=0) or reverse-complement (strand=1)
- * - Coordinates are normalized to sequence boundaries (left-extended, right-extended)
- *
- * @param a Anchor array
- * @param t Chain anchor indices (reverse order, size cL)
- * @param cL Chain length
- * @param msc Chain score
- * @param xid Query read ID
- * @param xl Query length
- * @param yl Target length
- * @param res[out] Result vector (overlap regions)
- * @param chainHitIndexFlat[out] Flattened hit indices (for alignment)
- *
- * @complexity O(cL) where cL = chain length
- */
+/// Emit the best chain as a HifiasmOverlapRegion with normalized coordinates.
+/// t[0..cL-1] holds chain indices in reverse order (from backtrack_best_chain).
+/// Chain hit global indices are appended to chainHitIndexFlat in forward order.
 static inline void emit_best_chain_as_overlap(
-    HifiasmKmerHit* a,
-    int64_t* t,
-    const int64_t cL,
-    const int64_t msc,
-    const uint32_t xid,
-    const int64_t xl,
-    const int64_t yl,
+    HifiasmKmerHit* a, int64_t* t, int64_t cL, int64_t msc,
+    uint32_t xid, int64_t xl, int64_t yl,
     vector<HifiasmOverlapRegion>& res,
     vector<uint32_t>& chainHitIndexFlat) noexcept
 {
-    // CRITICAL: Only emit if we found a valid chain (cL > 0)
-    // If no chain was found (msc_i < 0), cL == 0 and t[] is empty
-    if (cL > 0) {
-        HifiasmOverlapRegion z{};
+    if (cL <= 0) return;
 
-        // -----------------------------------------------------------------
-        // Compute overlap region from first and last anchor in chain
-        // -----------------------------------------------------------------
-        // Note: t[] is in reverse order, so t[cL-1] is first, t[0] is last
-        hifiasm_push_ovlp_chain_qgen(
-            z, xid, xl, yl, msc,
-            &a[static_cast<size_t>(t[static_cast<size_t>(cL - 1)])],  // First anchor (earliest)
-            &a[static_cast<size_t>(t[0])]);                             // Last anchor (latest)
+    HifiasmOverlapRegion z{};
+    hifiasm_push_ovlp_chain_qgen(z, xid, xl, yl, msc, &a[t[cL - 1]], &a[t[0]]);
+    z.align_length = static_cast<uint32_t>(cL);
+    z.non_homopolymer_errors = static_cast<uint32_t>(chainHitIndexFlat.size());
 
-        // -----------------------------------------------------------------
-        // Set chain metadata
-        // -----------------------------------------------------------------
-        z.align_length = static_cast<uint32_t>(cL);  // Number of anchors in chain
+    for (int64_t i = 0; i < cL; ++i)
+        chainHitIndexFlat.push_back(a[t[cL - i - 1]].globalIndex);
 
-        // Store starting index in chainHitIndexFlat (for Alignment construction)
-        z.non_homopolymer_errors = static_cast<uint32_t>(chainHitIndexFlat.size());
-
-        // -----------------------------------------------------------------
-        // Append chain hit indices (for Alignment construction)
-        // -----------------------------------------------------------------
-        // Copy anchor indices in increasing self_offset order
-        // (t[] is in reverse order, so iterate backwards)
-        for (int64_t i = 0; i < cL; ++i) {
-            const int64_t local = t[static_cast<size_t>(cL - i - 1)];
-            chainHitIndexFlat.push_back(a[static_cast<size_t>(local)].globalIndex);
-        }
-
-        res.push_back(z);
-    }
+    res.push_back(z);
 }
 
+/// Full DP chaining pipeline with optional quick-check and multi-copy extraction.
+///
+/// Phase 1: Optional O(N) quick-check for collinear hits (narrows DP range).
+/// Phase 2: O(N * max_iter) DP with max-skip and distance-window pruning.
+/// Phase 3: Backtrack best chain from predecessor pointers.
+/// Phase 4: Optional mcopy extraction (up to mcopy_num secondary chains).
+/// Phase 5: Emit best chain as overlap region (fallback if mcopy disabled/failed).
+///
+/// @reference Hifiasm Hash_Table.cpp:2097-2284 (lchain_qdp_mcopy_fast)
 static inline void hifiasm_lchain_qdp_mcopy_fast(
     vector<HifiasmKmerHit>& a,
     HifiasmChainDataScratch& dp,
     vector<HifiasmOverlapRegion>& res,
     vector<uint32_t>& chainHitIndexFlat,
-    const int64_t max_skip,
-    const int64_t max_iter,
-    const int64_t max_dis,
-    const double chn_pen_gap,
-    const double chn_pen_skip,
-    const double bw_rate,
-    const uint32_t xid,
-    const int64_t xl,
-    const int64_t yl,
-    const int64_t quick_check,
-    const int64_t mcopy_num,
-    const double mcopy_rate,
-    const int64_t mcopy_khit_cutoff)
+    int64_t max_skip, int64_t max_iter, int64_t max_dis,
+    double chn_pen_gap, double chn_pen_skip, double bw_rate,
+    uint32_t xid, int64_t xl, int64_t yl,
+    int64_t quick_check,
+    int64_t mcopy_num, double mcopy_rate, int64_t mcopy_khit_cutoff)
 {
-    // =========================================================================
-    // INITIALIZATION
-    // =========================================================================
     const int64_t a_n = static_cast<int64_t>(a.size());
-    if (a_n <= 0) return;  // No anchors to chain
+    if (a_n <= 0) return;
 
-    // Resize DP scratch space to accommodate all anchors
     dp.resize(static_cast<size_t>(a_n));
+    int64_t* p  = dp.pre.data();
+    int64_t* t  = dp.tmp.data();
+    int32_t* f  = dp.score.data();
+    int32_t* ii = dp.occ.data();
 
-    // Raw array pointers for cache-efficient access
-    int64_t* p = dp.pre.data();   // Predecessor pointers (backtracking)
-    int64_t* t = dp.tmp.data();   // Visit marks (DP) or heap keys (mcopy)
-    int32_t* f = dp.score.data(); // DP scores f[i]
-    int32_t* ii = dp.occ.data();  // Chain membership flags
-
-    // DP state variables (many locals moved to helper functions for clarity)
     int64_t msc, msc_i, movl, plus = 0;
     int64_t min_sc, ch_n, si, ei;
-    int64_t i, k, cL = 0;
-    int64_t sc;  // Still used in multi-copy extraction phase
+    int64_t i, k, cL = 0, sc;
 
-    // =========================================================================
-    // PHASE 1: OPTIONAL QUICK CHECK (O(N) fast path for collinear hits)
-    // =========================================================================
-    // Quick check attempts O(N) linear chaining for perfectly collinear hits.
-    // If successful, it:
-    //   1. Computes initial best score (msc, msc_i)
-    //   2. Identifies promising DP range [si, ei]
-    //   3. Initializes predecessor pointers p[] and scores f[]
-    // If quick check fails or is disabled, fall back to full DP.
-
+    // Phase 1: Quick check.
     if (quick_check) {
         hifiasm_quick_ck_lchain(
             a.data(), a_n, xl, yl, chn_pen_gap, chn_pen_skip, bw_rate,
             p, t, f, ii, &plus, &msc, &msc_i, &movl, &si, &ei);
     } else {
-        // No quick check: initialize for full DP over entire range
         msc = msc_i = INT32_MIN;
         movl = INT32_MAX;
         plus = 0;
-        si = 0;
-        ei = a_n;
-        std::fill(dp.tmp.begin(), dp.tmp.end(), int64_t(0));
+        si = 0; ei = a_n;
+        std::fill(t, t + a_n, int64_t(0));
     }
 
-    // Safety: Validate quick check results. If invalid (e.g., due to coordinate
-    // convention mismatch), fall back to full DP to ensure we always have a valid chain.
-    if (msc_i < 0 || si < 0 || ei < 0 || si > a_n || ei > a_n) {
-        msc = msc_i = INT32_MIN;
-        movl = INT32_MAX;
-        plus = 0;
-        si = 0;
-        ei = a_n;
-        std::fill(dp.tmp.begin(), dp.tmp.end(), int64_t(0));
-    }
-
-    // =========================================================================
-    // PHASE 2: MAIN DP LOOP (O(N * max_iter) with pruning)
-    // =========================================================================
-    // Run the main dynamic programming loop to find optimal chains.
-    // Extracted to run_main_dp_loop() for readability and testability.
+    // Phase 2: Main DP.
     run_main_dp_loop(
-        a.data(), si, ei,
-        max_skip, max_iter, max_dis,
-        chn_pen_gap, chn_pen_skip, bw_rate,
-        xl, yl,
-        p, f, t, ii,
-        &msc, &msc_i, &movl, &plus);
+        a.data(), si, ei, max_skip, max_iter, max_dis,
+        chn_pen_gap, chn_pen_skip, bw_rate, xl, yl,
+        p, f, t, ii, &msc, &msc_i, &movl, &plus);
 
-    // =========================================================================
-    // PHASE 3: BACKTRACKING (Extract best chain)
-    // =========================================================================
-    // Follow predecessor pointers from best anchor (msc_i) to chain root.
-    // Extracted to backtrack_best_chain() for readability and testability.
+    // Phase 3: Backtrack best chain.
     cL = backtrack_best_chain(msc_i, p, t, ii);
 
-    // =========================================================================
-    // PHASE 4: MULTI-COPY EXTRACTION (Optional, for repetitive regions)
-    // =========================================================================
-    // Extract up to mcopy_num high-scoring chains for repetitive regions.
-    // This is essential for:
-    //   - Segmental duplications
-    //   - Tandem repeats
-    //   - Paralogous genes
-    //
-    // Algorithm:
-    //   1. Normalize scores: f[i] -= plus (shift to non-negative)
-    //   2. Collect candidates: anchors with score >= mcopy_rate * best_score
-    //   3. Sort by score (descending) using radix sort
-    //   4. Extract top mcopy_num non-overlapping chains
-    //   5. For each chain, emit overlap region + chain hit indices
+    // Phase 4: Multi-copy extraction.
     if (mcopy_num > 1) {
-        // Only attempt mcopy if best chain has enough anchors (quality threshold)
         if (cL >= mcopy_khit_cutoff) {
-            // -----------------------------------------------------------------
-            // Step 1: Normalize scores to non-negative range
-            // -----------------------------------------------------------------
-            // Shift all scores by -plus (minimum score) to make them ≥ 0
-            // This is required for the radix sort and threshold comparison
+            // Normalize scores to non-negative range for threshold comparison.
             msc -= plus;
+            min_sc = static_cast<int64_t>(static_cast<double>(msc) * mcopy_rate);
+            ii[msc_i] = 0;
 
-            // Safety: Ensure msc is non-negative after normalization
-            if (msc < 0) msc = 0;
-
-            // Compute threshold with proper rounding (floor for safe truncation)
-            min_sc = static_cast<int64_t>(std::floor(static_cast<double>(msc) * mcopy_rate));
-
-            // Clear best chain flag (allow it to compete with other chains)
-            ii[static_cast<size_t>(msc_i)] = 0;
-
-            // -----------------------------------------------------------------
-            // Step 2: Collect candidate chains above threshold
-            // -----------------------------------------------------------------
-            // Build heap keys: (score << 32) | (index << 1)
-            // The left-shift by 32 puts score in high bits for radix sort
+            // Collect candidates: pack (score << 32 | index << 1) into t[].
             for (i = ch_n = 0; i < a_n; ++i) {
-                // Normalize score
-                f[static_cast<size_t>(i)] -= static_cast<int32_t>(plus);
-
-                // Clear t[] workspace for candidate collection
-                if (i >= ch_n) t[static_cast<size_t>(i)] = 0;
-
-                // Collect anchors not in best chain and above threshold
-                if ((!ii[static_cast<size_t>(i)]) &&
-                    (static_cast<int64_t>(f[static_cast<size_t>(i)]) >= min_sc)) {
-
-                    // Pack (score, index) into 64-bit key for sorting
-                    t[static_cast<size_t>(ch_n)] =
-                        (static_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(f[static_cast<size_t>(i)])) << 32) |
-                         (static_cast<uint64_t>(i) << 1));
+                f[i] -= static_cast<int32_t>(plus);
+                if (i >= ch_n) t[i] = 0;
+                if ((!ii[i]) && (f[i] >= min_sc)) {
+                    t[ch_n] = (static_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(f[i])) << 32)
+                             | (static_cast<uint64_t>(i) << 1));
                     ch_n++;
                 }
             }
 
-            // -----------------------------------------------------------------
-            // Safety: Restore best chain if mcopy collection failed
-            // -----------------------------------------------------------------
-            // If we found ≤1 candidate, the loop above overwrote t[] (which
-            // held the best-chain backtrack). Restore it to preserve hifiasm parity.
             if (ch_n <= 1) {
-                msc += plus;  // Restore original score
-                i = msc_i;
+                // Too few candidates — restore best chain for fallback emit.
+                msc += plus;
                 cL = 0;
-                // Rebuild best chain in t[]
-                while (i >= 0) {
-                    t[static_cast<size_t>(cL++)] = i;
-                    i = p[static_cast<size_t>(i)];
-                }
+                for (i = msc_i; i >= 0; i = p[i]) t[cL++] = i;
             }
-            // -----------------------------------------------------------------
-            // Step 3: Sort candidates by score (descending)
-            // -----------------------------------------------------------------
+
             if (ch_n > 1) {
                 int64_t n_v, n_v0, ni, n_u;
-                const int64_t n_u0 = static_cast<int64_t>(res.size());
 
-                // Sort by packed key: higher score → higher key → later in array
-                // We iterate backwards (k = ch_n-1 down to 0) to extract in score order
-                std::sort(t, t + ch_n,
-                    [](const int64_t a, const int64_t b) noexcept {
-                        return static_cast<uint64_t>(a) < static_cast<uint64_t>(b);
-                    });
+                std::sort(t, t + ch_n, [](int64_t a, int64_t b) noexcept {
+                    return static_cast<uint64_t>(a) < static_cast<uint64_t>(b);
+                });
 
-                // -----------------------------------------------------------------
-                // Step 4: Extract top mcopy_num chains
-                // -----------------------------------------------------------------
-                // Iterate backwards through sorted candidates (highest score first)
+                // Extract top mcopy_num chains in descending score order.
                 for (k = ch_n - 1, n_v = n_u = 0; k >= 0 && n_u < mcopy_num; --k) {
-                    n_v0 = n_v;  // Remember start of current chain in ii[]
-
-                    // Extract chain starting from anchor index in t[k]
-                    // (index is in bits 1-31, bit 0 is used as visited flag)
-                    i = static_cast<int64_t>((static_cast<uint32_t>(t[static_cast<size_t>(k)]) >> 1));
-
-                    // Follow predecessor pointers until we hit a visited anchor
-                    for (; i >= 0 && (t[static_cast<size_t>(i)] & 1) == 0; ) {
-                        ii[static_cast<size_t>(n_v++)] = static_cast<int32_t>(i);
-                        t[static_cast<size_t>(i)] |= 1;  // Mark as visited
-                        i = p[static_cast<size_t>(i)];
+                    n_v0 = n_v;
+                    for (i = static_cast<int64_t>(static_cast<uint32_t>(t[k]) >> 1);
+                         i >= 0 && (t[i] & 1) == 0; ) {
+                        ii[n_v++] = static_cast<int32_t>(i);
+                        t[i] |= 1;
+                        i = p[i];
                     }
-
-                    // Skip if chain is empty (fully overlaps with previous chains)
                     if (n_v0 == n_v) continue;
 
-                    // CRITICAL: Verify chain has valid bounds before accessing
-                    // After continue above, we're guaranteed n_v > n_v0, so n_v >= n_v0 + 1
-                    DINARA_ASSERT(n_v > n_v0);
-                    DINARA_ASSERT(n_v > 0);
+                    sc = (i < 0) ? static_cast<int64_t>(static_cast<uint32_t>(static_cast<uint64_t>(t[k]) >> 32))
+                                 : static_cast<int64_t>(static_cast<uint32_t>(static_cast<uint64_t>(t[k]) >> 32)) - f[i];
 
-                    // Extract score from packed key and adjust for overlap
-                    const uint64_t key = static_cast<uint64_t>(t[static_cast<size_t>(k)]);
-                    const int64_t top = static_cast<int64_t>(static_cast<uint32_t>(key >> 32));
-
-                    // If we stopped at an existing chain (i >= 0), subtract its score
-                    sc = (i < 0) ? top : (top - static_cast<int64_t>(f[static_cast<size_t>(i)]));
-
-                    // Emit chain if it passes threshold
                     if (sc >= min_sc) {
                         HifiasmOverlapRegion z{};
+                        hifiasm_push_ovlp_chain_qgen(z, xid, xl, yl, sc + plus, &a[ii[n_v - 1]], &a[ii[n_v0]]);
 
-                        // Populate overlap region (coordinates, strand, etc.)
-                        hifiasm_push_ovlp_chain_qgen(
-                            z, xid, xl, yl, sc + plus,
-                            &a[static_cast<size_t>(ii[static_cast<size_t>(n_v - 1)])],
-                            &a[static_cast<size_t>(ii[static_cast<size_t>(n_v0)])]);
-
-                        // Emit chain if it's the first or has >1 anchor
                         if ((!n_u) || (n_v - n_v0 > 1)) {
                             z.align_length = static_cast<uint32_t>(n_v - n_v0);
-                            z.x_id = static_cast<uint32_t>(n_v0);  // Temp: start index in ii[]
-
-                            // Store chain hit indices in increasing self_offset order
                             z.non_homopolymer_errors = static_cast<uint32_t>(chainHitIndexFlat.size());
                             ni = z.align_length;
-
-                            // Copy indices in reverse order (ii[] is in reverse)
-                            // Use uint32_t for iteration to prevent underflow in (ni - j - 1)
-                            for (uint32_t j = 0; j < ni; ++j) {
-                                const int64_t local = ii[static_cast<size_t>(n_v0 + (ni - j - 1))];
-                                chainHitIndexFlat.push_back(a[static_cast<size_t>(local)].globalIndex);
-                            }
-
+                            for (uint32_t j = 0; j < ni; ++j)
+                                chainHitIndexFlat.push_back(a[ii[n_v0 + (ni - j - 1)]].globalIndex);
                             res.push_back(z);
                             n_u++;
                         } else {
-                            // Chain is too short (only 1 anchor), discard
                             n_v = n_v0;
                         }
                     } else {
-                        // Score below threshold, discard
                         n_v = n_v0;
                     }
                 }
-
-                // If we successfully emitted mcopy chains, we're done
-                if (res.size() > static_cast<size_t>(n_u0)) {
-                    return;
-                }
-
-                // -----------------------------------------------------------------
-                // Fallback: Restore best chain if mcopy extraction failed
-                // -----------------------------------------------------------------
-                msc += plus;  // Restore original score
-                i = msc_i;
-                cL = 0;
-                while (i >= 0) {
-                    t[static_cast<size_t>(cL++)] = i;
-                    i = p[static_cast<size_t>(i)];
-                }
+                return;  // hifiasm parity: always return after ch_n > 1 block.
             }
         }
     }
 
-    // =========================================================================
-    // PHASE 5: EMIT BEST CHAIN (Always executed, fallback if mcopy failed)
-    // =========================================================================
-    // Emit the best chain (msc, msc_i) as an overlap region.
-    // Extracted to emit_best_chain_as_overlap() for readability and testability.
+    // Phase 5: Emit best chain (fallback).
     emit_best_chain_as_overlap(a.data(), t, cL, msc, xid, xl, yl, res, chainHitIndexFlat);
 }
 
-/**
- * @brief Classify overlap type for filtering and statistics (hifiasm parity).
- *
- * Determines how the query read aligns relative to its full length:
- *   - Type 0: Query prefix (overhang at end)
- *   - Type 1: Query suffix (overhang at start)
- *   - Type 2: Query fully contained (covered end-to-end)
- *   - Type 3: Query contains target (internal alignment)
- *
- * This classification is used downstream for:
- *   - Filtering overlaps by topology
- *   - Computing containment relationships
- *   - Prioritizing overlap types during graph construction
- *
- * @param r    Overlap region to classify
- * @param len  Query read length
- * @return Overlap type (0=prefix, 1=suffix, 2=contained, 3=contains)
- *
- * @complexity O(1)
- * @reference Hifiasm anchor.cpp:86 (ha_ov_type)
- */
-static inline int hifiasm_ha_ov_type(
-    const HifiasmOverlapRegion& r,
-    const uint32_t len) noexcept
+/// Classify overlap type by query coordinate coverage.
+///   0 = prefix  [0, ...]       1 = suffix  [..., len-1]
+///   2 = contained [0, len-1]   3 = internal [>0, <len-1]
+/// @reference Hifiasm anchor.cpp:86 (ha_ov_type)
+static inline int hifiasm_ha_ov_type(const HifiasmOverlapRegion& r, uint32_t len) noexcept
 {
-    // Type 2: Query is fully covered [0, len-1]
-    if (r.x_pos_s == 0 && r.x_pos_e == len - 1U) {
-        return 2;  // Contained
-    }
-    // Type 3: Query alignment is internal (not touching either end)
-    else if (r.x_pos_s > 0 && r.x_pos_e < len - 1U) {
-        return 3;  // Contains
-    }
-    // Type 0 or 1: Query touches one end
-    else {
-        return (r.x_pos_s == 0) ? 0 : 1;  // Prefix : Suffix
-    }
+    if (r.x_pos_s == 0 && r.x_pos_e == len - 1U) return 2;
+    if (r.x_pos_s > 0 && r.x_pos_e < len - 1U)   return 3;
+    return (r.x_pos_s == 0) ? 0 : 1;
 }
 
-// ============================================================================
-// POST-FILTER: MAX_N_CHAIN + COV_W + R485 WEAK-CHAIN SUPPRESSION
-// ============================================================================
-// Reference: Hifiasm anchor.cpp lchain_qgen_mcopy_fast max_n_chain + ocv_w + r485
-//
-// After the DP chaining phase produces overlap regions, this post-filter applies
-// three successive pruning stages to control output volume and quality:
-//
-//   ┌─────────────────────────────────────────────────────────────────┐
-//   │  Stage 1: MAX_N_CHAIN (per-overlap-type cap)                   │
-//   │    • Sort overlaps by score descending                          │
-//   │    • For each of the 4 overlap types (prefix/suffix/cont/int), │
-//   │      record the score at the max_n_chain-th position.           │
-//   │    • Reject overlaps below their type's threshold.              │
-//   │                                                                 │
-//   │  Stage 2: COV_W (Coverage Window overload control)              │
-//   │    • Only applies to type-3 (internal/containing) overlaps      │
-//   │    • Divides the query read into fixed-width windows            │
-//   │    • Each window has a capacity = window_size * (max_n_chain/2) │
-//   │    • A type-3 overlap below threshold is "rescued" if ≥70% of   │
-//   │      its span falls in under-capacity windows                    │
-//   │    • This prevents repetitive regions from drowning out signal   │
-//   │                                                                 │
-//   │  Stage 3: R485 (Weak-chain suppression)                         │
-//   │    • Chains with few anchors (< chain_cutoff) are "weak"        │
-//   │    • If a weak chain's query span overlaps a strong chain's     │
-//   │      span by ≥ 95%, and the strong chain has ≥ 16× more anchors │
-//   │      and ≥ 16× higher score, suppress the weak chain            │
-//   │    • Prevents short false-positive chains from shadowing real    │
-//   │      overlaps in repetitive regions                              │
-//   └─────────────────────────────────────────────────────────────────┘
-//
-// @param ol             Vector of overlap regions (modified in place, may shrink)
-// @param max_n_chain    Per-type cap on number of overlaps to keep
-// @param chain_cutoff   Minimum anchor count for "strong" chains in R485
-// @param ocv_w          COV_W window size (0 to disable)
-// @param rl             Query read length
-// @param chainHitIndexFlat  Flattened anchor indices for each chain
-// @param allHits        Full anchor array (for R485 position lookups)
-// ============================================================================
+/// Three-stage postfilter applied after DP chaining:
+///
+/// Stage 1 (max_n_chain): Per-overlap-type score cap. Sort by score descending,
+///   record the score at the max_n_chain-th position for each type, reject below.
+///
+/// Stage 2 (COV_W): Coverage-window rescue for type-3 overlaps. Divides the query
+///   into fixed-width windows; a below-threshold type-3 overlap is rescued if ≥70%
+///   of its span falls in under-capacity windows.
+///
+/// Stage 3 (R485): Weak-chain suppression. Chains with < chain_cutoff anchors are
+///   suppressed if a strong chain overlaps ≥95% of their span with ≥16× more
+///   anchors and ≥16× higher score.
+///
+/// @reference Hifiasm anchor.cpp:1920-2100 (lchain_qgen_mcopy_fast postfilter)
 static inline void hifiasm_lchain_qgen_mcopy_fast_postfilter(
     vector<HifiasmOverlapRegion>& ol,
-    const uint64_t max_n_chain,
-    const uint32_t chain_cutoff,
-    const uint64_t ocv_w,
-    const uint32_t rl,
+    uint64_t max_n_chain, uint32_t chain_cutoff, uint64_t ocv_w, uint32_t rl,
     const vector<uint32_t>& chainHitIndexFlat,
     const vector<HifiasmKmerHit>& allHits)
 {
-    if (ol.empty()) {
-        return;
-    }
+    if (ol.empty()) return;
 
-    uint64_t lch = 0;  // Counts overlaps that pass all filters.
+    uint64_t lch = 0;
 
-    // =====================================================================
-    // STAGE 1: MAX_N_CHAIN — Per-type score threshold
-    // =====================================================================
-    // Sort all overlaps by score descending. Then make a single pass to find,
-    // for each of the 4 overlap types, the score at position max_n_chain.
-    // Any overlap below its type's threshold is rejected (unless rescued).
+    // Stage 1: max_n_chain per-type cap.
     if (max_n_chain > 0 && ol.size() > max_n_chain) {
-        std::sort(ol.begin(), ol.end(),
-            [](const HifiasmOverlapRegion& a, const HifiasmOverlapRegion& b) {
-                return a.shared_seed > b.shared_seed;
-            });
+        std::sort(ol.begin(), ol.end(), [](const HifiasmOverlapRegion& a, const HifiasmOverlapRegion& b) {
+            return a.shared_seed > b.shared_seed;
+        });
 
-        // n[w] = count of overlaps of type w seen so far.
-        // s[w] = score at the max_n_chain-th overlap of type w (threshold).
-        int32_t n[4] = {0, 0, 0, 0};
-        int32_t s[4] = {0, 0, 0, 0};
+        int32_t n[4] = {}, s[4] = {};
         for (size_t i = 0; i < ol.size(); ++i) {
             const int w = hifiasm_ha_ov_type(ol[i], rl);
-            ++n[w];
-            if (uint64_t(n[w]) == max_n_chain) s[w] = ol[i].shared_seed;
+            if (static_cast<uint64_t>(++n[w]) == max_n_chain) s[w] = ol[i].shared_seed;
         }
 
-        // Only proceed if at least one type hit its cap.
         if (s[0] > 0 || s[1] > 0 || s[2] > 0 || s[3] > 0) {
-            // =============================================================
-            // STAGE 2: COV_W — Coverage Window rescue for type-3 overlaps
-            // =============================================================
-            // Divide the query read into fixed-width windows (ocv_w bases each).
-            // Each window tracks how much alignment span has been consumed.
-            // A below-threshold type-3 overlap is "rescued" if at least 70%
-            // of its span falls in windows that still have capacity.
-            //
-            // Window state packing (uint64_t):
-            //   High 32 bits = capacity (window_size * max_n_chain/2)
-            //   Low 32 bits  = used (sum of overlap spans assigned so far)
+            // Stage 2: COV_W coverage-window rescue for type-3 overlaps.
+            // Window state: high 32 bits = capacity, low 32 bits = used.
             vector<uint64_t> cc;
             uint64_t cwn = 0;
-            if (ocv_w > 0 && (uint64_t(n[3]) >= max_n_chain) && (uint64_t(rl) >= ocv_w)) {
-                cwn = (uint64_t(rl) / ocv_w) + ((uint64_t(rl) % ocv_w) ? 1ULL : 0ULL);
-                cc.resize(size_t(cwn), uint64_t(0));
-                for (uint64_t i = 0, cws = 0, cwe = 0; i < cwn; ++i) {
-                    cwe = cws + ocv_w;
-                    if (cwe > uint64_t(rl)) cwe = uint64_t(rl);
-                    const uint64_t winLen = cwe - cws;
-                    uint64_t cap = winLen * (max_n_chain >> 1);
-                    if (cap > uint64_t(UINT32_MAX)) cap = uint64_t(UINT32_MAX);
-                    cc[size_t(i)] = (cap << 32); // high32=cap, low32=used
-                    cws += ocv_w;
+            if (ocv_w > 0 && uint64_t(n[3]) >= max_n_chain && uint64_t(rl) >= ocv_w) {
+                cwn = uint64_t(rl) / ocv_w + (uint64_t(rl) % ocv_w ? 1ULL : 0ULL);
+                cc.resize(cwn, 0ULL);
+                for (uint64_t i = 0, cws = 0; i < cwn; ++i, cws += ocv_w) {
+                    uint64_t cwe = std::min(cws + ocv_w, uint64_t(rl));
+                    uint64_t cap = std::min((cwe - cws) * (max_n_chain >> 1), uint64_t(UINT32_MAX));
+                    cc[i] = cap << 32;
                 }
             }
 
             auto update_cc = [&](const HifiasmOverlapRegion& r) {
-                if (cwn == 0) return;
-                uint64_t m = uint64_t(r.x_pos_s) / ocv_w;
-                const uint64_t rs = uint64_t(r.x_pos_s);
-                const uint64_t re = uint64_t(r.x_pos_e) + 1ULL;
-                for (uint64_t cws = m * ocv_w; m < cwn; ++m, cws += ocv_w) {
-                    uint64_t cwe = cws + ocv_w;
-                    if (cwe > uint64_t(rl)) cwe = uint64_t(rl);
-                    const uint64_t os = (rs >= cws) ? rs : cws;
-                    const uint64_t oe = (re <= cwe) ? re : cwe;
+                if (!cwn) return;
+                const uint64_t rs = r.x_pos_s, re = uint64_t(r.x_pos_e) + 1;
+                for (uint64_t m = rs / ocv_w, cws = m * ocv_w; m < cwn; ++m, cws += ocv_w) {
+                    uint64_t cwe = std::min(cws + ocv_w, uint64_t(rl));
+                    uint64_t os = std::max(rs, cws), oe = std::min(re, cwe);
                     if (oe <= os) break;
-
-                    // Safely compute overlap span with overflow protection
-                    const uint64_t overlap_span = oe - os;
-                    const uint32_t add = (overlap_span > uint64_t(UINT32_MAX)) ?
-                        UINT32_MAX : uint32_t(overlap_span);
-
-                    const uint32_t used = uint32_t(cc[size_t(m)] & 0xffffffffULL);
-                    if (uint64_t(used) + uint64_t(add) < uint64_t(UINT32_MAX)) {
-                        cc[size_t(m)] += uint64_t(add);
-                    } else {
-                        cc[size_t(m)] = (cc[size_t(m)] & 0xffffffff00000000ULL) | uint64_t(UINT32_MAX);
-                    }
+                    uint32_t add = static_cast<uint32_t>(std::min(oe - os, uint64_t(UINT32_MAX)));
+                    uint32_t used = static_cast<uint32_t>(cc[m]);
+                    if (uint64_t(used) + add < UINT32_MAX) cc[m] += add;
+                    else cc[m] = (cc[m] & 0xffffffff00000000ULL) | UINT32_MAX;
                 }
             };
 
             auto should_rescue_type3 = [&](const HifiasmOverlapRegion& r) -> bool {
-                if (cwn == 0) return false;
-                uint64_t m = uint64_t(r.x_pos_s) / ocv_w;
+                if (!cwn) return false;
                 uint64_t cw0 = 0, cw1 = 0;
-                const uint64_t rs = uint64_t(r.x_pos_s);
-                const uint64_t re = uint64_t(r.x_pos_e) + 1ULL;
-                for (uint64_t cws = m * ocv_w; m < cwn; ++m, cws += ocv_w) {
-                    uint64_t cwe = cws + ocv_w;
-                    if (cwe > uint64_t(rl)) cwe = uint64_t(rl);
-                    const uint64_t os = (rs >= cws) ? rs : cws;
-                    const uint64_t oe = (re <= cwe) ? re : cwe;
+                const uint64_t rs = r.x_pos_s, re = uint64_t(r.x_pos_e) + 1;
+                for (uint64_t m = rs / ocv_w, cws = m * ocv_w; m < cwn; ++m, cws += ocv_w) {
+                    uint64_t cwe = std::min(cws + ocv_w, uint64_t(rl));
+                    uint64_t os = std::max(rs, cws), oe = std::min(re, cwe);
                     if (oe <= os) break;
-                    const uint64_t overlap = oe - os;
-                    const uint64_t cap = (cc[size_t(m)] >> 32);
-                    const uint64_t used = uint64_t(uint32_t(cc[size_t(m)] & 0xffffffffULL));
-                    if (used + overlap >= cap) cw1 += overlap;
-                    else cw0 += overlap;
+                    uint64_t span = oe - os;
+                    uint64_t cap = cc[m] >> 32, used = static_cast<uint32_t>(cc[m]);
+                    if (used + span >= cap) cw1 += span;
+                    else                    cw0 += span;
                 }
-                const uint64_t total = cw0 + cw1;
-                if (total == 0) return false;
-                // anchor.cpp:2027 uses a hard-coded 0.7 threshold.
-                return double(cw0) >= (double(total) * 0.7);
+                return double(cw0) >= double(cw0 + cw1) * 0.7;
             };
 
-            // Apply max_n_chain + COV_W filtering in a single pass.
-            // Overlaps above their type's threshold are always kept.
-            // Type-3 overlaps below threshold get a COV_W rescue check.
-            // Kept overlaps that have < chain_cutoff anchors mark lch=1
-            // to trigger R485 weak-chain suppression below.
             size_t k = 0;
             for (size_t i = 0; i < ol.size(); ++i) {
                 const int w = hifiasm_ha_ov_type(ol[i], rl);
                 bool keep = (ol[i].shared_seed >= s[w]);
-                if (!keep && w == 3 && cwn > 0) {
-                    keep = should_rescue_type3(ol[i]);  // COV_W rescue.
-                }
+                if (!keep && w == 3 && cwn > 0) keep = should_rescue_type3(ol[i]);
                 if (keep) {
-                    update_cc(ol[i]);  // Update window usage for future rescue checks.
+                    update_cc(ol[i]);
                     if (chain_cutoff >= 2 && ol[i].align_length < chain_cutoff) lch = 1;
                     if (k != i) std::swap(ol[k], ol[i]);
                     ++k;
@@ -2554,80 +1656,57 @@ static inline void hifiasm_lchain_qgen_mcopy_fast_postfilter(
         }
     }
 
-    // =================================================================
-    // STAGE 3: R485 WEAK-CHAIN SUPPRESSION
-    // =================================================================
-    // Sort surviving overlaps by query start position so we can do
-    // efficient interval overlap queries between weak and strong chains.
-    std::sort(ol.begin(), ol.end(),
-        [](const HifiasmOverlapRegion& a, const HifiasmOverlapRegion& b) {
-            if (a.x_pos_s != b.x_pos_s) return a.x_pos_s < b.x_pos_s;
-            if (a.x_pos_e != b.x_pos_e) return a.x_pos_e < b.x_pos_e;
-            if (a.y_id != b.y_id) return a.y_id < b.y_id;
-            if (a.y_pos_strand != b.y_pos_strand) return a.y_pos_strand < b.y_pos_strand;
-            if (a.y_pos_s != b.y_pos_s) return a.y_pos_s < b.y_pos_s;
-            return a.y_pos_e < b.y_pos_e;
-        });
+    // If max_n_chain filter was skipped (ol.size() <= max_n_chain), lch was never
+    // set above. In hifiasm, lch comes from the per-target chaining loop. We
+    // replicate that by scanning surviving overlaps for weak chains.
+    if (!lch && chain_cutoff >= 2) {
+        for (size_t i = 0; i < ol.size() && !lch; ++i) {
+            if (ol[i].align_length < chain_cutoff) lch = 1;
+        }
+    }
+
+    // Stage 3: R485 weak-chain suppression.
+    std::sort(ol.begin(), ol.end(), [](const HifiasmOverlapRegion& a, const HifiasmOverlapRegion& b) {
+        return (uint64_t(a.x_pos_s) << 32 | a.x_pos_e) < (uint64_t(b.x_pos_s) << 32 | b.x_pos_e);
+    });
 
     if (lch) {
-        // R485 weak-chain suppression (anchor.cpp:2061-2096).
-        //
-        // For each weak chain (align_length < chain_cutoff), check if there exists
-        // any strong chain whose query span overlaps by ≥ OFL (95%), has ≥ CH_OCC
-        // (16×) more anchors, has ≥ CH_SC (16×) higher score, AND has enough actual
-        // anchor positions within the overlap zone. If so, suppress the weak chain.
-        //
-        // This prevents short, spurious chains (often caused by repetitive k-mers)
-        // from diluting the overlap graph with false positives.
         size_t l = 0;
         for (size_t i = 0; i < ol.size(); ++i) {
             if (ol[i].align_length < chain_cutoff) {
-                // Weak chain: compute its query span [zs, ze) and thresholds.
-                const uint64_t zs = uint64_t(ol[i].x_pos_s);
-                const uint64_t ze = uint64_t(ol[i].x_pos_e) + 1ULL;
-                uint64_t ob = uint64_t(double(ze - zs) * HIFIASM_OFL);  // 95% overlap needed.
-                if (ob < 16) ob = 16;  // Minimum overlap of 16 bases.
-                const int64_t osc = int64_t(ol[i].shared_seed) * int64_t(HIFIASM_CH_SC);  // Score threshold.
-                const uint64_t ocn = uint64_t(ol[i].align_length) << HIFIASM_CH_OCC;  // Anchor count threshold.
+                const uint64_t zs = ol[i].x_pos_s, ze = uint64_t(ol[i].x_pos_e) + 1;
+                uint64_t ob = static_cast<uint64_t>(double(ze - zs) * HIFIASM_OFL);
+                if (ob < 16) ob = 16;
+                const int64_t osc = int64_t(ol[i].shared_seed) * HIFIASM_CH_SC;
+                const uint64_t ocn = uint64_t(ol[i].align_length) << HIFIASM_CH_OCC;
 
                 size_t k = 0;
-                for (; k < ol.size() && ze > uint64_t(ol[k].x_pos_s); ++k) {
+                for (; k < ol.size() && ze > ol[k].x_pos_s; ++k) {
                     if (ol[k].align_length < chain_cutoff) continue;
-                    if (uint64_t(ol[k].align_length) < ocn) continue;
+                    if (ol[k].align_length < ocn) continue;
                     if (int64_t(ol[k].shared_seed) < osc) continue;
 
-                    const uint64_t rs = uint64_t(ol[k].x_pos_s);
-                    const uint64_t re = uint64_t(ol[k].x_pos_e) + 1ULL;
-                    const uint64_t os = (rs >= zs) ? rs : zs;
-                    const uint64_t oe = (re <= ze) ? re : ze;
-                    if (!((oe > os) && (oe - os) >= ob)) continue;
+                    uint64_t rs = ol[k].x_pos_s, re = uint64_t(ol[k].x_pos_e) + 1;
+                    uint64_t os = std::max(rs, zs), oe = std::min(re, ze);
+                    if (!(oe > os && oe - os >= ob)) continue;
 
+                    // Count strong-chain anchors within the overlap zone.
                     uint64_t kn = 0;
-                    const uint64_t off = uint64_t(ol[k].non_homopolymer_errors);
-                    const uint64_t n_hit = uint64_t(ol[k].align_length);
-
-                    // CRITICAL: Check bounds before accessing chain hit indices
-                    if(off + n_hit > chainHitIndexFlat.size()) {
-                        continue;  // Skip this overlap - hit indices out of bounds
-                    }
+                    const uint64_t off = ol[k].non_homopolymer_errors;
+                    const uint64_t n_hit = ol[k].align_length;
+                    if (off + n_hit > chainHitIndexFlat.size()) continue;
 
                     for (uint64_t j = 0; j < n_hit && kn < ocn; ++j) {
-                        const uint64_t g = uint64_t(chainHitIndexFlat[size_t(off + j)]);
+                        uint64_t g = chainHitIndexFlat[off + j];
                         if (g >= allHits.size()) continue;
-                        const uint64_t me = uint64_t(allHits[size_t(g)].self_offset);
-                        const uint64_t span = uint64_t(allHits[size_t(g)].cnt & 0xffu);
-                        // Match hifiasm's unsigned wrap semantics: ms = me - span.
-                        const uint64_t ms = me - span;
+                        uint64_t me = allHits[g].self_offset;
+                        uint64_t ms = me - (allHits[g].cnt & 0xffu);
                         if (ms >= os && me <= oe) ++kn;
                     }
                     if (kn >= ocn) break;
                 }
-                if (k < ol.size() && ze > uint64_t(ol[k].x_pos_s)) {
-                    // Suppress this weak overlap.
-                    continue;
-                }
+                if (k < ol.size() && ze > ol[k].x_pos_s) continue;
             }
-
             if (l != i) std::swap(ol[l], ol[i]);
             ++l;
         }
