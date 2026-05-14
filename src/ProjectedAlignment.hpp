@@ -84,9 +84,7 @@ public:
         int64_t dpMatchScore,
         int64_t dpMismatchScore,
         int64_t dpGapOpen1,
-        int64_t dpGapExtend1,
-        int64_t dpGapOpen2,
-        int64_t dpGapExtend2);
+        int64_t dpGapExtend1);
     // The Base sequences in RLE represenation.
     array<vector<Base>, 2> rleSequences;
     void fillRleSequences();
@@ -107,8 +105,8 @@ public:
     // using hifiasm's if_is_homopolymer_repeat-style accounting.
     uint64_t nonHomopolymerErrorCount = invalid<uint64_t>;
     
-    // The number of deletions in the raw alignment.
-    uint64_t deletionCount = invalid<uint64_t>;
+    // Total bases involved in indels (insertions + deletions).
+    uint64_t indelBaseCount = invalid<uint64_t>;
 
     // The number of gap events (indels).
     uint64_t gapEventCount = invalid<uint64_t>;
@@ -155,9 +153,7 @@ public:
         int64_t dpMatchScore,
         int64_t dpMismatchScore,
         int64_t dpGapOpen1,
-        int64_t dpGapExtend1,
-        int64_t dpGapOpen2,
-        int64_t dpGapExtend2);
+        int64_t dpGapExtend1);
 
     ProjectedAlignment(
         uint32_t k,
@@ -170,8 +166,6 @@ public:
         int64_t dpMismatchScore,
         int64_t dpGapOpen1,
         int64_t dpGapExtend1,
-        int64_t dpGapOpen2,
-        int64_t dpGapExtend2,
         OverlapCigarStore* cigarStore = nullptr);
 
     void constructAll();
@@ -184,16 +178,11 @@ public:
     uint32_t k;
     uint32_t kHalf;
 
-    // Scoring scheme for overlap DP score.
-    // Hifiasm's current overlap path uses single-affine scoring (gapo/gape).
-    // We keep the second gap parameter pair in the API for compatibility with
-    // existing option plumbing, but overlap DP scoring ignores it.
+    // Single-affine scoring for overlap DP score (matches hifiasm's gapo/gape).
     const int64_t dpMatchScore;
     const int64_t dpMismatchScore;
     const int64_t dpGapOpen1;
     const int64_t dpGapExtend1;
-    const int64_t dpGapOpen2;
-    const int64_t dpGapExtend2;
 
     // The two OrientedReadIds in this alignment.
     const array<OrientedReadId, 2>& orientedReadIds;
@@ -235,8 +224,8 @@ public:
     // Total errors excluding homopolymer-repeat-associated errors.
     uint64_t nonHomopolymerErrorCount;
     
-    // The number of deletions in the raw alignment.
-    uint64_t totalDeletionCount; // Total bases in deletions
+    // Total bases involved in indels (insertions + deletions).
+    uint64_t totalIndelBaseCount;
 
     // The number of gap events (indels) in the raw alignment.
     uint64_t totalGapEventCount;

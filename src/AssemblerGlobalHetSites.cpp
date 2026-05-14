@@ -771,9 +771,7 @@ Assembler::GlobalMismatchSiteClusters Assembler::clusterMismatchingPositionsInto
                 alignOptions.overlapDpMatchScore,
                 alignOptions.overlapDpMismatchScore,
                 alignOptions.overlapDpGapOpen1,
-                alignOptions.overlapDpGapExtend1,
-                alignOptions.overlapDpGapOpen2,
-                alignOptions.overlapDpGapExtend2
+                alignOptions.overlapDpGapExtend1
             );
 
             const ReadId r0 = ad.readIds[0];
