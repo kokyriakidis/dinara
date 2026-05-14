@@ -29,7 +29,7 @@
 using namespace dinara;
 using namespace std;
 
-void Assembler::computeAlignmentsWithEvidence(
+void Assembler::computeBaseAlignmentsAndStore(
     const AlignOptions& alignOptions,
     uint64_t threadCount
 ) {
@@ -96,7 +96,7 @@ void Assembler::computeAlignmentsWithEvidence(
     cout << timestamp << "Alignment computation begins (Unified Chaining & Evidence path)." << endl;
     
     setupLoadBalancing(candidateCount, batchSize);
-    runThreads(&Assembler::computeAlignmentsWithEvidenceThreadFunction, threadCount);
+    runThreads(&Assembler::computeBaseAlignmentsAndStoreThreadFunction, threadCount);
     
     performanceLog << timestamp << "Alignment computation completed." << endl;
     cout << timestamp << "Alignment computation completed." << endl;
@@ -382,7 +382,7 @@ void Assembler::computeAlignmentDataFromChainedCandidatesOnly(
 
 
 
-void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
+void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
     auto& data = computeAlignmentsData;
     const AlignOptions& alignOptions = *data.alignOptions;
     auto& threadAlignmentData = data.threadAlignmentData[threadId];
@@ -398,8 +398,6 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
     const int64_t dpMismatchScore = alignOptions.overlapDpMismatchScore;
     const int64_t dpGapOpen1 = alignOptions.overlapDpGapOpen1;
     const int64_t dpGapExtend1 = alignOptions.overlapDpGapExtend1;
-    const int64_t dpGapOpen2 = alignOptions.overlapDpGapOpen2;
-    const int64_t dpGapExtend2 = alignOptions.overlapDpGapExtend2;
     
     // Initialize compressed alignment storage for this thread.
     data.threadCompressedAlignments[threadId] = make_shared<MemoryMapped::VectorOfVectors<char, uint64_t>>();
@@ -458,8 +456,6 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
                 dpMismatchScore,
                 dpGapOpen1,
                 dpGapExtend1,
-                dpGapOpen2,
-                dpGapExtend2,
                 &cigarStore);
             if(collectProjectedTiming) {
                 data.threadProjectedAlignmentTime[threadId] += seconds(steady_clock::now() - tProjStart);
@@ -486,7 +482,7 @@ void Assembler::computeAlignmentsWithEvidenceThreadFunction(size_t threadId) {
             alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             const double projectedGapErrorRate = projectedAlignment.errorRateGaps();
             alignmentInfo.errorRateGaps = float(projectedGapErrorRate);
-            alignmentInfo.gapCount = uint32_t(projectedAlignment.totalDeletionCount);
+            alignmentInfo.gapCount = uint32_t(projectedAlignment.totalIndelBaseCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount);
             alignmentInfo.dpScore = projectedAlignment.totalDpScore;
 
@@ -1110,7 +1106,7 @@ void Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t)
  * ## Execution Context
  *
  * This function MUST run after:
- * 1. ✅ `computeAlignmentsWithEvidence()` - base-level alignment computed
+ * 1. ✅ `computeBaseAlignmentsAndStore()` - base-level alignment computed
  * 2. ✅ `performHifiasmECParity()` - phasing marks cis/trans (DeleteReasonPhase)
  * 3. ✅ Before final alignment filtering - allows best overlap to survive
  *
