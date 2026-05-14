@@ -209,6 +209,13 @@ public:
     // Additional knobs for the InvertedIndex chaining path (defaults match hifiasm behavior).
     // These exist so we can more easily match hifiasm/minimap2 behavior when needed.
 
+    // --- Marker frequency hard cutoff (hifiasm htab.cpp max_kmer_cnt) ---
+    // K-mers occurring more than this many times are excluded entirely from
+    // the marker set. Hifiasm default: 2000 (CommandLines.cpp:270).
+    // K-mers between 5*coveragePeak and this threshold are kept but subject
+    // to per-streak downsampling during chaining.
+    uint32_t invertedIndexMaxKmerCount = 2000;
+
     // --- Marker frequency-based weighting (hifiasm anchor.cpp) ---
     double invertedIndexWeightExponent = 1.1;                // Exponent for frequency-based weight LUT: weight = pow(count, exponent)
     double invertedIndexLowFreqMultiplier = 0.333;           // Hifiasm HA_KMER_GOOD_RATIO: low_occ = hom_cov * 0.333
@@ -232,9 +239,9 @@ public:
     // If hifiasm's r484 were active, it would use 0.95 threshold.
     double invertedIndexNonRedundantOverlapFraction = 1.0;   // Disabled (was 0.5) - matches hifiasm r484 commented-out state
 
-	    // --- Chaining parameters (hifiasm lchain) ---
-	    bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
-	    bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring
+    // --- Chaining parameters (hifiasm lchain) ---
+    bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
+    bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring
 
     // --- Multi-peak chain extraction (hifiasm mcopy) ---
     bool invertedIndexEnableMcopyFast = true;                // Enable mcopy_fast: extract multiple score-competitive chains
