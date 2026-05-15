@@ -1,7 +1,6 @@
 DINARA_PHASING_DEBUG_READ=695 \
 /home/kokyriakidis/Downloads/dinara-build/Executable/dinara \
 --input /home/kokyriakidis/Downloads/GIAB_HG002_TESTS/PAW70337.chr1_35_45Mb_subregion.fasta \
---config Nanopore-r10.4.1_e8.2-400bps_sup-Herro-Jan2025 \
 --Reads.minReadLength 1000 \
 --threads 20 \
 --Kmers.k 50 \
