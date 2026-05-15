@@ -62,6 +62,65 @@ void Assembler::createReadGraphFromEcParityCisOverlaps(
     cout << timestamp << "createReadGraphFromEcParityCisOverlaps completed." << endl;
 }
 
+void Assembler::createReadGraphFromPhasingCisOverlaps()
+{
+    createReadGraphFromPhasingCisOverlaps(
+        std::thread::hardware_concurrency(),
+        /*rebuildDirectedReadGraph*/ false);
+}
+
+void Assembler::createReadGraphFromPhasingCisOverlaps(
+    uint64_t /*threadCount*/,
+    bool rebuildDirectedReadGraph)
+{
+    cout << timestamp << "createReadGraphFromPhasingCisOverlaps begins." << endl;
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+
+    vector<uint8_t> keepAlignmentByte(alignmentCount, 0);
+    uint64_t keptCount = 0;
+    uint64_t filteredTrans = 0;
+    uint64_t unlabeledCount = 0;
+
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(+:keptCount, filteredTrans, unlabeledCount)
+#endif
+    for(uint64_t i = 0; i < alignmentCount; i++) {
+        const AlignmentData& ad = alignmentData[i];
+        // hifiasmEcMatchState: 0=unlabeled, 1=CIS, 2=TRANS
+        // Keep if neither side is TRANS.
+        // Unlabeled (0) overlaps are kept — no phasing evidence means
+        // we can't reject them.
+        const bool trans0 = (ad.hifiasmEcMatchState0 == 2);
+        const bool trans1 = (ad.hifiasmEcMatchState1 == 2);
+        if(trans0 || trans1) {
+            keepAlignmentByte[i] = 0;
+            ++filteredTrans;
+        } else {
+            keepAlignmentByte[i] = 1;
+            ++keptCount;
+            if(ad.hifiasmEcMatchState0 == 0 || ad.hifiasmEcMatchState1 == 0) {
+                ++unlabeledCount;
+            }
+        }
+    }
+
+    cout << timestamp << "Kept " << keptCount << " / " << alignmentCount
+         << " alignments (filtered " << filteredTrans << " trans)." << endl;
+    cout << timestamp << "Of kept: " << unlabeledCount
+         << " have at least one unlabeled side." << endl;
+
+    vector<bool> keepAlignment(alignmentCount, false);
+    for(uint64_t i = 0; i < alignmentCount; ++i) {
+        keepAlignment[i] = (keepAlignmentByte[i] != 0);
+    }
+
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+
+    cout << timestamp << "createReadGraphFromPhasingCisOverlaps completed." << endl;
+}
+
 void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites()
 {
     createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(

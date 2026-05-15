@@ -1778,6 +1778,12 @@ private:
     void createReadGraphFromEcParityCisOverlaps();
     void createReadGraphFromEcParityCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
 
+    // Read graph from phaseOverlaps labels (hifiasmEcMatchState).
+    // Keeps overlaps where neither side is TRANS (state 2).
+    // Unlabeled overlaps (state 0) are kept.
+    void createReadGraphFromPhasingCisOverlaps();
+    void createReadGraphFromPhasingCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
+
     // Like createReadGraphFromEcParityCisOverlaps, but only keep cis overlaps that
     // cover at least one informative site (as recorded by AlignmentData::coversHetSite()
     // / informativeHetSiteCount{0,1} during performHifiasmECParity).
