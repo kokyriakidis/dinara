@@ -1030,7 +1030,13 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+    // For http server and debugging/development purposes, generate an exhaustive table of candidates.
+    // This can be done after alignment computation (it depends only on the candidate list).
+    assembler.computeCandidateTable();
+
     assembler.phaseOverlaps(threadCount);
+
+    assembler.createReadGraphFromPhasingCisOverlaps();
 
     return;
     
@@ -1046,9 +1052,7 @@ void dinara::main::assemble(
     // // // Delete internal overlaps (excessive overhangs or too short).
     // // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
 
-    // // For http server and debugging/development purposes, generate an exhaustive table of candidates.
-    // // This can be done after alignment computation (it depends only on the candidate list).
-    // assembler.computeCandidateTable();
+    
 
     // assembler.debugDumpSnpSitesForRead(0, 3);
     // return;
