@@ -243,33 +243,53 @@ for alt G" at the same position, matching hifiasm's `overlapSite` field.
 
 Port of hifiasm's adjacent-site filter (Correct.cpp:8855).
 
+Adjacent mismatches (positions p and p+1) are typically alignment artifacts
+— an indel that the aligner represents as two consecutive substitutions —
+rather than real heterozygous variants. Keeping them would add noise to
+the phasing DP and labeling. When a position is removed, ALL its
+PhasingSite entries are removed (multi-alt: if position p has sites for
+alt C and alt G, both are removed).
+
+Three arrays must stay consistent after removal: `sites[]` (compacted,
+indices shift down), `evidence[]` (entries for removed sites dropped),
+and `ev.siteIdx` (remapped from old to new site indices).
+
 ```
-group sites by position
-for each pair of adjacent position-groups:
-    if group[i].position + 1 == group[i+1].position:
+// 1. Identify adjacent positions
+group sites by position (multi-alt entries at same position are contiguous)
+for each pair of consecutive position-groups:
+    if group[i+1].position == group[i].position + 1:
         mark ALL sites in both groups for removal
-        (multi-alt: if position p has sites for alt C and alt G,
-         and position p+1 has a site, all three are removed)
 
-build oldToNew[i] index mapping (UINT32_MAX for removed sites)
-compact sites array, removing marked entries
+// 2. Build old-to-new site index mapping
+for each site i:
+    if not removed: oldToNew[i] = next new index
+    else:           oldToNew[i] = UINT32_MAX
 
-compact evidence array:
-    for each evidence entry:
-        if oldToNew[ev.siteIdx] == UINT32_MAX: drop (site was removed)
-        else: ev.siteIdx = oldToNew[ev.siteIdx]  // remap to new index
+// 3. Compact sites array
+keep only non-removed sites, shifting down to fill gaps
 
-rebuild evidenceBegin/evidenceEnd on surviving sites
-    (walk sites and evidence in tandem, both sorted by position)
+// 4. Compact evidence array and remap siteIdx
+for each evidence entry:
+    if oldToNew[ev.siteIdx] == UINT32_MAX:
+        drop entry (its site was removed)
+    else:
+        ev.siteIdx = oldToNew[ev.siteIdx]   // remap to new index
+        keep entry
+
+// 5. Rebuild evidenceBegin/evidenceEnd on surviving sites
+walk sites and evidence in tandem (both sorted by position)
+for each position with surviving sites:
+    find evidence range [begin, end) for this position
+    set evidenceBegin/evidenceEnd on ALL sites at this position
+    (multi-alt sites at same position share the same evidence range)
 ```
 
-Hifiasm (Correct.cpp:8855) compacts both `snp_stat` and evidence arrays,
-rewriting `overlapSite -= m_off` where `m_off` is the number of removed
+Hifiasm (Correct.cpp:8855) does the same compaction: it compacts
+`snp_stat[]` and the evidence `list[]`, rewriting
+`overlapSite -= m_off` where `m_off` is the cumulative count of removed
 entries before each surviving group. Our approach uses an explicit
-`oldToNew` mapping instead, which is equivalent.
-
-Prevents alignment artifacts (indels manifesting as adjacent mismatches)
-from being treated as het sites.
+`oldToNew[]` mapping instead, which is equivalent.
 
 ### 5. runDpPhasing
 
