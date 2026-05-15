@@ -18,6 +18,7 @@
 #include "mode3-AnchorGraph.hpp"
 #include "mode3-AnchorGraphSuperbubbles.hpp"
 #include "Shasta2Anchors.hpp"
+#include "Shasta2AnchorsFromSplitVertices.hpp"
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AssemblyGraph.hpp"
@@ -1040,13 +1041,13 @@ void dinara::main::assemble(
     
 
     // Set min and max marker graph vertex coverage thresholds.
-    const uint64_t minVertexCoverage = 8;
-    const uint64_t maxVertexCoverage = 5 * coveragePeak;
+    const uint64_t minAnchorCoverage = 8;
+    const uint64_t maxAnchorCoverage = 5 * coveragePeak;
 
-    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
+    // Build marker graph vertices using transitive alignments collapse.
     assembler.createMarkerGraphVertices(
-        minVertexCoverage,                                              // minVertexCoverage
-        maxVertexCoverage,                                              // maxVertexCoverage
+        minAnchorCoverage,                                              // minVertexCoverage
+        maxAnchorCoverage,                                              // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
@@ -1066,27 +1067,27 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    const uint64_t minPrimaryCoverage = 2;
-    const uint64_t maxPrimaryCoverage = 5 * coveragePeak;
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
-    cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
-        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+    cout << "Using: minAnchorCoverage = " << minAnchorCoverage <<
+        ", maxAnchorCoverage = " << maxAnchorCoverage << endl;
 
 
     const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
     
-    // Create Shasta2Anchors
-    // We use the markerGraph structure to define anchors.
-    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
+    // Create Shasta2Anchors with vertex splitting.
+    // Splits marker graph vertices whose reads were merged by transitive
+    // closure but lack direct pairwise overlaps in the read graph.
+    assembler.shasta2Anchors = createShasta2AnchorsFromSplitVertices(
             shasta2Owner,
             assembler.getReads(),
             assembler.assemblerInfo->k,
             *assembler.markers,
             assembler.markerGraph,
+            assembler.readGraph,
             threadCount,
-            minPrimaryCoverage,
-            maxPrimaryCoverage);
+            minAnchorCoverage,
+            maxAnchorCoverage);
     auto& shasta2Anchors = assembler.shasta2Anchors;
 
     // double kmerDensity = 1.0;
@@ -1114,6 +1115,21 @@ void dinara::main::assemble(
         threadCount,
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
+
+    // Create the Shasta2AnchorGraph.
+    const uint64_t minEdgeCoverage = 2;
+    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
+    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        minEdgeCoverage,
+        threadCount);
+    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
+
+    // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
+    // can load and visualize it even when we return before later assembly stages.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
     return;
 
@@ -1772,6 +1788,7 @@ void dinara::main::assemble(
             assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
     }
 
+    {
     const uint64_t minPrimaryCoverage = 2;
     const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
@@ -1937,6 +1954,7 @@ void dinara::main::assemble(
 
 
     return;
+    } // end of second assembly path block scope
 
 
 

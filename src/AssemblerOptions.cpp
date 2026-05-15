@@ -291,8 +291,8 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Reads.representation",
         value<uint64_t>(&readsOptions.representation)->
-        default_value(1),
-        "Read representation: 0 = raw sequence, 1 (default) = Run-Length Encoded (RLE) sequence. "
+        default_value(0),
+        "Read representation: 0 (default) = raw sequence, 1 = Run-Length Encoded (RLE) sequence. "
         "Experimental. Do not use.")
 
         ("Reads.minReadLength",
