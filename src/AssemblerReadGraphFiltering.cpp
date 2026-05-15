@@ -1387,8 +1387,9 @@ void Assembler::rescueChimericReadsThreadFunction(size_t threadId)
                 
                 if (isChimericRead[neighborId]) continue;
                 
-                bool isValid = (ad.cisTransStatus == CisTransStatus::Cis);
-                if (ad.cisTransStatus == CisTransStatus::Unknown && ad.info.isInReadGraph) {
+                const CisTransStatus cts = ad.getCisTransStatusFromReadPerspective(readId);
+                bool isValid = (cts == CisTransStatus::Cis);
+                if (cts == CisTransStatus::Unknown && ad.info.isInReadGraph) {
                     isValid = true;
                 }
                 
@@ -1450,8 +1451,9 @@ void Assembler::rescueChimericReadsThreadFunction(size_t threadId)
                         }
                         if (isChimericRead[neighborId]) continue;
                         
-                        bool isValidType = (ad.cisTransStatus == CisTransStatus::Cis);
-                        if (ad.cisTransStatus == CisTransStatus::Unknown && ad.info.isInReadGraph) isValidType = true;
+                        const CisTransStatus cts = ad.getCisTransStatusFromReadPerspective(readId);
+                        bool isValidType = (cts == CisTransStatus::Cis);
+                        if (cts == CisTransStatus::Unknown && ad.info.isInReadGraph) isValidType = true;
                         
                         bool keep = false;
                         if (isValidType) {

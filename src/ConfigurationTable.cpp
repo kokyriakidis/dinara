@@ -1747,7 +1747,7 @@ mode3.assemblyGraph.minLogP = 10
 
 [Reads]
 representation = 0
-minReadLength = 10000
+minReadLength = 1000
 noCache = True
 palindromicReads.deltaThreshold = 300
 
@@ -1764,8 +1764,8 @@ minFrequency = 5
 [Align]
 alignMethod = 5
 sameChannelReadAlignment.suppressDeltaThreshold = 30
-minAlignedMarkerCount = 500
-minAlignedFraction = 0.98
+minAlignedMarkerCount = 2
+minAlignedFraction = 0
 maxSkip = 50
 maxDrift = 50
 maxTrim = 50
