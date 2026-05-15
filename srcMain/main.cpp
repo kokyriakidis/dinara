@@ -1116,6 +1116,21 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
+    // Create the Shasta2AnchorGraph.
+    const uint64_t minEdgeCoverage = 2;
+    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
+    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        minEdgeCoverage,
+        threadCount);
+    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
+
+    // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
+    // can load and visualize it even when we return before later assembly stages.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+
     return;
 
 
