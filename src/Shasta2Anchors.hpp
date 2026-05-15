@@ -112,8 +112,18 @@ public:
         const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
         const MarkerGraph& markerGraph,
         uint64_t threadCount,
-        uint64_t minAnchorCoverage = 0,
-        uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max());
+        uint64_t minAnchorCoverage,
+        uint64_t maxAnchorCoverage);
+
+    // Minimal constructor: initializes members and builds MarkerKmers only.
+    // Does not build anchorMarkerInfos. Caller is responsible for populating them.
+    Shasta2Anchors(
+        const MappedMemoryOwner&,
+        const Reads& reads,
+        uint64_t k,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        const MarkerGraph& markerGraph,
+        uint64_t threadCount);
 
     // Access existing.
     Shasta2Anchors(
