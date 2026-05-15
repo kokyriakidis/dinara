@@ -26,6 +26,7 @@ phaseOverlaps(threadCount)          ← entry point (AssemblerPhasing.cpp)
         ├── 4b. filterAdjacentSites    — remove sites at positions p and p+1
         ├── 5. runDpPhasing            — O(n²) longest compatible chain
         │       ├── pre-DP: exclude strand-biased sites (is_st_bs)
+        │       ├── fill_incom: add synthetic match evidence at gap positions
         │       ├── checkCompatibility: fi/fj classification via ev.siteIdx
         │       ├── isHpcDependent: reject single-site chains needing HPC evidence
         │       └── per-site matchCount >= cc check within multi-site chains
@@ -322,7 +323,56 @@ for each site i:
 Excluded sites do not participate in the DP at all — they cannot be
 chain endpoints, chain members, or affect `checkCompatibility` calls.
 
-#### 5b. checkCompatibility (comput_sc_rphase)
+#### 5b. Incomplete evidence filling (fill_incom)
+
+Port of hifiasm's `fill_incom` (Correct.cpp:9597, called at 9749).
+
+If an overlap has evidence at site positions A and C but not at
+intermediate position B, it likely matches the query at B. This step
+adds synthetic match entries for those gaps, then recounts
+`matchCount`, `fwdStrandCount`, and `altCount` from the expanded
+evidence.
+
+```
+// Collect positions of non-excluded sites (deduplicated, sorted)
+activeSitePositions = unique sorted positions of non-excluded sites
+
+// Per-overlap: track last seen position index
+lastPosIdx[oi] = UINT32_MAX for all overlaps
+
+// Walk evidence (sorted by site position)
+for each evidence entry ev:
+    if ev.site not in activeSitePositions: skip
+    curPosIdx = index of ev.site in activeSitePositions
+    oi = ev.overlapIdx
+
+    if lastPosIdx[oi] == UINT32_MAX:
+        lastPosIdx[oi] = curPosIdx          // first time
+    else if curPosIdx > lastPosIdx[oi] + 1:
+        // Gap: add match entries for intermediate positions
+        for pi = lastPosIdx[oi]+1 to curPosIdx-1:
+            add synthetic match entry (oi, activeSitePositions[pi])
+        lastPosIdx[oi] = curPosIdx
+    else:
+        lastPosIdx[oi] = curPosIdx
+
+// Append synthetic entries, re-sort evidence, rebuild evidenceBegin/End
+// Assign siteIdx = lastSiteIdx at each position (same as buildSnpMatrix)
+
+// Recount from expanded evidence (hifiasm recounts occ_0/occ_1/overlap_num)
+for each site i:
+    matchCount = (count of isAlt==0 in evidence range) + 1
+    fwdStrandCount = (count of forward-strand matches) + 1
+    altCount = (count of isAlt==1 where siteIdx==i)
+    labelMatchCount = matchCount
+    labelFwdStrandCount = fwdStrandCount
+
+// Re-evaluate strand bias with updated counts
+for each site i:
+    dpExcluded[i] = isStrandBiased(site[i])
+```
+
+#### 5c. checkCompatibility (comput_sc_rphase)
 
 Tests whether two sites i and j are on the same haplotype block by
 checking if overlaps covering both show consistent allele assignments.
@@ -355,7 +405,7 @@ checkCompatibility(siteI, siteJ):
     return nn[0] > 0 and nn[1] > 0     // need evidence from both haplotypes
 ```
 
-#### 5c. DP and chain extraction
+#### 5d. DP and chain extraction
 
 ```
 cc = max(6, coveragePeak / 2 * 0.7)    // hifiasm: max(cut_bd, hom_cov/n_hap * cut_rate)
@@ -385,10 +435,10 @@ for each site in sorted order:
 sort chains by length desc
 ```
 
-#### 5d. Chain confirmation
+#### 5e. Chain confirmation
 
 ```
-for each chain (longest first, up to 15 chains):
+for each chain (longest first):
     if chainLength > 1:
         plus = 1                        // multi-site → confirmed
     else:
@@ -406,7 +456,7 @@ for each chain (longest first, up to 15 chains):
             dpChainId stays -1          // rejected even in confirmed chain
 ```
 
-#### 5e. isHpcDependent (is_hpc_vec)
+#### 5f. isHpcDependent (is_hpc_vec)
 
 ```
 isHpcDependent(siteIdx):
@@ -725,7 +775,7 @@ memory reused). Bounded by `threadCount > readCount` check.
 | `filterAdjacentSites` | adjacent-site filter | Correct.cpp:8855 |
 | `checkCompatibility` | `comput_sc_rphase` | Correct.cpp:9244 |
 | `isHpcDependent` | `is_hpc_vec` | Correct.cpp:9383 |
-| `runDpPhasing` | `gen_rphase_dp` + `gen_rphase_dp0_single_path` | Correct.cpp:9648, 9428 |
+| `runDpPhasing` | `gen_rphase_dp` + `fill_incom` + `gen_rphase_dp0_single_path` | Correct.cpp:9648, 9597, 9428 |
 | `labelCisTrans` | `generate_haplotypes_naive_HiFi` | Correct.cpp:8845 |
 | `phaseLargeIndels` | `rphase_lidel` + `rphase_lidel_cc` | Correct.cpp:20155 |
 | `dedupChains` | `dedup_chains` | ecovlp.cpp:2984 |
