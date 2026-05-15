@@ -1037,8 +1037,98 @@ void dinara::main::assemble(
     assembler.phaseOverlaps(threadCount);
 
     assembler.createReadGraphFromPhasingCisOverlaps();
+    
+
+    // Set min and max marker graph vertex coverage thresholds.
+    const uint64_t minVertexCoverage = 8;
+    const uint64_t maxVertexCoverage = 5 * coveragePeak;
+
+    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
+    assembler.createMarkerGraphVertices(
+        minVertexCoverage,                                              // minVertexCoverage
+        maxVertexCoverage,                                              // maxVertexCoverage
+        0,                                              // minVertexCoveragePerStrand
+        false,                                          // allowDuplicateMarkers
+        std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
+        invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
+        threadCount);
+    
+    // // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
+    // // This reduces unreliable anchors and artifacts in repetitive regions.
+    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+
+    // // Filter marker graph vertices whose marker k-mers have low sequence complexity
+    // // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
+    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+
+    // Find the reverse complement of each marker graph vertex.
+    // We need the reverse complement vertices to be populated for anchor generation.
+    assembler.findMarkerGraphReverseComplementVertices(threadCount);
+
+
+    const uint64_t minPrimaryCoverage = 2;
+    const uint64_t maxPrimaryCoverage = 5 * coveragePeak;
+    // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
+    // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
+    cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
+        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
+
+
+    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
+    
+    // Create Shasta2Anchors
+    // We use the markerGraph structure to define anchors.
+    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
+            shasta2Owner,
+            assembler.getReads(),
+            assembler.assemblerInfo->k,
+            *assembler.markers,
+            assembler.markerGraph,
+            threadCount,
+            minPrimaryCoverage,
+            maxPrimaryCoverage);
+    auto& shasta2Anchors = assembler.shasta2Anchors;
+
+    // double kmerDensity = 1.0;
+    // cout << timestamp << "Filtering Shasta2Anchors with Shasta2 hashed k-mer checker..." << endl;
+    // // shasta2Anchors->filterByShasta2HashedKmerChecker(
+    // //     assemblerOptions.kmersOptions.probability);
+    // shasta2Anchors->filterByShasta2HashedKmerChecker(
+    //     kmerDensity);
+
+    const string externalAnchorsName =
+        std::filesystem::absolute("Shasta2ExternalAnchors").string();
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
+
+    // Compute journeys.
+    cout << timestamp << "Creating Shasta2Journeys..." << endl;
+    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
+        2 * assembler.getReads().readCount(),
+        shasta2Anchors,
+        threadCount,
+        shasta2Owner);
+    auto& shasta2Journeys = assembler.shasta2Journeys;
 
     return;
+
+
+
+
+
+
+
+
+
+
+
+
+
     
 
     // The marker graph vertex builder iterates readGraph edges. For this
