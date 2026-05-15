@@ -22,9 +22,10 @@
 #include "Reads.hpp"
 #include <algorithm>
 #include <array>
-
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <vector>
 #include <thread>
@@ -2166,6 +2167,31 @@ private:
                     hifiasmOverlapRegions.clear();
                     hifiasmChainHitIndexFlat.clear();
 
+                    // Optional debug: set DINARA_OVERLAP_DEBUG_READ to trace
+                    // candidate discovery for a specific read.
+                    // Parsed once per thread on first use.
+                    static thread_local ReadId overlapDebugReadA = []() -> ReadId {
+                        const char* s = std::getenv("DINARA_OVERLAP_DEBUG_READ");
+                        if (s && *s) {
+                            char* end = nullptr;
+                            const unsigned long v = std::strtoul(s, &end, 10);
+                            if (end && end != s && *end == 0
+                                && v <= std::numeric_limits<uint32_t>::max()) {
+                                return ReadId(uint32_t(v));
+                            }
+                        }
+                        return invalidReadId;
+                    }();
+                    const bool isOverlapDebugRead =
+                        (overlapDebugReadA != invalidReadId && readIdA == overlapDebugReadA);
+
+                    static std::mutex overlapDebugMutex;
+                    if (isOverlapDebugRead) {
+                        std::lock_guard<std::mutex> lock(overlapDebugMutex);
+                        cout << timestamp << "[OVERLAP-DBG] read=" << readIdA
+                             << " flatHits=" << scratch.flatHits.size() << endl;
+                    }
+
                     // Iterate per partner readIdB (flatHits are sorted by (readIdB, posA)).
                     size_t hitIter = 0;
                     while(hitIter < scratch.flatHits.size()) {
@@ -2199,6 +2225,14 @@ private:
                         const bool keepRev0 = (revCount[0] >= size_t(hifiasmChainCutoff));
                         const bool keepRev1 = (revCount[1] >= size_t(hifiasmChainCutoff));
                         if(!keepRev0 && !keepRev1) {
+                            if (isOverlapDebugRead) {
+                                std::lock_guard<std::mutex> lock(overlapDebugMutex);
+                                cout << timestamp << "[OVERLAP-DBG]   partner=" << readIdB
+                                     << " hits=" << numHits
+                                     << " fwd=" << revCount[0]
+                                     << " rev=" << revCount[1]
+                                     << " -> REJECTED (chain_cutoff)" << endl;
+                            }
                             continue;
                         }
 
@@ -2294,6 +2328,12 @@ private:
                             int64_t(mcopyKhitCutoff));
                     }
 
+                    if (isOverlapDebugRead) {
+                        std::lock_guard<std::mutex> lock(overlapDebugMutex);
+                        cout << timestamp << "[OVERLAP-DBG] pre-postfilter chains="
+                             << hifiasmOverlapRegions.size() << endl;
+                    }
+
                     // Strict hifiasm max_n_chain + ocv_w rescue + r485 suppression.
                     // Note: In hifiasm ONT EC (`ecovlp.cpp:3274`), `chain_cutoff` is passed as a constant 2.
                     // This cutoff controls when the r485 weak-overlap suppression block is enabled
@@ -2308,6 +2348,19 @@ private:
                         readLenA32,
                         hifiasmChainHitIndexFlat,
                         hifiasmAllHits);
+
+                    if (isOverlapDebugRead) {
+                        std::lock_guard<std::mutex> lock(overlapDebugMutex);
+                        cout << timestamp << "[OVERLAP-DBG] post-postfilter chains="
+                             << hifiasmOverlapRegions.size() << endl;
+                        for (const auto& r : hifiasmOverlapRegions) {
+                            cout << timestamp << "[OVERLAP-DBG]   chain partner="
+                                 << r.y_id
+                                 << " strand=" << int(r.y_pos_strand)
+                                 << " qSpan=" << (r.x_pos_e - r.x_pos_s)
+                                 << " anchors=" << r.align_length << endl;
+                        }
+                    }
 
                     // Convert surviving overlaps to Dinara candidates/alignments.
                     for(const auto& r : hifiasmOverlapRegions) {
