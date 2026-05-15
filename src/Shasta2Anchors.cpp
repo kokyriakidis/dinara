@@ -93,6 +93,32 @@ dinara::Shasta2AnchorId dinara::shasta2AnchorIdFromString(const string& s)
 }
 
 
+// Minimal constructor: initializes members and builds MarkerKmers only.
+Shasta2Anchors::Shasta2Anchors(
+    const MappedMemoryOwner& mappedMemoryOwner,
+    const Reads& reads,
+    uint64_t k,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    const MarkerGraph& markerGraph,
+    uint64_t threadCount) :
+    MultithreadedObject<Shasta2Anchors>(*this),
+    MappedMemoryOwner(mappedMemoryOwner),
+    reads(reads),
+    k(k),
+    kHalf(k/2),
+    markers(markers),
+    markerGraph(markerGraph)
+{
+    cout << "Computing Shasta2 MarkerKmers..." << endl;
+    markerKmers = make_shared<MarkerKmers>(
+        k,
+        *this,
+        reads,
+        markers,
+        threadCount);
+}
+
+
 Shasta2Anchors::Shasta2Anchors(
     const MappedMemoryOwner& mappedMemoryOwner,
     const Reads& reads,
