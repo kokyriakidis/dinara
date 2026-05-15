@@ -1006,7 +1006,7 @@ public:
     }
     
     void computeAlignments(const AlignOptions& options, uint64_t threadCount = 1) {
-        withSilencedIoInDir(testDir, [&] { assembler->computeAlignmentsWithEvidence(options, threadCount); });
+        withSilencedIoInDir(testDir, [&] { assembler->computeBaseAlignmentsAndStore(options, threadCount); });
     }
 
     void computeAlignments() {
@@ -1476,7 +1476,7 @@ TEST_CASE("Integration: Projected alignment and evidence storage", "[integration
     CHECK(s1_03[0].second == expectedT03);
 }
 
-TEST_CASE("Integration: computeAlignmentsWithEvidence is deterministic across thread counts",
+TEST_CASE("Integration: computeBaseAlignmentsAndStore is deterministic across thread counts",
     "[integration][evidence][determinism][threads]")
 {
     const std::string base = randomSequence(2600, 7001);
@@ -1533,7 +1533,7 @@ TEST_CASE("Integration: computeAlignmentsWithEvidence is deterministic across th
     CHECK(oneThread.fingerprints == twoThreads.fingerprints);
 }
 
-TEST_CASE("Integration: computeAlignmentsWithEvidence maxErrorRate keeps == threshold and rejects below",
+TEST_CASE("Integration: computeBaseAlignmentsAndStore maxErrorRate keeps == threshold and rejects below",
     "[integration][evidence][boundary][error-rate]")
 {
     const std::string base = randomSequence(2400, 7101);
@@ -1582,9 +1582,7 @@ TEST_CASE("Integration: computeAlignmentsWithEvidence maxErrorRate keeps == thre
             options.overlapDpMatchScore,
             options.overlapDpMismatchScore,
             options.overlapDpGapOpen1,
-            options.overlapDpGapExtend1,
-            options.overlapDpGapOpen2,
-            options.overlapDpGapExtend2);
+            options.overlapDpGapExtend1);
         return projectedAlignment.errorRate();
     };
 
@@ -1626,7 +1624,7 @@ TEST_CASE("Integration: computeAlignmentsWithEvidence maxErrorRate keeps == thre
     CHECK(keptBelow == 0);
 }
 
-TEST_CASE("Integration: computeAlignmentsWithEvidence minAlignedMarkerCount uses >= boundary semantics",
+TEST_CASE("Integration: computeBaseAlignmentsAndStore minAlignedMarkerCount uses >= boundary semantics",
     "[integration][evidence][boundary][marker-count]")
 {
     const std::string base = randomSequence(2500, 7201);
@@ -1688,7 +1686,7 @@ TEST_CASE("Integration: computeAlignmentsWithEvidence minAlignedMarkerCount uses
     CHECK(keptAbove == 0);
 }
 
-TEST_CASE("Integration: randomized evidence invariants hold for computeAlignmentsWithEvidence",
+TEST_CASE("Integration: randomized evidence invariants hold for computeBaseAlignmentsAndStore",
     "[integration][evidence][fuzz][robustness]")
 {
     const size_t roundCount = 8;
@@ -1889,7 +1887,7 @@ TEST_CASE("Integration: transitive global het site clustering", "[integration][e
     options.overlapDpGapOpen2 = 24;
     options.overlapDpGapExtend2 = 1;
 
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeBaseAlignmentsAndStore(options, 1); });
 
     const auto clusters = fixture.assembler->clusterMismatchingPositionsIntoGlobalHetSites(options, 1);
 
@@ -1992,7 +1990,7 @@ TEST_CASE("Integration: read-reachable global het clustering excludes disconnect
     options.overlapDpGapOpen2 = 24;
     options.overlapDpGapExtend2 = 1;
 
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeBaseAlignmentsAndStore(options, 1); });
 
     for (auto& ad : fixture.assembler->alignmentData) {
         ad.info.isInReadGraph = 1;
@@ -2136,7 +2134,7 @@ TEST_CASE("Integration: readGraph global het propagation keeps reverse indel-shi
     options.overlapDpGapOpen2 = 24;
     options.overlapDpGapExtend2 = 1;
 
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeBaseAlignmentsAndStore(options, 1); });
 
     // Use all computed overlaps as read-graph edges for this focused test.
     for (auto& ad : fixture.assembler->alignmentData) {
@@ -2302,7 +2300,7 @@ TEST_CASE("Integration: readGraph global het propagation drops members with gap 
     options.overlapDpGapOpen2 = 24;
     options.overlapDpGapExtend2 = 1;
 
-    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeAlignmentsWithEvidence(options, 1); });
+    withSilencedIoInDir(fixture.testDir, [&] { fixture.assembler->computeBaseAlignmentsAndStore(options, 1); });
 
     const AlignmentData* gapAd = nullptr;
     for (const auto& ad : fixture.assembler->alignmentData) {

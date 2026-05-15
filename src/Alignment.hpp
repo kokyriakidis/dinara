@@ -257,6 +257,8 @@ public:
     uint32_t cigarOffset     = uint32_t(-1);
     uint32_t cigarTokenCount = uint32_t(-1);
 
+
+
     void clearFlags()
     {
         isInReadGraph = 0;
@@ -557,9 +559,6 @@ public:
     // The AlignmentInfo computed with the first read on strand 0.
     AlignmentInfo info;
 
-    // Classification of the overlap
-    CisTransStatus cisTransStatus = CisTransStatus::Unknown;
-
     // Flags
     // Number of informative het/SV sites (in query coordinates) covered by this overlap,
     // as computed by performHifiasmECParity, stored separately for each read perspective.
@@ -610,6 +609,16 @@ public:
         } else {
             return 1;
         }
+    }
+
+    // Per-read-perspective cis/trans status.
+    // Maps hifiasmEcMatchState (0=unclassified, 1=cis, 2=trans) to CisTransStatus.
+    CisTransStatus getCisTransStatusFromReadPerspective(ReadId queryReadId) const
+    {
+        const uint8_t state = getHifiasmEcMatchStateFromReadPerspective(queryReadId);
+        if(state == 2) return CisTransStatus::Trans;
+        if(state == 1) return CisTransStatus::Cis;
+        return CisTransStatus::Unknown;
     }
     void setHifiasmEcMatchStateFromReadPerspective(ReadId queryReadId, uint8_t state)
     {
@@ -677,11 +686,15 @@ public:
     
     bool hasLargeIndel = false;
 
-    // Explicit Coordinates (likely in bases, derived from markers or passed from PAF)
-    uint32_t qs = 0; // Query Start
-    uint32_t qe = 0; // Query End
-    uint32_t ts = 0; // Target Start
-    uint32_t te = 0; // Target End
+    // Alignment boundary coordinates (marker-based, forward-strand).
+    // These match the CIGAR's coordinate range (first to last marker pair).
+    // For RC overlaps, ts/te are forward-converted from oriented coordinates.
+    // To recover oriented (RC) read1Start for CIGAR walking:
+    //   oriented_start = targetLen - te
+    uint32_t qs = 0; // Query Start (forward)
+    uint32_t qe = 0; // Query End (forward)
+    uint32_t ts = 0; // Target Start (forward)
+    uint32_t te = 0; // Target End (forward)
 
     AlignmentData() {}
     AlignmentData(
