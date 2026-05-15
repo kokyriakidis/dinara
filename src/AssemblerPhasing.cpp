@@ -597,9 +597,25 @@ static void buildSnpMatrix(
 // filterAdjacentSites: remove SNP sites at adjacent positions
 //
 // Port of hifiasm's adjacent-site filter (Correct.cpp:8855).
-// If sites exist at positions p and p+1, BOTH are removed.
-// This prevents alignment artifacts (e.g., indels manifesting as
-// adjacent mismatches) from being treated as het sites.
+//
+// Removes SNP sites at adjacent positions (p and p+1). Adjacent
+// mismatches are typically alignment artifacts — an indel that the
+// aligner represents as two consecutive substitutions — rather than
+// real heterozygous variants. Keeping them would add noise to the
+// phasing DP and labeling.
+//
+// With multi-alt sites, a single position can have multiple PhasingSite
+// entries (one per qualifying alt base). When a position is removed,
+// ALL its PhasingSite entries are removed.
+//
+// Three arrays must stay consistent:
+//   sites[]    — compacted, indices shift down
+//   evidence[] — entries for removed sites are dropped
+//   ev.siteIdx — remapped from old site indices to new ones
+//
+// Hifiasm does the same compaction (Correct.cpp:8855): it compacts
+// snp_stat[], compacts the evidence list[], and rewrites
+// overlapSite -= m_off for each surviving evidence entry.
 // ============================================================================
 
 static void filterAdjacentSites(
@@ -607,15 +623,16 @@ static void filterAdjacentSites(
 {
     if (scratch.sites.size() < 2) return;
 
-    // Sites are sorted by position. With multi-alt, multiple entries can
-    // share the same position. We work on position groups: if positions
-    // p and p+1 both have sites, ALL entries at both positions are removed.
-
     const size_t n = scratch.sites.size();
     vector<bool> remove(n, false);
 
-    // Collect unique positions and their index ranges.
-    // posGroups[k] = {position, startIdx, endIdx}
+    // --- 1. Identify adjacent positions ---
+    //
+    // Group sites by position. Sites are sorted by position, and
+    // multi-alt entries at the same position are contiguous.
+    // If consecutive groups have positions p and p+1, mark both
+    // groups for removal.
+
     struct PosGroup { uint32_t pos; size_t begin; size_t end; };
     vector<PosGroup> groups;
     size_t gi = 0;
@@ -627,7 +644,6 @@ static void filterAdjacentSites(
         gi = gEnd;
     }
 
-    // Mark groups at adjacent positions for removal.
     for (size_t g = 0; g + 1 < groups.size(); g++) {
         if (groups[g + 1].pos == groups[g].pos + 1) {
             for (size_t i = groups[g].begin; i < groups[g].end; i++)
@@ -637,7 +653,28 @@ static void filterAdjacentSites(
         }
     }
 
-    // Compact.
+    bool anyRemoved = false;
+    for (size_t i = 0; i < n; i++) {
+        if (remove[i]) { anyRemoved = true; break; }
+    }
+    if (!anyRemoved) return;
+
+    // --- 2. Build old-to-new site index mapping ---
+    //
+    // Surviving sites shift down to fill gaps left by removed sites.
+    // oldToNew[i] gives the new index for site i, or UINT32_MAX if
+    // site i was removed. Used to remap ev.siteIdx in step 4.
+
+    vector<uint32_t> oldToNew(n, UINT32_MAX);
+    uint32_t newIdx = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!remove[i]) {
+            oldToNew[i] = newIdx++;
+        }
+    }
+
+    // --- 3. Compact sites array ---
+
     size_t write = 0;
     for (size_t i = 0; i < n; i++) {
         if (!remove[i]) {
@@ -645,6 +682,57 @@ static void filterAdjacentSites(
         }
     }
     scratch.sites.resize(write);
+
+    // --- 4. Compact evidence array and remap siteIdx ---
+    //
+    // Drop evidence entries whose site was removed (oldToNew == UINT32_MAX).
+    // For surviving entries, remap ev.siteIdx to the new site index.
+    // Evidence order is preserved (sorted by site position, then overlapIdx).
+
+    for (auto& site : scratch.sites) {
+        site.evidenceBegin = 0;
+        site.evidenceEnd = 0;
+    }
+
+    size_t evWrite = 0;
+    for (size_t ei = 0; ei < scratch.evidence.size(); ei++) {
+        auto& ev = scratch.evidence[ei];
+
+        if (ev.siteIdx < uint32_t(n)) {
+            uint32_t newSi = oldToNew[ev.siteIdx];
+            if (newSi == UINT32_MAX) continue;
+            ev.siteIdx = newSi;
+        }
+
+        scratch.evidence[evWrite++] = ev;
+    }
+    scratch.evidence.resize(evWrite);
+
+    // --- 5. Rebuild evidenceBegin/evidenceEnd on surviving sites ---
+    //
+    // Both sites and evidence are sorted by position, so we walk them
+    // in tandem. All sites at the same position share the same evidence
+    // range (set by buildSnpMatrix for multi-alt support).
+
+    if (!scratch.evidence.empty()) {
+        uint32_t si = 0;
+        uint32_t ei = 0;
+        while (si < uint32_t(scratch.sites.size()) &&
+               ei < uint32_t(scratch.evidence.size())) {
+            uint32_t pos = scratch.sites[si].site;
+            uint32_t rangeBegin = ei;
+            while (ei < uint32_t(scratch.evidence.size()) &&
+                   scratch.evidence[ei].site == pos) {
+                ei++;
+            }
+            while (si < uint32_t(scratch.sites.size()) &&
+                   scratch.sites[si].site == pos) {
+                scratch.sites[si].evidenceBegin = rangeBegin;
+                scratch.sites[si].evidenceEnd = ei;
+                si++;
+            }
+        }
+    }
 }
 
 // ============================================================================
