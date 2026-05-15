@@ -794,6 +794,9 @@ public:
 public:
     void writeReadsSummary();
     
+    // ONT overlap phasing (hifiasm rphase_hc parity).
+    void phaseOverlaps(uint64_t threadCount);
+
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
     // Experimental: EC parity using induced alignments through marker graph vertices.
@@ -1511,6 +1514,10 @@ public:
     {
         return alignmentTable;
     }
+    const OverlapCigarStore& getOverlapCigarStore() const
+    {
+        return overlapCigarStore;
+    }
 #ifdef DINARA_TESTING
 public:
     // Test-only hook: allows integration tests to construct a consistent alignmentTable
@@ -1586,6 +1593,8 @@ private:
     // Indexed by OrientedReadId::getValue(),
     MemoryMapped::VectorOfVectors<uint32_t, uint32_t> alignmentTable;
     void computeAlignmentTable();
+
+
 
 
 

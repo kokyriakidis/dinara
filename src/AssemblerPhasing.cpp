@@ -1,1102 +1,1389 @@
-#include "AssemblerPhasing.hpp"
+/// @file AssemblerPhasing.cpp
+/// @brief Hifiasm-parity ONT overlap phasing using OverlapCigarStore.
+///
+/// Ports hifiasm's rphase_hc pipeline (Correct.cpp:20191) to Dinara.
+/// Reads directly from OverlapCigarStore — no AlignedEvidenceStore needed.
+///
+/// Pipeline per query read:
+///   1. Gather overlaps from alignment table
+///   2. Sliding-window SNP detection (428 bp windows)
+///   3. SNP matrix construction (filter + confirm sites)
+///   3b. Adjacent site filter
+///   4. DP phasing (longest compatible chain)
+///   5. Allele grouping (greedy cis/trans labeling + consistency check)
+///   5b. multi_check (weak site promotion)
+///   6. Large indel phasing (>=16 bp SV detection + BFS clustering)
+///   7. Dedup chains (best overlap per target read)
+///
+/// @reference hifiasm v0.25.0-r726 (ec9a8b2)
+
 #include "Assembler.hpp"
-#include <algorithm>
-#include <map>
-#include <iostream>
-#include <numeric>
-#include <cmath>
+#include "PhasingTypes.hpp"
+#include "Alignment.hpp"
 #include "Reads.hpp"
 #include "timestamp.hpp"
 
-namespace dinara {
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <iostream>
+#include <numeric>
+#include <thread>
+#include <vector>
 
-namespace {
+using namespace std;
+using namespace dinara;
 
-    // Hifiasm Parity Helpers
-    
-    // is_st_bs: Checks if a site is likely HOMOZYGOUS based on coverage.
-    bool is_st_bs(uint32_t overlap_num, uint32_t occ_0, double st_rate, uint64_t st_max) {
-        if(st_max != (uint64_t)-1) {
-            if(overlap_num + st_max >= occ_0) return true;
-        }
-        if(occ_0 == 0) return false;
-        if( (double)overlap_num >= (double)occ_0 * (1.0 - st_rate) ) return true;
-        return false;
-    }
+// ============================================================================
+// cigarRead1Start: convert ad.ts (forward) to oriented coordinates for the
+// CIGAR cursor. ad.qs/ts now store marker-based (non-extended) positions in
+// forward coordinates. The CIGAR's yk is in oriented coordinates, so for RC
+// overlaps we convert: oriented_start = targetLen - ad.te.
+// ============================================================================
 
-    struct SVFeature {
-        uint32_t start;
-        uint32_t end;
-        int32_t type; // 1=Ins, 2=Del 
-        uint32_t ovIdx;
-        uint32_t size;
-    };
-    
-    // cal_lindel_dd: SV Similarity Score
-    double cal_lindel_dd(const SVFeature& a, const SVFeature& b, double ol_r, uint32_t ol_w, double err_dif) {
-        if(a.type != b.type) return -1.0;
-        
-        uint32_t os = std::max(a.start, b.start);
-        uint32_t oe = std::min(a.end, b.end);
-        
-        if(oe <= os + ol_w) return -1.0;
-        
-        double ol = (double)(oe - os);
-        double lenA = (double)(a.end - a.start);
-        double lenB = (double)(b.end - b.start);
-        
-        // Overlap Ratio check
-        if(ol < lenA * ol_r && ol < lenB * ol_r) return -1.0; 
-        
-        double szA = (double)a.size;
-        double szB = (double)b.size;
-        double diff = std::abs(szA - szB);
-        
-        if(diff > szA * err_dif || diff > szB * err_dif) return -1.0;
-        
-        // Score
-        double sc = (szA + szB - 2.0*diff) / (szA + szB);
-        sc += (2.0 * ol) / (lenA + lenB);
-        return sc;
-    }
-
-    // checkPeriodicity: Matches Hifiasm `hpc_mask_ff`
-    // Checks if position `p` is part of a repetitive run (homopolymer or STR)
-    // defined by `maxPeriod` (HPC_RR=4) and `cutoffFactor` (HPC_CC=6).
-    // Returns true if masked.
-    bool checkPeriodicity(const std::span<const uint8_t>& seq, uint32_t p, int maxPeriod, int cutoffFactor) {
-        uint32_t len = (uint32_t)seq.size();
-        if(p >= len) return false;
-
-        for(int r = 1; r <= maxPeriod; ++r) {
-            int threshold = r * cutoffFactor;
-            
-            // Scan Right
-            uint32_t ze = p + r;
-            while(ze < len && seq[ze] == seq[ze-r]) {
-                ze++;
-            }
-            
-            // Scan Left
-            int32_t zs = (int32_t)p - 1;
-            while(zs >= 0 && (zs + r) < (int32_t)len && seq[zs] == seq[zs+r]) {
-                zs--;
-            }
-            zs++; // First valid index
-
-            if((ze - zs) > (uint32_t)r && (ze - zs) >= (uint32_t)threshold) {
-                return true; // Masked
-            }
-        }
-        return false;
-    }
-
-} // namespace
-
-// ----------------------------------------------------------------------------
-// Assembler::performPhasing Implementation
-// ----------------------------------------------------------------------------
-
-// Deprecated Legacy Phasing Logic (Replaced by APES/TASSD in AssemblerHifiasmEC.cpp)
-void Assembler::performPhasing(uint64_t threadCount)
-{
-    (void)threadCount;
-    // No-op. Logic moved to performHifiasmECParity.
-}
-
-void Assembler::performPhasingThreadFunction(size_t threadId)
-{
-    (void)threadId;
-}
-
-
-// ----------------------------------------------------------------------------
-// AssemblerPhasing Static Methods
-// ----------------------------------------------------------------------------
-
-std::vector<uint32_t> AssemblerPhasing::filterOverlapsByPhasing(
+static uint64_t cigarRead1Start(
     const Assembler& assembler,
-    ReadId targetReadId,
-    const std::vector<PhasingOverlap>& overlaps,
-    const PhasingConfig& config)
+    const AlignmentData& ad)
 {
-    if (overlaps.empty()) return {};
-
-    std::vector<HaplotypeEvidence> evidence;
-    evidence.reserve(overlaps.size() * 10); 
-    
-    // Pass 1: Collect Evidence
-    for(size_t i=0; i<overlaps.size(); ++i) {
-        // Warning: collectHaplotypeEvidence needs to tag evidence with overlapId = i
-        // But HaplotypeEvidence stores uint32_t overlapId.
-        // We need to set it inside collectHaplotypeEvidence?
-        // Let's pass 'i' as implicit context, or update evidence after?
-        // Or update collectHaplotypeEvidence to take overlapId.
-        // I updated header to take `PhasingOverlap` but not `overlapId`.
-        // I will overload or simply set it here.
-        
-        size_t startSize = evidence.size();
-        collectHaplotypeEvidence(assembler, overlaps[i], evidence, config);
-        // Set overlapId for newly added items
-        for(size_t k=startSize; k<evidence.size(); ++k) {
-            evidence[k].overlapId = (uint32_t)i;
-        }
+    if (ad.isSameStrand) {
+        return ad.ts;
     }
-
-    if (evidence.empty()) {
-        std::vector<uint32_t> keptIndices(overlaps.size());
-        std::iota(keptIndices.begin(), keptIndices.end(), 0);
-        return keptIndices;
-    }
-
-    std::vector<SnpStats> stats;
-    std::vector<uint32_t> dpKept = generatePhasingDP(targetReadId, overlaps, evidence, stats, config);
-    
-    // 2. Naive Refinement (Stateful Parity)
-    std::vector<uint32_t> naiveKept = refineOverlapsNaive(dpKept, overlaps, evidence, stats, config);
-
-    // 3. SV Phasing (Parity with rphase_lidel)
-    return filterOverlapsBySV(naiveKept, overlaps, evidence, stats, assembler, config);
+    const uint32_t targetLen = uint32_t(
+        assembler.getReads().getRead(ad.readIds[1]).baseCount);
+    return targetLen - ad.te;
 }
 
-// Parity with generate_haplotypes_naive_HiFi
-// Stateful Greedy Refinement
-std::vector<uint32_t> AssemblerPhasing::refineOverlapsNaive(
-    const std::vector<uint32_t>& keptIndices,
-    const std::vector<PhasingOverlap>& overlaps,
-    const std::vector<HaplotypeEvidence>& evidence,
-    std::vector<SnpStats>& stats,
-    const PhasingConfig& config)
+// ============================================================================
+// gatherOverlaps: collect all overlaps for a query read
+// ============================================================================
+
+static void gatherOverlaps(
+    const Assembler& assembler,
+    ReadId queryReadId,
+    PhasingScratchpad& scratch)
 {
-    if(keptIndices.empty()) return {};
+    const auto& alignmentTable = assembler.getAlignmentTable();
+    const auto& alignmentData = assembler.alignmentData;
 
-    // Map Site -> Stats Index
-    std::map<uint32_t, size_t> siteToStatIdx;
-    for(size_t i=0; i<stats.size(); ++i) siteToStatIdx[stats[i].site] = i;
+    // alignmentTable is indexed by OrientedReadId::getValue().
+    // Use strand 0 (forward) for the query.
+    const OrientedReadId orientedQueryId(queryReadId, 0);
+    if (orientedQueryId.getValue() >= alignmentTable.size()) return;
+    const auto alignmentIds = alignmentTable[orientedQueryId.getValue()];
 
-    // We need to know which alleles each overlap supports to decrement correctly.
-    // Hifiasm iterates overlaps.
-    // Sorting: overlaps with MORE valid alleles processed first?
-    // Hifiasm: "sort by how many allels in each overlap; more -> less" (line 8999).
-    
+    for (const uint32_t alignmentId : alignmentIds) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+        const AlignmentInfo& info = ad.info;
 
+        // Skip deleted overlaps.
+        if (ad.isDeleted()) continue;
 
-    // Evidence Map for fast lookup: OvIdx -> range in evidence vector
-    std::vector<std::pair<size_t, size_t>> evRanges(overlaps.size(), {0,0});
-    {
-        // size_t start = 0;
-        for(size_t i=0; i<evidence.size(); ) {
-            uint32_t currId = evidence[i].overlapId;
-            size_t j = i;
-            while(j < evidence.size() && evidence[j].overlapId == currId) j++;
-            if(currId < overlaps.size()) {
-                evRanges[currId] = {i, j};
-            }
-            i = j;
+        // Skip overlaps without CIGAR data.
+        if (info.cigarOffset == uint32_t(-1)) continue;
+        if (info.cigarTokenCount == 0) continue;
+
+        PhasingOverlap ov;
+        ov.alignmentId = alignmentId;
+        ov.cigarOffset = info.cigarOffset;
+        ov.cigarTokenCount = info.cigarTokenCount;
+        ov.errorCount = (info.nonHomopolymerErrorCount != uint32_t(-1))
+            ? info.nonHomopolymerErrorCount
+            : (info.mismatchCount + info.gapCount);
+        ov.isMatch = 1; // default cis, matching hifiasm post-alignment state
+        ov.strong = 0;
+
+        // Determine which read in the pair is the query.
+        // AlignmentData stores readIds[0] < readIds[1] (canonical order).
+        // The CIGAR is always read0=query, read1=target in the store.
+        if (ad.readIds[0] == queryReadId) {
+            ov.queryIsRead0 = 1;
+            ov.targetReadId = ad.readIds[1];
+            ov.qs = ad.qs;
+            ov.qe = ad.qe;
+            ov.ts = ad.ts;
+            ov.te = ad.te;
+            ov.isRev = ad.isSameStrand ? 0 : 1;
+        } else {
+            ov.queryIsRead0 = 0;
+            ov.targetReadId = ad.readIds[0];
+            // Swap: query is read1, target is read0.
+            ov.qs = ad.ts;
+            ov.qe = ad.te;
+            ov.ts = ad.qs;
+            ov.te = ad.qe;
+            ov.isRev = ad.isSameStrand ? 0 : 1;
         }
+
+        scratch.overlaps.push_back(ov);
     }
-    
-    // Parity: Simple pass-through check (Stateless)
-    // Hifiasm checks consistency against the refined haplotype.
-    // It keeps an overlap if it has ANY valid evidence support.
-    
-    std::vector<uint32_t> finalKept;
-    finalKept.reserve(keptIndices.size());
-    
-    for(uint32_t ovId : keptIndices) {
-        int validCounts = 0;
-        size_t start = evRanges[ovId].first;
-        size_t end = evRanges[ovId].second;
-        
-        for(size_t k=start; k<end; ++k) {
-            const auto& ev = evidence[k];
-            
-            // We only care about consistency with VALID sites
-            auto it = siteToStatIdx.find(ev.site);
-            if(it != siteToStatIdx.end()) {
-                 const auto& s = stats[it->second];
-                 
-                 // Check if site is Valid (Parity with line 8899)
-                 if(s.occ_0 >= (uint32_t)config.s_hap_cov && s.occ_1 >= (uint32_t)config.infor_cov && 
-                    !is_st_bs(s.overlap_num, s.occ_0, config.st_rate, config.st_max)) {
-                     
-                     // Check if evidence supports the Variant (Type 1)
-                     if(ev.type == 1) { // SNP
-                          validCounts++;
-                     }
-                 }
-            }
-        }
-        
-        // Hifiasm: if(o >= 1) keep;
-        if(validCounts > 0) {
-            finalKept.push_back(ovId);
-        }
-    }
-    
-    // Restore original order by ID
-    std::sort(finalKept.begin(), finalKept.end());
-    return finalKept;
 }
 
+// ============================================================================
+// unpackQuerySequence: convert 2-bit packed bases to uint8_t array
+// ============================================================================
 
-
-
-// Parity with rphase_lidel
-std::vector<uint32_t> AssemblerPhasing::filterOverlapsBySV(
-    const std::vector<uint32_t>& keptIndices,
-    const std::vector<PhasingOverlap>& overlaps,
-    const std::vector<HaplotypeEvidence>& evidence,
-    std::vector<SnpStats>& snpStats,
-    const Assembler& /* assembler */,
-    const PhasingConfig& /* config */)
+static void unpackQuerySequence(
+    const Assembler& assembler,
+    ReadId queryReadId,
+    uint32_t queryLen,
+    PhasingScratchpad& scratch)
 {
-    if(keptIndices.empty()) return {};
-
-    // 1. Extract SVs
-    std::vector<SVFeature> svs;
-    std::vector<uint32_t> svToOv; // Map SV index -> Overlap Index
-
-    for(uint32_t ovId : keptIndices) {
-        const auto& ov = overlaps[ovId];
-        uint32_t tPos = ov.targetStart;
-        // qPos isn't tracked in PhasingOverlap explicitly (we use relative), 
-        // but we need it for SV size?
-        // Hifiasm extract_sub_cigar_sv tracks qs/qe.
-        // We just need event size.
-        
-        uint32_t idx = 0;
-        while(idx < ov.cigar.size()) {
-            uint32_t val = ov.cigar[idx];
-            uint32_t op = val & 0xF;
-            uint32_t len = val >> 4;
-            
-            if(op == 0 || op == 3) {
-                // Match or Blind
-                tPos += len;
-                idx++;
-            } else {
-                // Non-match (Ins=1, Del=2) -> SV Group
-                // Hifiasm groups consecutive operations where op != 0 (and !3?)
-                // Actually it groups as long as `op` stays "non-match".
-                // Wait, logic was `if(!!op != !!op0) break`.
-                // Ins=1, Del=2. Both !! is true.
-                // So it groups sequences of Ins and Del.
-                
-                uint32_t groupStartT = tPos;
-                uint32_t groupLen = 0; // Total length of indels (size)
-                // uint32_t groupSize = 0;
-                
-                uint32_t spanT = 0;
-                
-                while(idx < ov.cigar.size()) {
-                    uint32_t subVal = ov.cigar[idx];
-                    uint32_t subOp = subVal & 0xF;
-                    uint32_t subLen = subVal >> 4;
-                    
-                    if(subOp == 0 || subOp == 3) break; // End of group
-                    
-                    groupLen += subLen;
-                    if(subOp == 2) spanT += subLen; // Del consumes Target
-                    // Ins consumes Query (not represented in tPos)
-                    
-                    idx++;
-                }
-                
-                // Finished group
-                // Check if it qualifies as SV
-                if(groupLen >= 50) { 
-                    // Type: Hifiasm uses Type 1 for SV in `generate_haplotypes_sv`?
-                    // "type 1" usually means "Alt" / Indel.
-                    // We need a specific type (Ins vs Del) for clustering `cal_lindel_dd`.
-                    // But if it's mixed?
-                    // `cal_lindel_dd` checks `if(a->tn == b->tn)`. `tn` is type? No, tn is TargetName usually.
-                    // Wait, `cal_lindel_dd` doesn't check type!
-                    // It checks overlap and size difference.
-                    // So mixed groups allow clustering if size matches.
-                    // We'll use type=1 for all SVs here.
-                    
-                    svs.push_back({groupStartT, groupStartT + spanT, 1, ovId, groupLen});
-                }
-                
-                tPos += spanT;
-            }
-        }
+    scratch.queryBases.resize(queryLen);
+    const auto sequence = assembler.getReads().getRead(queryReadId);
+    for (uint32_t i = 0; i < queryLen; i++) {
+        scratch.queryBases[i] = sequence[i].value;
     }
-    
-    if(svs.empty()) return keptIndices;
+}
 
-    // 4. Hifiasm `rphase_lidel_cc` Clustering Strategy
-    
-    // Step 4.1: Neighbor Counting (Calculate 'sec' / support)
-    struct SVWrapper {
-        SVFeature sv;
-        uint32_t sec; // Secondary support (count of neighbors)
-        int clusterId;
-        uint32_t readId; // Target Read ID (Wait, Pre-Phasing is Target-centric?)
-        // In `filterOverlapsBySV`, 'overlaps' are all mapped TO the Target.
-        // So `ov.queryReadId` is the "Supporting Read".
-        // We need to ensure unique `queryReadId` per cluster.
-    };
-    
-    std::vector<SVWrapper> wrappers;
-    wrappers.reserve(svs.size());
-    for(const auto& s : svs) {
-        // Find queryReadId from overlap
-        // We need effective read ID. 
-        // `overlaps[s.ovIdx]` has `queryReadId`.
-        wrappers.push_back({s, 0, -1, overlaps[s.ovIdx].queryReadId});
-    }
-    
-    // Sort by Start (already done mostly, but ensure)
-    std::sort(wrappers.begin(), wrappers.end(), [](const SVWrapper& a, const SVWrapper& b){
-        return a.sv.start < b.sv.start;
-    });
-    
-    double ol_r = 0.5;
-    double err_dif = 0.25;
-    uint32_t ol_w = 3;
-    uint32_t c_sz = 3; // Min support to form core
-    
-    int nSVs = (int)wrappers.size();
-    
-    for(int k=0; k<nSVs; ++k) {
-        // Window optimization
-        // uint32_t max_dist = wrappers[k].sv.size * 2 + 100;
-        
-        for(int z=k+1; z<nSVs; ++z) {
-            if(wrappers[z].sv.start > wrappers[k].sv.end) break; // Start of z > End of k (approx)
-             
-            // Hifiasm window check: a[z].qs < a[k].qe ?
-            // Here we sort by Start.
-            
-            double score = cal_lindel_dd(wrappers[k].sv, wrappers[z].sv, ol_r, ol_w, err_dif);
-            if(score >= 0.0) {
-                wrappers[k].sec++;
-                wrappers[z].sec++;
-            }
-        }
-    }
-    
-    // Step 4.2: Filter Noise (sec == 0) and Compress? 
-    // We can just skip them in next loops.
+// ============================================================================
+// getBaseAtPosition: look up a base from a read sequence
+// ============================================================================
 
-    // Step 4.3: Build Core Clusters
-    int nextClusterId = 0;
-    
-    // Iterate to build clusters from high-support seeds
-    for(int k=0; k<nSVs; ++k) {
-        if(wrappers[k].sec < c_sz || wrappers[k].clusterId != -1) continue;
-        
-        // Start new cluster
-        int currentId = nextClusterId++;
-        wrappers[k].clusterId = currentId;
-        
-        // Track Reads in this cluster to enforce uniqueness
-        // Using a set for this local greedy expansion
-        std::set<uint32_t> clusterReads;
-        clusterReads.insert(wrappers[k].readId);
-        
-        // Expand
-        // Using a BFS/Queue or just simple pass? 
-        // Hifiasm does a seeded expansion using `buf` stack.
-        std::vector<int> stack;
-        stack.push_back(k);
-        
-        size_t head = 0;
-        while(head < stack.size()) {
-            int v = stack[head++];
-            
-            // Search neighbors of v
-            for(int z=0; z<nSVs; ++z) { // Ideally range search
-               // Optimization: Only check nearby?
-               if(wrappers[z].sv.start > wrappers[v].sv.end) break; // Sorted
-               // We need to look backwards too? 
-               // Hifiasm `rphase_lidel_cc` loops `z` from 0 to `an`.
-               // But optimized with `a[z].qs < a[v].qe`.
-            }
-            
-            // Re-implementing range search properly:
-            // We need to scan [0, nSVs].
-            // But we can optimize.
-            // Since we sorted by Start, we can search [v-window, v+window].
-            
-            // For rigorous parity, let's scan a safe window.
-            // Or just Full Scan for now (perf tradeoff for correctness).
-            // Actually, `cal_lindel_dd` fails if `oe <= os + ol_w`.
-            
-            // Let's use a window loop based on positions.
-            // Find start index
-            int zStart = v - 1;
-            while(zStart >= 0 && wrappers[zStart].sv.end >= wrappers[v].sv.start) zStart--;
-            zStart++; // approximate
-            
-            // Forward
-            for(int z=0; z<nSVs; ++z) {
-                if(wrappers[z].clusterId != -1) continue; // Already clustered
-                if(wrappers[z].sec < c_sz) continue; // Must be core-quality
-                if(z == v) continue;
-                
-                // Range check
-                uint32_t os = std::max(wrappers[v].sv.start, wrappers[z].sv.start);
-                uint32_t oe = std::min(wrappers[v].sv.end, wrappers[z].sv.end);
-                if(oe <= os + ol_w) continue;
-                
-                double sw = cal_lindel_dd(wrappers[v].sv, wrappers[z].sv, ol_r, ol_w, err_dif);
-                if(sw >= 0.0) {
-                     // Check Unique Read Constraint
-                     if(clusterReads.find(wrappers[z].readId) == clusterReads.end()) {
-                         wrappers[z].clusterId = currentId;
-                         clusterReads.insert(wrappers[z].readId);
-                         stack.push_back(z);
-                     }
-                }
-            }
-        }
+static inline uint8_t getBaseAtPosition(
+    const Assembler& assembler,
+    ReadId readId,
+    uint32_t position,
+    bool isReverseComplement)
+{
+    const auto sequence = assembler.getReads().getRead(readId);
+    if (!isReverseComplement) {
+        return sequence[position].value;
+    } else {
+        return sequence[sequence.baseCount - 1 - position].complement().value;
     }
-    
-    // Step 4.4: Rescue Pass (Assign remaining to best cluster)
-    for(int k=0; k<nSVs; ++k) {
-        if(wrappers[k].clusterId != -1) continue;
-        
-        // Find best cluster
-        int bestClust = -1;
-        double maxScore = -1.0;
-        
-        for(int z=0; z<nSVs; ++z) {
-            if(wrappers[z].clusterId == -1) continue;
-            if(wrappers[z].readId == wrappers[k].readId) continue; // Cannot join same read
-            
-            // Range check
-            uint32_t os = std::max(wrappers[k].sv.start, wrappers[z].sv.start);
-            uint32_t oe = std::min(wrappers[k].sv.end, wrappers[z].sv.end);
-            if(oe <= os + ol_w) continue;
+}
 
-            double sw = cal_lindel_dd(wrappers[k].sv, wrappers[z].sv, ol_r, ol_w, err_dif);
-            if(sw > maxScore) {
-                maxScore = sw;
-                bestClust = wrappers[z].clusterId;
-            }
+// ============================================================================
+// ============================================================================
+// isPeriodicRepeat: hifiasm hpc_mask_ff equivalent
+//
+// Checks if position p on the query read is within a periodic repeat
+// region of period 1..HPC_RR (4). For each period r, extends the
+// repeat in both directions from p. If the repeat span exceeds
+// r * HPC_CC (cutoff), the position is masked.
+// ============================================================================
+
+static constexpr uint32_t HPC_RR = 4;  // max repeat period
+static constexpr uint32_t HPC_CC = 2;  // cutoff multiplier
+
+static bool isPeriodicRepeat(
+    const uint8_t* seq,
+    uint32_t seqLen,
+    uint32_t p)
+{
+    if (seqLen == 0) return false;
+
+    const int64_t sn = int64_t(seqLen);
+    const int64_t pp = int64_t(p);
+
+    for (uint32_t r = 1; r <= HPC_RR; r++) {
+        const int64_t rc = int64_t(r) * int64_t(HPC_CC); // cutoff
+
+        // Scan 0: including p, extend right then left.
+        {
+            int64_t k = pp + int64_t(r);
+            while (k < sn && (k - int64_t(r)) >= 0 && seq[k] == seq[k - r]) k++;
+            int64_t ze = k;
+            k = pp - 1;
+            while (k >= 0 && (k + int64_t(r)) < sn && seq[k] == seq[k + r]) k--;
+            int64_t zs = k + 1;
+            if ((ze - zs) > int64_t(r) && (ze - zs) >= rc) return true;
         }
-        
-        if(bestClust != -1) {
-            // Need to verify Unique Read again? 
-            // Hifiasm `is_get_group` checks if the read is already in the target group (lines 19779).
-            // Yes.
-            
-            // We need to know which reads are in `bestClust`.
-            // Bruteforce check?
-            bool conflict = false;
-            for(int z=0; z<nSVs; ++z) {
-                if(wrappers[z].clusterId == bestClust && wrappers[z].readId == wrappers[k].readId) {
-                    conflict = true; break;
-                }
-            }
-            
-            if(!conflict) {
-                wrappers[k].clusterId = bestClust;
-            }
+
+        // Scan 1: not including p, right side only.
+        {
+            int64_t k = pp + int64_t(r) + 1;
+            while (k < sn && (k - int64_t(r)) >= 0 && seq[k] == seq[k - r]) k++;
+            int64_t zs = pp + 1;
+            int64_t ze = k;
+            if ((ze - zs) > int64_t(r) && (ze - zs) >= rc) return true;
+        }
+
+        // Scan 2: including p, extend left then right.
+        {
+            int64_t k = pp - int64_t(r);
+            while (k >= 0 && (k + int64_t(r)) < sn && seq[k] == seq[k + r]) k--;
+            int64_t zs = k + 1;
+            k = pp + 1;
+            while (k < sn && (k - int64_t(r)) >= 0 && seq[k] == seq[k - r]) k++;
+            int64_t ze = k;
+            if ((ze - zs) > int64_t(r) && (ze - zs) >= rc) return true;
+        }
+
+        // Scan 3: not including p, left side only.
+        {
+            int64_t k = pp - int64_t(r) - 1;
+            while (k >= 0 && (k + int64_t(r)) < sn && seq[k] == seq[k + r]) k--;
+            int64_t zs = k + 1;
+            int64_t ze = pp;
+            if ((ze - zs) > int64_t(r) && (ze - zs) >= rc) return true;
         }
     }
 
-    // 5. Filter overlaps based on Valid Clusters
-    // Calculate cluster sizes (Unique Reads)
-    std::map<int, std::set<uint32_t>> clusterReadSets;
-    for(const auto& w : wrappers) {
-        if(w.clusterId != -1) {
-            clusterReadSets[w.clusterId].insert(w.readId);
-        }
-    }
-    
-    std::set<int> validClusterIds;
-    for(auto const& [cid, reads] : clusterReadSets) {
-        if(reads.size() >= c_sz) validClusterIds.insert(cid);
-    }
-    
-    // Construct "Consensus SV Regions"
-    struct SVRegion {
-         uint32_t start, end;
-         int id;
-    };
-    std::vector<SVRegion> regions;
-    for(const auto& w : wrappers) {
-        if(validClusterIds.count(w.clusterId)) {
-            regions.push_back({w.sv.start, w.sv.end, w.clusterId});
-        }
-    }
+    return false;
+}
 
-    std::vector<uint32_t> finalKept;
-    std::vector<bool> keepMask(overlaps.size(), false);
-    for(uint32_t idx : keptIndices) keepMask[idx] = true;
+// ============================================================================
+// detectSnpSites: sliding-window SNP detection
+//
+// Port of hifiasm's hc_phase_robust_rr (Correct.cpp:10200).
+//
+// Three stages:
+//   Pre-walk — Walk each overlap's CIGAR once, collecting match/mismatch
+//              events into scratch.cigarEvents with per-overlap ranges.
+//   Pass 1   — For each 428 bp window, count mismatch votes per position.
+//              Positions with >= 2 votes become candidate SNPs (unless
+//              masked by periodic repeat detection).
+//   Pass 2   — Re-scan events at candidate positions, emitting
+//              PhasingEvidence entries with the observed base and
+//              match/mismatch status.
+// ============================================================================
 
-    for(const auto& r : regions) {
-        for(uint32_t ovId : keptIndices) {
-            if(!keepMask[ovId]) continue;
-            
-            const auto& ov = overlaps[ovId];
-            if(ov.targetStart <= r.start && ov.targetEnd >= r.end) {
-                 bool hasSV = false;
-                 // Does this overlap have an SV in this cluster?
-                 for(const auto& w : wrappers) {
-                     if(w.sv.ovIdx == ovId && w.clusterId == r.id) {
-                         hasSV = true; break;
-                     }
-                 }
-                 if(!hasSV) {
-                     keepMask[ovId] = false;
-                 }
-            }
-        }
-    }
+static void detectSnpSites(
+    const Assembler& assembler,
+    ReadId queryReadId,
+    uint32_t queryLen,
+    PhasingScratchpad& scratch)
+{
+    const auto& cigarStore = assembler.getOverlapCigarStore();
+    const uint32_t W = PHASING_WINDOW_SIZE;
 
-    for(uint32_t idx : keptIndices) {
-        if(keepMask[idx]) finalKept.push_back(idx);
-    }
+    // ----------------------------------------------------------------
+    // Pre-walk: collect all match/mismatch events per overlap.
+    //
+    // walkRangeWithCursor filters by xk (read0) coordinates, which only
+    // works when queryIsRead0. To handle both orientations uniformly, we
+    // do a single full walk per overlap and store events in forward-strand
+    // query coordinates. Each overlap's events are contiguous and sorted
+    // by qpos, enabling efficient window-based scanning below.
+    // ----------------------------------------------------------------
 
-    // Hifiasm Parity (generate_haplotypes_sv line 9171):
-    // Decrement occ_0 for evidence consumed by SV-phased overlaps.
-    // This prevents double-counting reference evidence.
-    if(!snpStats.empty()) {
-        // Build site-to-stat lookup
-        std::map<uint32_t, size_t> siteToStatIdx;
-        for(size_t i = 0; i < snpStats.size(); ++i) {
-            siteToStatIdx[snpStats[i].site] = i;
-        }
-        
-        // For each SV-phased overlap, find its reference evidence and decrement occ_0
-        for(const auto& w : wrappers) {
-            if(validClusterIds.count(w.clusterId)) {
-                uint32_t ovId = w.sv.ovIdx;
-                // Find all evidence for this overlap
-                for(const auto& ev : evidence) {
-                    if(ev.overlapId == ovId && ev.type == 0) { // Type 0 = Reference
-                        auto it = siteToStatIdx.find(ev.site);
-                        if(it != siteToStatIdx.end() && snpStats[it->second].occ_0 > 1) {
-                            snpStats[it->second].occ_0--;
+    auto& allEvents = scratch.cigarEvents;
+    scratch.cigarEventRanges.resize(scratch.overlaps.size());
+
+    allEvents.reserve(scratch.overlaps.size() * 64); // rough estimate
+
+    for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+        auto& ov = scratch.overlaps[oi];
+        const auto& ad = assembler.alignmentData[ov.alignmentId];
+
+        scratch.cigarEventRanges[oi].begin = uint32_t(allEvents.size());
+
+        OverlapCigarStore::Cursor cursor;
+        cursor.reset(ov.cigarOffset, ov.cigarTokenCount,
+            ad.qs, cigarRead1Start(assembler, ad), cigarStore);
+
+        // When queryIsRead0 == 0 and the overlap is RC, yk is in RC
+        // coordinates of read1 (the query). queryBases is in forward
+        // coordinates, so we must convert: qpos_fwd = queryLen - 1 - qpos_rc.
+        const bool queryNeedsRcConvert =
+            (ov.queryIsRead0 == 0) && (ov.isRev != 0);
+
+        cigarStore.walkRangeWithCursor(
+            cursor, 0, UINT32_MAX,
+            [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
+                if (op != 0 && op != 1) return; // skip indels
+
+                for (uint32_t b = 0; b < len; b++) {
+                    uint32_t qpos, tpos;
+                    if (ov.queryIsRead0) {
+                        qpos = uint32_t(xk) + b;
+                        tpos = uint32_t(yk) + b;
+                    } else {
+                        qpos = uint32_t(yk) + b;
+                        tpos = uint32_t(xk) + b;
+                        if (queryNeedsRcConvert) {
+                            if (qpos >= queryLen) continue;
+                            qpos = queryLen - 1 - qpos;
                         }
+                    }
+                    if (qpos >= queryLen) continue;
+
+                    CigarEvent ce;
+                    ce.qpos = qpos;
+                    ce.tpos = tpos;
+                    ce.op = op;
+                    allEvents.push_back(ce);
+                }
+            });
+
+        scratch.cigarEventRanges[oi].end = uint32_t(allEvents.size());
+
+        // For queryIsRead0==0 with RC, the qpos values are reverse-ordered
+        // after forward conversion. Sort to enable early-exit in window scans.
+        if (queryNeedsRcConvert) {
+            sort(allEvents.begin() + scratch.cigarEventRanges[oi].begin,
+                 allEvents.begin() + scratch.cigarEventRanges[oi].end,
+                 [](const CigarEvent& a, const CigarEvent& b) {
+                     return a.qpos < b.qpos;
+                 });
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Windowed SNP detection using pre-collected events.
+    // ----------------------------------------------------------------
+
+    for (uint32_t wStart = 0; wStart < queryLen; wStart += W) {
+        const uint32_t wEnd = min(wStart + W, queryLen);
+        const uint32_t wLen = wEnd - wStart;
+
+        // ---- Pass 1: vote counting ----
+        // Count how many overlaps have a mismatch at each position.
+        // Positions with > OCC_THRES (1) votes are candidate SNPs.
+        scratch.flag.assign(wLen, 0);
+
+        for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+            const auto& ov = scratch.overlaps[oi];
+            if (ov.qe <= wStart || ov.qs >= wEnd) continue;
+
+            for (uint32_t ei = scratch.cigarEventRanges[oi].begin;
+                 ei < scratch.cigarEventRanges[oi].end; ei++) {
+                const auto& ce = allEvents[ei];
+                if (ce.qpos < wStart) continue;
+                if (ce.qpos >= wEnd) break; // events are sorted by qpos
+                if (ce.op == 1) { // mismatch
+                    uint32_t fi = ce.qpos - wStart;
+                    if (scratch.flag[fi] < 255)
+                        scratch.flag[fi]++;
+                }
+            }
+        }
+
+        // Classify positions:
+        //   flag=0 → not a candidate (too few votes)
+        //   flag=1 → candidate SNP
+        //   flag=3 → masked by periodic repeat (hifiasm hpc_mask_ff)
+        bool anyCandidates = false;
+        for (uint32_t i = 0; i < wLen; i++) {
+            if (scratch.flag[i] > PHASING_OCC_THRES) {
+                const uint32_t absPos = wStart + i;
+                if (isPeriodicRepeat(scratch.queryBases.data(), queryLen,
+                                     absPos)) {
+                    scratch.flag[i] = 3;
+                } else {
+                    scratch.flag[i] = 1;
+                    anyCandidates = true;
+                }
+            } else {
+                scratch.flag[i] = 0;
+            }
+        }
+        if (!anyCandidates) continue;
+
+        // ---- Pass 2: evidence collection ----
+        // At candidate positions (flag==1), emit PhasingEvidence entries
+        // recording the observed base and whether it matches the query.
+        for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+            const auto& ov = scratch.overlaps[oi];
+            if (ov.qe <= wStart || ov.qs >= wEnd) continue;
+
+            for (uint32_t ei = scratch.cigarEventRanges[oi].begin;
+                 ei < scratch.cigarEventRanges[oi].end; ei++) {
+                const auto& ce = allEvents[ei];
+                if (ce.qpos < wStart) continue;
+                if (ce.qpos >= wEnd) break;
+
+                uint32_t fi = ce.qpos - wStart;
+                if (scratch.flag[fi] == 0 || scratch.flag[fi] == 3) continue;
+
+                PhasingEvidence ev;
+                ev.site = ce.qpos;
+                ev.overlapIdx = uint32_t(oi);
+
+                if (ce.op == 0) { // match → query base
+                    ev.base = scratch.queryBases[ce.qpos];
+                    ev.isAlt = 0;
+                } else { // mismatch → look up target base
+                    // tpos is in oriented coordinates of the target read.
+                    // When queryIsRead0: target is read1, RC if isRev.
+                    // When !queryIsRead0: target is read0, always forward.
+                    const bool targetIsRc = (ov.queryIsRead0 != 0) && (ov.isRev != 0);
+                    ev.base = getBaseAtPosition(
+                        assembler,
+                        ReadId(ov.targetReadId),
+                        ce.tpos, targetIsRc);
+                    ev.isAlt = 1;
+                }
+
+                ev.isHpc = 0;
+                scratch.evidence.push_back(ev);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// buildSnpMatrix: sort evidence, group by site, filter, confirm sites
+//
+// Port of hifiasm's SetSnpMatrix + push_info (Correct.cpp:10511).
+//
+// 1. Sort evidence by (site, overlapIdx).
+// 2. Group by site. For each site:
+//    - Dedup by overlapIdx (keep first per overlap).
+//    - Count matchCount (isAlt==0) and per-base altCount[4].
+//    - Require matchCount >= PHASING_S_HAP_COV and altCount >= PHASING_INFOR_COV.
+//    - For each qualifying alt base, create a PhasingSite.
+// 3. Record evidence ranges per site.
+// ============================================================================
+
+static void buildSnpMatrix(
+    PhasingScratchpad& scratch)
+{
+    if (scratch.evidence.empty()) return;
+
+    // Sort by (site, overlapIdx).
+    sort(scratch.evidence.begin(), scratch.evidence.end(),
+        [](const PhasingEvidence& a, const PhasingEvidence& b) {
+            if (a.site != b.site) return a.site < b.site;
+            return a.overlapIdx < b.overlapIdx;
+        });
+
+    // Dedup: within each (site, overlapIdx) group, keep only the first entry.
+    {
+        size_t write = 0;
+        for (size_t i = 0; i < scratch.evidence.size(); i++) {
+            if (i > 0 &&
+                scratch.evidence[i].site == scratch.evidence[i-1].site &&
+                scratch.evidence[i].overlapIdx == scratch.evidence[i-1].overlapIdx) {
+                continue; // skip duplicate
+            }
+            scratch.evidence[write++] = scratch.evidence[i];
+        }
+        scratch.evidence.resize(write);
+    }
+
+    // Group by site and build PhasingSite entries.
+    size_t i = 0;
+    while (i < scratch.evidence.size()) {
+        const uint32_t site = scratch.evidence[i].site;
+        const size_t groupBegin = i;
+
+        // Find end of this site's group.
+        while (i < scratch.evidence.size() && scratch.evidence[i].site == site) {
+            i++;
+        }
+        const size_t groupEnd = i;
+
+        // Count match and per-base alt.
+        uint32_t matchCount = 0;
+        uint32_t fwdStrandRefCount = 0; // forward-strand ref-matching overlaps
+        uint32_t altCount[4] = {0, 0, 0, 0};
+        uint8_t isHpc = 0;
+        uint8_t queryBase = 0;
+
+        for (size_t j = groupBegin; j < groupEnd; j++) {
+            const auto& ev = scratch.evidence[j];
+            if (j == groupBegin) {
+                queryBase = scratch.queryBases[site];
+                isHpc = ev.isHpc;
+            }
+            if (ev.isAlt == 0) {
+                matchCount++;
+                // Track forward-strand count for strand bias.
+                // isRev==0 means same-strand (forward).
+                if (scratch.overlaps[ev.overlapIdx].isRev == 0) {
+                    fwdStrandRefCount++;
+                }
+            } else {
+                if (ev.base < 4) altCount[ev.base]++;
+            }
+            if (ev.isHpc) isHpc = 1;
+        }
+
+        // Hifiasm adds +1 to matchCount for the query read itself.
+        matchCount += 1;
+
+        // Create a PhasingSite for each qualifying alt base (count >= 2).
+        // Hifiasm creates separate SnpStats entries per alt allele.
+        for (uint8_t b = 0; b < 4; b++) {
+            if (b == queryBase) continue;
+            if (altCount[b] < 2) continue; // hifiasm: occ_1[i] >= 2
+
+            // Filter: require sufficient evidence on both alleles.
+            if (matchCount < PHASING_S_HAP_COV) continue;
+            if (altCount[b] < PHASING_INFOR_COV) continue;
+
+            PhasingSite ps;
+            ps.site = site;
+            ps.queryBase = queryBase;
+            ps.altBase = b;
+            ps.isHpc = isHpc;
+            ps.dpChainId = -1;
+            ps.matchCount = matchCount;
+            ps.altCount = altCount[b];
+            ps.fwdStrandCount = fwdStrandRefCount + 1; // +1 for query read
+            ps.evidenceBegin = uint32_t(groupBegin);
+            ps.evidenceEnd = uint32_t(groupEnd);
+
+            scratch.sites.push_back(ps);
+        }
+    }
+}
+
+// ============================================================================
+// filterAdjacentSites: remove SNP sites at adjacent positions
+//
+// Port of hifiasm's adjacent-site filter (Correct.cpp:8855).
+// If sites exist at positions p and p+1, BOTH are removed.
+// This prevents alignment artifacts (e.g., indels manifesting as
+// adjacent mismatches) from being treated as het sites.
+// ============================================================================
+
+static void filterAdjacentSites(
+    PhasingScratchpad& scratch)
+{
+    if (scratch.sites.size() < 2) return;
+
+    // Sites are already sorted by position (from buildSnpMatrix's
+    // sequential processing of sorted evidence).
+    // With multi-alt, multiple sites can share the same position.
+    // Mark sites for removal if their position is adjacent to another site's.
+
+    const size_t n = scratch.sites.size();
+    vector<bool> remove(n, false);
+
+    for (size_t i = 0; i < n; i++) {
+        // Check predecessor (different position, adjacent).
+        if (i > 0 && scratch.sites[i].site == scratch.sites[i-1].site + 1) {
+            remove[i] = true;
+            // Also mark all sites at the predecessor position.
+            for (size_t j = i - 1; j < n && scratch.sites[j].site == scratch.sites[i].site - 1; ) {
+                remove[j] = true;
+                if (j == 0) break;
+                j--;
+            }
+        }
+        // Check successor (different position, adjacent).
+        if (i + 1 < n && scratch.sites[i + 1].site == scratch.sites[i].site + 1) {
+            remove[i] = true;
+        }
+    }
+
+    // Compact.
+    size_t write = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!remove[i]) {
+            scratch.sites[write++] = scratch.sites[i];
+        }
+    }
+    scratch.sites.resize(write);
+}
+
+// ============================================================================
+// checkCompatibility: are two SNP sites consistent across shared overlaps?
+//
+// Port of hifiasm's comput_sc_rphase (Correct.cpp:9600).
+//
+// Two sites are compatible if overlaps covering both show consistent
+// allele assignments: both match the query, or both mismatch.
+// Mixed assignments (match at one, mismatch at the other) are skipped.
+// Returns true only when evidence exists from both haplotypes (nn0>0, nn1>0).
+// ============================================================================
+
+static bool checkCompatibility(
+    const PhasingScratchpad& scratch,
+    uint32_t siteI,
+    uint32_t siteJ)
+{
+    const auto& si = scratch.sites[siteI];
+    const auto& sj = scratch.sites[siteJ];
+
+    // Walk both evidence ranges (sorted by overlapIdx) in tandem.
+    uint32_t pi = si.evidenceBegin;
+    uint32_t pj = sj.evidenceBegin;
+
+    // Count shared overlaps where both sites agree:
+    // nn0 = both match query (isAlt==0 at both sites)
+    // nn1 = both mismatch query (isAlt==1 at both sites)
+    // Hifiasm requires nn0 > 0 && nn1 > 0: evidence from both haplotypes
+    // is needed to confirm the sites are on the same haplotype block.
+    uint32_t nn0 = 0, nn1 = 0;
+
+    while (pi < si.evidenceEnd && pj < sj.evidenceEnd) {
+        const auto& ei = scratch.evidence[pi];
+        const auto& ej = scratch.evidence[pj];
+
+        if (ei.overlapIdx < ej.overlapIdx) { pi++; continue; }
+        if (ei.overlapIdx > ej.overlapIdx) { pj++; continue; }
+
+        // Same overlap covers both sites.
+        // Both match → nn0++. Both mismatch → nn1++.
+        // Mixed (one match, one mismatch) → skip (not counted).
+        if (ei.isAlt == ej.isAlt) {
+            if (ei.isAlt == 0) nn0++;
+            else nn1++;
+        }
+
+        pi++;
+        pj++;
+    }
+
+    // Require evidence from both haplotypes.
+    return nn0 > 0 && nn1 > 0;
+}
+
+// ============================================================================
+// runDpPhasing: longest compatible chain over confirmed SNP sites
+//
+// Port of hifiasm's gen_rphase_dp0_single_path (Correct.cpp:9648).
+//
+// Standard LIS-style DP: f[i] = max(f[j] + 1) for all j < i where
+// sites i and j are compatible. Backtrack to extract chains.
+// Sites in chains of length > 1 are confirmed. Length-1 chains require
+// stricter thresholds (matchCount >= hetCov * 0.7, minimum 6).
+// ============================================================================
+
+static void runDpPhasing(
+    PhasingScratchpad& scratch,
+    uint32_t hetCov)
+{
+    const uint32_t n = uint32_t(scratch.sites.size());
+    if (n == 0) return;
+
+    scratch.dpScore.assign(n, 1);
+    scratch.dpParent.assign(n, -1);
+
+    // DP: O(n^2) but n is typically small (tens to low hundreds of SNP sites).
+    for (uint32_t i = 1; i < n; i++) {
+        for (uint32_t j = 0; j < i; j++) {
+            if (scratch.dpScore[j] + 1 > scratch.dpScore[i]) {
+                if (checkCompatibility(scratch, i, j)) {
+                    scratch.dpScore[i] = scratch.dpScore[j] + 1;
+                    scratch.dpParent[i] = int32_t(j);
+                }
+            }
+        }
+    }
+
+    // Extract chains by backtracking from each local maximum.
+    scratch.dpChainId.assign(n, -1);
+    int8_t chainId = 0;
+
+    // Find chain endpoints: sites where no later site points to them.
+    scratch.dpIsEndpoint.assign(n, true);
+    for (uint32_t i = 0; i < n; i++) {
+        if (scratch.dpParent[i] >= 0) {
+            scratch.dpIsEndpoint[uint32_t(scratch.dpParent[i])] = false;
+        }
+    }
+
+    // Extract chains from longest to shortest.
+    scratch.dpEndpoints.clear();
+    for (uint32_t i = 0; i < n; i++) {
+        if (scratch.dpIsEndpoint[i]) {
+            scratch.dpEndpoints.push_back({scratch.dpScore[i], i});
+        }
+    }
+    sort(scratch.dpEndpoints.begin(), scratch.dpEndpoints.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (const auto& [score, endIdx] : scratch.dpEndpoints) {
+        if (uint32_t(chainId) >= PHASING_MAX_DP_CHAINS) break;
+        if (scratch.dpChainId[endIdx] >= 0) continue; // already claimed
+
+        // Backtrack.
+        scratch.dpChain.clear();
+        int32_t k = int32_t(endIdx);
+        while (k >= 0 && scratch.dpChainId[uint32_t(k)] < 0) {
+            scratch.dpChain.push_back(uint32_t(k));
+            k = scratch.dpParent[uint32_t(k)];
+        }
+
+        if (scratch.dpChain.size() < 2) {
+            // Single-site chain: apply stricter threshold.
+            uint32_t idx = scratch.dpChain[0];
+            uint32_t minMatch = max(6U, uint32_t(double(hetCov) * 0.7));
+            if (scratch.sites[idx].matchCount < minMatch) continue;
+            if (scratch.sites[idx].altCount < PHASING_INFOR_COV) continue;
+        }
+
+        // Assign chain ID.
+        for (uint32_t idx : scratch.dpChain) {
+            scratch.dpChainId[idx] = chainId;
+            scratch.sites[idx].dpChainId = chainId;
+        }
+        chainId++;
+    }
+}
+
+// ============================================================================
+// isStrandBiased: hifiasm is_st_bs macro equivalent
+//
+// Returns true if a site has strand bias — nearly all ref-matching
+// overlaps come from one strand. Hifiasm parameters: st_rate=0.05, st_max=2.
+// ============================================================================
+
+static constexpr double PHASING_ST_RATE = 0.05;
+static constexpr uint32_t PHASING_ST_MAX = 2;
+
+static bool isStrandBiased(const PhasingSite& site)
+{
+    // fwdStrandCount = forward-strand ref overlaps + 1 (query)
+    // matchCount = total ref overlaps + 1 (query)
+    // Condition: reverse-strand count <= ST_MAX AND forward fraction >= (1 - ST_RATE)
+    if (site.fwdStrandCount + PHASING_ST_MAX >= site.matchCount &&
+        site.matchCount * PHASING_ST_RATE + site.fwdStrandCount >= site.matchCount) {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// labelCisTrans: greedy cis/trans labeling from confirmed SNP sites
+//
+// Port of hifiasm's generate_haplotypes_naive_HiFi (Correct.cpp:8845).
+//
+// Four phases:
+//   Phase 1 — Count confirmed mismatches per overlap (at DP-confirmed sites).
+//   Phase 2 — Greedy labeling: overlaps sorted by mismatch count desc;
+//             those with mismatches → trans, others → cis.
+//   Phase 3 — Consistency check: cis overlaps with mismatches at
+//             trans-confirmed sites get flipped to trans.
+//   Phase 4 — multi_check: promote weak (sub-threshold) sites that
+//             appear across multiple overlaps, flipping additional
+//             cis overlaps to trans.
+// ============================================================================
+
+static void labelCisTrans(
+    PhasingScratchpad& scratch)
+{
+    // ----------------------------------------------------------------
+    // Phase 1: Count confirmed mismatches per overlap.
+    //
+    // For each DP-confirmed, non-strand-biased site, walk its evidence
+    // and tally how many confirmed sites each overlap covers
+    // (confirmedSiteCount) and how many of those are mismatches
+    // (confirmedMismatchCount).
+    // ----------------------------------------------------------------
+
+    for (auto& ov : scratch.overlaps) {
+        ov.confirmedSiteCount = 0;
+        ov.confirmedMismatchCount = 0;
+    }
+
+    for (uint32_t si = 0; si < uint32_t(scratch.sites.size()); si++) {
+        const auto& site = scratch.sites[si];
+        if (site.dpChainId < 0) continue; // not confirmed by DP
+        if (isStrandBiased(site)) continue;
+
+        for (uint32_t ei = site.evidenceBegin; ei < site.evidenceEnd; ei++) {
+            const auto& ev = scratch.evidence[ei];
+            auto& ov = scratch.overlaps[ev.overlapIdx];
+            ov.confirmedSiteCount++;
+            if (ev.isAlt) {
+                ov.confirmedMismatchCount++;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2: Greedy labeling (most mismatches first).
+    //
+    // Sort overlaps by confirmedMismatchCount descending. Overlaps with
+    // at least one confirmed mismatch → trans (is_match=2). Overlaps
+    // covering confirmed sites but with zero mismatches → cis (is_match=1).
+    // Overlaps not covering any confirmed site keep their default (cis).
+    // ----------------------------------------------------------------
+
+    scratch.sortedOverlapIndices.resize(scratch.overlaps.size());
+    iota(scratch.sortedOverlapIndices.begin(),
+         scratch.sortedOverlapIndices.end(), 0U);
+    sort(scratch.sortedOverlapIndices.begin(),
+         scratch.sortedOverlapIndices.end(),
+         [&](uint32_t a, uint32_t b) {
+             return scratch.overlaps[a].confirmedMismatchCount >
+                    scratch.overlaps[b].confirmedMismatchCount;
+         });
+
+    for (uint32_t idx : scratch.sortedOverlapIndices) {
+        auto& ov = scratch.overlaps[idx];
+        if (ov.confirmedSiteCount == 0) {
+            ov.isMatch = 1;
+            continue;
+        }
+        if (ov.confirmedMismatchCount > 0) {
+            ov.isMatch = 2; // trans
+            ov.strong = 1;
+        } else {
+            ov.isMatch = 1; // cis
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 3: Consistency check.
+    //
+    // Build a set of "trans-confirmed" sites: confirmed sites where at
+    // least one trans overlap has a mismatch. Then re-check all cis
+    // overlaps — if a cis overlap has a mismatch at any trans-confirmed
+    // site, flip it to trans.
+    // ----------------------------------------------------------------
+
+    // scratch.flag[si] = 1 means site si is trans-confirmed.
+    scratch.flag.assign(scratch.sites.size(), 0);
+
+    // Mark trans-confirmed sites.
+    for (uint32_t si = 0; si < uint32_t(scratch.sites.size()); si++) {
+        const auto& site = scratch.sites[si];
+        if (site.dpChainId < 0) continue;
+        for (uint32_t ei = site.evidenceBegin; ei < site.evidenceEnd; ei++) {
+            const auto& ev = scratch.evidence[ei];
+            if (ev.isAlt && scratch.overlaps[ev.overlapIdx].isMatch == 2) {
+                scratch.flag[si] = 1;
+                break;
+            }
+        }
+    }
+
+    // Flip cis overlaps that mismatch at trans-confirmed sites.
+    for (uint32_t si = 0; si < uint32_t(scratch.sites.size()); si++) {
+        if (scratch.flag[si] == 0) continue;
+        const auto& site = scratch.sites[si];
+        for (uint32_t ei = site.evidenceBegin; ei < site.evidenceEnd; ei++) {
+            const auto& ev = scratch.evidence[ei];
+            auto& ov = scratch.overlaps[ev.overlapIdx];
+            if (ov.isMatch == 1 && ev.isAlt) {
+                ov.isMatch = 2; // flip cis → trans
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4: multi_check — weak site promotion.
+    //
+    // Catches overlaps that the DP missed because individual sites
+    // didn't meet the strict threshold. Steps:
+    //   a) Identify "weak sites": evidence positions with occ_0 >= 2
+    //      and occ_1 >= 2 that are NOT already DP-confirmed.
+    //   b) For each cis overlap, collect its weak mismatch positions.
+    //      Require count >= alignLength * 0.04.
+    //   c) Apply 32bp proximity filter (remove clustered sites).
+    //      Require >= 2 surviving positions per overlap.
+    //   d) Positions appearing in >= 2 overlaps get "promoted".
+    //   e) Cis overlaps with mismatches at promoted positions → trans.
+    // ----------------------------------------------------------------
+
+    {
+        // (a) Build set of confirmed site positions for exclusion.
+        vector<uint32_t> confirmedPositions;
+        for (const auto& site : scratch.sites) {
+            if (site.dpChainId >= 0) {
+                confirmedPositions.push_back(site.site);
+            }
+        }
+        sort(confirmedPositions.begin(), confirmedPositions.end());
+
+        // Identify weak sites by grouping evidence by position.
+        struct WeakSiteInfo {
+            uint32_t site;
+            uint32_t matchCount;
+            uint32_t altCount;
+        };
+        vector<WeakSiteInfo> weakSites;
+
+        size_t ei = 0;
+        while (ei < scratch.evidence.size()) {
+            const uint32_t pos = scratch.evidence[ei].site;
+            size_t groupEnd = ei;
+            uint32_t mc = 0, ac = 0;
+            while (groupEnd < scratch.evidence.size() &&
+                   scratch.evidence[groupEnd].site == pos) {
+                if (scratch.evidence[groupEnd].isAlt) ac++;
+                else mc++;
+                groupEnd++;
+            }
+            mc += 1; // +1 for query read
+
+            bool isConfirmed = binary_search(
+                confirmedPositions.begin(), confirmedPositions.end(), pos);
+            if (!isConfirmed && mc >= 2 && ac >= 2) {
+                weakSites.push_back({pos, mc, ac});
+            }
+            ei = groupEnd;
+        }
+
+        if (!weakSites.empty()) {
+            // (b) Build per-overlap list of weak mismatch positions.
+            vector<uint32_t> weakPositions;
+            for (const auto& ws : weakSites) {
+                weakPositions.push_back(ws.site);
+            }
+
+            const uint32_t numOv = uint32_t(scratch.overlaps.size());
+            vector<vector<uint32_t>> overlapWeakMismatches(numOv);
+            for (const auto& ev : scratch.evidence) {
+                if (!ev.isAlt) continue;
+                if (ev.overlapIdx >= numOv) continue;
+                if (binary_search(weakPositions.begin(), weakPositions.end(), ev.site)) {
+                    overlapWeakMismatches[ev.overlapIdx].push_back(ev.site);
+                }
+            }
+
+            // (c-d) For each cis overlap, apply density + proximity filters,
+            //       then collect promotion candidates.
+            vector<uint32_t> promotionCandidates;
+
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                const auto& ov = scratch.overlaps[oi];
+                if (ov.isMatch == 2) continue; // already trans
+
+                auto& overlapWeakSites = overlapWeakMismatches[oi];
+                if (overlapWeakSites.empty()) continue;
+
+                // Density filter: need >= 4% of alignment length.
+                const uint32_t alignLen = ov.qe - ov.qs;
+                if (overlapWeakSites.size() < uint32_t(double(alignLen) * 0.04)) continue;
+
+                // 32bp proximity filter: remove sites within 32bp of neighbors.
+                sort(overlapWeakSites.begin(), overlapWeakSites.end());
+                vector<uint32_t> filtered;
+                for (size_t i = 0; i < overlapWeakSites.size(); i++) {
+                    bool tooClose = false;
+                    if (i > 0 && overlapWeakSites[i] - overlapWeakSites[i-1] < 32)
+                        tooClose = true;
+                    if (i + 1 < overlapWeakSites.size() &&
+                        overlapWeakSites[i+1] - overlapWeakSites[i] < 32)
+                        tooClose = true;
+                    if (!tooClose) filtered.push_back(overlapWeakSites[i]);
+                }
+
+                if (filtered.size() >= 2) {
+                    for (uint32_t pos : filtered) {
+                        promotionCandidates.push_back(pos);
+                    }
+                }
+            }
+
+            // (d) Positions appearing in >= 2 overlaps get promoted.
+            sort(promotionCandidates.begin(), promotionCandidates.end());
+            vector<uint32_t> promotedPositions;
+            for (size_t i = 0; i < promotionCandidates.size(); ) {
+                const uint32_t pos = promotionCandidates[i];
+                size_t count = 0;
+                while (i < promotionCandidates.size() &&
+                       promotionCandidates[i] == pos) {
+                    count++;
+                    i++;
+                }
+                if (count >= 2) {
+                    promotedPositions.push_back(pos);
+                }
+            }
+
+            // (e) Flip cis overlaps with mismatches at promoted positions.
+            if (!promotedPositions.empty()) {
+                for (const auto& ev : scratch.evidence) {
+                    if (!ev.isAlt) continue;
+                    auto& ov = scratch.overlaps[ev.overlapIdx];
+                    if (ov.isMatch != 1) continue;
+                    if (binary_search(promotedPositions.begin(),
+                                      promotedPositions.end(), ev.site)) {
+                        ov.isMatch = 2;
                     }
                 }
             }
         }
     }
-
-    return finalKept;
 }
 
-void AssemblerPhasing::collectHaplotypeEvidence(
+// ============================================================================
+// phaseLargeIndels: detect >=16 bp SVs from CIGARs, cluster, phase
+//
+// Port of hifiasm's rphase_lidel (Correct.cpp:20155).
+//
+// Only considers cis overlaps (is_match == 1). Four steps:
+//   Step 1 — Walk CIGARs and detect contiguous indel regions >= 16 bp.
+//   Step 2 — Sort SV events by query position.
+//   Step 3 — Cluster events by >= 50% position overlap (BFS connected
+//            components), with target-read dedup within each cluster.
+//   Step 4 — For each cluster with >= 3 unique targets and >= 3 spanning
+//            cis overlaps, label the SV-carrying overlaps as trans.
+// ============================================================================
+
+static void phaseLargeIndels(
     const Assembler& assembler,
-    const PhasingOverlap& overlap,
-    std::vector<HaplotypeEvidence>& evidenceOut,
-    const PhasingConfig& config)
+    ReadId queryReadId,
+    uint32_t queryLen,
+    PhasingScratchpad& scratch)
 {
-    (void)config;
-    const auto& reads = assembler.getReads();
-    
-    // Load Sequences
-    // Using `getRead` which returns a Read view.
-    // Target (Strand 0)
-    const auto rT = reads.getRead(overlap.targetReadId);
-    // Query (Oriented)
-    const auto rQ_raw = reads.getRead(overlap.queryReadId);
-    
-    std::vector<Base> seqQ;
-    bool queryIsRC = (overlap.queryStrand == 1);
-    
-    // We need random access to Query sequence.
-    // If RC, we build the RC sequence in memory.
-    // If NOT RC, we can access rQ_raw directly.
-    
-    if (queryIsRC) {
-        seqQ.reserve(rQ_raw.baseCount);
-        // Correct RC construction: reverse and complement
-        for(size_t i=0; i<rQ_raw.baseCount; ++i) {
-             seqQ.push_back(rQ_raw[rQ_raw.baseCount - 1 - i].complement());
-        }
-    }
-    
-    // Helper access
-    auto getQueryBase = [&](uint32_t idx) -> Base {
-        if (queryIsRC) return seqQ[idx];
-        return rQ_raw[idx];
-    };
-    
-    uint32_t tPos = overlap.targetStart;
-    uint32_t qPos = overlap.queryStart; // Used from new PhasingOverlap fields
+    const auto& cigarStore = assembler.getOverlapCigarStore();
 
-    size_t qSeqLen = rQ_raw.baseCount; // baseCount is valid member
-    size_t tSeqLen = rT.baseCount;
+    // ----------------------------------------------------------------
+    // Step 1: Detect SV events from cis overlaps.
+    //
+    // Walk each cis overlap's CIGAR. Contiguous indel runs (ins/del ops)
+    // whose span or base count >= SV_MIN_LEN (16) are recorded as
+    // PhasingSvEvents. RC overlaps have their coordinates converted to
+    // forward-strand afterward.
+    // ----------------------------------------------------------------
 
-    // Iterate CIGAR
-    for(uint32_t val : overlap.cigar) {
-        uint32_t op = val & 0xF;
-        uint32_t len = val >> 4;
-        
-        if (op == 3) { // Blind Match
-            tPos += len;
-            qPos += len;
-        } else if (op == 0) { // Match/Mismatch
-            for(uint32_t k=0; k<len; ++k) {
-                if(tPos >= tSeqLen || qPos >= qSeqLen) break; 
-                
-                Base bT = rT[tPos]; // Valid operator[]
-                Base bQ = getQueryBase(qPos);
-                
-                if (bT != bQ) {
-                     HaplotypeEvidence ev;
-                     ev.site = tPos;
-                     ev.base = bQ.value;
-                     ev.type = 1;
-                     ev.isSolid = 1;
-                     // overlapId set by caller
-                     evidenceOut.push_back(ev); 
-                }
-                tPos++;
-                qPos++;
+    for (uint32_t oi = 0; oi < uint32_t(scratch.overlaps.size()); oi++) {
+        const auto& ov = scratch.overlaps[oi];
+        if (ov.isMatch != 1) continue; // only cis overlaps
+
+        const auto& ad = assembler.alignmentData[ov.alignmentId];
+
+        // Walk the full CIGAR and detect contiguous error regions.
+        uint32_t indelRunStart = UINT32_MAX;
+        uint32_t indelRunEnd = 0;
+        uint32_t indelRunBases = 0;
+
+        auto flushRun = [&]() {
+            if (indelRunStart == UINT32_MAX) return;
+            uint32_t runLen = indelRunEnd - indelRunStart;
+            if (runLen >= PHASING_SV_MIN_LEN || indelRunBases >= PHASING_SV_MIN_LEN) {
+                PhasingSvEvent ev;
+                ev.overlapIdx = oi;
+                ev.queryPos = indelRunStart;
+                ev.queryEnd = indelRunEnd;
+                ev.errorBases = indelRunBases;
+                scratch.svEvents.push_back(ev);
             }
-        } else if (op == 1) { // Insert (in Query)
-            qPos += len;
-        } else if (op == 2) { // Deletion (Gap in Query)
-             for(uint32_t k=0; k<len; ++k) {
-                 if(tPos >= tSeqLen) break;
-                 // Hifiasm heuristic check (mismatchCount not available here, assuming it's a placeholder for a more complex check)
-                 // if(mismatchCount > 3) continue; 
+            indelRunStart = UINT32_MAX;
+            indelRunEnd = 0;
+            indelRunBases = 0;
+        };
 
-        // Check Homopolymer Context (Simple Sequence Check)
-        // If site is in a simple homopolymer run > X, flag/filter?
-        // Hifiasm `hpc_mask_ff` is complex.
-        // For strictest parity, we could check sequence context here.
-        // Assuming pre-aligned CIGAR handles most, but we can check adjacent bases.
-        // For now, relying on `is_st_bs` which catches artifacts effectively.
-        // Adding TODO for full hpc_mask_ff parity if strictly needed.
+        OverlapCigarStore::Cursor cursor;
+        cursor.reset(ov.cigarOffset, ov.cigarTokenCount,
+            ad.qs, cigarRead1Start(assembler, ad), cigarStore);
 
-        // Store Evidence
-        HaplotypeEvidence ev;
-        ev.overlapId = overlap.alnIdx; // Temp usage, sorted/grouped later
-                 ev.site = tPos;
-                 ev.base = 4; // Gap
-                 ev.type = 1;
-                 ev.isSolid = 0;
-        ev.isSameStrand = (overlap.queryStrand == 0); // Parity: Same strand check
-        
-        evidenceOut.push_back(ev);
-                 tPos++;
-             }
+        // Track SV events in oriented coordinates during the walk,
+        // then convert to forward coordinates afterward.
+        const bool qNeedsRc =
+            (ov.queryIsRead0 == 0) && (ov.isRev != 0);
+        const size_t svEventsBefore = scratch.svEvents.size();
+
+        cigarStore.walkRangeWithCursor(
+            cursor, 0, UINT32_MAX,
+            [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
+                // Map to query position (oriented coordinates).
+                uint32_t qpos = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
+
+                if (op == 2 || op == 3) { // insertion or deletion
+                    if (indelRunStart == UINT32_MAX) {
+                        indelRunStart = qpos;
+                    }
+                    // Compute how many query bases this op spans.
+                    // When queryIsRead0: query=xk, op3 (del) advances xk, op2 (ins) doesn't.
+                    // When !queryIsRead0: query=yk, op2 (ins) advances yk, op3 (del) doesn't.
+                    const bool queryAdvances = ov.queryIsRead0 ? (op == 3) : (op == 2);
+                    indelRunEnd = qpos + (queryAdvances ? len : 0);
+                    if (indelRunEnd <= indelRunStart) {
+                        indelRunEnd = indelRunStart + 1;
+                    }
+                    indelRunBases += len;
+                } else {
+                    // Match or mismatch — flush any pending indel run.
+                    flushRun();
+                }
+            });
+        flushRun();
+
+        // Convert RC-coordinate SV events to forward coordinates.
+        if (qNeedsRc) {
+            for (size_t ei = svEventsBefore; ei < scratch.svEvents.size(); ei++) {
+                auto& ev = scratch.svEvents[ei];
+                uint32_t fwdStart = queryLen - ev.queryEnd;
+                uint32_t fwdEnd = queryLen - ev.queryPos;
+                ev.queryPos = fwdStart;
+                ev.queryEnd = fwdEnd;
+            }
+        }
+    }
+
+    if (scratch.svEvents.empty()) return;
+
+    // ----------------------------------------------------------------
+    // Step 2: Sort SV events by query position.
+    // ----------------------------------------------------------------
+
+    sort(scratch.svEvents.begin(), scratch.svEvents.end(),
+        [](const PhasingSvEvent& a, const PhasingSvEvent& b) {
+            return a.queryPos < b.queryPos;
+        });
+
+    // ----------------------------------------------------------------
+    // Step 3: Cluster by position overlap >= 50% with target-read dedup.
+    //
+    // BFS connected components: events are sorted by position, and we
+    // greedily merge events that overlap the current cluster by >= 50%
+    // of the smaller span. Within each cluster, deduplicate by target
+    // read (keep first per target).
+    // ----------------------------------------------------------------
+
+    {
+        const size_t nev = scratch.svEvents.size();
+
+        // Assign cluster IDs via greedy merge.
+        vector<int32_t> clusterId(nev, -1);
+        int32_t nextCluster = 0;
+
+        for (size_t i = 0; i < nev; i++) {
+            if (clusterId[i] >= 0) continue;
+
+            // Start a new cluster with event i.
+            clusterId[i] = nextCluster;
+            uint32_t cStart = scratch.svEvents[i].queryPos;
+            uint32_t cEnd = scratch.svEvents[i].queryEnd;
+
+            // BFS: try to add subsequent events.
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (size_t j = i + 1; j < nev; j++) {
+                    if (clusterId[j] >= 0) continue;
+                    const auto& ev = scratch.svEvents[j];
+                    if (ev.queryPos > cEnd) break; // sorted, no more overlap
+
+                    uint32_t oStart = max(cStart, ev.queryPos);
+                    uint32_t oEnd = min(cEnd, ev.queryEnd);
+                    int32_t overlap = int32_t(oEnd) - int32_t(oStart);
+
+                    uint32_t cSpan = cEnd - cStart;
+                    uint32_t eSpan = ev.queryEnd - ev.queryPos;
+                    uint32_t minSpan = min(cSpan, eSpan);
+
+                    if (overlap > 0 && uint32_t(overlap) >= minSpan / 2) {
+                        clusterId[j] = nextCluster;
+                        cStart = min(cStart, ev.queryPos);
+                        cEnd = max(cEnd, ev.queryEnd);
+                        changed = true;
+                    }
+                }
+            }
+
+            // Build cluster with target-read dedup.
+            PhasingSvCluster cluster;
+            cluster.consensusPos = cStart;
+            cluster.consensusEnd = cEnd;
+            cluster.eventBegin = uint32_t(i);
+            cluster.eventCount = 0;
+
+            // Collect unique target reads in this cluster.
+            vector<uint32_t> seenTargets;
+            for (size_t j = i; j < nev; j++) {
+                if (clusterId[j] != nextCluster) continue;
+                const uint32_t tid = scratch.overlaps[scratch.svEvents[j].overlapIdx].targetReadId;
+                bool dup = false;
+                for (uint32_t t : seenTargets) {
+                    if (t == tid) { dup = true; break; }
+                }
+                if (!dup) {
+                    seenTargets.push_back(tid);
+                    cluster.eventCount++;
+                }
+            }
+            cluster.eventEnd = uint32_t(nev); // will scan by clusterId
+            scratch.svClusters.push_back(cluster);
+            nextCluster++;
+        }
+
+        // ---- Step 4: Label overlaps in qualifying clusters. ----
+        // Require >= 3 unique targets in the cluster AND >= 3 cis overlaps
+        // spanning the cluster's consensus region.
+        for (int32_t ci = 0; ci < nextCluster; ci++) {
+            const auto& cluster = scratch.svClusters[ci];
+            if (cluster.eventCount < 3) continue; // need >= 3 unique targets (hifiasm c_sz=3)
+
+            // Count how many cis overlaps span this region.
+            uint32_t spanCount = 0;
+            for (const auto& ov : scratch.overlaps) {
+                if (ov.isMatch != 1) continue;
+                if (ov.qs <= cluster.consensusPos && ov.qe >= cluster.consensusEnd) {
+                    spanCount++;
+                }
+            }
+            if (spanCount < 3) continue;
+
+            // Overlaps with SV events in this cluster → trans.
+            for (size_t ei = 0; ei < nev; ei++) {
+                if (clusterId[ei] != ci) continue;
+                auto& ov = scratch.overlaps[scratch.svEvents[ei].overlapIdx];
+                if (ov.isMatch == 1) {
+                    ov.isMatch = 2;
+                }
+            }
         }
     }
 }
 
-// Parity with `comput_sc_rphase`
-// Returns 1 if consistent, INT64_MIN if inconsistent.
-// Consistency check: Do shared overlaps show same alleles?
-static int64_t computeLinkScore(
-    uint32_t siteI, uint32_t siteJ,
-    const std::vector<const HaplotypeEvidence*>& evI,
-    const std::vector<const HaplotypeEvidence*>& evJ) 
+// ============================================================================
+// dedupChains: reduce to one overlap per target read
+//
+// Port of hifiasm's dedup_chains (ecovlp.cpp:2984).
+//
+// For each target read, keep the best overlap by:
+//   1. Lower is_match wins (cis preferred over trans)
+//   2. Higher score wins: score = (qe - qs) - 12 * errors
+// ============================================================================
+
+static void dedupChains(
+    PhasingScratchpad& scratch)
 {
-    if(siteI == siteJ) return -2e18; // Logic invalid
+    if (scratch.overlaps.empty()) return;
 
-    // Intersection
-    size_t k = 0, m = 0;
-    int nn0 = 0; // Shared Ref support
-    int nn1 = 0; // Shared Alt support
-    
-    // ev lists are sorted by overlapId (pre-condition)
-    while(k < evI.size() && m < evJ.size()) {
-        uint32_t ovI = evI[k]->overlapId;
-        uint32_t ovJ = evJ[m]->overlapId;
-        
-        if(ovI < ovJ) { k++; continue; }
-        else if(ovJ < ovI) { m++; continue; }
-        else {
-            // Same overlap covers both sites.
-            // Check consistency:
-            // Type 0 = Match(Ref), Type 1 = Variant(Alt)
-            int typeI = (evI[k]->type == 0) ? 0 : 1;
-            int typeJ = (evJ[m]->type == 0) ? 0 : 1;
-            
-            if(typeI != typeJ) return -2e18; // Inconsistent (Phase Switch)
-            
-            // Consistent!
-            if(typeI == 0) nn0++;
-            else nn1++;
+    // Sort by (targetReadId, isMatch, score desc, span desc).
+    // Matches hifiasm dedup_chains: lower isMatch wins (1=cis < 2=trans),
+    // then higher score = span - 12*errors, then higher span as tiebreaker.
+    sort(scratch.overlaps.begin(), scratch.overlaps.end(),
+        [&](const PhasingOverlap& a, const PhasingOverlap& b) {
+            if (a.targetReadId != b.targetReadId)
+                return a.targetReadId < b.targetReadId;
+            if (a.isMatch != b.isMatch)
+                return a.isMatch < b.isMatch;
+            // Quality-adjusted score: span - 12 * errors.
+            int32_t spanA = int32_t(a.qe - a.qs);
+            int32_t spanB = int32_t(b.qe - b.qs);
+            int32_t scoreA = spanA - 12 * int32_t(a.errorCount);
+            int32_t scoreB = spanB - 12 * int32_t(b.errorCount);
+            if (scoreA != scoreB)
+                return scoreA > scoreB;
+            return spanA > spanB;
+        });
 
-            k++; m++;
+    // Keep first per target (best by sort order).
+    size_t write = 0;
+    for (size_t i = 0; i < scratch.overlaps.size(); i++) {
+        if (i > 0 &&
+            scratch.overlaps[i].targetReadId ==
+            scratch.overlaps[i-1].targetReadId) {
+            continue;
         }
+        scratch.overlaps[write++] = scratch.overlaps[i];
     }
-    
-    // Hifiasm Parity (comput_sc_rphase):
-    // Requires both Ref and Alt support to be confident.
-    // Line 9280: if(nn[0] > 0 && nn[1] > 0) return 1;
-    
-    if(nn0 > 0 && nn1 > 0) return 1;
-    return -2e18; // Insufficient dual-haplotype support
+    scratch.overlaps.resize(write);
 }
 
-std::vector<uint32_t> AssemblerPhasing::generatePhasingDP(
-    ReadId /* targetReadId */,
-    const std::vector<PhasingOverlap>& overlaps,
-    const std::vector<HaplotypeEvidence>& evidence,
-    std::vector<SnpStats>& outStats,
-    const PhasingConfig& config)
+// ============================================================================
+// writeResults: write phasing labels back to AlignmentData
+// ============================================================================
+
+static void writeResults(
+    Assembler& assembler,
+    ReadId queryReadId,
+    const PhasingScratchpad& scratch)
 {
-    outStats.clear();
-    
-    // 1. Identify Candidate Sites & Build Lookup
-    std::map<uint32_t, std::vector<const HaplotypeEvidence*>> siteEvidence;
-    // Iterate sequentially to group by site
-    
-    for(const auto& ev : evidence) {
-        siteEvidence[ev.site].push_back(&ev);
-    }
-    
-    struct Candidate {
-        uint32_t site;
-        uint32_t occ_0;
-        uint32_t occ_1;
-        uint32_t overlap_num; // RefSameStrand
-    };
-    std::vector<Candidate> candidates;
-    
-    for(auto& [site, evList] : siteEvidence) {
-        uint32_t occ0 = 0;
-        uint32_t occ1 = 0;
-        uint32_t overlap_num = 0; // Hifiasm Parity: Ref Same Strand
+    for (const auto& ov : scratch.overlaps) {
+        auto& ad = assembler.alignmentData[ov.alignmentId];
 
-        for(auto* e : evList) {
-             if(e->type == 0) {
-                 occ0++;
-                 if(e->isSameStrand) overlap_num++; 
-             }
-             else occ1++;
-        }
-
-        // Hifiasm Pre-filter: !is_st_bs
-        // Also: Hifiasm Line 10560: if(rev_n == occ_0) return 0 -> discard if ALL Ref reads are same strand
-        if(occ0 >= 2 && occ1 >= 2) {
-             // Check: NOT all Ref reads on same strand (would indicate strand bias)
-             if(overlap_num != occ0) { // At least one Ref read on opposite strand
-                 if(!is_st_bs(overlap_num, occ0, config.st_rate, config.st_max)) {
-                     // Hifiasm Line 10571: occ_0 = 1 + occ_0 (adds target read count)
-                     candidates.push_back({site, occ0 + 1, occ1, overlap_num + 1}); // +1 for self
-                 }
-             }
-        }
+        // Per-read-perspective match state. Each thread writes to a different
+        // field (state0 vs state1) based on queryReadId, so no race.
+        ad.setHifiasmEcMatchStateFromReadPerspective(queryReadId, ov.isMatch);
     }
-    
-    // Sort evidence lists by overlapId for computeLinkScore intersection
-    for(auto& [site, evList] : siteEvidence) {
-        std::sort(evList.begin(), evList.end(), [](const HaplotypeEvidence* a, const HaplotypeEvidence* b){
-            return a->overlapId < b->overlapId;
+}
+
+// ============================================================================
+// phaseOverlaps: threaded entry point
+//
+// Iterates over all reads, running the full phasing pipeline per read.
+// Thread-local PhasingScratchpad avoids per-read allocation.
+// ============================================================================
+
+void Assembler::phaseOverlaps(uint64_t threadCount)
+{
+    cout << timestamp << "=== ONT Overlap Phasing Pipeline ===" << endl;
+
+    const uint64_t readCount = getReads().readCount();
+    cout << timestamp << "Read count: " << readCount << endl;
+    cout << timestamp << "Thread count: " << threadCount << endl;
+
+    if (readCount == 0) {
+        cout << timestamp << "No reads to phase." << endl;
+        return;
+    }
+
+    // Counters for progress reporting.
+    atomic<uint64_t> readsProcessed(0);
+    atomic<uint64_t> readsWithOverlaps(0);
+    atomic<uint64_t> readsWithSites(0);
+    atomic<uint64_t> totalCis(0);
+    atomic<uint64_t> totalTrans(0);
+
+    // Static block scheduling (same pattern as performHifiasmECParity).
+    vector<thread> threads;
+    uint64_t chunkSize = readCount / threadCount;
+    if (chunkSize == 0) chunkSize = 1;
+
+    for (uint64_t t = 0; t < threadCount; t++) {
+        threads.emplace_back([&, t]() {
+            const uint64_t start = t * chunkSize;
+            if (start >= readCount) return;
+            const uint64_t end = min((t + 1) * chunkSize, readCount);
+
+            PhasingScratchpad scratch;
+
+            for (uint64_t rid = start; rid < end; rid++) {
+                const ReadId readId(rid);
+                scratch.clear();
+
+                // 1. Gather overlaps.
+                gatherOverlaps(*this, readId, scratch);
+                if (scratch.overlaps.empty()) {
+                    readsProcessed++;
+                    continue;
+                }
+                readsWithOverlaps++;
+
+                // 2. Unpack query sequence.
+                const uint32_t queryLen =
+                    uint32_t(getReads().getRead(readId).baseCount);
+                unpackQuerySequence(*this, readId, queryLen, scratch);
+
+                // 3. Sliding-window SNP detection.
+                detectSnpSites(*this, readId, queryLen, scratch);
+
+                // 4. Build SNP matrix (filter + confirm sites).
+                buildSnpMatrix(scratch);
+
+                // 4b. Remove adjacent sites (positions p and p+1).
+                filterAdjacentSites(scratch);
+
+                if (!scratch.sites.empty()) {
+                    readsWithSites++;
+
+                    // 5. DP phasing.
+                    // hetCov = number of overlaps (proxy for local coverage).
+                    const uint32_t hetCov = uint32_t(scratch.overlaps.size());
+                    runDpPhasing(scratch, hetCov);
+
+                    // 6. Allele grouping (cis/trans labeling).
+                    labelCisTrans(scratch);
+
+                    // 7. Large indel phasing.
+                    phaseLargeIndels(*this, readId, queryLen, scratch);
+                }
+
+                // 8. Dedup chains (best overlap per target).
+                dedupChains(scratch);
+
+                // 9. Write results back.
+                writeResults(*this, readId, scratch);
+
+                // Count labels for reporting.
+                for (const auto& ov : scratch.overlaps) {
+                    if (ov.isMatch == 1) totalCis++;
+                    else if (ov.isMatch == 2) totalTrans++;
+                }
+
+                readsProcessed++;
+
+                // Progress reporting every 10000 reads.
+                const uint64_t n = readsProcessed.load();
+                if (n % 10000 == 0) {
+                    cout << timestamp << "Phased " << n << " / "
+                         << readCount << " reads" << endl;
+                }
+            }
         });
     }
-    
-    if(candidates.empty()) {
-        std::vector<uint32_t> kept(overlaps.size());
-        std::iota(kept.begin(), kept.end(), 0);
-        return kept;
-    }
 
-    // 2. DP Chaining (O(N^2))
-    int n = (int)candidates.size();
-    std::vector<int64_t> f(n, 0); 
-    std::vector<int> p(n, -1);
-    
-    int64_t maxScoreGlobal = 0;
-    
-    for(int i=0; i<n; ++i) {
-        f[i] = 1; // Base score (self)
-        
-        // Hifiasm Parity: No lookback limit (Full O(N^2))
-        // Hifiasm Line 9442: `for (j = i - 1; j >= st; --j)` where st=0.
-        
-        for(int j=i-1; j>=0; --j) {
-            // Check consistency
-            int64_t link = computeLinkScore(
-                candidates[i].site, candidates[j].site,
-                siteEvidence[candidates[i].site], siteEvidence[candidates[j].site]
-            );
-            
-            if(link > -1e17) { // Consistent
-                 if(f[j] + link > f[i]) {
-                     f[i] = f[j] + link;
-                     p[i] = j;
-                 }
-            }
-        }
-        
-        if(f[i] > maxScoreGlobal) {
-            maxScoreGlobal = f[i];
-        }
-    }
-    
-    // 3. Iterative Multi-Chain Extraction (Hifiasm Parity)
-    // Hifiasm sorts nodes by score and extracts disjoint chains until exhausted.
-    
-    // Sort indices by score descending
-    std::vector<int> sortedIndices(n);
-    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
-    std::sort(sortedIndices.begin(), sortedIndices.end(), [&](int a, int b){
-        return f[a] > f[b];
-    });
-    
-    std::vector<bool> visited(n, false);
-    
-    uint64_t cc = (config.hom_cov / 2); 
-    cc = (uint64_t)((double)cc * 0.70);
-    if (cc < 6) cc = 6;
-    
-    outStats.clear(); // Reset output
-    
-    // Helper for homopolymer filtering (Hifiasm Parity)
-    auto isHpcVec = [&](SnpStats& s) -> bool {
-        // Hifiasm logic: Subtract HP evidence (if tracked) and check robustness
-        // Since we don't track per-read HP status deeply yet, we check total counts against thresholds.
-        // Line 9396: if((occ0 < 2 || occ1 < 2) || !(occ0 >= s_hap_cov && occ1 >= infor_cov)) return true (invalid);
-        
-        if (s.occ_0 < 2 || s.occ_1 < 2) return true;
-        if (!(s.occ_0 >= (uint32_t)config.s_hap_cov && s.occ_1 >= (uint32_t)config.infor_cov)) return true;
-        return false; // Valid
-    };
+    for (auto& t : threads) t.join();
 
-    for(int startNode : sortedIndices) {
-        if(visited[startNode]) continue;
-        
-        // Extract Chain
-        std::vector<SnpStats> chain;
-        int curr = startNode;
-        while(curr != -1 && !visited[curr]) {
-            visited[curr] = true;
-            
-            SnpStats s;
-            s.site = candidates[curr].site;
-            s.occ_0 = candidates[curr].occ_0;
-            s.occ_1 = candidates[curr].occ_1;
-            s.overlap_num = candidates[curr].overlap_num; // Hifiasm Parity: RefSameStrand 
-            chain.push_back(s);
-            
-            curr = p[curr];
-        }
-        std::reverse(chain.begin(), chain.end());
-        
-        if(chain.empty()) continue;
-        
-        // Filter Chain (Hifiasm Logic)
-        if(chain.size() == 1) {
-            // Single site chain check
-            // Hifiasm Line 9493: if( (!is_hpc_vec(...)) && (occ0 >= cc) ) keep;
-             if (!isHpcVec(chain[0]) && chain[0].occ_0 >= cc) {
-                 outStats.push_back(chain[0]);
-             }
-        } else {
-            // Multi-site chain: Filter individual sites by cc
-            // Hifiasm Line 9542: if(occ_0 >= cc) keep;
-            // Note: Hifiasm DP multi-path check (line 9482) is complex, but for single-path it relies on chain score.
-            for(const auto& s : chain) {
-                if(s.occ_0 >= cc) {
-                    outStats.push_back(s);
-                }
-            }
-        }
-    }
-    
-    // Re-sort outStats by site as we might have merged chains out of order
-    std::sort(outStats.begin(), outStats.end(), [](const SnpStats& a, const SnpStats& b){
-        return a.site < b.site;
-    }); 
-    
-    // Note: Hifiasm also has logic for "plus" score calculation based on chain consistency.
-    // But since we backtracked the Optimal Chain from DP, we assume internal consistency (plus=1).
-    // The main filter is the coverage check `occ_0 >= cc`.
-
-    // 4. Score Overlaps based on Valid Chain
-    std::vector<uint32_t> keptIndices;
-    
-    for(size_t ovId=0; ovId<overlaps.size(); ++ovId) {
-        const auto& ov = overlaps[ovId];
-        
-        int score = 0;
-        uint32_t minT = ov.targetStart;
-        uint32_t maxT = ov.targetEnd;
-        
-        // Iterate only Valid Sites in range
-        for(const auto& s : outStats) {
-             if(s.site < minT) continue;
-             if(s.site > maxT) break;
-             
-             // Check valid site evidence for THIS overlap
-             const auto& evList = siteEvidence[s.site];
-             
-             // Binary search
-             auto it = std::lower_bound(evList.begin(), evList.end(), (uint32_t)ovId, 
-                [](const HaplotypeEvidence* a, uint32_t id) {
-                    return a->overlapId < id; 
-                });
-             
-             if(it != evList.end() && (*it)->overlapId == ovId) {
-                 if((*it)->type == 1) score++; // Alt support
-                 else score--; 
-             }
-        }
-        
-        if(score <= 0) {
-            keptIndices.push_back((uint32_t)ovId);
-        }
-    }
-
-    return keptIndices;
+    cout << timestamp << "Phasing complete." << endl;
+    cout << timestamp << "Reads processed: " << readsProcessed.load() << endl;
+    cout << timestamp << "Reads with overlaps: " << readsWithOverlaps.load() << endl;
+    cout << timestamp << "Reads with SNP sites: " << readsWithSites.load() << endl;
+    cout << timestamp << "Total cis labels: " << totalCis.load() << endl;
+    cout << timestamp << "Total trans labels: " << totalTrans.load() << endl;
 }
-
-
-// NEW: Returns phasing score per overlap (Hifiasm parity)
-// This matches Hifiasm's logic exactly: TRANS overlaps are classified but NOT removed
-std::vector<AssemblerPhasing::OverlapPhasingResult> AssemblerPhasing::getOverlapPhasingScores(
-    const Assembler& assembler,
-    ReadId targetReadId,
-    const std::vector<PhasingOverlap>& overlaps,
-    const PhasingConfig& config)
-{
-    std::vector<OverlapPhasingResult> results(overlaps.size(), {0, false});
-    
-    if (overlaps.empty()) return results;
-    
-    // Collect all haplotype evidence
-    std::vector<HaplotypeEvidence> evidence;
-    evidence.reserve(overlaps.size() * 10);
-    
-    for (size_t i = 0; i < overlaps.size(); ++i) {
-        size_t startSize = evidence.size();
-        collectHaplotypeEvidence(assembler, overlaps[i], evidence, config);
-        for (size_t k = startSize; k < evidence.size(); ++k) {
-            evidence[k].overlapId = (uint32_t)i;
-        }
-    }
-    
-    // DEBUG: Log evidence count for read 0
-    if (targetReadId == 0) {
-        std::cout << "  DEBUG getOverlapPhasingScores for read 0:" << std::endl;
-        std::cout << "    Overlaps: " << overlaps.size() << std::endl;
-        std::cout << "    Evidence items collected: " << evidence.size() << std::endl;
-    }
-    
-    if (evidence.empty()) {
-        // No evidence = all overlaps are CIS with no informative sites
-        if (targetReadId == 0) {
-            std::cout << "    WARNING: No evidence collected!" << std::endl;
-        }
-        return results;
-    }
-    
-    // Build site evidence map
-    std::map<uint32_t, std::vector<const HaplotypeEvidence*>> siteEvidence;
-    for (const auto& ev : evidence) {
-        siteEvidence[ev.site].push_back(&ev);
-    }
-    
-    // DEBUG: Log site count and type distribution
-    if (targetReadId == 0) {
-        std::cout << "    Unique sites: " << siteEvidence.size() << std::endl;
-        
-        // Count type distribution
-        uint64_t type0Count = 0, type1Count = 0;
-        for (const auto& ev : evidence) {
-            if (ev.type == 0) type0Count++;
-            else type1Count++;
-        }
-        std::cout << "    Type distribution: type0(Match)=" << type0Count 
-                  << ", type1(Mismatch)=" << type1Count << std::endl;
-        
-        // Show first 5 sites with their occ values
-        std::cout << "    Sample sites:" << std::endl;
-        int sampleCount = 0;
-        for (auto& [site, evList] : siteEvidence) {
-            if (sampleCount >= 5) break;
-            uint32_t occ0 = 0, occ1 = 0;
-            for (auto* e : evList) {
-                if (e->type == 0) occ0++;
-                else occ1++;
-            }
-            std::cout << "      Site " << site << ": occ0=" << occ0 << ", occ1=" << occ1 << std::endl;
-            sampleCount++;
-        }
-    }
-    
-    // Identify valid candidate sites (Hifiasm parity)
-    std::vector<SnpStats> validSites;
-    uint64_t rejectedLowOcc = 0, rejectedStrand = 0, rejectedStBs = 0;
-    
-    for (auto& [site, evList] : siteEvidence) {
-        uint32_t occ0 = 0, occ1 = 0, overlap_num = 0;
-        
-        for (auto* e : evList) {
-            if (e->type == 0) {
-                occ0++;
-                if (e->isSameStrand) overlap_num++;
-            } else {
-                occ1++;
-            }
-        }
-        
-        // Hifiasm filter: occ_0 >= 2 && occ_1 >= 2 && not-all-same-strand
-        if (occ0 < 2 || occ1 < 2) {
-            rejectedLowOcc++;
-        } else if (overlap_num == occ0) {
-            rejectedStrand++;
-        } else if (is_st_bs(overlap_num, occ0, config.st_rate, config.st_max)) {
-            rejectedStBs++;
-        } else {
-            validSites.push_back({site, occ0, occ1, overlap_num, 0, 0});
-        }
-    }
-    
-    // DEBUG: Log validation stats
-    if (targetReadId == 0) {
-        std::cout << "    Valid sites: " << validSites.size() << std::endl;
-        std::cout << "    Rejected (low occ): " << rejectedLowOcc << std::endl;
-        std::cout << "    Rejected (strand bias): " << rejectedStrand << std::endl;
-        std::cout << "    Rejected (is_st_bs): " << rejectedStBs << std::endl;
-    }
-    
-    // Sort evidence lists by overlapId for binary search
-    for (auto& [site, evList] : siteEvidence) {
-        std::sort(evList.begin(), evList.end(), 
-            [](const HaplotypeEvidence* a, const HaplotypeEvidence* b) {
-                return a->overlapId < b->overlapId;
-            });
-    }
-    
-    // Score each overlap (Hifiasm parity: +1 for Alt, -1 for Ref at valid sites)
-    for (size_t ovId = 0; ovId < overlaps.size(); ++ovId) {
-        const auto& ov = overlaps[ovId];
-        int score = 0;
-        bool hasInformative = false;
-        
-        for (const auto& s : validSites) {
-            if (s.site < ov.targetStart) continue;
-            if (s.site > ov.targetEnd) break;
-            
-            const auto& evList = siteEvidence[s.site];
-            
-            // Binary search for this overlap's evidence at this site
-            auto it = std::lower_bound(evList.begin(), evList.end(), (uint32_t)ovId,
-                [](const HaplotypeEvidence* a, uint32_t id) {
-                    return a->overlapId < id;
-                });
-            
-            if (it != evList.end() && (*it)->overlapId == ovId) {
-                hasInformative = true;
-                if ((*it)->type == 1) {
-                    score++;  // Alt support → TRANS
-                } else {
-                    score--;  // Ref support → CIS
-                }
-            }
-        }
-        
-        results[ovId].score = score;
-        results[ovId].hasInformativeSite = hasInformative;
-    }
-    
-    return results;
-}
-
-} // namespace dinara

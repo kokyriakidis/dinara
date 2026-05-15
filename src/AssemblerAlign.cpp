@@ -1087,9 +1087,6 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             // Check for large indels (>= 6 bases)
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
 
-            // Cis/Trans Status
-            thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
-            
             // Alignment covers an informative het site (counted per read perspective during EC parity)
             thisAlignmentData.informativeHetSiteCount0 = 0;
             thisAlignmentData.informativeHetSiteCount1 = 0;
