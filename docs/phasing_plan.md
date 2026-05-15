@@ -21,9 +21,11 @@ phaseOverlaps(threadCount)          ← entry point (AssemblerPhasing.cpp)
         │       │    └── periodic repeat mask (period 1–4, ±12 bp window)
         │       └── Pass 2: emit PhasingEvidence at all candidate positions
         ├── 4. buildSnpMatrix          — group evidence by site, filter, create PhasingSite
-        │       └── multi-alt: separate PhasingSite per qualifying alt base
+        │       ├── multi-alt: separate PhasingSite per qualifying alt base
+        │       └── reject position if all ref matches are forward-strand
         ├── 4b. filterAdjacentSites    — remove sites at positions p and p+1
         ├── 5. runDpPhasing            — O(n²) longest compatible chain
+        │       ├── pre-DP: exclude strand-biased sites (is_st_bs)
         │       ├── checkCompatibility: fi/fj classification via ev.siteIdx
         │       ├── isHpcDependent: reject single-site chains needing HPC evidence
         │       └── per-site matchCount >= cc check within multi-site chains
@@ -197,6 +199,12 @@ for each group of evidence at the same site position:
     matchCount += 1                     // +1 for query read itself
     fwdStrandCount = fwdStrandRefCount + 1
 
+    // Reject position if ALL matching overlaps are forward-strand
+    // (zero reverse-strand). Hifiasm: push_info (Correct.cpp:10567)
+    // checks rev_n == occ_0. This is a strict subset of the is_st_bs
+    // strand-bias check applied later in the DP.
+    if fwdStrandRefCount == matchCount - 1: skip this position
+
     // Create PhasingSite per qualifying alt base (multi-alt support).
     // Hifiasm creates separate SnpStats per alt base at the same position.
     lastSiteIdx = UINT32_MAX
@@ -293,9 +301,28 @@ entries before each surviving group. Our approach uses an explicit
 
 ### 5. runDpPhasing
 
-Port of hifiasm's `gen_rphase_dp0_single_path` (Correct.cpp:9428).
+Port of hifiasm's `gen_rphase_dp` + `gen_rphase_dp0_single_path`
+(Correct.cpp:9648, 9428).
 
-#### 5a. checkCompatibility (comput_sc_rphase)
+#### 5a. Pre-DP strand bias filter
+
+Hifiasm's `gen_rphase_dp` (Correct.cpp:9665) physically removes
+strand-biased sites before running the DP. We mark them as excluded
+instead and skip them during scoring and chain extraction.
+
+```
+// isStrandBiased: port of hifiasm's is_st_bs macro
+// st_rate = 0.05, st_max = 2
+// True when: reverse-strand count <= 2 AND forward fraction >= 95%
+for each site i:
+    if isStrandBiased(site[i]):
+        dpExcluded[i] = true
+```
+
+Excluded sites do not participate in the DP at all — they cannot be
+chain endpoints, chain members, or affect `checkCompatibility` calls.
+
+#### 5b. checkCompatibility (comput_sc_rphase)
 
 Tests whether two sites i and j are on the same haplotype block by
 checking if overlaps covering both show consistent allele assignments.
@@ -328,22 +355,25 @@ checkCompatibility(siteI, siteJ):
     return nn[0] > 0 and nn[1] > 0     // need evidence from both haplotypes
 ```
 
-#### 5b. DP and chain extraction
+#### 5c. DP and chain extraction
 
 ```
 cc = max(6, coveragePeak / 2 * 0.7)    // hifiasm: max(cut_bd, hom_cov/n_hap * cut_rate)
 
 // DP: iterate j from i-1 DOWN to 0 (hifiasm tie-breaking)
+// Excluded (strand-biased) sites are skipped entirely.
 for i = 1 to n-1:
+    if dpExcluded[i]: continue
     maxF = 1, maxJ = -1
     for j = i-1 down to 0:
+        if dpExcluded[j]: continue
         if not checkCompatibility(i, j): continue
         sc = dpScore[j] + 1
         if sc > maxF: maxF = sc, maxJ = j
     dpScore[i] = maxF, dpParent[i] = maxJ
 
-// Sort ALL sites by score descending (not just endpoints)
-sort sites by dpScore desc, index asc
+// Sort non-excluded sites by score descending (not just endpoints)
+sort non-excluded sites by dpScore desc, index asc
 
 // Greedy chain extraction
 for each site in sorted order:
@@ -355,7 +385,7 @@ for each site in sorted order:
 sort chains by length desc
 ```
 
-#### 5c. Chain confirmation
+#### 5d. Chain confirmation
 
 ```
 for each chain (longest first, up to 15 chains):
@@ -376,7 +406,7 @@ for each chain (longest first, up to 15 chains):
             dpChainId stays -1          // rejected even in confirmed chain
 ```
 
-#### 5d. isHpcDependent (is_hpc_vec)
+#### 5e. isHpcDependent (is_hpc_vec)
 
 ```
 isHpcDependent(siteIdx):
@@ -621,9 +651,10 @@ isStrandBiased(matchCount, fwdStrandCount):
 ```
 
 Parameters: `ST_RATE = 0.05`, `ST_MAX = 2`. Two variants:
-- `isStrandBiased(site)` — uses immutable `matchCount`/`fwdStrandCount` (for DP).
+- `isStrandBiased(site)` — uses immutable `matchCount`/`fwdStrandCount`
+  (pre-DP exclusion in §5a, and Steps A/B initial filtering).
 - `isLabelStrandBiased(site)` — uses mutable `labelMatchCount`/`labelFwdStrandCount`
-  (for greedy labeling, where counts change as trans overlaps are processed).
+  (greedy labeling, where counts change as trans overlaps are processed).
 
 ### 7. phaseLargeIndels
 
@@ -694,7 +725,7 @@ memory reused). Bounded by `threadCount > readCount` check.
 | `filterAdjacentSites` | adjacent-site filter | Correct.cpp:8855 |
 | `checkCompatibility` | `comput_sc_rphase` | Correct.cpp:9244 |
 | `isHpcDependent` | `is_hpc_vec` | Correct.cpp:9383 |
-| `runDpPhasing` | `gen_rphase_dp0_single_path` | Correct.cpp:9428 |
+| `runDpPhasing` | `gen_rphase_dp` + `gen_rphase_dp0_single_path` | Correct.cpp:9648, 9428 |
 | `labelCisTrans` | `generate_haplotypes_naive_HiFi` | Correct.cpp:8845 |
 | `phaseLargeIndels` | `rphase_lidel` + `rphase_lidel_cc` | Correct.cpp:20155 |
 | `dedupChains` | `dedup_chains` | ecovlp.cpp:2984 |

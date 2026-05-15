@@ -510,6 +510,12 @@ static void buildSnpMatrix(
         // +1 for query read (hifiasm: p->occ_0 = 1 + occ_0).
         matchCount += 1;
 
+        // Reject position if ALL matching overlaps are forward-strand
+        // (zero reverse-strand). Hifiasm: push_info rejects when
+        // rev_n == occ_0 (Correct.cpp:10567). This is a strict subset
+        // of the is_st_bs strand-bias check applied later in the DP.
+        if (fwdStrandRefCount == matchCount - 1) continue;
+
         // Identify qualifying alt bases and create PhasingSite entries.
         // Record the siteIdx for each qualifying base.
         uint32_t baseSiteIdx[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
@@ -851,9 +857,48 @@ static bool isHpcDependent(
 }
 
 // ============================================================================
+// isStrandBiased: hifiasm is_st_bs macro equivalent
+//
+// Returns true if a site has strand bias — nearly all ref-matching
+// overlaps come from one strand. Hifiasm parameters: st_rate=0.05, st_max=2.
+// ============================================================================
+
+static constexpr double PHASING_ST_RATE = 0.05;
+static constexpr uint32_t PHASING_ST_MAX = 2;
+
+static bool isStrandBiased(uint32_t matchCount, uint32_t fwdStrandCount)
+{
+    // fwdStrandCount = forward-strand ref overlaps + 1 (query)
+    // matchCount = total ref overlaps + 1 (query)
+    // Condition: reverse-strand count <= ST_MAX AND forward fraction >= (1 - ST_RATE)
+    if (fwdStrandCount + PHASING_ST_MAX >= matchCount &&
+        matchCount * PHASING_ST_RATE + fwdStrandCount >= matchCount) {
+        return true;
+    }
+    return false;
+}
+
+/// Check strand bias using immutable counts (for DP and initial labeling).
+static bool isStrandBiased(const PhasingSite& site)
+{
+    return isStrandBiased(site.matchCount, site.fwdStrandCount);
+}
+
+/// Check strand bias using mutable label counts (for greedy labeling).
+static bool isLabelStrandBiased(const PhasingSite& site)
+{
+    return isStrandBiased(site.labelMatchCount, site.labelFwdStrandCount);
+}
+
+// ============================================================================
 // runDpPhasing: longest compatible chain over confirmed SNP sites
 //
-// Port of hifiasm's gen_rphase_dp0_single_path (Correct.cpp:9428).
+// Port of hifiasm's gen_rphase_dp + gen_rphase_dp0_single_path
+// (Correct.cpp:9648, 9428).
+//
+// Pre-DP filter: strand-biased sites (is_st_bs) are excluded from the
+// DP entirely, matching hifiasm's gen_rphase_dp which physically removes
+// them before calling gen_rphase_dp0_single_path.
 //
 // LIS-style DP: f[i] = max(f[j] + 1) for all j < i where sites i and j
 // are compatible. Iterates j from i-1 down to 0 (hifiasm tie-breaking).
@@ -874,14 +919,27 @@ static void runDpPhasing(
 
     const uint32_t cc = max(6U, uint32_t(double(hetCov) * 0.7));
 
+    // Pre-DP filter: mark strand-biased sites for exclusion.
+    // Hifiasm (gen_rphase_dp, Correct.cpp:9665) physically removes
+    // strand-biased sites before running the DP. We mark them instead
+    // and skip them during scoring and chain assignment.
+    vector<bool> dpExcluded(n, false);
+    for (uint32_t i = 0; i < n; i++) {
+        if (isStrandBiased(scratch.sites[i])) {
+            dpExcluded[i] = true;
+        }
+    }
+
     scratch.dpScore.assign(n, 1);
     scratch.dpParent.assign(n, -1);
 
     // DP: iterate j from i-1 down to 0 (hifiasm tie-breaking: last
     // improving j wins, which is the smallest index due to reverse scan).
     for (uint32_t i = 1; i < n; i++) {
+        if (dpExcluded[i]) continue;
         int32_t maxF = 1, maxJ = -1;
         for (int32_t j = int32_t(i) - 1; j >= 0; j--) {
+            if (dpExcluded[uint32_t(j)]) continue;
             if (!checkCompatibility(scratch, i, uint32_t(j))) continue;
             int32_t sc = scratch.dpScore[uint32_t(j)] + 1;
             if (sc > maxF) {
@@ -897,6 +955,7 @@ static void runDpPhasing(
     // Hifiasm: encode (UINT32_MAX - f[i]) << 32 | i, radix sort.
     scratch.dpEndpoints.clear();
     for (uint32_t i = 0; i < n; i++) {
+        if (dpExcluded[i]) continue;
         scratch.dpEndpoints.push_back({scratch.dpScore[i], i});
     }
     sort(scratch.dpEndpoints.begin(), scratch.dpEndpoints.end(),
@@ -968,40 +1027,6 @@ static void runDpPhasing(
         }
         if (anyConfirmed) chainId++;
     }
-}
-
-// ============================================================================
-// isStrandBiased: hifiasm is_st_bs macro equivalent
-//
-// Returns true if a site has strand bias — nearly all ref-matching
-// overlaps come from one strand. Hifiasm parameters: st_rate=0.05, st_max=2.
-// ============================================================================
-
-static constexpr double PHASING_ST_RATE = 0.05;
-static constexpr uint32_t PHASING_ST_MAX = 2;
-
-static bool isStrandBiased(uint32_t matchCount, uint32_t fwdStrandCount)
-{
-    // fwdStrandCount = forward-strand ref overlaps + 1 (query)
-    // matchCount = total ref overlaps + 1 (query)
-    // Condition: reverse-strand count <= ST_MAX AND forward fraction >= (1 - ST_RATE)
-    if (fwdStrandCount + PHASING_ST_MAX >= matchCount &&
-        matchCount * PHASING_ST_RATE + fwdStrandCount >= matchCount) {
-        return true;
-    }
-    return false;
-}
-
-/// Check strand bias using immutable counts (for DP and initial labeling).
-static bool isStrandBiased(const PhasingSite& site)
-{
-    return isStrandBiased(site.matchCount, site.fwdStrandCount);
-}
-
-/// Check strand bias using mutable label counts (for greedy labeling).
-static bool isLabelStrandBiased(const PhasingSite& site)
-{
-    return isStrandBiased(site.labelMatchCount, site.labelFwdStrandCount);
 }
 
 // ============================================================================
