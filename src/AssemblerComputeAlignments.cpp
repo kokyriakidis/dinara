@@ -350,7 +350,6 @@ void Assembler::computeAlignmentDataFromChainedCandidatesOnly(
         thisAlignmentData.ts = alignment.ts;
         thisAlignmentData.te = alignment.te;
         thisAlignmentData.hasLargeIndel = false;
-        thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
         thisAlignmentData.informativeHetSiteCount0 = 0;
         thisAlignmentData.informativeHetSiteCount1 = 0;
         thisAlignmentData.informativeHetSiteScore = 0;
@@ -488,14 +487,21 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
 
             AlignmentData thisAlignmentData(candidate, alignmentInfo);
             
-            // Coordinates were extended to read boundaries during chaining.
-            thisAlignmentData.qs = alignment.qs;
-            thisAlignmentData.qe = alignment.qe;
-            thisAlignmentData.ts = alignment.ts;
-            thisAlignmentData.te = alignment.te;
+            // Store CIGAR boundary positions (marker-based, not extended).
+            // read0 is always strand 0 → forward coordinates.
+            thisAlignmentData.qs = projectedAlignment.cigarRead0Start;
+            thisAlignmentData.qe = projectedAlignment.cigarRead0End;
+            // read1 may be strand 1 → convert oriented coords to forward.
+            if (candidate.isSameStrand) {
+                thisAlignmentData.ts = projectedAlignment.cigarRead1Start;
+                thisAlignmentData.te = projectedAlignment.cigarRead1End;
+            } else {
+                const uint32_t tLen = uint32_t(sequenceViews[1].baseCount);
+                thisAlignmentData.ts = tLen - projectedAlignment.cigarRead1End;
+                thisAlignmentData.te = tLen - projectedAlignment.cigarRead1Start;
+            }
             
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
-            thisAlignmentData.cisTransStatus = CisTransStatus::Unknown;
             thisAlignmentData.informativeHetSiteCount0 = 0;
             thisAlignmentData.informativeHetSiteCount1 = 0;
             thisAlignmentData.informativeHetSiteScore = 0;
@@ -1165,7 +1171,7 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
         ReadId partner = invalidReadId;
         uint32_t errorCount = 0; // hifiasm-style non-homopolymer error count
         uint32_t span = 0;       // qe - qs (query span)
-        uint8_t isMatchRank = 1; // Stored hifiasm-style EC state for this query perspective
+        uint8_t isMatchRank = 1; // Hifiasm-style: 1=cis, 2=trans
         int64_t score = std::numeric_limits<int64_t>::min(); // span - 12*errorCount
     };
     vector<CandidateInfo> group;
@@ -1316,8 +1322,8 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
                     ((ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount) +
                     ((ad.info.gapCount == invalid<uint32_t>) ? 0U : ad.info.gapCount);
 
-                // Use the stored hifiasm-style EC match state for this query perspective
-                // instead of reconstructing it from DeleteReasonPhase.
+                // Hifiasm-style EC match state: 1=cis, 2=trans.
+                // Lower value (cis) is preferred in dedup.
                 const uint8_t isMatchRank = ad.getHifiasmEcMatchStateFromReadPerspective(r0);
 
                 // Score formula: span - 12*errors

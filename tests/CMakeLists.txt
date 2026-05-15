@@ -72,6 +72,7 @@ find_package(ZLIB REQUIRED)
 add_executable(test_integration
     test_integration.cpp
     test_overlap_cigar_store.cpp
+    test_phasing_coordinates.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )

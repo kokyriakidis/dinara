@@ -1026,6 +1026,8 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+    assembler.phaseOverlaps(threadCount);
+
     return;
     
 

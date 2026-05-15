@@ -297,6 +297,16 @@ void ProjectedAlignment::constructQuickRawSparse()
         cigarOffset = cigarStore->beginAlignment();
     }
 
+    // Record the CIGAR's boundary positions (first and last marker pairs).
+    // These are in oriented-read coordinates.
+    if(alignment.ordinals.size() >= 2) {
+        const auto lastIdx = alignment.ordinals.size() - 1;
+        cigarRead0Start = markers[0][alignment.ordinals[0][0]].position + kHalf;
+        cigarRead1Start = markers[1][alignment.ordinals[0][1]].position + kHalf;
+        cigarRead0End   = markers[0][alignment.ordinals[lastIdx][0]].position + kHalf;
+        cigarRead1End   = markers[1][alignment.ordinals[lastIdx][1]].position + kHalf;
+    }
+
     // Scoring parameters (hoisted out of the per-segment loop).
     const int64_t match = dpMatchScore;
     const int64_t mismatch = dpMismatchScore;

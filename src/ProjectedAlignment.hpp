@@ -256,4 +256,11 @@ public:
     // CIGAR location in the store's arena, populated when cigarStore is non-null.
     uint32_t cigarOffset     = uint32_t(-1);
     uint32_t cigarTokenCount = uint32_t(-1);
+
+    // CIGAR boundary positions (oriented-read coordinates).
+    // Set during constructQuickRawSparse.
+    uint32_t cigarRead0Start = 0;
+    uint32_t cigarRead1Start = 0;
+    uint32_t cigarRead0End   = 0;
+    uint32_t cigarRead1End   = 0;
 };
