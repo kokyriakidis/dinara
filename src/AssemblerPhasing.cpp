@@ -930,6 +930,150 @@ static void runDpPhasing(
         }
     }
 
+    // Fill incomplete evidence (port of hifiasm fill_incom, Correct.cpp:9597).
+    //
+    // For each overlap, if it has evidence at site positions A and C but
+    // not at intermediate site position B, add a synthetic match entry at
+    // B. The assumption: if an overlap covers a site position and has no
+    // evidence there, it's a match.
+    //
+    // Hifiasm does this in gen_rphase_dp (Correct.cpp:9749) before the DP.
+    // After adding incomplete entries, it recounts occ_0/occ_1/overlap_num.
+    {
+        // Collect non-excluded site positions in order.
+        vector<uint32_t> activeSitePositions;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!dpExcluded[i]) {
+                activeSitePositions.push_back(scratch.sites[i].site);
+            }
+        }
+        // Deduplicate positions (multi-alt sites share positions).
+        sort(activeSitePositions.begin(), activeSitePositions.end());
+        activeSitePositions.erase(
+            unique(activeSitePositions.begin(), activeSitePositions.end()),
+            activeSitePositions.end());
+
+        if (activeSitePositions.size() > 1) {
+            // Build position → index in activeSitePositions.
+            unordered_map<uint32_t, uint32_t> posToIdx;
+            for (uint32_t i = 0; i < uint32_t(activeSitePositions.size()); i++) {
+                posToIdx[activeSitePositions[i]] = i;
+            }
+
+            const uint32_t numOv = uint32_t(scratch.overlaps.size());
+            // Per-overlap: last seen position index in activeSitePositions.
+            // UINT32_MAX = not yet seen.
+            vector<uint32_t> lastPosIdx(numOv, UINT32_MAX);
+
+            // Collect incomplete entries: (overlapIdx, sitePosition).
+            vector<pair<uint32_t, uint32_t>> incompleteEntries;
+
+            // Walk evidence sorted by site position (already sorted).
+            for (const auto& ev : scratch.evidence) {
+                auto it = posToIdx.find(ev.site);
+                if (it == posToIdx.end()) continue; // position not active
+                uint32_t curPosIdx = it->second;
+                uint32_t oi = ev.overlapIdx;
+
+                if (lastPosIdx[oi] == UINT32_MAX) {
+                    // First time seeing this overlap — just record.
+                    lastPosIdx[oi] = curPosIdx;
+                } else if (curPosIdx > lastPosIdx[oi] + 1) {
+                    // Gap: add match entries for intermediate positions.
+                    for (uint32_t pi = lastPosIdx[oi] + 1; pi < curPosIdx; pi++) {
+                        incompleteEntries.push_back({oi, activeSitePositions[pi]});
+                    }
+                    lastPosIdx[oi] = curPosIdx;
+                } else {
+                    lastPosIdx[oi] = curPosIdx;
+                }
+            }
+
+            // Append synthetic match evidence entries.
+            for (const auto& [oi, sitePos] : incompleteEntries) {
+                PhasingEvidence ev;
+                ev.site = sitePos;
+                ev.overlapIdx = oi;
+                ev.siteIdx = UINT32_MAX; // assigned below during recount
+                ev.base = 0;
+                ev.isAlt = 0; // match
+                ev.isHpc = 0;
+                scratch.evidence.push_back(ev);
+            }
+
+            if (!incompleteEntries.empty()) {
+                // Re-sort evidence by (site, overlapIdx).
+                sort(scratch.evidence.begin(), scratch.evidence.end(),
+                    [](const PhasingEvidence& a, const PhasingEvidence& b) {
+                        if (a.site != b.site) return a.site < b.site;
+                        return a.overlapIdx < b.overlapIdx;
+                    });
+
+                // Assign siteIdx to new entries and rebuild evidenceBegin/End.
+                // For synthetic match entries (siteIdx == UINT32_MAX), assign
+                // the lastSiteIdx at that position (same as buildSnpMatrix).
+                uint32_t si = 0, ei = 0;
+                while (si < n && ei < uint32_t(scratch.evidence.size())) {
+                    uint32_t pos = scratch.sites[si].site;
+                    uint32_t rangeBegin = ei;
+
+                    // Find last site at this position (for lastSiteIdx).
+                    uint32_t lastSi = si;
+                    while (lastSi + 1 < n &&
+                           scratch.sites[lastSi + 1].site == pos) {
+                        lastSi++;
+                    }
+
+                    // Walk evidence at this position.
+                    while (ei < uint32_t(scratch.evidence.size()) &&
+                           scratch.evidence[ei].site == pos) {
+                        if (scratch.evidence[ei].siteIdx == UINT32_MAX) {
+                            // Synthetic match → assign to last site at position.
+                            scratch.evidence[ei].siteIdx = lastSi;
+                        }
+                        ei++;
+                    }
+
+                    // Set evidenceBegin/End for all sites at this position.
+                    for (uint32_t s = si; s <= lastSi; s++) {
+                        scratch.sites[s].evidenceBegin = rangeBegin;
+                        scratch.sites[s].evidenceEnd = ei;
+                    }
+                    si = lastSi + 1;
+                }
+
+                // Recount matchCount, fwdStrandCount, altCount from evidence.
+                // Hifiasm recounts occ_0, occ_1, overlap_num after fill_incom.
+                for (uint32_t i = 0; i < n; i++) {
+                    auto& site = scratch.sites[i];
+                    uint32_t mc = 0, fwd = 0, ac = 0;
+                    for (uint32_t e = site.evidenceBegin; e < site.evidenceEnd; e++) {
+                        const auto& ev = scratch.evidence[e];
+                        if (ev.isAlt == 0) {
+                            mc++;
+                            if (scratch.overlaps[ev.overlapIdx].isRev == 0) {
+                                fwd++;
+                            }
+                        } else if (ev.siteIdx == i) {
+                            ac++;
+                        }
+                    }
+                    site.matchCount = mc + 1;  // +1 for query
+                    site.fwdStrandCount = fwd + 1; // +1 for query
+                    site.altCount = ac;
+                    // Also update mutable label copies.
+                    site.labelMatchCount = site.matchCount;
+                    site.labelFwdStrandCount = site.fwdStrandCount;
+                }
+
+                // Re-evaluate dpExcluded with updated counts.
+                for (uint32_t i = 0; i < n; i++) {
+                    dpExcluded[i] = isStrandBiased(scratch.sites[i]);
+                }
+            }
+        }
+    }
+
     scratch.dpScore.assign(n, 1);
     scratch.dpParent.assign(n, -1);
 
@@ -967,7 +1111,7 @@ static void runDpPhasing(
     // Greedy chain extraction: start from highest-scoring site,
     // follow parent pointers, mark claimed sites.
     scratch.dpChainId.assign(n, -1);
-    int8_t chainId = 0;
+    int32_t chainId = 0;
 
     // Temporary: collect (chainLength, chainStartInBuffer) pairs.
     vector<pair<uint32_t, uint32_t>> chains;
@@ -980,7 +1124,7 @@ static void runDpPhasing(
         int32_t k = int32_t(startIdx);
         while (k >= 0 && scratch.dpChainId[uint32_t(k)] < 0) {
             chainBuf.push_back(uint32_t(k));
-            scratch.dpChainId[uint32_t(k)] = 127; // temporary claim
+            scratch.dpChainId[uint32_t(k)] = INT32_MAX; // temporary claim
             k = scratch.dpParent[uint32_t(k)];
         }
         uint32_t chainLen = uint32_t(chainBuf.size()) - bufStart;
@@ -997,9 +1141,8 @@ static void runDpPhasing(
         [](const auto& a, const auto& b) { return a.first > b.first; });
 
     // Assign chain IDs with confirmation logic.
+    // Hifiasm processes all chains without a limit.
     for (const auto& [chainLen, bufStart] : chains) {
-        if (uint32_t(chainId) >= PHASING_MAX_DP_CHAINS) break;
-
         int8_t plus = -1; // default: not confirmed
 
         if (chainLen > 1) {
