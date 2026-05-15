@@ -21,12 +21,16 @@
 #include "PhasingTypes.hpp"
 #include "Alignment.hpp"
 #include "Reads.hpp"
+#include "invalid.hpp"
 #include "timestamp.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <numeric>
 #include <thread>
 #include <vector>
@@ -1815,6 +1819,31 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
     atomic<uint64_t> totalCis(0);
     atomic<uint64_t> totalTrans(0);
 
+    // Mutex for debug output (prevents interleaving across threads).
+    static std::mutex phasingCoutMutex;
+
+    // Optional debug hook: set DINARA_PHASING_DEBUG_READ to a read ID (uint32)
+    // to print detailed per-site and per-overlap accounting.
+    ReadId phasingDebugReadId = invalid<ReadId>;
+    {
+        const char* s = std::getenv("DINARA_PHASING_DEBUG_READ");
+        if (s && *s) {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(s, &end, 10);
+            if (end && end != s && *end == 0
+                && v <= std::numeric_limits<uint32_t>::max()
+                && v < readCount) {
+                phasingDebugReadId = ReadId(uint32_t(v));
+                cout << timestamp << "[PHASING-DBG] Enabled for read "
+                     << phasingDebugReadId << "-0" << endl;
+            } else {
+                cout << timestamp << "[PHASING-DBG] Requested read "
+                     << s << " is invalid or out of range (readCount="
+                     << readCount << ")" << endl;
+            }
+        }
+    }
+
     // Static block scheduling (same pattern as performHifiasmECParity).
     vector<thread> threads;
     uint64_t chunkSize = readCount / threadCount;
@@ -1832,9 +1861,18 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                 const ReadId readId(rid);
                 scratch.clear();
 
+                const bool isDebugRead =
+                    (phasingDebugReadId != invalid<ReadId>
+                     && readId == phasingDebugReadId);
+
                 // 1. Gather overlaps.
                 gatherOverlaps(*this, readId, scratch);
                 if (scratch.overlaps.empty()) {
+                    if (isDebugRead) {
+                        std::lock_guard<std::mutex> lock(phasingCoutMutex);
+                        cout << timestamp << "[PHASING-DBG] read=" << readId
+                             << " overlaps=0" << endl;
+                    }
                     readsProcessed++;
                     continue;
                 }
@@ -1854,6 +1892,27 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                 // 4b. Remove adjacent sites (positions p and p+1).
                 filterAdjacentSites(scratch);
 
+                // Debug: candidate sites.
+                if (isDebugRead) {
+                    std::lock_guard<std::mutex> lock(phasingCoutMutex);
+                    cout << timestamp << "[PHASING-DBG] read=" << readId
+                         << " queryLen=" << queryLen
+                         << " overlaps=" << scratch.overlaps.size()
+                         << " candidateSites=" << scratch.sites.size()
+                         << endl;
+                    for (uint32_t si = 0; si < scratch.sites.size(); si++) {
+                        const auto& s = scratch.sites[si];
+                        cout << timestamp << "[PHASING-DBG]   candidate[" << si
+                             << "] pos=" << s.site
+                             << " ref=" << "ACGT"[s.queryBase]
+                             << " alt=" << "ACGT"[s.altBase]
+                             << " refSupport=" << s.matchCount
+                             << " altSupport=" << s.altCount
+                             << " fwdStrand=" << s.fwdStrandCount
+                             << " isHpc=" << int(s.isHpc) << endl;
+                    }
+                }
+
                 if (!scratch.sites.empty()) {
                     readsWithSites++;
 
@@ -1867,6 +1926,56 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
 
                     // 6. Allele grouping (cis/trans labeling).
                     labelCisTrans(scratch);
+
+                    // Debug: confirmed sites and overlap labels.
+                    if (isDebugRead) {
+                        std::lock_guard<std::mutex> lock(phasingCoutMutex);
+                        uint32_t confirmed = 0;
+                        for (const auto& s : scratch.sites) {
+                            if (s.dpChainId >= 0) confirmed++;
+                        }
+                        cout << timestamp << "[PHASING-DBG] coveragePeak="
+                             << coveragePeak << " hetCov=" << hetCov
+                             << " confirmed=" << confirmed
+                             << "/" << scratch.sites.size() << endl;
+                        for (uint32_t si = 0; si < scratch.sites.size(); si++) {
+                            const auto& s = scratch.sites[si];
+                            if (s.dpChainId < 0) continue;
+                            cout << timestamp << "[PHASING-DBG]   confirmed["
+                                 << si << "] pos=" << s.site
+                                 << " ref=" << "ACGT"[s.queryBase]
+                                 << " alt=" << "ACGT"[s.altBase]
+                                 << " refSupport=" << s.matchCount
+                                 << " altSupport=" << s.altCount
+                                 << " fwdStrand=" << s.fwdStrandCount
+                                 << " chain=" << s.dpChainId
+                                 << " isHpc=" << int(s.isHpc)
+                                 << " labelConfirmed="
+                                 << s.isLabelConfirmed() << endl;
+                        }
+                        uint32_t cisCount = 0, transCount = 0;
+                        for (const auto& ov : scratch.overlaps) {
+                            if (ov.isMatch == 1) cisCount++;
+                            else if (ov.isMatch == 2) transCount++;
+                        }
+                        cout << timestamp << "[PHASING-DBG] labels cis="
+                             << cisCount << " trans=" << transCount
+                             << " unlabeled="
+                             << (scratch.overlaps.size() - cisCount - transCount)
+                             << endl;
+                        for (const auto& ov : scratch.overlaps) {
+                            const char* label =
+                                (ov.isMatch == 1) ? "CIS" :
+                                (ov.isMatch == 2) ? "TRANS" : "UNLABELED";
+                            cout << timestamp << "[PHASING-DBG]   target="
+                                 << ov.targetReadId
+                                 << " isRev=" << int(ov.isRev)
+                                 << " strong=" << int(ov.strong)
+                                 << " confirmedSites=" << ov.confirmedSiteCount
+                                 << " mismatches=" << ov.confirmedMismatchCount
+                                 << " -> " << label << endl;
+                        }
+                    }
 
                     // 7. Large indel phasing.
                     phaseLargeIndels(*this, readId, queryLen, scratch);

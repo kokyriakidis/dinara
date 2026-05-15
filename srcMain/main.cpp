@@ -941,6 +941,10 @@ void dinara::main::assemble(
         // Compute marker KmerIds (required for LowHash and alignment).
         // The SIMD path already creates these, but findMarkers does not.
         assembler.computeMarkerKmerIds(threadCount);
+
+        // Compute k-mer histogram to get coveragePeak (needed by phasing).
+        // The SIMD path does this via countKmersFromMarkerKmerIds.
+        assembler.countKmersFromMarkerKmerIds(threadCount);
     }
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
