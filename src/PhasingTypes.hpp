@@ -38,8 +38,6 @@ static constexpr uint32_t PHASING_INFOR_COV = 3;
 /// Minimum indel size for SV-based phasing (hifiasm rphase_lidel).
 static constexpr uint32_t PHASING_SV_MIN_LEN = 16;
 
-/// Maximum chains in DP phasing (hifiasm gen_rphase_dp0_single_path).
-static constexpr uint32_t PHASING_MAX_DP_CHAINS = 15;
 
 // ============================================================================
 // Per-overlap phasing state
@@ -110,7 +108,7 @@ struct PhasingSite {
     uint8_t  queryBase;       ///< Query (reference) allele (2-bit)
     uint8_t  altBase;         ///< Alternative allele (2-bit)
     uint8_t  isHpc;           ///< Homopolymer context flag
-    int8_t   dpChainId;       ///< DP chain assignment (-1 = unassigned)
+    int32_t  dpChainId;       ///< DP chain assignment (-1 = unassigned)
 
     // --- Immutable counts (set by buildSnpMatrix) ---
     uint32_t matchCount;      ///< Overlaps matching query allele (occ_0)
@@ -198,7 +196,7 @@ struct PhasingScratchpad {
     // --- DP phasing ---
     vector<int32_t> dpScore;          ///< DP score per site
     vector<int32_t> dpParent;         ///< DP predecessor per site
-    vector<int8_t>  dpChainId;        ///< Chain assignment per site
+    vector<int32_t> dpChainId;        ///< Chain assignment per site
     vector<bool>    dpIsEndpoint;     ///< Endpoint flags for chain extraction
     vector<pair<int32_t, uint32_t>> dpEndpoints; ///< (score, index) for chain extraction
     vector<uint32_t> dpChain;         ///< Backtrack buffer for chain extraction
