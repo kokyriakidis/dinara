@@ -250,9 +250,23 @@ for each pair of adjacent position-groups:
         mark ALL sites in both groups for removal
         (multi-alt: if position p has sites for alt C and alt G,
          and position p+1 has a site, all three are removed)
+
+build oldToNew[i] index mapping (UINT32_MAX for removed sites)
 compact sites array, removing marked entries
-rewrite evidence siteIdx values to match new site indices
+
+compact evidence array:
+    for each evidence entry:
+        if oldToNew[ev.siteIdx] == UINT32_MAX: drop (site was removed)
+        else: ev.siteIdx = oldToNew[ev.siteIdx]  // remap to new index
+
+rebuild evidenceBegin/evidenceEnd on surviving sites
+    (walk sites and evidence in tandem, both sorted by position)
 ```
+
+Hifiasm (Correct.cpp:8855) compacts both `snp_stat` and evidence arrays,
+rewriting `overlapSite -= m_off` where `m_off` is the number of removed
+entries before each surviving group. Our approach uses an explicit
+`oldToNew` mapping instead, which is equivalent.
 
 Prevents alignment artifacts (indels manifesting as adjacent mismatches)
 from being treated as het sites.
