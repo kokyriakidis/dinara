@@ -78,12 +78,33 @@ struct PhasingOverlap {
 struct PhasingEvidence {
     uint32_t site;        ///< Position on query read (forward-strand base coords)
     uint32_t overlapIdx;  ///< Index into PhasingScratchpad::overlaps
+    uint32_t siteIdx;     ///< Index into PhasingScratchpad::sites (hifiasm overlapSite)
     uint8_t  base;        ///< 2-bit base observed at this position (0=A,1=C,2=G,3=T)
     uint8_t  isAlt;       ///< 1 if this observation differs from the query base
-    uint8_t  isHpc;       ///< 1 if position is in a homopolymer context (≥ HPC_PL)
+    uint8_t  isHpc;       ///< 1 if position is in a periodic repeat (hpc_mask_ff)
 };
 
 /// Confirmed heterozygous SNP site on the query read.
+///
+/// Hifiasm reuses SnpStats fields (occ_0, overlap_num, score) across pipeline
+/// stages with different semantics. We use separate fields for clarity:
+///
+///   matchCount / altCount / fwdStrandCount — immutable after buildSnpMatrix.
+///   dpChainId — output of runDpPhasing (-1 = rejected, >=0 = chain ID).
+///   labelMatchCount / labelFwdStrandCount — mutable copies decremented during
+///       greedy labeling (hifiasm mutates occ_0/overlap_num in-place).
+///
+/// Hifiasm's `score` field is reused across labelCisTrans steps with three
+/// different meanings. We split it into three separate flags:
+///
+///   transConfirmed — Step B: set when a trans overlap has a mismatch here.
+///   cisReset       — Step D: set when a cis overlap has a mismatch here
+///                    (overrides transConfirmed for multi_check filtering).
+///   promoted       — Step E: set when multi_check promotes this weak site.
+///
+/// The combined check `isLabelConfirmed()` returns true when the site should
+/// be treated as confirmed for Step F (final loop): transConfirmed and not
+/// cisReset, OR promoted.
 struct PhasingSite {
     uint32_t site;            ///< Position on query read
     uint8_t  queryBase;       ///< Query (reference) allele (2-bit)
@@ -91,9 +112,25 @@ struct PhasingSite {
     uint8_t  isHpc;           ///< Homopolymer context flag
     int8_t   dpChainId;       ///< DP chain assignment (-1 = unassigned)
 
+    // --- Immutable counts (set by buildSnpMatrix) ---
     uint32_t matchCount;      ///< Overlaps matching query allele (occ_0)
     uint32_t altCount;        ///< Overlaps with alt allele (occ_1)
     uint32_t fwdStrandCount;  ///< Forward-strand ref-matching overlaps (+1 for query)
+
+    // --- Mutable copies for greedy labeling (labelCisTrans) ---
+    uint32_t labelMatchCount;    ///< Decremented as trans overlaps are processed
+    uint32_t labelFwdStrandCount;///< Decremented for fwd-strand matches at trans overlaps
+
+    // --- Per-step labeling flags (replaces hifiasm's reused `score`) ---
+    uint8_t  transConfirmed;  ///< Step B: mismatch at this site in a trans overlap
+    uint8_t  cisReset;        ///< Step D: mismatch at this site in a cis overlap
+    uint8_t  promoted;        ///< Step E: multi_check promoted this weak site
+
+    /// Combined check: is this site confirmed for Step F?
+    /// Hifiasm equivalent: score == 1 at the point Step F runs.
+    bool isLabelConfirmed() const {
+        return (transConfirmed && !cisReset) || promoted;
+    }
 
     /// Range into sorted evidence array for this site.
     uint32_t evidenceBegin;
