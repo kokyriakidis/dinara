@@ -610,12 +610,15 @@ static void filterAdjacentSites(
     // Sites are sorted by position. With multi-alt, multiple entries can
     // share the same position. We work on position groups: if positions
     // p and p+1 both have sites, ALL entries at both positions are removed.
+    //
+    // Hifiasm (Correct.cpp:8855) compacts both snp_stat and evidence,
+    // rewriting overlapSite indices. We do the same: compact sites,
+    // compact evidence, rewrite ev.siteIdx.
 
     const size_t n = scratch.sites.size();
     vector<bool> remove(n, false);
 
     // Collect unique positions and their index ranges.
-    // posGroups[k] = {position, startIdx, endIdx}
     struct PosGroup { uint32_t pos; size_t begin; size_t end; };
     vector<PosGroup> groups;
     size_t gi = 0;
@@ -637,7 +640,24 @@ static void filterAdjacentSites(
         }
     }
 
-    // Compact.
+    // Check if anything to remove.
+    bool anyRemoved = false;
+    for (size_t i = 0; i < n; i++) {
+        if (remove[i]) { anyRemoved = true; break; }
+    }
+    if (!anyRemoved) return;
+
+    // Build old→new site index mapping.
+    // oldToNew[i] = new index for site i, or UINT32_MAX if removed.
+    vector<uint32_t> oldToNew(n, UINT32_MAX);
+    uint32_t newIdx = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!remove[i]) {
+            oldToNew[i] = newIdx++;
+        }
+    }
+
+    // Compact sites.
     size_t write = 0;
     for (size_t i = 0; i < n; i++) {
         if (!remove[i]) {
@@ -645,6 +665,66 @@ static void filterAdjacentSites(
         }
     }
     scratch.sites.resize(write);
+
+    // Compact evidence: drop entries for removed sites, rewrite siteIdx.
+    // Also update evidenceBegin/evidenceEnd on surviving sites.
+    //
+    // Evidence is sorted by (site, overlapIdx). Sites at the same position
+    // share the same evidence range. We walk evidence and keep entries
+    // whose siteIdx maps to a surviving site.
+    size_t evWrite = 0;
+
+    // Track which new site indices need evidenceBegin/End updated.
+    // Reset all to 0 first, then set as we encounter evidence.
+    for (auto& site : scratch.sites) {
+        site.evidenceBegin = 0;
+        site.evidenceEnd = 0;
+    }
+
+    // We need to track the first evidence index for each new site's
+    // position group. Since evidence is sorted by site position, we
+    // can track transitions.
+    for (size_t ei = 0; ei < scratch.evidence.size(); ei++) {
+        auto& ev = scratch.evidence[ei];
+
+        // Remap siteIdx.
+        if (ev.siteIdx < uint32_t(n)) {
+            uint32_t newSi = oldToNew[ev.siteIdx];
+            if (newSi == UINT32_MAX) continue; // site was removed, drop evidence
+            ev.siteIdx = newSi;
+        }
+        // else: siteIdx == UINT32_MAX (match evidence before buildSnpMatrix
+        // assigned it) — keep as-is. This shouldn't happen after buildSnpMatrix
+        // but handle defensively.
+
+        scratch.evidence[evWrite++] = ev;
+    }
+    scratch.evidence.resize(evWrite);
+
+    // Rebuild evidenceBegin/evidenceEnd for surviving sites.
+    // Evidence is sorted by site position. All sites at the same
+    // position share the same evidence range. Sites are also sorted
+    // by position, so we can walk both in tandem.
+    if (!scratch.evidence.empty()) {
+        uint32_t si = 0;
+        uint32_t ei = 0;
+        while (si < uint32_t(scratch.sites.size()) &&
+               ei < uint32_t(scratch.evidence.size())) {
+            uint32_t pos = scratch.sites[si].site;
+            uint32_t rangeBegin = ei;
+            while (ei < uint32_t(scratch.evidence.size()) &&
+                   scratch.evidence[ei].site == pos) {
+                ei++;
+            }
+            // Set range for all sites at this position.
+            while (si < uint32_t(scratch.sites.size()) &&
+                   scratch.sites[si].site == pos) {
+                scratch.sites[si].evidenceBegin = rangeBegin;
+                scratch.sites[si].evidenceEnd = ei;
+                si++;
+            }
+        }
+    }
 }
 
 // ============================================================================
