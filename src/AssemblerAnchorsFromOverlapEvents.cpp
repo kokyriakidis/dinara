@@ -2209,8 +2209,8 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                     if(!ad.keptByBothSides()) {
                         continue;
                     }
-                    // If cis/trans is populated, skip trans edges when defining segments.
-                    if(ad.cisTransStatus == CisTransStatus::Trans) {
+                    // Skip trans edges from this read's perspective.
+                    if(ad.getCisTransStatusFromReadPerspective(orientedReadId.getReadId()) == CisTransStatus::Trans) {
                         continue;
                     }
                     if(!ad.info.isInReadGraph) {
@@ -3080,7 +3080,8 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                         if(!ad.info.isInReadGraph) {
                             continue;
                         }
-                        if(ad.cisTransStatus == CisTransStatus::Trans) {
+                        const CisTransStatus cts = ad.getCisTransStatusFromReadPerspective(orientedReadId.getReadId());
+                        if(cts == CisTransStatus::Trans) {
                             continue;
                         }
                         const OrientedReadId other = edge.getOther(orientedReadId);
@@ -3102,7 +3103,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesBestPe
                             continue;
                         }
                         adjAll[u].push_back(vIdx);
-                        if(ad.cisTransStatus == CisTransStatus::Cis) {
+                        if(cts == CisTransStatus::Cis) {
                             adjCis[u].push_back(vIdx);
                             hasAnyCisEdge = true;
                         }
@@ -3323,7 +3324,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromMarkerGraphVerticesSplitU
                         }
 
                         adjAll[u].push_back(vIdx);
-                        if(ad.cisTransStatus == CisTransStatus::Cis) {
+                        if(ad.getCisTransStatusFromReadPerspective(orientedReadId.getReadId()) == CisTransStatus::Cis) {
                             adjCis[u].push_back(vIdx);
                             hasAnyCisEdge = true;
                         }
@@ -3525,7 +3526,7 @@ shared_ptr<mode3::Anchors> Assembler::createAnchorsFromOverlapsBestPerOverlapInt
     // Experimental: If we have informative het coverage (set by AssemblerHifiasmEC),
     // only generate anchors from reads that cover at least one informative het site,
     // and only using their cis overlaps (trans overlaps are excluded by readGraph filtering,
-    // but we also explicitly skip those if cisTransStatus is populated).
+    // using per-read-perspective hifiasmEcMatchState).
     bool restrictToInformativeHetReads = false;
     vector<uint8_t> readHasInformativeHet(readCount, 0);
     {
