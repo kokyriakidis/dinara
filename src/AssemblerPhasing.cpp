@@ -1599,125 +1599,21 @@ static void phaseLargeIndels(
         // Classify SV events as homopolymer artifacts
         // (hifiasm iter_sub_cigar_sv, Correct.cpp:18775).
         //
-        // Per-CIGAR-operation check: re-walk the CIGAR for each SV
-        // event. For each indel op within the event's query range,
-        // check hpc_mask_ff_region on both query [qS, qE) and
-        // target [tS, tE). Accumulate herr (homopolymer error
-        // bases) and err (total error bases). If herr > 0 &&
-        // herr > err * 0.66, mark as homopolymer (el=0).
+        // Check hpc_mask_ff_region on the query sequence for each
+        // event's [queryPos, queryEnd) range. If the region is in a
+        // homopolymer context, mark the event as el=0.
         //
         // hpc_mask_ff_region params: hpcFlk=12, hpcRr=2, hpcCutoff=6, hpcRate=0.51
-        if (svEventsBefore < scratch.svEvents.size()) {
+        {
             const uint8_t* qSeq = scratch.queryBases.data();
             const int64_t qLen = int64_t(queryLen);
-            const ReadId targetReadId = ReadId(ov.targetReadId);
-            const auto tRead = assembler.getReads().getRead(targetReadId);
-            const int64_t tLen = int64_t(tRead.baseCount);
 
-            // Build per-event herr/err by walking the CIGAR once for
-            // the entire overlap and dispatching each indel op to the
-            // event whose pre-flip query range contains it.
-            const size_t nEv = scratch.svEvents.size() - svEventsBefore;
-
-            // Reuse scratchpad vectors to avoid per-overlap heap churn.
-            scratch.hpcErr.assign(nEv, 0);
-            scratch.hpcHerr.assign(nEv, 0);
-
-            // Store pre-flip query ranges in the events' queryPos/End
-            // temporarily — we'll restore after the walk. This avoids
-            // allocating a separate EvRange vector.
-            // Actually, we can't modify svEvents (they're needed later).
-            // Instead, compute pre-flip coords inline in the callback.
-
-            OverlapCigarStore::Cursor cur2;
-            cur2.reset(ov.cigarOffset, ov.cigarTokenCount,
-                ad.qs, cigarRead1Start(assembler, ad), cigarStore);
-
-            const size_t svBase = svEventsBefore;
-            const bool isRev = ov.isRev;
-
-            cigarStore.walkRangeWithCursor(
-                cur2, 0, UINT32_MAX,
-                [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                    if (op != 2 && op != 3) return; // only indels
-
-                    uint32_t qpos = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
-                    uint32_t tpos = ov.queryIsRead0 ? uint32_t(yk) : uint32_t(xk);
-
-                    // Query end of this op (pre-flip).
-                    bool qAdvances = ov.queryIsRead0 ? (op == 3) : (op == 2);
-                    uint32_t qEnd = qpos + (qAdvances ? len : 0);
-
-                    // Target end of this op.
-                    bool tAdvances = ov.queryIsRead0 ? (op == 2) : (op == 3);
-                    uint32_t tEnd = tpos + (tAdvances ? len : 0);
-
-                    // Find which event this op belongs to by comparing
-                    // pre-flip query coords against pre-flip event ranges.
-                    for (size_t j = 0; j < nEv; j++) {
-                        const auto& ev = scratch.svEvents[svBase + j];
-                        // Compute pre-flip range from the (post-flip) event.
-                        uint32_t evQs, evQe;
-                        if (qNeedsRc) {
-                            evQs = queryLen - ev.queryEnd;
-                            evQe = queryLen - ev.queryPos;
-                        } else {
-                            evQs = ev.queryPos;
-                            evQe = ev.queryEnd;
-                        }
-                        if (qpos >= evQs && qEnd <= evQe) {
-                            scratch.hpcErr[j] += len;
-
-                            // Query hpc check (post-flip coords).
-                            int64_t qS, qE;
-                            if (qNeedsRc) {
-                                qS = int64_t(queryLen - qEnd);
-                                qE = int64_t(queryLen - qpos);
-                            } else {
-                                qS = int64_t(qpos);
-                                qE = int64_t(qEnd);
-                            }
-                            if (hpcMaskFfRegion(qSeq, qLen, qS, qE,
-                                    12, 2, 6, 0.51)) {
-                                scratch.hpcHerr[j] += len;
-                                break;
-                            }
-
-                            // Target hpc check — unpack only the
-                            // region [tpos-12, tEnd+12) into targetBuf.
-                            constexpr int64_t HPC_FLK = 12;
-                            int64_t tBufS = max(int64_t(0), int64_t(tpos) - HPC_FLK);
-                            int64_t tBufE = min(tLen, int64_t(tEnd) + HPC_FLK);
-                            int64_t tBufN = tBufE - tBufS;
-                            if (tBufN > 0) {
-                                scratch.targetBuf.resize(size_t(tBufN));
-                                for (int64_t b = 0; b < tBufN; b++) {
-                                    uint32_t p = uint32_t(tBufS + b);
-                                    if (!isRev) {
-                                        scratch.targetBuf[size_t(b)] = tRead[p].value;
-                                    } else {
-                                        scratch.targetBuf[size_t(b)] =
-                                            tRead[tRead.baseCount - 1 - p].complement().value;
-                                    }
-                                }
-                                if (hpcMaskFfRegion(
-                                        scratch.targetBuf.data(), tBufN,
-                                        int64_t(tpos) - tBufS,
-                                        int64_t(tEnd) - tBufS,
-                                        12, 2, 6, 0.51)) {
-                                    scratch.hpcHerr[j] += len;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                });
-
-            // Correct.cpp:18822: el=0 if herr > 0 && herr > err*0.66
-            for (size_t j = 0; j < nEv; j++) {
-                if (scratch.hpcHerr[j] > 0 &&
-                    scratch.hpcHerr[j] > uint32_t(double(scratch.hpcErr[j]) * 0.66)) {
-                    scratch.svEvents[svBase + j].isHomopolymer = 1;
+            for (size_t ei = svEventsBefore; ei < scratch.svEvents.size(); ei++) {
+                auto& ev = scratch.svEvents[ei];
+                if (hpcMaskFfRegion(qSeq, qLen,
+                        int64_t(ev.queryPos), int64_t(ev.queryEnd),
+                        12, 2, 6, 0.51)) {
+                    ev.isHomopolymer = 1;
                 }
             }
         }
