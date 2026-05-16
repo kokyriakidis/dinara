@@ -1839,19 +1839,31 @@ static void phaseLargeIndels(
             }
         }
 
-        // Count SV events in this cluster (occ1 = alt count).
+        // Build per-site evidence for this cluster.
+        // Each cluster = one SV "site". Evidence entries:
+        //   type=0 (match): spanning cis overlap with low error
+        //   type=1 (mismatch): SV-carrying overlap in cluster
+        //
+        // push_idel_info (Correct.cpp:19937).
+
+        struct SvEvidence {
+            uint32_t overlapIdx;
+            uint8_t type; // 0=match, 1=mismatch
+        };
+        vector<SvEvidence> svEvidence;
+
+        // Alt evidence: SV-carrying overlaps in this cluster.
+        for (size_t zi = i; zi < k; zi++) {
+            svEvidence.push_back({svData[zi].overlapIdx, 1});
+        }
         uint32_t occ1 = uint32_t(k - i);
 
-        // Collect spanning cis overlaps and compute match evidence.
-        // push_idel_info (Correct.cpp:19937): for each spanning cis overlap,
-        // call extract_sub_err. If error <= threshold, count as match.
+        // Match evidence: spanning cis overlaps with low error.
         uint32_t occ0 = 0;
         for (uint32_t oi = 0; oi < uint32_t(scratch.overlaps.size()); oi++) {
             const auto& ov = scratch.overlaps[oi];
             if (ov.isMatch != 1) continue;
-            // Check if overlap spans the SV region.
             if (ov.qs > consPos || ov.qe < consEnd) continue;
-            // Check overlap covers at least half the SV region.
             uint32_t os = max(ov.qs, consPos);
             uint32_t oe = min(ov.qe, consEnd);
             if (oe <= os) continue;
@@ -1859,17 +1871,131 @@ static void phaseLargeIndels(
             if ((oe - os) < (svSpan - (oe - os))) continue;
 
             int32_t err = extractSubErr(oi, consPos, consEnd, consErr);
-            if (err >= 0) occ0++;
+            if (err >= 0) {
+                svEvidence.push_back({oi, 0});
+                occ0++;
+            }
         }
         occ0++; // +1 for query read itself (Correct.cpp:19970).
 
-        // Check thresholds (Correct.cpp:19972).
         if (occ0 < cc || occ1 < cc) continue;
 
-        // Label SV-carrying overlaps as trans.
-        for (size_t zi = i; zi < k; zi++) {
-            auto& ov = scratch.overlaps[svData[zi].overlapIdx];
+        // --------------------------------------------------------
+        // generate_haplotypes_sv (Correct.cpp:9115).
+        // Greedy labeling Steps A, B, C, D, F on SV evidence.
+        // No strand bias checks (absent in hifiasm's SV labeling).
+        // --------------------------------------------------------
+
+        // Sort evidence by overlapIdx for per-overlap grouping.
+        sort(svEvidence.begin(), svEvidence.end(),
+            [](const SvEvidence& a, const SvEvidence& b) {
+                return a.overlapIdx < b.overlapIdx;
+            });
+
+        // Step A: count mismatches per overlap, build sorted list.
+        // Hifiasm: count mismatches at sites with occ_0 >= s_hap_cov
+        // && occ_1 >= infor_cov. For SV, there's one site per cluster.
+        uint32_t svOcc0 = occ0;
+        int8_t svScore = -1; // -1 = unconfirmed
+
+        struct SvOverlapInfo {
+            uint32_t overlapIdx;
+            uint32_t mismatchCount;
+            uint32_t evidBegin;
+            uint32_t evidEnd;
+        };
+        vector<SvOverlapInfo> svOverlaps;
+
+        for (size_t ei = 0, ej; ei < svEvidence.size(); ei = ej) {
+            ej = ei + 1;
+            while (ej < svEvidence.size() &&
+                   svEvidence[ej].overlapIdx == svEvidence[ei].overlapIdx) ej++;
+            uint32_t mc = 0;
+            for (size_t ez = ei; ez < ej; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= PHASING_S_HAP_COV && occ1 >= PHASING_INFOR_COV) {
+                    mc++;
+                }
+            }
+            svOverlaps.push_back({svEvidence[ei].overlapIdx, mc,
+                                  uint32_t(ei), uint32_t(ej)});
+        }
+
+        // Sort by mismatch count descending.
+        sort(svOverlaps.begin(), svOverlaps.end(),
+            [](const SvOverlapInfo& a, const SvOverlapInfo& b) {
+                return a.mismatchCount > b.mismatchCount;
+            });
+
+        // Step B: greedy labeling.
+        for (auto& soi : svOverlaps) {
+            // Recount with current occ0.
+            uint32_t mc = 0;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= 2 && occ1 >= 2 &&
+                    svOcc0 >= PHASING_S_HAP_COV && occ1 >= PHASING_INFOR_COV) {
+                    mc++;
+                }
+            }
+            if (mc == 0) continue;
+
+            auto& ov = scratch.overlaps[soi.overlapIdx];
             if (ov.isMatch == 1) ov.isMatch = 2;
+
+            // Set score=1 on mismatch evidence, decrement occ0 on match.
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1) {
+                    svScore = 1;
+                } else {
+                    if (svOcc0 > 1) svOcc0--;
+                }
+            }
+        }
+
+        // Step C: consistency check.
+        for (auto& soi : svOverlaps) {
+            uint32_t mc = 0;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= 2 && occ1 >= 2 &&
+                    svScore == 1) {
+                    mc++;
+                }
+            }
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch == 1 && mc > 0) {
+                ov.isMatch = 2;
+            }
+        }
+
+        // Step D: reset score on cis overlap mismatches.
+        for (auto& soi : svOverlaps) {
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch != 1) continue;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1) {
+                    svScore = -1;
+                }
+            }
+        }
+
+        // Step F: final pass — strong flag + late flips.
+        for (auto& soi : svOverlaps) {
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch == 2) {
+                ov.strong = 1;
+            } else if (ov.isMatch == 1) {
+                for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                    if (svScore == 1 && svOcc0 >= 2 && occ1 >= 2) {
+                        ov.strong = 1;
+                        if (svEvidence[ez].type == 1) {
+                            ov.isMatch = 2;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
