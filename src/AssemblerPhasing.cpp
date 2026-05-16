@@ -236,6 +236,94 @@ static bool isPeriodicRepeat(
 }
 
 // ============================================================================
+// hpcMaskFfRegion: region-based homopolymer check
+//
+// Port of hifiasm's hpc_mask_ff_region (Correct.cpp:10454).
+// Checks if the region [s0, e0) on sequence `seq` is within a periodic
+// repeat of period 1..hpcRr. Used by phaseLargeIndels to classify SV
+// events as homopolymer artifacts.
+//
+// Parameters match hifiasm call site in iter_sub_cigar_sv:
+//   hpcFlk=12, hpcRr=2, hpcCutoff=6, hpcRate=0.51
+// ============================================================================
+
+static bool hpcMaskFfRegion(
+    const uint8_t* seq,
+    int64_t sn,
+    int64_t s0,
+    int64_t e0,
+    int64_t hpcFlk,
+    int64_t hpcRr,
+    int64_t hpcCutoff,
+    double hpcRate)
+{
+    if (e0 < s0) return false;
+    int64_t s = (s0 >= hpcFlk) ? (s0 - hpcFlk) : 0;
+    int64_t e = ((e0 + hpcFlk) <= sn) ? (e0 + hpcFlk) : sn;
+
+    for (int64_t r = 1; r <= hpcRr; r++) {
+        int64_t rc = r * max(hpcCutoff, hpcRr);
+
+        // Scan 0: including endpoint, extend right from e0-1 then left.
+        {
+            int64_t k;
+            int64_t anchor = (e0 > s0) ? (e0 - 1) : e0;
+            for (k = anchor + r; k < e && (k - r) >= s && seq[k] == seq[k - r]; k++);
+            int64_t ze = k; if (ze > e) ze = e;
+            for (k = anchor - 1; k >= s && (k + r) < e && seq[k] == seq[k + r]; k--);
+            int64_t zs = k + 1; if (zs < s) zs = s;
+            if ((ze - zs) > r && (ze - zs) >= rc) {
+                int64_t os = max(zs, s0), oe = min(ze, e0);
+                int64_t ovlp = (oe > os) ? (oe - os) : 0;
+                if (e0 > s0) {
+                    if (ovlp > 0 && ovlp >= int64_t((e0 - s0) * hpcRate)) return true;
+                } else {
+                    if (zs <= s0 && ze >= e0) return true;
+                }
+            }
+        }
+
+        // Scan 1: not including endpoint, right side only (e0 <= s0 case).
+        if (e0 <= s0) {
+            int64_t k;
+            for (k = e0 + r + 1; k < e && (k - r) >= s && seq[k] == seq[k - r]; k++);
+            int64_t zs = e0 + 1; if (zs < s) zs = s;
+            int64_t ze = k; if (ze > e) ze = e;
+            if ((ze - zs) > r && (ze - zs) >= rc) return true;
+        }
+
+        // Scan 2: including start, extend left from s0 then right.
+        {
+            int64_t k;
+            for (k = s0 - r; k >= s && (k + r) < e && seq[k] == seq[k + r]; k--);
+            int64_t zs = k + 1; if (zs < s) zs = s;
+            for (k = s0 + 1; k < e && (k - r) >= s && seq[k] == seq[k - r]; k++);
+            int64_t ze = k; if (ze > e) ze = e;
+            if ((ze - zs) > r && (ze - zs) >= rc) {
+                int64_t os = max(zs, s0), oe = min(ze, e0);
+                int64_t ovlp = (oe > os) ? (oe - os) : 0;
+                if (e0 > s0) {
+                    if (ovlp > 0 && ovlp >= int64_t((e0 - s0) * hpcRate)) return true;
+                } else {
+                    if (zs <= s0 && ze >= e0) return true;
+                }
+            }
+        }
+
+        // Scan 3: not including start, left side only (e0 <= s0 case).
+        if (e0 <= s0) {
+            int64_t k;
+            for (k = s0 - r - 1; k >= s && (k + r) < e && seq[k] == seq[k + r]; k--);
+            int64_t zs = k + 1; if (zs < s) zs = s;
+            int64_t ze = s0; if (ze > e) ze = e;
+            if ((ze - zs) > r && (ze - zs) >= rc) return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
 // detectSnpSites: single-pass SNP detection
 //
 // Fused single-pass approach (hifiasm extract_sub_cigar_hc pattern):
@@ -1461,6 +1549,7 @@ static void phaseLargeIndels(
                 ev.errorBases = indelRunBases;
                 ev.supportCount = 0;
                 ev.clusterId = -1;
+                ev.isHomopolymer = 0;
                 scratch.svEvents.push_back(ev);
             }
             indelRunStart = UINT32_MAX;
@@ -1506,6 +1595,124 @@ static void phaseLargeIndels(
                 ev.queryEnd = fwdEnd;
             }
         }
+
+        // Classify SV events as homopolymer artifacts
+        // (hifiasm iter_sub_cigar_sv, Correct.cpp:18775).
+        //
+        // Per-CIGAR-operation check: re-walk the CIGAR for each SV
+        // event. For each indel op within the event's query range,
+        // check hpc_mask_ff_region on both query [qS, qE) and
+        // target [tS, tE). Accumulate herr (homopolymer error
+        // bases) and err (total error bases). If herr > 0 &&
+        // herr > err * 0.66, mark as homopolymer (el=0).
+        //
+        // hpc_mask_ff_region params: hpcFlk=12, hpcRr=2, hpcCutoff=6, hpcRate=0.51
+        if (svEventsBefore < scratch.svEvents.size()) {
+            const uint8_t* qSeq = scratch.queryBases.data();
+            const int64_t qLen = int64_t(queryLen);
+            const ReadId targetReadId = ReadId(ov.targetReadId);
+            const auto tRead = assembler.getReads().getRead(targetReadId);
+            const int64_t tLen = int64_t(tRead.baseCount);
+
+            // Build per-event herr/err by walking the CIGAR once for
+            // the entire overlap and dispatching each indel op to the
+            // event whose pre-flip query range contains it.
+            const size_t nEv = scratch.svEvents.size() - svEventsBefore;
+            // Per-event accumulators.
+            vector<uint32_t> evErr(nEv, 0), evHerr(nEv, 0);
+
+            // Pre-flip query ranges for matching.
+            struct EvRange { uint32_t qs, qe; };
+            vector<EvRange> evRanges(nEv);
+            for (size_t j = 0; j < nEv; j++) {
+                const auto& ev = scratch.svEvents[svEventsBefore + j];
+                if (qNeedsRc) {
+                    evRanges[j].qs = queryLen - ev.queryEnd;
+                    evRanges[j].qe = queryLen - ev.queryPos;
+                } else {
+                    evRanges[j].qs = ev.queryPos;
+                    evRanges[j].qe = ev.queryEnd;
+                }
+            }
+
+            OverlapCigarStore::Cursor cur2;
+            cur2.reset(ov.cigarOffset, ov.cigarTokenCount,
+                ad.qs, cigarRead1Start(assembler, ad), cigarStore);
+
+            cigarStore.walkRangeWithCursor(
+                cur2, 0, UINT32_MAX,
+                [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
+                    if (op != 2 && op != 3) return; // only indels
+
+                    uint32_t qpos = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
+                    uint32_t tpos = ov.queryIsRead0 ? uint32_t(yk) : uint32_t(xk);
+
+                    // Query end of this op (pre-flip).
+                    bool qAdvances = ov.queryIsRead0 ? (op == 3) : (op == 2);
+                    uint32_t qEnd = qpos + (qAdvances ? len : 0);
+
+                    // Target end of this op.
+                    bool tAdvances = ov.queryIsRead0 ? (op == 2) : (op == 3);
+                    uint32_t tEnd = tpos + (tAdvances ? len : 0);
+
+                    // Find which event this op belongs to.
+                    for (size_t j = 0; j < nEv; j++) {
+                        if (qpos >= evRanges[j].qs && qEnd <= evRanges[j].qe) {
+                            evErr[j] += len;
+
+                            // Query hpc check (post-flip coords).
+                            int64_t qS, qE;
+                            if (qNeedsRc) {
+                                qS = int64_t(queryLen - qEnd);
+                                qE = int64_t(queryLen - qpos);
+                            } else {
+                                qS = int64_t(qpos);
+                                qE = int64_t(qEnd);
+                            }
+                            if (hpcMaskFfRegion(qSeq, qLen, qS, qE,
+                                    12, 2, 6, 0.51)) {
+                                evHerr[j] += len;
+                                break;
+                            }
+
+                            // Target hpc check — unpack only the
+                            // region [tpos-12, tEnd+12) into targetBuf.
+                            constexpr int64_t HPC_FLK = 12;
+                            int64_t tBufS = max(int64_t(0), int64_t(tpos) - HPC_FLK);
+                            int64_t tBufE = min(tLen, int64_t(tEnd) + HPC_FLK);
+                            int64_t tBufN = tBufE - tBufS;
+                            if (tBufN > 0) {
+                                scratch.targetBuf.resize(size_t(tBufN));
+                                for (int64_t b = 0; b < tBufN; b++) {
+                                    uint32_t p = uint32_t(tBufS + b);
+                                    if (!ov.isRev) {
+                                        scratch.targetBuf[size_t(b)] = tRead[p].value;
+                                    } else {
+                                        scratch.targetBuf[size_t(b)] =
+                                            tRead[tRead.baseCount - 1 - p].complement().value;
+                                    }
+                                }
+                                if (hpcMaskFfRegion(
+                                        scratch.targetBuf.data(), tBufN,
+                                        int64_t(tpos) - tBufS,
+                                        int64_t(tEnd) - tBufS,
+                                        12, 2, 6, 0.51)) {
+                                    evHerr[j] += len;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+
+            // Correct.cpp:18822: el=0 if herr > 0 && herr > err*0.66
+            for (size_t j = 0; j < nEv; j++) {
+                if (evHerr[j] > 0 &&
+                    evHerr[j] > uint32_t(double(evErr[j]) * 0.66)) {
+                    scratch.svEvents[svEventsBefore + j].isHomopolymer = 1;
+                }
+            }
+        }
     }
 
     if (scratch.svEvents.empty()) return;
@@ -1540,9 +1747,9 @@ static void phaseLargeIndels(
     auto calLindelDd = [&](size_t ai, size_t bi) -> double {
         const auto& a = svData[ai];
         const auto& b = svData[bi];
-        uint32_t tnA = scratch.overlaps[a.overlapIdx].targetReadId;
-        uint32_t tnB = scratch.overlaps[b.overlapIdx].targetReadId;
-        if (tnA == tnB) return -1;
+        // Hifiasm compares overlap indices (a->tn == b->tn), not
+        // target read IDs (Correct.cpp:19742).
+        if (a.overlapIdx == b.overlapIdx) return -1;
         uint32_t os = max(a.queryPos, b.queryPos);
         uint32_t oe = min(a.queryEnd, b.queryEnd);
         if (oe <= os + LEN_W) return -1;
@@ -1670,7 +1877,7 @@ static void phaseLargeIndels(
 
             int32_t bestCluster = -1;
             double bestScore = -1;
-            uint32_t tnK = scratch.overlaps[svData[k].overlapIdx].targetReadId;
+            uint32_t oiK = svData[k].overlapIdx;
 
             for (size_t z = 0; z < an && svData[z].queryPos < svData[k].queryEnd; z++) {
                 if (svData[z].supportCount < C_SZ) continue;
@@ -1679,17 +1886,18 @@ static void phaseLargeIndels(
                 double sw = calLindelDd(k, z);
                 if (sw < 0) continue;
 
-                // is_get_group (Correct.cpp:19785): check target not
-                // already in this cluster.
+                // is_get_group (Correct.cpp:19785): check overlap index
+                // not already in this cluster. Hifiasm compares a[k].tn
+                // (overlap index), not target read ID.
                 int32_t ci = svData[z].clusterId;
-                bool targetInCluster = false;
+                bool overlapInCluster = false;
                 for (int32_t idx = clusterHead[ci]; idx >= 0; idx = clusterNext[idx]) {
-                    if (scratch.overlaps[svData[idx].overlapIdx].targetReadId == tnK) {
-                        targetInCluster = true;
+                    if (svData[idx].overlapIdx == oiK) {
+                        overlapInCluster = true;
                         break;
                     }
                 }
-                if (!targetInCluster && sw > bestScore) {
+                if (!overlapInCluster && sw > bestScore) {
                     bestCluster = ci;
                     bestScore = sw;
                 }
@@ -1778,6 +1986,17 @@ static void phaseLargeIndels(
         k = i + 1;
         while (k < an && svData[k].clusterId == svData[i].clusterId) k++;
         if (svData[i].clusterId < 0) continue;
+
+        // nec[0] < nec[1] filter (Correct.cpp:20049): skip clusters
+        // dominated by homopolymer artifacts.
+        {
+            uint32_t nec0 = 0, nec1 = 0;
+            for (size_t zi = i; zi < k; zi++) {
+                if (svData[zi].isHomopolymer) nec0++;
+                else nec1++;
+            }
+            if (nec0 >= nec1) continue;
+        }
 
         // Consensus position: mode of (qs, qe) pairs.
         uint64_t firstPair = (uint64_t(svData[i].queryPos) << 32) | svData[i].queryEnd;
