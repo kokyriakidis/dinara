@@ -53,6 +53,7 @@ phaseOverlaps(threadCount)          ← entry point (AssemblerPhasing.cpp)
 |------|------|
 | `src/AssemblerPhasing.cpp` | Full pipeline implementation |
 | `src/PhasingTypes.hpp` | Data structures and constants |
+| `src/radixSort.hpp` | In-place MSD radix sort (port of hifiasm's ksort.h `KRADIX_SORT_INIT`) |
 | `src/Alignment.hpp` | `AlignmentData` with `hifiasmEcMatchState0/1` output fields |
 | `src/Assembler.hpp` | `phaseOverlaps(threadCount)` declaration |
 
@@ -217,15 +218,17 @@ overlapID + fused dedup/count/filter/emit.
 Two-level sort matching hifiasm's pattern:
 
 1. **Counting sort by site position** — O(n + maxSite). Site values are
-   bounded by query read length (~20k), so the histogram is small.
+   bounded by query read length (~20k), so the histogram is small and
+   a single-pass counting sort outperforms MSD radix sort (which would
+   do 4 passes for a uint32_t key).
    Hifiasm: `radix_sort_haplotype_evdience_srt`.
 
-2. **Per-site insertion sort by overlapIdx** — O(m²) worst case but
-   fast for typical group sizes (~35 elements). Matches hifiasm's
-   `radix_sort_haplotype_evdience_id_srt` which falls back to insertion
-   sort for groups ≤ 64 (`RS_MIN_SIZE` in ksort.h). In practice all
-   groups are ≤ 64, so insertion sort is always the fast path. Counting
-   sort is kept as fallback for rare large groups.
+2. **Per-site `radixSort` by overlapIdx** — uses `radixSort.hpp`, a
+   port of hifiasm's `KRADIX_SORT_INIT` (ksort.h). In-place MSD radix
+   sort with insertion sort fallback for groups ≤ 64 (`RS_MIN_SIZE`).
+   In practice all per-site groups are ≤ 64 (avg ~35), so the insertion
+   sort path is always taken.
+   Hifiasm: `radix_sort_haplotype_evdience_id_srt` inside `push_info`.
 
 3. **Fused dedup + count** — the dedup loop simultaneously compacts
    duplicates and accumulates match/alt/strand counts, eliminating a
@@ -241,11 +244,8 @@ swap evidence ↔ evidenceTmp
 //         (mirrors hifiasm's push_info called per site group)
 for each group of evidence at the same site position:
 
-    // (a) sort this group by overlapIdx
-    if groupLen <= 64:
-        insertion sort (hifiasm rs_insertsort fallback)
-    else:
-        counting sort via countBuf/sortTmp
+    // (a) radixSort by overlapIdx (insertion sort for ≤ 64)
+    radixSort(group.begin, group.end, [](ev) { return ev.overlapIdx; })
 
     // (b) fused dedup + count (hifiasm push_info lines 10517-10533)
     for each overlapIdx run (sorted, adjacent duplicates):
@@ -267,11 +267,7 @@ for each group of evidence at the same site position:
 ```
 
 **Performance**: 4.7× speedup over the original `std::sort` — from
-~1,870ms to ~395ms (sum over 4 threads on the 989-read test dataset).
-The insertion sort for small groups accounts for most of the gain over
-the intermediate counting-sort-everywhere version (607ms → 395ms),
-because counting sort has O(numOverlaps) setup cost per group (histogram
-zeroing + prefix sum) that dominates when groups average only 35 elements.
+~1,870ms to ~408ms (sum over 4 threads on the 989-read test dataset).
 Phasing output is identical.
 
 The `siteIdx` assignment is the key multi-alt mechanism. It allows
@@ -821,7 +817,7 @@ Defined in `src/PhasingTypes.hpp`:
 | `PhasingSite` | Confirmed het site: position, alleles, immutable counts (`matchCount`, `altCount`, `fwdStrandCount`), mutable label counts (`labelMatchCount`, `labelFwdStrandCount`), per-step flags (`transConfirmed`, `cisReset`, `promoted`), DP chain assignment |
 | `PhasingSvEvent` | Contiguous indel region ≥ 16 bp from one overlap |
 | `PhasingSvCluster` | Cluster of SV events at similar positions |
-| `PhasingScratchpad` | Thread-local workspace, cleared between reads. Includes `evidenceTmp`, `sortTmp`, `countBuf` scratch buffers for counting sort |
+| `PhasingScratchpad` | Thread-local workspace, cleared between reads. Includes `evidenceTmp` and `countBuf` for global counting sort by site |
 
 ## Differences from AssemblerHifiasmEC.cpp
 

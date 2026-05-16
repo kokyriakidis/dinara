@@ -22,6 +22,7 @@
 #include "Alignment.hpp"
 #include "Reads.hpp"
 #include "invalid.hpp"
+#include "radixSort.hpp"
 #include "timestamp.hpp"
 
 #include <algorithm>
@@ -937,7 +938,9 @@ static void runDpPhasing(
             }
         }
         // Deduplicate positions (multi-alt sites share positions).
-        sort(activeSitePositions.begin(), activeSitePositions.end());
+        dinara::radixSort(activeSitePositions.data(),
+            activeSitePositions.data() + activeSitePositions.size(),
+            [](uint32_t x) { return x; });
         activeSitePositions.erase(
             unique(activeSitePositions.begin(), activeSitePositions.end()),
             activeSitePositions.end());
@@ -992,10 +995,10 @@ static void runDpPhasing(
 
             if (!incompleteEntries.empty()) {
                 // Re-sort evidence by (site, overlapIdx).
-                sort(scratch.evidence.begin(), scratch.evidence.end(),
-                    [](const PhasingEvidence& a, const PhasingEvidence& b) {
-                        if (a.site != b.site) return a.site < b.site;
-                        return a.overlapIdx < b.overlapIdx;
+                dinara::radixSort(scratch.evidence.data(),
+                    scratch.evidence.data() + scratch.evidence.size(),
+                    [](const PhasingEvidence& e) -> uint64_t {
+                        return (uint64_t(e.site) << 32) | e.overlapIdx;
                     });
 
                 // Assign siteIdx to new entries and rebuild evidenceBegin/End.
@@ -1194,10 +1197,9 @@ static void labelCisTrans(
     // overlapEvBegin[oi], overlapEvEnd[oi]: range for overlap oi.
     vector<uint32_t> overlapEvIdx(scratch.evidence.size());
     iota(overlapEvIdx.begin(), overlapEvIdx.end(), 0U);
-    sort(overlapEvIdx.begin(), overlapEvIdx.end(),
-        [&](uint32_t a, uint32_t b) {
-            return scratch.evidence[a].overlapIdx < scratch.evidence[b].overlapIdx;
-        });
+    dinara::radixSort(overlapEvIdx.data(),
+        overlapEvIdx.data() + overlapEvIdx.size(),
+        [&](uint32_t a) { return scratch.evidence[a].overlapIdx; });
 
     vector<uint32_t> overlapEvBegin(numOv, 0);
     vector<uint32_t> overlapEvEnd(numOv, 0);
@@ -1404,7 +1406,9 @@ static void labelCisTrans(
             if (o < uint32_t(double(alignLen) * 0.04)) continue;
 
             // Sort by siteIdx (hifiasm sorts overlapSite values).
-            sort(weakSiteIndices.begin(), weakSiteIndices.end());
+            dinara::radixSort(weakSiteIndices.data(),
+                weakSiteIndices.data() + weakSiteIndices.size(),
+                [](uint32_t x) { return x; });
 
             // 32bp proximity filter: remove sites within 32bp of neighbors.
             // Hifiasm uses site positions looked up via snp_stat[a[i]].site.
@@ -1441,7 +1445,9 @@ static void labelCisTrans(
 
         // Promote: siteIdx values appearing in >=2 overlaps.
         if (!promotionCandidates.empty()) {
-            sort(promotionCandidates.begin(), promotionCandidates.end());
+            dinara::radixSort(promotionCandidates.data(),
+                promotionCandidates.data() + promotionCandidates.size(),
+                [](uint32_t x) { return x; });
             for (size_t i = 0; i < promotionCandidates.size(); ) {
                 uint32_t si = promotionCandidates[i];
                 size_t count = 0;
@@ -1602,10 +1608,9 @@ static void phaseLargeIndels(
     // Step 2: Sort SV events by query position.
     // ----------------------------------------------------------------
 
-    sort(scratch.svEvents.begin(), scratch.svEvents.end(),
-        [](const PhasingSvEvent& a, const PhasingSvEvent& b) {
-            return a.queryPos < b.queryPos;
-        });
+    dinara::radixSort(scratch.svEvents.data(),
+        scratch.svEvents.data() + scratch.svEvents.size(),
+        [](const PhasingSvEvent& e) { return e.queryPos; });
 
     // ----------------------------------------------------------------
     // Step 3: Cluster by position overlap >= 50% with target-read dedup.
