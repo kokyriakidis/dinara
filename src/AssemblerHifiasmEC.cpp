@@ -3641,6 +3641,7 @@ void Assembler::performHifiasmECParity(uint64_t threadCount)
                             std::unique(informativeSnpSites.begin(), informativeSnpSites.end()),
                             informativeSnpSites.end());
                     }
+
 	                    // Note: informativeHetSiteCount{0,1} are currently computed using SNP sites only.
 	                    // SV sites (large indels) are still used for cis/trans decisions, but are not used
 	                    // for overlap ranking, because SNP sites are easier to interpret and compare across reads.
