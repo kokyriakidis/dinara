@@ -153,6 +153,7 @@ struct PhasingSvEvent {
     uint32_t errorBases;  ///< Total error bases in this region (hifiasm qn)
     uint32_t supportCount;///< Number of compatible events (hifiasm sec)
     int32_t  clusterId;   ///< Cluster assignment, -1 = unassigned (hifiasm ts)
+    uint8_t  isHomopolymer;///< 1 if homopolymer artifact (hifiasm el==0), 0 otherwise
 };
 
 // ============================================================================
@@ -213,6 +214,7 @@ struct PhasingScratchpad {
 
     // --- Large indel phasing ---
     vector<PhasingSvEvent> svEvents;
+    vector<uint8_t> targetBuf;        ///< Scratch buffer for target bases (hpc check)
 
     /// Reset all vectors without releasing memory.
     void clear() {
@@ -239,6 +241,7 @@ struct PhasingScratchpad {
         sortTmp.clear();
         countBuf.clear();
         svEvents.clear();
+        targetBuf.clear();
     }
 };
 
