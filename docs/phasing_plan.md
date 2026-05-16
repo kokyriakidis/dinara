@@ -15,31 +15,37 @@ phaseOverlaps(threadCount)          ← entry point (AssemblerPhasing.cpp)
         │
         ├── 1. gatherOverlaps         — collect overlaps, init isMatch=1 (cis)
         ├── 2. unpackQuerySequence     — 2-bit → uint8_t for base lookups
-        ├── 3. detectSnpSites          — two-pass SNP detection (hifiasm pattern)
-        │       ├── Pass 1: walk each overlap's CIGAR once, skip match runs,
-        │       │    │       increment vote counter at mismatch positions
+        ├── 3. detectSnpSites          — single-pass SNP detection
+        │       ├── Walk each overlap's CIGAR once: vote counting +
+        │       │    mismatch recording + indel range tracking
+        │       ├── Classify: positions with > OCC_THRES votes → candidates
         │       │    └── periodic repeat mask (period 1–4, ±12 bp window)
-        │       └── Pass 2: re-walk each overlap's CIGAR, emit PhasingEvidence
-        │                   only at candidate positions (flag != 0)
+        │       └── Emit evidence from recorded data (no second CIGAR walk)
         ├── 4. buildSnpMatrix          — group evidence by site, filter, create PhasingSite
         │       ├── multi-alt: separate PhasingSite per qualifying alt base
         │       └── reject position if all ref matches are forward-strand
-        ├── 4b. filterAdjacentSites    — remove sites at positions p and p+1
         ├── 5. runDpPhasing            — O(n²) longest compatible chain
         │       ├── pre-DP: exclude strand-biased sites (is_st_bs)
         │       ├── fill_incom: add synthetic match evidence at gap positions
         │       ├── checkCompatibility: fi/fj classification via ev.siteIdx
         │       ├── isHpcDependent: reject single-site chains needing HPC evidence
-        │       └── per-site matchCount >= cc check within multi-site chains
-        ├── 6. labelCisTrans           — greedy cis/trans labeling
+        │       ├── per-site matchCount >= cc check within multi-site chains
+        │       └── chain sort tie-breaking: bufStart as secondary key
+        ├── 5b. filterAdjacentSites    — remove sites at positions p and p+1
+        │       (runs after DP so dpChainId is available for labelCisTrans)
+        ├── 6. labelCisTrans           — greedy cis/trans labeling (ONT path)
         │       ├── Step A: count confirmed mismatches per overlap
+        │       │    └── dpChainId guard: only count sites on DP chain
         │       ├── Step B: greedy labeling (sorted by count desc)
+        │       │    ├── dpChainId guard on recount
         │       │    └── decrement labelMatchCount/labelFwdStrandCount for matches
         │       ├── Step C: consistency check (flip cis at transConfirmed sites)
         │       ├── Step D: set cisReset for mismatch sites at cis overlaps
-        │       ├── Step E: multi_check (set promoted for weak sites via siteIdx)
-        │       └── Step F: final loop (set strong, apply promotions)
-        ├── 7. phaseLargeIndels        — ≥16 bp SV detection + BFS clustering
+        │       │    └── dpChainId guard: only process sites on DP chain
+        │       ├── Step E: disabled on ONT path (multi_check not used)
+        │       └── Step F: final loop (set strong, require score==1)
+        │            └── dpChainId guard: only process sites on DP chain
+        ├── 7. phaseLargeIndels        — ≥16 bp SV detection + DFS clustering
         ├── 8. dedupChains             — best overlap per target read
         └── 9. writeResults            — per-read-perspective hifiasmEcMatchState
                 │
@@ -109,23 +115,31 @@ O(1) base lookups during SNP detection.
 Port of hifiasm's `extract_sub_cigar_hc` / `hc_phase_robust_rr`
 (Correct.cpp:18541, 19065).
 
-Each overlap's CIGAR is walked directly via `forEachOpWithPositions` —
-no intermediate event arrays are materialized. Match runs are skipped
-in O(1) per CIGAR op (one token decode, no per-base iteration). Only
-mismatch positions are iterated per-base. Each overlap's CIGAR is walked
-exactly twice: once for vote counting, once for evidence emission.
+Fused single-pass approach: each overlap's CIGAR is walked exactly once.
+During the walk, mismatch positions are vote-counted AND recorded as
+`(qpos, tpos)` pairs. Indel ranges are also tracked per overlap. After
+the walk, candidate positions are classified and evidence is emitted
+from the recorded data — no second CIGAR walk is needed.
 
-**Pass 1** — vote counting (mismatches only):
+**Single-pass CIGAR walk** — vote counting + mismatch recording:
 
 ```
 flag[0..queryLen) = 0                   // full-length array
+mismatchRecords = []                    // flat (qpos, tpos) pairs
+indelRanges = []                        // per-overlap [start, end) ranges
 
-for each overlap:
-    walk CIGAR via forEachOpWithPositions:
-        if op != 1 (mismatch): skip     // match/indel → O(1) skip
-        for each base b in mismatch run:
-            qpos = query-forward position
-            if flag[qpos] < 255: flag[qpos]++
+for each overlap oi:
+    recordStart = len(mismatchRecords)
+    walk CIGAR via walkRangeWithCursor:
+        if op == 1 (mismatch):
+            for each base b in mismatch run:
+                qpos = query-forward position
+                if flag[qpos] < 255: flag[qpos]++
+                record (qpos, tpos) in mismatchRecords
+        if op == 2 or op == 3 (indel):
+            record indel range [qpos, qpos+len) in indelRanges
+    recordEnd = len(mismatchRecords)
+    store (recordStart, recordEnd) for overlap oi
 
 // Classify
 for each position p in [0, queryLen):
@@ -138,43 +152,34 @@ for each position p in [0, queryLen):
         flag[p] = 0                     // not a candidate
 ```
 
-**Pass 2** — evidence at candidate positions:
+**Evidence emission** — from recorded data (no second CIGAR walk):
 
 ```
-for each overlap:
-    walk CIGAR via forEachOpWithPositions:
-        if op == 2 or op == 3: skip     // indels
-        // op == 0 (match) or op == 1 (mismatch):
-        for each base in run that falls on a candidate position:
-            if flag[qpos] == 0: skip
-            emit PhasingEvidence:
-                site      = qpos
-                overlapIdx = overlap index
-                siteIdx   = UINT32_MAX  // set in buildSnpMatrix
-                isHpc     = (flag[qpos] == 3) ? 1 : 0
-                if op == 0:
-                    base  = queryBases[qpos]
-                    isAlt = 0
-                else:
-                    base  = target read base at tpos
-                    isAlt = 1
-```
+// Alt evidence: from recorded mismatches at candidate positions
+for each overlap oi:
+    for each (qpos, tpos) in mismatchRecords[recordStart..recordEnd):
+        if flag[qpos] == 0: skip
+        emit PhasingEvidence:
+            site = qpos, overlapIdx = oi, isAlt = 1
+            base = target read base at tpos
+            isHpc = (flag[qpos] == 3) ? 1 : 0
 
-For forward-strand overlaps, match runs in Pass 2 iterate only the
-sub-range that intersects the candidate positions (most positions have
-`flag==0` and are skipped). For RC overlaps (`queryIsRead0==0 && isRev`),
-positions are converted per-base: `qpos = queryLen - 1 - qpos_rc`.
+// Match evidence: overlaps whose query range covers a candidate
+// position and has no mismatch or indel there
+for each overlap oi:
+    for each candidate position p in [ov.qs, ov.qe):
+        if flag[p] == 0: skip
+        if p falls inside an indel range for oi: skip
+        if p has a recorded mismatch for oi: skip
+        emit PhasingEvidence:
+            site = p, overlapIdx = oi, isAlt = 0
+            base = queryBases[p]
+            isHpc = (flag[p] == 3) ? 1 : 0
+```
 
 Flag==3 positions still have evidence collected (with `isHpc=1`). The
 `isHpc` flag is used later by `isHpcDependent` to test whether a single-site
 DP chain depends on periodic-repeat evidence to pass thresholds.
-
-**Performance**: The old implementation pre-walked each overlap's CIGAR
-into a `CigarEvent` array (one struct per aligned base, ~450M events for
-a typical dataset), then re-scanned per 428 bp window. The new
-implementation eliminates both the materialization and the per-window
-re-scanning, reducing `detectSnpSites` from ~297s to ~7s (sum over 8
-threads) on the test dataset.
 
 #### isPeriodicRepeat
 
@@ -273,58 +278,6 @@ Phasing output is identical.
 The `siteIdx` assignment is the key multi-alt mechanism. It allows
 downstream functions to distinguish "mismatch for alt C" from "mismatch
 for alt G" at the same position, matching hifiasm's `overlapSite` field.
-
-### 4b. filterAdjacentSites
-
-Port of hifiasm's adjacent-site filter (Correct.cpp:8855).
-
-Adjacent mismatches (positions p and p+1) are typically alignment artifacts
-— an indel that the aligner represents as two consecutive substitutions —
-rather than real heterozygous variants. Keeping them would add noise to
-the phasing DP and labeling. When a position is removed, ALL its
-PhasingSite entries are removed (multi-alt: if position p has sites for
-alt C and alt G, both are removed).
-
-Three arrays must stay consistent after removal: `sites[]` (compacted,
-indices shift down), `evidence[]` (entries for removed sites dropped),
-and `ev.siteIdx` (remapped from old to new site indices).
-
-```
-// 1. Identify adjacent positions
-group sites by position (multi-alt entries at same position are contiguous)
-for each pair of consecutive position-groups:
-    if group[i+1].position == group[i].position + 1:
-        mark ALL sites in both groups for removal
-
-// 2. Build old-to-new site index mapping
-for each site i:
-    if not removed: oldToNew[i] = next new index
-    else:           oldToNew[i] = UINT32_MAX
-
-// 3. Compact sites array
-keep only non-removed sites, shifting down to fill gaps
-
-// 4. Compact evidence array and remap siteIdx
-for each evidence entry:
-    if oldToNew[ev.siteIdx] == UINT32_MAX:
-        drop entry (its site was removed)
-    else:
-        ev.siteIdx = oldToNew[ev.siteIdx]   // remap to new index
-        keep entry
-
-// 5. Rebuild evidenceBegin/evidenceEnd on surviving sites
-walk sites and evidence in tandem (both sorted by position)
-for each position with surviving sites:
-    find evidence range [begin, end) for this position
-    set evidenceBegin/evidenceEnd on ALL sites at this position
-    (multi-alt sites at same position share the same evidence range)
-```
-
-Hifiasm (Correct.cpp:8855) does the same compaction: it compacts
-`snp_stat[]` and the evidence `list[]`, rewriting
-`overlapSite -= m_off` where `m_off` is the cumulative count of removed
-entries before each surviving group. Our approach uses an explicit
-`oldToNew[]` mapping instead, which is equivalent.
 
 ### 5. runDpPhasing
 
@@ -457,8 +410,9 @@ for each site in sorted order:
     follow parent pointers, collecting chain, marking claimed
     record (chainLength, chainBuffer)
 
-// Sort chains by length descending
-sort chains by length desc
+// Sort chains by length descending, then by bufStart ascending
+// (hifiasm tie-breaking: gen_rphase_dp0_single_path, Correct.cpp:9429)
+sort chains by (length desc, bufStart asc)
 ```
 
 #### 5e. Chain confirmation
@@ -494,13 +448,71 @@ isHpcDependent(siteIdx):
     return mc < 2 or ac < 2 or mc < S_HAP_COV or ac < INFOR_COV
 ```
 
+### 5g. filterAdjacentSites
+
+Port of hifiasm's adjacent-site filter (Correct.cpp:8855). Runs after
+the DP (not before) so that `dpChainId` is available for `labelCisTrans`.
+
+Adjacent mismatches (positions p and p+1) are typically alignment artifacts
+— an indel that the aligner represents as two consecutive substitutions —
+rather than real heterozygous variants. When a position is removed, ALL its
+PhasingSite entries are removed (multi-alt: if position p has sites for
+alt C and alt G, both are removed).
+
+Three arrays must stay consistent after removal: `sites[]` (compacted,
+indices shift down), `evidence[]` (entries for removed sites dropped),
+and `ev.siteIdx` (remapped from old to new site indices).
+
+```
+// 1. Identify adjacent positions
+group sites by position (multi-alt entries at same position are contiguous)
+for each pair of consecutive position-groups:
+    if group[i+1].position == group[i].position + 1:
+        mark ALL sites in both groups for removal
+
+// 2. Build old-to-new site index mapping
+for each site i:
+    if not removed: oldToNew[i] = next new index
+    else:           oldToNew[i] = UINT32_MAX
+
+// 3. Compact sites array
+keep only non-removed sites, shifting down to fill gaps
+
+// 4. Compact evidence array and remap siteIdx
+for each evidence entry:
+    if oldToNew[ev.siteIdx] == UINT32_MAX:
+        drop entry (its site was removed)
+    else:
+        ev.siteIdx = oldToNew[ev.siteIdx]   // remap to new index
+        keep entry
+
+// 5. Rebuild evidenceBegin/evidenceEnd on surviving sites
+walk sites and evidence in tandem (both sorted by position)
+for each position with surviving sites:
+    find evidence range [begin, end) for this position
+    set evidenceBegin/evidenceEnd on ALL sites at this position
+    (multi-alt sites at same position share the same evidence range)
+```
+
+Hifiasm (Correct.cpp:8855) does the same compaction: it compacts
+`snp_stat[]` and the evidence `list[]`, rewriting
+`overlapSite -= m_off` where `m_off` is the cumulative count of removed
+entries before each surviving group. Our approach uses an explicit
+`oldToNew[]` mapping instead, which is equivalent.
+
 ### 6. labelCisTrans
 
-Port of hifiasm's `generate_haplotypes_naive_HiFi` (Correct.cpp:8845).
+Port of hifiasm's `generate_haplotypes_naive_HiFi` (Correct.cpp:8845),
+ONT path (`!qual_a`).
 
 Builds a per-overlap evidence index (`overlapEvIdx`, `overlapEvBegin/End`)
 to support hifiasm's per-overlap iteration pattern while keeping the
 per-site evidence layout from `buildSnpMatrix`.
+
+All steps use a `dpChainId` guard: only sites with `dpChainId >= 0`
+(confirmed by the DP in step 5) participate in mismatch counting and
+labeling decisions. This matches hifiasm's ONT path where
+`filterAdjacentSites` runs after the DP.
 
 #### Threshold helper (used in Steps A, B, C, E, F)
 
@@ -523,13 +535,13 @@ passesFullThresholds(site):
 sort evidence indices by overlapIdx → overlapEvIdx[]
 build overlapEvBegin[oi], overlapEvEnd[oi] ranges
 
-// Count mismatches at confirmed sites for each overlap
+// Count mismatches at DP-confirmed sites for each overlap
 for each overlap oi:
     o = 0
     for each evidence entry at oi (via overlapEvIdx):
         if isAlt == 0: skip                     // only count mismatches
         site = sites[ev.siteIdx]
-        if site.dpChainId < 0: skip             // not DP-confirmed
+        if site.dpChainId < 0: skip             // dpChainId guard
         if not passesFullThresholds(site): skip
         o++
     confirmedMismatchCount[oi] = o
@@ -546,6 +558,9 @@ mismatches to fewest. As each trans overlap is processed, match counts
 on its sites are decremented, potentially causing sites to fail threshold
 checks for later overlaps.
 
+On the ONT path, hifiasm does NOT do a forward walk to find additional
+sites — only the sites already in the overlap's evidence are processed.
+
 ```
 for each oi in sortedOverlapIndices:
     // RE-COUNT with current label counts (may have changed from decrements)
@@ -553,7 +568,7 @@ for each oi in sortedOverlapIndices:
     for each evidence entry at oi:
         if isAlt == 0: skip
         site = sites[ev.siteIdx]
-        if site.dpChainId < 0: skip
+        if site.dpChainId < 0: skip             // dpChainId guard
         if not passesFullThresholds(site): skip
         o++
     if o == 0: skip                             // thresholds no longer met
@@ -609,70 +624,28 @@ for each overlap oi (ALL overlaps, not just sorted list):
     if overlaps[oi].isMatch != 1: skip          // only cis overlaps
     for each evidence entry at oi:
         if isAlt == 1:
+            site = sites[ev.siteIdx]
+            if site.dpChainId < 0: skip         // dpChainId guard
             sites[ev.siteIdx].cisReset = 1
 ```
 
 After Step D, `isLabelConfirmed()` = `(transConfirmed && !cisReset)`.
 Only sites with mismatches exclusively at trans overlaps remain confirmed.
 
-#### Step E — multi_check: weak site promotion (Correct.cpp:9035)
+#### Step E — multi_check: disabled on ONT path
 
-Catches overlaps that the DP missed because individual sites didn't meet
-the strict thresholds. Looks for weak sites (pass basic thresholds but
-not full thresholds) that appear across multiple cis overlaps.
+Hifiasm's `multi_check` (Correct.cpp:9035) is a weak-site promotion
+mechanism that catches overlaps the DP missed. On the ONT path
+(`multi_check=0`), this step is skipped entirely.
 
-```
-promotionCandidates = []
-
-for each cis overlap oi:
-    weakSiteIndices = []
-    for each evidence entry at oi:
-        if isAlt == 0: skip
-        site = sites[ev.siteIdx]
-        if not passesThresholds(site): skip
-        if passesFullThresholds(site): skip     // not weak — already confirmed
-        if site.isLabelConfirmed(): skip        // already trans-confirmed
-        weakSiteIndices.append(ev.siteIdx)
-
-    o = len(weakSiteIndices)
-    if o == 0: skip
-
-    // Density filter: need ≥ 4% of alignment length
-    if o < alignLength * 0.04: skip
-
-    // Sort by siteIdx (hifiasm sorts by overlapSite value)
-    sort weakSiteIndices
-
-    // 32bp proximity filter: remove sites within 32bp of neighbors
-    filtered = []
-    for i = 0 to len(weakSiteIndices) - 1:
-        pos = sites[weakSiteIndices[i]].site
-        tooClose = false
-        if i > 0 and sites[weakSiteIndices[i-1]].site + 32 > pos:
-            tooClose = true
-        if i + 1 < len(weakSiteIndices):
-            nextPos = sites[weakSiteIndices[i+1]].site
-            if pos + 32 > nextPos: tooClose = true
-        else:
-            tooClose = true             // last element always dropped
-                                        // (replicates hifiasm stale-pointer bug)
-        if not tooClose: filtered.append(weakSiteIndices[i])
-
-    if len(filtered) >= 2:
-        promotionCandidates.extend(filtered)
-
-// Promote: siteIdx values appearing in ≥2 overlaps
-sort promotionCandidates
-for each unique siteIdx with count >= 2:
-    sites[siteIdx].promoted = 1
-```
-
-After Step E, `isLabelConfirmed()` = `(transConfirmed && !cisReset) || promoted`.
+`isLabelConfirmed()` = `(transConfirmed && !cisReset)` (no `promoted`
+flag is set).
 
 #### Step F — Final loop (Correct.cpp:9085)
 
-Sets the `strong` flag and applies final cis→trans flips based on
-promoted sites.
+Sets the `strong` flag and applies final cis→trans flips. On the ONT
+path (no Step E promotions), `isLabelConfirmed()` is equivalent to
+hifiasm's `score == 1` check: `transConfirmed && !cisReset`.
 
 ```
 for each overlap oi:
@@ -682,8 +655,11 @@ for each overlap oi:
     else if isMatch == 1:                       // cis
         for each evidence entry at oi:
             site = sites[ev.siteIdx]
-            if not site.isLabelConfirmed(): skip
+            if site.dpChainId < 0: skip         // dpChainId guard
             if not passesThresholds(site): skip
+            // Explicit score==1 check (Correct.cpp:9098):
+            // transConfirmed && !cisReset
+            if not site.isLabelConfirmed(): skip
             // Evidence at a confirmed site (match or mismatch)
             strong = 1
             if isAlt == 1:                      // mismatch at confirmed site
@@ -708,10 +684,11 @@ We split it into three separate flags:
 |------|--------|---------|---------------------------|
 | `transConfirmed` | Step B | Mismatch at this site in a trans overlap | `score = 1` (Step B) |
 | `cisReset` | Step D | Mismatch at this site in a cis overlap | `score = -1` (Step D) |
-| `promoted` | Step E | multi_check promoted this weak site | `score = 1` (Step E) |
+| `promoted` | Step E | multi_check promoted this weak site (disabled on ONT) | `score = 1` (Step E) |
 
-The combined check `isLabelConfirmed()` returns `(transConfirmed && !cisReset) || promoted`,
-equivalent to hifiasm's `score == 1` at the point Step F runs.
+On the ONT path (Step E disabled), `isLabelConfirmed()` returns
+`(transConfirmed && !cisReset)`, equivalent to hifiasm's `score == 1`
+at the point Step F runs.
 
 #### Strand Bias Filter
 
