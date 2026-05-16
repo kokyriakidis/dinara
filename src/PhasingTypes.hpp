@@ -160,30 +160,12 @@ struct PhasingSvCluster {
 // Thread-local scratchpad
 // ============================================================================
 
-/// Per-overlap CIGAR event at a single query-coordinate position.
-/// Collected once per overlap during the pre-walk in detectSnpSites.
-struct CigarEvent {
-    uint32_t qpos;    ///< Position on query read (forward-strand base coords)
-    uint32_t tpos;    ///< Corresponding position on target read
-    uint8_t  op;      ///< CIGAR op (0=match, 1=mismatch)
-};
-
-/// Index range into the cigarEvents vector for one overlap.
-struct OverlapEventRange {
-    uint32_t begin;
-    uint32_t end;
-};
-
 /// Reusable workspace for phasing one query read.
 /// Allocated once per thread, cleared between reads via clear().
 struct PhasingScratchpad {
 
     // --- Per-query-read overlap list ---
     vector<PhasingOverlap> overlaps;
-
-    // --- Pre-walked CIGAR events (detectSnpSites) ---
-    vector<CigarEvent> cigarEvents;
-    vector<OverlapEventRange> cigarEventRanges;
 
     // --- SNP detection (sliding window) ---
     vector<uint8_t> flag;             ///< Per-position mismatch vote count (window-local)
@@ -211,8 +193,6 @@ struct PhasingScratchpad {
     /// Reset all vectors without releasing memory.
     void clear() {
         overlaps.clear();
-        cigarEvents.clear();
-        cigarEventRanges.clear();
         flag.clear();
         queryBases.clear();
         evidence.clear();
