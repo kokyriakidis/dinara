@@ -43,6 +43,7 @@ using namespace dinara;
 // Standard library.
 #include "chrono.hpp"
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -1031,30 +1032,51 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+    // Build a vector of ReadIds sorted by read length (longest first).
+    const Reads& reads = assembler.getReads();
+    const ReadId readCount = reads.readCount();
+    vector<ReadId> readIdsSortedByLength(readCount);
+    iota(readIdsSortedByLength.begin(), readIdsSortedByLength.end(), ReadId(0));
+    sort(readIdsSortedByLength.begin(), readIdsSortedByLength.end(),
+        [&reads](ReadId a, ReadId b) {
+            return reads.getReadRawSequenceLength(a) >
+                   reads.getReadRawSequenceLength(b);
+        });
+
+    // Flag contained reads so createMarkerGraphVertices can skip them.
+    // Contained reads overlap with different regions and can bridge during transitive closure.
+    // Parameters match hifiasm defaults: max_hang=1000, max_hang_rate=0.8, min_ovlp=50.
+    assembler.flagContainedReads(1000, 0.8, 50, threadCount);
+
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
 
-    assembler.phaseOverlaps(threadCount);
-
-    // assembler.performHifiasmECParity(threadCount);
-
-    assembler.createReadGraphFromPhasingCisOverlaps();
-    
+    // Build read graph: contained reads keep only their best alignment
+    // to a non-contained read, preventing them from bridging during transitive closure.
+    assembler.createReadGraphAllAlignments(/*pruneContained=*/ true);
 
     // Set min and max marker graph vertex coverage thresholds.
-    const uint64_t minAnchorCoverage = 8;
+    const uint64_t minAnchorCoverage = 2;
     const uint64_t maxAnchorCoverage = 5 * coveragePeak;
 
     // Build marker graph vertices using transitive alignments collapse.
     assembler.createMarkerGraphVertices(
-        minAnchorCoverage,                                              // minVertexCoverage
-        maxAnchorCoverage,                                              // maxVertexCoverage
+        minAnchorCoverage,                              // minVertexCoverage
+        maxAnchorCoverage,                              // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
+
+
+
+    // assembler.phaseOverlaps(threadCount);
+
+    // assembler.performHifiasmECParity(threadCount);
+
+    // assembler.createReadGraphFromPhasingCisOverlaps();
     
     // // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
     // // This reduces unreliable anchors and artifacts in repetitive regions.
