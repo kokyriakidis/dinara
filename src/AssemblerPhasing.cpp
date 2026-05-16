@@ -236,14 +236,21 @@ static bool isPeriodicRepeat(
 }
 
 // ============================================================================
-// detectSnpSites: two-pass SNP detection (hifiasm extract_sub_cigar_hc pattern)
+// detectSnpSites: single-pass SNP detection
 //
-// Pass 1 — Walk each overlap's CIGAR once over the full read. Skip match
-//          runs in O(1). At mismatch positions, increment vote counter.
-//          Then classify: positions with > OCC_THRES votes and passing
-//          the periodic-repeat filter become candidates (flag=1 or 3).
-// Pass 2 — Walk each overlap's CIGAR once more. At candidate positions
-//          only, emit PhasingEvidence (match → ref base, mismatch → alt).
+// Fused single-pass approach (hifiasm extract_sub_cigar_hc pattern):
+//
+// 1. Walk each overlap's CIGAR once. At mismatch positions, increment
+//    vote counter AND record (qpos, tpos) per overlap.
+// 2. Classify: positions with > OCC_THRES votes become candidates.
+// 3. Emit evidence from recorded data — no second CIGAR walk needed.
+//    - Alt evidence: from recorded mismatches at candidate positions.
+//    - Match evidence: for each candidate position, any overlap whose
+//      query range covers it and has no mismatch/indel there.
+//
+// To handle indels correctly, we also record per-overlap indel ranges
+// during the walk. A candidate position inside an indel range for an
+// overlap does NOT get match evidence from that overlap.
 // ============================================================================
 
 static void detectSnpSites(
@@ -253,13 +260,25 @@ static void detectSnpSites(
     PhasingScratchpad& scratch)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
 
-    // ---- Pass 1: vote counting ----
-    // Full-length flag array. Walk each overlap's CIGAR once, skipping
-    // match runs entirely. Only mismatch bases are iterated.
+    // ---- Single-pass CIGAR walk: vote counting + mismatch recording ----
     scratch.flag.assign(queryLen, 0);
 
-    for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+    // Per-overlap mismatch records: (qpos, tpos) pairs.
+    // Flat vector with per-overlap range indices.
+    scratch.mismatchRecords.clear();
+    scratch.mismatchRangeBegin.resize(numOv + 1);
+
+    // Per-overlap indel coverage: positions where this overlap has an indel.
+    // We track indel ranges as (start, end) pairs per overlap.
+    // For efficiency, use a flat vector with per-overlap range indices.
+    scratch.indelRecords.clear();
+    scratch.indelRangeBegin.resize(numOv + 1);
+
+    for (size_t oi = 0; oi < numOv; oi++) {
+        scratch.mismatchRangeBegin[oi] = uint32_t(scratch.mismatchRecords.size());
+        scratch.indelRangeBegin[oi] = uint32_t(scratch.indelRecords.size());
         const auto& ov = scratch.overlaps[oi];
         const auto& ad = assembler.alignmentData[ov.alignmentId];
         const bool needsRcConvert =
@@ -269,24 +288,64 @@ static void detectSnpSites(
             ov.cigarOffset, ov.cigarTokenCount,
             ad.qs, cigarRead1Start(assembler, ad),
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                if (op != 1) return; // skip match/indel
-
-                for (uint32_t b = 0; b < len; b++) {
-                    uint32_t qpos;
-                    if (ov.queryIsRead0) {
-                        qpos = uint32_t(xk) + b;
+                if (op == 1) {
+                    // Mismatch: increment votes and record positions.
+                    if (!needsRcConvert) {
+                        const uint32_t qStart_op = ov.queryIsRead0
+                            ? uint32_t(xk) : uint32_t(yk);
+                        const uint32_t qEnd_op = qStart_op + len;
+                        for (uint32_t qpos = qStart_op; qpos < qEnd_op; qpos++) {
+                            if (qpos >= queryLen) break;
+                            if (scratch.flag[qpos] < 255)
+                                scratch.flag[qpos]++;
+                            const uint32_t tpos = ov.queryIsRead0
+                                ? uint32_t(yk) + (qpos - uint32_t(xk))
+                                : uint32_t(xk) + (qpos - uint32_t(yk));
+                            scratch.mismatchRecords.push_back({qpos, tpos});
+                        }
                     } else {
-                        qpos = uint32_t(yk) + b;
-                        if (needsRcConvert) {
-                            if (qpos >= queryLen) continue;
-                            qpos = queryLen - 1 - qpos;
+                        for (uint32_t b = 0; b < len; b++) {
+                            const uint32_t qpos_rc = uint32_t(yk) + b;
+                            if (qpos_rc >= queryLen) continue;
+                            const uint32_t qpos = queryLen - 1 - qpos_rc;
+                            if (scratch.flag[qpos] < 255)
+                                scratch.flag[qpos]++;
+                            const uint32_t tpos = uint32_t(xk) + b;
+                            scratch.mismatchRecords.push_back({qpos, tpos});
                         }
                     }
-                    if (qpos < queryLen && scratch.flag[qpos] < 255)
-                        scratch.flag[qpos]++;
+                } else if (op == 2 || op == 3) {
+                    // Record query positions consumed by indels.
+                    // op=2 (insertion): yk advances, xk stays.
+                    //   queryIsRead0 → no query consumed (target insertion).
+                    //   !queryIsRead0 → query (yk) consumed.
+                    // op=3 (deletion): xk advances, yk stays.
+                    //   queryIsRead0 → query (xk) consumed.
+                    //   !queryIsRead0 → no query consumed (target deletion).
+                    bool queryConsumed =
+                        (op == 3 && ov.queryIsRead0) ||
+                        (op == 2 && !ov.queryIsRead0);
+                    if (queryConsumed) {
+                        // Query positions in CIGAR coordinates.
+                        const uint32_t rawStart = (op == 3)
+                            ? uint32_t(xk) : uint32_t(yk);
+                        const uint32_t rawEnd = std::min(rawStart + len, queryLen);
+                        if (rawStart < rawEnd) {
+                            if (!needsRcConvert) {
+                                scratch.indelRecords.push_back({rawStart, rawEnd});
+                            } else {
+                                // RC: reverse the range.
+                                const uint32_t fwdStart = queryLen - rawEnd;
+                                const uint32_t fwdEnd = queryLen - rawStart;
+                                scratch.indelRecords.push_back({fwdStart, fwdEnd});
+                            }
+                        }
+                    }
                 }
             });
     }
+    scratch.mismatchRangeBegin[numOv] = uint32_t(scratch.mismatchRecords.size());
+    scratch.indelRangeBegin[numOv] = uint32_t(scratch.indelRecords.size());
 
     // Classify: candidate SNPs where vote count > OCC_THRES.
     bool anyCandidates = false;
@@ -304,80 +363,106 @@ static void detectSnpSites(
     }
     if (!anyCandidates) return;
 
-    // ---- Pass 2: evidence collection at candidate positions ----
-    // Walk each overlap's CIGAR once more. At candidate positions,
-    // emit match (ref) or mismatch (alt) evidence.
-    for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+    // Build sorted candidate position list.
+    scratch.candidatePositions.clear();
+    for (uint32_t i = 0; i < queryLen; i++) {
+        if (scratch.flag[i] != 0) {
+            scratch.candidatePositions.push_back(i);
+        }
+    }
+    const uint32_t numCand = uint32_t(scratch.candidatePositions.size());
+
+    // ---- Emit alt evidence from recorded mismatches ----
+    for (uint32_t oi = 0; oi < numOv; oi++) {
         const auto& ov = scratch.overlaps[oi];
-        const auto& ad = assembler.alignmentData[ov.alignmentId];
+        const bool targetIsRc =
+            (ov.queryIsRead0 != 0) && (ov.isRev != 0);
         const bool needsRcConvert =
             (ov.queryIsRead0 == 0) && (ov.isRev != 0);
 
-        cigarStore.forEachOpWithPositions(
-            ov.cigarOffset, ov.cigarTokenCount,
-            ad.qs, cigarRead1Start(assembler, ad),
-            [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                if (op != 0 && op != 1) return; // skip indels
+        const uint32_t mBegin = scratch.mismatchRangeBegin[oi];
+        const uint32_t mEnd = scratch.mismatchRangeBegin[oi + 1];
+        for (uint32_t mi = mBegin; mi < mEnd; mi++) {
+            const auto& mr = scratch.mismatchRecords[mi];
+            if (scratch.flag[mr.qpos] == 0) continue; // not a candidate
 
-                if (!needsRcConvert) {
-                    // Forward path. Query positions are monotonic.
-                    const uint32_t qStart_op = ov.queryIsRead0
-                        ? uint32_t(xk) : uint32_t(yk);
-                    const uint32_t qEnd_op = qStart_op + len;
+            PhasingEvidence ev;
+            ev.site = mr.qpos;
+            ev.overlapIdx = oi;
+            ev.siteIdx = UINT32_MAX;
+            ev.isHpc = (scratch.flag[mr.qpos] == 3) ? 1 : 0;
+            // For RC path (!queryIsRead0 && isRev), tpos is xk+b with targetIsRc=false.
+            // For forward path with queryIsRead0 && isRev, targetIsRc=true.
+            ev.base = getBaseAtPosition(
+                assembler, ReadId(ov.targetReadId),
+                mr.tpos, needsRcConvert ? false : targetIsRc);
+            ev.isAlt = 1;
+            scratch.evidence.push_back(ev);
+        }
+    }
 
-                    for (uint32_t qpos = qStart_op; qpos < qEnd_op; qpos++) {
-                        if (qpos >= queryLen) break;
-                        if (scratch.flag[qpos] == 0) continue;
+    // ---- Emit match evidence from range checks ----
+    // Build per-overlap mismatch bitmap for fast lookup.
+    scratch.mismatchBitmap.assign(size_t(numOv) * numCand, 0);
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        const uint32_t mBegin = scratch.mismatchRangeBegin[oi];
+        const uint32_t mEnd = scratch.mismatchRangeBegin[oi + 1];
+        for (uint32_t mi = mBegin; mi < mEnd; mi++) {
+            const uint32_t qpos = scratch.mismatchRecords[mi].qpos;
+            if (scratch.flag[qpos] == 0) continue;
+            const auto it = std::lower_bound(
+                scratch.candidatePositions.begin(),
+                scratch.candidatePositions.end(), qpos);
+            if (it != scratch.candidatePositions.end() && *it == qpos) {
+                const uint32_t ci = uint32_t(it - scratch.candidatePositions.begin());
+                scratch.mismatchBitmap[oi * numCand + ci] = 1;
+            }
+        }
+    }
 
-                        PhasingEvidence ev;
-                        ev.site = qpos;
-                        ev.overlapIdx = uint32_t(oi);
-                        ev.siteIdx = UINT32_MAX;
-                        ev.isHpc = (scratch.flag[qpos] == 3) ? 1 : 0;
+    // Build per-overlap indel bitmap: mark candidate positions inside indels.
+    // indelBitmap[oi * numCand + ci] = 1 if candidate ci is inside an indel for overlap oi.
+    scratch.indelBitmap.assign(size_t(numOv) * numCand, 0);
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        const uint32_t iBegin = scratch.indelRangeBegin[oi];
+        const uint32_t iEnd = scratch.indelRangeBegin[oi + 1];
+        for (uint32_t ii = iBegin; ii < iEnd; ii++) {
+            const auto& ir = scratch.indelRecords[ii];
+            // Find candidates within [ir.qpos, ir.tpos) (tpos used as end).
+            auto lo = std::lower_bound(
+                scratch.candidatePositions.begin(),
+                scratch.candidatePositions.end(), ir.qpos);
+            auto hi = std::lower_bound(lo,
+                scratch.candidatePositions.end(), ir.tpos);
+            for (auto it = lo; it != hi; ++it) {
+                const uint32_t ci = uint32_t(it - scratch.candidatePositions.begin());
+                scratch.indelBitmap[oi * numCand + ci] = 1;
+            }
+        }
+    }
 
-                        if (op == 0) {
-                            ev.base = scratch.queryBases[qpos];
-                            ev.isAlt = 0;
-                        } else {
-                            const uint32_t tpos = ov.queryIsRead0
-                                ? uint32_t(yk) + (qpos - uint32_t(xk))
-                                : uint32_t(xk) + (qpos - uint32_t(yk));
-                            const bool targetIsRc =
-                                (ov.queryIsRead0 != 0) && (ov.isRev != 0);
-                            ev.base = getBaseAtPosition(
-                                assembler, ReadId(ov.targetReadId),
-                                tpos, targetIsRc);
-                            ev.isAlt = 1;
-                        }
-                        scratch.evidence.push_back(ev);
-                    }
-                } else {
-                    // RC path: query positions are reversed.
-                    for (uint32_t b = 0; b < len; b++) {
-                        const uint32_t qpos_rc = uint32_t(yk) + b;
-                        if (qpos_rc >= queryLen) continue;
-                        const uint32_t qpos = queryLen - 1 - qpos_rc;
-                        if (scratch.flag[qpos] == 0) continue;
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        const uint32_t qpos = scratch.candidatePositions[ci];
+        const uint8_t isHpc = (scratch.flag[qpos] == 3) ? 1 : 0;
+        const uint8_t base = scratch.queryBases[qpos];
 
-                        PhasingEvidence ev;
-                        ev.site = qpos;
-                        ev.overlapIdx = uint32_t(oi);
-                        ev.siteIdx = UINT32_MAX;
-                        ev.isHpc = (scratch.flag[qpos] == 3) ? 1 : 0;
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            const auto& ov = scratch.overlaps[oi];
+            // Check if overlap covers this position.
+            if (qpos < ov.qs || qpos >= ov.qe) continue;
+            // Skip if mismatch or indel at this position.
+            if (scratch.mismatchBitmap[oi * numCand + ci]) continue;
+            if (scratch.indelBitmap[oi * numCand + ci]) continue;
 
-                        if (op == 0) {
-                            ev.base = scratch.queryBases[qpos];
-                            ev.isAlt = 0;
-                        } else {
-                            ev.base = getBaseAtPosition(
-                                assembler, ReadId(ov.targetReadId),
-                                uint32_t(xk) + b, false);
-                            ev.isAlt = 1;
-                        }
-                        scratch.evidence.push_back(ev);
-                    }
-                }
-            });
+            PhasingEvidence ev;
+            ev.site = qpos;
+            ev.overlapIdx = oi;
+            ev.siteIdx = UINT32_MAX;
+            ev.isHpc = isHpc;
+            ev.base = base;
+            ev.isAlt = 0;
+            scratch.evidence.push_back(ev);
+        }
     }
 }
 

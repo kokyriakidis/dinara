@@ -170,6 +170,27 @@ struct PhasingScratchpad {
     // --- SNP detection (sliding window) ---
     vector<uint8_t> flag;             ///< Per-position mismatch vote count (window-local)
     vector<uint8_t> queryBases;       ///< Unpacked query sequence (2-bit → uint8_t)
+    vector<uint32_t> candidatePositions; ///< Sorted candidate SNP positions
+
+    /// Mismatch record: query position + target position from CIGAR walk.
+    struct MismatchRecord {
+        uint32_t qpos;
+        uint32_t tpos;
+    };
+    vector<MismatchRecord> mismatchRecords;  ///< All mismatch positions per overlap
+    vector<uint32_t> mismatchRangeBegin;     ///< Per-overlap range into mismatchRecords
+
+    /// Indel record: query position range [qpos, tpos) affected by indel.
+    /// (tpos field reused as end position for compactness.)
+    struct IndelRecord {
+        uint32_t qpos;  ///< Start of query range
+        uint32_t tpos;  ///< End of query range (exclusive)
+    };
+    vector<IndelRecord> indelRecords;    ///< All indel ranges per overlap
+    vector<uint32_t> indelRangeBegin;    ///< Per-overlap range into indelRecords
+
+    vector<uint8_t> mismatchBitmap;  ///< [oi * numCand + ci] = 1 if overlap oi mismatches at candidate ci
+    vector<uint8_t> indelBitmap;     ///< [oi * numCand + ci] = 1 if candidate ci is in indel for overlap oi
 
     // --- SNP evidence ---
     vector<PhasingEvidence> evidence; ///< All evidence entries (sorted by site, overlapIdx)
@@ -200,6 +221,13 @@ struct PhasingScratchpad {
         overlaps.clear();
         flag.clear();
         queryBases.clear();
+        candidatePositions.clear();
+        mismatchRecords.clear();
+        mismatchRangeBegin.clear();
+        indelRecords.clear();
+        indelRangeBegin.clear();
+        mismatchBitmap.clear();
+        indelBitmap.clear();
         evidence.clear();
         sites.clear();
         dpScore.clear();
