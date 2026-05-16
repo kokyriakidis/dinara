@@ -38,6 +38,11 @@ static constexpr uint32_t PHASING_INFOR_COV = 3;
 /// Minimum indel size for SV-based phasing (hifiasm rphase_lidel).
 static constexpr uint32_t PHASING_SV_MIN_LEN = 16;
 
+/// Strand bias rate for SV phasing (hifiasm st_rate for ONT).
+static constexpr double PHASING_SV_ST_RATE = 0.05;
+/// Strand bias max for SV phasing (hifiasm st_max for ONT).
+static constexpr uint32_t PHASING_SV_ST_MAX = 2;
+
 
 // ============================================================================
 // Per-overlap phasing state
@@ -140,20 +145,14 @@ struct PhasingSite {
 // ============================================================================
 
 /// A contiguous error region ≥ SV_MIN_LEN detected from a single overlap's CIGAR.
+/// Maps to hifiasm's ul_ov_t in rphase_lidel (Correct.cpp:20155).
 struct PhasingSvEvent {
-    uint32_t overlapIdx;  ///< Index into PhasingScratchpad::overlaps
-    uint32_t queryPos;    ///< Start position on query read
-    uint32_t queryEnd;    ///< End position on query read
-    uint32_t errorBases;  ///< Total insertion + deletion bases in this region
-};
-
-/// A cluster of SV events at similar positions across overlaps.
-struct PhasingSvCluster {
-    uint32_t consensusPos;    ///< Consensus start position
-    uint32_t consensusEnd;    ///< Consensus end position
-    uint32_t eventCount;      ///< Number of overlaps contributing
-    uint32_t eventBegin;      ///< Range into sorted svEvents array
-    uint32_t eventEnd;
+    uint32_t overlapIdx;  ///< Index into PhasingScratchpad::overlaps (hifiasm tn)
+    uint32_t queryPos;    ///< Start position on query read (hifiasm qs)
+    uint32_t queryEnd;    ///< End position on query read (hifiasm qe)
+    uint32_t errorBases;  ///< Total error bases in this region (hifiasm qn)
+    uint32_t supportCount;///< Number of compatible events (hifiasm sec)
+    int32_t  clusterId;   ///< Cluster assignment, -1 = unassigned (hifiasm ts)
 };
 
 // ============================================================================
@@ -214,7 +213,6 @@ struct PhasingScratchpad {
 
     // --- Large indel phasing ---
     vector<PhasingSvEvent> svEvents;
-    vector<PhasingSvCluster> svClusters;
 
     /// Reset all vectors without releasing memory.
     void clear() {
@@ -241,7 +239,6 @@ struct PhasingScratchpad {
         sortTmp.clear();
         countBuf.clear();
         svEvents.clear();
-        svClusters.clear();
     }
 };
 
