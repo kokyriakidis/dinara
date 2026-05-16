@@ -234,19 +234,14 @@ static bool isPeriodicRepeat(
 }
 
 // ============================================================================
-// detectSnpSites: sliding-window SNP detection
+// detectSnpSites: two-pass SNP detection (hifiasm extract_sub_cigar_hc pattern)
 //
-// Port of hifiasm's hc_phase_robust_rr (Correct.cpp:10200).
-//
-// Three stages:
-//   Pre-walk — Walk each overlap's CIGAR once, collecting match/mismatch
-//              events into scratch.cigarEvents with per-overlap ranges.
-//   Pass 1   — For each 428 bp window, count mismatch votes per position.
-//              Positions with >= 2 votes become candidate SNPs (unless
-//              masked by periodic repeat detection).
-//   Pass 2   — Re-scan events at candidate positions, emitting
-//              PhasingEvidence entries with the observed base and
-//              match/mismatch status.
+// Pass 1 — Walk each overlap's CIGAR once over the full read. Skip match
+//          runs in O(1). At mismatch positions, increment vote counter.
+//          Then classify: positions with > OCC_THRES votes and passing
+//          the periodic-repeat filter become candidates (flag=1 or 3).
+// Pass 2 — Walk each overlap's CIGAR once more. At candidate positions
+//          only, emit PhasingEvidence (match → ref base, mismatch → alt).
 // ============================================================================
 
 static void detectSnpSites(
@@ -256,174 +251,131 @@ static void detectSnpSites(
     PhasingScratchpad& scratch)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
-    const uint32_t W = PHASING_WINDOW_SIZE;
 
-    // ----------------------------------------------------------------
-    // Pre-walk: collect all match/mismatch events per overlap.
-    //
-    // walkRangeWithCursor filters by xk (read0) coordinates, which only
-    // works when queryIsRead0. To handle both orientations uniformly, we
-    // do a single full walk per overlap and store events in forward-strand
-    // query coordinates. Each overlap's events are contiguous and sorted
-    // by qpos, enabling efficient window-based scanning below.
-    // ----------------------------------------------------------------
-
-    auto& allEvents = scratch.cigarEvents;
-    scratch.cigarEventRanges.resize(scratch.overlaps.size());
-
-    allEvents.reserve(scratch.overlaps.size() * 64); // rough estimate
+    // ---- Pass 1: vote counting ----
+    // Full-length flag array. Walk each overlap's CIGAR once, skipping
+    // match runs entirely. Only mismatch bases are iterated.
+    scratch.flag.assign(queryLen, 0);
 
     for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
-        auto& ov = scratch.overlaps[oi];
+        const auto& ov = scratch.overlaps[oi];
         const auto& ad = assembler.alignmentData[ov.alignmentId];
-
-        scratch.cigarEventRanges[oi].begin = uint32_t(allEvents.size());
-
-        OverlapCigarStore::Cursor cursor;
-        cursor.reset(ov.cigarOffset, ov.cigarTokenCount,
-            ad.qs, cigarRead1Start(assembler, ad), cigarStore);
-
-        // When queryIsRead0 == 0 and the overlap is RC, yk is in RC
-        // coordinates of read1 (the query). queryBases is in forward
-        // coordinates, so we must convert: qpos_fwd = queryLen - 1 - qpos_rc.
-        const bool queryNeedsRcConvert =
+        const bool needsRcConvert =
             (ov.queryIsRead0 == 0) && (ov.isRev != 0);
 
-        cigarStore.walkRangeWithCursor(
-            cursor, 0, UINT32_MAX,
+        cigarStore.forEachOpWithPositions(
+            ov.cigarOffset, ov.cigarTokenCount,
+            ad.qs, cigarRead1Start(assembler, ad),
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                if (op != 0 && op != 1) return; // skip indels
+                if (op != 1) return; // skip match/indel
 
                 for (uint32_t b = 0; b < len; b++) {
-                    uint32_t qpos, tpos;
+                    uint32_t qpos;
                     if (ov.queryIsRead0) {
                         qpos = uint32_t(xk) + b;
-                        tpos = uint32_t(yk) + b;
                     } else {
                         qpos = uint32_t(yk) + b;
-                        tpos = uint32_t(xk) + b;
-                        if (queryNeedsRcConvert) {
+                        if (needsRcConvert) {
                             if (qpos >= queryLen) continue;
                             qpos = queryLen - 1 - qpos;
                         }
                     }
-                    if (qpos >= queryLen) continue;
-
-                    CigarEvent ce;
-                    ce.qpos = qpos;
-                    ce.tpos = tpos;
-                    ce.op = op;
-                    allEvents.push_back(ce);
+                    if (qpos < queryLen && scratch.flag[qpos] < 255)
+                        scratch.flag[qpos]++;
                 }
             });
-
-        scratch.cigarEventRanges[oi].end = uint32_t(allEvents.size());
-
-        // For queryIsRead0==0 with RC, the qpos values are reverse-ordered
-        // after forward conversion. Sort to enable early-exit in window scans.
-        if (queryNeedsRcConvert) {
-            sort(allEvents.begin() + scratch.cigarEventRanges[oi].begin,
-                 allEvents.begin() + scratch.cigarEventRanges[oi].end,
-                 [](const CigarEvent& a, const CigarEvent& b) {
-                     return a.qpos < b.qpos;
-                 });
-        }
     }
 
-    // ----------------------------------------------------------------
-    // Windowed SNP detection using pre-collected events.
-    // ----------------------------------------------------------------
-
-    for (uint32_t wStart = 0; wStart < queryLen; wStart += W) {
-        const uint32_t wEnd = min(wStart + W, queryLen);
-        const uint32_t wLen = wEnd - wStart;
-
-        // ---- Pass 1: vote counting ----
-        // Count how many overlaps have a mismatch at each position.
-        // Positions with > OCC_THRES (1) votes are candidate SNPs.
-        scratch.flag.assign(wLen, 0);
-
-        for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
-            const auto& ov = scratch.overlaps[oi];
-            if (ov.qe <= wStart || ov.qs >= wEnd) continue;
-
-            for (uint32_t ei = scratch.cigarEventRanges[oi].begin;
-                 ei < scratch.cigarEventRanges[oi].end; ei++) {
-                const auto& ce = allEvents[ei];
-                if (ce.qpos < wStart) continue;
-                if (ce.qpos >= wEnd) break; // events are sorted by qpos
-                if (ce.op == 1) { // mismatch
-                    uint32_t fi = ce.qpos - wStart;
-                    if (scratch.flag[fi] < 255)
-                        scratch.flag[fi]++;
-                }
-            }
-        }
-
-        // Classify positions:
-        //   flag=0 → not a candidate (too few votes)
-        //   flag=1 → candidate SNP
-        //   flag=3 → HPC-masked candidate (evidence still collected)
-        bool anyCandidates = false;
-        for (uint32_t i = 0; i < wLen; i++) {
-            if (scratch.flag[i] > PHASING_OCC_THRES) {
-                const uint32_t absPos = wStart + i;
-                if (isPeriodicRepeat(scratch.queryBases.data(), queryLen,
-                                     absPos)) {
-                    scratch.flag[i] = 3;
-                } else {
-                    scratch.flag[i] = 1;
-                }
-                anyCandidates = true;
+    // Classify: candidate SNPs where vote count > OCC_THRES.
+    bool anyCandidates = false;
+    for (uint32_t i = 0; i < queryLen; i++) {
+        if (scratch.flag[i] > PHASING_OCC_THRES) {
+            if (isPeriodicRepeat(scratch.queryBases.data(), queryLen, i)) {
+                scratch.flag[i] = 3; // HPC-masked candidate
             } else {
-                scratch.flag[i] = 0;
+                scratch.flag[i] = 1; // candidate SNP
             }
+            anyCandidates = true;
+        } else {
+            scratch.flag[i] = 0;
         }
-        if (!anyCandidates) continue;
+    }
+    if (!anyCandidates) return;
 
-        // ---- Pass 2: evidence collection ----
-        // At candidate positions (flag==1 or flag==3), emit PhasingEvidence
-        // entries recording the observed base and whether it matches the
-        // query. flag==3 positions are HPC-masked but evidence is still
-        // collected (matching hifiasm); the isHpc flag is set on the
-        // evidence but is unused in the ONT pipeline.
-        for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
-            const auto& ov = scratch.overlaps[oi];
-            if (ov.qe <= wStart || ov.qs >= wEnd) continue;
+    // ---- Pass 2: evidence collection at candidate positions ----
+    // Walk each overlap's CIGAR once more. At candidate positions,
+    // emit match (ref) or mismatch (alt) evidence.
+    for (size_t oi = 0; oi < scratch.overlaps.size(); oi++) {
+        const auto& ov = scratch.overlaps[oi];
+        const auto& ad = assembler.alignmentData[ov.alignmentId];
+        const bool needsRcConvert =
+            (ov.queryIsRead0 == 0) && (ov.isRev != 0);
 
-            for (uint32_t ei = scratch.cigarEventRanges[oi].begin;
-                 ei < scratch.cigarEventRanges[oi].end; ei++) {
-                const auto& ce = allEvents[ei];
-                if (ce.qpos < wStart) continue;
-                if (ce.qpos >= wEnd) break;
+        cigarStore.forEachOpWithPositions(
+            ov.cigarOffset, ov.cigarTokenCount,
+            ad.qs, cigarRead1Start(assembler, ad),
+            [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
+                if (op != 0 && op != 1) return; // skip indels
 
-                uint32_t fi = ce.qpos - wStart;
-                if (scratch.flag[fi] == 0) continue;
+                if (!needsRcConvert) {
+                    // Forward path. Query positions are monotonic.
+                    const uint32_t qStart_op = ov.queryIsRead0
+                        ? uint32_t(xk) : uint32_t(yk);
+                    const uint32_t qEnd_op = qStart_op + len;
 
-                PhasingEvidence ev;
-                ev.site = ce.qpos;
-                ev.overlapIdx = uint32_t(oi);
-                ev.siteIdx = UINT32_MAX; // set properly in buildSnpMatrix
-                ev.isHpc = (scratch.flag[fi] == 3) ? 1 : 0;
+                    for (uint32_t qpos = qStart_op; qpos < qEnd_op; qpos++) {
+                        if (qpos >= queryLen) break;
+                        if (scratch.flag[qpos] == 0) continue;
 
-                if (ce.op == 0) { // match → query base
-                    ev.base = scratch.queryBases[ce.qpos];
-                    ev.isAlt = 0;
-                } else { // mismatch → look up target base
-                    // tpos is in oriented coordinates of the target read.
-                    // When queryIsRead0: target is read1, RC if isRev.
-                    // When !queryIsRead0: target is read0, always forward.
-                    const bool targetIsRc = (ov.queryIsRead0 != 0) && (ov.isRev != 0);
-                    ev.base = getBaseAtPosition(
-                        assembler,
-                        ReadId(ov.targetReadId),
-                        ce.tpos, targetIsRc);
-                    ev.isAlt = 1;
+                        PhasingEvidence ev;
+                        ev.site = qpos;
+                        ev.overlapIdx = uint32_t(oi);
+                        ev.siteIdx = UINT32_MAX;
+                        ev.isHpc = (scratch.flag[qpos] == 3) ? 1 : 0;
+
+                        if (op == 0) {
+                            ev.base = scratch.queryBases[qpos];
+                            ev.isAlt = 0;
+                        } else {
+                            const uint32_t tpos = ov.queryIsRead0
+                                ? uint32_t(yk) + (qpos - uint32_t(xk))
+                                : uint32_t(xk) + (qpos - uint32_t(yk));
+                            const bool targetIsRc =
+                                (ov.queryIsRead0 != 0) && (ov.isRev != 0);
+                            ev.base = getBaseAtPosition(
+                                assembler, ReadId(ov.targetReadId),
+                                tpos, targetIsRc);
+                            ev.isAlt = 1;
+                        }
+                        scratch.evidence.push_back(ev);
+                    }
+                } else {
+                    // RC path: query positions are reversed.
+                    for (uint32_t b = 0; b < len; b++) {
+                        const uint32_t qpos_rc = uint32_t(yk) + b;
+                        if (qpos_rc >= queryLen) continue;
+                        const uint32_t qpos = queryLen - 1 - qpos_rc;
+                        if (scratch.flag[qpos] == 0) continue;
+
+                        PhasingEvidence ev;
+                        ev.site = qpos;
+                        ev.overlapIdx = uint32_t(oi);
+                        ev.siteIdx = UINT32_MAX;
+                        ev.isHpc = (scratch.flag[qpos] == 3) ? 1 : 0;
+
+                        if (op == 0) {
+                            ev.base = scratch.queryBases[qpos];
+                            ev.isAlt = 0;
+                        } else {
+                            ev.base = getBaseAtPosition(
+                                assembler, ReadId(ov.targetReadId),
+                                uint32_t(xk) + b, false);
+                            ev.isAlt = 1;
+                        }
+                        scratch.evidence.push_back(ev);
+                    }
                 }
-
-                scratch.evidence.push_back(ev);
-            }
-        }
+            });
     }
 }
 
@@ -1917,8 +1869,6 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                     readsWithSites++;
 
                     // 5. DP phasing.
-                    // Hifiasm: cc = max(6, (het_cov > 0 ? het_cov : hom_cov/n_hap) * 0.7)
-                    // het_cov is typically 0; hom_cov = coveragePeak; n_hap = 2.
                     const uint64_t coveragePeak =
                         assemblerInfo->kmerDistributionInfo.coveragePeak;
                     const uint32_t hetCov = uint32_t(coveragePeak / 2);
