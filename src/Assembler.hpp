@@ -1112,7 +1112,7 @@ public:
     /// Delete overlaps where one read is contained in the other (ma_hit2arc containment).
     /// Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps.
     void deleteContainmentOverlaps(uint64_t threadCount);
-    /// Delete internal overlaps (ma_hit2arc result -1/-2: excessive overhangs or too short).
+    /// Delete internal overlaps (ma_hit2arc MA_HT_INT/MA_HT_SHORT_OVLP: excessive overhangs or too short).
     /// Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
@@ -1770,7 +1770,10 @@ private:
     // Use this together with marker graph vertex coverage thresholds
     // (minCoverage/maxCoverage in createMarkerGraphVertices) to filter
     // instead of pre-filtering per read.
-    void createReadGraphAllAlignments();
+    // Build a read graph from all alignments.
+    // If pruneContained is true, contained reads (flagged by flagContainedReads)
+    // keep only their single best alignment to a non-contained read.
+    void createReadGraphAllAlignments(bool pruneContained = false);
 
     // Create a read graph using only the cis/trans (phasing) decisions produced by
     // performHifiasmECParity. This ignores all non-phasing deletion reasons.
