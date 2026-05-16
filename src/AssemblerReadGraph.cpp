@@ -174,15 +174,108 @@ void Assembler::createReadGraph(
 // Used for the marker-graph + journeys pipeline, where alignment
 // selection is deferred to coverage thresholds on marker graph vertices
 // rather than done up-front per read.
-void Assembler::createReadGraphAllAlignments()
+void Assembler::createReadGraphAllAlignments(bool pruneContained)
 {
     const uint64_t n = alignmentData.size();
-    cout << timestamp << "createReadGraphAllAlignments: keeping all " << n << " alignments." << endl;
-    vector<bool> keepAlignment(n, true);
+
+    if(!pruneContained) {
+        // Keep all alignments.
+        cout << timestamp << "createReadGraphAllAlignments: keeping all " << n << " alignments." << endl;
+        vector<bool> keepAlignment(n, true);
+        createReadGraphUsingSelectedAlignments(keepAlignment);
+        createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
+        return;
+    }
+
+    // Prune contained reads: each contained read keeps only its single best
+    // alignment (by markerCount) to a non-contained partner.
+    // Alignments between two contained reads are discarded.
+    // Non-contained reads keep all their alignments.
+    cout << timestamp << "createReadGraphAllAlignments (pruneContained): "
+         << n << " alignments, pruning contained reads to best overlap." << endl;
+
+    const uint64_t readCount = reads->readCount();
+
+    // For each contained read, find the best alignment to a non-contained partner.
+    // Selection criteria (in order): markerCount, dpScore, partner read length.
+    struct BestInfo {
+        uint64_t alignmentId = invalid<uint64_t>;
+        uint32_t markerCount = 0;
+        int64_t dpScore = std::numeric_limits<int64_t>::min();
+        uint64_t partnerLength = 0;
+    };
+    vector<BestInfo> bestForRead(readCount);
+
+    for(uint64_t alignmentId = 0; alignmentId < n; alignmentId++) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+
+        const ReadId readId0 = ad.readIds[0];
+        const ReadId readId1 = ad.readIds[1];
+        const bool contained0 = reads->getFlags(readId0).isContained;
+        const bool contained1 = reads->getFlags(readId1).isContained;
+
+        if(contained0 && contained1) continue;
+        if(!contained0 && !contained1) continue;
+
+        // Exactly one is contained.
+        const ReadId containedReadId = contained0 ? readId0 : readId1;
+        const ReadId partnerId = contained0 ? readId1 : readId0;
+        const uint32_t mc = ad.info.markerCount;
+        const int64_t dp = (ad.info.dpScore != invalid<int64_t>) ?
+            ad.info.dpScore : std::numeric_limits<int64_t>::min();
+        const uint64_t partnerLen = reads->getReadRawSequenceLength(partnerId);
+
+        auto& best = bestForRead[containedReadId];
+        if(mc > best.markerCount
+            || (mc == best.markerCount && dp > best.dpScore)
+            || (mc == best.markerCount && dp == best.dpScore && partnerLen > best.partnerLength)) {
+            best.alignmentId = alignmentId;
+            best.markerCount = mc;
+            best.dpScore = dp;
+            best.partnerLength = partnerLen;
+        }
+    }
+
+    // Build the keepAlignment vector.
+    vector<bool> keepAlignment(n, false);
+    uint64_t keptNonContained = 0;
+    uint64_t keptContained = 0;
+    uint64_t skippedBothContained = 0;
+    uint64_t skippedNotBest = 0;
+
+    for(uint64_t alignmentId = 0; alignmentId < n; alignmentId++) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+
+        const ReadId readId0 = ad.readIds[0];
+        const ReadId readId1 = ad.readIds[1];
+        const bool contained0 = reads->getFlags(readId0).isContained;
+        const bool contained1 = reads->getFlags(readId1).isContained;
+
+        if(!contained0 && !contained1) {
+            keepAlignment[alignmentId] = true;
+            ++keptNonContained;
+        } else if(contained0 && contained1) {
+            ++skippedBothContained;
+        } else {
+            const ReadId containedReadId = contained0 ? readId0 : readId1;
+            if(bestForRead[containedReadId].alignmentId == alignmentId) {
+                keepAlignment[alignmentId] = true;
+                ++keptContained;
+            } else {
+                ++skippedNotBest;
+            }
+        }
+    }
+
+    cout << timestamp << "createReadGraphAllAlignments (pruneContained): "
+         << keptNonContained << " non-contained kept, "
+         << keptContained << " best-contained kept, "
+         << skippedBothContained << " both-contained skipped, "
+         << skippedNotBest << " non-best contained skipped." << endl;
+
     createReadGraphUsingSelectedAlignments(keepAlignment);
     createDirectedReadGraphUsingSelectedAlignments(keepAlignment);
 }
-
 
 
 
