@@ -1037,6 +1037,8 @@ void dinara::main::assemble(
 
     assembler.phaseOverlaps(threadCount);
 
+    // assembler.performHifiasmECParity(threadCount);
+
     assembler.createReadGraphFromPhasingCisOverlaps();
     
 
