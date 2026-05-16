@@ -431,6 +431,7 @@ static void buildSnpMatrix(
     // Write qualifying evidence compactly into evidenceTmp (output buffer).
     // This mirrors hifiasm's push_info called per site group from rphase_hc.
     scratch.evidenceTmp.clear();
+    scratch.evidenceTmp.reserve(n); // output ≤ input; avoid reallocations
 
     size_t i = 0;
     while (i < n) {
@@ -440,24 +441,43 @@ static void buildSnpMatrix(
         const size_t groupEnd = i;
         const size_t groupLen = groupEnd - groupBegin;
 
-        // (a) Counting sort this site's evidence by overlapIdx.
-        //     For groups of 1, skip — already trivially sorted.
+        // (a) Sort this site's evidence by overlapIdx.
+        //     Hifiasm uses radix sort which falls back to insertion sort
+        //     for groups ≤ 64 (RS_MIN_SIZE). In practice all groups are
+        //     ≤ 64 (avg ~35), so insertion sort is the fast path.
         if (groupLen > 1) {
-            scratch.countBuf.assign(numOverlaps + 1, 0);
-            for (size_t j = groupBegin; j < groupEnd; j++) {
-                scratch.countBuf[scratch.evidence[j].overlapIdx + 1]++;
-            }
-            for (uint32_t k = 1; k <= numOverlaps; k++) {
-                scratch.countBuf[k] += scratch.countBuf[k - 1];
-            }
-            scratch.sortTmp.resize(groupLen);
-            for (size_t j = groupBegin; j < groupEnd; j++) {
-                scratch.sortTmp[
-                    scratch.countBuf[scratch.evidence[j].overlapIdx]++] =
-                    scratch.evidence[j];
-            }
-            for (size_t j = 0; j < groupLen; j++) {
-                scratch.evidence[groupBegin + j] = scratch.sortTmp[j];
+            auto* base = scratch.evidence.data() + groupBegin;
+            if (groupLen <= 64) {
+                // Insertion sort — matches hifiasm's rs_insertsort fallback.
+                for (size_t j = 1; j < groupLen; j++) {
+                    if (base[j].overlapIdx < base[j - 1].overlapIdx) {
+                        PhasingEvidence tmp = base[j];
+                        size_t k = j;
+                        do {
+                            base[k] = base[k - 1];
+                            k--;
+                        } while (k > 0 && tmp.overlapIdx < base[k - 1].overlapIdx);
+                        base[k] = tmp;
+                    }
+                }
+            } else {
+                // Counting sort for rare large groups.
+                scratch.countBuf.assign(numOverlaps + 1, 0);
+                for (size_t j = groupBegin; j < groupEnd; j++) {
+                    scratch.countBuf[scratch.evidence[j].overlapIdx + 1]++;
+                }
+                for (uint32_t k = 1; k <= numOverlaps; k++) {
+                    scratch.countBuf[k] += scratch.countBuf[k - 1];
+                }
+                scratch.sortTmp.resize(groupLen);
+                for (size_t j = groupBegin; j < groupEnd; j++) {
+                    scratch.sortTmp[
+                        scratch.countBuf[scratch.evidence[j].overlapIdx]++] =
+                        scratch.evidence[j];
+                }
+                for (size_t j = 0; j < groupLen; j++) {
+                    base[j] = scratch.sortTmp[j];
+                }
             }
         }
 
