@@ -1129,9 +1129,15 @@ static void runDpPhasing(
     // Reset temporary claims.
     scratch.dpChainId.assign(n, -1);
 
-    // Sort chains by length descending (hifiasm does this).
+    // Sort chains by length descending, then by bufStart ascending
+    // (hifiasm encodes ((UINT32_MAX - length) << 32) | rn0 and radix
+    // sorts, so equal-length chains are ordered by extraction order,
+    // i.e. higher-scoring endpoints first).
     sort(chains.begin(), chains.end(),
-        [](const auto& a, const auto& b) { return a.first > b.first; });
+        [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        });
 
     // Assign chain IDs with confirmation logic.
     // Hifiasm processes all chains without a limit.
@@ -1408,15 +1414,17 @@ static void labelCisTrans(
 // ============================================================================
 // phaseLargeIndels: detect >=16 bp SVs from CIGARs, cluster, phase
 //
-// Port of hifiasm's rphase_lidel (Correct.cpp:20155).
+// Port of hifiasm's rphase_lidel + rphase_lidel_cc + rcall_lidel_variant
+// + generate_haplotypes_sv (Correct.cpp:20155, 19796, 20030, 9115).
 //
-// Only considers cis overlaps (is_match == 1). Four steps:
-//   Step 1 — Walk CIGARs and detect contiguous indel regions >= 16 bp.
-//   Step 2 — Sort SV events by query position.
-//   Step 3 — Cluster events by >= 50% position overlap (BFS connected
-//            components), with target-read dedup within each cluster.
-//   Step 4 — For each cluster with >= 3 unique targets and >= 3 spanning
-//            cis overlaps, label the SV-carrying overlaps as trans.
+// Steps:
+//   1. Walk CIGARs to detect contiguous indel regions >= 16 bp.
+//   2. Sort by (queryPos, queryEnd). Count pairwise support (cal_lindel_dd).
+//   3. Filter events with sec==0. BFS clustering with target-read dedup
+//      (set_cgid). Second pass for unclustered events (is_get_group).
+//   4. Per cluster: compute consensus pos/error, collect spanning cis
+//      overlaps, build evidence (push_idel_info with extract_sub_err),
+//      run greedy labeling (generate_haplotypes_sv).
 // ============================================================================
 
 static void phaseLargeIndels(
@@ -1428,21 +1436,15 @@ static void phaseLargeIndels(
     const auto& cigarStore = assembler.getOverlapCigarStore();
 
     // ----------------------------------------------------------------
-    // Step 1: Detect SV events from cis overlaps.
-    //
-    // Walk each cis overlap's CIGAR. Contiguous indel runs (ins/del ops)
-    // whose span or base count >= SV_MIN_LEN (16) are recorded as
-    // PhasingSvEvents. RC overlaps have their coordinates converted to
-    // forward-strand afterward.
+    // Step 1: Detect SV events from cis overlaps (extract_sub_cigar_sv).
     // ----------------------------------------------------------------
 
     for (uint32_t oi = 0; oi < uint32_t(scratch.overlaps.size()); oi++) {
         const auto& ov = scratch.overlaps[oi];
-        if (ov.isMatch != 1) continue; // only cis overlaps
+        if (ov.isMatch != 1) continue;
 
         const auto& ad = assembler.alignmentData[ov.alignmentId];
 
-        // Walk the full CIGAR and detect contiguous error regions.
         uint32_t indelRunStart = UINT32_MAX;
         uint32_t indelRunEnd = 0;
         uint32_t indelRunBases = 0;
@@ -1456,6 +1458,8 @@ static void phaseLargeIndels(
                 ev.queryPos = indelRunStart;
                 ev.queryEnd = indelRunEnd;
                 ev.errorBases = indelRunBases;
+                ev.supportCount = 0;
+                ev.clusterId = -1;
                 scratch.svEvents.push_back(ev);
             }
             indelRunStart = UINT32_MAX;
@@ -1467,8 +1471,6 @@ static void phaseLargeIndels(
         cursor.reset(ov.cigarOffset, ov.cigarTokenCount,
             ad.qs, cigarRead1Start(assembler, ad), cigarStore);
 
-        // Track SV events in oriented coordinates during the walk,
-        // then convert to forward coordinates afterward.
         const bool qNeedsRc =
             (ov.queryIsRead0 == 0) && (ov.isRev != 0);
         const size_t svEventsBefore = scratch.svEvents.size();
@@ -1476,16 +1478,12 @@ static void phaseLargeIndels(
         cigarStore.walkRangeWithCursor(
             cursor, 0, UINT32_MAX,
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                // Map to query position (oriented coordinates).
                 uint32_t qpos = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
 
-                if (op == 2 || op == 3) { // insertion or deletion
+                if (op == 2 || op == 3) {
                     if (indelRunStart == UINT32_MAX) {
                         indelRunStart = qpos;
                     }
-                    // Compute how many query bases this op spans.
-                    // When queryIsRead0: query=xk, op3 (del) advances xk, op2 (ins) doesn't.
-                    // When !queryIsRead0: query=yk, op2 (ins) advances yk, op3 (del) doesn't.
                     const bool queryAdvances = ov.queryIsRead0 ? (op == 3) : (op == 2);
                     indelRunEnd = qpos + (queryAdvances ? len : 0);
                     if (indelRunEnd <= indelRunStart) {
@@ -1493,13 +1491,11 @@ static void phaseLargeIndels(
                     }
                     indelRunBases += len;
                 } else {
-                    // Match or mismatch — flush any pending indel run.
                     flushRun();
                 }
             });
         flushRun();
 
-        // Convert RC-coordinate SV events to forward coordinates.
         if (qNeedsRc) {
             for (size_t ei = svEventsBefore; ei < scratch.svEvents.size(); ei++) {
                 auto& ev = scratch.svEvents[ei];
@@ -1514,112 +1510,490 @@ static void phaseLargeIndels(
     if (scratch.svEvents.empty()) return;
 
     // ----------------------------------------------------------------
-    // Step 2: Sort SV events by query position.
+    // Step 2: Sort by (queryPos, queryEnd). Count pairwise support.
+    //
+    // Hifiasm (Correct.cpp:20178): radix_sort_ul_ov_srt_qs1, then
+    // within same qs, radix_sort_ul_ov_srt_qe1.
     // ----------------------------------------------------------------
 
-    dinara::radixSort(scratch.svEvents.data(),
-        scratch.svEvents.data() + scratch.svEvents.size(),
+    auto* svData = scratch.svEvents.data();
+    const size_t svN = scratch.svEvents.size();
+
+    // Sort by queryPos.
+    dinara::radixSort(svData, svData + svN,
         [](const PhasingSvEvent& e) { return e.queryPos; });
 
-    // ----------------------------------------------------------------
-    // Step 3: Cluster by position overlap >= 50% with target-read dedup.
-    //
-    // BFS connected components: events are sorted by position, and we
-    // greedily merge events that overlap the current cluster by >= 50%
-    // of the smaller span. Within each cluster, deduplicate by target
-    // read (keep first per target).
-    // ----------------------------------------------------------------
+    // Within same queryPos, sort by queryEnd.
+    for (size_t i = 0, j; i < svN; i = j) {
+        j = i + 1;
+        while (j < svN && svData[j].queryPos == svData[i].queryPos) j++;
+        if (j - i > 1) {
+            sort(svData + i, svData + j,
+                [](const PhasingSvEvent& a, const PhasingSvEvent& b) {
+                    return a.queryEnd < b.queryEnd;
+                });
+        }
+    }
 
+    // cal_lindel_dd pairwise compatibility (Correct.cpp:19740).
+    // Parameters: len_st=0.500001, len_w=3, err_dif=0.25.
+    constexpr double LEN_ST = 0.500001;
+    constexpr uint32_t LEN_W = 3;
+    constexpr double ERR_DIF = 0.25;
+    constexpr uint32_t C_SZ = 3;
+
+    auto calLindelDd = [&](size_t ai, size_t bi) -> double {
+        const auto& a = svData[ai];
+        const auto& b = svData[bi];
+        // Same target → reject.
+        uint32_t tnA = scratch.overlaps[a.overlapIdx].targetReadId;
+        uint32_t tnB = scratch.overlaps[b.overlapIdx].targetReadId;
+        if (tnA == tnB) return -1;
+        // Overlap check.
+        uint32_t os = max(a.queryPos, b.queryPos);
+        uint32_t oe = min(a.queryEnd, b.queryEnd);
+        if (oe <= os + LEN_W) return -1;
+        uint32_t ol = oe - os;
+        uint32_t spanA = a.queryEnd - a.queryPos;
+        uint32_t spanB = b.queryEnd - b.queryPos;
+        // Overlap < 50% of BOTH spans → reject (hifiasm uses &&).
+        if (ol < uint32_t(spanA * LEN_ST) && ol < uint32_t(spanB * LEN_ST))
+            return -1;
+        // Error difference check.
+        int32_t ea = int32_t(a.errorBases);
+        int32_t eb = int32_t(b.errorBases);
+        int32_t ed = abs(ea - eb);
+        if (ed > int32_t(ea * ERR_DIF) || ed > int32_t(eb * ERR_DIF))
+            return -1;
+        // Score.
+        double sc = double(ea - ed + eb - ed) / double(ea + eb);
+        sc += double(ol + ol) / double(spanA + spanB);
+        return sc;
+    };
+
+    // Count pairwise support (Correct.cpp:19808).
+    for (size_t k = 0; k < svN; k++) {
+        uint32_t spanK = svData[k].queryEnd - svData[k].queryPos;
+        uint32_t olMin = uint32_t(spanK * LEN_ST);
+        if (olMin < LEN_W) olMin = LEN_W;
+        if (spanK < olMin) continue;
+        for (size_t z = k + 1; z < svN && svData[z].queryPos < svData[k].queryEnd; z++) {
+            if (calLindelDd(k, z) >= 0) {
+                svData[k].supportCount++;
+                svData[z].supportCount++;
+            }
+        }
+    }
+
+    // Remove events with supportCount == 0 (Correct.cpp:19820).
     {
-        const size_t nev = scratch.svEvents.size();
+        size_t w = 0;
+        for (size_t k = 0; k < svN; k++) {
+            if (svData[k].supportCount == 0) continue;
+            svData[w++] = svData[k];
+        }
+        scratch.svEvents.resize(w);
+    }
+    if (scratch.svEvents.empty()) return;
 
-        // Assign cluster IDs via greedy merge.
-        vector<int32_t> clusterId(nev, -1);
-        int32_t nextCluster = 0;
+    svData = scratch.svEvents.data();
+    const size_t an = scratch.svEvents.size();
 
-        for (size_t i = 0; i < nev; i++) {
-            if (clusterId[i] >= 0) continue;
+    // ----------------------------------------------------------------
+    // Step 3: BFS clustering with target-read dedup (rphase_lidel_cc).
+    //
+    // Hifiasm (Correct.cpp:19830): BFS from events with sec >= c_sz.
+    // set_cgid checks target-read uniqueness within each cluster.
+    // Second pass assigns unclustered events to best matching cluster.
+    // ----------------------------------------------------------------
 
-            // Start a new cluster with event i.
-            clusterId[i] = nextCluster;
-            uint32_t cStart = scratch.svEvents[i].queryPos;
-            uint32_t cEnd = scratch.svEvents[i].queryEnd;
+    const size_t numOv = scratch.overlaps.size();
+    // Per-overlap: how many clusters this overlap's target is in (0 or 1).
+    vector<uint8_t> targetUsed(numOv, 0);
+    int32_t nextCluster = 0;
+    int32_t totalAssigned = 0;
 
-            // BFS: try to add subsequent events.
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                for (size_t j = i + 1; j < nev; j++) {
-                    if (clusterId[j] >= 0) continue;
-                    const auto& ev = scratch.svEvents[j];
-                    if (ev.queryPos > cEnd) break; // sorted, no more overlap
+    // BFS queue.
+    vector<size_t> bfsQueue;
 
-                    uint32_t oStart = max(cStart, ev.queryPos);
-                    uint32_t oEnd = min(cEnd, ev.queryEnd);
-                    int32_t overlap = int32_t(oEnd) - int32_t(oStart);
+    // Track which targets were touched during this cluster's BFS
+    // so we can reset targetUsed afterward.
+    vector<uint32_t> touchedTargets;
 
-                    uint32_t cSpan = cEnd - cStart;
-                    uint32_t eSpan = ev.queryEnd - ev.queryPos;
-                    uint32_t minSpan = min(cSpan, eSpan);
+    for (size_t k = 0; k < an; k++) {
+        if (svData[k].supportCount < C_SZ) continue;
+        if (svData[k].clusterId >= 0) continue;
 
-                    if (overlap > 0 && uint32_t(overlap) >= minSpan / 2) {
-                        clusterId[j] = nextCluster;
-                        cStart = min(cStart, ev.queryPos);
-                        cEnd = max(cEnd, ev.queryEnd);
-                        changed = true;
+        int32_t ci = nextCluster++;
+        bfsQueue.clear();
+        touchedTargets.clear();
+        bfsQueue.push_back(k);
+
+        size_t qi = 0;
+        while (qi < bfsQueue.size()) {
+            size_t v = bfsQueue[qi++];
+            uint32_t spanV = svData[v].queryEnd - svData[v].queryPos;
+            uint32_t olMin = uint32_t(spanV * LEN_ST);
+            if (olMin < LEN_W) olMin = LEN_W;
+            if (spanV < olMin) continue;
+
+            // set_cgid: check if this event can join cluster ci.
+            auto tryClaim = [&](size_t idx) -> bool {
+                if (svData[idx].clusterId >= 0) return false;
+                uint32_t oi = svData[idx].overlapIdx;
+                if (targetUsed[oi] != 0) return false;
+                svData[idx].clusterId = ci;
+                targetUsed[oi] = 1;
+                touchedTargets.push_back(oi);
+                totalAssigned++;
+                return true;
+            };
+
+            if (tryClaim(v) || svData[v].clusterId == ci) {
+                for (size_t z = 0; z < an && svData[z].queryPos < svData[v].queryEnd; z++) {
+                    if (svData[z].supportCount < C_SZ) continue;
+                    if (svData[z].clusterId >= 0) continue;
+                    if (z == v) continue;
+                    if (calLindelDd(v, z) >= 0 && tryClaim(z)) {
+                        bfsQueue.push_back(z);
                     }
                 }
             }
-
-            // Build cluster with target-read dedup.
-            PhasingSvCluster cluster;
-            cluster.consensusPos = cStart;
-            cluster.consensusEnd = cEnd;
-            cluster.eventBegin = uint32_t(i);
-            cluster.eventCount = 0;
-
-            // Collect unique target reads in this cluster.
-            vector<uint32_t> seenTargets;
-            for (size_t j = i; j < nev; j++) {
-                if (clusterId[j] != nextCluster) continue;
-                const uint32_t tid = scratch.overlaps[scratch.svEvents[j].overlapIdx].targetReadId;
-                bool dup = false;
-                for (uint32_t t : seenTargets) {
-                    if (t == tid) { dup = true; break; }
-                }
-                if (!dup) {
-                    seenTargets.push_back(tid);
-                    cluster.eventCount++;
-                }
-            }
-            cluster.eventEnd = uint32_t(nev); // will scan by clusterId
-            scratch.svClusters.push_back(cluster);
-            nextCluster++;
         }
 
-        // ---- Step 4: Label overlaps in qualifying clusters. ----
-        // Require >= 3 unique targets in the cluster AND >= 3 cis overlaps
-        // spanning the cluster's consensus region.
-        for (int32_t ci = 0; ci < nextCluster; ci++) {
-            const auto& cluster = scratch.svClusters[ci];
-            if (cluster.eventCount < 3) continue; // need >= 3 unique targets (hifiasm c_sz=3)
+        // Reset targetUsed for next cluster.
+        for (uint32_t oi : touchedTargets) targetUsed[oi] = 0;
+    }
 
-            // Count how many cis overlaps span this region.
-            uint32_t spanCount = 0;
-            for (const auto& ov : scratch.overlaps) {
-                if (ov.isMatch != 1) continue;
-                if (ov.qs <= cluster.consensusPos && ov.qe >= cluster.consensusEnd) {
-                    spanCount++;
+    if (nextCluster <= 0 || totalAssigned <= 0) return;
+
+    // Second pass: assign unclustered events to best matching cluster
+    // (Correct.cpp:19870).
+    if (totalAssigned < int32_t(an)) {
+        // Build per-cluster linked list of event indices for is_get_group.
+        // clusterHead[ci] = first event index in cluster ci.
+        // clusterNext[k] = next event index in same cluster, or -1.
+        vector<int32_t> clusterHead(nextCluster, -1);
+        vector<int32_t> clusterNext(an, -1);
+        for (int32_t k = int32_t(an) - 1; k >= 0; k--) {
+            if (svData[k].clusterId < 0) continue;
+            int32_t ci = svData[k].clusterId;
+            clusterNext[k] = clusterHead[ci];
+            clusterHead[ci] = k;
+        }
+
+        for (size_t k = 0; k < an; k++) {
+            if (svData[k].clusterId >= 0) continue;
+            uint32_t spanK = svData[k].queryEnd - svData[k].queryPos;
+            uint32_t olMin = uint32_t(spanK * LEN_ST);
+            if (olMin < LEN_W) olMin = LEN_W;
+            if (spanK < olMin) continue;
+
+            int32_t bestCluster = -1;
+            double bestScore = -1;
+            uint32_t tnK = scratch.overlaps[svData[k].overlapIdx].targetReadId;
+
+            for (size_t z = 0; z < an && svData[z].queryPos < svData[k].queryEnd; z++) {
+                if (svData[z].supportCount < C_SZ) continue;
+                if (svData[z].clusterId < 0) continue;
+                if (z == k) continue;
+                double sw = calLindelDd(k, z);
+                if (sw < 0) continue;
+
+                // is_get_group: check target not already in this cluster.
+                int32_t ci = svData[z].clusterId;
+                bool targetInCluster = false;
+                for (int32_t idx = clusterHead[ci]; idx >= 0; idx = clusterNext[idx]) {
+                    if (scratch.overlaps[svData[idx].overlapIdx].targetReadId == tnK) {
+                        targetInCluster = true;
+                        break;
+                    }
+                }
+                if (!targetInCluster && sw > bestScore) {
+                    bestCluster = ci;
+                    bestScore = sw;
                 }
             }
-            if (spanCount < 3) continue;
 
-            // Overlaps with SV events in this cluster → trans.
-            for (size_t ei = 0; ei < nev; ei++) {
-                if (clusterId[ei] != ci) continue;
-                auto& ov = scratch.overlaps[scratch.svEvents[ei].overlapIdx];
-                if (ov.isMatch == 1) {
-                    ov.isMatch = 2;
+            if (bestCluster >= 0) {
+                svData[k].clusterId = bestCluster;
+                clusterNext[k] = clusterHead[bestCluster];
+                clusterHead[bestCluster] = int32_t(k);
+            }
+        }
+    }
+
+    // Sort by clusterId for group processing (Correct.cpp:19908).
+    sort(svData, svData + an,
+        [](const PhasingSvEvent& a, const PhasingSvEvent& b) {
+            uint32_t ca = (a.clusterId >= 0) ? uint32_t(a.clusterId) : UINT32_MAX;
+            uint32_t cb = (b.clusterId >= 0) ? uint32_t(b.clusterId) : UINT32_MAX;
+            return ca < cb;
+        });
+
+    // ----------------------------------------------------------------
+    // Step 4: Per-cluster variant calling + evidence + greedy labeling.
+    //
+    // rcall_lidel_variant (Correct.cpp:20030):
+    //   - Compute consensus position (mode of (qs,qe) pairs).
+    //   - Compute consensus error (mode of qn values at consensus pos).
+    //   - Collect spanning cis overlaps.
+    //   - push_idel_info: build match/alt evidence via extract_sub_err.
+    //   - If enough evidence, run generate_haplotypes_sv.
+    //
+    // generate_haplotypes_sv (Correct.cpp:9115):
+    //   - Same Steps A, B, C, D, F as generate_haplotypes_naive_HiFi.
+    //   - Labels SV-carrying overlaps as trans.
+    // ----------------------------------------------------------------
+
+    // Helper: compute error in a CIGAR region [s, e) for an overlap.
+    // Port of extract_sub_err (Correct.cpp:18674).
+    // Returns error count if <= threshold, else -1.
+    auto extractSubErr = [&](uint32_t oi, uint32_t s, uint32_t e,
+                             uint32_t expectedErr) -> int32_t {
+        const auto& ov = scratch.overlaps[oi];
+        const auto& ad = assembler.alignmentData[ov.alignmentId];
+        if (s >= e) return -1;
+
+        uint32_t matchBases = 0, errBases = 0;
+        cigarStore.walkRange(
+            ov.cigarOffset, ov.cigarTokenCount,
+            ad.qs, cigarRead1Start(assembler, ad),
+            uint64_t(s), uint64_t(e),
+            [&](uint8_t op, uint32_t len, uint64_t, uint64_t) {
+                if (op == 0) matchBases += len;
+                else errBases += len;
+            });
+
+        // Hifiasm: err = err0 * err_sec_rate (0.2).
+        // If actual error <= threshold, return it. Else -1.
+        int32_t threshold = int32_t(double(expectedErr) * 0.2);
+        if (int32_t(errBases) <= threshold) return int32_t(errBases);
+        return -1;
+    };
+
+    // Process each cluster group.
+    const uint64_t coveragePeak =
+        assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+    const uint32_t hetCov = uint32_t(coveragePeak / 2);
+    // cc = max(5, hetCov * 0.333) (Correct.cpp:19972).
+    const uint32_t cc = max(5U, uint32_t(double(hetCov) * 0.333333));
+
+    for (size_t i = 0, k; i < an; i = k) {
+        // Find cluster group [i, k).
+        k = i + 1;
+        while (k < an && svData[k].clusterId == svData[i].clusterId) k++;
+        if (svData[i].clusterId < 0) continue; // unclustered
+
+        // Compute consensus position: mode of (qs, qe) pairs.
+        // Hifiasm (Correct.cpp:20042): encode (qs<<32)|qe, find mode.
+        // If the most common value is a majority, use it directly.
+        // Otherwise, sort and find the most frequent.
+        uint64_t firstPair = (uint64_t(svData[i].queryPos) << 32) | svData[i].queryEnd;
+        uint32_t firstCount = 0;
+        vector<uint64_t> posPairs;
+        for (size_t zi = i; zi < k; zi++) {
+            uint64_t p = (uint64_t(svData[zi].queryPos) << 32) | svData[zi].queryEnd;
+            posPairs.push_back(p);
+            if (p == firstPair) firstCount++;
+        }
+
+        uint64_t bestPair = firstPair;
+        if (firstCount <= 0 || firstCount < (posPairs.size() - firstCount)) {
+            sort(posPairs.begin(), posPairs.end());
+            uint32_t bestCount = 0;
+            for (size_t zi = 0, zk; zi < posPairs.size(); zi = zk) {
+                zk = zi + 1;
+                while (zk < posPairs.size() && posPairs[zk] == posPairs[zi]) zk++;
+                if (zk - zi > bestCount) {
+                    bestCount = uint32_t(zk - zi);
+                    bestPair = posPairs[zi];
+                }
+            }
+        }
+
+        uint32_t consPos = uint32_t(bestPair >> 32);
+        uint32_t consEnd = uint32_t(bestPair);
+
+        // Compute consensus error: mode of qn values at consensus position.
+        uint64_t firstErr = svData[i].errorBases;
+        uint32_t firstErrCount = 0;
+        vector<uint32_t> errVals;
+        for (size_t zi = i; zi < k; zi++) {
+            if (svData[zi].queryPos != consPos || svData[zi].queryEnd != consEnd)
+                continue;
+            errVals.push_back(svData[zi].errorBases);
+            if (svData[zi].errorBases == firstErr) firstErrCount++;
+        }
+        uint32_t consErr = uint32_t(firstErr);
+        if (firstErrCount <= 0 || firstErrCount < (errVals.size() - firstErrCount)) {
+            sort(errVals.begin(), errVals.end());
+            uint32_t bestCount = 0;
+            for (size_t zi = 0, zk; zi < errVals.size(); zi = zk) {
+                zk = zi + 1;
+                while (zk < errVals.size() && errVals[zk] == errVals[zi]) zk++;
+                if (zk - zi > bestCount) {
+                    bestCount = uint32_t(zk - zi);
+                    consErr = errVals[zi];
+                }
+            }
+        }
+
+        // Build per-site evidence for this cluster.
+        // Each cluster = one SV "site". Evidence entries:
+        //   type=0 (match): spanning cis overlap with low error
+        //   type=1 (mismatch): SV-carrying overlap in cluster
+        //
+        // push_idel_info (Correct.cpp:19937).
+
+        struct SvEvidence {
+            uint32_t overlapIdx;
+            uint8_t type; // 0=match, 1=mismatch
+        };
+        vector<SvEvidence> svEvidence;
+
+        // Alt evidence: SV-carrying overlaps in this cluster.
+        for (size_t zi = i; zi < k; zi++) {
+            svEvidence.push_back({svData[zi].overlapIdx, 1});
+        }
+        uint32_t occ1 = uint32_t(k - i);
+
+        // Match evidence: spanning cis overlaps with low error.
+        uint32_t occ0 = 0;
+        for (uint32_t oi = 0; oi < uint32_t(scratch.overlaps.size()); oi++) {
+            const auto& ov = scratch.overlaps[oi];
+            if (ov.isMatch != 1) continue;
+            if (ov.qs > consPos || ov.qe < consEnd) continue;
+            uint32_t os = max(ov.qs, consPos);
+            uint32_t oe = min(ov.qe, consEnd);
+            if (oe <= os) continue;
+            uint32_t svSpan = consEnd - consPos;
+            if ((oe - os) < (svSpan - (oe - os))) continue;
+
+            int32_t err = extractSubErr(oi, consPos, consEnd, consErr);
+            if (err >= 0) {
+                svEvidence.push_back({oi, 0});
+                occ0++;
+            }
+        }
+        occ0++; // +1 for query read itself (Correct.cpp:19970).
+
+        if (occ0 < cc || occ1 < cc) continue;
+
+        // --------------------------------------------------------
+        // generate_haplotypes_sv (Correct.cpp:9115).
+        // Greedy labeling Steps A, B, C, D, F on SV evidence.
+        // No strand bias checks (absent in hifiasm's SV labeling).
+        // --------------------------------------------------------
+
+        // Sort evidence by overlapIdx for per-overlap grouping.
+        sort(svEvidence.begin(), svEvidence.end(),
+            [](const SvEvidence& a, const SvEvidence& b) {
+                return a.overlapIdx < b.overlapIdx;
+            });
+
+        // Step A: count mismatches per overlap, build sorted list.
+        // Hifiasm: count mismatches at sites with occ_0 >= s_hap_cov
+        // && occ_1 >= infor_cov. For SV, there's one site per cluster.
+        uint32_t svOcc0 = occ0;
+        int8_t svScore = -1; // -1 = unconfirmed
+
+        struct SvOverlapInfo {
+            uint32_t overlapIdx;
+            uint32_t mismatchCount;
+            uint32_t evidBegin;
+            uint32_t evidEnd;
+        };
+        vector<SvOverlapInfo> svOverlaps;
+
+        for (size_t ei = 0, ej; ei < svEvidence.size(); ei = ej) {
+            ej = ei + 1;
+            while (ej < svEvidence.size() &&
+                   svEvidence[ej].overlapIdx == svEvidence[ei].overlapIdx) ej++;
+            uint32_t mc = 0;
+            for (size_t ez = ei; ez < ej; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= PHASING_S_HAP_COV && occ1 >= PHASING_INFOR_COV) {
+                    mc++;
+                }
+            }
+            svOverlaps.push_back({svEvidence[ei].overlapIdx, mc,
+                                  uint32_t(ei), uint32_t(ej)});
+        }
+
+        // Sort by mismatch count descending.
+        sort(svOverlaps.begin(), svOverlaps.end(),
+            [](const SvOverlapInfo& a, const SvOverlapInfo& b) {
+                return a.mismatchCount > b.mismatchCount;
+            });
+
+        // Step B: greedy labeling.
+        for (auto& soi : svOverlaps) {
+            // Recount with current occ0.
+            uint32_t mc = 0;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= 2 && occ1 >= 2 &&
+                    svOcc0 >= PHASING_S_HAP_COV && occ1 >= PHASING_INFOR_COV) {
+                    mc++;
+                }
+            }
+            if (mc == 0) continue;
+
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch == 1) ov.isMatch = 2;
+
+            // Set score=1 on mismatch evidence, decrement occ0 on match.
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1) {
+                    svScore = 1;
+                } else {
+                    if (svOcc0 > 1) svOcc0--;
+                }
+            }
+        }
+
+        // Step C: consistency check.
+        for (auto& soi : svOverlaps) {
+            uint32_t mc = 0;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1 &&
+                    svOcc0 >= 2 && occ1 >= 2 &&
+                    svScore == 1) {
+                    mc++;
+                }
+            }
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch == 1 && mc > 0) {
+                ov.isMatch = 2;
+            }
+        }
+
+        // Step D: reset score on cis overlap mismatches.
+        for (auto& soi : svOverlaps) {
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch != 1) continue;
+            for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                if (svEvidence[ez].type == 1) {
+                    svScore = -1;
+                }
+            }
+        }
+
+        // Step F: final pass — strong flag + late flips.
+        for (auto& soi : svOverlaps) {
+            auto& ov = scratch.overlaps[soi.overlapIdx];
+            if (ov.isMatch == 2) {
+                ov.strong = 1;
+            } else if (ov.isMatch == 1) {
+                for (uint32_t ez = soi.evidBegin; ez < soi.evidEnd; ez++) {
+                    if (svScore == 1 && svOcc0 >= 2 && occ1 >= 2) {
+                        ov.strong = 1;
+                        if (svEvidence[ez].type == 1) {
+                            ov.isMatch = 2;
+                            break;
+                        }
+                    }
                 }
             }
         }
