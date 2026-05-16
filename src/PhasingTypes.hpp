@@ -186,6 +186,11 @@ struct PhasingScratchpad {
     // --- Allele grouping ---
     vector<uint32_t> sortedOverlapIndices; ///< Overlaps sorted by mismatch count
 
+    // --- Sorting scratch buffers ---
+    vector<PhasingEvidence> evidenceTmp;  ///< Output / scatter buffer for counting sort
+    vector<PhasingEvidence> sortTmp;      ///< Per-site sort scatter buffer
+    vector<uint32_t> countBuf;            ///< Reusable counting sort histogram
+
     // --- Large indel phasing ---
     vector<PhasingSvEvent> svEvents;
     vector<PhasingSvCluster> svClusters;
@@ -204,6 +209,9 @@ struct PhasingScratchpad {
         dpEndpoints.clear();
         dpChain.clear();
         sortedOverlapIndices.clear();
+        evidenceTmp.clear();
+        sortTmp.clear();
+        countBuf.clear();
         svEvents.clear();
         svClusters.clear();
     }
