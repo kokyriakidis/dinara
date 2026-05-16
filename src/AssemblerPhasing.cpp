@@ -1129,9 +1129,15 @@ static void runDpPhasing(
     // Reset temporary claims.
     scratch.dpChainId.assign(n, -1);
 
-    // Sort chains by length descending (hifiasm does this).
+    // Sort chains by length descending, then by bufStart ascending
+    // (hifiasm encodes ((UINT32_MAX - length) << 32) | rn0 and radix
+    // sorts, so equal-length chains are ordered by extraction order,
+    // i.e. higher-scoring endpoints first).
     sort(chains.begin(), chains.end(),
-        [](const auto& a, const auto& b) { return a.first > b.first; });
+        [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        });
 
     // Assign chain IDs with confirmation logic.
     // Hifiasm processes all chains without a limit.
