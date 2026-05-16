@@ -837,7 +837,7 @@ void Assembler::filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint
 deleteContainmentOverlaps: Delete overlaps where one read is contained in the other.
 
 Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps
-without removing the contained reads themselves. Uses ma_hit2arc_containment to detect
+without removing the contained reads themselves. Uses ma_hit2arc to detect
 QCONT (query contained in target) or TCONT (target contained in query), and marks
 those overlaps with DeleteReasonContained.
 
@@ -892,14 +892,14 @@ void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
             const uint32_t qs = ad.qs, qe = ad.qe, ts = ad.ts, te = ad.te;
             if (qe <= qs || te <= ts) continue;
 
-            const int result = ma_hit2arc_containment(
+            const int result = ma_hit2arc(
                 (int32_t)qs, (int32_t)qe, (int32_t)qLen,
                 (int32_t)ts, (int32_t)te, (int32_t)tLen,
                 !ad.isSameStrand,
-                INT32_MAX, 0.0, 0);
+                INT32_MAX, 0.0f, 0);
 
-            // result 1 = QCONT, 2 = TCONT: delete this overlap
-            if (result == 1 || result == 2) {
+            // MA_HT_QCONT or MA_HT_TCONT: delete this overlap
+            if (result == MA_HT_QCONT || result == MA_HT_TCONT) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonContained);
             }
         }
@@ -907,7 +907,7 @@ void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
 }
 
 /*
-deleteInternalOverlaps: Delete overlaps classified as internal or too short by ma_hit2arc_containment.
+deleteInternalOverlaps: Delete overlaps classified as internal or too short by ma_hit2arc.
 
 Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches:
   - result -1: internal (excessive overhangs on both reads)
@@ -1002,7 +1002,7 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
 
             if (qe <= qs || te <= ts) continue;
 
-            const int result = ma_hit2arc_containment(
+            const int result = ma_hit2arc(
                 (int32_t)qs, (int32_t)qe, (int32_t)qLen,
                 (int32_t)ts, (int32_t)te, (int32_t)tLen,
                 !ad.isSameStrand,
@@ -1010,8 +1010,8 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
                 maxHangRate,
                 (int32_t)minOvlp);
 
-            // result -1 = internal, -2 = too short: delete this overlap
-            if (result < 0) {
+            // MA_HT_INT or MA_HT_SHORT_OVLP: delete this overlap
+            if (result == MA_HT_INT || result == MA_HT_SHORT_OVLP) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
             }
         }
@@ -1039,7 +1039,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             /*
             Hifiasm ma_hit_flt: get read lengths in valid coordinates.
             After ma_hit_cut, overlap coordinates are normalized to valid regions,
-            so we use valid region lengths as "read lengths" for ma_hit2arc_containment.
+            so we use valid region lengths as "read lengths" for ma_hit2arc.
             */
             uint32_t ql, tl;
             if (validReadIntervals.empty()) {
@@ -1070,15 +1070,15 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             }
 
             /*
-            Hifiasm ma_hit2arc_containment: classify overlap type.
+            Hifiasm ma_hit2arc: classify overlap type.
             Returns:
-              0  = dovetail (keep)
-              1  = query contained in target (keep - handled by removeContainedReads)
-              2  = target contained in query (keep - handled by removeContainedReads)
-              -1 = internal match (delete - excessive overhangs)
-              -2 = too short (delete - effective overlap < min_ovlp)
+              >= 0           dovetail (keep)
+              MA_HT_QCONT    query contained in target (keep - handled by removeContainedReads)
+              MA_HT_TCONT    target contained in query (keep - handled by removeContainedReads)
+              MA_HT_INT      internal match (delete - excessive overhangs)
+              MA_HT_SHORT_OVLP  too short (delete - effective overlap < min_ovlp)
             */
-            const int result = ma_hit2arc_containment(
+            const int result = ma_hit2arc(
                 (int32_t)qs, (int32_t)qe, (int32_t)ql,
                 (int32_t)ts, (int32_t)te, (int32_t)tl,
                 !ad.isSameStrand,
@@ -1088,7 +1088,7 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
             );
 
             // Hifiasm ma_hit_flt: delete internal matches and too-short overlaps
-            if (result < 0) {
+            if (result == MA_HT_INT || result == MA_HT_SHORT_OVLP) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
             }
         }
@@ -1840,7 +1840,7 @@ void Assembler::rescuePhasedOverlapsThreadFunction(size_t threadId)
     }
 }
 
-// ma_hit2arc_containment is now in overlapClassification.hpp (shared with clique filter).
+// ma_hit2arc is now in overlapClassification.hpp (shared with clique filter).
 
 
 void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
@@ -1868,11 +1868,11 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
        - Skip overlaps to already-deleted reads
 
     3. Containment Classification:
-       - Call `ma_hit2arc_containment()` from qn's perspective
-       - result == 1 (QCONT): query (qn) is contained in target (tn)
-       - result == 2 (TCONT): target (tn) is contained in query (qn)
-       - result == 0: dovetail overlap (keep both reads)
-       - result < 0: internal/bad (already filtered by ma_hit_flt)
+       - Call `ma_hit2arc()` from qn's perspective
+       - result == MA_HT_QCONT (-2): query (qn) is contained in target (tn)
+       - result == MA_HT_TCONT (-3): target (tn) is contained in query (qn)
+       - result >= 0: dovetail overlap (keep both reads)
+       - result == MA_HT_INT (-1) or MA_HT_SHORT_OVLP (-4): internal/bad (already filtered by ma_hit_flt)
 
     4. Containment Actions (hifiasm `delete_all_edges`):
        When containment detected:
@@ -1997,17 +1997,7 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
             if (qs >= qe || ts >= te) continue;
             if (qs > ql || qe > ql || ts > tl || te > tl) continue;
 
-            /*
-            Hifiasm ma_hit2arc_containment: classify overlap type.
-
-            Returns:
-               0 = dovetail (no containment, keep both reads)
-               1 = QCONT (query contained in target → delete query)
-               2 = TCONT (target contained in query → delete target)
-              -1 = internal (already filtered by ma_hit_flt)
-              -2 = too short (already filtered by ma_hit_flt)
-            */
-            const int result = ma_hit2arc_containment(
+            const int result = ma_hit2arc(
                 qs, qe, ql,
                 ts, te, tl,
                 rev,
@@ -2016,7 +2006,7 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
                 int32_t(minOverlapLength)
             );
 
-            if (result == 1) {
+            if (result == MA_HT_QCONT) {
                 // QCONT: query (qn) is contained in target (tn)
                 if (!validReadIntervals[qn].isDeleted) {
                     validReadIntervals[qn].isDeleted = true;              // Mark read deleted
@@ -2027,7 +2017,7 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
                 // Hifiasm: stop processing this read once contained
                 break;
 
-            } else if (result == 2) {
+            } else if (result == MA_HT_TCONT) {
                 // TCONT: target (tn) is contained in query (qn)
                 if (!validReadIntervals[tn].isDeleted) {
                     validReadIntervals[tn].isDeleted = true;              // Mark read deleted
@@ -2167,65 +2157,53 @@ void Assembler::removeReadsFlaggedContained(uint64_t threadCount)
     cout << timestamp << "Removed " << containedReadCount << " reads flagged as contained." << endl;
 }
 
+/*
+flagContainedReads: Flag reads that are fully contained in another read.
+
+Port of hifiasm's ma_hit_contained_advance (Overlaps.cpp).
+For each overlap, calls ma_hit2arc (= hifiasm ma_hit2arc) to classify
+the overlap as dovetail, QCONT, TCONT, internal, or too-short.
+
+When a read is found to be contained (QCONT or TCONT), its isContained flag is set
+and a local "deleted" mask prevents it from participating in further containment
+decisions — matching hifiasm's immediate delete_all_edges behavior.
+
+This function only sets ReadFlags::isContained. It does not delete or modify overlaps.
+Downstream code (e.g. createMarkerGraphVertices) can check the flag to skip contained reads.
+
+Uses raw read lengths and overlap coordinates (no validReadIntervals dependency).
+*/
 void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
-    cout << timestamp << "Flagging contained reads (diagnostic-only, does not remove overlaps)..." << endl;
+    cout << timestamp << "Flagging contained reads." << endl;
 
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
 
     checkAlignmentDataAreOpen();
-
-    // We will write into read flags.
     reads->checkReadsAreOpen();
     reads->checkReadFlagsAreOpenForWriting();
-
-    // Historically this diagnostic expected `validReadIntervals` to be available (ma_hit_sub / ma_hit_cut).
-    // For quick experimentation we allow running without it by treating the entire read as valid.
-    // In that mode we operate on raw overlap coordinates (`ad.qs/qe/ts/te`) and full read lengths.
-    if(validReadIntervals.empty()) {
-        cout << timestamp
-             << "[DIAG] flagContainedReads: validReadIntervals not set; using full read lengths and raw overlap coordinates."
-             << endl;
-        validReadIntervals.resize(reads->readCount());
-        for(ReadId r=0; r<reads->readCount(); ++r) {
-            const uint64_t len = reads->getReadRawSequenceLength(r);
-            validReadIntervals[r] = {0, uint32_t(len), false};
-        }
-    }
-
-    if(!containmentParent->isOpen) {
-        containmentParent->createNew(largeDataName("ContainmentParent"), largeDataPageSize);
-        containmentParent->resize(reads->readCount());
-    }
-    std::fill(containmentParent->begin(), containmentParent->end(), ReadId(invalidReadId));
 
     const uint64_t readCount = reads->readCount();
     const uint64_t alignmentCount = alignmentData.size();
 
     // Clear previous flags.
-    for(ReadId r=0; r<readCount; ++r) {
+    for(ReadId r = 0; r < readCount; ++r) {
         reads->setContainedFlag(r, false);
     }
 
-    uint64_t containedReadCount = 0;
-    // Simulate hifiasm ma_hit_contained_advance decisions, but without mutating overlaps.
-    // We maintain a local "deleted" mask so that once a read is deemed contained, we stop
-    // considering it and we ignore overlaps incident to it (matching the fact that hifiasm
-    // deletes all its edges immediately).
+    // Local "deleted" mask: once a read is deemed contained, we stop considering it
+    // and ignore overlaps incident to it. This matches hifiasm's behavior where
+    // delete_all_edges + coverage_cut[qn].del = 1 prevents further processing.
     vector<uint8_t> deletedLocal(readCount, 0);
-    for(ReadId r = 0; r < readCount; ++r) {
-        if(r < validReadIntervals.size() && validReadIntervals[r].isDeleted) {
-            deletedLocal[r] = 1;
-        }
-    }
+
+    uint64_t containedReadCount = 0;
 
     for(ReadId qn = 0; qn < readCount; ++qn) {
-        if(qn >= validReadIntervals.size() || deletedLocal[qn]) continue;
+        if(deletedLocal[qn]) continue;
 
-        const auto& vrQ = validReadIntervals[qn];
-        const int32_t ql = int32_t(vrQ.end - vrQ.start);
+        const int32_t ql = int32_t(reads->getReadRawSequenceLength(qn));
         if(ql <= 0) continue;
 
         const OrientedReadId oid(qn, 0);
@@ -2238,14 +2216,13 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
             if(!ad.keptByBothSides()) continue;
 
             const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
-            if(tn >= validReadIntervals.size() || deletedLocal[tn]) continue;
+            if(deletedLocal[tn]) continue;
 
-            const auto& vrT = validReadIntervals[tn];
-            const int32_t tl = int32_t(vrT.end - vrT.start);
+            const int32_t tl = int32_t(reads->getReadRawSequenceLength(tn));
             if(tl <= 0) continue;
 
             const bool rev = !ad.isSameStrand;
-            int32_t qs = 0, qe = 0, ts = 0, te = 0;
+            int32_t qs, qe, ts, te;
             if(ad.readIds[0] == qn) {
                 qs = int32_t(ad.qs);
                 qe = int32_t(ad.qe);
@@ -2257,11 +2234,9 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
                 ts = int32_t(ad.qs);
                 te = int32_t(ad.qe);
             }
-            if(qs < 0 || qe < 0 || ts < 0 || te < 0) continue;
             if(qs >= qe || ts >= te) continue;
-            if(qs > ql || qe > ql || ts > tl || te > tl) continue;
 
-            const int result = ma_hit2arc_containment(
+            const int result = ma_hit2arc(
                 qs, qe, ql,
                 ts, te, tl,
                 rev,
@@ -2270,18 +2245,16 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
                 int32_t(minOverlapLength)
             );
 
-            if(result == 1) {
-                // Query contained in target: flag and stop processing this query.
+            if(result == MA_HT_QCONT) {
+                // QCONT: query contained in target. Flag and stop processing this query.
                 reads->setContainedFlag(qn, true);
-                (*containmentParent)[qn] = tn;
                 deletedLocal[qn] = 1;
                 ++containedReadCount;
                 break;
-            } else if(result == 2) {
-                // Target contained in query: flag the target and keep scanning (qn may contain multiple reads).
+            } else if(result == MA_HT_TCONT) {
+                // TCONT: target contained in query. Flag target, keep scanning.
                 if(!deletedLocal[tn]) {
                     reads->setContainedFlag(tn, true);
-                    (*containmentParent)[tn] = qn;
                     deletedLocal[tn] = 1;
                     ++containedReadCount;
                 }
@@ -2289,33 +2262,8 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
         }
     }
 
-    // Compress containment chains.
-    for(ReadId r = 0; r < readCount; ++r) {
-        if((*containmentParent)[r] == ReadId(invalidReadId)) continue;
-        ReadId root = r;
-        vector<ReadId> visited;
-        visited.reserve(16);
-        while(root != ReadId(invalidReadId) && (*containmentParent)[root] != ReadId(invalidReadId)) {
-            if(std::find(visited.begin(), visited.end(), root) != visited.end()) {
-                // Cycle detected (can happen for identical reads). Break deterministically by choosing
-                // the smallest read id in the cycle as the root container.
-                ReadId cycleRoot = root;
-                for(const ReadId x : visited) {
-                    if(x < cycleRoot) cycleRoot = x;
-                }
-                (*containmentParent)[r] = cycleRoot;
-                root = ReadId(invalidReadId);
-                break;
-            }
-            visited.push_back(root);
-            root = (*containmentParent)[root];
-        }
-        if(root != ReadId(invalidReadId)) {
-            (*containmentParent)[r] = root;
-        }
-    }
-
-    cout << timestamp << "Flagged " << containedReadCount << " contained reads." << endl;
+    cout << timestamp << "Flagged " << containedReadCount << " contained reads out of "
+         << readCount << " total." << endl;
 }
 
 

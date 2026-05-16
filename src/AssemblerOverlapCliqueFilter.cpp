@@ -96,9 +96,9 @@ void Assembler::filterOverlapsByRegionalCliques(
     uint64_t totalAccepted = 0;
     uint64_t readsProcessed = 0;
 
-    // Parameters for ma_hit2arc_containment (same defaults as filterHangingOverlaps).
+    // Parameters for ma_hit2arc (same defaults as hifiasm).
     const int32_t maxHang = 1000;
-    const double intFrac = 0.8;
+    const float intFrac = 0.8f;
     const int32_t minOvlp = 50;
 
     for (const ReadId readId : readOrder) {
@@ -174,7 +174,7 @@ void Assembler::filterOverlapsByRegionalCliques(
             // Skip degenerate intervals.
             if (endOnR <= startOnR) continue;
 
-            // Classify using raw bounds (ma_hit2arc_containment expects query=R, target=partner).
+            // Classify using raw bounds (ma_hit2arc expects query=R, target=partner).
             int32_t classQs, classQe, classQl, classTs, classTe, classTl;
             bool classIsReverse;
             if (isRead0) {
@@ -195,14 +195,14 @@ void Assembler::filterOverlapsByRegionalCliques(
                 classIsReverse = !ad.isSameStrand;
             }
 
-            const int classification = ma_hit2arc_containment(
+            const int classification = ma_hit2arc(
                 classQs, classQe, classQl,
                 classTs, classTe, classTl,
                 classIsReverse, maxHang, intFrac, minOvlp);
 
-            // result 0 = dovetail, 1 = R contained, 2 = partner contained
-            // Skip contained overlaps entirely; only use dovetails.
-            if (classification != 0) continue;
+            // >= 0 = dovetail, < 0 = contained/internal/short.
+            // Skip non-dovetail overlaps entirely; only use dovetails.
+            if (classification < 0) continue;
 
             candidates.push_back({
                 alignmentIdx,
