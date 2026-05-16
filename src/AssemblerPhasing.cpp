@@ -1602,19 +1602,21 @@ static void phaseLargeIndels(
     int32_t nextCluster = 0;
     int32_t totalAssigned = 0;
 
-    vector<size_t> bfsQueue;
+    // Hifiasm uses a stack (LIFO), not a queue (FIFO).
+    // v = buf->a[--buf->n] is a stack pop (Correct.cpp:19836).
+    vector<size_t> dfsStack;
 
     for (size_t k = 0; k < an; k++) {
         if (svData[k].supportCount < C_SZ) continue;
         if (svData[k].clusterId >= 0) continue;
 
         int32_t ci = nextCluster++;
-        bfsQueue.clear();
-        bfsQueue.push_back(k);
+        dfsStack.clear();
+        dfsStack.push_back(k);
 
-        size_t qi = 0;
-        while (qi < bfsQueue.size()) {
-            size_t v = bfsQueue[qi++];
+        while (!dfsStack.empty()) {
+            size_t v = dfsStack.back();
+            dfsStack.pop_back();
             uint32_t spanV = svData[v].queryEnd - svData[v].queryPos;
             uint32_t olMin = uint32_t(spanV * LEN_ST);
             if (olMin < LEN_W) olMin = LEN_W;
@@ -1637,7 +1639,7 @@ static void phaseLargeIndels(
                     if (svData[z].clusterId >= 0) continue;
                     if (z == v) continue;
                     if (calLindelDd(v, z) >= 0 && tryClaim(z)) {
-                        bfsQueue.push_back(z);
+                        dfsStack.push_back(z);
                     }
                 }
             }
