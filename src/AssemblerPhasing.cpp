@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -382,15 +383,17 @@ static void detectSnpSites(
 // ============================================================================
 // buildSnpMatrix: sort evidence, group by site, filter, confirm sites
 //
-// Port of hifiasm's SetSnpMatrix + push_info (Correct.cpp:10511).
+// Port of hifiasm's radix_sort_haplotype_evdience_srt (by site) followed
+// by per-site push_info (Correct.cpp:10511) which does radix sort by
+// overlapID + fused dedup/count/filter/emit in one pass.
 //
-// 1. Sort evidence by (site, overlapIdx).
-// 2. Group by site. For each site:
-//    - Dedup by overlapIdx (keep first per overlap).
-//    - Count matchCount (isAlt==0) and per-base altCount[4].
-//    - Require matchCount >= PHASING_S_HAP_COV and altCount >= PHASING_INFOR_COV.
-//    - For each qualifying alt base, create a PhasingSite.
-// 3. Record evidence ranges per site.
+// 1. Counting sort all evidence by site position — O(n + maxSite).
+// 2. Per site group (hifiasm push_info pattern):
+//    a. Counting sort by overlapIdx — O(m + numOverlaps).
+//    b. Single fused pass: dedup by overlapIdx, count match/alt/strand.
+//    c. Filter: require matchCount >= S_HAP_COV, altCount >= INFOR_COV.
+//    d. Emit qualifying evidence with siteIdx assigned, compacting in-place.
+// 3. Evidence array contains only qualifying entries on exit.
 // ============================================================================
 
 static void buildSnpMatrix(
@@ -398,82 +401,107 @@ static void buildSnpMatrix(
 {
     if (scratch.evidence.empty()) return;
 
-    // Sort by (site, overlapIdx).
-    sort(scratch.evidence.begin(), scratch.evidence.end(),
-        [](const PhasingEvidence& a, const PhasingEvidence& b) {
-            if (a.site != b.site) return a.site < b.site;
-            return a.overlapIdx < b.overlapIdx;
-        });
+    const size_t n = scratch.evidence.size();
+    const uint32_t numOverlaps = uint32_t(scratch.overlaps.size());
 
-    // Dedup: within each (site, overlapIdx) group, keep only the first entry.
-    {
-        size_t write = 0;
-        for (size_t i = 0; i < scratch.evidence.size(); i++) {
-            if (i > 0 &&
-                scratch.evidence[i].site == scratch.evidence[i-1].site &&
-                scratch.evidence[i].overlapIdx == scratch.evidence[i-1].overlapIdx) {
-                continue; // skip duplicate
-            }
-            scratch.evidence[write++] = scratch.evidence[i];
-        }
-        scratch.evidence.resize(write);
+    // --- Counting sort by site position ---
+    uint32_t maxSite = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (scratch.evidence[i].site > maxSite)
+            maxSite = scratch.evidence[i].site;
     }
 
-    // Group by site and build PhasingSite entries.
-    //
-    // Hifiasm creates separate SnpStats per qualifying alt base at each
-    // position. All SnpStats at the same position share the same evidence
-    // range. Each evidence entry has an overlapSite field pointing to the
-    // SnpStats it belongs to:
-    //   - Match evidence → overlapSite = LAST SnpStats at this position
-    //   - Mismatch evidence → overlapSite = SnpStats for its specific base
-    //   - Non-qualifying mismatches (base count < 2) → dropped
-    //
-    // We replicate this with ev.siteIdx on PhasingEvidence.
+    scratch.countBuf.assign(maxSite + 2, 0);
+    for (size_t i = 0; i < n; i++) {
+        scratch.countBuf[scratch.evidence[i].site + 1]++;
+    }
+    for (uint32_t i = 1; i <= maxSite + 1; i++) {
+        scratch.countBuf[i] += scratch.countBuf[i - 1];
+    }
 
-    const size_t rawEnd = scratch.evidence.size();
+    scratch.evidenceTmp.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        scratch.evidenceTmp[scratch.countBuf[scratch.evidence[i].site]++] =
+            scratch.evidence[i];
+    }
+    scratch.evidence.swap(scratch.evidenceTmp);
+    // evidence is now sorted by site. evidenceTmp is free for reuse.
+
+    // --- Per-site: fused sort-by-overlapIdx / dedup / count / filter / emit ---
+    // Write qualifying evidence compactly into evidenceTmp (output buffer).
+    // This mirrors hifiasm's push_info called per site group from rphase_hc.
+    scratch.evidenceTmp.clear();
+
     size_t i = 0;
-    while (i < rawEnd) {
+    while (i < n) {
         const uint32_t currentSite = scratch.evidence[i].site;
         const size_t groupBegin = i;
-
-        // Find end of this site's group.
-        while (i < rawEnd && scratch.evidence[i].site == currentSite) {
-            i++;
-        }
+        while (i < n && scratch.evidence[i].site == currentSite) i++;
         const size_t groupEnd = i;
+        const size_t groupLen = groupEnd - groupBegin;
 
-        // Count match and per-base alt.
+        // (a) Counting sort this site's evidence by overlapIdx.
+        //     For groups of 1, skip — already trivially sorted.
+        if (groupLen > 1) {
+            scratch.countBuf.assign(numOverlaps + 1, 0);
+            for (size_t j = groupBegin; j < groupEnd; j++) {
+                scratch.countBuf[scratch.evidence[j].overlapIdx + 1]++;
+            }
+            for (uint32_t k = 1; k <= numOverlaps; k++) {
+                scratch.countBuf[k] += scratch.countBuf[k - 1];
+            }
+            scratch.sortTmp.resize(groupLen);
+            for (size_t j = groupBegin; j < groupEnd; j++) {
+                scratch.sortTmp[
+                    scratch.countBuf[scratch.evidence[j].overlapIdx]++] =
+                    scratch.evidence[j];
+            }
+            for (size_t j = 0; j < groupLen; j++) {
+                scratch.evidence[groupBegin + j] = scratch.sortTmp[j];
+            }
+        }
+
+        // (b) Fused dedup + count pass (hifiasm push_info lines 10517-10533).
+        //     Walk sorted-by-overlapIdx evidence. For each overlapIdx run,
+        //     keep first entry, accumulate match/alt/strand counts.
         uint32_t matchCount = 0;
         uint32_t fwdStrandRefCount = 0;
         uint32_t altCount[4] = {0, 0, 0, 0};
         uint8_t isHpc = 0;
-        uint8_t queryBase = scratch.queryBases[currentSite];
+        const uint8_t queryBase = scratch.queryBases[currentSite];
 
-        for (size_t j = groupBegin; j < groupEnd; j++) {
-            const auto& ev = scratch.evidence[j];
-            if (ev.isAlt == 0) {
-                matchCount++;
-                if (scratch.overlaps[ev.overlapIdx].isRev == 0) {
-                    fwdStrandRefCount++;
+        // Dedup in-place within evidence[groupBegin..groupEnd).
+        size_t dedupEnd = groupBegin;
+        size_t m = groupBegin; // start of current overlapIdx run
+        for (size_t k = groupBegin + 1; k <= groupEnd; k++) {
+            if (k == groupEnd ||
+                scratch.evidence[k].overlapIdx !=
+                scratch.evidence[m].overlapIdx) {
+                // Keep first entry of this overlapIdx run.
+                const auto& ev = scratch.evidence[m];
+                scratch.evidence[dedupEnd] = ev;
+                if (ev.isAlt == 0) {
+                    matchCount++;
+                    if (scratch.overlaps[ev.overlapIdx].isRev == 0)
+                        fwdStrandRefCount++;
+                } else {
+                    if (ev.base < 4) altCount[ev.base]++;
                 }
-            } else {
-                if (ev.base < 4) altCount[ev.base]++;
+                if (ev.isHpc) isHpc = 1;
+                dedupEnd++;
+                m = k;
             }
-            if (ev.isHpc) isHpc = 1;
         }
 
-        // +1 for query read (hifiasm: p->occ_0 = 1 + occ_0).
+        // +1 for query read itself (hifiasm: p->occ_0 = 1 + occ_0).
         matchCount += 1;
 
-        // Reject position if ALL matching overlaps are forward-strand
-        // (zero reverse-strand). Hifiasm: push_info rejects when
-        // rev_n == occ_0 (Correct.cpp:10567). This is a strict subset
-        // of the is_st_bs strand-bias check applied later in the DP.
+        // (c) Filter: strand bias, min counts.
+        // Reject if all ref-matching overlaps are forward-strand
+        // (hifiasm: rev_n == occ_0, Correct.cpp:10567).
         if (fwdStrandRefCount == matchCount - 1) continue;
 
         // Identify qualifying alt bases and create PhasingSite entries.
-        // Record the siteIdx for each qualifying base.
         uint32_t baseSiteIdx[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
         uint32_t lastSiteIdx = UINT32_MAX;
 
@@ -497,7 +525,7 @@ static void buildSnpMatrix(
             ps.transConfirmed = 0;
             ps.cisReset = 0;
             ps.promoted = 0;
-            ps.evidenceBegin = 0; // set below
+            ps.evidenceBegin = 0;
             ps.evidenceEnd = 0;
 
             lastSiteIdx = uint32_t(scratch.sites.size());
@@ -505,31 +533,29 @@ static void buildSnpMatrix(
             scratch.sites.push_back(ps);
         }
 
-        if (lastSiteIdx == UINT32_MAX) continue; // no qualifying bases
+        if (lastSiteIdx == UINT32_MAX) continue;
 
-        // Build shared evidence range: all matches + qualifying mismatches.
-        // Set ev.siteIdx exactly like hifiasm sets overlapSite:
-        //   match → lastSiteIdx (last SnpStats at this position)
-        //   mismatch → baseSiteIdx[base] (SnpStats for its specific base)
-        const uint32_t sharedBegin = uint32_t(scratch.evidence.size());
+        // (d) Emit qualifying evidence with siteIdx assigned.
+        //     Append to evidenceTmp (output buffer). Set evidence ranges.
+        //     match → lastSiteIdx, mismatch → baseSiteIdx[base].
+        const uint32_t sharedBegin = uint32_t(scratch.evidenceTmp.size());
 
-        for (size_t j = groupBegin; j < groupEnd; j++) {
+        for (size_t j = groupBegin; j < dedupEnd; j++) {
             const auto& ev = scratch.evidence[j];
             if (ev.isAlt == 0) {
                 PhasingEvidence out = ev;
                 out.siteIdx = lastSiteIdx;
-                scratch.evidence.push_back(out);
+                scratch.evidenceTmp.push_back(out);
             } else if (ev.base < 4 && baseSiteIdx[ev.base] != UINT32_MAX) {
                 PhasingEvidence out = ev;
                 out.siteIdx = baseSiteIdx[ev.base];
-                scratch.evidence.push_back(out);
+                scratch.evidenceTmp.push_back(out);
             }
             // Non-qualifying mismatches → dropped
         }
 
-        const uint32_t sharedEnd = uint32_t(scratch.evidence.size());
+        const uint32_t sharedEnd = uint32_t(scratch.evidenceTmp.size());
 
-        // Set shared evidence range on all PhasingSite entries at this position.
         for (uint8_t b = 0; b < 4; b++) {
             if (baseSiteIdx[b] != UINT32_MAX) {
                 scratch.sites[baseSiteIdx[b]].evidenceBegin = sharedBegin;
@@ -538,21 +564,8 @@ static void buildSnpMatrix(
         }
     }
 
-    // Remove the raw evidence (indices 0..rawEnd). Shift tail to front
-    // and update all evidenceBegin/evidenceEnd indices.
-    if (!scratch.sites.empty()) {
-        const size_t tailStart = rawEnd;
-        const size_t tailLen = scratch.evidence.size() - tailStart;
-        for (size_t j = 0; j < tailLen; j++) {
-            scratch.evidence[j] = scratch.evidence[tailStart + j];
-        }
-        scratch.evidence.resize(tailLen);
-        const uint32_t shift = uint32_t(tailStart);
-        for (auto& ps : scratch.sites) {
-            ps.evidenceBegin -= shift;
-            ps.evidenceEnd -= shift;
-        }
-    }
+    // Output is in evidenceTmp. Swap into evidence.
+    scratch.evidence.swap(scratch.evidenceTmp);
 }
 
 // ============================================================================
@@ -1796,6 +1809,14 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
         }
     }
 
+    // Per-thread timing accumulators (microseconds). Aggregated after join.
+    struct alignas(64) ThreadTiming {
+        int64_t gather = 0, unpack = 0, detectSnp = 0, buildMatrix = 0;
+        int64_t filterAdj = 0, dpPhase = 0, labelCT = 0;
+        int64_t largeIndel = 0, dedup = 0, write = 0;
+    };
+    vector<ThreadTiming> threadTimings(threadCount);
+
     // Static block scheduling (same pattern as performHifiasmECParity).
     vector<thread> threads;
     uint64_t chunkSize = readCount / threadCount;
@@ -1808,6 +1829,11 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
             const uint64_t end = min((t + 1) * chunkSize, readCount);
 
             PhasingScratchpad scratch;
+            ThreadTiming& tt = threadTimings[t];
+            using clk = std::chrono::steady_clock;
+            auto usec = [](clk::time_point a, clk::time_point b) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
 
             for (uint64_t rid = start; rid < end; rid++) {
                 const ReadId readId(rid);
@@ -1818,7 +1844,10 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                      && readId == phasingDebugReadId);
 
                 // 1. Gather overlaps.
+                auto tp0 = clk::now();
                 gatherOverlaps(*this, readId, scratch);
+                auto tp1 = clk::now();
+                tt.gather += usec(tp0, tp1);
                 if (scratch.overlaps.empty()) {
                     if (isDebugRead) {
                         std::lock_guard<std::mutex> lock(phasingCoutMutex);
@@ -1831,18 +1860,30 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                 readsWithOverlaps++;
 
                 // 2. Unpack query sequence.
+                tp0 = clk::now();
                 const uint32_t queryLen =
                     uint32_t(getReads().getRead(readId).baseCount);
                 unpackQuerySequence(*this, readId, queryLen, scratch);
+                tp1 = clk::now();
+                tt.unpack += usec(tp0, tp1);
 
-                // 3. Sliding-window SNP detection.
+                // 3. SNP detection.
+                tp0 = clk::now();
                 detectSnpSites(*this, readId, queryLen, scratch);
+                tp1 = clk::now();
+                tt.detectSnp += usec(tp0, tp1);
 
                 // 4. Build SNP matrix (filter + confirm sites).
+                tp0 = clk::now();
                 buildSnpMatrix(scratch);
+                tp1 = clk::now();
+                tt.buildMatrix += usec(tp0, tp1);
 
                 // 4b. Remove adjacent sites (positions p and p+1).
+                tp0 = clk::now();
                 filterAdjacentSites(scratch);
+                tp1 = clk::now();
+                tt.filterAdj += usec(tp0, tp1);
 
                 // Debug: candidate sites.
                 if (isDebugRead) {
@@ -1872,10 +1913,16 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                     const uint64_t coveragePeak =
                         assemblerInfo->kmerDistributionInfo.coveragePeak;
                     const uint32_t hetCov = uint32_t(coveragePeak / 2);
+                    tp0 = clk::now();
                     runDpPhasing(scratch, hetCov);
+                    tp1 = clk::now();
+                    tt.dpPhase += usec(tp0, tp1);
 
                     // 6. Allele grouping (cis/trans labeling).
+                    tp0 = clk::now();
                     labelCisTrans(scratch);
+                    tp1 = clk::now();
+                    tt.labelCT += usec(tp0, tp1);
 
                     // Debug: confirmed sites and overlap labels.
                     if (isDebugRead) {
@@ -1928,14 +1975,23 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                     }
 
                     // 7. Large indel phasing.
+                    tp0 = clk::now();
                     phaseLargeIndels(*this, readId, queryLen, scratch);
+                    tp1 = clk::now();
+                    tt.largeIndel += usec(tp0, tp1);
                 }
 
                 // 8. Dedup chains (best overlap per target).
+                tp0 = clk::now();
                 dedupChains(scratch);
+                tp1 = clk::now();
+                tt.dedup += usec(tp0, tp1);
 
                 // 9. Write results back.
+                tp0 = clk::now();
                 writeResults(*this, readId, scratch);
+                tp1 = clk::now();
+                tt.write += usec(tp0, tp1);
 
                 // Count labels for reporting.
                 for (const auto& ov : scratch.overlaps) {
@@ -1956,6 +2012,33 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
     }
 
     for (auto& t : threads) t.join();
+
+    // Aggregate and print per-stage timing.
+    ThreadTiming total;
+    for (const auto& tt : threadTimings) {
+        total.gather += tt.gather;
+        total.unpack += tt.unpack;
+        total.detectSnp += tt.detectSnp;
+        total.buildMatrix += tt.buildMatrix;
+        total.filterAdj += tt.filterAdj;
+        total.dpPhase += tt.dpPhase;
+        total.labelCT += tt.labelCT;
+        total.largeIndel += tt.largeIndel;
+        total.dedup += tt.dedup;
+        total.write += tt.write;
+    }
+    auto ms = [](int64_t us) { return us / 1000; };
+    cout << timestamp << "Phasing per-stage timing (ms, sum over " << threadCount << " threads):" << endl;
+    cout << timestamp << "  gatherOverlaps:    " << ms(total.gather) << endl;
+    cout << timestamp << "  unpackQuery:       " << ms(total.unpack) << endl;
+    cout << timestamp << "  detectSnpSites:    " << ms(total.detectSnp) << endl;
+    cout << timestamp << "  buildSnpMatrix:    " << ms(total.buildMatrix) << endl;
+    cout << timestamp << "  filterAdjacentSites:" << ms(total.filterAdj) << endl;
+    cout << timestamp << "  runDpPhasing:      " << ms(total.dpPhase) << endl;
+    cout << timestamp << "  labelCisTrans:     " << ms(total.labelCT) << endl;
+    cout << timestamp << "  phaseLargeIndels:  " << ms(total.largeIndel) << endl;
+    cout << timestamp << "  dedupChains:       " << ms(total.dedup) << endl;
+    cout << timestamp << "  writeResults:      " << ms(total.write) << endl;
 
     cout << timestamp << "Phasing complete." << endl;
     cout << timestamp << "Reads processed: " << readsProcessed.load() << endl;
