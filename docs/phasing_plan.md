@@ -210,71 +210,63 @@ All scan boundaries are clamped to `[p - HPC_PL, p + HPC_PL)`.
 
 ### 4. buildSnpMatrix
 
-Port of hifiasm's `SetSnpMatrix` + `push_info` (Correct.cpp:10511).
+Port of hifiasm's `radix_sort_haplotype_evdience_srt` (by site) followed
+by per-site `push_info` (Correct.cpp:10511) which does radix sort by
+overlapID + fused dedup/count/filter/emit.
+
+Uses two counting sorts instead of `std::sort`, matching hifiasm's
+two-radix-sort pattern:
+
+1. **Counting sort by site position** — O(n + maxSite). Site values are
+   bounded by query read length (~20k), so the histogram is small.
+   Hifiasm: `radix_sort_haplotype_evdience_srt`.
+
+2. **Per-site counting sort by overlapIdx** — O(m + numOverlaps) per site.
+   overlapIdx is bounded by the overlap count (typically a few hundred).
+   Hifiasm: `radix_sort_haplotype_evdience_id_srt` inside `push_info`.
+
+3. **Fused dedup + count** — the dedup loop simultaneously compacts
+   duplicates and accumulates match/alt/strand counts, eliminating a
+   separate counting pass.
 
 ```
-sort evidence by (site, overlapIdx)
-dedup: within each (site, overlap) group, keep first entry only
+// Step 1: counting sort all evidence by site — O(n + maxSite)
+histogram countBuf[0..maxSite+1] from evidence[].site
+prefix sum → scatter into evidenceTmp[]
+swap evidence ↔ evidenceTmp
 
+// Step 2: per-site fused sort/dedup/count/filter/emit
+//         (mirrors hifiasm's push_info called per site group)
 for each group of evidence at the same site position:
-    queryBase = query sequence base at this position
-    matchCount = 0
-    altCount[4] = {0, 0, 0, 0}
-    fwdStrandRefCount = 0
 
-    for each evidence entry:
-        if isAlt == 0:
-            matchCount++
-            if overlap is forward-strand: fwdStrandRefCount++
-        else:
-            altCount[base]++
+    // (a) counting sort this group by overlapIdx — O(m + numOverlaps)
+    if groupLen > 1:
+        histogram countBuf[0..numOverlaps] from group[].overlapIdx
+        prefix sum → scatter into sortTmp[]
+        copy sortTmp[] back into evidence[groupBegin..groupEnd)
+
+    // (b) fused dedup + count (hifiasm push_info lines 10517-10533)
+    for each overlapIdx run (sorted, adjacent duplicates):
+        keep first entry, accumulate:
+            matchCount, fwdStrandRefCount, altCount[4], isHpc
 
     matchCount += 1                     // +1 for query read itself
-    fwdStrandCount = fwdStrandRefCount + 1
 
-    // Reject position if ALL matching overlaps are forward-strand
-    // (zero reverse-strand). Hifiasm: push_info (Correct.cpp:10567)
-    // checks rev_n == occ_0. This is a strict subset of the is_st_bs
-    // strand-bias check applied later in the DP.
-    if fwdStrandRefCount == matchCount - 1: skip this position
+    // (c) filter
+    if fwdStrandRefCount == matchCount - 1: skip  // strand bias
+    for each alt base with altCount[b] >= INFOR_COV and matchCount >= S_HAP_COV:
+        create PhasingSite (same as before)
 
-    // Create PhasingSite per qualifying alt base (multi-alt support).
-    // Hifiasm creates separate SnpStats per alt base at the same position.
-    lastSiteIdx = UINT32_MAX
-    baseSiteIdx[4] = {UINT32_MAX, ...}
+    // (d) emit qualifying evidence with siteIdx assigned
+    //     match → lastSiteIdx, mismatch → baseSiteIdx[base]
+    append to evidenceTmp (output buffer), set evidenceBegin/End
 
-    for base in {0, 1, 2, 3}:
-        if base == queryBase: skip
-        if altCount[base] < 2: skip
-        if matchCount < S_HAP_COV (3): skip
-        if altCount[base] < INFOR_COV (3): skip
-
-        create PhasingSite:
-            site = position, queryBase, altBase = base
-            matchCount, altCount = altCount[base], fwdStrandCount
-            labelMatchCount = matchCount        // mutable copy
-            labelFwdStrandCount = fwdStrandCount // mutable copy
-            transConfirmed = 0, cisReset = 0, promoted = 0
-            dpChainId = -1
-
-        lastSiteIdx = index of new PhasingSite
-        baseSiteIdx[base] = lastSiteIdx
-
-    if no qualifying alt bases: skip this position
-
-    // Build shared evidence range for all PhasingSites at this position.
-    // Set ev.siteIdx exactly like hifiasm sets overlapSite:
-    for each evidence entry at this position:
-        if isAlt == 0:
-            ev.siteIdx = lastSiteIdx    // match → last site at position
-        else if baseSiteIdx[ev.base] != UINT32_MAX:
-            ev.siteIdx = baseSiteIdx[ev.base]  // mismatch → its specific site
-        else:
-            drop this evidence entry    // non-qualifying mismatch
-
-    // All PhasingSites at same position share the same evidence range
-    // (evidenceBegin, evidenceEnd point to the same span).
+// Step 3: swap evidenceTmp → evidence (output)
 ```
+
+**Performance**: Replacing `std::sort` O(n log n) with two counting sorts
+reduced `buildSnpMatrix` from ~1,870ms to ~607ms (3.1× speedup, sum over
+4 threads on the 989-read test dataset). Phasing output is identical.
 
 The `siteIdx` assignment is the key multi-alt mechanism. It allows
 downstream functions to distinguish "mismatch for alt C" from "mismatch
@@ -803,7 +795,7 @@ memory reused). Bounded by `threadCount > readCount` check.
 | `detectSnpSites` | `hc_phase_robust_rr` | Correct.cpp:10200 |
 | `isPeriodicRepeat` | `hpc_mask_ff` (f=NULL path) | Correct.cpp:10399 |
 | `isStrandBiased` / `isLabelStrandBiased` | `is_st_bs` macro | Correct.cpp:8800 |
-| `buildSnpMatrix` | `SetSnpMatrix` + `push_info` | Correct.cpp:10511 |
+| `buildSnpMatrix` | `radix_sort_haplotype_evdience_srt` + per-site `push_info` (with `radix_sort_haplotype_evdience_id_srt`) | Correct.cpp:10511, 19706 |
 | `filterAdjacentSites` | adjacent-site filter | Correct.cpp:8855 |
 | `checkCompatibility` | `comput_sc_rphase` | Correct.cpp:9244 |
 | `isHpcDependent` | `is_hpc_vec` | Correct.cpp:9383 |
@@ -823,7 +815,7 @@ Defined in `src/PhasingTypes.hpp`:
 | `PhasingSite` | Confirmed het site: position, alleles, immutable counts (`matchCount`, `altCount`, `fwdStrandCount`), mutable label counts (`labelMatchCount`, `labelFwdStrandCount`), per-step flags (`transConfirmed`, `cisReset`, `promoted`), DP chain assignment |
 | `PhasingSvEvent` | Contiguous indel region ≥ 16 bp from one overlap |
 | `PhasingSvCluster` | Cluster of SV events at similar positions |
-| `PhasingScratchpad` | Thread-local workspace, cleared between reads |
+| `PhasingScratchpad` | Thread-local workspace, cleared between reads. Includes `evidenceTmp`, `sortTmp`, `countBuf` scratch buffers for counting sort |
 
 ## Differences from AssemblerHifiasmEC.cpp
 
