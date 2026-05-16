@@ -675,28 +675,20 @@ static void buildSnpMatrix(
 }
 
 // ============================================================================
-// filterAdjacentSites: remove SNP sites at adjacent positions
+// filterAdjacentSites: reject DP-confirmed sites at adjacent positions
 //
 // Port of hifiasm's adjacent-site filter (Correct.cpp:8855).
 //
-// Removes SNP sites at adjacent positions (p and p+1). Adjacent
-// mismatches are typically alignment artifacts — an indel that the
-// aligner represents as two consecutive substitutions — rather than
-// real heterozygous variants. Keeping them would add noise to the
-// phasing DP and labeling.
+// In hifiasm this runs inside generate_haplotypes_naive_HiFi, AFTER
+// gen_rphase_dp has physically removed DP-rejected sites. It removes
+// sites at adjacent positions (p and p+1) from the compacted arrays.
 //
-// With multi-alt sites, a single position can have multiple PhasingSite
-// entries (one per qualifying alt base). When a position is removed,
-// ALL its PhasingSite entries are removed.
-//
-// Three arrays must stay consistent:
-//   sites[]    — compacted, indices shift down
-//   evidence[] — entries for removed sites are dropped
-//   ev.siteIdx — remapped from old site indices to new ones
-//
-// Hifiasm does the same compaction (Correct.cpp:8855): it compacts
-// snp_stat[], compacts the evidence list[], and rewrites
-// overlapSite -= m_off for each surviving evidence entry.
+// In dinara, DP-rejected sites remain with dpChainId < 0. This function
+// runs after runDpPhasing and marks adjacent DP-confirmed sites as
+// rejected (dpChainId = -1). Only DP-confirmed sites (dpChainId >= 0)
+// are considered when checking adjacency, matching hifiasm's
+// post-compaction behavior. labelCisTrans guards on dpChainId in every
+// step, so rejected sites are invisible to the labeling logic.
 // ============================================================================
 
 static void filterAdjacentSites(
@@ -705,15 +697,9 @@ static void filterAdjacentSites(
     if (scratch.sites.size() < 2) return;
 
     const size_t n = scratch.sites.size();
-    vector<bool> remove(n, false);
 
-    // --- 1. Identify adjacent positions ---
-    //
-    // Group sites by position. Sites are sorted by position, and
-    // multi-alt entries at the same position are contiguous.
-    // If consecutive groups have positions p and p+1, mark both
-    // groups for removal.
-
+    // Group sites by position. Only groups with at least one
+    // DP-confirmed site participate in adjacency checks.
     struct PosGroup { uint32_t pos; size_t begin; size_t end; };
     vector<PosGroup> groups;
     size_t gi = 0;
@@ -721,97 +707,27 @@ static void filterAdjacentSites(
         const uint32_t pos = scratch.sites[gi].site;
         size_t gEnd = gi;
         while (gEnd < n && scratch.sites[gEnd].site == pos) gEnd++;
-        groups.push_back({pos, gi, gEnd});
+        bool hasConfirmed = false;
+        for (size_t i = gi; i < gEnd; i++) {
+            if (scratch.sites[i].dpChainId >= 0) {
+                hasConfirmed = true;
+                break;
+            }
+        }
+        if (hasConfirmed) {
+            groups.push_back({pos, gi, gEnd});
+        }
         gi = gEnd;
     }
 
+    // Hifiasm (Correct.cpp:8855): if consecutive groups have positions
+    // p and p+1, both are removed. We set dpChainId = -1 instead.
     for (size_t g = 0; g + 1 < groups.size(); g++) {
         if (groups[g + 1].pos == groups[g].pos + 1) {
             for (size_t i = groups[g].begin; i < groups[g].end; i++)
-                remove[i] = true;
+                scratch.sites[i].dpChainId = -1;
             for (size_t i = groups[g + 1].begin; i < groups[g + 1].end; i++)
-                remove[i] = true;
-        }
-    }
-
-    bool anyRemoved = false;
-    for (size_t i = 0; i < n; i++) {
-        if (remove[i]) { anyRemoved = true; break; }
-    }
-    if (!anyRemoved) return;
-
-    // --- 2. Build old-to-new site index mapping ---
-    //
-    // Surviving sites shift down to fill gaps left by removed sites.
-    // oldToNew[i] gives the new index for site i, or UINT32_MAX if
-    // site i was removed. Used to remap ev.siteIdx in step 4.
-
-    vector<uint32_t> oldToNew(n, UINT32_MAX);
-    uint32_t newIdx = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (!remove[i]) {
-            oldToNew[i] = newIdx++;
-        }
-    }
-
-    // --- 3. Compact sites array ---
-
-    size_t write = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (!remove[i]) {
-            scratch.sites[write++] = scratch.sites[i];
-        }
-    }
-    scratch.sites.resize(write);
-
-    // --- 4. Compact evidence array and remap siteIdx ---
-    //
-    // Drop evidence entries whose site was removed (oldToNew == UINT32_MAX).
-    // For surviving entries, remap ev.siteIdx to the new site index.
-    // Evidence order is preserved (sorted by site position, then overlapIdx).
-
-    for (auto& site : scratch.sites) {
-        site.evidenceBegin = 0;
-        site.evidenceEnd = 0;
-    }
-
-    size_t evWrite = 0;
-    for (size_t ei = 0; ei < scratch.evidence.size(); ei++) {
-        auto& ev = scratch.evidence[ei];
-
-        if (ev.siteIdx < uint32_t(n)) {
-            uint32_t newSi = oldToNew[ev.siteIdx];
-            if (newSi == UINT32_MAX) continue;
-            ev.siteIdx = newSi;
-        }
-
-        scratch.evidence[evWrite++] = ev;
-    }
-    scratch.evidence.resize(evWrite);
-
-    // --- 5. Rebuild evidenceBegin/evidenceEnd on surviving sites ---
-    //
-    // Both sites and evidence are sorted by position, so we walk them
-    // in tandem. All sites at the same position share the same evidence
-    // range (set by buildSnpMatrix for multi-alt support).
-
-    if (!scratch.evidence.empty()) {
-        uint32_t si = 0;
-        uint32_t ei = 0;
-        while (si < uint32_t(scratch.sites.size()) &&
-               ei < uint32_t(scratch.evidence.size())) {
-            uint32_t pos = scratch.sites[si].site;
-            uint32_t rangeBegin = ei;
-            while (ei < uint32_t(scratch.evidence.size()) &&
-                   scratch.evidence[ei].site == pos) {
-                ei++;
-            }
-            while (si < uint32_t(scratch.sites.size()) &&
-                   scratch.sites[si].site == pos) {
-                scratch.sites[si].evidenceBegin = rangeBegin;
-                scratch.sites[si].evidenceEnd = ei;
-                si++;
-            }
+                scratch.sites[i].dpChainId = -1;
         }
     }
 }
@@ -1366,33 +1282,27 @@ static void labelCisTrans(
         if (ov.isMatch == 1) ov.isMatch = 2; // trans
 
         // Walk this overlap's evidence: mark mismatch sites, decrement
-        // match counts.
+        // match counts. Hifiasm physically removes DP-rejected sites
+        // before this function, so they never appear. We skip them
+        // via dpChainId < 0.
         for (uint32_t p = overlapEvBegin[sortIdx]; p < overlapEvEnd[sortIdx]; p++) {
             const auto& ev = scratch.evidence[overlapEvIdx[p]];
             if (ev.siteIdx >= numSites) continue;
+            if (scratch.sites[ev.siteIdx].dpChainId < 0) continue;
 
             if (ev.isAlt == 1) {
-                // Mismatch: mark as trans-confirmed.
-                // Hifiasm: s->score = 1 for ALL mismatches at trans overlaps.
+                // Mismatch: set score=1 (Correct.cpp:8979).
                 scratch.sites[ev.siteIdx].transConfirmed = 1;
             } else {
-                // Match: decrement labelMatchCount on ALL sites at this
-                // position. Hifiasm walks backwards from overlapSite to
-                // find all SnpStats at the same position.
+                // Match: decrement occ_0 on all sites at same position.
+                // Hifiasm walks backwards only from overlapSite
+                // (Correct.cpp:8983). Match evidence points to the last
+                // site at this position, so backwards covers all.
                 const uint32_t pos = scratch.sites[ev.siteIdx].site;
-                // Walk backwards from ev.siteIdx.
                 for (int32_t si = int32_t(ev.siteIdx); si >= 0; si--) {
                     if (scratch.sites[uint32_t(si)].site != pos) break;
                     auto& s = scratch.sites[uint32_t(si)];
-                    if (s.labelMatchCount > 1) s.labelMatchCount--;
-                    if (ov.isRev == 0 && s.labelFwdStrandCount > 1) {
-                        s.labelFwdStrandCount--;
-                    }
-                }
-                // Also walk forwards (ev.siteIdx may not be the last).
-                for (uint32_t si = ev.siteIdx + 1; si < numSites; si++) {
-                    if (scratch.sites[si].site != pos) break;
-                    auto& s = scratch.sites[si];
+                    if (s.dpChainId < 0) continue;
                     if (s.labelMatchCount > 1) s.labelMatchCount--;
                     if (ov.isRev == 0 && s.labelFwdStrandCount > 1) {
                         s.labelFwdStrandCount--;
@@ -1443,119 +1353,31 @@ static void labelCisTrans(
         if (scratch.overlaps[oi].isMatch != 1) continue;
         for (uint32_t p = overlapEvBegin[oi]; p < overlapEvEnd[oi]; p++) {
             const auto& ev = scratch.evidence[overlapEvIdx[p]];
-            if (ev.isAlt == 1 && ev.siteIdx < numSites) {
+            if (ev.isAlt == 1 && ev.siteIdx < numSites &&
+                scratch.sites[ev.siteIdx].dpChainId >= 0) {
+                // Hifiasm: score = -1 (Correct.cpp:9025).
                 scratch.sites[ev.siteIdx].cisReset = 1;
             }
         }
     }
 
     // ----------------------------------------------------------------
-    // Step E: multi_check — weak site promotion.
-    //
-    // Hifiasm (Correct.cpp:9035): for each cis overlap, find mismatches
-    // at sites that pass basic thresholds but are NOT confirmed and NOT
-    // trans-confirmed (after cisReset). Apply density + 32bp proximity
-    // filter. Site indices appearing in >=2 overlaps get promoted.
-    // ----------------------------------------------------------------
-
-    {
-        // Collect per-overlap weak mismatch siteIdx values.
-        vector<uint32_t> promotionCandidates;
-
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (scratch.overlaps[oi].isMatch == 2) continue; // skip trans
-
-            // Collect weak mismatch site indices for this overlap.
-            vector<uint32_t> weakSiteIndices;
-            for (uint32_t p = overlapEvBegin[oi]; p < overlapEvEnd[oi]; p++) {
-                const auto& ev = scratch.evidence[overlapEvIdx[p]];
-                if (ev.isAlt == 0) continue;
-                if (ev.siteIdx >= numSites) continue;
-                const auto& s = scratch.sites[ev.siteIdx];
-                if (s.labelMatchCount < 2 || s.altCount < 2) continue;
-                if (isLabelStrandBiased(s)) continue;
-                // Skip confirmed sites (pass full thresholds).
-                if (s.labelMatchCount >= PHASING_S_HAP_COV &&
-                    s.altCount >= PHASING_INFOR_COV) continue;
-                // Skip already confirmed (trans-confirmed and not cis-reset).
-                if (s.isLabelConfirmed()) continue;
-                weakSiteIndices.push_back(ev.siteIdx);
-            }
-
-            uint32_t o = uint32_t(weakSiteIndices.size());
-            if (o == 0) continue;
-
-            // Density filter: need >= 4% of alignment length.
-            const uint32_t alignLen = scratch.overlaps[oi].qe -
-                                      scratch.overlaps[oi].qs;
-            if (o < uint32_t(double(alignLen) * 0.04)) continue;
-
-            // Sort by siteIdx (hifiasm sorts overlapSite values).
-            dinara::radixSort(weakSiteIndices.data(),
-                weakSiteIndices.data() + weakSiteIndices.size(),
-                [](uint32_t x) { return x; });
-
-            // 32bp proximity filter: remove sites within 32bp of neighbors.
-            // Hifiasm uses site positions looked up via snp_stat[a[i]].site.
-            //
-            // Note: hifiasm has a stale-pointer bug here (Correct.cpp:9068):
-            // the `t` pointer for the last element retains its value from
-            // the previous iteration, pointing to the current element
-            // itself, so `site + 32 > site` is always true and the last
-            // element is always dropped. We replicate this for parity.
-            vector<uint32_t> filtered;
-            for (size_t i = 0; i < weakSiteIndices.size(); i++) {
-                uint32_t pos = scratch.sites[weakSiteIndices[i]].site;
-                bool tooClose = false;
-                if (i > 0) {
-                    uint32_t prevPos = scratch.sites[weakSiteIndices[i-1]].site;
-                    if (prevPos + 32 > pos) tooClose = true;
-                }
-                // Last element: hifiasm always filters it (stale t pointer).
-                if (i + 1 < weakSiteIndices.size()) {
-                    uint32_t nextPos = scratch.sites[weakSiteIndices[i+1]].site;
-                    if (pos + 32 > nextPos) tooClose = true;
-                } else {
-                    tooClose = true; // replicate hifiasm last-element drop
-                }
-                if (!tooClose) filtered.push_back(weakSiteIndices[i]);
-            }
-
-            if (filtered.size() >= 2) {
-                for (uint32_t si : filtered) {
-                    promotionCandidates.push_back(si);
-                }
-            }
-        }
-
-        // Promote: siteIdx values appearing in >=2 overlaps.
-        if (!promotionCandidates.empty()) {
-            dinara::radixSort(promotionCandidates.data(),
-                promotionCandidates.data() + promotionCandidates.size(),
-                [](uint32_t x) { return x; });
-            for (size_t i = 0; i < promotionCandidates.size(); ) {
-                uint32_t si = promotionCandidates[i];
-                size_t count = 0;
-                while (i < promotionCandidates.size() &&
-                       promotionCandidates[i] == si) {
-                    count++;
-                    i++;
-                }
-                if (count >= 2) {
-                    scratch.sites[si].promoted = 1;
-                }
-            }
-        }
-    }
+    // Step E: multi_check — disabled for ONT (multi_check=0).
+    // Hifiasm (Correct.cpp:9033): if(multi_check) { ... }
+    // ONT path passes multi_check=0, so this entire block is skipped.
 
     // ----------------------------------------------------------------
-    // Step F: Final loop — set strong flag, apply promotions.
+    // Step F: Final loop (Correct.cpp:9085).
     //
-    // Hifiasm (Correct.cpp:9085): for each overlap:
-    //   - trans: strong=1
-    //   - cis: check evidence at confirmed sites (transConfirmed and not
-    //     cisReset, OR promoted). If mismatch found, flip to trans.
-    //     If match found, set strong=1.
+    // For each overlap:
+    //   trans → strong=1
+    //   cis → check evidence at sites with score==1 && occ_0>=2 &&
+    //          occ_1>=2 && !is_st_bs. If found: strong=1.
+    //          If mismatch: also flip to trans and break.
+    //
+    // score==1 at this point means transConfirmed was set in Step B
+    // and NOT overwritten to -1 in Step D. With multi_check disabled,
+    // this is (transConfirmed && !cisReset).
     // ----------------------------------------------------------------
 
     for (uint32_t oi = 0; oi < numOv; oi++) {
@@ -1568,7 +1390,9 @@ static void labelCisTrans(
                 if (ev.siteIdx >= numSites) continue;
                 if (ev.isAlt != 0 && ev.isAlt != 1) continue;
                 const auto& s = scratch.sites[ev.siteIdx];
-                if (!s.isLabelConfirmed()) continue;
+                if (s.dpChainId < 0) continue;
+                // score == 1: transConfirmed && !cisReset
+                if (!(s.transConfirmed && !s.cisReset)) continue;
                 if (s.labelMatchCount < 2 || s.altCount < 2) continue;
                 if (isLabelStrandBiased(s)) continue;
                 ov.strong = 1;
@@ -1989,12 +1813,6 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                 tp1 = clk::now();
                 tt.buildMatrix += usec(tp0, tp1);
 
-                // 4b. Remove adjacent sites (positions p and p+1).
-                tp0 = clk::now();
-                filterAdjacentSites(scratch);
-                tp1 = clk::now();
-                tt.filterAdj += usec(tp0, tp1);
-
                 // Debug: candidate sites.
                 if (isDebugRead) {
                     std::lock_guard<std::mutex> lock(phasingCoutMutex);
@@ -2027,6 +1845,14 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                     runDpPhasing(scratch, hetCov);
                     tp1 = clk::now();
                     tt.dpPhase += usec(tp0, tp1);
+
+                    // 5b. Adjacent-site filter (after DP, like hifiasm).
+                    // Hifiasm runs this inside generate_haplotypes_naive_HiFi
+                    // (Correct.cpp:8855), after gen_rphase_dp.
+                    tp0 = clk::now();
+                    filterAdjacentSites(scratch);
+                    tp1 = clk::now();
+                    tt.filterAdj += usec(tp0, tp1);
 
                     // 6. Allele grouping (cis/trans labeling).
                     tp0 = clk::now();
