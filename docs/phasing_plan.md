@@ -15,11 +15,12 @@ phaseOverlaps(threadCount)          ← entry point (AssemblerPhasing.cpp)
         │
         ├── 1. gatherOverlaps         — collect overlaps, init isMatch=1 (cis)
         ├── 2. unpackQuerySequence     — 2-bit → uint8_t for base lookups
-        ├── 3. detectSnpSites          — sliding-window SNP detection (428 bp)
-        │       ├── Pre-walk: single CIGAR walk per overlap → CigarEvent array
-        │       ├── Pass 1: count mismatch votes per position
+        ├── 3. detectSnpSites          — two-pass SNP detection (hifiasm pattern)
+        │       ├── Pass 1: walk each overlap's CIGAR once, skip match runs,
+        │       │    │       increment vote counter at mismatch positions
         │       │    └── periodic repeat mask (period 1–4, ±12 bp window)
-        │       └── Pass 2: emit PhasingEvidence at all candidate positions
+        │       └── Pass 2: re-walk each overlap's CIGAR, emit PhasingEvidence
+        │                   only at candidate positions (flag != 0)
         ├── 4. buildSnpMatrix          — group evidence by site, filter, create PhasingSite
         │       ├── multi-alt: separate PhasingSite per qualifying alt base
         │       └── reject position if all ref matches are forward-strand
@@ -104,18 +105,30 @@ O(1) base lookups during SNP detection.
 
 ### 3. detectSnpSites
 
-Port of hifiasm's `hc_phase_robust_rr` (Correct.cpp:10200).
+Port of hifiasm's `extract_sub_cigar_hc` / `hc_phase_robust_rr`
+(Correct.cpp:18541, 19065).
 
-**Pre-walk**: Each overlap's CIGAR is walked once, collecting match/mismatch
-events as `CigarEvent` structs (qpos, tpos, op) in forward-strand query
-coordinates. Events are stored contiguously with per-overlap index ranges.
+Each overlap's CIGAR is walked directly via `forEachOpWithPositions` —
+no intermediate event arrays are materialized. Match runs are skipped
+in O(1) per CIGAR op (one token decode, no per-base iteration). Only
+mismatch positions are iterated per-base. Each overlap's CIGAR is walked
+exactly twice: once for vote counting, once for evidence emission.
 
-**Pass 1** (per 428 bp window): Count mismatch votes per position.
+**Pass 1** — vote counting (mismatches only):
 
 ```
-for each position p in window:
-    count = number of overlaps with a mismatch at p
-    if count >= OCC_THRES + 1:          // ≥2 mismatch votes
+flag[0..queryLen) = 0                   // full-length array
+
+for each overlap:
+    walk CIGAR via forEachOpWithPositions:
+        if op != 1 (mismatch): skip     // match/indel → O(1) skip
+        for each base b in mismatch run:
+            qpos = query-forward position
+            if flag[qpos] < 255: flag[qpos]++
+
+// Classify
+for each position p in [0, queryLen):
+    if flag[p] > OCC_THRES:             // ≥2 mismatch votes
         if isPeriodicRepeat(querySeq, p):
             flag[p] = 3                 // HPC-masked candidate
         else:
@@ -124,24 +137,43 @@ for each position p in window:
         flag[p] = 0                     // not a candidate
 ```
 
-**Pass 2**: At candidate positions (flag==1 or flag==3), emit evidence.
+**Pass 2** — evidence at candidate positions:
 
 ```
 for each overlap:
-    for each CIGAR event at query position p:
-        if flag[p] == 0: skip
-        emit PhasingEvidence:
-            site      = p
-            overlapIdx = overlap index
-            siteIdx   = UINT32_MAX      // set properly in buildSnpMatrix
-            base      = observed 2-bit base (target base at this position)
-            isAlt     = (base != queryBase[p]) ? 1 : 0
-            isHpc     = (flag[p] == 3) ? 1 : 0
+    walk CIGAR via forEachOpWithPositions:
+        if op == 2 or op == 3: skip     // indels
+        // op == 0 (match) or op == 1 (mismatch):
+        for each base in run that falls on a candidate position:
+            if flag[qpos] == 0: skip
+            emit PhasingEvidence:
+                site      = qpos
+                overlapIdx = overlap index
+                siteIdx   = UINT32_MAX  // set in buildSnpMatrix
+                isHpc     = (flag[qpos] == 3) ? 1 : 0
+                if op == 0:
+                    base  = queryBases[qpos]
+                    isAlt = 0
+                else:
+                    base  = target read base at tpos
+                    isAlt = 1
 ```
+
+For forward-strand overlaps, match runs in Pass 2 iterate only the
+sub-range that intersects the candidate positions (most positions have
+`flag==0` and are skipped). For RC overlaps (`queryIsRead0==0 && isRev`),
+positions are converted per-base: `qpos = queryLen - 1 - qpos_rc`.
 
 Flag==3 positions still have evidence collected (with `isHpc=1`). The
 `isHpc` flag is used later by `isHpcDependent` to test whether a single-site
 DP chain depends on periodic-repeat evidence to pass thresholds.
+
+**Performance**: The old implementation pre-walked each overlap's CIGAR
+into a `CigarEvent` array (one struct per aligned base, ~450M events for
+a typical dataset), then re-scanned per 428 bp window. The new
+implementation eliminates both the materialization and the per-window
+re-scanning, reducing `detectSnpSites` from ~297s to ~7s (sum over 8
+threads) on the test dataset.
 
 #### isPeriodicRepeat
 
@@ -791,13 +823,44 @@ Defined in `src/PhasingTypes.hpp`:
 | `PhasingSite` | Confirmed het site: position, alleles, immutable counts (`matchCount`, `altCount`, `fwdStrandCount`), mutable label counts (`labelMatchCount`, `labelFwdStrandCount`), per-step flags (`transConfirmed`, `cisReset`, `promoted`), DP chain assignment |
 | `PhasingSvEvent` | Contiguous indel region ≥ 16 bp from one overlap |
 | `PhasingSvCluster` | Cluster of SV events at similar positions |
-| `CigarEvent` | Single match/mismatch event from CIGAR pre-walk |
-| `OverlapEventRange` | Index range into CigarEvent array for one overlap |
 | `PhasingScratchpad` | Thread-local workspace, cleared between reads |
 
 ## Differences from AssemblerHifiasmEC.cpp
+
+### Evidence source
 
 `AssemblerHifiasmEC.cpp` reads from `AlignedEvidenceStore` (pre-extracted SNPs
 and indels as separate streams). `AssemblerPhasing.cpp` reads directly from
 `OverlapCigarStore`, which matches hifiasm's data flow and avoids the
 intermediate evidence store.
+
+### Alt-strand-bias filter
+
+`performHifiasmECParity` (in `detectHetSites`, AssemblerHifiasmEC.cpp) applies
+an alt-strand-bias filter during SNP detection that rejects candidate sites
+where ≥95% of alt-supporting reads are on the same strand:
+
+```cpp
+if (misCount > 2) {
+    if ((altReadsFwd + 2 >= misCount) && (altReadsFwd * 100 >= misCount * 95)) continue;
+    if ((altReadsFwd <= 2) && (altReadsFwd * 100 <= misCount * 5)) continue;
+}
+```
+
+**This filter is not present in hifiasm.** Hifiasm's `push_info`
+(Correct.cpp:10511) only applies a ref-strand-bias filter
+(`rev_n == occ_0`, rejecting sites where all ref overlaps are on the same
+strand). The `is_st_bs` macro applied later in the DP checks ref-strand-bias
+only.
+
+`phaseOverlaps` matches hifiasm's behavior: it applies only a ref-strand-bias
+filter in `buildSnpMatrix` (reject if all ref overlaps are forward-strand)
+and the `is_st_bs`-equivalent check in `runDpPhasing`. No alt-strand-bias
+filter is applied during detection.
+
+**Impact**: The extra alt-strand-bias filter in `performHifiasmECParity`
+causes it to reject SNP sites that hifiasm and `phaseOverlaps` would keep.
+On the test dataset (read 100), this removes 11 confirmed sites, reducing
+trans calls by ~43 overlaps from that read's perspective. Overall,
+`performHifiasmECParity` produces ~3,200 fewer trans labels than
+`phaseOverlaps` (15,345 vs 18,602 out of 38,542 alignments).
