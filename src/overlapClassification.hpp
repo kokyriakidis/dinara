@@ -5,112 +5,72 @@
 
 namespace dinara {
 
+// Return value constants — identical to hifiasm (Overlaps.h).
+#define MA_HT_INT        (-1)
+#define MA_HT_QCONT      (-2)
+#define MA_HT_TCONT      (-3)
+#define MA_HT_SHORT_OVLP (-4)
+
 /*
-Hifiasm ma_hit2arc: classify overlap type based on overhang analysis.
+Exact port of hifiasm's ma_hit2arc (Overlaps.h).
 
-This is a direct translation of hifiasm's `ma_hit2arc` function used for both
-ma_hit_flt (hanging overlap filtering) and ma_hit_contained_advance (containment detection).
+Classifies an overlap between a query read and a target read.
+In hifiasm the function also populates an asg_arc_t for dovetail overlaps;
+we only need the classification, so the arc output is omitted.
 
-Given an overlap with:
-  - Query: interval [qs, qe) on read of length ql
-  - Target: interval [ts, te) on read of length tl
-  - isReverse: whether target is reverse-complemented
+Parameters (matching hifiasm):
+  qs, qe  — query start/end on forward strand
+  ql      — query length
+  ts, te  — target start/end on forward strand
+  tl      — target length
+  rev     — true if target is reverse-complemented
+  max_hang — maximum allowed extension (default 1000)
+  int_frac — minimum overlap fraction (default 0.8f)
+  min_ovlp — minimum effective overlap length (default 50)
 
-Algorithm:
-1. Compute overhangs (unaligned portions):
-   - Query 5' overhang: qs
-   - Query 3' overhang: ql - qe
-   - Target overhangs: adjusted for orientation (forward vs RC)
+Return values (matching hifiasm):
+  >= 0            dovetail overlap (value is the non-overlap length l)
+  MA_HT_INT       (-1)  internal match (excessive overhangs or low overlap fraction)
+  MA_HT_QCONT     (-2)  query contained in target
+  MA_HT_TCONT     (-3)  target contained in query
+  MA_HT_SHORT_OVLP (-4)  overlap too short
 
-2. Compute extensions (minimum overhangs at each end):
-   - ext5 = min(query 5' overhang, target 5' overhang)
-   - ext3 = min(query 3' overhang, target 3' overhang)
-
-3. Apply filters in order:
-   a) Absolute overhang filter: ext5 > max_hang OR ext3 > max_hang -> internal (-1)
-   b) Fractional overlap filter: overlap/(overlap+ext5+ext3) < int_frac -> internal (-1)
-   c) Containment detection: compare query/target overhangs -> contained (1 or 2)
-   d) Minimum overlap filter: effective_length < min_ovlp -> too short (-2)
-   e) Default: dovetail (0)
-
-Return values:
-   0 = dovetail (proper prefix-suffix overlap)
-   1 = query contained in target (QCONT)
-   2 = target contained in query (TCONT)
-  -1 = internal match (excessive overhangs, reject)
-  -2 = too short (effective overlap < min_ovlp, reject)
-
-Hifiasm parameters (typical defaults):
-  - max_hang = 1000 (asm_opt.max_hang)
-  - int_frac = 0.8 (asm_opt.int_frac)
-  - min_ovlp = 50 (asm_opt.min_ovlp)
-
-Coordinates:
-  - qs/qe are on the query read's forward strand.
-  - ts/te are on the target read's forward strand (even for RC overlaps).
-  - isSameStrand indicates whether the alignment is forward/forward or forward/reverse.
-  - The function applies an orientation-aware conversion to determine 5'/3' overhangs.
+///in default, max_hang = 1000, int_frac = 0.8, min_ovlp = 50
 */
-inline int ma_hit2arc_containment(
+inline int ma_hit2arc(
     int32_t qs, int32_t qe, int32_t ql,
     int32_t ts, int32_t te, int32_t tl,
-    bool isReverse,
+    bool rev,
     int32_t max_hang,
-    double int_frac,
+    float int_frac,
     int32_t min_ovlp)
 {
-    // Step 1: Compute target overhangs in query orientation
-    int32_t tl5, tl3;  // Target 5' and 3' overhangs
-    if (isReverse) {
-        // Reverse-complement: 5' and 3' are swapped
-        tl5 = tl - te;  // Target 5' overhang = bases after target end
-        tl3 = ts;       // Target 3' overhang = bases before target start
-    } else {
-        // Forward orientation
-        tl5 = ts;       // Target 5' overhang = bases before target start
-        tl3 = tl - te;  // Target 3' overhang = bases after target end
+    int32_t tl5, tl3, ext5, ext3;
+    uint32_t l;
+
+    ///if query and target are in different strand
+    if (rev) tl5 = tl - te, tl3 = ts; // tl5: 5'-end overhang (on the query strand); tl3: similar
+    else tl5 = ts, tl3 = tl - te;
+
+    ///ext5 and ext3 is the hang on left side and right side, respectively
+    ext5 = qs < tl5? qs : tl5;
+    ext3 = ql - qe < tl3? ql - qe : tl3;
+
+    ///ext3 and ext5 should be always 0
+    if (ext5 > max_hang || ext3 > max_hang
+    || qe - qs < (qe - qs + ext5 + ext3) * int_frac
+    || te - ts < (te - ts + ext5 + ext3) * int_frac)
+    {
+        return MA_HT_INT;
     }
 
-    // Step 2: Compute extensions (minimum overhangs at each end)
-    int32_t ext5 = (qs < tl5) ? qs : tl5;           // 5' extension
-    int32_t ext3 = ((ql - qe) < tl3) ? (ql - qe) : tl3;  // 3' extension
+    if (qs <= tl5 && ql - qe <= tl3) return MA_HT_QCONT; // query contained in target
+    else if (qs >= tl5 && ql - qe >= tl3) return MA_HT_TCONT; // target contained in query
+    else if (qs > tl5) l = qs - tl5; ///query-to-target overlap, l is the length of node in string graph
+    else l = (ql - qe) - tl3; ///target-to-query overlap, l is the length of node in string graph
+    if (qe - qs + ext5 + ext3 < min_ovlp || te - ts + ext5 + ext3 < min_ovlp) return MA_HT_SHORT_OVLP; // short overlap
 
-    // Step 3a: Hifiasm ma_hit_flt: reject if absolute overhangs exceed threshold
-    if (ext5 > max_hang || ext3 > max_hang) {
-        return -1;  // Internal match
-    }
-
-    // Step 3b: Hifiasm ma_hit_flt: reject if fractional overlap is too low
-    int32_t qOverlapLen = qe - qs;
-    int32_t tOverlapLen = te - ts;
-
-    // Check query: overlap_len / (overlap_len + ext5 + ext3) >= int_frac
-    // Equivalent: overlap_len >= (overlap_len + ext5 + ext3) * int_frac
-    if (qOverlapLen < (qOverlapLen + ext5 + ext3) * int_frac) {
-        return -1;  // Internal match
-    }
-    if (tOverlapLen < (tOverlapLen + ext5 + ext3) * int_frac) {
-        return -1;  // Internal match
-    }
-
-    // Step 3c: Hifiasm containment detection
-    // QCONT: query is contained if both query overhangs <= corresponding target overhangs
-    if (qs <= tl5 && (ql - qe) <= tl3) {
-        return 1;  // Query contained in target
-    }
-    // TCONT: target is contained if both target overhangs <= corresponding query overhangs
-    if (qs >= tl5 && (ql - qe) >= tl3) {
-        return 2;  // Target contained in query
-    }
-
-    // Step 3d: Hifiasm minimum overlap filter
-    // Effective overlap length = overlap + extensions
-    if (qOverlapLen + ext5 + ext3 < min_ovlp || tOverlapLen + ext5 + ext3 < min_ovlp) {
-        return -2;  // Too short
-    }
-
-    // Step 3e: Default case - proper dovetail overlap
-    return 0;
+    return (int)l;
 }
 
 } // namespace dinara
