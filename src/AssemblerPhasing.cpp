@@ -1618,26 +1618,23 @@ static void phaseLargeIndels(
             // the entire overlap and dispatching each indel op to the
             // event whose pre-flip query range contains it.
             const size_t nEv = scratch.svEvents.size() - svEventsBefore;
-            // Per-event accumulators.
-            vector<uint32_t> evErr(nEv, 0), evHerr(nEv, 0);
 
-            // Pre-flip query ranges for matching.
-            struct EvRange { uint32_t qs, qe; };
-            vector<EvRange> evRanges(nEv);
-            for (size_t j = 0; j < nEv; j++) {
-                const auto& ev = scratch.svEvents[svEventsBefore + j];
-                if (qNeedsRc) {
-                    evRanges[j].qs = queryLen - ev.queryEnd;
-                    evRanges[j].qe = queryLen - ev.queryPos;
-                } else {
-                    evRanges[j].qs = ev.queryPos;
-                    evRanges[j].qe = ev.queryEnd;
-                }
-            }
+            // Reuse scratchpad vectors to avoid per-overlap heap churn.
+            scratch.hpcErr.assign(nEv, 0);
+            scratch.hpcHerr.assign(nEv, 0);
+
+            // Store pre-flip query ranges in the events' queryPos/End
+            // temporarily — we'll restore after the walk. This avoids
+            // allocating a separate EvRange vector.
+            // Actually, we can't modify svEvents (they're needed later).
+            // Instead, compute pre-flip coords inline in the callback.
 
             OverlapCigarStore::Cursor cur2;
             cur2.reset(ov.cigarOffset, ov.cigarTokenCount,
                 ad.qs, cigarRead1Start(assembler, ad), cigarStore);
+
+            const size_t svBase = svEventsBefore;
+            const bool isRev = ov.isRev;
 
             cigarStore.walkRangeWithCursor(
                 cur2, 0, UINT32_MAX,
@@ -1655,10 +1652,21 @@ static void phaseLargeIndels(
                     bool tAdvances = ov.queryIsRead0 ? (op == 2) : (op == 3);
                     uint32_t tEnd = tpos + (tAdvances ? len : 0);
 
-                    // Find which event this op belongs to.
+                    // Find which event this op belongs to by comparing
+                    // pre-flip query coords against pre-flip event ranges.
                     for (size_t j = 0; j < nEv; j++) {
-                        if (qpos >= evRanges[j].qs && qEnd <= evRanges[j].qe) {
-                            evErr[j] += len;
+                        const auto& ev = scratch.svEvents[svBase + j];
+                        // Compute pre-flip range from the (post-flip) event.
+                        uint32_t evQs, evQe;
+                        if (qNeedsRc) {
+                            evQs = queryLen - ev.queryEnd;
+                            evQe = queryLen - ev.queryPos;
+                        } else {
+                            evQs = ev.queryPos;
+                            evQe = ev.queryEnd;
+                        }
+                        if (qpos >= evQs && qEnd <= evQe) {
+                            scratch.hpcErr[j] += len;
 
                             // Query hpc check (post-flip coords).
                             int64_t qS, qE;
@@ -1671,7 +1679,7 @@ static void phaseLargeIndels(
                             }
                             if (hpcMaskFfRegion(qSeq, qLen, qS, qE,
                                     12, 2, 6, 0.51)) {
-                                evHerr[j] += len;
+                                scratch.hpcHerr[j] += len;
                                 break;
                             }
 
@@ -1685,7 +1693,7 @@ static void phaseLargeIndels(
                                 scratch.targetBuf.resize(size_t(tBufN));
                                 for (int64_t b = 0; b < tBufN; b++) {
                                     uint32_t p = uint32_t(tBufS + b);
-                                    if (!ov.isRev) {
+                                    if (!isRev) {
                                         scratch.targetBuf[size_t(b)] = tRead[p].value;
                                     } else {
                                         scratch.targetBuf[size_t(b)] =
@@ -1697,7 +1705,7 @@ static void phaseLargeIndels(
                                         int64_t(tpos) - tBufS,
                                         int64_t(tEnd) - tBufS,
                                         12, 2, 6, 0.51)) {
-                                    evHerr[j] += len;
+                                    scratch.hpcHerr[j] += len;
                                 }
                             }
                             break;
@@ -1707,9 +1715,9 @@ static void phaseLargeIndels(
 
             // Correct.cpp:18822: el=0 if herr > 0 && herr > err*0.66
             for (size_t j = 0; j < nEv; j++) {
-                if (evHerr[j] > 0 &&
-                    evHerr[j] > uint32_t(double(evErr[j]) * 0.66)) {
-                    scratch.svEvents[svEventsBefore + j].isHomopolymer = 1;
+                if (scratch.hpcHerr[j] > 0 &&
+                    scratch.hpcHerr[j] > uint32_t(double(scratch.hpcErr[j]) * 0.66)) {
+                    scratch.svEvents[svBase + j].isHomopolymer = 1;
                 }
             }
         }

@@ -215,6 +215,8 @@ struct PhasingScratchpad {
     // --- Large indel phasing ---
     vector<PhasingSvEvent> svEvents;
     vector<uint8_t> targetBuf;        ///< Scratch buffer for target bases (hpc check)
+    vector<uint32_t> hpcErr;          ///< Per-event total error (hpc classification)
+    vector<uint32_t> hpcHerr;         ///< Per-event homopolymer error (hpc classification)
 
     /// Reset all vectors without releasing memory.
     void clear() {
@@ -242,6 +244,8 @@ struct PhasingScratchpad {
         countBuf.clear();
         svEvents.clear();
         targetBuf.clear();
+        hpcErr.clear();
+        hpcHerr.clear();
     }
 };
 
