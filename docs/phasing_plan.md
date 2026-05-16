@@ -214,20 +214,22 @@ Port of hifiasm's `radix_sort_haplotype_evdience_srt` (by site) followed
 by per-site `push_info` (Correct.cpp:10511) which does radix sort by
 overlapID + fused dedup/count/filter/emit.
 
-Uses two counting sorts instead of `std::sort`, matching hifiasm's
-two-radix-sort pattern:
+Two-level sort matching hifiasm's pattern:
 
 1. **Counting sort by site position** — O(n + maxSite). Site values are
    bounded by query read length (~20k), so the histogram is small.
    Hifiasm: `radix_sort_haplotype_evdience_srt`.
 
-2. **Per-site counting sort by overlapIdx** — O(m + numOverlaps) per site.
-   overlapIdx is bounded by the overlap count (typically a few hundred).
-   Hifiasm: `radix_sort_haplotype_evdience_id_srt` inside `push_info`.
+2. **Per-site insertion sort by overlapIdx** — O(m²) worst case but
+   fast for typical group sizes (~35 elements). Matches hifiasm's
+   `radix_sort_haplotype_evdience_id_srt` which falls back to insertion
+   sort for groups ≤ 64 (`RS_MIN_SIZE` in ksort.h). In practice all
+   groups are ≤ 64, so insertion sort is always the fast path. Counting
+   sort is kept as fallback for rare large groups.
 
 3. **Fused dedup + count** — the dedup loop simultaneously compacts
    duplicates and accumulates match/alt/strand counts, eliminating a
-   separate counting pass.
+   separate counting pass. Matches hifiasm's `push_info` lines 10517-10533.
 
 ```
 // Step 1: counting sort all evidence by site — O(n + maxSite)
@@ -239,11 +241,11 @@ swap evidence ↔ evidenceTmp
 //         (mirrors hifiasm's push_info called per site group)
 for each group of evidence at the same site position:
 
-    // (a) counting sort this group by overlapIdx — O(m + numOverlaps)
-    if groupLen > 1:
-        histogram countBuf[0..numOverlaps] from group[].overlapIdx
-        prefix sum → scatter into sortTmp[]
-        copy sortTmp[] back into evidence[groupBegin..groupEnd)
+    // (a) sort this group by overlapIdx
+    if groupLen <= 64:
+        insertion sort (hifiasm rs_insertsort fallback)
+    else:
+        counting sort via countBuf/sortTmp
 
     // (b) fused dedup + count (hifiasm push_info lines 10517-10533)
     for each overlapIdx run (sorted, adjacent duplicates):
@@ -264,9 +266,13 @@ for each group of evidence at the same site position:
 // Step 3: swap evidenceTmp → evidence (output)
 ```
 
-**Performance**: Replacing `std::sort` O(n log n) with two counting sorts
-reduced `buildSnpMatrix` from ~1,870ms to ~607ms (3.1× speedup, sum over
-4 threads on the 989-read test dataset). Phasing output is identical.
+**Performance**: 4.7× speedup over the original `std::sort` — from
+~1,870ms to ~395ms (sum over 4 threads on the 989-read test dataset).
+The insertion sort for small groups accounts for most of the gain over
+the intermediate counting-sort-everywhere version (607ms → 395ms),
+because counting sort has O(numOverlaps) setup cost per group (histogram
+zeroing + prefix sum) that dominates when groups average only 35 elements.
+Phasing output is identical.
 
 The `siteIdx` assignment is the key multi-alt mechanism. It allows
 downstream functions to distinguish "mismatch for alt C" from "mismatch
