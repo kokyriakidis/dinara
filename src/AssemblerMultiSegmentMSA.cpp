@@ -21,6 +21,7 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 using namespace dinara;
@@ -136,102 +137,105 @@ void Assembler::testMultiSegmentMSA(
 
     cout << "  TheseusMSA created with " << nodeIds.size() << " segment nodes." << endl;
 
-    // For each non-backbone read in the window, find which backbone anchors
-    // it shares, extract the corresponding sequence, and align_from.
-    uint32_t alignedCount = 0;
-    uint32_t skippedCount = 0;
+    // Build read -> sorted backbone boundary info directly from anchor marker
+    // intervals. For each backbone boundary anchor, look up all oriented reads
+    // that contain it and record the boundary index and marker ordinal.
+    // This avoids walking each read's full journey.
+    struct BoundaryHit {
+        uint32_t boundaryIndex;
+        uint32_t ordinal;  // marker ordinal on this read
+    };
+    unordered_map<uint64_t, vector<BoundaryHit>> readBoundaryHits;
 
-    for(const auto& readInterval : window.readIntervals) {
-        const OrientedReadId oid = readInterval.orientedReadId;
-        if(oid == backboneOid) {
-            continue;
-        }
-
-        const auto readJourney = (*shasta2Journeys)[oid];
-        if(readJourney.empty()) {
-            skippedCount++;
-            continue;
-        }
-
-        // Find the first and last backbone anchor that this read shares.
-        // The read's journey positions [readInterval.begin, readInterval.end)
-        // correspond to anchors in the read's journey. We need to find which
-        // of these anchors are also in the backbone's journey, and map them
-        // to segment indices.
-
-        // Build a map from backbone anchor ID to segment boundary index.
-        // Backbone anchor at journey position (backboneBegin + i) is boundary i.
-        // Segment i spans boundaries i to i+1.
-        // We need to find the read's entry boundary and exit boundary.
-
-        uint32_t readEntryBoundary = UINT32_MAX;
-        uint32_t readExitBoundary = 0;
-
-        for(uint32_t jp = readInterval.begin; jp < readInterval.end; jp++) {
-            if(jp >= readJourney.size()) break;
-            const Shasta2AnchorId anchorId = readJourney[jp];
-
-            // Check if this anchor is one of the backbone's anchors.
-            for(uint32_t bi = 0; bi <= nSegments; bi++) {
-                const uint32_t backboneJp = window.backboneBegin + bi;
-                if(backboneJp < backboneJourney.size() && backboneJourney[backboneJp] == anchorId) {
-                    readEntryBoundary = min(readEntryBoundary, bi);
-                    readExitBoundary  = max(readExitBoundary, bi);
-                    break;
-                }
-            }
-        }
-
-        if(readEntryBoundary >= readExitBoundary || readEntryBoundary == UINT32_MAX) {
-            skippedCount++;
-            continue;
-        }
-
-        // Extract the read's sequence between its entry and exit anchors.
-        const Shasta2AnchorId entryAnchorId = backboneJourney[window.backboneBegin + readEntryBoundary];
-        const Shasta2AnchorId exitAnchorId  = backboneJourney[window.backboneBegin + readExitBoundary];
-
-        const uint32_t entryOrdinal = shasta2Anchors->getOrdinal(entryAnchorId, oid);
-        const uint32_t exitOrdinal  = shasta2Anchors->getOrdinal(exitAnchorId, oid);
-
-        if(entryOrdinal == invalid<uint32_t> || exitOrdinal == invalid<uint32_t>) {
-            skippedCount++;
-            continue;
-        }
-
-        string readSeq = extractSegmentSequence(readsRef, markersRef, k, oid, entryOrdinal, exitOrdinal);
-        if(readSeq.empty()) {
-            skippedCount++;
-            continue;
-        }
-
-        // Align from the entry boundary's segment node.
-        // readEntryBoundary is the boundary index; the segment starting at
-        // that boundary is segment index readEntryBoundary, whose node ID
-        // is nodeIds[readEntryBoundary].
-        if(readEntryBoundary >= nodeIds.size()) {
-            skippedCount++;
-            continue;
-        }
-
-        auto alignment = aligner.align_from(
-            readSeq,
-            nodeIds[readEntryBoundary],
-            1,     // weight
-            true,  // is_ends_free (read may not reach the last segment)
-            0);    // start_offset
-
-        alignedCount++;
-        if(alignedCount <= 5) {
-            cout << "  read " << oid
-                 << " boundaries [" << readEntryBoundary << "," << readExitBoundary << "]"
-                 << " seq " << readSeq.size() << " bases"
-                 << " score " << alignment.compute_affine_gap_score(penalties)
-                 << endl;
+    for(uint32_t bi = 0; bi <= nSegments; bi++) {
+        const uint32_t bjp = window.backboneBegin + bi;
+        if(bjp >= backboneJourney.size()) break;
+        const Shasta2AnchorId anchorId = backboneJourney[bjp];
+        const auto anchor = (*shasta2Anchors)[anchorId];
+        for(const auto& info : anchor) {
+            if(info.orientedReadId == backboneOid) continue;
+            readBoundaryHits[info.orientedReadId.getValue()].push_back(
+                {bi, info.ordinal});
         }
     }
 
-    cout << "  aligned " << alignedCount << " reads, skipped " << skippedCount << endl;
+    // Sort each read's hits by boundary index (they may arrive out of order
+    // if the same read appears at multiple backbone anchors).
+    for(auto& [readId, hits] : readBoundaryHits) {
+        sort(hits.begin(), hits.end(),
+            [](const BoundaryHit& a, const BoundaryHit& b) {
+                return a.boundaryIndex < b.boundaryIndex;
+            });
+    }
+
+    // Remove reads with fewer than 2 boundary hits.
+    uint32_t skippedReads = 0;
+    for(auto it = readBoundaryHits.begin(); it != readBoundaryHits.end(); ) {
+        if(it->second.size() < 2) {
+            skippedReads++;
+            it = readBoundaryHits.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    cout << "  non-backbone reads with >=2 shared anchors: " << readBoundaryHits.size()
+         << ", skipped: " << skippedReads << endl;
+
+    // For each read, align segments between consecutive shared backbone anchors.
+    uint32_t alignedSegments = 0;
+    uint32_t alignedReads = 0;
+
+    for(const auto& [readIdValue, hits] : readBoundaryHits) {
+        const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
+
+        uint32_t readSegments = 0;
+        for(size_t hi = 0; hi + 1 < hits.size(); hi++) {
+            const uint32_t prevBoundary = hits[hi].boundaryIndex;
+            const uint32_t nextBoundary = hits[hi + 1].boundaryIndex;
+
+            if(nextBoundary <= prevBoundary || prevBoundary >= nodeIds.size()) {
+                continue;
+            }
+
+            const uint32_t prevOrdinal = hits[hi].ordinal;
+            const uint32_t nextOrdinal = hits[hi + 1].ordinal;
+
+            if(nextOrdinal <= prevOrdinal) {
+                continue;
+            }
+
+            string readSeq = extractSegmentSequence(readsRef, markersRef, k, oid, prevOrdinal, nextOrdinal);
+            if(readSeq.empty()) {
+                continue;
+            }
+
+            auto alignment = aligner.align_from(
+                readSeq,
+                nodeIds[prevBoundary],
+                1,     // weight
+                true,  // is_ends_free
+                0);    // start_offset
+
+            readSegments++;
+            alignedSegments++;
+
+            if(alignedReads < 5 && readSegments == 1) {
+                cout << "  read " << oid
+                     << " matches=" << hits.size()
+                     << " firstSeg boundaries [" << prevBoundary << "," << nextBoundary << "]"
+                     << " seq " << readSeq.size() << " bases"
+                     << " score " << alignment.compute_affine_gap_score(penalties)
+                     << endl;
+            }
+        }
+
+        if(readSegments > 0) {
+            alignedReads++;
+        }
+    }
+
+    cout << "  aligned " << alignedReads << " reads (" << alignedSegments << " segments), skipped " << skippedReads << endl;
 
     // Write the MSA and GFA to files.
     {
