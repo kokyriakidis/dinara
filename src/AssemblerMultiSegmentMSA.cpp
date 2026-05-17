@@ -201,6 +201,11 @@ void Assembler::testMultiSegmentMSA(
     double maxAlignTime = 0.0;
     uint32_t maxAlignSeg = 0;
     size_t totalAlignBases = 0;
+    int readSeqId = 1;  // 0 is the backbone
+    vector<string> msaSeqNames;
+    msaSeqNames.push_back(to_string(backboneOid.getValue()));
+    vector<uint64_t> msaSeqIds;
+    msaSeqIds.push_back(backboneOid.getValue());
 
     for(const auto& [readIdValue, hits] : readBoundaryHits) {
         const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
@@ -239,7 +244,8 @@ void Assembler::testMultiSegmentMSA(
                 1,     // weight
                 true,  // is_ends_free
                 0,     // start_offset
-                endNode);
+                endNode,
+                readSeqId);
             auto t1 = chrono::steady_clock::now();
             double elapsed = chrono::duration<double>(t1 - t0).count();
             totalAlignTime += elapsed;
@@ -270,7 +276,10 @@ void Assembler::testMultiSegmentMSA(
         }
 
         if(readSegments > 0) {
+            msaSeqNames.push_back(to_string(oid.getValue()));
+            msaSeqIds.push_back(oid.getValue());
             alignedReads++;
+            readSeqId++;
         }
     }
 
@@ -295,7 +304,7 @@ void Assembler::testMultiSegmentMSA(
     {
         const string msaPath = "testMultiSegmentMSA_window" + to_string(window.windowId) + ".fasta";
         ofstream msaFile(msaPath);
-        aligner.print_as_msa(msaFile);
+        aligner.print_as_msa(msaFile, readSeqId - 1, &msaSeqNames);
         cout << "  MSA written to " << msaPath << endl;
     }
     {
