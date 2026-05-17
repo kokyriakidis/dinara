@@ -808,12 +808,14 @@ def installShasta2():
 
 
 def installTheseusLib():
-    # Pericles: POA / consensus-oriented branch (TheseusMSA, weighted voting, etc.).
-    # See https://github.com/albertjimenezbl/theseus-lib/tree/pericles
+    # Our fork of theseus-lib, pericles branch. Includes the upstream pericles
+    # features (weights, ends-free, ostream) plus multi-segment constructor
+    # and align_from for sub-region MSA alignment.
+    # See https://github.com/kokyriakidis/theseus-lib-multi-segment/tree/pericles
     #
-    # Always clone and build: each run pulls the current tip of `pericles` (shallow
-    # clone) so installs stay up to date without tracking a commit hash here.
-    print("Installing theseus-lib (branch pericles, latest)...")
+    # Always clone and build: each run pulls the current tip (shallow clone)
+    # so installs stay up to date without tracking a commit hash here.
+    print("Installing theseus-lib (kokyriakidis fork, pericles branch, latest)...")
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building theseus-lib using temporary directory", temporaryDirectory)
@@ -824,9 +826,9 @@ def installTheseusLib():
         # Shallow clone of current branch tip — enough to build; fresh each run.
         runCommand(
             "git clone -b pericles --depth 1 "
-            "https://github.com/albertjimenezbl/theseus-lib.git"
+            "https://github.com/kokyriakidis/theseus-lib-multi-segment.git"
         )
-        os.chdir("theseus-lib")
+        os.chdir("theseus-lib-multi-segment")
 
         # Legacy main-branch layout put print_as_gfa in graph.h with empty vtx.name
         # for POA graphs. Pericles emits GFA segment names as numeric node ids from
