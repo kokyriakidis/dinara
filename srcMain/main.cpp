@@ -5,6 +5,7 @@
 
 // Dinara.
 #include "Assembler.hpp"
+#include "AnchorWindows.hpp"
 #include "AssemblerOptions.hpp"
 #include "buildId.hpp"
 #if DINARA_ENABLE_VARIANT_CLUSTERING
@@ -43,6 +44,7 @@ using namespace dinara;
 // Standard library.
 #include "chrono.hpp"
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -1212,6 +1214,31 @@ void dinara::main::assemble(
 
     // Structural scaffold before het detection / phasing: journey co-read CSR (marker graph).
     assembler.computeStrand0JourneyCoReadsTable();
+
+    // Sort reads by length (longest first) for backbone priority.
+    const uint64_t readCount = assembler.getReads().readCount();
+    vector<ReadId> readIdsSortedByLength(readCount);
+    std::iota(readIdsSortedByLength.begin(), readIdsSortedByLength.end(), ReadId(0));
+    std::sort(readIdsSortedByLength.begin(), readIdsSortedByLength.end(),
+        [&](ReadId a, ReadId b) {
+            return assembler.getReads().getRead(a).baseCount
+                 > assembler.getReads().getRead(b).baseCount;
+        });
+
+    // Partition anchor journeys into disjoint windows.
+    vector<AnchorWindow> anchorWindows;
+    assembler.computeAnchorWindows(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        readIdsSortedByLength,
+        anchorWindows,
+        threadCount);
+
+    // Test multi-segment MSA on one window.
+    assembler.testMultiSegmentMSA(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        anchorWindows);
 
     // Diagnostic prototype: partition Shasta2 anchor journeys into windows, then later
     // run one Theseus MSA per anchor-window interval.
