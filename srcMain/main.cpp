@@ -1156,6 +1156,22 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
+    // Partition anchor journeys into disjoint windows.
+    // Reuses readIdsSortedByLength from above (already sorted longest-first).
+    vector<AnchorWindow> anchorWindows;
+    assembler.computeAnchorWindows(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        readIdsSortedByLength,
+        anchorWindows,
+        threadCount);
+
+    // Test multi-segment MSA on one window.
+    assembler.testMultiSegmentMSA(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        anchorWindows);
+
     return;
 
 
