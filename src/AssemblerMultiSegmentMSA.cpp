@@ -17,6 +17,7 @@
 #include <theseus/theseus_msa_aligner.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -82,6 +83,17 @@ void Assembler::testMultiSegmentMSA(
     const AnchorWindow& window = anchorWindows.front();
     const OrientedReadId backboneOid = window.backboneOrientedReadId;
     const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+    // Report memory before MSA.
+    {
+        ifstream procStatus("/proc/self/status");
+        string line;
+        while(getline(procStatus, line)) {
+            if(line.find("VmRSS") == 0) {
+                cout << "  before MSA: " << line << endl;
+            }
+        }
+    }
 
     cout << "testMultiSegmentMSA: window " << window.windowId
          << " backbone " << backboneOid
@@ -185,6 +197,10 @@ void Assembler::testMultiSegmentMSA(
     // For each read, align segments between consecutive shared backbone anchors.
     uint32_t alignedSegments = 0;
     uint32_t alignedReads = 0;
+    double totalAlignTime = 0.0;
+    double maxAlignTime = 0.0;
+    uint32_t maxAlignSeg = 0;
+    size_t totalAlignBases = 0;
 
     for(const auto& [readIdValue, hits] : readBoundaryHits) {
         const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
@@ -210,15 +226,38 @@ void Assembler::testMultiSegmentMSA(
                 continue;
             }
 
+            // Pass end_node to scope the alignment to the subgraph
+            // between the two boundary nodes.
+            int endNode = (nextBoundary < nodeIds.size())
+                ? static_cast<int>(nodeIds[nextBoundary])
+                : -1;  // -1 = sink
+
+            auto t0 = chrono::steady_clock::now();
             auto alignment = aligner.align_from(
                 readSeq,
                 nodeIds[prevBoundary],
                 1,     // weight
                 true,  // is_ends_free
-                0);    // start_offset
+                0,     // start_offset
+                endNode);
+            auto t1 = chrono::steady_clock::now();
+            double elapsed = chrono::duration<double>(t1 - t0).count();
+            totalAlignTime += elapsed;
+            totalAlignBases += readSeq.size();
+            if(elapsed > maxAlignTime) {
+                maxAlignTime = elapsed;
+                maxAlignSeg = alignedSegments;
+            }
 
             readSegments++;
             alignedSegments++;
+
+            if(elapsed > 0.1) {
+                cout << "  SLOW: read " << oid
+                     << " boundaries [" << prevBoundary << "," << nextBoundary << "]"
+                     << " seq " << readSeq.size() << " bases"
+                     << " took " << elapsed << "s" << endl;
+            }
 
             if(alignedReads < 5 && readSegments == 1) {
                 cout << "  read " << oid
@@ -236,6 +275,21 @@ void Assembler::testMultiSegmentMSA(
     }
 
     cout << "  aligned " << alignedReads << " reads (" << alignedSegments << " segments), skipped " << skippedReads << endl;
+    cout << "  total align time: " << totalAlignTime << "s"
+         << "  avg: " << (alignedSegments > 0 ? totalAlignTime / alignedSegments * 1000 : 0) << "ms/seg"
+         << "  max: " << maxAlignTime << "s (seg#" << maxAlignSeg << ")"
+         << "  total bases: " << totalAlignBases << endl;
+
+    // Report memory usage.
+    {
+        ifstream procStatus("/proc/self/status");
+        string line;
+        while(getline(procStatus, line)) {
+            if(line.find("VmRSS") == 0 || line.find("VmPeak") == 0) {
+                cout << "  " << line << endl;
+            }
+        }
+    }
 
     // Write the MSA and GFA to files.
     {
