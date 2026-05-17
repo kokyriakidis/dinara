@@ -194,6 +194,26 @@ void Assembler::testMultiSegmentMSA(
     cout << "  non-backbone reads with >=2 shared anchors: " << readBoundaryHits.size()
          << ", skipped: " << skippedReads << endl;
 
+    // Prefix sum of backbone segment lengths for computing base spans.
+    vector<size_t> segPrefixSum(nSegments + 1, 0);
+    for(uint32_t i = 0; i < nSegments; i++) {
+        segPrefixSum[i + 1] = segPrefixSum[i] + segmentStrings[i].size();
+    }
+
+    // Sort reads by backbone base span (descending) so longer-spanning
+    // reads are added to the POA graph first.
+    // Use a flat vector of (baseSpan, readIdValue) pairs — sort compares
+    // the span directly without any hash lookups.
+    vector<pair<size_t, uint64_t>> readsBySpan;
+    readsBySpan.reserve(readBoundaryHits.size());
+    for(const auto& [readIdValue, hits] : readBoundaryHits) {
+        size_t span = segPrefixSum[hits.back().boundaryIndex]
+                    - segPrefixSum[hits.front().boundaryIndex];
+        readsBySpan.push_back({span, readIdValue});
+    }
+    sort(readsBySpan.begin(), readsBySpan.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
     // For each read, align segments between consecutive shared backbone anchors.
     uint32_t alignedSegments = 0;
     uint32_t alignedReads = 0;
@@ -207,7 +227,8 @@ void Assembler::testMultiSegmentMSA(
     vector<uint64_t> msaSeqIds;
     msaSeqIds.push_back(backboneOid.getValue());
 
-    for(const auto& [readIdValue, hits] : readBoundaryHits) {
+    for(const auto& [baseSpan, readIdValue] : readsBySpan) {
+        const auto& hits = readBoundaryHits[readIdValue];
         const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
 
         uint32_t readSegments = 0;
