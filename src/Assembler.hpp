@@ -87,6 +87,7 @@ namespace dinara {
     class Reads;
     class ReferenceOverlapMap;
     class ProjectedAlignment;
+    struct AnchorWindow;
     class Shasta2Anchors;
     class Shasta2Journeys;
     class Shasta2AnchorGraph;
@@ -3588,6 +3589,22 @@ public:
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
         uint64_t threadCount);
+    // Partition anchor journeys into disjoint windows based on a backbone
+    // read's journey, then expanded to include intervals on reads sharing
+    // those anchors. readIdsSortedByLength controls backbone priority.
+    void computeAnchorWindows(
+        shared_ptr<Shasta2Anchors> shasta2Anchors,
+        shared_ptr<Shasta2Journeys> shasta2Journeys,
+        const vector<ReadId>& readIdsSortedByLength,
+        vector<AnchorWindow>& anchorWindows,
+        uint64_t threadCount);
+
+    // Test the multi-segment TheseusMSA on one anchor window.
+    void testMultiSegmentMSA(
+        const shared_ptr<Shasta2Anchors>& shasta2Anchors,
+        const shared_ptr<Shasta2Journeys>& shasta2Journeys,
+        const vector<AnchorWindow>& anchorWindows);
+
     void benchmarkFastGAOnChainedReadPairs(ReadId focalReadId, uint32_t strand);
     void alignChainedCandidatesWithFastGA(uint64_t threadCount);
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
