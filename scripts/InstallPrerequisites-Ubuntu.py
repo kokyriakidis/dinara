@@ -732,8 +732,8 @@ def installShasta2():
         installTmpDir = os.path.abspath("../install_tmp")
         
         # Run cmake with install prefix
-        # We need to explicitly include the paths to our locally built dependencies (poasta, astarpa, etc)
-        cxx_flags = f"-I{INCLUDE_DIR}/poasta -I{INCLUDE_DIR}/astarpa -I{INCLUDE_DIR}/simd-minimizers"
+        # We need to explicitly include the paths to our locally built dependencies (poasta, astarpa, theseus, etc)
+        cxx_flags = f"-I{INCLUDE_DIR} -I{INCLUDE_DIR}/poasta -I{INCLUDE_DIR}/astarpa -I{INCLUDE_DIR}/simd-minimizers"
         runCommand(f"cmake .. -DCMAKE_CXX_FLAGS=\"{cxx_flags}\" -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON -DBUILD_STATIC_LIBRARY=ON -DCMAKE_INSTALL_PREFIX={installTmpDir}")
         runCommand("make -j")
         # Run make install to populate install_tmp
@@ -1061,11 +1061,12 @@ installPoasta()
 installSimdMinimizers()
 installBubbleFinder()
 
+# Install theseus-lib (C++23 POA / sequence-to-graph aligner)
+# Must come before shasta2 because shasta2's theseusWrapper.cpp includes theseus headers.
+installTheseusLib()
+
 # Install shasta2 (and abpoa via shasta2 scripts)
 installShasta2()
-
-# Install theseus-lib (C++23 POA / sequence-to-graph aligner)
-installTheseusLib()
 
 installVg()
 installMinipoa()
