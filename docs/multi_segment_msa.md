@@ -36,20 +36,38 @@ Each node contains the full base sequence of one inter-anchor segment. The
 constructor returns the `NodeId` for each segment node, which is used to
 target `align_from` calls.
 
+## Read Discovery
+
+Overlapping reads are discovered directly from the anchor marker intervals
+rather than from the window's `readIntervals`. For each backbone boundary
+anchor, the function queries `anchorMarkerInfos[anchorId]` to get all
+oriented reads containing that anchor, along with their marker ordinals.
+This builds a map from each read to its sorted list of **boundary hits**
+(backbone boundary index + marker ordinal) in a single pass over the
+backbone anchors.
+
+This approach avoids:
+- Deduplicating reads from `readIntervals`
+- Walking each read's full journey to find shared backbone anchors
+- Calling `getOrdinal()` per shared anchor (ordinals come directly from
+  the marker info struct)
+
+Reads with fewer than 2 boundary hits are discarded — at least two shared
+backbone anchors are needed to define a segment to align.
+
 ## Read Alignment
 
-Each non-backbone read in the window shares some subset of the backbone's
-anchors. The function identifies the read's **entry boundary** (first shared
-anchor) and **exit boundary** (last shared anchor), then:
+For each read with ≥2 shared backbone anchors, the function aligns one
+segment per pair of consecutive boundary hits. Given consecutive hits at
+backbone boundaries `i` and `j` with marker ordinals `o_i` and `o_j`:
 
-1. Extracts the read's base sequence between its own marker ordinals for the
-   entry and exit anchors.
-2. Calls `align_from(seq, nodeIds[entryBoundary])` to align the read starting
-   at the correct segment node.
+1. Extracts the read's base sequence between ordinals `o_i` and `o_j`.
+2. Calls `align_from(seq, nodeIds[i])` to align the read starting at
+   boundary `i`'s segment node.
 
-The POA aligner handles the fact that the read's segment lengths may differ
-from the backbone's due to insertions and deletions — the alignment naturally
-crosses node boundaries at whatever position produces the best score.
+When `j - i = 1` the read segment corresponds to exactly one backbone
+segment. When `j - i > 1` the read skips intermediate backbone anchors
+and the alignment traverses multiple backbone segments in the graph.
 
 Each `align_from` call updates the POA graph: matching bases increment node
 weights, while divergent bases create new branches. After all reads are
@@ -58,11 +76,10 @@ the window.
 
 ## Partial Coverage
 
-Reads typically don't span the entire window. A read entering at anchor A1
-and exiting at A2 only covers segments 1. The `align_from` call starts at
-segment 1's node with `is_ends_free=true`, so the aligner doesn't penalize
-the read for not reaching the sink. The partial backtrace mechanism handles
-this case.
+Reads typically don't span the entire window. A read sharing anchors A5
+and A8 only contributes segments between those boundaries. The `align_from`
+call uses `is_ends_free=true`, so the aligner doesn't penalize the read
+for not reaching the sink.
 
 ## Output
 
