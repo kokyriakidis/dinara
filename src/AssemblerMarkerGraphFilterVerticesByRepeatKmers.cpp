@@ -26,7 +26,7 @@ void Assembler::filterMarkerGraphVerticesByRepeatKmers(uint64_t threadCount)
     const uint64_t k = assemblerInfo->k;
 
     // Same defaults as Shasta2 (--max-anchor-repeat-length).
-    const vector<uint64_t> maxAnchorRepeatLength = {8, 3, 3, 3, 3};
+    const vector<uint64_t> maxAnchorRepeatLength = {6, 4, 4, 4, 4};
 
     auto shouldSkipKmerDueToRepeats = [&](const Kmer& kmer0) -> bool {
         for(uint64_t i=0; i<maxAnchorRepeatLength.size(); i++) {

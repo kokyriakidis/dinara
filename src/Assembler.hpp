@@ -798,6 +798,12 @@ public:
     // ONT overlap phasing (hifiasm rphase_hc parity).
     void phaseOverlaps(uint64_t threadCount);
 
+    // K-means overlap phasing (pgphase/longcallD-style iterative clustering).
+    // Detects clean het sites from CIGAR walks, phases overlaps via k-means,
+    // identifies noisy regions for future targeted MSA refinement.
+    // isOnt: enables ONT-specific Fisher exact strand bias filter.
+    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false, bool useEvidenceStore = false);
+
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
     // Experimental: EC parity using induced alignments through marker graph vertices.
@@ -1105,6 +1111,15 @@ private:
 	    // for each (read0, read1) pair, keep only the single best overlap by DP score
 	    // among overlaps that are cis on both reads and not already deleted.
 	    void keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount);
+public:
+    // Pre-phasing chain deduplication: keep one best chain per read pair.
+    // Port of hifiasm's dedup_chains (ecovlp.cpp:2984) for use before
+    // marker graph construction, when phasing info is not yet available.
+    // Uses score = span - 12*errors, then span as tiebreaker.
+    void dedupChainsPrePhasing(uint64_t threadCount);
+private:
+    void dedupChainsPrePhasingThreadFunction(size_t threadId);
+    std::atomic<uint64_t> removedPrePhasingDedupCount;
 public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
@@ -3604,6 +3619,14 @@ public:
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         const vector<AnchorWindow>& anchorWindows);
+
+    // Build a single multi-segment Theseus MSA for one focal read using
+    // all its direct overlaps from alignmentTable. Evaluates feasibility
+    // of per-read MSA for het-site detection.
+    void testDirectOverlapMSA(
+        const shared_ptr<Shasta2Anchors>& shasta2Anchors,
+        const shared_ptr<Shasta2Journeys>& shasta2Journeys,
+        ReadId focalReadId = ReadId(0));
 
     void benchmarkFastGAOnChainedReadPairs(ReadId focalReadId, uint32_t strand);
     void alignChainedCandidatesWithFastGA(uint64_t threadCount);
