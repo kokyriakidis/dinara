@@ -801,7 +801,8 @@ public:
     // K-means overlap phasing (pgphase/longcallD-style iterative clustering).
     // Detects clean het sites from CIGAR walks, phases overlaps via k-means,
     // identifies noisy regions for future targeted MSA refinement.
-    void phaseOverlapsKmeans(uint64_t threadCount);
+    // isOnt: enables ONT-specific Fisher exact strand bias filter.
+    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false);
 
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);

@@ -193,13 +193,23 @@ struct KmScratchpad {
     vector<uint32_t> digarBegin; ///< digars[digarBegin[oi]..digarEnd[oi])
     vector<uint32_t> digarEnd;
 
+    // Per-overlap noisy regions (pgphase NoisyRegionBuilder output).
+    // Flat buffer with per-overlap ranges, like digars.
+    vector<KmNoisyRegion> overlapNoisyRegions;
+    vector<uint32_t> overlapNoisyBegin;
+    vector<uint32_t> overlapNoisyEnd;
+
+    // Low-complexity intervals on backbone (sdust output, sorted).
+    vector<std::pair<uint32_t,uint32_t>> lowComplexity;
+
+    // Chunk-level noisy regions (merged from per-overlap, after pre_process_noisy_regs).
+    vector<KmNoisyRegion> noisyRegions;
+
     // Candidate table (sorted by KmVarKey).
     vector<KmCandidate> candidates;
 
     // Per-overlap allele profiles.
     vector<KmOverlapProfile> overlapProfiles;
-
-    vector<KmNoisyRegion> noisyRegions;
 
     // K-means pivot selection scratch.
     vector<uint32_t> validVarIdx;
@@ -210,9 +220,13 @@ struct KmScratchpad {
         digars.clear();
         digarBegin.clear();
         digarEnd.clear();
+        overlapNoisyRegions.clear();
+        overlapNoisyBegin.clear();
+        overlapNoisyEnd.clear();
+        lowComplexity.clear();
+        noisyRegions.clear();
         candidates.clear();
         overlapProfiles.clear();
-        noisyRegions.clear();
         validVarIdx.clear();
     }
 };
@@ -226,11 +240,17 @@ struct KmPhasingOptions {
     uint32_t minAltDepth = 2;
     double   minAf = 0.20;
     double   maxAf = 0.80;
-    double   strandBiasPval = 0.01;
-    uint32_t noisyRegMergeDis = 500;
+    bool     isOnt = false;           ///< ONT mode: enables Fisher exact strand bias test.
+    double   strandBiasPval = 0.01;   ///< p-value threshold for ONT strand bias (pgphase default).
+    uint32_t noisyRegMaxXgaps = 5;    ///< Max indel span for repeat check (pgphase kDefaultNoisyRegMaxXgaps).
+    uint32_t noisyRegMergeDis = 500;  ///< Merge distance for noisy region intervals.
+    uint32_t noisyRegFlankLen = 10;   ///< Flank extension for noisy regions (pgphase kNoisyRegFlankLen).
+    int      minNoisyRegTotalDepth = 0; ///< Min total depth for noisy region (pgphase default 0 = disabled).
+    uint32_t sdustThreshold = 5;      ///< SDUST complexity threshold (pgphase kSdustThreshold).
+    uint32_t sdustWindow = 20;        ///< SDUST window size (pgphase kSdustWindow).
     uint32_t maxKmeansIter = 10;
     uint32_t minSpanningReads = 2;
-    int      minSvLen = 30;  ///< Insertions >= this length use fuzzy length-ratio collapsing.
+    int      minSvLen = 30;           ///< Insertions >= this length use fuzzy length-ratio collapsing.
 };
 
 } // namespace dinara
