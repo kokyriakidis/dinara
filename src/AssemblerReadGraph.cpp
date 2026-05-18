@@ -209,6 +209,9 @@ void Assembler::createReadGraphAllAlignments(bool pruneContained)
     for(uint64_t alignmentId = 0; alignmentId < n; alignmentId++) {
         const AlignmentData& ad = alignmentData[alignmentId];
 
+        // Skip alignments marked for deletion.
+        if(!ad.keptByBothSides()) continue;
+
         const ReadId readId0 = ad.readIds[0];
         const ReadId readId1 = ad.readIds[1];
         const bool contained0 = reads->getFlags(readId0).isContained;
@@ -250,6 +253,9 @@ void Assembler::createReadGraphAllAlignments(bool pruneContained)
         const ReadId readId1 = ad.readIds[1];
         const bool contained0 = reads->getFlags(readId0).isContained;
         const bool contained1 = reads->getFlags(readId1).isContained;
+
+        // Skip alignments marked for deletion.
+        if(!ad.keptByBothSides()) continue;
 
         if(!contained0 && !contained1) {
             keepAlignment[alignmentId] = true;
