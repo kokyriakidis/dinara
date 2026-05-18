@@ -1044,10 +1044,18 @@ void dinara::main::assemble(
                    reads.getReadRawSequenceLength(b);
         });
 
-    // Flag contained reads so createMarkerGraphVertices can skip them.
-    // Contained reads overlap with different regions and can bridge during transitive closure.
-    // Parameters match hifiasm defaults: max_hang=1000, max_hang_rate=0.8, min_ovlp=50.
-    assembler.flagContainedReads(1000, 0.8, 50, threadCount);
+    // // Flag contained reads so createMarkerGraphVertices can skip them.
+    // // Contained reads overlap with different regions and can bridge during transitive closure.
+    // // Parameters match hifiasm defaults: max_hang=1000, max_hang_rate=0.8, min_ovlp=50.
+    // assembler.flagContainedReads(1000, 0.8, 50, threadCount);
+
+    // Delete internal overlaps (excessive overhangs or too short).
+    assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
+
+    // Keep one best chain per read pair (hifiasm dedup_chains port).
+    // Secondary chains create extra ordinal-pair merges in the marker graph
+    // disjoint set, amplifying transitive closure contamination.
+    assembler.dedupChainsPrePhasing(threadCount);
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
@@ -1074,6 +1082,7 @@ void dinara::main::assemble(
 
 
     // assembler.phaseOverlaps(threadCount);
+    assembler.phaseOverlapsKmeans(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);
 
@@ -1100,19 +1109,15 @@ void dinara::main::assemble(
 
     const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
     
-    // Create Shasta2Anchors with vertex splitting.
-    // Splits marker graph vertices whose reads were merged by transitive
-    // closure but lack direct pairwise overlaps in the read graph.
-    assembler.shasta2Anchors = createShasta2AnchorsFromSplitVertices(
-            shasta2Owner,
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            *assembler.markers,
-            assembler.markerGraph,
-            assembler.readGraph,
-            threadCount,
-            minAnchorCoverage,
-            maxAnchorCoverage);
+    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
+        shasta2Owner,
+        assembler.getReads(),
+        assembler.assemblerInfo->k,
+        *assembler.markers,
+        assembler.markerGraph,
+        threadCount,
+        minAnchorCoverage,
+        maxAnchorCoverage);
     auto& shasta2Anchors = assembler.shasta2Anchors;
 
     // double kmerDensity = 1.0;
@@ -1171,6 +1176,12 @@ void dinara::main::assemble(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         anchorWindows);
+
+    // Test direct-overlap MSA for read 0-0.
+    assembler.testDirectOverlapMSA(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        ReadId(0));
 
     return;
 
