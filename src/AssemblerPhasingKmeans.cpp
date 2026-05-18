@@ -740,8 +740,7 @@ static void kmPreProcessNoisyRegs(KmScratchpad& scratch, const KmPhasingOptions&
     // span it at all (pgphase: noisy_reg_to_total).
     const int minNoisyReads = int(opts.minAltDepth);
     const float minNoisyRatio = float(opts.minAf);
-    // pgphase: min_noisy_reg_total_depth defaults to 0 (effectively disabled).
-    const int minOverlapReads = int(opts.minNoisyRegTotalDepth);
+    // longcallD only checks n_noisy < min_alt_dp and ratio < min_af.
 
     for (const auto& [mStart, mEnd] : allNoisy) {
         int nTotal = 0;
@@ -758,7 +757,6 @@ static void kmPreProcessNoisyRegs(KmScratchpad& scratch, const KmPhasingOptions&
             }
         }
         // pgphase filter: skip if insufficient support.
-        if (minOverlapReads > 0 && nTotal < minOverlapReads) continue;
         if (nNoisy < minNoisyReads) continue;
         if (nTotal > 0 && float(nNoisy) / float(nTotal) < minNoisyRatio) continue;
         scratch.noisyRegions.push_back({mStart, mEnd, 0, false});
