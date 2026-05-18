@@ -2,6 +2,7 @@
 /// @brief K-means overlap phasing adapted from pgphase/longcallD.
 
 #include "Assembler.hpp"
+#include "AlignedEvidenceStore.hpp"
 #include "PhasingKmeansTypes.hpp"
 #include "Alignment.hpp"
 #include "Reads.hpp"
@@ -403,10 +404,6 @@ static void kmParseCigars(
         const bool needsRc = (ov.queryIsRead0 == 0) && (ov.isRev != 0);
         const bool qIsR0 = (ov.queryIsRead0 != 0);
 
-        // Estimate max events for this overlap's CIGAR.
-        int maxSites = max(1, int(ov.cigarTokenCount) * 2 + 8);
-        KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
-
         cigarStore.forEachOpWithPositions(
             ov.cigarOffset, ov.cigarTokenCount,
             ad.qs, kmCigarRead1Start(assembler, ad),
@@ -427,11 +424,33 @@ static void kmParseCigars(
                             tPos = uint32_t(xk) + b;
                         }
                         if (bbPos >= backboneLen) continue;
-                        uint8_t altBase = kmGetBase(assembler, ReadId(ov.targetReadId),
-                                                    tPos, ov.isRev != 0);
+                        // Get the target read's base in the backbone's forward frame.
+                        // Read0 is always strand 0; read1's strand depends on isSameStrand.
+                        //
+                        // When target=read1 (qIsR0=1):
+                        //   tPos is read1's oriented position (forward if same-strand,
+                        //   RC if opposite). kmGetBase with isRc handles both correctly
+                        //   because it converts oriented pos → forward pos + complement.
+                        //
+                        // When target=read0 (qIsR0=0):
+                        //   tPos is read0's forward position (read0 is always strand 0).
+                        //   If strands differ (isRev), read0 is on the opposite strand
+                        //   from the backbone. We need to complement the base to put it
+                        //   in the backbone's frame, but NOT mirror the position (tPos
+                        //   is already a valid forward index into read0's sequence).
+                        uint8_t altBase;
+                        if (qIsR0) {
+                            // Target is read1: use kmGetBase which handles oriented positions.
+                            altBase = kmGetBase(assembler, ReadId(ov.targetReadId),
+                                                tPos, ov.isRev != 0);
+                        } else {
+                            // Target is read0 (always strand 0): read forward base directly.
+                            const auto seq = assembler.getReads().getRead(ReadId(ov.targetReadId));
+                            altBase = seq[tPos].value;
+                            // If strands differ, complement to match backbone's frame.
+                            if (ov.isRev) altBase = uint8_t((~altBase) & 3);
+                        }
                         scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1});
-                        // pgphase: observe_variant(pos, 1, 1) for SNP.
-                        noisy.observe(bbPos, 1, 1);
                     }
                 } else if (op == 2 || op == 3) { // Ins/Del
                     bool bbConsumed = (op==3 && qIsR0) || (op==2 && !qIsR0);
@@ -443,28 +462,170 @@ static void kmParseCigars(
                         else { s = raw; e = rawE; }
                         if (s < backboneLen) {
                             scratch.digars.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s)});
-                            // pgphase: observe_variant(ref_pos, len, len) for deletion.
-                            noisy.observe(s, e - s, int(e - s));
                         }
                     } else {
                         uint32_t anchor = qIsR0 ? uint32_t(xk) : uint32_t(yk);
-                        if (needsRc && anchor > 0) anchor = backboneLen - 1 - anchor;
+                        // For RC, convert boundary (not position): b → backboneLen - b.
+                        // pgphase never needs this because BAM CIGARs are reference-forward.
+                        if (needsRc) anchor = backboneLen - anchor;
                         if (anchor < backboneLen) {
                             scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len)});
-                            // pgphase: observe_variant(ref_pos, 0, len) for insertion.
-                            noisy.observe(anchor, 0, int(len));
                         }
                     }
                 }
             });
 
-        noisy.flush();
-
         // Sort this overlap's digars by backbone position.
         uint32_t dEnd = uint32_t(scratch.digars.size());
         sort(scratch.digars.begin() + scratch.digarBegin[oi],
              scratch.digars.begin() + dEnd);
+
+        // Run noisy region detection on sorted digars so the sliding window
+        // sees events in backbone-position order (required for RC overlaps).
+        int maxSites = max(1, int(dEnd - scratch.digarBegin[oi]) * 2 + 8);
+        KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
+        for (uint32_t di = scratch.digarBegin[oi]; di < dEnd; di++) {
+            const auto& d = scratch.digars[di];
+            if (d.type == KmVarType::Snp)
+                noisy.observe(d.pos, 1, 1);
+            else if (d.type == KmVarType::Deletion)
+                noisy.observe(d.pos, d.len, int(d.len));
+            else
+                noisy.observe(d.pos, 0, int(d.len));
+        }
+        noisy.flush();
         scratch.digarEnd[oi] = dEnd;
+        scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
+    }
+}
+
+// ============================================================================
+// Step 2 (alt): Parse digars from AlignedEvidenceStore instead of raw CIGARs.
+//
+// The evidence store has pre-extracted SNP and indel streams built during
+// alignment computation. SNP positions and alt bases are stored directly;
+// indel positions and lengths are stored as 64-bit records. Both streams
+// are already in the target read's forward coordinates (RC handled at
+// construction time), so no coordinate flipping is needed here.
+//
+// We merge the two streams in backbone-position order so the noisy region
+// sliding window sees events in the same order as the CIGAR path.
+// ============================================================================
+
+static void kmParseFromEvidenceStore(
+    const Assembler& assembler, ReadId backboneReadId,
+    uint32_t backboneLen, KmScratchpad& scratch, const KmPhasingOptions& opts)
+{
+    const auto& evidenceStore = assembler.alignedEvidenceStore;
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+
+    scratch.digars.clear();
+    scratch.digarBegin.resize(numOv);
+    scratch.digarEnd.resize(numOv);
+    scratch.overlapNoisyRegions.clear();
+    scratch.overlapNoisyBegin.resize(numOv);
+    scratch.overlapNoisyEnd.resize(numOv);
+
+    const int noisyWin = opts.isOnt ? 25 : 100;
+    const int noisyMaxS = int(opts.noisyRegMaxXgaps);
+
+    // Temporary buffer for merging SNPs + indels in position order.
+    struct MergedEvent {
+        uint32_t bbPos;
+        KmVarType type;
+        uint8_t altBase;   // only for SNPs
+        uint16_t len;      // refLen for DEL, altLen for INS, 1 for SNP
+    };
+    vector<MergedEvent> merged;
+
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        scratch.digarBegin[oi] = uint32_t(scratch.digars.size());
+        scratch.overlapNoisyBegin[oi] = uint32_t(scratch.overlapNoisyRegions.size());
+        const auto& ov = scratch.overlaps[oi];
+        const auto& ad = assembler.alignmentData[ov.alignmentId];
+        const size_t evidenceId = ad.info.alignmentId;
+        if (evidenceId == invalid<size_t>) {
+            scratch.digarEnd[oi] = uint32_t(scratch.digars.size());
+            scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
+            continue;
+        }
+
+        const bool qIsR0 = (ov.queryIsRead0 != 0);
+
+        // Determine backbone coordinate range for this overlap.
+        const uint32_t bbStart = ov.qs;
+        const uint32_t bbEnd   = ov.qe;
+
+        merged.clear();
+
+        // Collect SNPs from the appropriate stream.
+        // When backbone=read0: Stream 1 has read0 positions + read1 bases.
+        //   Same-strand: read1's forward base. RC: read1's oriented (RC) base.
+        //   Both are correct — the base is in the alignment frame.
+        // When backbone=read1: Stream 0 has read1 positions + read0 bases.
+        //   Same-strand: read0's forward base (= alignment frame base).
+        //   RC: complement(read0's forward base) — already in backbone's frame.
+        // No additional complement needed in either case.
+        auto addSnp = [&](uint32_t pos, uint8_t base) {
+            if (pos >= backboneLen) return;
+            merged.push_back({pos, KmVarType::Snp, base, 1});
+        };
+        if (qIsR0) {
+            evidenceStore.forEachSnp1InRange(uint32_t(evidenceId), bbStart, bbEnd, addSnp);
+        } else {
+            evidenceStore.forEachSnp0InRange(uint32_t(evidenceId), bbStart, bbEnd, addSnp);
+        }
+
+        // Collect indels from the appropriate stream.
+        // In the evidence store, isDeletion() means "the other read has a gap at
+        // these positions" — i.e., the target read is missing bases here.
+        // From the digar perspective: target has a deletion → KmVarType::Deletion.
+        // isInsertion() means "the other read has extra bases" — target has an
+        // insertion → KmVarType::Insertion.
+        span<const IndelEvidence> indels;
+        if (qIsR0) {
+            indels = evidenceStore.getIndels1(uint32_t(evidenceId));
+        } else {
+            indels = evidenceStore.getIndels0(uint32_t(evidenceId));
+        }
+        for (const auto& ie : indels) {
+            uint32_t pos = ie.pos();
+            if (pos >= backboneLen) continue;
+            // Filter to backbone range.
+            if (ie.isDeletion()) {
+                uint32_t endPos = pos + ie.len();
+                if (endPos > backboneLen) endPos = backboneLen;
+                // Only include if overlapping the backbone range.
+                if (endPos <= bbStart || pos >= bbEnd) continue;
+                merged.push_back({pos, KmVarType::Deletion, 0, uint16_t(endPos - pos)});
+            } else if (ie.isInsertion()) {
+                if (pos < bbStart || pos >= bbEnd) continue;
+                merged.push_back({pos, KmVarType::Insertion, 0, uint16_t(ie.len())});
+            }
+        }
+
+        // Sort merged events by backbone position for noisy region detection.
+        sort(merged.begin(), merged.end(),
+            [](const MergedEvent& a, const MergedEvent& b) { return a.bbPos < b.bbPos; });
+
+        // Feed noisy region builder and emit digars.
+        int maxSites = max(1, int(merged.size()) * 2 + 8);
+        KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
+
+        for (const auto& ev : merged) {
+            scratch.digars.push_back({ev.bbPos, ev.type, ev.altBase, ev.len});
+            if (ev.type == KmVarType::Snp) {
+                noisy.observe(ev.bbPos, 1, 1);
+            } else if (ev.type == KmVarType::Deletion) {
+                noisy.observe(ev.bbPos, ev.len, int(ev.len));
+            } else {
+                noisy.observe(ev.bbPos, 0, int(ev.len));
+            }
+        }
+        noisy.flush();
+
+        // Digars are already sorted (merged was sorted by bbPos).
+        scratch.digarEnd[oi] = uint32_t(scratch.digars.size());
         scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
     }
 }
@@ -1611,12 +1772,25 @@ static void kmWriteResults(
 // Public entry point
 // ============================================================================
 
-void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
+void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEvidenceStore)
 {
     cout << timestamp << "=== K-means Overlap Phasing ===" << endl;
+    if (useEvidenceStore)
+        cout << timestamp << "Using AlignedEvidenceStore (pre-parsed SNP/indel streams)." << endl;
+    else
+        cout << timestamp << "Using OverlapCigarStore (raw CIGAR parsing)." << endl;
     const uint64_t readCount = getReads().readCount();
     cout << timestamp << "Read count: " << readCount << endl;
     if (readCount == 0) { cout << timestamp << "No reads." << endl; return; }
+
+    // Debug mode: if DINARA_PHASING_DEBUG_READ is set, process only that read
+    // with verbose output, single-threaded.
+    int64_t debugReadId = -1;
+    if (const char* env = getenv("DINARA_PHASING_DEBUG_READ")) {
+        debugReadId = atol(env);
+        cout << timestamp << "DEBUG MODE: processing only read " << debugReadId << endl;
+        threadCount = 1;
+    }
 
     KmPhasingOptions opts;
     opts.isOnt = isOnt;
@@ -1647,14 +1821,22 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
                 return chrono::duration_cast<chrono::microseconds>(b-a).count(); };
 
             for (uint64_t rid = start; rid < end; rid++) {
+                if (debugReadId >= 0 && int64_t(rid) != debugReadId) {
+                    readsProcessed++; continue;
+                }
                 ReadId readId(rid);
                 scratch.clear();
 
+                const bool dbg = (debugReadId >= 0);
                 auto t0 = clk::now();
                 kmGatherOverlaps(*this, readId, scratch);
                 auto t1 = clk::now(); tt.gather += us(t0,t1);
-                if (scratch.overlaps.empty()) { readsProcessed++; continue; }
+                if (scratch.overlaps.empty()) {
+                    if (dbg) cout << "DEBUG read " << rid << ": no overlaps found." << endl;
+                    readsProcessed++; continue;
+                }
                 readsWithOverlaps++;
+                if (dbg) cout << "DEBUG read " << rid << ": " << scratch.overlaps.size() << " overlaps" << endl;
 
                 t0 = clk::now();
                 uint32_t bbLen = uint32_t(getReads().getRead(readId).baseCount);
@@ -1666,15 +1848,23 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
                         int(opts.sdustThreshold), int(opts.sdustWindow),
                         scratch.lowComplexity);
                 t1 = clk::now(); tt.unpack += us(t0,t1);
+                if (dbg) cout << "DEBUG read " << rid << ": bbLen=" << bbLen
+                              << " lowComplexity=" << scratch.lowComplexity.size() << " intervals" << endl;
 
                 t0 = clk::now();
-                kmParseCigars(*this, readId, bbLen, scratch, opts);
+                if (useEvidenceStore)
+                    kmParseFromEvidenceStore(*this, readId, bbLen, scratch, opts);
+                else
+                    kmParseCigars(*this, readId, bbLen, scratch, opts);
                 t1 = clk::now(); tt.detect += us(t0,t1);
+                if (dbg) cout << "DEBUG read " << rid << ": " << scratch.digars.size() << " digars, "
+                              << scratch.overlapNoisyRegions.size() << " per-overlap noisy regions" << endl;
 
                 t0 = clk::now();
                 kmCollectCandidates(scratch, opts.minSvLen);
                 kmCountAlleles(scratch, opts.minSvLen);
                 t1 = clk::now(); tt.count += us(t0,t1);
+                if (dbg) cout << "DEBUG read " << rid << ": " << scratch.candidates.size() << " candidates after collect+count" << endl;
 
                 // pgphase step 2.1: pre-process per-overlap noisy regions before classification.
                 t0 = clk::now();
@@ -1683,16 +1873,57 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
                 t1 = clk::now(); tt.classify += us(t0,t1);
                 totalNoisyRegions += scratch.noisyRegions.size();
 
-                uint32_t cleanHet = 0;
-                for (const auto& c : scratch.candidates)
+                uint32_t cleanHet = 0, cleanHom = 0, repHet = 0, noisyHet = 0;
+                for (const auto& c : scratch.candidates) {
                     if (c.category == KmVariantCategory::CleanHetSnp ||
                         c.category == KmVariantCategory::CleanHetIndel) cleanHet++;
+                    else if (c.category == KmVariantCategory::CleanHom) cleanHom++;
+                    else if (c.category == KmVariantCategory::RepeatHetIndel) repHet++;
+                    else if (c.category == KmVariantCategory::NoisyCandHet) noisyHet++;
+                }
                 if (cleanHet > 0) readsWithSites++;
+                if (dbg) {
+                    cout << "DEBUG read " << rid << ": after classify: "
+                         << scratch.candidates.size() << " candidates (cleanHet=" << cleanHet
+                         << " cleanHom=" << cleanHom << " repHetIndel=" << repHet
+                         << " noisyHet=" << noisyHet << "), "
+                         << scratch.noisyRegions.size() << " noisy regions" << endl;
+                    // Print each candidate
+                    for (uint32_t ci = 0; ci < uint32_t(scratch.candidates.size()); ci++) {
+                        const auto& c = scratch.candidates[ci];
+                        const char* catStr = "?";
+                        switch (c.category) {
+                            case KmVariantCategory::CleanHetSnp:    catStr = "CleanHetSnp"; break;
+                            case KmVariantCategory::CleanHetIndel:  catStr = "CleanHetIndel"; break;
+                            case KmVariantCategory::CleanHom:       catStr = "CleanHom"; break;
+                            case KmVariantCategory::LowCoverage:    catStr = "LowCov"; break;
+                            case KmVariantCategory::LowAlleleFraction: catStr = "LowAF"; break;
+                            case KmVariantCategory::StrandBias:     catStr = "StrandBias"; break;
+                            case KmVariantCategory::RepeatHetIndel: catStr = "RepHetIndel"; break;
+                            case KmVariantCategory::NoisyCandHet:   catStr = "NoisyCandHet"; break;
+                            case KmVariantCategory::NoisyCandHom:   catStr = "NoisyCandHom"; break;
+                            case KmVariantCategory::NonVariant:     catStr = "NonVar"; break;
+                        }
+                        const char* typeStr = c.key.type == KmVarType::Snp ? "SNP" :
+                                              c.key.type == KmVarType::Insertion ? "INS" : "DEL";
+                        cout << "  cand[" << ci << "] pos=" << c.key.pos << " " << typeStr
+                             << " refLen=" << c.key.refLen << " altLen=" << c.key.altLen
+                             << " cov=" << c.totalCov << " alt=" << c.altCov
+                             << " af=" << c.alleleFraction << " cat=" << catStr << endl;
+                    }
+                }
 
                 // Build profiles after classification (skips NON_VAR).
                 t0 = clk::now();
                 kmBuildOverlapProfiles(scratch, opts.minSvLen);
                 t1 = clk::now(); tt.count += us(t0,t1);
+                if (dbg) {
+                    int profiled = 0;
+                    for (const auto& p : scratch.overlapProfiles)
+                        if (p.startVarIdx >= 0) profiled++;
+                    cout << "DEBUG read " << rid << ": " << profiled << "/" << scratch.overlaps.size()
+                         << " overlaps have profiles" << endl;
+                }
 
                 t0 = clk::now();
                 if (cleanHet > 0) kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
@@ -1701,6 +1932,17 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
                 t0 = clk::now();
                 kmWriteResults(*this, readId, scratch);
                 t1 = clk::now(); tt.write += us(t0,t1);
+
+                if (dbg) {
+                    int hap1 = 0, hap2 = 0, hap0 = 0;
+                    for (const auto& ov : scratch.overlaps) {
+                        if (ov.hap == 1) hap1++;
+                        else if (ov.hap == 2) hap2++;
+                        else hap0++;
+                    }
+                    cout << "DEBUG read " << rid << ": RESULT hap1(cis)=" << hap1
+                         << " hap2(trans)=" << hap2 << " unassigned=" << hap0 << endl;
+                }
 
                 for (const auto& ov : scratch.overlaps) {
                     if (ov.hap == 1 || ov.hap == 0) totalCis++;
