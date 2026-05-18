@@ -149,10 +149,9 @@ void Assembler::testMultiSegmentMSA(
 
     cout << "  TheseusMSA created with " << nodeIds.size() << " segment nodes." << endl;
 
-    // Build read -> sorted backbone boundary info directly from anchor marker
-    // intervals. For each backbone boundary anchor, look up all oriented reads
-    // that contain it and record the boundary index and marker ordinal.
-    // This avoids walking each read's full journey.
+    // Build read -> backbone boundary info from anchor membership.
+    // For each backbone anchor, look up all reads that contain it and
+    // record the boundary index and marker ordinal.
     struct BoundaryHit {
         uint32_t boundaryIndex;
         uint32_t ordinal;  // marker ordinal on this read
@@ -171,8 +170,7 @@ void Assembler::testMultiSegmentMSA(
         }
     }
 
-    // Sort each read's hits by boundary index (they may arrive out of order
-    // if the same read appears at multiple backbone anchors).
+    // Sort each read's hits by boundary index.
     for(auto& [readId, hits] : readBoundaryHits) {
         sort(hits.begin(), hits.end(),
             [](const BoundaryHit& a, const BoundaryHit& b) {
@@ -191,36 +189,106 @@ void Assembler::testMultiSegmentMSA(
         }
     }
 
-    cout << "  non-backbone reads with >=2 shared anchors: " << readBoundaryHits.size()
-         << ", skipped: " << skippedReads << endl;
+    // Clip boundary hits to pairwise alignment ordinal range.
+    // For each read, find its best alignment with the backbone and
+    // remove boundary hits outside the alignment's ordinal range.
+    // This eliminates spurious hits from transitive closure.
+    const auto& clipTable = getAlignmentTable();
+    const ReadId backboneReadId = backboneOid.getReadId();
+    uint32_t clippedReads = 0;
+    for(auto& [readIdValue, hits] : readBoundaryHits) {
+        const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
+        const ReadId readId = oid.getReadId();
 
-    // Prefix sum of backbone segment lengths for computing base spans.
-    vector<size_t> segPrefixSum(nSegments + 1, 0);
-    for(uint32_t i = 0; i < nSegments; i++) {
-        segPrefixSum[i + 1] = segPrefixSum[i] + segmentStrings[i].size();
+        // Find best alignment with backbone.
+        uint32_t bestFirst = 0, bestLast = 0;
+        uint32_t bestSpan = 0;
+        const auto& aligns = clipTable[oid.getValue()];
+        for(uint32_t idx : aligns) {
+            const auto& ad = alignmentData[idx];
+            ReadId partnerId = (ad.readIds[0] == readId) ? ad.readIds[1] : ad.readIds[0];
+            if(partnerId != backboneReadId) continue;
+
+            int targetIdx = (ad.readIds[0] == readId) ? 0 : 1;
+            uint32_t firstOrd = ad.info.data[targetIdx].firstOrdinal;
+            uint32_t lastOrd  = ad.info.data[targetIdx].lastOrdinal;
+
+            // Flip ordinals if strand mismatch.
+            Strand storedStrand = (targetIdx == 0) ? 0
+                : (ad.isSameStrand ? 0 : 1);
+            if(storedStrand != oid.getStrand()) {
+                uint32_t mc = ad.info.data[targetIdx].markerCount;
+                uint32_t f = mc - 1 - lastOrd;
+                uint32_t l = mc - 1 - firstOrd;
+                firstOrd = f;
+                lastOrd = l;
+            }
+
+            uint32_t span = (lastOrd > firstOrd) ? (lastOrd - firstOrd) : 0;
+            if(span > bestSpan) {
+                bestSpan = span;
+                bestFirst = firstOrd;
+                bestLast = lastOrd;
+            }
+        }
+
+        if(bestSpan > 0) {
+            size_t before = hits.size();
+            hits.erase(
+                std::remove_if(hits.begin(), hits.end(),
+                    [&](const BoundaryHit& h) {
+                        return h.ordinal < bestFirst || h.ordinal > bestLast;
+                    }),
+                hits.end());
+            if(hits.size() < before) clippedReads++;
+        }
     }
 
-    // Sort reads by backbone base span (descending) so longer-spanning
-    // reads are added to the POA graph first.
-    // Use a flat vector of (baseSpan, readIdValue) pairs — sort compares
-    // the span directly without any hash lookups.
-    vector<pair<size_t, uint64_t>> readsBySpan;
+    // Re-remove reads that dropped below 2 hits after clipping.
+    for(auto it = readBoundaryHits.begin(); it != readBoundaryHits.end(); ) {
+        if(it->second.size() < 2) {
+            skippedReads++;
+            it = readBoundaryHits.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Sort reads by base span descending (longest first).
+    vector<pair<uint32_t, uint64_t>> readsBySpan;
     readsBySpan.reserve(readBoundaryHits.size());
     for(const auto& [readIdValue, hits] : readBoundaryHits) {
-        size_t span = segPrefixSum[hits.back().boundaryIndex]
-                    - segPrefixSum[hits.front().boundaryIndex];
+        const auto readMarkers = markersRef[readIdValue];
+        uint32_t firstPos = readMarkers[hits.front().ordinal].position;
+        uint32_t lastPos  = readMarkers[hits.back().ordinal].position;
+        uint32_t span = (lastPos > firstPos) ? (lastPos - firstPos) : 0;
         readsBySpan.push_back({span, readIdValue});
     }
     sort(readsBySpan.begin(), readsBySpan.end(),
         [](const auto& a, const auto& b) { return a.first > b.first; });
 
-    // For each read, align segments between consecutive shared backbone anchors.
+    cout << "  reads with >=2 shared anchors: " << readsBySpan.size()
+         << ", skipped: " << skippedReads
+         << ", clipped: " << clippedReads << endl;
+
+
+
+    // ---------------------------------------------------------------
+    // Alignment loop: journey-chained MSA.
+    // For each read (longest first), walk its journey interval and
+    // find anchors that already have nodes in the graph. Align
+    // sub-segments between consecutive known anchors. After each
+    // sub-segment, register intermediate journey anchors from the
+    // alignment path so subsequent reads can use them as boundaries.
+    // ---------------------------------------------------------------
     uint32_t alignedSegments = 0;
     uint32_t alignedReads = 0;
     double totalAlignTime = 0.0;
     double maxAlignTime = 0.0;
     uint32_t maxAlignSeg = 0;
     size_t totalAlignBases = 0;
+
+    vector<double> perReadTime;  // per-read timing
     int readSeqId = 1;  // 0 is the backbone
     vector<string> msaSeqNames;
     msaSeqNames.push_back(to_string(backboneOid.getValue()));
@@ -232,31 +300,23 @@ void Assembler::testMultiSegmentMSA(
         const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
 
         uint32_t readSegments = 0;
+        double readTime = 0.0;
         for(size_t hi = 0; hi + 1 < hits.size(); hi++) {
             const uint32_t prevBoundary = hits[hi].boundaryIndex;
             const uint32_t nextBoundary = hits[hi + 1].boundaryIndex;
-
-            if(nextBoundary <= prevBoundary || prevBoundary >= nodeIds.size()) {
-                continue;
-            }
+            if(nextBoundary <= prevBoundary || prevBoundary >= nodeIds.size()) continue;
 
             const uint32_t prevOrdinal = hits[hi].ordinal;
             const uint32_t nextOrdinal = hits[hi + 1].ordinal;
+            if(nextOrdinal <= prevOrdinal) continue;
 
-            if(nextOrdinal <= prevOrdinal) {
-                continue;
-            }
+            string readSeq = extractSegmentSequence(
+                readsRef, markersRef, k, oid, prevOrdinal, nextOrdinal);
+            if(readSeq.empty()) continue;
 
-            string readSeq = extractSegmentSequence(readsRef, markersRef, k, oid, prevOrdinal, nextOrdinal);
-            if(readSeq.empty()) {
-                continue;
-            }
-
-            // Pass end_node to scope the alignment to the subgraph
-            // between the two boundary nodes.
             int endNode = (nextBoundary < nodeIds.size())
                 ? static_cast<int>(nodeIds[nextBoundary])
-                : -1;  // -1 = sink
+                : -1;
 
             auto t0 = chrono::steady_clock::now();
             auto alignment = aligner.align_from(
@@ -270,6 +330,7 @@ void Assembler::testMultiSegmentMSA(
             auto t1 = chrono::steady_clock::now();
             double elapsed = chrono::duration<double>(t1 - t0).count();
             totalAlignTime += elapsed;
+            readTime += elapsed;
             totalAlignBases += readSeq.size();
             if(elapsed > maxAlignTime) {
                 maxAlignTime = elapsed;
@@ -285,26 +346,31 @@ void Assembler::testMultiSegmentMSA(
                      << " seq " << readSeq.size() << " bases"
                      << " took " << elapsed << "s" << endl;
             }
-
-            if(alignedReads < 5 && readSegments == 1) {
-                cout << "  read " << oid
-                     << " matches=" << hits.size()
-                     << " firstSeg boundaries [" << prevBoundary << "," << nextBoundary << "]"
-                     << " seq " << readSeq.size() << " bases"
-                     << " score " << alignment.compute_affine_gap_score(penalties)
-                     << endl;
-            }
         }
 
         if(readSegments > 0) {
             msaSeqNames.push_back(to_string(oid.getValue()));
             msaSeqIds.push_back(oid.getValue());
+            perReadTime.push_back(readTime);
             alignedReads++;
             readSeqId++;
         }
     }
 
     cout << "  aligned " << alignedReads << " reads (" << alignedSegments << " segments), skipped " << skippedReads << endl;
+
+    // Report timing by quartile (reads are already in longest-first order).
+    if(perReadTime.size() >= 4) {
+        size_t q = perReadTime.size() / 4;
+        for(int qi = 0; qi < 4; qi++) {
+            size_t start = qi * q;
+            size_t end = (qi == 3) ? perReadTime.size() : (qi + 1) * q;
+            double sum = 0;
+            for(size_t i = start; i < end; i++) sum += perReadTime[i];
+            cout << "  Q" << (qi + 1) << " (reads " << start << "-" << (end - 1)
+                 << "): " << sum << "s total, " << (sum / (end - start) * 1000) << "ms/read" << endl;
+        }
+    }
     cout << "  total align time: " << totalAlignTime << "s"
          << "  avg: " << (alignedSegments > 0 ? totalAlignTime / alignedSegments * 1000 : 0) << "ms/seg"
          << "  max: " << maxAlignTime << "s (seg#" << maxAlignSeg << ")"
