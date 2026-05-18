@@ -802,7 +802,7 @@ public:
     // Detects clean het sites from CIGAR walks, phases overlaps via k-means,
     // identifies noisy regions for future targeted MSA refinement.
     // isOnt: enables ONT-specific Fisher exact strand bias filter.
-    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false);
+    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false, bool useEvidenceStore = false);
 
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
