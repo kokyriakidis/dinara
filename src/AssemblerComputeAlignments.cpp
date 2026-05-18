@@ -1341,3 +1341,166 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
     // Update global removed count (atomic)
     removedOntDeduplicatedChainCount += localRemoved;
 }
+
+
+
+// ---------------------------------------------------------------------------
+// Pre-phasing chain deduplication (hifiasm dedup_chains port)
+// ---------------------------------------------------------------------------
+// For each (readIds[0], readIds[1]) pair, keep only the single best chain.
+// Runs before marker graph construction, so no phasing info is available.
+//
+// Scoring (matches hifiasm ecovlp.cpp:2984):
+//   1. Maximize score = span - 12 * nonHomopolymerErrors
+//   2. Maximize span (tiebreaker)
+//   3. Minimize alignmentId (determinism tiebreaker)
+//
+// Unlike deduplicateOntChainsPerPartnerReadHifiasmLike, this version:
+//   - Does not filter by deletion reasons (nothing is deleted yet)
+//   - Does not use is_match / phasing state (phasing hasn't run)
+//   - Processes ALL alignments regardless of cis/trans status
+
+void Assembler::dedupChainsPrePhasing(uint64_t threadCount)
+{
+    const auto tBegin = steady_clock::now();
+    cout << timestamp << "Pre-phasing chain dedup (one chain per read pair) begins." << endl;
+
+    removedPrePhasingDedupCount = 0;
+
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100);
+    runThreads(&Assembler::dedupChainsPrePhasingThreadFunction, threadCount);
+
+    const auto tEnd = steady_clock::now();
+    const double tSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "Pre-phasing chain dedup ends in " << tSeconds << " s. Removed "
+         << removedPrePhasingDedupCount.load() << " secondary chains." << endl;
+}
+
+
+
+void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
+{
+    uint64_t begin = 0, end = 0;
+    uint64_t localRemoved = 0;
+
+    struct CandidateInfo {
+        uint32_t alignmentId;
+        uint32_t span;      // qe - qs
+        int64_t score;      // span - 12 * errors
+    };
+    vector<CandidateInfo> group;
+    group.reserve(8);
+
+    auto flushGroup = [&]() {
+        if(group.size() <= 1) {
+            return;
+        }
+
+        // Find best: maximize score, then span, then minimize alignmentId.
+        size_t best = 0;
+        for(size_t i = 1; i < group.size(); ++i) {
+            const auto& a = group[i];
+            const auto& b = group[best];
+
+            if(a.score != b.score) {
+                if(a.score > b.score) best = i;
+                continue;
+            }
+            if(a.span != b.span) {
+                if(a.span > b.span) best = i;
+                continue;
+            }
+            if(a.alignmentId < b.alignmentId) {
+                best = i;
+            }
+        }
+
+        // Mark non-best as secondary.
+        for(size_t i = 0; i < group.size(); ++i) {
+            if(i == best) continue;
+            alignmentData[group[i].alignmentId].addDeleteReasonsBoth(
+                AlignmentData::DeleteReasonSecondary);
+            ++localRemoved;
+        }
+    };
+
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); ++r0) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) {
+                continue;
+            }
+
+            group.clear();
+            ReadId currentPartner = invalidReadId;
+
+            // Binary search: skip prefix where partner < r0.
+            size_t firstIndex = 0;
+            {
+                size_t lo = 0;
+                size_t hi = table.size();
+                while(lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const uint32_t alignmentId = table[mid];
+                    const OrientedReadId other =
+                        alignmentData[alignmentId].getOther(orientedR0);
+                    if(other < orientedR0) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                firstIndex = lo;
+            }
+
+            for(size_t tableIndex = firstIndex; tableIndex < table.size();
+                ++tableIndex) {
+                const uint32_t alignmentId = table[tableIndex];
+                const auto& ad = alignmentData[alignmentId];
+
+                // Canonical ordering: only process where r0 == readIds[0].
+                if(ad.readIds[0] != r0) {
+                    continue;
+                }
+
+                // Skip self-overlaps.
+                if(ad.readIds[0] == ad.readIds[1]) {
+                    alignmentData[alignmentId].addDeleteReasonsBoth(
+                        AlignmentData::DeleteReasonSecondary);
+                    ++localRemoved;
+                    continue;
+                }
+
+                const ReadId partner = ad.readIds[1];
+
+                if(partner != currentPartner) {
+                    flushGroup();
+                    group.clear();
+                    currentPartner = partner;
+                }
+
+                // Compute score: span - 12 * errors.
+                // Matches hifiasm: sc = (x_pos_e + 1 - x_pos_s) - 12 * non_homopolymer_errors
+                const uint32_t span = ad.qe - ad.qs;
+
+                const uint32_t err =
+                    (ad.info.nonHomopolymerErrorCount != invalid<uint32_t>) ?
+                    ad.info.nonHomopolymerErrorCount :
+                    ((ad.info.mismatchCount == invalid<uint32_t>) ? 0U
+                        : ad.info.mismatchCount) +
+                    ((ad.info.gapCount == invalid<uint32_t>) ? 0U
+                        : ad.info.gapCount);
+
+                const int64_t score = int64_t(span) - 12 * int64_t(err);
+
+                group.push_back(CandidateInfo{alignmentId, span, score});
+            }
+
+            flushGroup();
+        }
+    }
+
+    removedPrePhasingDedupCount += localRemoved;
+}
