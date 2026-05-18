@@ -2,39 +2,25 @@
 #define DINARA_PHASING_KMEANS_TYPES_HPP
 
 /// @file PhasingKmeansTypes.hpp
-/// @brief Data structures for k-means overlap phasing.
-///
-/// Adapts pgphase/longcallD's iterative k-means read-haplotype clustering
-/// to operate on dinara's OverlapCigarStore pairwise CIGARs.
-///
-/// Key difference from pgphase: there is no reference genome. Each backbone
-/// read acts as its own reference. Variant sites are detected from pairwise
-/// overlap CIGARs projected onto the backbone read's coordinate system.
+/// @brief Data structures for k-means overlap phasing (pgphase/longcallD-style).
 
 #include "cstdint.hpp"
 #include "vector.hpp"
+#include <array>
+#include <cstring>
 
 namespace dinara {
 
 // ============================================================================
-// Variant categories (adapted from pgphase/longcallD)
+// Variant categories
 // ============================================================================
 
-/// Classification of a candidate variant site on the backbone read.
 enum class KmVariantCategory : uint8_t {
-    LowCoverage,       ///< Too few reads cover this position.
-    LowAlleleFraction, ///< Alt allele fraction below threshold.
-    StrandBias,        ///< Strand-biased alt observations.
-    CleanHetSnp,       ///< Clean heterozygous SNP (balanced AF, not in repeat).
-    CleanHetIndel,     ///< Clean heterozygous indel (balanced AF, not in repeat).
-    CleanHom,          ///< Homozygous variant (AF > max_af).
-    RepeatHetIndel,    ///< Indel in homopolymer/tandem repeat context.
-    NoisyCandHet,      ///< Noisy-region het (from MSA recall, phase 2).
-    NoisyCandHom,      ///< Noisy-region hom (from MSA recall, phase 2).
-    NonVariant         ///< Demoted: inside noisy region or filtered.
+    LowCoverage, LowAlleleFraction, StrandBias,
+    CleanHetSnp, CleanHetIndel, CleanHom,
+    RepeatHetIndel, NoisyCandHet, NoisyCandHom, NonVariant
 };
 
-/// Bitmask flags for category filtering in k-means (mirrors longcallD).
 static constexpr uint32_t KM_CLEAN_HET_SNP   = 0x004u;
 static constexpr uint32_t KM_CLEAN_HET_INDEL = 0x008u;
 static constexpr uint32_t KM_REP_HET_VAR     = 0x010u;
@@ -43,11 +29,8 @@ static constexpr uint32_t KM_NOISY_CAND_HET  = 0x100u;
 static constexpr uint32_t KM_NOISY_CAND_HOM  = 0x200u;
 static constexpr uint32_t KM_NON_VAR          = 0x800u;
 
-/// Clean germline categories (used for initial k-means pass).
 static constexpr uint32_t KM_GERMLINE_CLEAN =
     KM_CLEAN_HET_SNP | KM_CLEAN_HET_INDEL | KM_CLEAN_HOM;
-
-/// All germline categories including noisy (used after MSA refinement).
 static constexpr uint32_t KM_GERMLINE_ALL =
     KM_GERMLINE_CLEAN | KM_NOISY_CAND_HET | KM_NOISY_CAND_HOM;
 
@@ -65,56 +48,104 @@ inline uint32_t kmCategoryToFlag(KmVariantCategory c) {
 }
 
 // ============================================================================
-// Candidate variant site
+// Variant type (mirrors pgphase VariantType)
 // ============================================================================
 
-/// A candidate variant site on the backbone read.
-struct KmCandidate {
-    uint32_t pos;              ///< Position on backbone read (base coords).
-    uint8_t  refBase;          ///< Backbone base at this position (0-3=ACGT).
-    uint8_t  type;             ///< 0=SNP, 1=insertion, 2=deletion.
-    uint16_t refLen;           ///< Reference length consumed (1 for SNP, >1 for del).
+enum class KmVarType : uint8_t { Snp = 0, Insertion = 1, Deletion = 2 };
 
-    // Allele counts.
-    uint32_t totalCov;         ///< Total overlaps covering this position.
-    uint32_t refCov;           ///< Overlaps matching backbone allele.
-    uint32_t altCov;           ///< Overlaps with alt allele (primary alt).
-    uint32_t lowQualCov;       ///< Low-quality alt observations.
-    uint32_t fwdRef;           ///< Forward-strand ref-matching overlaps.
-    uint32_t revRef;           ///< Reverse-strand ref-matching overlaps.
-    uint32_t fwdAlt;           ///< Forward-strand alt overlaps.
-    uint32_t revAlt;           ///< Reverse-strand alt overlaps.
+// ============================================================================
+// DigarOp: per-read variant event (mirrors pgphase DigarOp)
+// ============================================================================
 
-    /// Multi-allelic: per-allele coverage. Index 0 = ref, 1 = primary alt, 2+ = other alts.
-    /// Empty when biallelic (use refCov/altCov directly).
-    vector<int> alleCovs;
-    int nUniqAlles = 2;
+/// One variant event on the backbone read, parsed from a pairwise CIGAR.
+/// Equivalent to pgphase's DigarOp. Sorted by backbone position within each overlap.
+struct KmDigarOp {
+    uint32_t pos;          ///< Backbone position (0-based).
+    KmVarType type;        ///< SNP, insertion, or deletion.
+    uint8_t  altBase;      ///< For SNPs: alt base (0-3=ACGT). For indels: unused.
+    uint16_t len;          ///< For indels: length. For SNPs: 1.
 
-    double alleleFraction;     ///< altCov / totalCov.
-    KmVariantCategory category;
-    uint32_t categoryFlag;     ///< Bitmask flag for k-means filtering.
-
-    bool isHomopolymerIndel = false;
-
-    // K-means phasing state.
-    /// Per-haplotype allele profile: alleCovs-sized vector per hap (0=unassigned, 1, 2).
-    vector<int> hapAlleProfile[3];
-    /// Consensus allele per hap (-1 = unknown).
-    int hapConsAlle[3] = {-1, -1, -1};
-    int32_t phaseSet = 0;
-    int hapAlt = 0;            ///< Which hap carries the alt allele (1 or 2, 0=unresolved).
-    int hapRef = 0;            ///< Which hap carries the ref allele.
+    /// Sort key: pos first, then type, then altBase, then len.
+    bool operator<(const KmDigarOp& o) const {
+        if (pos != o.pos) return pos < o.pos;
+        if (type != o.type) return type < o.type;
+        if (altBase != o.altBase) return altBase < o.altBase;
+        return len < o.len;
+    }
+    bool operator==(const KmDigarOp& o) const {
+        return pos == o.pos && type == o.type && altBase == o.altBase && len == o.len;
+    }
 };
 
 // ============================================================================
-// Per-overlap allele profile
+// Variant key: candidate identity (mirrors pgphase VariantKey)
 // ============================================================================
 
-/// Sparse allele observations for one overlap across candidate sites.
+/// Unique identity of a candidate variant site.
+/// Two events with the same key are the same variant.
+struct KmVarKey {
+    uint32_t pos;
+    KmVarType type;
+    uint8_t  altBase;      ///< For SNPs: 0-3. For indels: unused (0).
+    uint16_t refLen;       ///< SNP=1, ins=0, del=length.
+    uint16_t altLen;       ///< SNP=1, ins=length, del=0.
+
+    bool operator<(const KmVarKey& o) const {
+        // Sort by sort_pos (indels use pos-1 like pgphase), then type, then refLen, then altLen, then altBase.
+        uint32_t sp1 = (type == KmVarType::Snp) ? pos : (pos > 0 ? pos - 1 : 0);
+        uint32_t sp2 = (o.type == KmVarType::Snp) ? o.pos : (o.pos > 0 ? o.pos - 1 : 0);
+        if (sp1 != sp2) return sp1 < sp2;
+        if (type != o.type) return type < o.type;
+        if (refLen != o.refLen) return refLen < o.refLen;
+        if (altLen != o.altLen) return altLen < o.altLen;
+        return altBase < o.altBase;
+    }
+    bool operator==(const KmVarKey& o) const {
+        return pos == o.pos && type == o.type && altBase == o.altBase
+            && refLen == o.refLen && altLen == o.altLen;
+    }
+};
+
+// ============================================================================
+// Candidate variant site (mirrors pgphase CandidateVariant)
+// ============================================================================
+
+struct KmCandidate {
+    KmVarKey key;
+
+    // Allele counts.
+    int totalCov = 0;
+    int refCov = 0;
+    int altCov = 0;
+    int lowQualCov = 0;
+    int fwdRef = 0, revRef = 0;
+    int fwdAlt = 0, revAlt = 0;
+
+    /// Per-allele coverage. Index 0 = ref, 1 = primary alt, 2+ = other alts.
+    vector<int> alleCovs;
+    int nUniqAlles = 2;
+
+    double alleleFraction = 0.0;
+    KmVariantCategory category = KmVariantCategory::LowCoverage;
+    uint32_t categoryFlag = 0;
+    bool isHomopolymerIndel = false;
+
+    // K-means phasing state.
+    std::array<vector<int>, 3> hapAlleProfile;
+    std::array<int, 3> hapConsAlle = {-1, -1, -1};
+    int32_t phaseSet = 0;
+    int hapAlt = 0;
+    int hapRef = 0;
+};
+
+// ============================================================================
+// Per-overlap allele profile (mirrors pgphase ReadVariantProfile)
+// ============================================================================
+
 struct KmOverlapProfile {
-    uint32_t overlapIdx;       ///< Index into KmScratchpad::overlaps.
-    int startVarIdx = -1;      ///< First candidate index this overlap covers.
-    int endVarIdx = -1;        ///< Last candidate index this overlap covers.
+    uint32_t overlapIdx = 0;
+    int startVarIdx = -1;
+    int endVarIdx = -1;
     /// Allele at each candidate in [startVarIdx, endVarIdx]:
     ///   0 = ref, 1 = primary alt, -1 = no observation, -2 = low-quality alt.
     vector<int> alleles;
@@ -124,91 +155,64 @@ struct KmOverlapProfile {
 // Noisy region interval
 // ============================================================================
 
-/// A contiguous region on the backbone read where CIGAR evidence is ambiguous.
 struct KmNoisyRegion {
-    uint32_t start;            ///< Start position on backbone read.
-    uint32_t end;              ///< End position (exclusive).
-    int label = 0;             ///< Metadata (variant density, merge info).
-    bool done = false;         ///< True after MSA processing.
+    uint32_t start;
+    uint32_t end;
+    int label = 0;
+    bool done = false;
 };
 
 // ============================================================================
-// Per-overlap phasing state (reused from PhasingTypes.hpp pattern)
+// Per-overlap phasing state
 // ============================================================================
 
-/// Lightweight overlap descriptor for k-means phasing.
 struct KmOverlap {
-    uint32_t alignmentId;      ///< Index into assembler.alignmentData.
-    uint32_t targetReadId;     ///< Partner read ID.
-    uint32_t qs, qe;          ///< Query (backbone) start/end in base coords.
-    uint32_t ts, te;          ///< Target start/end in base coords.
+    uint32_t alignmentId;
+    uint32_t targetReadId;
+    uint32_t qs, qe;
+    uint32_t ts, te;
     uint32_t cigarOffset;
     uint32_t cigarTokenCount;
-    uint8_t  isRev;            ///< 1 if target is reverse-complemented.
-    uint8_t  queryIsRead0;     ///< 1 if backbone == readIds[0] in AlignmentData.
-    int      hap = 0;          ///< Assigned haplotype: 0=unassigned, 1=hap1, 2=hap2.
-    int32_t  phaseSet = -1;    ///< Phase set assignment.
-    uint8_t  strong = 0;       ///< 1 = confidently phased.
+    uint8_t  isRev;
+    uint8_t  queryIsRead0;
+    int      hap = 0;
+    int32_t  phaseSet = -1;
+    uint8_t  strong = 0;
 };
 
 // ============================================================================
 // Thread-local scratchpad
 // ============================================================================
 
-/// Reusable workspace for k-means phasing of one backbone read.
 struct KmScratchpad {
-    // Overlaps for this backbone read.
     vector<KmOverlap> overlaps;
-
-    // Unpacked backbone sequence.
     vector<uint8_t> backboneBases;
 
-    // Candidate variant sites (sorted by position).
+    // Per-overlap parsed digars. Flat buffer with per-overlap ranges.
+    vector<KmDigarOp> digars;
+    vector<uint32_t> digarBegin; ///< digars[digarBegin[oi]..digarEnd[oi])
+    vector<uint32_t> digarEnd;
+
+    // Candidate table (sorted by KmVarKey).
     vector<KmCandidate> candidates;
 
     // Per-overlap allele profiles.
     vector<KmOverlapProfile> overlapProfiles;
 
-    // Noisy regions detected from classification.
     vector<KmNoisyRegion> noisyRegions;
 
-    // Mismatch vote counts per backbone position (for candidate detection).
-    vector<uint8_t> mismatchVotes;
-
-    // Indel event positions per backbone position.
-    vector<uint8_t> indelVotes;
-
-    // Per-overlap mismatch records for allele counting.
-    struct MismatchRecord {
-        uint32_t backbonePos;  ///< Position on backbone read.
-        uint32_t targetPos;    ///< Position on target read.
-        uint32_t overlapIdx;   ///< Which overlap produced this.
-    };
-    vector<MismatchRecord> mismatchRecords;
-
-    // Per-overlap indel records.
-    struct IndelRecord {
-        uint32_t backboneStart; ///< Start on backbone.
-        uint32_t backboneEnd;   ///< End on backbone (exclusive).
-        uint32_t overlapIdx;
-        uint8_t  type;          ///< 2=insertion, 3=deletion.
-        uint16_t len;           ///< Length of indel.
-    };
-    vector<IndelRecord> indelRecords;
-
-    // Sorted overlap indices for k-means pivot selection.
+    // K-means pivot selection scratch.
     vector<uint32_t> validVarIdx;
 
     void clear() {
         overlaps.clear();
         backboneBases.clear();
+        digars.clear();
+        digarBegin.clear();
+        digarEnd.clear();
         candidates.clear();
         overlapProfiles.clear();
         noisyRegions.clear();
-        mismatchVotes.clear();
-        indelVotes.clear();
-        mismatchRecords.clear();
-        indelRecords.clear();
         validVarIdx.clear();
     }
 };
@@ -217,7 +221,6 @@ struct KmScratchpad {
 // Thresholds
 // ============================================================================
 
-/// Configuration for k-means phasing pipeline.
 struct KmPhasingOptions {
     uint32_t minDepth = 5;
     uint32_t minAltDepth = 2;
@@ -226,7 +229,8 @@ struct KmPhasingOptions {
     double   strandBiasPval = 0.01;
     uint32_t noisyRegMergeDis = 500;
     uint32_t maxKmeansIter = 10;
-    uint32_t minSpanningReads = 2; ///< Min reads spanning adjacent het sites for phase-set continuity.
+    uint32_t minSpanningReads = 2;
+    int      minSvLen = 30;  ///< Insertions >= this length use fuzzy length-ratio collapsing.
 };
 
 } // namespace dinara

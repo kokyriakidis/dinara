@@ -114,137 +114,342 @@ static void kmGatherOverlaps(
 }
 
 // ============================================================================
-// Step 2: Walk CIGARs, detect candidate sites
+// Step 2: Parse CIGARs into per-overlap digars (single walk, like pgphase)
 // ============================================================================
 
-static void kmDetectCandidateSites(
+static void kmParseCigars(
     const Assembler& assembler, ReadId backboneReadId,
     uint32_t backboneLen, KmScratchpad& scratch)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
 
-    scratch.mismatchVotes.assign(backboneLen, 0);
-    scratch.indelVotes.assign(backboneLen, 0);
-    scratch.mismatchRecords.clear();
-    scratch.indelRecords.clear();
+    scratch.digars.clear();
+    scratch.digarBegin.resize(numOv);
+    scratch.digarEnd.resize(numOv);
 
     for (uint32_t oi = 0; oi < numOv; oi++) {
+        scratch.digarBegin[oi] = uint32_t(scratch.digars.size());
         const auto& ov = scratch.overlaps[oi];
         const auto& ad = assembler.alignmentData[ov.alignmentId];
-        const bool needsRcConvert = (ov.queryIsRead0 == 0) && (ov.isRev != 0);
+        const bool needsRc = (ov.queryIsRead0 == 0) && (ov.isRev != 0);
+        const bool qIsR0 = (ov.queryIsRead0 != 0);
 
         cigarStore.forEachOpWithPositions(
             ov.cigarOffset, ov.cigarTokenCount,
             ad.qs, kmCigarRead1Start(assembler, ad),
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-                if (op == 1) { // Mismatch
-                    if (!needsRcConvert) {
-                        const uint32_t qStart = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
-                        for (uint32_t b = 0; b < len; b++) {
-                            const uint32_t qpos = qStart + b;
-                            if (qpos >= backboneLen) break;
-                            if (scratch.mismatchVotes[qpos] < 255) scratch.mismatchVotes[qpos]++;
-                            const uint32_t tpos = ov.queryIsRead0 ? uint32_t(yk)+b : uint32_t(xk)+b;
-                            scratch.mismatchRecords.push_back({qpos, tpos, oi});
+                if (op == 1) { // Mismatch — one digar per base with actual alt base
+                    for (uint32_t b = 0; b < len; b++) {
+                        uint32_t bbPos, tPos;
+                        if (needsRc) {
+                            uint32_t rc = uint32_t(yk) + b;
+                            if (rc >= backboneLen) continue;
+                            bbPos = backboneLen - 1 - rc;
+                            tPos = uint32_t(xk) + b;
+                        } else if (qIsR0) {
+                            bbPos = uint32_t(xk) + b;
+                            tPos = uint32_t(yk) + b;
+                        } else {
+                            bbPos = uint32_t(yk) + b;
+                            tPos = uint32_t(xk) + b;
                         }
-                    } else {
-                        for (uint32_t b = 0; b < len; b++) {
-                            const uint32_t qpos_rc = uint32_t(yk) + b;
-                            if (qpos_rc >= backboneLen) continue;
-                            const uint32_t qpos = backboneLen - 1 - qpos_rc;
-                            if (scratch.mismatchVotes[qpos] < 255) scratch.mismatchVotes[qpos]++;
-                            scratch.mismatchRecords.push_back({qpos, uint32_t(xk)+b, oi});
-                        }
+                        if (bbPos >= backboneLen) continue;
+                        // Read actual alt base from target read.
+                        uint8_t altBase = kmGetBase(assembler, ReadId(ov.targetReadId),
+                                                    tPos, ov.isRev != 0);
+                        scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1});
                     }
                 } else if (op == 2 || op == 3) { // Ins/Del
-                    bool bbConsumed = (op==3 && ov.queryIsRead0) || (op==2 && !ov.queryIsRead0);
+                    // Determine if this consumes backbone or target.
+                    bool bbConsumed = (op==3 && qIsR0) || (op==2 && !qIsR0);
                     if (bbConsumed) {
-                        const uint32_t rawStart = (op==3) ? uint32_t(xk) : uint32_t(yk);
-                        uint32_t rawEnd = min(rawStart + len, backboneLen);
-                        if (!needsRcConvert) {
-                            for (uint32_t p = rawStart; p < rawEnd; p++)
-                                if (scratch.indelVotes[p] < 255) scratch.indelVotes[p]++;
-                            scratch.indelRecords.push_back({rawStart, rawEnd, oi, op, uint16_t(len)});
-                        } else {
-                            uint32_t fS = backboneLen - rawEnd, fE = backboneLen - rawStart;
-                            for (uint32_t p = fS; p < fE && p < backboneLen; p++)
-                                if (scratch.indelVotes[p] < 255) scratch.indelVotes[p]++;
-                            scratch.indelRecords.push_back({fS, fE, oi, op, uint16_t(len)});
-                        }
+                        // Deletion on backbone (or insertion on target that consumes backbone).
+                        uint32_t raw = (op==3) ? uint32_t(xk) : uint32_t(yk);
+                        uint32_t rawE = (raw + len < backboneLen) ? raw + len : backboneLen;
+                        uint32_t s, e;
+                        if (needsRc) { s = backboneLen - rawE; e = backboneLen - raw; }
+                        else { s = raw; e = rawE; }
+                        // One digar for the whole deletion event, anchored at start.
+                        if (s < backboneLen)
+                            scratch.digars.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s)});
                     } else {
-                        uint32_t anchor = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
-                        if (anchor < backboneLen) {
-                            if (scratch.indelVotes[anchor] < 255) scratch.indelVotes[anchor]++;
-                            scratch.indelRecords.push_back({anchor, anchor+1, oi, op, uint16_t(len)});
-                        }
+                        // Insertion on backbone (target has extra bases).
+                        uint32_t anchor = qIsR0 ? uint32_t(xk) : uint32_t(yk);
+                        if (needsRc && anchor > 0) anchor = backboneLen - 1 - anchor;
+                        if (anchor < backboneLen)
+                            scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len)});
                     }
                 }
             });
-    }
 
-    // Positions with >= 2 votes become candidates.
-    for (uint32_t pos = 0; pos < backboneLen; pos++) {
-        if (scratch.mismatchVotes[pos] >= 2 || scratch.indelVotes[pos] >= 2) {
-            KmCandidate cand{};
-            cand.pos = pos;
-            cand.refBase = scratch.backboneBases[pos];
-            cand.type = (scratch.mismatchVotes[pos] >= scratch.indelVotes[pos]) ? 0 : 2;
-            cand.refLen = 1;
-            cand.category = KmVariantCategory::LowCoverage;
-            scratch.candidates.push_back(cand);
-        }
+        // Sort this overlap's digars by backbone position.
+        uint32_t dEnd = uint32_t(scratch.digars.size());
+        sort(scratch.digars.begin() + scratch.digarBegin[oi],
+             scratch.digars.begin() + dEnd);
+        scratch.digarEnd[oi] = dEnd;
     }
 }
 
 // ============================================================================
-// Step 3: Count alleles per candidate site
+// Step 3a: Collect candidate sites from digars (sort + dedup like pgphase)
 // ============================================================================
 
-static void kmCountAlleles(
-    const Assembler& assembler, ReadId backboneReadId,
-    uint32_t backboneLen, KmScratchpad& scratch)
-{
-    if (scratch.candidates.empty()) return;
-    const uint32_t numOv = uint32_t(scratch.overlaps.size());
-    const uint32_t numCand = uint32_t(scratch.candidates.size());
-
-    // Position → candidate index.
-    vector<uint32_t> posToCand(backboneLen, UINT32_MAX);
-    for (uint32_t ci = 0; ci < numCand; ci++)
-        posToCand[scratch.candidates[ci].pos] = ci;
-
-    // Per-overlap × candidate: has alt?
-    vector<uint8_t> ovHasAlt(size_t(numOv) * numCand, 0);
-    for (const auto& mr : scratch.mismatchRecords) {
-        if (mr.backbonePos >= backboneLen) continue;
-        uint32_t ci = posToCand[mr.backbonePos];
-        if (ci != UINT32_MAX) ovHasAlt[size_t(mr.overlapIdx) * numCand + ci] = 1;
+/// Fuzzy insertion comparison (mirrors pgphase exact_comp_var_site_ins).
+/// For insertions >= minSvLen at the same position: returns 0 if
+/// min(len1,len2) >= max(len1,len2) * 0.8 (within 20% length ratio).
+/// For shorter insertions and all other types: exact match required.
+static inline int kmCompareKeysFuzzy(const KmVarKey& a, const KmVarKey& b, int minSvLen) {
+    uint32_t asp = (a.type == KmVarType::Snp) ? a.pos : (a.pos > 0 ? a.pos - 1 : 0);
+    uint32_t bsp = (b.type == KmVarType::Snp) ? b.pos : (b.pos > 0 ? b.pos - 1 : 0);
+    if (asp != bsp) return asp < bsp ? -1 : 1;
+    if (a.type != b.type) return a.type < b.type ? -1 : 1;
+    if (a.refLen != b.refLen) return a.refLen < b.refLen ? -1 : 1;
+    if (a.type == KmVarType::Snp) {
+        if (a.altLen != b.altLen) return a.altLen < b.altLen ? -1 : 1;
+        if (a.altBase != b.altBase) return a.altBase < b.altBase ? -1 : 1;
+        return 0;
     }
-    for (const auto& ir : scratch.indelRecords) {
-        for (uint32_t p = ir.backboneStart; p < ir.backboneEnd && p < backboneLen; p++) {
-            uint32_t ci = posToCand[p];
-            if (ci != UINT32_MAX) ovHasAlt[size_t(ir.overlapIdx) * numCand + ci] = 1;
+    if (a.type == KmVarType::Insertion) {
+        if (int(a.altLen) < minSvLen) {
+            // Short insertion: exact length + base match required.
+            if (a.altLen != b.altLen) return a.altLen < b.altLen ? -1 : 1;
+            // We don't store insertion sequence, so same length = same.
+            return 0;
+        }
+        // Large insertion: fuzzy length-ratio rule.
+        int minL = int(a.altLen) < int(b.altLen) ? int(a.altLen) : int(b.altLen);
+        int maxL = int(a.altLen) > int(b.altLen) ? int(a.altLen) : int(b.altLen);
+        if (double(minL) >= double(maxL) * 0.8) return 0;
+        return int(a.altLen) - int(b.altLen);
+    }
+    // Deletion: refLen already compared above, that's sufficient.
+    return 0;
+}
+
+static void kmCollectCandidates(KmScratchpad& scratch, int minSvLen)
+{
+    // Emit one candidate key per digar event.
+    vector<KmVarKey> keys;
+    keys.reserve(scratch.digars.size());
+    for (const auto& d : scratch.digars) {
+        KmVarKey k;
+        k.pos = d.pos;
+        k.type = d.type;
+        k.altBase = (d.type == KmVarType::Snp) ? d.altBase : 0;
+        k.refLen = (d.type == KmVarType::Deletion) ? d.len : (d.type == KmVarType::Snp ? 1 : 0);
+        k.altLen = (d.type == KmVarType::Insertion) ? d.len : (d.type == KmVarType::Snp ? 1 : 0);
+        keys.push_back(k);
+    }
+
+    // Sort by exact order.
+    sort(keys.begin(), keys.end());
+
+    // Collapse fuzzy large insertions (mirrors pgphase collapse_fuzzy_large_insertions).
+    // Then exact dedup for everything else.
+    if (!keys.empty()) {
+        size_t wi = 1;
+        for (size_t ri = 1; ri < keys.size(); ri++) {
+            if (kmCompareKeysFuzzy(keys[wi - 1], keys[ri], minSvLen) == 0)
+                continue; // merge-equivalent → skip
+            if (wi != ri) keys[wi] = keys[ri];
+            wi++;
+        }
+        keys.resize(wi);
+    }
+
+    scratch.candidates.clear();
+    scratch.candidates.reserve(keys.size());
+    for (const auto& k : keys) {
+        KmCandidate cand;
+        cand.key = k;
+        scratch.candidates.push_back(cand);
+    }
+}
+
+// ============================================================================
+// Step 3b: Allele counting via merge walk
+// ============================================================================
+
+/// Compare digar to candidate key using fuzzy insertion matching.
+/// Used in both allele counting and profile merge walks.
+/// Mirrors pgphase lcd_exact_comp_var_site_ins_merge.
+static inline int kmCompareDigarToCand(const KmDigarOp& d, const KmVarKey& k, int minSvLen) {
+    uint32_t dsp = (d.type == KmVarType::Snp) ? d.pos : (d.pos > 0 ? d.pos - 1 : 0);
+    uint32_t ksp = (k.type == KmVarType::Snp) ? k.pos : (k.pos > 0 ? k.pos - 1 : 0);
+    if (dsp != ksp) return dsp < ksp ? -1 : 1;
+    if (d.type != k.type) return d.type < k.type ? -1 : 1;
+    // refLen comparison.
+    uint16_t dRefLen = (d.type == KmVarType::Deletion) ? d.len : (d.type == KmVarType::Snp ? 1 : 0);
+    if (dRefLen != k.refLen) return dRefLen < k.refLen ? -1 : 1;
+    if (d.type == KmVarType::Snp) {
+        uint16_t dAltLen = 1;
+        if (dAltLen != k.altLen) return dAltLen < k.altLen ? -1 : 1;
+        if (d.altBase != k.altBase) return d.altBase < k.altBase ? -1 : 1;
+        return 0;
+    }
+    if (d.type == KmVarType::Insertion) {
+        if (int(d.len) < minSvLen) {
+            if (d.len != k.altLen) return d.len < k.altLen ? -1 : 1;
+            return 0;
+        }
+        int minL = int(d.len) < int(k.altLen) ? int(d.len) : int(k.altLen);
+        int maxL = int(d.len) > int(k.altLen) ? int(d.len) : int(k.altLen);
+        if (double(minL) >= double(maxL) * 0.8) return 0;
+        return int(d.len) - int(k.altLen);
+    }
+    return 0;
+}
+
+// ============================================================================
+// Step 3b: Allele counting only (merge walk, like pgphase collect_allele_counts_from_records)
+// ============================================================================
+
+static void kmCountAlleles(KmScratchpad& scratch, int minSvLen)
+{
+    const uint32_t numCand = uint32_t(scratch.candidates.size());
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+    if (numCand == 0 || numOv == 0) return;
+
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        auto& c = scratch.candidates[ci];
+        c.totalCov = 1; c.refCov = 1; c.fwdRef = 1;
+    }
+
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        const auto& ov = scratch.overlaps[oi];
+        uint32_t di = scratch.digarBegin[oi];
+        uint32_t diEnd = scratch.digarEnd[oi];
+
+        uint32_t ciStart = uint32_t(lower_bound(
+            scratch.candidates.begin(), scratch.candidates.end(), ov.qs,
+            [](const KmCandidate& c, uint32_t p) { return c.key.pos < p; })
+            - scratch.candidates.begin());
+
+        for (uint32_t ci = ciStart; ci < numCand && scratch.candidates[ci].key.pos < ov.qe; ci++) {
+            auto& c = scratch.candidates[ci];
+            c.totalCov++;
+
+            while (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) < 0)
+                di++;
+
+            bool isAlt = false;
+            if (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) == 0) {
+                isAlt = true;
+                di++;
+            }
+
+            if (isAlt) {
+                c.altCov++;
+                if (ov.isRev == 0) c.fwdAlt++; else c.revAlt++;
+            } else {
+                c.refCov++;
+                if (ov.isRev == 0) c.fwdRef++; else c.revRef++;
+            }
         }
     }
 
     for (uint32_t ci = 0; ci < numCand; ci++) {
         auto& c = scratch.candidates[ci];
-        uint32_t ref = 0, alt = 0, fR = 0, rR = 0, fA = 0, rA = 0, tot = 0;
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            const auto& ov = scratch.overlaps[oi];
-            if (c.pos < ov.qs || c.pos >= ov.qe) continue;
-            tot++;
-            if (ovHasAlt[size_t(oi) * numCand + ci]) {
-                alt++; if (ov.isRev == 0) fA++; else rA++;
+        c.alleleFraction = c.totalCov > 0 ? double(c.altCov) / double(c.totalCov) : 0.0;
+    }
+}
+
+// ============================================================================
+// Step 5: Build per-overlap allele profiles (after classification)
+//
+// Mirrors pgphase collect_read_var_profile:
+// - Skips NON_VAR candidates
+// - Detects overlapping variants (deletion spanning a SNP → allele = -1)
+// - Separate merge walk per overlap against candidate table
+// ============================================================================
+
+/// Check if digar and candidate overlap positionally (pgphase lcd_profile_ovlp_var_site).
+/// Returns true if the reference spans of the two events overlap.
+/// Positional overlap check (mirrors pgphase lcd_profile_ovlp_var_site).
+/// Returns true if the reference spans of digar and candidate overlap.
+static inline bool kmDigarOverlapsCand(const KmDigarOp& d, const KmVarKey& k) {
+    // Compute reference spans.
+    // SNP: refLen=1. Deletion: refLen=len. Insertion: refLen=0.
+    uint32_t dRefLen = (d.type == KmVarType::Snp) ? 1 :
+                       (d.type == KmVarType::Deletion) ? d.len : 0;
+    uint32_t dBeg = d.pos;
+    uint32_t dEnd = d.pos + dRefLen;
+    uint32_t kBeg = k.pos;
+    uint32_t kEnd = k.pos + k.refLen;
+
+    // Both insertions (refLen=0): overlap iff same position.
+    if (dRefLen == 0 && k.refLen == 0)
+        return dBeg == kBeg;
+    // Digar is insertion: overlaps if strictly inside candidate's span.
+    if (dRefLen == 0)
+        return dBeg > kBeg && dBeg < kEnd;
+    // Candidate is insertion: overlaps if strictly inside digar's span.
+    if (k.refLen == 0)
+        return kBeg > dBeg && kBeg < dEnd;
+    // Both have nonzero ref span — standard interval overlap.
+    return !(dBeg >= kEnd || kBeg >= dEnd);
+}
+
+static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen)
+{
+    const uint32_t numCand = uint32_t(scratch.candidates.size());
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+    if (numCand == 0 || numOv == 0) return;
+
+    scratch.overlapProfiles.resize(numOv);
+
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        const auto& ov = scratch.overlaps[oi];
+        auto& prof = scratch.overlapProfiles[oi];
+        prof.overlapIdx = oi;
+        prof.startVarIdx = -1; prof.endVarIdx = -1;
+        prof.alleles.clear();
+
+        uint32_t di = scratch.digarBegin[oi];
+        uint32_t diEnd = scratch.digarEnd[oi];
+
+        uint32_t ciStart = uint32_t(lower_bound(
+            scratch.candidates.begin(), scratch.candidates.end(), ov.qs,
+            [](const KmCandidate& c, uint32_t p) { return c.key.pos < p; })
+            - scratch.candidates.begin());
+
+        for (uint32_t ci = ciStart; ci < numCand && scratch.candidates[ci].key.pos < ov.qe; ci++) {
+            const auto& c = scratch.candidates[ci];
+
+            // Skip NON_VAR candidates (like pgphase skips kLongcalldNonVar).
+            if (c.categoryFlag == KM_NON_VAR) continue;
+
+            // Advance digar pointer, skipping digars before this candidate.
+            while (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) < 0
+                   && !kmDigarOverlapsCand(scratch.digars[di], c.key))
+                di++;
+
+            // Determine allele observation.
+            int allele;
+            if (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) == 0) {
+                // Exact match → alt.
+                allele = 1;
+                di++;
+            } else if (di < diEnd && kmDigarOverlapsCand(scratch.digars[di], c.key)) {
+                // Digar overlaps candidate but doesn't match exactly.
+                // E.g., deletion spanning a SNP position → no observation.
+                allele = -1;
             } else {
-                ref++; if (ov.isRev == 0) fR++; else rR++;
+                // No digar at this position → ref.
+                allele = 0;
             }
+
+            // Append to profile.
+            if (prof.startVarIdx < 0) prof.startVarIdx = int(ci);
+            while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
+                prof.alleles.push_back(-1);
+            prof.endVarIdx = int(ci);
+            prof.alleles.push_back(allele);
         }
-        ref++; tot++; fR++; // backbone itself
-        c.totalCov = tot; c.refCov = ref; c.altCov = alt;
-        c.fwdRef = fR; c.revRef = rR; c.fwdAlt = fA; c.revAlt = rA;
-        c.alleleFraction = tot > 0 ? double(alt) / double(tot) : 0.0;
+
+        // Tail: remaining candidates within overlap range that aren't NON_VAR get ref.
+        // (Already handled by the for loop — they have no matching digar → allele = 0.)
     }
 }
 
@@ -258,14 +463,12 @@ static void kmClassifyCandidates(
     const uint32_t numCand = uint32_t(scratch.candidates.size());
     if (numCand == 0) return;
 
-    // Pass 1: per-site classification.
     for (uint32_t ci = 0; ci < numCand; ci++) {
         auto& c = scratch.candidates[ci];
-        if (c.totalCov < opts.minDepth || c.altCov < opts.minAltDepth) {
+        if (c.totalCov < int(opts.minDepth) || c.altCov < int(opts.minAltDepth)) {
             c.category = KmVariantCategory::LowCoverage; c.categoryFlag = 0; continue;
         }
-        // Strand bias: all alt on one strand with >= 4 alt reads.
-        { int fa = int(c.fwdAlt), ra = int(c.revAlt);
+        { int fa = c.fwdAlt, ra = c.revAlt;
           if ((fa == 0 || ra == 0) && (fa + ra) >= 4) {
               c.category = KmVariantCategory::StrandBias; c.categoryFlag = 0; continue; } }
         if (c.alleleFraction < opts.minAf) {
@@ -274,34 +477,35 @@ static void kmClassifyCandidates(
         if (c.alleleFraction > opts.maxAf) {
             c.category = KmVariantCategory::CleanHom; c.categoryFlag = KM_CLEAN_HOM; continue;
         }
-        if (c.type != 0) { // indel
-            if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.pos)) {
+        bool isIndel = (c.key.type != KmVarType::Snp);
+        if (isIndel) {
+            if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.key.pos)) {
                 c.category = KmVariantCategory::RepeatHetIndel; c.categoryFlag = KM_REP_HET_VAR; continue;
             }
             c.category = KmVariantCategory::CleanHetIndel; c.categoryFlag = KM_CLEAN_HET_INDEL; continue;
         }
-        // SNP
-        if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.pos)) {
+        if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.key.pos)) {
             c.category = KmVariantCategory::RepeatHetIndel; c.categoryFlag = KM_REP_HET_VAR; continue;
         }
         c.category = KmVariantCategory::CleanHetSnp; c.categoryFlag = KM_CLEAN_HET_SNP;
     }
 
-    // Pass 2: noisy region seeds from repeat-het and dense clusters.
+    // Noisy region seeds.
     scratch.noisyRegions.clear();
     vector<pair<uint32_t,uint32_t>> seeds;
     for (uint32_t ci = 0; ci < numCand; ci++) {
         if (scratch.candidates[ci].category == KmVariantCategory::RepeatHetIndel)
-            seeds.push_back({scratch.candidates[ci].pos, scratch.candidates[ci].pos + scratch.candidates[ci].refLen});
+            seeds.push_back({scratch.candidates[ci].key.pos,
+                             scratch.candidates[ci].key.pos + scratch.candidates[ci].key.refLen});
     }
     for (uint32_t ci = 1; ci < numCand; ci++) {
         const auto& prev = scratch.candidates[ci-1];
         const auto& cur = scratch.candidates[ci];
         if (prev.category == KmVariantCategory::LowCoverage || prev.category == KmVariantCategory::NonVariant) continue;
         if (cur.category == KmVariantCategory::LowCoverage || cur.category == KmVariantCategory::NonVariant) continue;
-        if (cur.pos - prev.pos <= 25) {
+        if (cur.key.pos - prev.key.pos <= 25) {
             if (prev.category != KmVariantCategory::CleanHetSnp || cur.category != KmVariantCategory::CleanHetSnp)
-                seeds.push_back({prev.pos, cur.pos + cur.refLen});
+                seeds.push_back({prev.key.pos, cur.key.pos + cur.key.refLen});
         }
     }
     if (seeds.empty()) return;
@@ -318,62 +522,13 @@ static void kmClassifyCandidates(
     for (const auto& [s, e] : merged)
         scratch.noisyRegions.push_back({s, e, 0, false});
 
-    // Demote candidates inside noisy regions.
     size_t ri = 0;
     for (uint32_t ci = 0; ci < numCand && ri < scratch.noisyRegions.size(); ci++) {
         auto& c = scratch.candidates[ci];
-        while (ri < scratch.noisyRegions.size() && scratch.noisyRegions[ri].end <= c.pos) ri++;
+        while (ri < scratch.noisyRegions.size() && scratch.noisyRegions[ri].end <= c.key.pos) ri++;
         if (ri < scratch.noisyRegions.size() &&
-            c.pos >= scratch.noisyRegions[ri].start && c.pos < scratch.noisyRegions[ri].end) {
+            c.key.pos >= scratch.noisyRegions[ri].start && c.key.pos < scratch.noisyRegions[ri].end) {
             c.category = KmVariantCategory::NonVariant; c.categoryFlag = KM_NON_VAR;
-        }
-    }
-}
-
-// ============================================================================
-// Step 5: Build per-overlap allele profiles
-// ============================================================================
-
-static void kmBuildOverlapProfiles(
-    uint32_t backboneLen, KmScratchpad& scratch)
-{
-    const uint32_t numOv = uint32_t(scratch.overlaps.size());
-    const uint32_t numCand = uint32_t(scratch.candidates.size());
-    if (numCand == 0 || numOv == 0) return;
-
-    vector<uint32_t> posToCand(backboneLen, UINT32_MAX);
-    for (uint32_t ci = 0; ci < numCand; ci++)
-        posToCand[scratch.candidates[ci].pos] = ci;
-
-    vector<uint8_t> ovHasAlt(size_t(numOv) * numCand, 0);
-    for (const auto& mr : scratch.mismatchRecords) {
-        if (mr.backbonePos >= backboneLen) continue;
-        uint32_t ci = posToCand[mr.backbonePos];
-        if (ci != UINT32_MAX) ovHasAlt[size_t(mr.overlapIdx) * numCand + ci] = 1;
-    }
-    for (const auto& ir : scratch.indelRecords) {
-        for (uint32_t p = ir.backboneStart; p < ir.backboneEnd && p < backboneLen; p++) {
-            uint32_t ci = posToCand[p];
-            if (ci != UINT32_MAX) ovHasAlt[size_t(ir.overlapIdx) * numCand + ci] = 1;
-        }
-    }
-
-    scratch.overlapProfiles.resize(numOv);
-    for (uint32_t oi = 0; oi < numOv; oi++) {
-        auto& prof = scratch.overlapProfiles[oi];
-        prof.overlapIdx = oi;
-        prof.startVarIdx = -1; prof.endVarIdx = -1;
-        prof.alleles.clear();
-        const auto& ov = scratch.overlaps[oi];
-        for (uint32_t ci = 0; ci < numCand; ci++) {
-            const auto& cand = scratch.candidates[ci];
-            if (cand.categoryFlag == KM_NON_VAR) continue;
-            if (cand.pos < ov.qs || cand.pos >= ov.qe) continue;
-            if (prof.startVarIdx < 0) prof.startVarIdx = int(ci);
-            while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
-                prof.alleles.push_back(-1);
-            prof.endVarIdx = int(ci);
-            prof.alleles.push_back(ovHasAlt[size_t(oi) * numCand + ci] ? 1 : 0);
         }
     }
 }
@@ -395,7 +550,7 @@ static inline int kmAlleSlots(const KmCandidate& c) {
 }
 
 static int kmSelectPivot(const KmScratchpad& s, const vector<uint32_t>& vi) {
-    int bSnp = -1, bIndel = -1; uint32_t bSnpD = 0, bIndelD = 0;
+    int bSnp = -1, bIndel = -1; int bSnpD = 0, bIndelD = 0;
     for (int i = 0; i < int(vi.size()); i++) {
         const auto& c = s.candidates[vi[i]];
         if (c.category == KmVariantCategory::CleanHetSnp && (bSnp < 0 || c.totalCov > bSnpD))
@@ -505,7 +660,7 @@ static bool kmPhaseSetFlip(KmScratchpad& scratch,
 
     bool changed = false;
     int flip = 0;
-    int32_t ps = int32_t(scratch.candidates[validIdx[0]].pos);
+    int32_t ps = int32_t(scratch.candidates[validIdx[0]].key.pos);
     scratch.candidates[validIdx[0]].phaseSet = ps;
     for (int vi = 1; vi < n; vi++) {
         auto& c = scratch.candidates[validIdx[vi]];
@@ -513,7 +668,7 @@ static bool kmPhaseSetFlip(KmScratchpad& scratch,
                       c.hapConsAlle[1] != c.hapConsAlle[2] && !c.isHomopolymerIndel);
         if (isHet) {
             if (nAgree[vi] < int(opts.minSpanningReads) && nConflict[vi] < int(opts.minSpanningReads))
-                ps = int32_t(c.pos);
+                ps = int32_t(c.key.pos);
             else if (nConflict[vi] > nAgree[vi]) flip ^= 1;
             if (flip == 1) { changed = true; swap(c.hapConsAlle[1], c.hapConsAlle[2]); }
         }
@@ -647,7 +802,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
 
     struct alignas(64) TT {
         int64_t gather=0, unpack=0, detect=0, count=0;
-        int64_t classify=0, profile=0, kmeans=0, write=0;
+        int64_t classify=0, kmeans=0, write=0;
     };
     vector<TT> ttv(threadCount);
 
@@ -684,11 +839,12 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
                 t1 = clk::now(); tt.unpack += us(t0,t1);
 
                 t0 = clk::now();
-                kmDetectCandidateSites(*this, readId, bbLen, scratch);
+                kmParseCigars(*this, readId, bbLen, scratch);
                 t1 = clk::now(); tt.detect += us(t0,t1);
 
                 t0 = clk::now();
-                kmCountAlleles(*this, readId, bbLen, scratch);
+                kmCollectCandidates(scratch, opts.minSvLen);
+                kmCountAlleles(scratch, opts.minSvLen);
                 t1 = clk::now(); tt.count += us(t0,t1);
 
                 t0 = clk::now();
@@ -702,9 +858,10 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
                         c.category == KmVariantCategory::CleanHetIndel) cleanHet++;
                 if (cleanHet > 0) readsWithSites++;
 
+                // Build profiles after classification (skips NON_VAR).
                 t0 = clk::now();
-                kmBuildOverlapProfiles(bbLen, scratch);
-                t1 = clk::now(); tt.profile += us(t0,t1);
+                kmBuildOverlapProfiles(scratch, opts.minSvLen);
+                t1 = clk::now(); tt.count += us(t0,t1);
 
                 t0 = clk::now();
                 if (cleanHet > 0) kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
@@ -731,7 +888,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
     for (const auto& tt : ttv) {
         total.gather += tt.gather; total.unpack += tt.unpack;
         total.detect += tt.detect; total.count += tt.count;
-        total.classify += tt.classify; total.profile += tt.profile;
+        total.classify += tt.classify;
         total.kmeans += tt.kmeans; total.write += tt.write;
     }
     auto ms = [](int64_t u) { return u/1000; };
@@ -739,9 +896,8 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
     cout << timestamp << "  gather:   " << ms(total.gather) << endl;
     cout << timestamp << "  unpack:   " << ms(total.unpack) << endl;
     cout << timestamp << "  detect:   " << ms(total.detect) << endl;
-    cout << timestamp << "  count:    " << ms(total.count) << endl;
+    cout << timestamp << "  count+prof:" << ms(total.count) << endl;
     cout << timestamp << "  classify: " << ms(total.classify) << endl;
-    cout << timestamp << "  profile:  " << ms(total.profile) << endl;
     cout << timestamp << "  kmeans:   " << ms(total.kmeans) << endl;
     cout << timestamp << "  write:    " << ms(total.write) << endl;
     cout << timestamp << "Complete. Reads=" << readsProcessed.load()
