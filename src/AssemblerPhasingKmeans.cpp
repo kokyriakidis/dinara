@@ -1761,9 +1761,25 @@ static void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uin
 static void kmWriteResults(
     Assembler& assembler, ReadId backboneReadId, const KmScratchpad& scratch)
 {
+    // Check if any overlap was actually phased (hap 1 or 2).
+    bool hasPhased = false;
+    for (const auto& ov : scratch.overlaps) {
+        if (ov.hap == 1 || ov.hap == 2) { hasPhased = true; break; }
+    }
+
     for (const auto& ov : scratch.overlaps) {
         auto& ad = assembler.alignmentData[ov.alignmentId];
-        uint8_t matchState = (ov.hap == 2) ? 2 : 1;
+        uint8_t matchState;
+        if (!hasPhased) {
+            // No het sites found — no phasing signal. Leave default (cis=1).
+            matchState = 1;
+        } else if (ov.hap == 2) {
+            matchState = 2; // trans
+        } else if (ov.hap == 1) {
+            matchState = 1; // cis
+        } else {
+            matchState = 0; // unassigned — unknown
+        }
         ad.setHifiasmEcMatchStateFromReadPerspective(backboneReadId, matchState);
     }
 }
@@ -1802,6 +1818,9 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
     struct alignas(64) TT {
         int64_t gather=0, unpack=0, detect=0, count=0;
         int64_t classify=0, kmeans=0, write=0;
+        // Sub-timers for profiling.
+        int64_t unpackSeq=0, unpackSdust=0;
+        int64_t countCollect=0, countAlleles=0, countProfiles=0;
     };
     vector<TT> ttv(threadCount);
 
@@ -1843,11 +1862,17 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 scratch.backboneBases.resize(bbLen);
                 auto seq = getReads().getRead(readId);
                 for (uint32_t i = 0; i < bbLen; i++) scratch.backboneBases[i] = seq[i].value;
+                auto tMid = clk::now(); tt.unpackSeq += us(t0,tMid);
                 // pgphase populate_low_complexity_intervals: sdust on backbone.
-                kmSdust(scratch.backboneBases.data(), int(bbLen),
-                        int(opts.sdustThreshold), int(opts.sdustWindow),
-                        scratch.lowComplexity);
-                t1 = clk::now(); tt.unpack += us(t0,t1);
+                // Disabled until Step 4 (noisy region MSA) is implemented.
+                // SDUST is only used to extend noisy region boundaries; without
+                // it, noisy regions are slightly smaller but phasing is unaffected.
+                // kmSdust(scratch.backboneBases.data(), int(bbLen),
+                //         int(opts.sdustThreshold), int(opts.sdustWindow),
+                //         scratch.lowComplexity);
+                scratch.lowComplexity.clear();
+                t1 = clk::now(); tt.unpackSdust += us(tMid,t1);
+                tt.unpack += us(t0,t1);
                 if (dbg) cout << "DEBUG read " << rid << ": bbLen=" << bbLen
                               << " lowComplexity=" << scratch.lowComplexity.size() << " intervals" << endl;
 
@@ -1862,8 +1887,10 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
 
                 t0 = clk::now();
                 kmCollectCandidates(scratch, opts.minSvLen);
+                tMid = clk::now(); tt.countCollect += us(t0,tMid);
                 kmCountAlleles(scratch, opts.minSvLen);
-                t1 = clk::now(); tt.count += us(t0,t1);
+                t1 = clk::now(); tt.countAlleles += us(tMid,t1);
+                tt.count += us(t0,t1);
                 if (dbg) cout << "DEBUG read " << rid << ": " << scratch.candidates.size() << " candidates after collect+count" << endl;
 
                 // pgphase step 2.1: pre-process per-overlap noisy regions before classification.
@@ -1916,7 +1943,8 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 // Build profiles after classification (skips NON_VAR).
                 t0 = clk::now();
                 kmBuildOverlapProfiles(scratch, opts.minSvLen);
-                t1 = clk::now(); tt.count += us(t0,t1);
+                t1 = clk::now(); tt.countProfiles += us(t0,t1);
+                tt.count += us(t0,t1);
                 if (dbg) {
                     int profiled = 0;
                     for (const auto& p : scratch.overlapProfiles)
@@ -1963,13 +1991,19 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
         total.detect += tt.detect; total.count += tt.count;
         total.classify += tt.classify;
         total.kmeans += tt.kmeans; total.write += tt.write;
+        total.unpackSeq += tt.unpackSeq; total.unpackSdust += tt.unpackSdust;
+        total.countCollect += tt.countCollect; total.countAlleles += tt.countAlleles;
+        total.countProfiles += tt.countProfiles;
     }
     auto ms = [](int64_t u) { return u/1000; };
     cout << timestamp << "Timing (ms, sum " << threadCount << " threads):" << endl;
     cout << timestamp << "  gather:   " << ms(total.gather) << endl;
-    cout << timestamp << "  unpack:   " << ms(total.unpack) << endl;
+    cout << timestamp << "  unpack:   " << ms(total.unpack)
+         << "  (seq=" << ms(total.unpackSeq) << " sdust=" << ms(total.unpackSdust) << ")" << endl;
     cout << timestamp << "  detect:   " << ms(total.detect) << endl;
-    cout << timestamp << "  count+prof:" << ms(total.count) << endl;
+    cout << timestamp << "  count+prof:" << ms(total.count)
+         << "  (collect=" << ms(total.countCollect) << " alleles=" << ms(total.countAlleles)
+         << " profiles=" << ms(total.countProfiles) << ")" << endl;
     cout << timestamp << "  classify: " << ms(total.classify) << endl;
     cout << timestamp << "  kmeans:   " << ms(total.kmeans) << endl;
     cout << timestamp << "  write:    " << ms(total.write) << endl;
