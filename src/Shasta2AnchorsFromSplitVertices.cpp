@@ -23,6 +23,7 @@
 #include <atomic>
 #include <iostream>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace dinara;
@@ -32,12 +33,16 @@ using namespace std;
 
 // Split a single marker graph vertex into overlap-connected components.
 // If the vertex is coherent (all reads overlap-connected), returns a single group.
+// When alignmentData/alignmentTable are provided, also validates that both
+// reads' ordinals at the vertex fall within their pairwise alignment range.
 static void splitVertex(
     const MarkerGraph& markerGraph,
     MarkerGraphVertexId vertexId,
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
     const ReadGraph& readGraph,
     const Reads& reads,
+    const MemoryMapped::Vector<AlignmentData>* alignmentData,
+    const MemoryMapped::VectorOfVectors<uint32_t, uint32_t>* alignmentTable,
     vector<vector<Shasta2AnchorMarkerInfo>>& groups)
 {
     groups.clear();
@@ -91,20 +96,54 @@ static void splitVertex(
     }
     sort(vertexReadsSorted.begin(), vertexReadsSorted.end());
 
+    // Build a lookup from OrientedReadId value -> index in entries,
+    // so we can find a neighbor's ordinal at this vertex.
+    unordered_map<uint32_t, uint64_t> oidToEntryIndex;
+    for(uint64_t i = 0; i < n; i++) {
+        oidToEntryIndex[entries[i].orientedReadId.getValue()] = i;
+    }
+
     const bool readGraphIsOpen = readGraph.connectivity.isOpen();
+    const bool hasAlignmentInfo = (alignmentData != nullptr && alignmentTable != nullptr);
     vector<vector<uint32_t>> inVertexNeighbors(n);
     for(uint64_t i = 0; i < n; i++) {
         if(!readGraphIsOpen) continue;
         const auto orientedReadId = entries[i].orientedReadId;
+        const uint32_t ordinal_i = entries[i].ordinal;
         const auto adjacentEdges = readGraph.connectivity[orientedReadId.getValue()];
         for(const uint32_t edgeId : adjacentEdges) {
             const ReadGraphEdge& edge = readGraph.edges[edgeId];
             if(edge.crossesStrands) continue;
             const OrientedReadId neighbor = edge.getOther(orientedReadId);
             const uint32_t neighborVal = neighbor.getValue();
-            if(binary_search(vertexReadsSorted.begin(), vertexReadsSorted.end(), neighborVal)) {
-                inVertexNeighbors[i].push_back(neighborVal);
+            if(!binary_search(vertexReadsSorted.begin(), vertexReadsSorted.end(), neighborVal)) {
+                continue;
             }
+
+            // If alignment data is available, verify that both reads'
+            // ordinals at this vertex fall within the pairwise alignment range.
+            if(hasAlignmentInfo) {
+                auto jIt = oidToEntryIndex.find(neighborVal);
+                if(jIt == oidToEntryIndex.end()) continue;
+                const uint32_t ordinal_j = entries[jIt->second].ordinal;
+
+                // The read graph edge stores the alignment ID directly.
+                const uint64_t alignmentId = edge.alignmentId;
+                const auto& ad = (*alignmentData)[alignmentId];
+
+                // Orient the alignment info to match our oriented read IDs.
+                const AlignmentInfo info = ad.orient(orientedReadId, neighbor);
+
+                // Check that both ordinals fall within the alignment range.
+                if(ordinal_i < info.data[0].firstOrdinal ||
+                   ordinal_i > info.data[0].lastOrdinal ||
+                   ordinal_j < info.data[1].firstOrdinal ||
+                   ordinal_j > info.data[1].lastOrdinal) {
+                    continue;
+                }
+            }
+
+            inVertexNeighbors[i].push_back(neighborVal);
         }
         sort(inVertexNeighbors[i].begin(), inVertexNeighbors[i].end());
     }
@@ -191,7 +230,9 @@ shared_ptr<Shasta2Anchors> dinara::createShasta2AnchorsFromSplitVertices(
     const ReadGraph& readGraph,
     uint64_t threadCount,
     uint64_t minAnchorCoverage,
-    uint64_t maxAnchorCoverage)
+    uint64_t maxAnchorCoverage,
+    const MemoryMapped::Vector<AlignmentData>* alignmentData,
+    const MemoryMapped::VectorOfVectors<uint32_t, uint32_t>* alignmentTable)
 {
     cout << timestamp << "Creating Shasta2Anchors with vertex splitting." << endl;
 
@@ -257,7 +298,7 @@ shared_ptr<Shasta2Anchors> dinara::createShasta2AnchorsFromSplitVertices(
                     markerGraph.reverseComplementVertex[vertexId];
                 const bool isSelfComplement = (vertexId == rcVertexId);
 
-                splitVertex(markerGraph, vertexId, markers, readGraph, reads, groups);
+                splitVertex(markerGraph, vertexId, markers, readGraph, reads, alignmentData, alignmentTable, groups);
 
                 if(groups.empty()) continue;
 
@@ -376,7 +417,7 @@ shared_ptr<Shasta2Anchors> dinara::createShasta2AnchorsFromSplitVertices(
                     markerGraph.reverseComplementVertex[vertexId];
                 const bool isSelfComplement = (vertexId == rcVertexId);
 
-                splitVertex(markerGraph, vertexId, markers, readGraph, reads, groups);
+                splitVertex(markerGraph, vertexId, markers, readGraph, reads, alignmentData, alignmentTable, groups);
 
                 uint64_t anchorId = anchorIdOffset[ci];
                 for(const auto& group : groups) {
