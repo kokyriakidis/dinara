@@ -10,9 +10,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <numeric>
@@ -21,6 +24,138 @@
 
 using namespace std;
 using namespace dinara;
+
+// ============================================================================
+// SDUST low-complexity detection (C++ port of heng li's sdust.c from pgphase)
+//
+// Detects low-complexity regions using symmetric DUST algorithm.
+// Input: 2-bit encoded sequence (0=A, 1=C, 2=G, 3=T, >=4 = N/break).
+// Output: vector of (start, end) intervals (0-based, half-open).
+// Parameters: T=threshold (pgphase default 5), W=window (pgphase default 20).
+// ============================================================================
+
+static constexpr int SD_WLEN = 3;
+static constexpr int SD_WTOT = (1 << (SD_WLEN << 1));  // 64
+static constexpr int SD_WMSK = SD_WTOT - 1;
+
+struct SdustPerfIntv { int start, finish, r, l; };
+
+/// Port of sdust.c shift_window.
+static inline void kmSdustShiftWindow(
+    int t, deque<int>& w, int T, int W,
+    int& L, int& rw, int& rv, int* cw, int* cv)
+{
+    int s;
+    if (int(w.size()) >= W - SD_WLEN + 1) {
+        s = w.front(); w.pop_front();
+        rw -= --cw[s];
+        if (L > int(w.size()))
+            --L, rv -= --cv[s];
+    }
+    w.push_back(t);
+    ++L;
+    rw += cw[t]++;
+    rv += cv[t]++;
+    if (cv[t] * 10 > T << 1) {
+        do {
+            s = w[w.size() - L];
+            rv -= --cv[s];
+            --L;
+        } while (s != t);
+    }
+}
+
+/// Port of sdust.c save_masked_regions.
+static inline void kmSdustSaveMasked(
+    vector<pair<uint32_t,uint32_t>>& res, vector<SdustPerfIntv>& P, int start)
+{
+    if (P.empty() || P.back().start >= start) return;
+    auto& p = P.back();
+    int saved = 0;
+    if (!res.empty()) {
+        uint32_t f = res.back().second;
+        if (uint32_t(p.start) <= f) {
+            saved = 1;
+            res.back().second = (f > uint32_t(p.finish)) ? f : uint32_t(p.finish);
+        }
+    }
+    if (!saved)
+        res.push_back({uint32_t(p.start), uint32_t(p.finish)});
+    int i;
+    for (i = int(P.size()) - 1; i >= 0 && P[i].start < start; --i);
+    P.resize(i + 1);
+}
+
+/// Port of sdust.c find_perfect.
+static void kmSdustFindPerfect(
+    vector<SdustPerfIntv>& P, const deque<int>& w,
+    int T, int start, int L, int rv, const int* cv)
+{
+    int c[SD_WTOT], r = rv;
+    memcpy(c, cv, SD_WTOT * sizeof(int));
+    int max_r = 0, max_l = 0;
+    for (int i = int(w.size()) - L - 1; i >= 0; --i) {
+        int t = w[i];
+        r += c[t]++;
+        int new_r = r, new_l = int(w.size()) - i - 1;
+        if (new_r * 10 > T * new_l) {
+            int j;
+            for (j = 0; j < int(P.size()) && P[j].start >= i + start; ++j) {
+                auto& p = P[j];
+                if (max_r == 0 || p.r * max_l > max_r * p.l)
+                    max_r = p.r, max_l = p.l;
+            }
+            if (max_r == 0 || new_r * max_l >= max_r * new_l) {
+                max_r = new_r; max_l = new_l;
+                SdustPerfIntv pi;
+                pi.start = i + start;
+                pi.finish = int(w.size()) + (SD_WLEN - 1) + start;
+                pi.r = new_r; pi.l = new_l;
+                P.insert(P.begin() + j, pi);
+            }
+        }
+    }
+}
+
+/// Port of sdust.c sdust_core. Input is already 2-bit encoded (0-3).
+static void kmSdust(const uint8_t* seq, int lSeq, int T, int W,
+                    vector<pair<uint32_t,uint32_t>>& out)
+{
+    out.clear();
+    if (lSeq < SD_WLEN) return;
+
+    deque<int> w;
+    vector<SdustPerfIntv> P;
+    int rv = 0, rw = 0, L = 0;
+    int cv[SD_WTOT], cw[SD_WTOT];
+    memset(cv, 0, sizeof(cv));
+    memset(cw, 0, sizeof(cw));
+    unsigned t = 0;
+    int l = 0;
+
+    for (int i = 0; i <= lSeq; ++i) {
+        // Our backbone bases are already 0-3 encoded; treat >=4 as N/break.
+        int b = (i < lSeq) ? int(seq[i]) : 4;
+        if (b < 4) {
+            ++l;
+            t = (t << 2 | b) & SD_WMSK;
+            if (l >= SD_WLEN) {
+                int start = (l - W > 0 ? l - W : 0) + (i + 1 - l);
+                kmSdustSaveMasked(out, P, start);
+                kmSdustShiftWindow(t, w, T, W, L, rw, rv, cw, cv);
+                if (rw * 10 > L * T)
+                    kmSdustFindPerfect(P, w, T, start, L, rv, cv);
+            }
+        } else {
+            // pgphase sdust.c: only reset l and t on N/break.
+            // The window state (w, L, rv, rw, cv, cw) is NOT reset —
+            // old entries age out naturally via shift_window.
+            int start = (l - W + 1 > 0 ? l - W + 1 : 0) + (i + 1 - l);
+            while (!P.empty()) kmSdustSaveMasked(out, P, start++);
+            l = 0; t = 0;
+        }
+    }
+}
 
 // ============================================================================
 // Helpers
@@ -44,35 +179,76 @@ static inline uint8_t kmGetBase(
     return sequence[sequence.baseCount - 1 - position].complement().value;
 }
 
-static constexpr uint32_t KM_HPC_RR = 4;
-static constexpr uint32_t KM_HPC_CC = 2;
-static constexpr uint32_t KM_HPC_PL = 12;
-
-static bool kmIsPeriodicRepeat(const uint8_t* seq, uint32_t seqLen, uint32_t p)
+/// pgphase var_is_homopolymer_pg: checks if flanking reference has a periodic
+/// repeat pattern (unit length 1-6, 3 copies) in either direction from the
+/// variant boundary.
+static bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
+                            const KmVarKey& key, int xid)
 {
     if (seqLen == 0) return false;
-    const int64_t sn = int64_t(seqLen), pp = int64_t(p);
-    const int64_t s = (pp >= int64_t(KM_HPC_PL)) ? (pp - int64_t(KM_HPC_PL)) : 0;
-    const int64_t e = ((pp + int64_t(KM_HPC_PL)) <= sn) ? (pp + int64_t(KM_HPC_PL)) : sn;
-    for (uint32_t r = 1; r <= KM_HPC_RR; r++) {
-        const int64_t rc = int64_t(r) * int64_t(KM_HPC_CC);
-        { int64_t k=pp+int64_t(r); while(k<e&&(k-int64_t(r))>=s&&seq[k]==seq[k-r])k++;
-          int64_t ze=k; if(ze>e)ze=e; k=pp-1;
-          while(k>=s&&(k+int64_t(r))<e&&seq[k]==seq[k+r])k--;
-          int64_t zs=k+1; if(zs<s)zs=s;
-          if((ze-zs)>int64_t(r)&&(ze-zs)>=rc) return true; }
-        { int64_t k=pp+int64_t(r)+1; while(k<e&&(k-int64_t(r))>=s&&seq[k]==seq[k-r])k++;
-          int64_t zs=pp+1; if(zs<s)zs=s; int64_t ze=k; if(ze>e)ze=e;
-          if((ze-zs)>int64_t(r)&&(ze-zs)>=rc) return true; }
-        { int64_t k=pp-int64_t(r); while(k>=s&&(k+int64_t(r))<e&&seq[k]==seq[k+r])k--;
-          int64_t zs=k+1; if(zs<s)zs=s; k=pp+1;
-          while(k<e&&(k-int64_t(r))>=s&&seq[k]==seq[k-r])k++;
-          int64_t ze=k; if(ze>e)ze=e;
-          if((ze-zs)>int64_t(r)&&(ze-zs)>=rc) return true; }
-        { int64_t k=pp-int64_t(r)-1; while(k>=s&&(k+int64_t(r))<e&&seq[k]==seq[k+r])k--;
-          int64_t zs=k+1; if(zs<s)zs=s; int64_t ze=pp; if(ze>e)ze=e;
-          if((ze-zs)>int64_t(r)&&(ze-zs)>=rc) return true; }
+    const int64_t sn = int64_t(seqLen);
+    int64_t startPos, endPos;
+    if (key.type == KmVarType::Snp) {
+        startPos = int64_t(key.pos) - 1;
+        endPos   = int64_t(key.pos) + 1;
+    } else if (key.type == KmVarType::Insertion) {
+        if (int(key.altLen) > xid) return false;
+        startPos = int64_t(key.pos) - 1;
+        endPos   = int64_t(key.pos);
+    } else { // Deletion
+        if (int(key.refLen) > xid) return false;
+        startPos = int64_t(key.pos) + int64_t(key.refLen) - 1;
+        endPos   = int64_t(key.pos);
     }
+    constexpr int maxUnitLen = 6;
+    constexpr int nCheckCopyNum = 3;
+    auto safeBase = [&](int64_t p) -> uint8_t {
+        if (p < 0 || p >= sn) return 255;
+        return seq[p];
+    };
+    // Check forward from endPos.
+    uint8_t refBases[6];
+    for (int i = 0; i < 6; i++) refBases[i] = safeBase(endPos + i);
+    for (int r = 1; r <= maxUnitLen; r++) {
+        bool isHp = true;
+        for (int i = 1; i < nCheckCopyNum && isHp; i++)
+            for (int j = 0; j < r && isHp; j++)
+                if (safeBase(endPos + i * r + j) != refBases[j]) isHp = false;
+        if (isHp) return true;
+    }
+    // Check backward from startPos.
+    for (int i = 0; i < 6; i++) refBases[i] = safeBase(startPos - i);
+    for (int r = 1; r <= maxUnitLen; r++) {
+        bool isHp = true;
+        for (int i = 1; i < nCheckCopyNum && isHp; i++)
+            for (int j = 0; j < r && isHp; j++)
+                if (safeBase(startPos - i * r - j) != refBases[j]) isHp = false;
+        if (isHp) return true;
+    }
+    return false;
+}
+
+/// pgphase var_is_repeat_region_pg: checks if the deleted/inserted motif is a
+/// tandem repeat of the flanking reference. For insertions we don't store the
+/// alt sequence, so we can only check deletions.
+static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
+                             const KmVarKey& key, int xid)
+{
+    if (seqLen == 0) return false;
+    const int64_t sn = int64_t(seqLen);
+    if (key.type == KmVarType::Deletion) {
+        const int delLen = int(key.refLen);
+        if (delLen > xid) return false;
+        const int len = delLen * 3;
+        const int64_t pos = int64_t(key.pos);
+        if (pos < 0 || pos + delLen + len > sn) return false;
+        // Compare deleted bases [pos, pos+delLen) against [pos+delLen, pos+delLen+len).
+        for (int i = 0; i < len; i++)
+            if (seq[pos + i] != seq[pos + delLen + i]) return false;
+        return true;
+    }
+    // Insertion: would need alt sequence which we don't store.
+    // Skip — this is a known limitation.
     return false;
 }
 
@@ -114,12 +290,96 @@ static void kmGatherOverlaps(
 }
 
 // ============================================================================
-// Step 2: Parse CIGARs into per-overlap digars (single walk, like pgphase)
+// Step 2: Parse CIGARs into per-overlap digars + noisy region detection
+//
+// Port of pgphase NoisyRegionBuilder / XidQueue sliding window.
+// During CIGAR walk, variant events are pushed into a sliding window.
+// When total event weight in the window exceeds max_s (noisyRegMaxXgaps),
+// the window span is flagged as a noisy interval for this overlap.
 // ============================================================================
+
+/// Sliding window noisy region detector (pgphase XidQueue + xid_push_win).
+struct KmNoisyBuilder {
+    // Circular queue of events in the window.
+    vector<uint32_t> pos;    // backbone position
+    vector<uint32_t> lens;   // ref-space length (0 for insertions)
+    vector<int>      counts; // event weight (1 for SNP, len for indel)
+    int front = 0;
+    int rear = -1;
+    int totalCount = 0;
+    int maxS;   // threshold: noisy when totalCount > maxS
+    int win;    // sliding window size in bp
+
+    // Active noisy interval tracking.
+    int32_t curStart = -1, curEnd = -1;
+    int curQStart = -1, curQEnd = -1;
+
+    // Output.
+    vector<KmNoisyRegion>& noisyOut;
+
+    KmNoisyBuilder(int maxSites, int maxSIn, int winIn, vector<KmNoisyRegion>& out)
+        : pos(max(1, maxSites)), lens(max(1, maxSites)), counts(max(1, maxSites)),
+          maxS(maxSIn), win(winIn), noisyOut(out) {}
+
+    void ensureCapacity() {
+        if (size_t(rear + 1) < pos.size()) return;
+        size_t nc = pos.size() * 2;
+        pos.resize(nc); lens.resize(nc); counts.resize(nc);
+    }
+
+    void observe(uint32_t p, uint32_t len, int count) {
+        ensureCapacity();
+        ++rear;
+        pos[rear] = p; lens[rear] = len; counts[rear] = count;
+        totalCount += count;
+
+        // Evict events that fell behind the window.
+        while (front <= rear &&
+               int64_t(pos[front]) + int64_t(lens[front]) - 1 <= int64_t(p) - win) {
+            totalCount -= counts[front];
+            ++front;
+        }
+
+        if (count <= 0) return;
+        if (totalCount <= maxS) return;
+
+        int32_t noisyStart = int32_t(pos[front]);
+        int32_t noisyEnd = int32_t(pos[rear] + lens[rear]);
+
+        if (curStart == -1) {
+            curStart = noisyStart; curEnd = noisyEnd;
+            curQStart = front; curQEnd = rear;
+            return;
+        }
+        if (noisyStart <= curEnd) {
+            curEnd = noisyEnd; curQEnd = rear;
+            return;
+        }
+        // Flush previous interval.
+        int varSize = 0;
+        for (int i = curQStart; i <= curQEnd; i++) varSize += counts[i];
+        int span = int(curEnd - curStart + 1);
+        if (varSize < span) varSize = span;
+        noisyOut.push_back({uint32_t(curStart), uint32_t(curEnd), varSize, false});
+
+        curStart = noisyStart; curEnd = noisyEnd;
+        curQStart = front; curQEnd = rear;
+    }
+
+    void flush() {
+        if (curStart == -1) return;
+        int varSize = 0;
+        for (int i = curQStart; i <= curQEnd; i++) varSize += counts[i];
+        int span = int(curEnd - curStart + 1);
+        if (varSize < span) varSize = span;
+        noisyOut.push_back({uint32_t(curStart), uint32_t(curEnd), varSize, false});
+        curStart = -1;
+    }
+};
 
 static void kmParseCigars(
     const Assembler& assembler, ReadId backboneReadId,
-    uint32_t backboneLen, KmScratchpad& scratch)
+    uint32_t backboneLen, KmScratchpad& scratch, const KmPhasingOptions& opts)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
@@ -127,13 +387,25 @@ static void kmParseCigars(
     scratch.digars.clear();
     scratch.digarBegin.resize(numOv);
     scratch.digarEnd.resize(numOv);
+    scratch.overlapNoisyRegions.clear();
+    scratch.overlapNoisyBegin.resize(numOv);
+    scratch.overlapNoisyEnd.resize(numOv);
+
+    // pgphase: window size depends on technology.
+    const int noisyWin = opts.isOnt ? 25 : 100;  // kDefaultNoisyRegSlideWinOnt / Hifi
+    const int noisyMaxS = int(opts.noisyRegMaxXgaps);
 
     for (uint32_t oi = 0; oi < numOv; oi++) {
         scratch.digarBegin[oi] = uint32_t(scratch.digars.size());
+        scratch.overlapNoisyBegin[oi] = uint32_t(scratch.overlapNoisyRegions.size());
         const auto& ov = scratch.overlaps[oi];
         const auto& ad = assembler.alignmentData[ov.alignmentId];
         const bool needsRc = (ov.queryIsRead0 == 0) && (ov.isRev != 0);
         const bool qIsR0 = (ov.queryIsRead0 != 0);
+
+        // Estimate max events for this overlap's CIGAR.
+        int maxSites = max(1, int(ov.cigarTokenCount) * 2 + 8);
+        KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
 
         cigarStore.forEachOpWithPositions(
             ov.cigarOffset, ov.cigarTokenCount,
@@ -155,39 +427,45 @@ static void kmParseCigars(
                             tPos = uint32_t(xk) + b;
                         }
                         if (bbPos >= backboneLen) continue;
-                        // Read actual alt base from target read.
                         uint8_t altBase = kmGetBase(assembler, ReadId(ov.targetReadId),
                                                     tPos, ov.isRev != 0);
                         scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1});
+                        // pgphase: observe_variant(pos, 1, 1) for SNP.
+                        noisy.observe(bbPos, 1, 1);
                     }
                 } else if (op == 2 || op == 3) { // Ins/Del
-                    // Determine if this consumes backbone or target.
                     bool bbConsumed = (op==3 && qIsR0) || (op==2 && !qIsR0);
                     if (bbConsumed) {
-                        // Deletion on backbone (or insertion on target that consumes backbone).
                         uint32_t raw = (op==3) ? uint32_t(xk) : uint32_t(yk);
                         uint32_t rawE = (raw + len < backboneLen) ? raw + len : backboneLen;
                         uint32_t s, e;
                         if (needsRc) { s = backboneLen - rawE; e = backboneLen - raw; }
                         else { s = raw; e = rawE; }
-                        // One digar for the whole deletion event, anchored at start.
-                        if (s < backboneLen)
+                        if (s < backboneLen) {
                             scratch.digars.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s)});
+                            // pgphase: observe_variant(ref_pos, len, len) for deletion.
+                            noisy.observe(s, e - s, int(e - s));
+                        }
                     } else {
-                        // Insertion on backbone (target has extra bases).
                         uint32_t anchor = qIsR0 ? uint32_t(xk) : uint32_t(yk);
                         if (needsRc && anchor > 0) anchor = backboneLen - 1 - anchor;
-                        if (anchor < backboneLen)
+                        if (anchor < backboneLen) {
                             scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len)});
+                            // pgphase: observe_variant(ref_pos, 0, len) for insertion.
+                            noisy.observe(anchor, 0, int(len));
+                        }
                     }
                 }
             });
+
+        noisy.flush();
 
         // Sort this overlap's digars by backbone position.
         uint32_t dEnd = uint32_t(scratch.digars.size());
         sort(scratch.digars.begin() + scratch.digarBegin[oi],
              scratch.digars.begin() + dEnd);
         scratch.digarEnd[oi] = dEnd;
+        scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
     }
 }
 
@@ -356,6 +634,138 @@ static void kmCountAlleles(KmScratchpad& scratch, int minSvLen)
 }
 
 // ============================================================================
+// Interval helpers (used by noisy region processing and classification)
+// ============================================================================
+
+/// Check if position range [qStart, qEnd) overlaps any interval in sorted list.
+static bool kmOverlapsAny(const vector<pair<uint32_t,uint32_t>>& intervals,
+                           uint32_t qStart, uint32_t qEnd)
+{
+    auto it = lower_bound(intervals.begin(), intervals.end(), qStart,
+        [](const pair<uint32_t,uint32_t>& iv, uint32_t val) { return iv.second <= val; });
+    return it != intervals.end() && it->first < qEnd;
+}
+
+/// Count how many intervals in sorted list overlap [qStart, qEnd).
+static int kmCountOverlaps(const vector<pair<uint32_t,uint32_t>>& intervals,
+                            uint32_t qStart, uint32_t qEnd)
+{
+    auto it = lower_bound(intervals.begin(), intervals.end(), qStart,
+        [](const pair<uint32_t,uint32_t>& iv, uint32_t val) { return iv.second <= val; });
+    int count = 0;
+    while (it != intervals.end() && it->first < qEnd) { count++; ++it; }
+    return count;
+}
+
+/// Check if [qStart, qEnd) is fully contained in some interval.
+static bool kmIsContained(const vector<pair<uint32_t,uint32_t>>& intervals,
+                           uint32_t qStart, uint32_t qEnd)
+{
+    auto it = lower_bound(intervals.begin(), intervals.end(), qStart,
+        [](const pair<uint32_t,uint32_t>& iv, uint32_t val) { return iv.second <= val; });
+    while (it != intervals.end() && it->first <= qStart) {
+        if (it->second >= qEnd) return true;
+        ++it;
+    }
+    return false;
+}
+
+/// Extend [start, end) to include overlapping low-complexity intervals.
+/// Port of pgphase cr_add_var_to_noisy_cr low_comp extension.
+static void kmExtendWithLowComp(const vector<pair<uint32_t,uint32_t>>& lowComp,
+                                 uint32_t& start, uint32_t& end)
+{
+    if (lowComp.empty()) return;
+    // Find low-complexity intervals overlapping [start, end).
+    auto it = lower_bound(lowComp.begin(), lowComp.end(), start,
+        [](const pair<uint32_t,uint32_t>& iv, uint32_t val) { return iv.second <= val; });
+    while (it != lowComp.end() && it->first < end) {
+        if (it->first < start) start = it->first;
+        if (it->second > end) end = it->second;
+        ++it;
+    }
+}
+
+/// Merge overlapping/adjacent intervals (sorted input, merge distance = mergeDis).
+static void kmMergeIntervals(vector<pair<uint32_t,uint32_t>>& intervals, uint32_t mergeDis)
+{
+    if (intervals.size() <= 1) return;
+    sort(intervals.begin(), intervals.end());
+    vector<pair<uint32_t,uint32_t>> merged;
+    merged.push_back(intervals[0]);
+    for (size_t i = 1; i < intervals.size(); i++) {
+        auto& last = merged.back();
+        if (intervals[i].first <= last.second + mergeDis)
+            last.second = max(last.second, intervals[i].second);
+        else
+            merged.push_back(intervals[i]);
+    }
+    intervals = std::move(merged);
+}
+
+// ============================================================================
+// Step 2b: Pre-process noisy regions (pgphase pre_process_noisy_regs)
+//
+// Merges per-overlap noisy intervals into chunk-level noisy regions.
+// Filters by read support: requires >= minAltDepth overlaps with noisy
+// intervals overlapping each merged region, and noisy ratio >= minAf.
+// These chunk-level noisy regions feed into classify pass 2.
+// ============================================================================
+
+static void kmPreProcessNoisyRegs(KmScratchpad& scratch, const KmPhasingOptions& opts)
+{
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+    scratch.noisyRegions.clear();
+
+    // Collect all per-overlap noisy intervals into a single sorted list.
+    vector<pair<uint32_t,uint32_t>> allNoisy;
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        for (uint32_t ni = scratch.overlapNoisyBegin[oi]; ni < scratch.overlapNoisyEnd[oi]; ni++) {
+            const auto& nr = scratch.overlapNoisyRegions[ni];
+            allNoisy.push_back({nr.start, nr.end});
+        }
+    }
+    if (allNoisy.empty()) return;
+
+    // pgphase: cr_extend_noisy_regs_with_low_comp — extend each noisy interval
+    // to include overlapping low-complexity (sdust) intervals, then merge.
+    for (auto& [s, e] : allNoisy)
+        kmExtendWithLowComp(scratch.lowComplexity, s, e);
+
+    // Merge overlapping intervals (pgphase cr_merge).
+    kmMergeIntervals(allNoisy, opts.noisyRegMergeDis);
+
+    // For each merged region, count how many overlaps have noisy intervals
+    // overlapping it (pgphase: noisy_reg_to_noisy) and how many overlaps
+    // span it at all (pgphase: noisy_reg_to_total).
+    const int minNoisyReads = int(opts.minAltDepth);
+    const float minNoisyRatio = float(opts.minAf);
+    // pgphase: min_noisy_reg_total_depth defaults to 0 (effectively disabled).
+    const int minOverlapReads = int(opts.minNoisyRegTotalDepth);
+
+    for (const auto& [mStart, mEnd] : allNoisy) {
+        int nTotal = 0;
+        int nNoisy = 0;
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            const auto& ov = scratch.overlaps[oi];
+            // pgphase: any overlap between read span and merged region counts.
+            if (ov.qs >= mEnd || ov.qe <= mStart) continue;
+            nTotal++;
+            // Does this overlap have a noisy interval overlapping the merged region?
+            for (uint32_t ni = scratch.overlapNoisyBegin[oi]; ni < scratch.overlapNoisyEnd[oi]; ni++) {
+                const auto& nr = scratch.overlapNoisyRegions[ni];
+                if (nr.start < mEnd && nr.end > mStart) { nNoisy++; break; }
+            }
+        }
+        // pgphase filter: skip if insufficient support.
+        if (minOverlapReads > 0 && nTotal < minOverlapReads) continue;
+        if (nNoisy < minNoisyReads) continue;
+        if (nTotal > 0 && float(nNoisy) / float(nTotal) < minNoisyRatio) continue;
+        scratch.noisyRegions.push_back({mStart, mEnd, 0, false});
+    }
+}
+
+// ============================================================================
 // Step 5: Build per-overlap allele profiles (after classification)
 //
 // Mirrors pgphase collect_read_var_profile:
@@ -436,7 +846,21 @@ static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen)
                 // E.g., deletion spanning a SNP position → no observation.
                 allele = -1;
             } else {
-                // No digar at this position → ref.
+                // No digar at this position.
+                // pgphase: during merge walk, always count as ref (allele=0).
+                // The noisy region check only applies in the tail loop
+                // (after all digars consumed), handled below.
+                if (di >= diEnd) {
+                    // Tail: all digars consumed. Check per-overlap noisy region.
+                    bool inOverlapNoisy = false;
+                    for (uint32_t ni = scratch.overlapNoisyBegin[oi]; ni < scratch.overlapNoisyEnd[oi]; ni++) {
+                        const auto& nr = scratch.overlapNoisyRegions[ni];
+                        if (c.key.pos >= nr.start && c.key.pos < nr.end) {
+                            inOverlapNoisy = true; break;
+                        }
+                    }
+                    if (inOverlapNoisy) continue; // pgphase: skip, don't append
+                }
                 allele = 0;
             }
 
@@ -447,89 +871,375 @@ static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen)
             prof.endVarIdx = int(ci);
             prof.alleles.push_back(allele);
         }
-
-        // Tail: remaining candidates within overlap range that aren't NON_VAR get ref.
-        // (Already handled by the for loop — they have no matching digar → allele = 0.)
     }
 }
 
 // ============================================================================
-// Step 4: Classify candidates and detect noisy regions
+// Fisher exact test for strand bias (pgphase log_hypergeometric + fisher_exact)
 // ============================================================================
+
+/// Log of the hypergeometric PMF term (longcallD `log_hypergeometric`, lgamma only).
+/// 2x2 table: row1 (a,b), row2 (c,d).
+static double kmLogHypergeom(int a, int b, int c, int d)
+{
+    const int n1 = a + b;
+    const int n2 = c + d;
+    const int m1 = a + c;
+    const int m2 = b + d;
+    const int N  = n1 + n2;
+    if (N <= 0) return -std::numeric_limits<double>::infinity();
+    if (n1 > n2) return kmLogHypergeom(c, d, a, b);
+    if (m1 > m2) return kmLogHypergeom(b, a, d, c);
+    return std::lgamma(double(n1 + 1)) + std::lgamma(double(n2 + 1)) +
+           std::lgamma(double(m1 + 1)) + std::lgamma(double(m2 + 1)) -
+          (std::lgamma(double(a  + 1)) + std::lgamma(double(b  + 1)) +
+           std::lgamma(double(c  + 1)) + std::lgamma(double(d  + 1)) +
+           std::lgamma(double(N  + 1)));
+}
+
+/// Two-tailed Fisher exact test (longcallD `fisher_exact`).
+/// Returns p-value in [0,1].
+static double kmFisherExactTwoTail(int a, int b, int c, int d)
+{
+    if (a + b + c + d <= 0) return 1.0;
+    const double p_observed = std::exp(kmLogHypergeom(a, b, c, d));
+    double total_p = 0.0;
+    int min_a = (0 > (a + c) - (b + d)) ? 0 : (a + c) - (b + d);
+    const int max_a = (a + b) < (a + c) ? (a + b) : (a + c);
+    const int denom = a + b + c + d;
+    const int mode_a = denom > 0
+        ? int((double(a + b) * double(a + c)) / double(denom))
+        : 0;
+    for (int delta = 0; delta <= max_a - min_a; ++delta) {
+        int cur_a = mode_a + delta;
+        if (cur_a <= max_a) {
+            int cur_b = (a + b) - cur_a;
+            int cur_c = (a + c) - cur_a;
+            int cur_d = (b + d) - cur_b;
+            if (cur_b >= 0 && cur_c >= 0 && cur_d >= 0) {
+                const double p = std::exp(kmLogHypergeom(cur_a, cur_b, cur_c, cur_d));
+                if (p <= p_observed + DBL_EPSILON) total_p += p;
+            }
+        }
+        if (delta > 0) {
+            cur_a = mode_a - delta;
+            if (cur_a >= min_a) {
+                int cur_b = (a + b) - cur_a;
+                int cur_c = (a + c) - cur_a;
+                int cur_d = (b + d) - cur_b;
+                if (cur_b >= 0 && cur_c >= 0 && cur_d >= 0) {
+                    const double p = std::exp(kmLogHypergeom(cur_a, cur_b, cur_c, cur_d));
+                    if (p <= p_observed + DBL_EPSILON) total_p += p;
+                }
+            }
+        }
+    }
+    return total_p;
+}
+
+// ============================================================================
+// Step 4: Classify candidates and detect noisy regions
+//
+// Port of pgphase classify_cand_vars_pgphase (two-pass) +
+// post_process_noisy_regs_pgphase + apply_noisy_containment_filter +
+// prune_not_candidate_variants.
+//
+// Backbone bases serve as the reference sequence; sdust low-complexity
+// intervals and per-overlap noisy regions (from kmParseCigars) are used
+// in place of pgphase's BAM-derived equivalents.
+// ============================================================================
+
+/// pgphase classify_variant_initial: local rules only.
+/// Returns initial category; does NOT set c.category (caller stores in cats[]).
+static KmVariantCategory kmClassifyVariantInitial(
+    KmCandidate& c, const uint8_t* bbSeq, uint32_t bbLen,
+    const KmPhasingOptions& opts)
+{
+    c.alleleFraction = c.totalCov > 0 ? double(c.altCov) / double(c.totalCov) : 0.0;
+
+    if (c.totalCov < int(opts.minDepth) || c.altCov < int(opts.minAltDepth))
+        return KmVariantCategory::LowCoverage;
+
+    // ONT strand bias: Fisher exact on (fwd_alt, rev_alt, expected, expected).
+    if (opts.isOnt) {
+        const int fa = c.fwdAlt;
+        const int ra = c.revAlt;
+        const int expected = (fa + ra) / 2;
+        if (expected > 0) {
+            const double p = kmFisherExactTwoTail(fa, ra, expected, expected);
+            if (p < opts.strandBiasPval)
+                return KmVariantCategory::StrandBias;
+        }
+    }
+
+    if (c.alleleFraction < opts.minAf)
+        return KmVariantCategory::LowAlleleFraction;
+    if (c.alleleFraction > opts.maxAf)
+        return KmVariantCategory::CleanHom;
+
+    // pgphase: repeat check only for insertions and deletions, not SNPs.
+    // Uses var_is_homopolymer_pg || var_is_repeat_region_pg, gated on
+    // span <= noisyRegMaxXgaps (default 5).
+    if (c.key.type == KmVarType::Insertion || c.key.type == KmVarType::Deletion) {
+        // pgphase: var_is_homopolymer_pg || var_is_repeat_region_pg,
+        // both gated on span <= noisyRegMaxXgaps internally.
+        if (kmIsHomopolymer(bbSeq, bbLen, c.key, int(opts.noisyRegMaxXgaps)) ||
+            kmIsRepeatRegion(bbSeq, bbLen, c.key, int(opts.noisyRegMaxXgaps)))
+            return KmVariantCategory::RepeatHetIndel;
+        return KmVariantCategory::CleanHetIndel;
+    }
+    return KmVariantCategory::CleanHetSnp;
+}
+
+/// pgphase category_skipped_for_noisy_flank.
+static bool kmCategorySkippedForNoisyFlank(KmVariantCategory c)
+{
+    return c == KmVariantCategory::LowCoverage ||
+           c == KmVariantCategory::StrandBias ||
+           c == KmVariantCategory::NonVariant;
+}
+
+/// Candidate genomic span on backbone (pgphase variant_genomic_span).
+static void kmVariantSpan(const KmVarKey& k, uint32_t& start, uint32_t& end)
+{
+    if (k.type == KmVarType::Insertion) {
+        start = k.pos;
+        end = k.pos;  // zero-width on backbone
+    } else {
+        start = k.pos;
+        end = k.pos + k.refLen;
+    }
+}
 
 static void kmClassifyCandidates(
     uint32_t backboneLen, KmScratchpad& scratch, const KmPhasingOptions& opts)
 {
     const uint32_t numCand = uint32_t(scratch.candidates.size());
     if (numCand == 0) return;
+    const uint8_t* bbSeq = scratch.backboneBases.data();
+
+    // ── Pass 1: local classification (pgphase classify_variant_initial) ──
+    // Fill cats[] and build interval index of all surviving candidates
+    // (not LOW_COV, not STRAND_BIAS in ONT mode).
+    vector<KmVariantCategory> cats(numCand);
+    vector<pair<uint32_t,uint32_t>> varPosIntervals;  // pgphase var_pos_cr
 
     for (uint32_t ci = 0; ci < numCand; ci++) {
-        auto& c = scratch.candidates[ci];
-        if (c.totalCov < int(opts.minDepth) || c.altCov < int(opts.minAltDepth)) {
-            c.category = KmVariantCategory::LowCoverage; c.categoryFlag = 0; continue;
+        cats[ci] = kmClassifyVariantInitial(scratch.candidates[ci], bbSeq, backboneLen, opts);
+
+        // Build interval index: skip LOW_COV; skip STRAND_BIAS in ONT mode.
+        if (cats[ci] == KmVariantCategory::LowCoverage) continue;
+        if (opts.isOnt && cats[ci] == KmVariantCategory::StrandBias) continue;
+
+        uint32_t vs, ve;
+        kmVariantSpan(scratch.candidates[ci].key, vs, ve);
+        if (ve <= vs) ve = vs + 1;  // insertions: 1bp span for overlap checks
+        varPosIntervals.push_back({vs, ve});
+    }
+    sort(varPosIntervals.begin(), varPosIntervals.end());
+
+    // ── Pass 2: context rules (pgphase classify_cand_vars pass 2) ──
+    // chunk_noisy containment → NON_VAR; RepeatHetIndel → noisy seed;
+    // dense overlap (n_ov > 1) → noisy seed; LOW_AF → LOW_COV.
+    vector<pair<uint32_t,uint32_t>> noisyVarSeeds;  // pgphase noisy_var_cr
+
+    // Build sorted chunk_noisy intervals from pre_process_noisy_regs output.
+    vector<pair<uint32_t,uint32_t>> chunkNoisy;
+    for (const auto& nr : scratch.noisyRegions)
+        chunkNoisy.push_back({nr.start, nr.end});
+    sort(chunkNoisy.begin(), chunkNoisy.end());
+
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        KmVariantCategory c = cats[ci];
+
+        // pgphase: skip NON_VAR and STRAND_BIAS before overlap checks.
+        if (c == KmVariantCategory::NonVariant || c == KmVariantCategory::StrandBias)
+            continue;
+
+        uint32_t vs, ve;
+        kmVariantSpan(scratch.candidates[ci].key, vs, ve);
+        if (ve <= vs) ve = vs + 1;
+
+        // pgphase: if candidate overlaps chunk_noisy → NON_VAR.
+        if (!chunkNoisy.empty() && kmOverlapsAny(chunkNoisy, vs, ve)) {
+            cats[ci] = KmVariantCategory::NonVariant;
+            continue;
         }
-        { int fa = c.fwdAlt, ra = c.revAlt;
-          if ((fa == 0 || ra == 0) && (fa + ra) >= 4) {
-              c.category = KmVariantCategory::StrandBias; c.categoryFlag = 0; continue; } }
-        if (c.alleleFraction < opts.minAf) {
-            c.category = KmVariantCategory::LowAlleleFraction; c.categoryFlag = 0; continue;
+
+        if (c == KmVariantCategory::LowCoverage)
+            continue;
+
+        // RepeatHetIndel → add to noisy seeds (pgphase: cr_add_var_to_noisy_cr, no ratio check).
+        // Extend variant span to include overlapping low-complexity intervals.
+        if (c == KmVariantCategory::RepeatHetIndel) {
+            uint32_t es = vs, ee = ve;
+            kmExtendWithLowComp(scratch.lowComplexity, es, ee);
+            noisyVarSeeds.push_back({es, ee});
+            continue;
         }
-        if (c.alleleFraction > opts.maxAf) {
-            c.category = KmVariantCategory::CleanHom; c.categoryFlag = KM_CLEAN_HOM; continue;
-        }
-        bool isIndel = (c.key.type != KmVarType::Snp);
-        if (isIndel) {
-            if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.key.pos)) {
-                c.category = KmVariantCategory::RepeatHetIndel; c.categoryFlag = KM_REP_HET_VAR; continue;
+
+        // Dense overlap check: n_ov > 1 in var_pos_cr → add to noisy seeds
+        // (pgphase: cr_add_var_to_noisy_cr with check_noisy_reads_ratio=true).
+        // Ratio check: of overlaps spanning this position, what fraction have
+        // per-overlap noisy intervals here? Only add if ratio >= minAf.
+        int nOv = kmCountOverlaps(varPosIntervals, vs, ve);
+        if (nOv > 1) {
+            int nTotal = 0, nNoisy = 0;
+            for (uint32_t oi = 0; oi < uint32_t(scratch.overlaps.size()); oi++) {
+                const auto& ov = scratch.overlaps[oi];
+                // pgphase: any overlap between read span and variant position.
+                if (ov.qs >= ve || ov.qe <= vs) continue;
+                nTotal++;
+                for (uint32_t ni = scratch.overlapNoisyBegin[oi]; ni < scratch.overlapNoisyEnd[oi]; ni++) {
+                    const auto& nr = scratch.overlapNoisyRegions[ni];
+                    if (nr.start < ve && nr.end > vs) { nNoisy++; break; }
+                }
             }
-            c.category = KmVariantCategory::CleanHetIndel; c.categoryFlag = KM_CLEAN_HET_INDEL; continue;
+            if (nTotal > 0 && double(nNoisy) / double(nTotal) >= opts.minAf) {
+                uint32_t es = vs, ee = ve;
+                kmExtendWithLowComp(scratch.lowComplexity, es, ee);
+                noisyVarSeeds.push_back({es, ee});
+            }
         }
-        if (kmIsPeriodicRepeat(scratch.backboneBases.data(), backboneLen, c.key.pos)) {
-            c.category = KmVariantCategory::RepeatHetIndel; c.categoryFlag = KM_REP_HET_VAR; continue;
-        }
-        c.category = KmVariantCategory::CleanHetSnp; c.categoryFlag = KM_CLEAN_HET_SNP;
+
+        // pgphase: LOW_AF → LOW_COV after this loop.
+        if (c == KmVariantCategory::LowAlleleFraction)
+            cats[ci] = KmVariantCategory::LowCoverage;
     }
 
-    // Noisy region seeds.
+    // ── Merge noisy_var_cr seeds into chunk noisy regions ──
+    // pgphase: cr_merge2(chunk_noisy, noisy_var_cr, ...) merges pre-existing
+    // chunk noisy (from pre_process_noisy_regs) with new seeds from classification.
+    if (!noisyVarSeeds.empty()) {
+        // Add pre-existing chunk noisy regions to the seed list.
+        for (const auto& nr : scratch.noisyRegions)
+            noisyVarSeeds.push_back({nr.start, nr.end});
+        kmMergeIntervals(noisyVarSeeds, opts.noisyRegMergeDis);
+    } else if (!scratch.noisyRegions.empty()) {
+        // No new seeds, but keep pre-existing chunk noisy regions.
+        for (const auto& nr : scratch.noisyRegions)
+            noisyVarSeeds.push_back({nr.start, nr.end});
+    }
+
+    // Write merged noisy regions back (pgphase: intervals_from_cr → chunk.noisy_regions).
     scratch.noisyRegions.clear();
-    vector<pair<uint32_t,uint32_t>> seeds;
-    for (uint32_t ci = 0; ci < numCand; ci++) {
-        if (scratch.candidates[ci].category == KmVariantCategory::RepeatHetIndel)
-            seeds.push_back({scratch.candidates[ci].key.pos,
-                             scratch.candidates[ci].key.pos + scratch.candidates[ci].key.refLen});
-    }
-    for (uint32_t ci = 1; ci < numCand; ci++) {
-        const auto& prev = scratch.candidates[ci-1];
-        const auto& cur = scratch.candidates[ci];
-        if (prev.category == KmVariantCategory::LowCoverage || prev.category == KmVariantCategory::NonVariant) continue;
-        if (cur.category == KmVariantCategory::LowCoverage || cur.category == KmVariantCategory::NonVariant) continue;
-        if (cur.key.pos - prev.key.pos <= 25) {
-            if (prev.category != KmVariantCategory::CleanHetSnp || cur.category != KmVariantCategory::CleanHetSnp)
-                seeds.push_back({prev.key.pos, cur.key.pos + cur.key.refLen});
-        }
-    }
-    if (seeds.empty()) return;
-
-    sort(seeds.begin(), seeds.end());
-    vector<pair<uint32_t,uint32_t>> merged;
-    merged.push_back(seeds[0]);
-    for (size_t i = 1; i < seeds.size(); i++) {
-        auto& last = merged.back();
-        if (seeds[i].first <= last.second + opts.noisyRegMergeDis)
-            last.second = max(last.second, seeds[i].second);
-        else merged.push_back(seeds[i]);
-    }
-    for (const auto& [s, e] : merged)
+    for (const auto& [s, e] : noisyVarSeeds)
         scratch.noisyRegions.push_back({s, e, 0, false});
 
-    size_t ri = 0;
-    for (uint32_t ci = 0; ci < numCand && ri < scratch.noisyRegions.size(); ci++) {
-        auto& c = scratch.candidates[ci];
-        while (ri < scratch.noisyRegions.size() && scratch.noisyRegions[ri].end <= c.key.pos) ri++;
-        if (ri < scratch.noisyRegions.size() &&
-            c.key.pos >= scratch.noisyRegions[ri].start && c.key.pos < scratch.noisyRegions[ri].end) {
-            c.category = KmVariantCategory::NonVariant; c.categoryFlag = KM_NON_VAR;
+    // ── Post-process noisy regions: extend boundaries to nearest clean candidates ──
+    // (pgphase post_process_noisy_regs_pgphase → collect_noisy_reg_start_end)
+    if (!noisyVarSeeds.empty()) {
+        const int32_t flankLen = int32_t(opts.noisyRegFlankLen);
+        const int nNoisy = int(noisyVarSeeds.size());
+        vector<int32_t> startOut(nNoisy), endOut(nNoisy);
+
+        // Find max_left_var_i and min_right_var_i per noisy region.
+        vector<int> maxLeftVarI(nNoisy, -1);
+        vector<int> minRightVarI(nNoisy, -1);
+
+        int regI = 0, varI = 0;
+        while (regI < nNoisy && varI < int(numCand)) {
+            if (kmCategorySkippedForNoisyFlank(cats[varI])) { varI++; continue; }
+            uint32_t vs, ve;
+            kmVariantSpan(scratch.candidates[varI].key, vs, ve);
+            uint32_t regStart = noisyVarSeeds[regI].first;
+            uint32_t regEnd = noisyVarSeeds[regI].second;
+            if (vs > regEnd) {
+                if (minRightVarI[regI] == -1) minRightVarI[regI] = varI;
+                regI++;
+            } else if (ve < regStart) {
+                maxLeftVarI[regI] = varI;
+                varI++;
+            } else {
+                varI++;
+            }
         }
+
+        for (int ri = 0; ri < nNoisy; ri++) {
+            if (maxLeftVarI[ri] == -1) maxLeftVarI[ri] = 0;
+            if (minRightVarI[ri] == -1) minRightVarI[ri] = max(0, int(numCand) - 1);
+
+            int32_t regStart = int32_t(noisyVarSeeds[ri].first);
+            int32_t regEnd = int32_t(noisyVarSeeds[ri].second);
+
+            // Extend left.
+            int32_t curStart = regStart - flankLen;
+            for (int v = maxLeftVarI[ri]; v >= 0; v--) {
+                if (kmCategorySkippedForNoisyFlank(cats[v])) continue;
+                uint32_t vs, ve;
+                kmVariantSpan(scratch.candidates[v].key, vs, ve);
+                if (int32_t(ve) < curStart - 1) break;
+                if (int32_t(vs) - flankLen < curStart)
+                    curStart = int32_t(vs) - flankLen;
+            }
+            startOut[ri] = max(curStart, int32_t(0));
+
+            // Extend right.
+            int32_t curEnd = regEnd + flankLen;
+            for (int v = minRightVarI[ri]; v < int(numCand); v++) {
+                if (kmCategorySkippedForNoisyFlank(cats[v])) continue;
+                uint32_t vs, ve;
+                kmVariantSpan(scratch.candidates[v].key, vs, ve);
+                if (int32_t(vs) > curEnd + 1) break;
+                if (int32_t(ve) + flankLen > curEnd)
+                    curEnd = int32_t(ve) + flankLen;
+            }
+            endOut[ri] = min(curEnd, int32_t(backboneLen));
+        }
+
+        // Build extended noisy regions and re-merge.
+        vector<pair<uint32_t,uint32_t>> extendedNoisy;
+        for (int ri = 0; ri < nNoisy; ri++)
+            extendedNoisy.push_back({uint32_t(startOut[ri]), uint32_t(endOut[ri])});
+        kmMergeIntervals(extendedNoisy, 0);
+
+        // ── Apply noisy containment filter ──
+        // (pgphase apply_noisy_containment_filter: candidates fully inside noisy → NON_VAR)
+        for (uint32_t ci = 0; ci < numCand; ci++) {
+            // pgphase: skip NOT_CAND categories (NON_VAR, LOW_COV, STRAND_BIAS).
+            if (cats[ci] == KmVariantCategory::NonVariant ||
+                cats[ci] == KmVariantCategory::LowCoverage ||
+                cats[ci] == KmVariantCategory::StrandBias)
+                continue;
+            uint32_t vs, ve;
+            kmVariantSpan(scratch.candidates[ci].key, vs, ve);
+            if (ve <= vs) ve = vs + 1;
+            if (kmIsContained(extendedNoisy, vs, ve))
+                cats[ci] = KmVariantCategory::NonVariant;
+        }
+
+        // Replace noisy regions with extended+merged result for future MSA.
+        scratch.noisyRegions.clear();
+        for (const auto& [s, e] : extendedNoisy)
+            scratch.noisyRegions.push_back({s, e, 0, false});
+    }
+
+    // ── Write final categories and flags ──
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        auto& c = scratch.candidates[ci];
+        c.category = cats[ci];
+        switch (cats[ci]) {
+            case KmVariantCategory::CleanHetSnp:    c.categoryFlag = KM_CLEAN_HET_SNP; break;
+            case KmVariantCategory::CleanHetIndel:  c.categoryFlag = KM_CLEAN_HET_INDEL; break;
+            case KmVariantCategory::CleanHom:       c.categoryFlag = KM_CLEAN_HOM; break;
+            case KmVariantCategory::RepeatHetIndel: c.categoryFlag = KM_REP_HET_VAR; break;
+            default:                                c.categoryFlag = 0; break;
+        }
+    }
+
+    // ── Prune non-candidate variants ──
+    // (pgphase prune_not_candidate_variants: remove NON_VAR, LOW_COV, STRAND_BIAS)
+    {
+        vector<KmCandidate> kept;
+        kept.reserve(numCand);
+        for (auto& c : scratch.candidates) {
+            if (c.category == KmVariantCategory::NonVariant ||
+                c.category == KmVariantCategory::LowCoverage ||
+                c.category == KmVariantCategory::StrandBias)
+                continue;
+            kept.push_back(std::move(c));
+        }
+        scratch.candidates = std::move(kept);
     }
 }
 
@@ -550,15 +1260,27 @@ static inline int kmAlleSlots(const KmCandidate& c) {
 }
 
 static int kmSelectPivot(const KmScratchpad& s, const vector<uint32_t>& vi) {
-    int bSnp = -1, bIndel = -1; int bSnpD = 0, bIndelD = 0;
+    // pgphase select_init_var: CleanHetSnp > CleanHetIndel > NoisyCandHet(SNP) > NoisyCandHet(non-hp indel).
+    int bSnp = -1, bIndel = -1, bNSnp = -1, bNIndel = -1;
+    int bSnpD = 0, bIndelD = 0, bNSnpD = 0, bNIndelD = 0;
     for (int i = 0; i < int(vi.size()); i++) {
         const auto& c = s.candidates[vi[i]];
-        if (c.category == KmVariantCategory::CleanHetSnp && (bSnp < 0 || c.totalCov > bSnpD))
-            { bSnp = i; bSnpD = c.totalCov; }
-        else if (c.category == KmVariantCategory::CleanHetIndel && (bIndel < 0 || c.totalCov > bIndelD))
-            { bIndel = i; bIndelD = c.totalCov; }
+        if (c.category == KmVariantCategory::CleanHetSnp) {
+            if (bSnp < 0 || c.totalCov > bSnpD) { bSnp = i; bSnpD = c.totalCov; }
+        } else if (c.category == KmVariantCategory::CleanHetIndel) {
+            if (bIndel < 0 || c.totalCov > bIndelD) { bIndel = i; bIndelD = c.totalCov; }
+        } else if (c.category == KmVariantCategory::NoisyCandHet) {
+            if (c.key.type == KmVarType::Snp) {
+                if (bNSnp < 0 || c.totalCov > bNSnpD) { bNSnp = i; bNSnpD = c.totalCov; }
+            } else if (!c.isHomopolymerIndel) {
+                if (bNIndel < 0 || c.totalCov > bNIndelD) { bNIndel = i; bNIndelD = c.totalCov; }
+            }
+        }
     }
-    return bSnp >= 0 ? bSnp : bIndel;
+    if (bSnp >= 0) return bSnp;
+    if (bIndel >= 0) return bIndel;
+    if (bNSnp >= 0) return bNSnp;
+    return bNIndel;
 }
 
 static int kmReadToConsScore(KmCandidate& c, int hap, int alle) {
@@ -572,12 +1294,17 @@ static int kmReadToConsScore(KmCandidate& c, int hap, int alle) {
     return -vs;
 }
 
-static void kmUpdateConsAlle(KmCandidate& c, int hap) {
+static void kmUpdateConsAlle(KmCandidate& c, int hap, bool isOnt = false) {
     if (hap == 0) return;
     const auto& prof = c.hapAlleProfile[hap];
-    int mx = 0, ma = -1;
-    for (int a = 0; a < int(prof.size()); a++)
+    int mx = 0, ma = -1, total = 0;
+    for (int a = 0; a < int(prof.size()); a++) {
+        total += prof[a];
         if (prof[a] > mx) { mx = prof[a]; ma = a; }
+    }
+    // pgphase ONT 67% guard: homopolymer indels need supermajority.
+    if (isOnt && c.isHomopolymerIndel && mx < int(total * 0.67))
+        ma = -1;
     c.hapConsAlle[hap] = ma;
 }
 
@@ -588,7 +1315,8 @@ static int kmAssignOverlapHap(KmScratchpad& s, uint32_t oi, uint32_t flags) {
     for (int ci = prof.startVarIdx; ci <= prof.endVarIdx; ci++) {
         auto& c = s.candidates[ci];
         if ((c.categoryFlag & flags) == 0) continue;
-        if (c.isHomopolymerIndel) continue;
+        // pgphase: skip homopolymer indels and NoisyCandHom in hap assignment.
+        if (c.isHomopolymerIndel || c.category == KmVariantCategory::NoisyCandHom) continue;
         int a = kmGetAllele(s, oi, uint32_t(ci));
         if (a < 0) continue;
         for (int h = 1; h <= 2; h++) {
@@ -607,7 +1335,8 @@ static int kmAssignOverlapHap(KmScratchpad& s, uint32_t oi, uint32_t flags) {
     return mxS > 0 ? mxH : 3 - mnH;
 }
 
-static void kmUpdateProfiles(KmScratchpad& s, uint32_t oi, int hap, uint32_t flags) {
+/// Phase 1: update profiles AND consensus per overlap (pgphase update_var_hap_profile_cons_alle).
+static void kmUpdateProfilesAndCons(KmScratchpad& s, uint32_t oi, int hap, uint32_t flags, bool isOnt) {
     const auto& prof = s.overlapProfiles[oi];
     if (prof.startVarIdx < 0) return;
     for (int ci = prof.startVarIdx; ci <= prof.endVarIdx; ci++) {
@@ -617,10 +1346,27 @@ static void kmUpdateProfiles(KmScratchpad& s, uint32_t oi, int hap, uint32_t fla
         if (a < 0 || a >= int(c.hapAlleProfile[1].size())) continue;
         if (hap == 0) {
             c.hapAlleProfile[1][a]++; c.hapAlleProfile[2][a]++;
-            kmUpdateConsAlle(c, 1); kmUpdateConsAlle(c, 2);
+            kmUpdateConsAlle(c, 1, isOnt); kmUpdateConsAlle(c, 2, isOnt);
         } else {
             c.hapAlleProfile[hap][a]++;
-            kmUpdateConsAlle(c, hap);
+            kmUpdateConsAlle(c, hap, isOnt);
+        }
+    }
+}
+
+/// Phase 2: update profiles only, no consensus (pgphase update_var_hap_profile).
+static void kmUpdateProfilesOnly(KmScratchpad& s, uint32_t oi, int hap, uint32_t flags) {
+    const auto& prof = s.overlapProfiles[oi];
+    if (prof.startVarIdx < 0) return;
+    for (int ci = prof.startVarIdx; ci <= prof.endVarIdx; ci++) {
+        auto& c = s.candidates[ci];
+        if ((c.categoryFlag & flags) == 0) continue;
+        int a = kmGetAllele(s, oi, uint32_t(ci));
+        if (a < 0 || a >= int(c.hapAlleProfile[1].size())) continue;
+        if (hap == 0) {
+            c.hapAlleProfile[1][a]++; c.hapAlleProfile[2][a]++;
+        } else {
+            c.hapAlleProfile[hap][a]++;
         }
     }
 }
@@ -670,7 +1416,17 @@ static bool kmPhaseSetFlip(KmScratchpad& scratch,
             if (nAgree[vi] < int(opts.minSpanningReads) && nConflict[vi] < int(opts.minSpanningReads))
                 ps = int32_t(c.key.pos);
             else if (nConflict[vi] > nAgree[vi]) flip ^= 1;
-            if (flip == 1) { changed = true; swap(c.hapConsAlle[1], c.hapConsAlle[2]); }
+            if (flip == 1) {
+                changed = true;
+                // pgphase longcallD: swap loop for hap=1..PLOID (=2) does two swaps
+                // that cancel out (net identity). We replicate this no-op behavior.
+                // The flip only affects `changed` (forces another iteration).
+                for (int h = 1; h <= 2; h++) {
+                    int tmp = c.hapConsAlle[h];
+                    c.hapConsAlle[h] = c.hapConsAlle[3-h];
+                    c.hapConsAlle[3-h] = tmp;
+                }
+            }
         }
         c.phaseSet = ps;
     }
@@ -694,15 +1450,28 @@ static void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uin
     if (scratch.validVarIdx.empty()) return;
 
     // Init allele profiles.
+    // pgphase: hapAlleProfile[0] is only zeroed on first init (when [1] and [2] are empty).
     for (uint32_t ci : scratch.validVarIdx) {
         auto& c = scratch.candidates[ci];
         int na = kmAlleSlots(c);
-        c.hapAlleProfile[0].assign(na, 0);
+        bool firstInit = c.hapAlleProfile[1].empty() && c.hapAlleProfile[2].empty();
+        if (firstInit) c.hapAlleProfile[0].assign(na, 0);
         c.hapAlleProfile[1].assign(na, 0);
         c.hapAlleProfile[2].assign(na, 0);
-        if (c.category == KmVariantCategory::CleanHom) { c.hapConsAlle[1] = 1; c.hapConsAlle[2] = 1; }
+        if (c.category == KmVariantCategory::CleanHom ||
+            c.category == KmVariantCategory::NoisyCandHom) { c.hapConsAlle[1] = 1; c.hapConsAlle[2] = 1; }
         else { c.hapConsAlle[1] = -1; c.hapConsAlle[2] = -1; }
-        c.hapConsAlle[0] = (c.refCov >= c.altCov) ? 0 : 1;
+        // pgphase get_var_init_max_cov_allele: argmax of allele coverages.
+        // ONT guard: homopolymer indels get -1 (no initial consensus).
+        int maxCov = 0, maxAlle = -1;
+        if (opts.isOnt && c.isHomopolymerIndel) { c.hapConsAlle[0] = -1; continue; }
+        int na0 = int(c.alleCovs.empty() ? 2 : c.alleCovs.size());
+        for (int a = 0; a < na0; a++) {
+            int cov = c.alleCovs.empty() ? (a == 0 ? c.refCov : (a == 1 ? c.altCov : 0))
+                                         : c.alleCovs[a];
+            if (cov > maxCov) { maxCov = cov; maxAlle = a; }
+        }
+        c.hapConsAlle[0] = maxAlle;
     }
 
     // Phase 1: seed from pivot.
@@ -712,41 +1481,83 @@ static void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uin
       pc.hapConsAlle[1] = 0; pc.hapConsAlle[2] = 1; }
 
     for (auto& ov : scratch.overlaps) { ov.hap = 0; ov.phaseSet = -1; }
-    for (uint32_t oi = 0; oi < numOv; oi++) {
-        int hap = kmAssignOverlapHap(scratch, oi, flags);
-        if (hap > 0) { scratch.overlaps[oi].hap = hap; kmUpdateProfiles(scratch, oi, hap, flags); }
-        else if (hap == 0) kmUpdateProfiles(scratch, oi, 0, flags);
-    }
-    for (uint32_t ci : scratch.validVarIdx) {
-        kmUpdateConsAlle(scratch.candidates[ci], 1);
-        kmUpdateConsAlle(scratch.candidates[ci], 2);
-    }
 
-    // Phase 2: iterative refinement.
+    // Phase 1: variant-centric sweep from pivot outward.
+    // pgphase: for each variant in sweep order, find overlaps covering it,
+    // assign unassigned reads, update profiles+consensus.
+    // Sweep order: [pivot, pivot-1, ..., 0, pivot+1, ..., nv-1].
+    // HOM variants are skipped in Phase 1.
+    const bool isOnt = opts.isOnt;
+    const int nv = int(scratch.validVarIdx.size());
+    vector<int> sweepOrder(nv);
+    sweepOrder[0] = pivotVi;
+    for (int vi = pivotVi - 1; vi >= 0; --vi) sweepOrder[pivotVi - vi] = vi;
+    for (int vi = pivotVi + 1; vi < nv; ++vi) sweepOrder[vi] = vi;
+
+    for (int idx = 0; idx < nv; idx++) {
+        uint32_t ci = scratch.validVarIdx[sweepOrder[idx]];
+        const auto& c = scratch.candidates[ci];
+        // pgphase: skip HOM in Phase 1 (both CleanHom and NoisyCandHom).
+        if (c.category == KmVariantCategory::CleanHom ||
+            c.category == KmVariantCategory::NoisyCandHom) continue;
+
+        // Find all overlaps covering this candidate position.
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            if (scratch.overlaps[oi].hap != 0) continue; // already assigned
+            const auto& prof = scratch.overlapProfiles[oi];
+            if (prof.startVarIdx < 0) continue;
+            if (int(ci) < prof.startVarIdx || int(ci) > prof.endVarIdx) continue;
+
+            int hap = kmAssignOverlapHap(scratch, oi, flags);
+            // pgphase: if hap == -1, seed as hap 1.
+            if (hap == -1) hap = 1;
+            scratch.overlaps[oi].hap = hap;
+            kmUpdateProfilesAndCons(scratch, oi, hap, flags, isOnt);
+        }
+    }
+    // Phase 2: iterative refinement — batch profile update, then batch consensus
+    // (pgphase iter_update_var_hap_to_cons_alle: profiles only per read,
+    //  then update_var_hap_to_cons_alle for all vars after all reads).
     for (uint32_t iter = 0; iter < opts.maxKmeansIter; iter++) {
-        kmPhaseSetFlip(scratch, scratch.validVarIdx, opts);
+        // Phase-set flip detection (pgphase iter_update_var_hap_cons_phase_set).
+        bool flipChanged = kmPhaseSetFlip(scratch, scratch.validVarIdx, opts);
+
+        // Save old consensus for convergence check.
+        vector<array<int,3>> savedCons(scratch.validVarIdx.size());
+        for (size_t vi = 0; vi < scratch.validVarIdx.size(); vi++)
+            savedCons[vi] = scratch.candidates[scratch.validVarIdx[vi]].hapConsAlle;
+
+        // Reset profiles (pgphase var_init_hap_to_alle_profile).
         for (uint32_t ci : scratch.validVarIdx) {
             auto& c = scratch.candidates[ci]; int na = kmAlleSlots(c);
             c.hapAlleProfile[0].assign(na, 0);
             c.hapAlleProfile[1].assign(na, 0);
             c.hapAlleProfile[2].assign(na, 0);
         }
-        bool anyChanged = false;
+
+        // Assign all overlaps and update profiles only (no consensus).
+        // pgphase: if hap == -1, treat as 0 (unassigned) and still update profiles.
         for (uint32_t oi = 0; oi < numOv; oi++) {
-            int oldH = scratch.overlaps[oi].hap;
             int newH = kmAssignOverlapHap(scratch, oi, flags);
-            if (newH > 0) { scratch.overlaps[oi].hap = newH; kmUpdateProfiles(scratch, oi, newH, flags); }
-            else { scratch.overlaps[oi].hap = 0; if (newH == 0) kmUpdateProfiles(scratch, oi, 0, flags); }
-            if (scratch.overlaps[oi].hap != oldH) anyChanged = true;
+            if (newH == -1) newH = 0;
+            scratch.overlaps[oi].hap = newH;
+            kmUpdateProfilesOnly(scratch, oi, newH, flags);
         }
-        bool consChanged = false;
+
+        // Batch consensus update after all overlaps (pgphase update_var_hap_to_cons_alle).
         for (uint32_t ci : scratch.validVarIdx) {
-            auto& c = scratch.candidates[ci];
-            int o1 = c.hapConsAlle[1], o2 = c.hapConsAlle[2];
-            kmUpdateConsAlle(c, 1); kmUpdateConsAlle(c, 2);
-            if (c.hapConsAlle[1] != o1 || c.hapConsAlle[2] != o2) consChanged = true;
+            kmUpdateConsAlle(scratch.candidates[ci], 1, isOnt);
+            kmUpdateConsAlle(scratch.candidates[ci], 2, isOnt);
         }
-        if (!anyChanged && !consChanged) break;
+
+        // Convergence check: break when both phase-set flip and consensus unchanged
+        // (pgphase: if (c1 == 0 && c2 == 0) break).
+        bool consChanged = false;
+        for (size_t vi = 0; vi < scratch.validVarIdx.size(); vi++) {
+            const auto& cur = scratch.candidates[scratch.validVarIdx[vi]].hapConsAlle;
+            if (cur[1] != savedCons[vi][1] || cur[2] != savedCons[vi][2]) { consChanged = true; break; }
+        }
+        if (!flipChanged && !consChanged) break;
     }
 
     // Phase 3: assign phase sets to overlaps.
@@ -763,11 +1574,24 @@ static void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uin
         }
     }
 
-    // Phase 4: fill hapAlt/hapRef.
-    for (uint32_t ci : scratch.validVarIdx) {
-        auto& c = scratch.candidates[ci];
-        if (c.hapConsAlle[1] == 1) { c.hapAlt = 1; c.hapRef = 2; }
-        else if (c.hapConsAlle[2] == 1) { c.hapAlt = 2; c.hapRef = 1; }
+    // Phase 4: fill hapAlt/hapRef (pgphase: iterate all candidates, not just valid).
+    for (auto& c : scratch.candidates) {
+        int c1 = c.hapConsAlle[1];
+        int c2 = c.hapConsAlle[2];
+        c.hapAlt = 0;
+        c.hapRef = 0;
+        // pgphase: both -1 → fall back to hapConsAlle[0] (hom_idx).
+        if (c1 == -1 && c2 == -1) {
+            c1 = c2 = c.hapConsAlle[0];
+        }
+        if (c1 == -1) c1 = 0; // unknown hap → ref
+        if (c2 == -1) c2 = 0;
+        const bool h1Alt = (c1 != 0);
+        const bool h2Alt = (c2 != 0);
+        if (h1Alt && h2Alt)       { c.hapAlt = 3; c.hapRef = 0; }
+        else if (h1Alt && !h2Alt) { c.hapAlt = 1; c.hapRef = 2; }
+        else if (!h1Alt && h2Alt) { c.hapAlt = 2; c.hapRef = 1; }
+        // both ref/unresolved: leave hapAlt/hapRef as 0/0
     }
 }
 
@@ -789,7 +1613,7 @@ static void kmWriteResults(
 // Public entry point
 // ============================================================================
 
-void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
+void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
 {
     cout << timestamp << "=== K-means Overlap Phasing ===" << endl;
     const uint64_t readCount = getReads().readCount();
@@ -797,6 +1621,9 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
     if (readCount == 0) { cout << timestamp << "No reads." << endl; return; }
 
     KmPhasingOptions opts;
+    opts.isOnt = isOnt;
+    if (isOnt) cout << timestamp << "ONT mode: Fisher exact strand bias filter enabled (p < "
+                    << opts.strandBiasPval << ")" << endl;
     atomic<uint64_t> readsProcessed(0), readsWithOverlaps(0), readsWithSites(0);
     atomic<uint64_t> totalCis(0), totalTrans(0), totalNoisyRegions(0);
 
@@ -836,10 +1663,14 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
                 scratch.backboneBases.resize(bbLen);
                 auto seq = getReads().getRead(readId);
                 for (uint32_t i = 0; i < bbLen; i++) scratch.backboneBases[i] = seq[i].value;
+                // pgphase populate_low_complexity_intervals: sdust on backbone.
+                kmSdust(scratch.backboneBases.data(), int(bbLen),
+                        int(opts.sdustThreshold), int(opts.sdustWindow),
+                        scratch.lowComplexity);
                 t1 = clk::now(); tt.unpack += us(t0,t1);
 
                 t0 = clk::now();
-                kmParseCigars(*this, readId, bbLen, scratch);
+                kmParseCigars(*this, readId, bbLen, scratch, opts);
                 t1 = clk::now(); tt.detect += us(t0,t1);
 
                 t0 = clk::now();
@@ -847,7 +1678,9 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount)
                 kmCountAlleles(scratch, opts.minSvLen);
                 t1 = clk::now(); tt.count += us(t0,t1);
 
+                // pgphase step 2.1: pre-process per-overlap noisy regions before classification.
                 t0 = clk::now();
+                kmPreProcessNoisyRegs(scratch, opts);
                 kmClassifyCandidates(bbLen, scratch, opts);
                 t1 = clk::now(); tt.classify += us(t0,t1);
                 totalNoisyRegions += scratch.noisyRegions.size();
