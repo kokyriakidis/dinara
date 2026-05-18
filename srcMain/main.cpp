@@ -1049,21 +1049,31 @@ void dinara::main::assemble(
     // // Parameters match hifiasm defaults: max_hang=1000, max_hang_rate=0.8, min_ovlp=50.
     // assembler.flagContainedReads(1000, 0.8, 50, threadCount);
 
-    // Delete internal overlaps (excessive overhangs or too short).
-    assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
+    // // Delete internal overlaps (excessive overhangs or too short).
+    // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
 
-    // Keep one best chain per read pair (hifiasm dedup_chains port).
-    // Secondary chains create extra ordinal-pair merges in the marker graph
-    // disjoint set, amplifying transitive closure contamination.
-    assembler.dedupChainsPrePhasing(threadCount);
+    // // Keep one best chain per read pair (hifiasm dedup_chains port).
+    // // Secondary chains create extra ordinal-pair merges in the marker graph
+    // // disjoint set, amplifying transitive closure contamination.
+    // assembler.dedupChainsPrePhasing(threadCount);
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
 
-    // Build read graph: contained reads keep only their best alignment
-    // to a non-contained read, preventing them from bridging during transitive closure.
-    assembler.createReadGraphAllAlignments(/*pruneContained=*/ true);
+
+    // assembler.phaseOverlaps(threadCount);
+    assembler.phaseOverlapsKmeans(threadCount);
+
+    // assembler.performHifiasmECParity(threadCount);
+
+
+
+    // // Build read graph: contained reads keep only their best alignment
+    // // to a non-contained read, preventing them from bridging during transitive closure.
+    // assembler.createReadGraphAllAlignments(/*pruneContained=*/ false);
+
+    assembler.createReadGraphFromPhasingCisOverlaps();
 
     // Set min and max marker graph vertex coverage thresholds.
     const uint64_t minAnchorCoverage = 2;
@@ -1081,20 +1091,17 @@ void dinara::main::assemble(
 
 
 
-    // assembler.phaseOverlaps(threadCount);
-    assembler.phaseOverlapsKmeans(threadCount);
-
-    // assembler.performHifiasmECParity(threadCount);
-
-    // assembler.createReadGraphFromPhasingCisOverlaps();
     
-    // // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
-    // // This reduces unreliable anchors and artifacts in repetitive regions.
-    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
 
-    // // Filter marker graph vertices whose marker k-mers have low sequence complexity
-    // // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
-    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    
+    
+    // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
+    // This reduces unreliable anchors and artifacts in repetitive regions.
+    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+
+    // Filter marker graph vertices whose marker k-mers have low sequence complexity
+    // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
+    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
     // Find the reverse complement of each marker graph vertex.
     // We need the reverse complement vertices to be populated for anchor generation.
@@ -1161,27 +1168,27 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
-    // Partition anchor journeys into disjoint windows.
-    // Reuses readIdsSortedByLength from above (already sorted longest-first).
-    vector<AnchorWindow> anchorWindows;
-    assembler.computeAnchorWindows(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        readIdsSortedByLength,
-        anchorWindows,
-        threadCount);
+    // // Partition anchor journeys into disjoint windows.
+    // // Reuses readIdsSortedByLength from above (already sorted longest-first).
+    // vector<AnchorWindow> anchorWindows;
+    // assembler.computeAnchorWindows(
+    //     assembler.shasta2Anchors,
+    //     assembler.shasta2Journeys,
+    //     readIdsSortedByLength,
+    //     anchorWindows,
+    //     threadCount);
 
-    // Test multi-segment MSA on one window.
-    assembler.testMultiSegmentMSA(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        anchorWindows);
+    // // Test multi-segment MSA on one window.
+    // assembler.testMultiSegmentMSA(
+    //     assembler.shasta2Anchors,
+    //     assembler.shasta2Journeys,
+    //     anchorWindows);
 
-    // Test direct-overlap MSA for read 0-0.
-    assembler.testDirectOverlapMSA(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        ReadId(0));
+    // // Test direct-overlap MSA for read 0-0.
+    // assembler.testDirectOverlapMSA(
+    //     assembler.shasta2Anchors,
+    //     assembler.shasta2Journeys,
+    //     ReadId(0));
 
     return;
 
