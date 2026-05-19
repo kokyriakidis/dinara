@@ -1044,14 +1044,6 @@ void dinara::main::assemble(
                    reads.getReadRawSequenceLength(b);
         });
 
-    // // Flag contained reads so createMarkerGraphVertices can skip them.
-    // // Contained reads overlap with different regions and can bridge during transitive closure.
-    // // Parameters match hifiasm defaults: max_hang=1000, max_hang_rate=0.8, min_ovlp=50.
-    // assembler.flagContainedReads(1000, 0.8, 50, threadCount);
-
-    // // Delete internal overlaps (excessive overhangs or too short).
-    // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
-
     // // Keep one best chain per read pair (hifiasm dedup_chains port).
     // // Secondary chains create extra ordinal-pair merges in the marker graph
     // // disjoint set, amplifying transitive closure contamination.
@@ -1067,13 +1059,52 @@ void dinara::main::assemble(
 
     // assembler.performHifiasmECParity(threadCount);
 
+    // ---- Post-phasing overlap cleaning (hifiasm order: Overlaps.cpp:39390-39726) ----
 
+    // // 1. Remove weak overlaps (no het sites) contradicted by strong+trans chains.
+    // //    Port of clean_weak_ma_hit_t. HiFi only (hifiasm skips for ONT).
+    // assembler.cleanWeakOverlaps();
 
-    // // Build read graph: contained reads keep only their best alignment
-    // // to a non-contained read, preventing them from bridging during transitive closure.
-    // assembler.createReadGraphAllAlignments(/*pruneContained=*/ false);
+    // 2. Coverage-based read trimming: compute per-read coverage profile from
+    //    overlaps, find longest contiguous region with coverage >= min_dp.
+    //    Port of ma_hit_sub. Default min_dp=0 (asm_opt.min_overlap_coverage)
+    //    makes this a no-op (just initializes validReadIntervals to full read
+    //    length), but it must run because steps 3-5 depend on the intervals.
+    assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
 
+    // 3. Chimeric read detection: flag reads where left-side and right-side
+    //    overlaps don't connect (gap in the middle).
+    //    Port of detect_chimeric_reads. Uses max_ov_diff_final*2.0 = 0.06.
+    assembler.detectChimericReads(threadCount);
+
+    // 4. Clip overlap coordinates to trimmed coverage_cut intervals and delete
+    //    internal/short overlaps via ma_hit2arc classification.
+    //    Port of ma_hit_cut + ma_hit_flt.
+    //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
+    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+
+    // 5. Flag and remove contained reads. For each containment overlap, the
+    //    contained read is deleted entirely. Containment chains resolved
+    //    transitively.
+    //    Port of ma_hit_contained_advance.
+    //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
+    assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+
+    // 6. Rescue overlaps with directional cis/trans disagreement.
+    //    Port of try_rescue_overlaps.
+    //    skipDeleted=true for ONT (hifiasm's is_del=1).
+    assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
+
+    // 7. Build read graph from surviving overlaps.
+    //    Keeps overlaps that are not deleted and not trans on either side.
+    //    Unlabeled (state 0) overlaps that survived earlier stages are kept.
+    //    Port of ma_sg_gen (string graph construction from sources[]).
     assembler.createReadGraphFromPhasingCisOverlaps();
+
+    // 8. Transitive reduction: remove redundant edges where v→x can be
+    //    reached through v→w→x within fuzz tolerance.
+    //    Port of asg_arc_del_trans.
+    assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
 
     // Set min and max marker graph vertex coverage thresholds.
     const uint64_t minAnchorCoverage = 2;
