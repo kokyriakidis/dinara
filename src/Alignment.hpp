@@ -555,6 +555,7 @@ public:
     static constexpr DeleteReasonMask DeleteReasonPalindromic = 1u << 8; // palindromic read filtering
     static constexpr DeleteReasonMask DeleteReasonContainedPrune = 1u << 9; // keep best overlap for contained reads
     static constexpr DeleteReasonMask DeleteReasonClique        = 1u << 10; // regional interval clique filter
+    static constexpr DeleteReasonMask DeleteReasonWeakContradicted = 1u << 11; // clean_weak_ma_hit_t: weak overlap contradicted by strong+trans chain
 
     // The AlignmentInfo computed with the first read on strand 0.
     AlignmentInfo info;

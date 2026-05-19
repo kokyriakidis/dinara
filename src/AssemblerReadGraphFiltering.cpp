@@ -43,17 +43,6 @@ using namespace dinara;
 using namespace std;
 
 namespace {
-    inline bool isDeletedFromReadPerspective(const dinara::AlignmentData& ad, dinara::ReadId readId)
-    {
-        if (ad.readIds[0] == readId) {
-            return ad.isDeleted0();
-        } else {
-            return ad.isDeleted1();
-        }
-    }
-}
-
-namespace {
     inline bool boundaryVerify(
         const Reads& reads,
         uint32_t qIntervalStart,
@@ -93,11 +82,32 @@ depth >= `minCoverage`:
 
 When `minCoverage <= 1`, hifiasm keeps the full read as the valid region, so we do the same.
 */
+/*
+ma_hit_sub (hifiasm) — exact port.
+
+Computes a per-read valid interval by finding the longest contiguous region
+where overlap depth >= minCoverage.
+
+When minCoverage <= 1 (the default, asm_opt.min_overlap_coverage = 0), this
+is a no-op: every read gets validReadIntervals = [0, readLen).  The function
+must still run because downstream stages (detectChimericReads,
+deleteInternalOverlaps, flagContainedReads) read validReadIntervals.
+
+When minCoverage >= 2, the algorithm:
+  1. Collects all overlap intervals on the read (from one orientation only,
+     matching hifiasm's sources[r] adjacency list to avoid double-counting).
+  2. Builds a sweep-line depth profile using +1/-1 events.
+  3. Finds the longest interval where depth >= minCoverage.
+  4. Stores the result in validReadIntervals[r].
+
+Reads with no valid interval get isDeleted = true, which causes downstream
+stages to skip them (equivalent to hifiasm's coverage_cut[r].del = 1).
+*/
 void Assembler::filterLocalSegments(
     uint64_t minCoverage,
     uint64_t threadCount)
 {
-    cout << timestamp << "Filtering local segments (ma_hit_sub equivalent, minCoverage="
+    cout << timestamp << "filterLocalSegments begins (minCoverage="
          << minCoverage << ")." << endl;
 
     const uint64_t readCount = reads->readCount();
@@ -108,7 +118,6 @@ void Assembler::filterLocalSegments(
     setupLoadBalancing(readCount, 100);
     runThreads(&Assembler::filterLocalSegmentsThreadFunction, threadCount);
 
-    // Compute diagnostics
     uint64_t readsWithValidIntervals = 0;
     uint64_t readsDeleted = 0;
     uint64_t totalValidBases = 0;
@@ -125,7 +134,7 @@ void Assembler::filterLocalSegments(
         }
     }
 
-    cout << timestamp << "Local segment filtering (ma_hit_sub): "
+    cout << timestamp << "filterLocalSegments: "
          << readsWithValidIntervals << " reads with valid intervals, "
          << readsDeleted << " reads deleted ("
          << (readCount - readsDeleted) << " remaining). "
@@ -306,198 +315,115 @@ void Assembler::applyOntChemicalArcMaskThreadFunction(size_t threadId)
 
 void Assembler::filterLocalSegmentsThreadFunction(size_t threadId)
 {
-    /*
-    ============================================================================
-    ma_hit_sub (miniasm/hifiasm) thread function - COMPLETE PARITY VERIFIED
-    ============================================================================
-
-    This function computes a per-read high-coverage interval that represents the
-    "valid" portion of each read for subsequent assembly steps.
-
-    HIFIASM ALGORITHM (ma_hit_sub):
-    --------------------------------
-    For each read r:
-      1. Collect all overlaps involving r (from r's perspective only, to avoid double-counting)
-      2. Build a sweep-line depth profile over the read coordinates
-      3. Find the longest interval where overlap depth >= minCoverage
-      4. Store this interval as coverage_cut[r].s and coverage_cut[r].e
-      5. Special case: if minCoverage <= 1, keep the full read [0, length)
-
-    KEY IMPLEMENTATION DETAILS FOR HIFIASM PARITY:
-    -----------------------------------------------
-    1. **Single orientation query** (lines 311-331):
-       - Only process alignmentTable[OrientedReadId(r0, 0)]
-       - This matches hifiasm's sources[r0] adjacency list structure
-       - Avoids double-counting: each overlap appears once per read
-
-    2. **Skip deleted overlaps** (line 314):
-       - isDeletedFromReadPerspective checks if overlap is deleted from r0's side
-       - Matches hifiasm's per-read deletion flags
-
-    3. **Sweep-line algorithm** (lines 338-378):
-       - Events: +1 for interval start, -1 for interval end
-       - Sort events by position, with starts before ends at same position
-       - Track coverage depth as we sweep through the read
-       - Find the longest interval where depth >= minCoverage
-
-    4. **Special case for minCoverage <= 1** (lines 302-306):
-       - Hifiasm: when minDp <= 1, keep full read without computation
-       - Sets validReadIntervals[r0] = {0, readLength, false}
-
-    OUTPUT:
-    -------
-    validReadIntervals[r0] contains:
-      - start: beginning of high-coverage interval
-      - end: end of high-coverage interval
-      - isDeleted: true if no valid interval found (corresponds to coverage_cut[r].del = 1)
-
-    This interval will be used by ma_hit_cut (applyCoverageCuts) to clip overlaps
-    to the valid read regions.
-    */
     static_cast<void>(threadId);
-    const uint64_t minDp = this->localSegmentMinCoverage;
+    const uint64_t minDepth = this->localSegmentMinCoverage;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
-        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); r0++) {
-            /*
-            HIFIASM SPECIAL CASE: minCoverage <= 1
-            ---------------------------------------
-            When minDp <= 1, hifiasm's ma_hit_sub keeps the full read as the valid region
-            without computing coverage intervals. This matches the behavior:
-              coverage_cut[r].s = 0
-              coverage_cut[r].e = read_length
-              coverage_cut[r].del = 0
-            */
-            if (minDp <= 1) {
-                 uint64_t len = reads->getReadRawSequenceLength(r0);
-                 validReadIntervals[r0] = {0, (uint32_t)len, false};
-                 continue;
-            }
+        for(ReadId readId = ReadId(begin); readId != ReadId(end); readId++) {
 
-            /*
-            STEP 1: Collect overlap intervals for read r0
-            ----------------------------------------------
-            Hifiasm ma_hit_sub collects overlaps from sources[r0], which contains one
-            copy of each overlap involving r0. We replicate this by querying only
-            alignmentTable[OrientedReadId(r0, 0)] to avoid double-counting.
-            */
-            std::vector<std::pair<uint32_t, uint32_t>> intervals;
-
-            auto collectIntervals = [&](OrientedReadId orientedR0) {
-                const auto& table = alignmentTable[orientedR0.getValue()];
-                for (uint32_t alignmentId : table) {
-                    const auto& ad = alignmentData[alignmentId];
-
-                    // Skip overlaps deleted from r0's perspective
-                    if (isDeletedFromReadPerspective(ad, r0)) continue;
-
-                    // Extract interval on r0 (query or target depending on role)
-                    uint32_t start = 0, end = 0;
-                    if (ad.readIds[0] == r0) {
-                        start = ad.qs;
-                        end = ad.qe;
-                    } else {
-                        start = ad.ts;
-                        end = ad.te;
-                    }
-
-                    // Add non-empty interval
-                    if (end > start) {
-                        intervals.push_back({start, end});
-                    }
-                }
-            };
-            collectIntervals(OrientedReadId(r0, 0));
-
-            /*
-            HIFIASM BEHAVIOR: No valid overlaps
-            ------------------------------------
-            If no overlaps remain after filtering, mark the read as deleted:
-              coverage_cut[r].del = 1
-            */
-            if (intervals.empty()) {
-                validReadIntervals[r0] = {0, 0, true};
+            // ---------------------------------------------------------------
+            // Fast path: minDepth <= 1.
+            //
+            // hifiasm's ma_hit_sub skips all sweep-line computation when
+            // min_dp <= 1 and sets coverage_cut[r] = {0, readLen, del=0}.
+            // With the default asm_opt.min_overlap_coverage = 0, this is
+            // always taken — every read gets the full [0, readLen) interval.
+            // ---------------------------------------------------------------
+            if (minDepth <= 1) {
+                const uint32_t readLen = uint32_t(reads->getReadRawSequenceLength(readId));
+                validReadIntervals[readId] = {0, readLen, false};
                 continue;
             }
 
-            /*
-            STEP 2: Build sweep-line events
-            --------------------------------
-            Hifiasm ma_hit_sub uses a sweep-line algorithm to find the longest interval
-            with coverage >= minDp:
-              - Event +1: interval start (coverage increases)
-              - Event -1: interval end (coverage decreases)
-              - Sort events by position, with starts (+1) before ends (-1) at same position
-            */
-            std::vector<std::pair<uint32_t, int>> events;
-            events.reserve(intervals.size() * 2);
-            for(const auto& interval : intervals) {
-                events.push_back({interval.first, 1});   // +1 = start
-                events.push_back({interval.second, -1}); // -1 = end
+            // ---------------------------------------------------------------
+            // Collect overlap intervals on this read.
+            //
+            // Query only alignmentTable[OrientedReadId(readId, 0)] — this
+            // contains all overlaps involving readId exactly once, matching
+            // hifiasm's sources[r] adjacency list.
+            // ---------------------------------------------------------------
+            std::vector<std::pair<uint32_t, uint32_t>> intervals;
+
+            const auto& table = alignmentTable[OrientedReadId(readId, 0).getValue()];
+            for (uint32_t alignmentId : table) {
+                const auto& ad = alignmentData[alignmentId];
+                if (!ad.keptByBothSides()) continue;
+
+                uint32_t ovlpStart = 0, ovlpEnd = 0;
+                if (ad.readIds[0] == readId) {
+                    ovlpStart = ad.qs;
+                    ovlpEnd   = ad.qe;
+                } else {
+                    ovlpStart = ad.ts;
+                    ovlpEnd   = ad.te;
+                }
+
+                if (ovlpEnd > ovlpStart) {
+                    intervals.push_back({ovlpStart, ovlpEnd});
+                }
             }
 
-            // Sort by position, then by event type (start before end at same position)
-            std::sort(events.begin(), events.end(), [](const pair<uint32_t, int>& a, const pair<uint32_t, int>& b){
-                if (a.first != b.first) return a.first < b.first;
-                return a.second > b.second; // +1 (start) before -1 (end)
-            });
+            // No overlaps → mark read as deleted (coverage_cut[r].del = 1).
+            if (intervals.empty()) {
+                validReadIntervals[readId] = {0, 0, true};
+                continue;
+            }
 
-            /*
-            STEP 3: Sweep through events to find longest high-coverage interval
-            --------------------------------------------------------------------
-            Hifiasm ma_hit_sub finds the longest interval where depth >= minDp:
-              - Track current coverage depth as we process events
-              - When coverage transitions from <minDp to >=minDp: start new segment
-              - When coverage transitions from >=minDp to <minDp: close segment
-              - Keep track of the longest segment found
-            */
-            int coverage = 0;
-            uint32_t maxS = 0, maxE = 0;          // Longest high-coverage interval found
-            uint32_t currentStart = 0;             // Start of current segment
-            bool inSegment = false;                // Are we currently in a high-coverage segment?
+            // ---------------------------------------------------------------
+            // Sweep-line: find the longest interval with depth >= minDepth.
+            //
+            // Build +1/-1 events, sort by position (starts before ends at
+            // the same position), then sweep tracking depth transitions.
+            // ---------------------------------------------------------------
+            std::vector<std::pair<uint32_t, int>> events;
+            events.reserve(intervals.size() * 2);
+            for (const auto& interval : intervals) {
+                events.push_back({interval.first,  +1});
+                events.push_back({interval.second, -1});
+            }
 
-            for(const auto& ev : events) {
-                int oldCoverage = coverage;
-                coverage += ev.second;             // Update coverage (+1 or -1)
-                uint32_t pos = ev.first;           // Event position
+            // Sort: by position, then starts (+1) before ends (-1).
+            std::sort(events.begin(), events.end(),
+                [](const pair<uint32_t, int>& a, const pair<uint32_t, int>& b) {
+                    if (a.first != b.first) return a.first < b.first;
+                    return a.second > b.second;
+                });
 
-                // Transition into high-coverage region (coverage crosses minDp threshold upward)
-                if (oldCoverage < (int)minDp && coverage >= (int)minDp) {
-                    currentStart = pos;
+            int depth = 0;
+            uint32_t longestStart = 0, longestEnd = 0;
+            uint32_t segmentStart = 0;
+            bool inSegment = false;
+
+            for (const auto& ev : events) {
+                const int oldDepth = depth;
+                depth += ev.second;
+                const uint32_t pos = ev.first;
+
+                // Crossed threshold upward: start a new segment.
+                if (oldDepth < (int)minDepth && depth >= (int)minDepth) {
+                    segmentStart = pos;
                     inSegment = true;
                 }
-                // Transition out of high-coverage region (coverage drops below minDp threshold)
-                else if (oldCoverage >= (int)minDp && coverage < (int)minDp) {
+                // Crossed threshold downward: close segment, keep if longest.
+                else if (oldDepth >= (int)minDepth && depth < (int)minDepth) {
                     if (inSegment) {
-                        uint32_t currentLen = pos - currentStart;
-                        uint32_t maxLen = maxE - maxS;
-
-                        // Keep this segment if it's longer than the previous best
-                        if (currentLen > maxLen) {
-                            maxS = currentStart;
-                            maxE = pos;
+                        const uint32_t segmentLen = pos - segmentStart;
+                        const uint32_t longestLen = longestEnd - longestStart;
+                        if (segmentLen > longestLen) {
+                            longestStart = segmentStart;
+                            longestEnd   = pos;
                         }
                         inSegment = false;
                     }
                 }
             }
 
-            /*
-            STEP 4: Store result
-            --------------------
-            Hifiasm ma_hit_sub sets:
-              - coverage_cut[r].s = maxS (start of longest high-coverage interval)
-              - coverage_cut[r].e = maxE (end of longest high-coverage interval)
-              - coverage_cut[r].del = (maxE <= maxS ? 1 : 0) (no valid interval found)
-
-            We store this in validReadIntervals[r0] for use by subsequent stages.
-            */
-            if (maxE > maxS) {
-                validReadIntervals[r0] = {maxS, maxE, false};
+            // Store result.
+            if (longestEnd > longestStart) {
+                validReadIntervals[readId] = {longestStart, longestEnd, false};
             } else {
-                // No interval with coverage >= minDp found
-                validReadIntervals[r0] = {0, 0, true};
+                validReadIntervals[readId] = {0, 0, true};
             }
         }
     }
@@ -907,13 +833,48 @@ void Assembler::deleteContainmentOverlapsThreadFunction(size_t threadId)
 }
 
 /*
-deleteInternalOverlaps: Delete overlaps classified as internal or too short by ma_hit2arc.
+ma_hit_cut + ma_hit_flt (hifiasm) — combined port.
 
-Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches:
-  - result -1: internal (excessive overhangs on both reads)
-  - result -2: too short (effective overlap < min_ovlp)
+Classifies each overlap using hifiasm's ma_hit2arc geometry test and deletes
+overlaps that are internal matches or too short.
 
-Uses extended coordinates (ad.qs/qe/ts/te) from chaining.
+ma_hit2arc examines the "overhang" on each side of the overlap:
+
+    5' overhang                              3' overhang
+    |<------->|                              |<------->|
+    query:  ===========XXXXXXXXXXXXXXXXX==============
+                        |||||||||||||||||
+    target:       ======XXXXXXXXXXXXXXXXX=======
+                  |<--->|               |<----->|
+                  tl5 (target 5' hang)  tl3 (target 3' hang)
+
+    ext5 = min(qs, tl5)    — the smaller of the two 5' overhangs
+    ext3 = min(ql-qe, tl3) — the smaller of the two 3' overhangs
+
+Classification:
+  MA_HT_INT (-1):       ext5 or ext3 exceeds maxHang, or the aligned portion
+                         is less than maxHangRate of the total span.  These are
+                         "internal" matches — the overlap sits in the middle of
+                         both reads with large unaligned flanks on both sides.
+  MA_HT_QCONT (-2):     query is contained in target (qs <= tl5 and ql-qe <= tl3).
+  MA_HT_TCONT (-3):     target is contained in query.
+  MA_HT_SHORT_OVLP (-4): effective overlap length < minOverlapLength.
+  >= 0:                  proper dovetail overlap (value = non-overlap node length).
+
+In the post-phasing pipeline, filterLocalSegments runs with minCoverage=0, so
+validReadIntervals are [0, readLen) for all reads.  This makes ma_hit_cut a
+no-op (no coordinate clipping) and ma_hit_flt uses raw read lengths.  We
+therefore use raw read lengths directly, skipping the clipping step.
+
+ad.qs/qe/ts/te store extended coordinates (matching hifiasm's
+append_inexact_overlap_region_alloc), where chain anchor positions are
+extended toward read tips.  These are the same coordinates hifiasm stores
+in ma_hit_t and passes to ma_hit2arc.
+
+Parameters (hifiasm defaults):
+  maxHang          = 1000  (asm_opt.max_hang_Len)
+  maxHangRate      = 0.8   (asm_opt.max_hang_rate)
+  minOverlapLength = 50    (asm_opt.min_overlap_Len)
 */
 void Assembler::deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
@@ -928,27 +889,27 @@ void Assembler::deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uin
     hangingFilterMaxHangRate = maxHangRate;
     hangingFilterMinOverlap = minOverlapLength;
 
-    uint64_t internalBefore = 0;
+    uint64_t deletedBefore = 0;
     for (const auto& ad : alignmentData) {
         if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
             (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
-            ++internalBefore;
+            ++deletedBefore;
         }
     }
 
     setupLoadBalancing(alignmentData.size(), 10000);
     runThreads(&Assembler::deleteInternalOverlapsThreadFunction, threadCount);
 
-    uint64_t internalAfter = 0;
+    uint64_t deletedAfter = 0;
     for (const auto& ad : alignmentData) {
         if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
             (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
-            ++internalAfter;
+            ++deletedAfter;
         }
     }
 
-    cout << timestamp << "Internal overlaps: " << (internalAfter - internalBefore) << " deleted ("
-         << internalAfter << " total)." << endl;
+    cout << timestamp << "Internal overlaps: " << (deletedAfter - deletedBefore) << " deleted ("
+         << deletedAfter << " total)." << endl;
 }
 
 void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
@@ -958,66 +919,73 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
     const uint64_t maxHang = this->hangingFilterMaxHang;
     const double maxHangRate = this->hangingFilterMaxHangRate;
     const uint64_t minOvlp = this->hangingFilterMinOverlap;
-    const uint32_t k = assemblerInfo.isOpen ? uint32_t(assemblerInfo->k) : 0U;
 
     while (getNextBatch(begin, end)) {
         for (uint64_t i = begin; i != end; i++) {
             AlignmentData& ad = alignmentData[i];
+
+            // Skip overlaps already deleted by earlier stages (chimeric, weak, etc.).
+            // Matches hifiasm's "if(p->del) continue" in ma_hit_cut/ma_hit_flt.
             if (!ad.keptByBothSides()) continue;
 
-            ReadId qn = ad.readIds[0];
-            ReadId tn = ad.readIds[1];
-            const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qn));
-            const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(tn));
+            const ReadId queryId  = ad.readIds[0];
+            const ReadId targetId = ad.readIds[1];
+            const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
+            const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
 
-            // Use marker-based coordinates for accurate hang calculation.
-            // Falls back to raw ad.qs/qe/ts/te if markers are unavailable.
-            uint32_t qs, qe, ts, te;
-            bool usedMarkers = false;
-            if(markers && assemblerInfo.isOpen && k > 0) {
-                const OrientedReadId o0(qn, 0);
-                const OrientedReadId o1(tn, ad.isSameStrand ? 0 : 1);
-                const auto m0 = (*markers)[o0.getValue()];
-                const auto m1 = (*markers)[o1.getValue()];
-                if(!m0.empty() && !m1.empty() &&
-                   ad.info.data[0].lastOrdinal < m0.size() &&
-                   ad.info.data[1].lastOrdinal < m1.size()) {
-                    qs = m0[ad.info.data[0].firstOrdinal].position;
-                    qe = m0[ad.info.data[0].lastOrdinal].position + k;
-                    const uint32_t tsCoreOriented = m1[ad.info.data[1].firstOrdinal].position;
-                    const uint32_t teCoreOriented = m1[ad.info.data[1].lastOrdinal].position + k;
-                    if(o1.getStrand() != 0) {
-                        ts = tLen - teCoreOriented;
-                        te = tLen - tsCoreOriented;
-                    } else {
-                        ts = tsCoreOriented;
-                        te = teCoreOriented;
-                    }
-                    usedMarkers = true;
-                }
-            }
-            if(!usedMarkers) {
-                qs = ad.qs; qe = ad.qe; ts = ad.ts; te = ad.te;
-            }
+            // ad.qs/qe/ts/te are extended coordinates (matching hifiasm's
+            // append_inexact_overlap_region_alloc), where chain anchor
+            // positions are extended toward read tips.  These are the same
+            // coordinates hifiasm stores in ma_hit_t and passes to ma_hit2arc.
+            const uint32_t queryStart  = ad.qs;
+            const uint32_t queryEnd    = ad.qe;
+            const uint32_t targetStart = ad.ts;
+            const uint32_t targetEnd   = ad.te;
 
-            if (qe <= qs || te <= ts) continue;
+            // Degenerate overlap: zero or negative length.
+            if (queryEnd <= queryStart || targetEnd <= targetStart) continue;
 
-            const int result = ma_hit2arc(
-                (int32_t)qs, (int32_t)qe, (int32_t)qLen,
-                (int32_t)ts, (int32_t)te, (int32_t)tLen,
+            // ---------------------------------------------------------------
+            // ma_hit2arc classification.
+            //
+            // With minCoverage=0, validReadIntervals are [0, readLen) for all
+            // reads, so ma_hit_cut clipping is a no-op and ma_hit_flt uses
+            // raw read lengths.  We pass raw lengths directly.
+            //
+            // Return values:
+            //   >= 0:            dovetail overlap (keep)
+            //   MA_HT_QCONT:    query contained in target (keep for now,
+            //                    handled by flagContainedReads)
+            //   MA_HT_TCONT:    target contained in query (keep for now)
+            //   MA_HT_INT:      internal match — excessive overhangs (delete)
+            //   MA_HT_SHORT_OVLP: overlap too short (delete)
+            // ---------------------------------------------------------------
+            const int classification = ma_hit2arc(
+                (int32_t)queryStart,  (int32_t)queryEnd,  (int32_t)queryLen,
+                (int32_t)targetStart, (int32_t)targetEnd, (int32_t)targetLen,
                 !ad.isSameStrand,
                 (int32_t)maxHang,
                 maxHangRate,
                 (int32_t)minOvlp);
 
-            // MA_HT_INT or MA_HT_SHORT_OVLP: delete this overlap
-            if (result == MA_HT_INT || result == MA_HT_SHORT_OVLP) {
+            if (classification == MA_HT_INT || classification == MA_HT_SHORT_OVLP) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
             }
         }
     }
 }
 
+/*
+filterHangingOverlapsThreadFunction: alternative thread function that uses
+coverage-trimmed read lengths (validReadIntervals) instead of raw lengths.
+
+This is the full ma_hit_flt port for use when filterLocalSegments runs with
+minCoverage >= 2 (non-trivial coverage trimming).  In the current post-phasing
+pipeline minCoverage=0, so deleteInternalOverlapsThreadFunction (which uses
+raw lengths) is equivalent and is the one wired in.
+
+Kept for future use if coverage trimming is enabled.
+*/
 void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
 {
     static_cast<void>(threadId);
@@ -1030,65 +998,52 @@ void Assembler::filterHangingOverlapsThreadFunction(size_t threadId)
         for(uint64_t i=begin; i!=end; i++) {
             AlignmentData& ad = alignmentData[i];
 
-            // Hifiasm ma_hit_flt: only process overlaps kept by both sides
+            // Skip overlaps already deleted by earlier stages.
             if(!ad.keptByBothSides()) continue;
 
-            ReadId qn = ad.readIds[0];
-            ReadId tn = ad.readIds[1];
+            const ReadId queryId  = ad.readIds[0];
+            const ReadId targetId = ad.readIds[1];
 
-            /*
-            Hifiasm ma_hit_flt: get read lengths in valid coordinates.
-            After ma_hit_cut, overlap coordinates are normalized to valid regions,
-            so we use valid region lengths as "read lengths" for ma_hit2arc.
-            */
-            uint32_t ql, tl;
+            // Use coverage-trimmed read lengths.  After ma_hit_cut clips
+            // overlap coordinates to validReadIntervals, the effective read
+            // length for ma_hit2arc is the trimmed interval length, not the
+            // raw sequence length.
+            uint32_t queryEffectiveLen, targetEffectiveLen;
             if (validReadIntervals.empty()) {
-                // Fallback: use raw read lengths if valid intervals not computed
-                ql = (uint32_t)reads->getReadRawSequenceLength(qn);
-                tl = (uint32_t)reads->getReadRawSequenceLength(tn);
+                queryEffectiveLen  = (uint32_t)reads->getReadRawSequenceLength(queryId);
+                targetEffectiveLen = (uint32_t)reads->getReadRawSequenceLength(targetId);
             } else {
-                const auto& rq = validReadIntervals[qn];
-                const auto& rt = validReadIntervals[tn];
+                const auto& queryInterval  = validReadIntervals[queryId];
+                const auto& targetInterval = validReadIntervals[targetId];
 
-                // Hifiasm ma_hit_flt: skip overlaps involving deleted reads
-                if (rq.isDeleted || rt.isDeleted) continue;
+                // Skip overlaps involving reads deleted by coverage trimming
+                // or chimera detection.
+                if (queryInterval.isDeleted || targetInterval.isDeleted) continue;
 
-                // Read length = valid region length (after ma_hit_cut normalization)
-                ql = rq.end - rq.start;
-                tl = rt.end - rt.start;
+                queryEffectiveLen  = queryInterval.end - queryInterval.start;
+                targetEffectiveLen = targetInterval.end - targetInterval.start;
             }
 
-            uint32_t qs = ad.qs;
-            uint32_t qe = ad.qe;
-            uint32_t ts = ad.ts;
-            uint32_t te = ad.te;
+            uint32_t queryStart  = ad.qs;
+            uint32_t queryEnd    = ad.qe;
+            uint32_t targetStart = ad.ts;
+            uint32_t targetEnd   = ad.te;
 
-            // Sanity check: invalid overlap coordinates
-            if (qe <= qs || te <= ts) {
+            if (queryEnd <= queryStart || targetEnd <= targetStart) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
                 continue;
             }
 
-            /*
-            Hifiasm ma_hit2arc: classify overlap type.
-            Returns:
-              >= 0           dovetail (keep)
-              MA_HT_QCONT    query contained in target (keep - handled by removeContainedReads)
-              MA_HT_TCONT    target contained in query (keep - handled by removeContainedReads)
-              MA_HT_INT      internal match (delete - excessive overhangs)
-              MA_HT_SHORT_OVLP  too short (delete - effective overlap < min_ovlp)
-            */
-            const int result = ma_hit2arc(
-                (int32_t)qs, (int32_t)qe, (int32_t)ql,
-                (int32_t)ts, (int32_t)te, (int32_t)tl,
+            const int classification = ma_hit2arc(
+                (int32_t)queryStart,  (int32_t)queryEnd,  (int32_t)queryEffectiveLen,
+                (int32_t)targetStart, (int32_t)targetEnd, (int32_t)targetEffectiveLen,
                 !ad.isSameStrand,
                 (int32_t)maxHang,
                 maxHangRate,
                 (int32_t)minOvlp
             );
 
-            // Hifiasm ma_hit_flt: delete internal matches and too-short overlaps
-            if (result == MA_HT_INT || result == MA_HT_SHORT_OVLP) {
+            if (classification == MA_HT_INT || classification == MA_HT_SHORT_OVLP) {
                 ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
             }
         }
@@ -1108,6 +1063,52 @@ absolute coordinates). For each read, we:
 We mark chimeric reads in `isChimericRead`/`validReadIntervals[].isDeleted` and mark incident overlaps
 with `DeleteReasonChimeric`.
 */
+/*
+detect_chimeric_reads (hifiasm) — exact port.
+
+A chimeric read is one formed by ligation of two unrelated genomic fragments.
+The signature: overlaps anchored to the left end of the read and overlaps
+anchored to the right end don't meet in the middle — there is a gap or a
+suspiciously thin bridge.
+
+Algorithm (three phases per read):
+
+  Phase 1 — collect_sides: find the reach of left-anchored and right-anchored
+  overlaps.  A "left-anchored" overlap starts at position 0 on the read; a
+  "right-anchored" overlap ends at the read length.  We track the union
+  envelope of each group:
+      leftAnchorEnd   = max qe  among overlaps with qs == 0
+      rightAnchorStart = min qs  among overlaps with qe == readLen
+
+  Phase 2 — collect_contain: extend the envelopes using "interior" overlaps
+  (those touching neither end) that overlap the current envelope by at least
+  10% of their length.  This bridges small gaps caused by contained overlaps
+  that don't reach the read ends.
+
+  Phase 3 — classify:
+    (a) If leftAnchorEnd and rightAnchorStart overlap by >= readLen * 0.06,
+        the read is normal (not chimeric).
+    (b) If leftAnchorEnd <= rightAnchorStart (gap between anchors), the read
+        is a simple chimera.
+    (c) Otherwise the anchors overlap but not enough — complex case.  We check
+        whether any overlap spanning the ambiguous zone [rightAnchorStart,
+        leftAnchorEnd) fails base-level boundary verification (banded BPM
+        alignment).  If any spanning overlap fails, the read is chimeric.
+
+Hifiasm parity notes:
+  - This must run sequentially: when a read is marked chimeric, all its
+    overlaps are deleted immediately, and later reads observe those deletions.
+  - hifiasm also checks the `el` field (non-homopolymer error count from
+    error correction) as a fast path in the complex case.  We omit this
+    because dinara does not perform hifiasm-style error correction.
+  - hifiasm has a UL (ultra-long read) bypass in collect_sides that marks
+    reads as non-chimeric if enough ultra-long reads span them.  We omit
+    this because dinara does not use ultra-long reads.
+
+Parameters (hifiasm defaults):
+  shiftRate   = max_ov_diff_final * 2.0 = 0.03 * 2.0 = 0.06
+  overlapRate = 0.1  (minimum fractional overlap for collect_contain extension)
+*/
 void Assembler::detectChimericReads(uint64_t threadCount)
 {
     cout << timestamp << "Detecting chimeric reads..." << endl;
@@ -1123,194 +1124,304 @@ void Assembler::detectChimericReads(uint64_t threadCount)
         isChimericRead.resize(readCount);
     }
     std::fill(isChimericRead.begin(), isChimericRead.end(), false);
-    // Hifiasm parity note:
-    // detect_chimeric_reads deletes overlaps in-place while scanning reads. Later reads are
-    // expected to observe those deletions, so this pass must remain sequential.
-    constexpr double shiftRate = 0.03 * 2.0; // asm_opt.max_ov_diff_final * 2.0 (default 0.03)
-    constexpr float overlapRate = 0.1f;
 
-    struct SubRegion { uint32_t s, e; };
-    struct ProjectionToTarget {
-        ReadId tId = invalid<ReadId>;
-        uint32_t qs = 0, qe = 0; // query interval in qId coordinates
-        uint32_t ts = 0, te = 0; // target interval in tId forward coordinates
-        bool rev = false;        // target is reverse-complemented relative to query
-    };
+    // hifiasm defaults.
+    constexpr double shiftRate   = 0.03 * 2.0; // asm_opt.max_ov_diff_final * 2.0
+    constexpr float  overlapRate = 0.1f;        // collect_contain fractional threshold
 
-    std::vector<char> xBuf;
-    std::vector<char> yBuf;
+    // Scratch buffers for boundary verification (reused across reads).
+    std::vector<char> boundaryBufX;
+    std::vector<char> boundaryBufY;
 
-    // hifiasm delete_all_edges equivalent for one read.
-    auto markReadChimericAndDeleteIncidentOverlaps = [&](ReadId qId) {
-        if (qId >= readCount || isChimericRead[qId]) {
+    // -----------------------------------------------------------------------
+    // delete_all_edges equivalent: mark a read as chimeric and delete all
+    // its incident overlaps from both perspectives.
+    //
+    // hifiasm sets del=1 on every overlap in sources[qn] and the reverse
+    // edge in sources[tn], plus coverage_cut[qn].del = 1.
+    // We set DeleteReasonChimeric on both sides of every incident overlap
+    // and mark validReadIntervals[qn].isDeleted = true.
+    // -----------------------------------------------------------------------
+    auto deleteAllEdges = [&](ReadId readId) {
+        if (readId >= readCount || isChimericRead[readId]) {
             return;
         }
-        isChimericRead[qId] = true;
-        if (qId < validReadIntervals.size()) {
-            validReadIntervals[qId].isDeleted = true;
+        isChimericRead[readId] = true;
+        if (readId < validReadIntervals.size()) {
+            validReadIntervals[readId].isDeleted = true;
         }
 
-        const OrientedReadId oid(qId, 0);
+        const OrientedReadId oid(readId, 0);
         if (oid.getValue() >= alignmentTable.size()) {
             return;
         }
-        const auto& table = alignmentTable[oid.getValue()];
-        for (uint32_t alignmentId : table) {
+        for (uint32_t alignmentId : alignmentTable[oid.getValue()]) {
             alignmentData[alignmentId].addDeleteReasonsBoth(AlignmentData::DeleteReasonChimeric);
         }
     };
 
-    // Given an overlap in the incidence list of qId, return [qs,qe) on qId.
-    auto getQueryInterval = [&](const AlignmentData& ad, ReadId qId, uint32_t& qs, uint32_t& qe) {
-        if (ad.readIds[0] == qId) {
-            qs = ad.qs;
-            qe = ad.qe;
+    // -----------------------------------------------------------------------
+    // Extract the overlap interval on a given read's coordinate axis.
+    //
+    // Each AlignmentData stores coordinates for readIds[0] in (qs,qe) and
+    // for readIds[1] in (ts,te), both on the respective read's forward
+    // strand.  This lambda returns whichever pair belongs to `readId`.
+    // -----------------------------------------------------------------------
+    auto getOverlapIntervalOnRead = [&](const AlignmentData& ad, ReadId readId,
+                                        uint32_t& ovlpStart, uint32_t& ovlpEnd) {
+        if (ad.readIds[0] == readId) {
+            ovlpStart = ad.qs;
+            ovlpEnd   = ad.qe;
         } else {
-            DINARA_ASSERT(ad.readIds[1] == qId);
-            qs = ad.ts;
-            qe = ad.te;
+            DINARA_ASSERT(ad.readIds[1] == readId);
+            ovlpStart = ad.ts;
+            ovlpEnd   = ad.te;
         }
     };
 
-    // Given an overlap in the incidence list of qId, return all fields needed by boundaryVerify.
-    auto projectFromQueryPerspective = [&](const AlignmentData& ad, ReadId qId) -> ProjectionToTarget {
-        ProjectionToTarget p;
-        if (ad.readIds[0] == qId) {
-            p.tId = ad.readIds[1];
-            p.qs = ad.qs;
-            p.qe = ad.qe;
-            p.ts = ad.ts;
-            p.te = ad.te;
-            p.rev = !ad.isSameStrand;
-        } else {
-            DINARA_ASSERT(ad.readIds[1] == qId);
-            p.tId = ad.readIds[0];
-            p.qs = ad.ts;
-            p.qe = ad.te;
-            p.ts = ad.qs;
-            p.te = ad.qe;
-            p.rev = !ad.isSameStrand;
-        }
-        return p;
+    // -----------------------------------------------------------------------
+    // Project an overlap into the coordinate system needed by boundaryVerify.
+    //
+    // boundaryVerify needs:
+    //   - partnerId:       the other read in the overlap
+    //   - ovlpStartOnRead: overlap start on readId's forward strand (= xs in hifiasm)
+    //   - ovlpEndOnRead:   overlap end on readId's forward strand
+    //   - partnerStart:    overlap start on partner's forward strand (= ts in hifiasm)
+    //   - partnerEnd:      overlap end on partner's forward strand (= te in hifiasm)
+    //   - isReverseStrand: true if the reads are on opposite strands
+    // -----------------------------------------------------------------------
+    struct OverlapProjection {
+        ReadId   partnerId        = invalid<ReadId>;
+        uint32_t ovlpStartOnRead  = 0;   // qs from readId's perspective
+        uint32_t ovlpEndOnRead    = 0;   // qe from readId's perspective
+        uint32_t partnerStart     = 0;   // ts on partner's forward strand
+        uint32_t partnerEnd       = 0;   // te on partner's forward strand
+        bool     isReverseStrand  = false;
     };
 
-    uint64_t chimericCount = 0;
-    uint64_t simpleChimericCount = 0;
-    uint64_t complexCheckedCount = 0;
+    auto projectOverlap = [&](const AlignmentData& ad, ReadId readId) -> OverlapProjection {
+        OverlapProjection proj;
+        if (ad.readIds[0] == readId) {
+            proj.partnerId       = ad.readIds[1];
+            proj.ovlpStartOnRead = ad.qs;
+            proj.ovlpEndOnRead   = ad.qe;
+            proj.partnerStart    = ad.ts;
+            proj.partnerEnd      = ad.te;
+        } else {
+            DINARA_ASSERT(ad.readIds[1] == readId);
+            proj.partnerId       = ad.readIds[0];
+            proj.ovlpStartOnRead = ad.ts;
+            proj.ovlpEndOnRead   = ad.te;
+            proj.partnerStart    = ad.qs;
+            proj.partnerEnd      = ad.qe;
+        }
+        proj.isReverseStrand = !ad.isSameStrand;
+        return proj;
+    };
+
+    uint64_t chimericCount        = 0;
+    uint64_t simpleChimericCount  = 0;
+    uint64_t complexCheckedCount  = 0;
     uint64_t complexChimericCount = 0;
-    for (ReadId qId = 0; qId < readCount; ++qId) {
-        // hifiasm uses raw read length here (not coverage-clipped interval length).
-        const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(qId));
-        const OrientedReadId oid(qId, 0);
+
+    for (ReadId readId = 0; readId < readCount; ++readId) {
+        const uint32_t readLen = uint32_t(reads->getReadRawSequenceLength(readId));
+        const OrientedReadId oid(readId, 0);
         if (oid.getValue() >= alignmentTable.size()) {
             continue;
         }
-        const auto& table = alignmentTable[oid.getValue()];
+        const auto& overlaps = alignmentTable[oid.getValue()];
 
-        SubRegion maxLeft{qLen, 0};
-        SubRegion maxRight{qLen, 0};
+        // =================================================================
+        // Phase 1: collect_sides
+        //
+        // Find the farthest reach of left-anchored overlaps (qs == 0) and
+        // right-anchored overlaps (qe == readLen).
+        //
+        // leftAnchorEnd:    rightmost qe among all overlaps starting at 0
+        // rightAnchorStart: leftmost qs among all overlaps ending at readLen
+        //
+        // Initialized to sentinel values: leftAnchorEnd = 0 (no reach),
+        // rightAnchorStart = readLen (no reach).  The .s fields track the
+        // minimum start for each group (always 0 for left, variable for
+        // right); we use leftAnchorFound/rightAnchorFound to detect the
+        // "end node" case where one side has no anchors at all.
+        // =================================================================
+        uint32_t leftAnchorEnd    = 0;       // max qe among left-anchored overlaps
+        uint32_t rightAnchorStart = readLen;  // min qs among right-anchored overlaps
+        bool leftAnchorFound  = false;
+        bool rightAnchorFound = false;
 
-        // collect_sides equivalent (without UL-aware bypass).
-        for (uint32_t alignmentId : table) {
+        for (uint32_t alignmentId : overlaps) {
             const AlignmentData& ad = alignmentData[alignmentId];
-            if (isDeletedFromReadPerspective(ad, qId)) {
+            if (!ad.keptByBothSides()) {
                 continue;
             }
 
-            uint32_t qs = 0, qe = 0;
-            getQueryInterval(ad, qId, qs, qe);
+            uint32_t ovlpStart = 0, ovlpEnd = 0;
+            getOverlapIntervalOnRead(ad, readId, ovlpStart, ovlpEnd);
 
-            if (qs == 0) {
-                if (qs < maxLeft.s) maxLeft.s = qs;
-                if (qe > maxLeft.e) maxLeft.e = qe;
-            }
-            if (qe == qLen) {
-                if (qs < maxRight.s) maxRight.s = qs;
-                if (qe > maxRight.e) maxRight.e = qe;
-            }
-        }
-
-        if (maxLeft.s == qLen || maxRight.s == qLen) {
-            continue;
-        }
-
-        // collect_contain equivalent.
-        uint32_t newLeftE = maxLeft.e;
-        uint32_t newRightS = maxRight.s;
-        for (uint32_t alignmentId : table) {
-            const AlignmentData& ad = alignmentData[alignmentId];
-            if (isDeletedFromReadPerspective(ad, qId)) {
-                continue;
-            }
-
-            uint32_t qs = 0, qe = 0;
-            getQueryInterval(ad, qId, qs, qe);
-
-            if (qs == 0 || qe == qLen) {
-                continue;
-            }
-            const uint32_t len = qe - qs;
-            if (len == 0) {
-                continue;
-            }
-
-            if (qs < maxLeft.e && qe > maxLeft.e &&
-                (maxLeft.e - qs) > uint32_t(overlapRate * float(len))) {
-                if (qe > newLeftE) {
-                    newLeftE = qe;
+            // Left-anchored: overlap starts at position 0.
+            if (ovlpStart == 0) {
+                leftAnchorFound = true;
+                if (ovlpEnd > leftAnchorEnd) {
+                    leftAnchorEnd = ovlpEnd;
                 }
             }
-            if (qs < maxRight.s && qe > maxRight.s &&
-                (qe - maxRight.s) > uint32_t(overlapRate * float(len))) {
-                if (qs < newRightS) {
-                    newRightS = qs;
+
+            // Right-anchored: overlap ends at the read length.
+            // Note: an overlap can be both left- and right-anchored (spans
+            // the entire read).  hifiasm adds it to both groups.
+            if (ovlpEnd == readLen) {
+                rightAnchorFound = true;
+                if (ovlpStart < rightAnchorStart) {
+                    rightAnchorStart = ovlpStart;
                 }
             }
         }
-        maxLeft.e = newLeftE;
-        maxRight.s = newRightS;
 
-        // Normal read.
-        if (maxLeft.e > maxRight.s &&
-            (maxLeft.e - maxRight.s) >= uint32_t(double(qLen) * shiftRate)) {
+        // End node: one side has no anchored overlaps at all.  This read is
+        // a tip in the overlap graph, not a chimera.
+        if (!leftAnchorFound || !rightAnchorFound) {
             continue;
         }
 
-        // Simple chimera.
-        if (maxLeft.e <= maxRight.s) {
-            markReadChimericAndDeleteIncidentOverlaps(qId);
+        // =================================================================
+        // Phase 2: collect_contain
+        //
+        // Extend the anchor envelopes using interior overlaps (those that
+        // touch neither end of the read).  An interior overlap [qs, qe)
+        // extends the left envelope rightward if it overlaps leftAnchorEnd
+        // by at least 10% of its length.  Similarly for the right envelope.
+        //
+        // This catches cases where a contained overlap bridges the gap
+        // between the anchor envelope and the middle of the read.
+        //
+        // We accumulate extensions into temporaries and apply once, matching
+        // hifiasm's single-pass collect_contain.
+        // =================================================================
+        uint32_t extendedLeftEnd    = leftAnchorEnd;
+        uint32_t extendedRightStart = rightAnchorStart;
+
+        for (uint32_t alignmentId : overlaps) {
+            const AlignmentData& ad = alignmentData[alignmentId];
+            if (!ad.keptByBothSides()) {
+                continue;
+            }
+
+            uint32_t ovlpStart = 0, ovlpEnd = 0;
+            getOverlapIntervalOnRead(ad, readId, ovlpStart, ovlpEnd);
+
+            // Skip anchored overlaps — only interior overlaps participate.
+            if (ovlpStart == 0 || ovlpEnd == readLen) {
+                continue;
+            }
+            const uint32_t ovlpLen = ovlpEnd - ovlpStart;
+            if (ovlpLen == 0) {
+                continue;
+            }
+
+            // Can this overlap extend the left envelope rightward?
+            // Condition: the overlap straddles leftAnchorEnd, and the portion
+            // to the left of leftAnchorEnd is at least 10% of the overlap length.
+            if (ovlpStart < leftAnchorEnd && ovlpEnd > leftAnchorEnd &&
+                (leftAnchorEnd - ovlpStart) > uint32_t(overlapRate * float(ovlpLen))) {
+                if (ovlpEnd > extendedLeftEnd) {
+                    extendedLeftEnd = ovlpEnd;
+                }
+            }
+
+            // Can this overlap extend the right envelope leftward?
+            // Condition: the overlap straddles rightAnchorStart, and the portion
+            // to the right of rightAnchorStart is at least 10% of the overlap length.
+            if (ovlpStart < rightAnchorStart && ovlpEnd > rightAnchorStart &&
+                (ovlpEnd - rightAnchorStart) > uint32_t(overlapRate * float(ovlpLen))) {
+                if (ovlpStart < extendedRightStart) {
+                    extendedRightStart = ovlpStart;
+                }
+            }
+        }
+
+        leftAnchorEnd    = extendedLeftEnd;
+        rightAnchorStart = extendedRightStart;
+
+        // =================================================================
+        // Phase 3: classify
+        //
+        // Compare the (possibly extended) left and right envelopes.
+        //
+        //   leftAnchorEnd
+        //        v
+        //   |============================|.............|===================| read
+        //        left envelope                gap?         right envelope
+        //                                              ^
+        //                                       rightAnchorStart
+        //
+        // (a) Large overlap (>= 6% of read length): normal read.
+        // (b) No overlap (gap): simple chimera.
+        // (c) Small overlap: complex case — verify by base-level alignment.
+        // =================================================================
+
+        // (a) Normal read: the two envelopes overlap substantially.
+        if (leftAnchorEnd > rightAnchorStart &&
+            (leftAnchorEnd - rightAnchorStart) >= uint32_t(double(readLen) * shiftRate)) {
+            continue;
+        }
+
+        // (b) Simple chimera: clear gap between left and right envelopes.
+        if (leftAnchorEnd <= rightAnchorStart) {
+            deleteAllEdges(readId);
             ++chimericCount;
             ++simpleChimericCount;
             continue;
         }
 
-        // Complex case with boundary verification:
-        // maxLeft and maxRight overlap, but not enough for "normal" classification.
-        // We ask if at least one overlap spanning [intervalS,intervalE) fails boundary consistency.
+        // (c) Complex chimera: the envelopes overlap, but the overlap is
+        // suspiciously thin (< 6% of read length).
+        //
+        // The ambiguous zone is [rightAnchorStart, leftAnchorEnd).  We look
+        // for any overlap that fully spans this zone and check whether its
+        // base-level alignment across the zone boundary is consistent.
+        //
+        // hifiasm also short-circuits on the `el` field (non-homopolymer
+        // error count from error correction).  We skip this because dinara
+        // does not perform hifiasm-style error correction — boundaryVerify
+        // alone decides.
         ++complexCheckedCount;
-        const uint32_t intervalS = maxRight.s;
-        const uint32_t intervalE = maxLeft.e;
-        bool isChimeric = false;
+        const uint32_t ambiguousZoneStart = rightAnchorStart;
+        const uint32_t ambiguousZoneEnd   = leftAnchorEnd;
+        bool chimericByBoundary = false;
 
-        for (uint32_t alignmentId : table) {
+        for (uint32_t alignmentId : overlaps) {
             const AlignmentData& ad = alignmentData[alignmentId];
-            if (isDeletedFromReadPerspective(ad, qId)) {
+            if (!ad.keptByBothSides()) {
                 continue;
             }
 
-            const ProjectionToTarget p = projectFromQueryPerspective(ad, qId);
-            if (p.qs <= intervalS && p.qe >= intervalE) {
-                // For raw/uncorrected reads, exact-overlap surrogates are unreliable.
-                // Use boundary verification alone to decide complex chimeras.
-                if (!boundaryVerify(*reads, intervalS, intervalE, qId, p.tId, p.qs, p.ts, p.te, p.rev, xBuf, yBuf)) {
-                    isChimeric = true;
+            const OverlapProjection proj = projectOverlap(ad, readId);
+
+            // Does this overlap fully span the ambiguous zone?
+            if (proj.ovlpStartOnRead <= ambiguousZoneStart &&
+                proj.ovlpEndOnRead   >= ambiguousZoneEnd) {
+
+                // boundaryVerify returns true if the base-level alignment
+                // across the zone boundary is consistent (NOT chimeric).
+                // Returns false if the alignment fails (chimeric evidence).
+                if (!boundaryVerify(*reads,
+                        ambiguousZoneStart, ambiguousZoneEnd,
+                        readId, proj.partnerId,
+                        proj.ovlpStartOnRead,
+                        proj.partnerStart, proj.partnerEnd,
+                        proj.isReverseStrand,
+                        boundaryBufX, boundaryBufY)) {
+                    chimericByBoundary = true;
                     break;
                 }
             }
         }
 
-        if (isChimeric) {
-            markReadChimericAndDeleteIncidentOverlaps(qId);
+        if (chimericByBoundary) {
+            deleteAllEdges(readId);
             ++chimericCount;
             ++complexChimericCount;
         }
@@ -2158,24 +2269,43 @@ void Assembler::removeReadsFlaggedContained(uint64_t threadCount)
 }
 
 /*
-flagContainedReads: Flag reads that are fully contained in another read.
+ma_hit_contained_advance (hifiasm) — detection logic ported, handling differs.
 
-Port of hifiasm's ma_hit_contained_advance (Overlaps.cpp).
-For each overlap, calls ma_hit2arc (= hifiasm ma_hit2arc) to classify
-the overlap as dovetail, QCONT, TCONT, internal, or too-short.
+Identifies reads that are fully contained within another read using the same
+ma_hit2arc geometry test as deleteInternalOverlaps.  A read is "contained" when
+its overlap with another read covers the entire shorter read:
 
-When a read is found to be contained (QCONT or TCONT), its isContained flag is set
-and a local "deleted" mask prevents it from participating in further containment
-decisions — matching hifiasm's immediate delete_all_edges behavior.
+    query:    ====XXXXXXXXXXXXXXXXX====
+                  |||||||||||||||||
+    target:       XXXXXXXXXXXXXXXXX        ← target contained in query (TCONT)
 
-This function only sets ReadFlags::isContained. It does not delete or modify overlaps.
-Downstream code (e.g. createMarkerGraphVertices) can check the flag to skip contained reads.
+    query:        XXXXXXXXXXXXXXXXX        ← query contained in target (QCONT)
+                  |||||||||||||||||
+    target:  ====XXXXXXXXXXXXXXXXX====
 
-Uses raw read lengths and overlap coordinates (no validReadIntervals dependency).
+Containment is detected by ma_hit2arc when both overhangs on one side are
+smaller than the corresponding overhangs on the other side (qs <= tl5 and
+ql-qe <= tl3 for QCONT, or the reverse for TCONT).
+
+This must run sequentially: when a read is found to be contained, it is
+immediately masked out so later reads don't consider overlaps to it.  This
+matches hifiasm's delete_all_edges + coverage_cut[qn].del = 1 behavior.
+
+Architectural difference from hifiasm:
+  hifiasm eagerly deletes all overlaps of contained reads (delete_all_edges)
+  and removes them from the overlap graph entirely.  dinara only sets the
+  isContained flag on the read — overlaps are preserved.  Downstream stages
+  (pruneContainedReadsToOneBestOverlapByDpScore, marker graph construction)
+  use this flag to handle contained reads with more flexibility.
+
+Parameters (hifiasm defaults):
+  maxHang          = 1000  (asm_opt.max_hang_Len)
+  maxHangRate      = 0.8   (asm_opt.max_hang_rate)
+  minOverlapLength = 50    (asm_opt.min_overlap_Len)
 */
 void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
 {
-    cout << timestamp << "Flagging contained reads." << endl;
+    cout << timestamp << "flagContainedReads begins." << endl;
 
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
@@ -2188,81 +2318,84 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
     const uint64_t readCount = reads->readCount();
     const uint64_t alignmentCount = alignmentData.size();
 
-    // Clear previous flags.
     for(ReadId r = 0; r < readCount; ++r) {
         reads->setContainedFlag(r, false);
     }
 
-    // Local "deleted" mask: once a read is deemed contained, we stop considering it
-    // and ignore overlaps incident to it. This matches hifiasm's behavior where
-    // delete_all_edges + coverage_cut[qn].del = 1 prevents further processing.
-    vector<uint8_t> deletedLocal(readCount, 0);
+    // Local deletion mask.  Once a read is deemed contained, we set its bit
+    // so subsequent iterations skip it and skip overlaps incident to it.
+    // This replicates hifiasm's immediate delete_all_edges +
+    // coverage_cut[qn].del = 1 mutation visibility.
+    vector<uint8_t> containedMask(readCount, 0);
 
     uint64_t containedReadCount = 0;
 
-    for(ReadId qn = 0; qn < readCount; ++qn) {
-        if(deletedLocal[qn]) continue;
+    for(ReadId queryId = 0; queryId < readCount; ++queryId) {
+        if(containedMask[queryId]) continue;
 
-        const int32_t ql = int32_t(reads->getReadRawSequenceLength(qn));
-        if(ql <= 0) continue;
+        const int32_t queryLen = int32_t(reads->getReadRawSequenceLength(queryId));
+        if(queryLen <= 0) continue;
 
-        const OrientedReadId oid(qn, 0);
+        const OrientedReadId oid(queryId, 0);
         if(oid.getValue() >= alignmentTable.size()) continue;
 
-        const auto& table = alignmentTable[oid.getValue()];
-        for(const uint32_t alignmentId : table) {
+        const auto& overlaps = alignmentTable[oid.getValue()];
+        for(const uint32_t alignmentId : overlaps) {
             if(alignmentId >= alignmentCount) continue;
             const AlignmentData& ad = alignmentData[alignmentId];
+
+            // Skip overlaps already deleted by earlier stages.
             if(!ad.keptByBothSides()) continue;
 
-            const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
-            if(deletedLocal[tn]) continue;
+            const ReadId targetId = (ad.readIds[0] == queryId) ? ad.readIds[1] : ad.readIds[0];
+            if(containedMask[targetId]) continue;
 
-            const int32_t tl = int32_t(reads->getReadRawSequenceLength(tn));
-            if(tl <= 0) continue;
+            const int32_t targetLen = int32_t(reads->getReadRawSequenceLength(targetId));
+            if(targetLen <= 0) continue;
 
-            const bool rev = !ad.isSameStrand;
-            int32_t qs, qe, ts, te;
-            if(ad.readIds[0] == qn) {
-                qs = int32_t(ad.qs);
-                qe = int32_t(ad.qe);
-                ts = int32_t(ad.ts);
-                te = int32_t(ad.te);
+            // Project overlap coordinates onto queryId's axis.
+            int32_t queryStart, queryEnd, targetStart, targetEnd;
+            if(ad.readIds[0] == queryId) {
+                queryStart  = int32_t(ad.qs);
+                queryEnd    = int32_t(ad.qe);
+                targetStart = int32_t(ad.ts);
+                targetEnd   = int32_t(ad.te);
             } else {
-                qs = int32_t(ad.ts);
-                qe = int32_t(ad.te);
-                ts = int32_t(ad.qs);
-                te = int32_t(ad.qe);
+                queryStart  = int32_t(ad.ts);
+                queryEnd    = int32_t(ad.te);
+                targetStart = int32_t(ad.qs);
+                targetEnd   = int32_t(ad.qe);
             }
-            if(qs >= qe || ts >= te) continue;
+            if(queryStart >= queryEnd || targetStart >= targetEnd) continue;
 
-            const int result = ma_hit2arc(
-                qs, qe, ql,
-                ts, te, tl,
-                rev,
+            const int classification = ma_hit2arc(
+                queryStart, queryEnd, queryLen,
+                targetStart, targetEnd, targetLen,
+                !ad.isSameStrand,
                 int32_t(maxHang),
                 maxHangRate,
                 int32_t(minOverlapLength)
             );
 
-            if(result == MA_HT_QCONT) {
-                // QCONT: query contained in target. Flag and stop processing this query.
-                reads->setContainedFlag(qn, true);
-                deletedLocal[qn] = 1;
+            if(classification == MA_HT_QCONT) {
+                // Query is contained in target.  Flag it and stop scanning
+                // this query's overlaps (hifiasm breaks after delete_all_edges).
+                reads->setContainedFlag(queryId, true);
+                containedMask[queryId] = 1;
                 ++containedReadCount;
                 break;
-            } else if(result == MA_HT_TCONT) {
-                // TCONT: target contained in query. Flag target, keep scanning.
-                if(!deletedLocal[tn]) {
-                    reads->setContainedFlag(tn, true);
-                    deletedLocal[tn] = 1;
+            } else if(classification == MA_HT_TCONT) {
+                // Target is contained in query.  Flag it, keep scanning.
+                if(!containedMask[targetId]) {
+                    reads->setContainedFlag(targetId, true);
+                    containedMask[targetId] = 1;
                     ++containedReadCount;
                 }
             }
         }
     }
 
-    cout << timestamp << "Flagged " << containedReadCount << " contained reads out of "
+    cout << timestamp << "flagContainedReads: " << containedReadCount << " contained reads out of "
          << readCount << " total." << endl;
 }
 
@@ -2421,4 +2554,385 @@ void Assembler::pruneContainedReadsToOneBestOverlapByDpScore(uint64_t /* threadC
          << " fellBackToAnyPartner=" << containedReadsFellBackToAnyPartner
          << " missingContainmentParent=" << containedReadsMissingContainmentParent
          << " overlapsPruned=" << overlapsPruned << endl;
+}
+
+
+
+/*
+cleanWeakOverlaps: Remove weak cis overlaps that are contradicted by
+strong phasing evidence.
+
+Exact logic port of hifiasm's clean_weak_ma_hit_t (Overlaps.cpp:11177).
+
+Background:
+  After phaseOverlapsKmeans, each overlap has per-side phasing labels:
+    0 = unknown (no het sites in the overlap region)
+    1 = cis (same haplotype)
+    2 = trans (different haplotype)
+
+  An overlap is "weak" when both sides are unknown (0) — the overlap
+  region contained no het SNP sites, so the phasing pipeline could not
+  determine the haplotype relationship. In hifiasm, this corresponds to
+  ml == 0 (the overlap does not span any het site identified during
+  error correction).
+
+  A weak cis overlap can be dangerous: it might connect reads from
+  different haplotypes in a region with no distinguishing variants.
+  This function identifies and removes such false cis overlaps.
+
+Algorithm (for standard HiFi, ou_thres = -1):
+  For each weak overlap qn→tn (both sides ecMatchState == 0):
+    Search qn's overlaps for a "strong" overlap qn→S where:
+      a) S has at least one side with ecMatchState != 0 (has het sites)
+      b) S's interval on qn contains the weak overlap's interval
+         (qs_strong <= qs_weak && qe_strong >= qe_weak)
+      c) S has a trans overlap to tn (ecMatchState == 2 from either side)
+
+    If such a chain qn→S→tn exists, the weak overlap is contradicted:
+      - qn and S are cis (strong overlap confirms same haplotype)
+      - S and tn are trans (different haplotype)
+      - Therefore qn and tn should be trans, not cis
+      → Mark the weak overlap for deletion.
+
+    If no contradicting chain exists, the weak overlap is kept.
+
+  After marking, set DeleteReasonWeakContradicted on both sides of
+  all marked overlaps.
+
+Differences from hifiasm:
+  - hifiasm's ml bit maps to our ecMatchState: ml==0 ↔ both sides unknown,
+    ml==1 ↔ at least one side labeled.
+  - hifiasm's sources/reverse_sources arrays map to our ecMatchState
+    labels: cis overlaps are in sources, trans in reverse_sources.
+  - hifiasm marks with a temporary bit in bl, then sets del=1. We set
+    a delete reason bitmask on both sides.
+  - The ou_thres / update_weak_by_contain rescue pass (for ultra-long
+    reads) is not implemented. For standard HiFi (ou_thres == -1), that
+    pass is a no-op in hifiasm.
+
+This runs after phaseOverlapsKmeans, before rescueTransOverlaps.
+*/
+void Assembler::cleanWeakOverlaps()
+{
+    cout << timestamp << "cleanWeakOverlaps begins." << endl;
+
+    checkAlignmentDataAreOpen();
+
+    const uint64_t alignmentCount = alignmentData.size();
+
+    uint64_t weakCount = 0;
+    uint64_t contradictedCount = 0;
+
+    // Helper: check if read S has a trans overlap to read tn.
+    // Scans alignmentTable[S] for an overlap with tn where at least
+    // one side says trans (ecMatchState == 2).
+    // Matches hifiasm's get_specific_overlap(&reverse_sources[S], S, tn).
+    auto hasTransOverlap = [&](ReadId readS, ReadId readTn) -> bool {
+        const OrientedReadId oidS(readS, 0);
+        if(oidS.getValue() >= alignmentTable.size()) return false;
+        const auto& tableS = alignmentTable[oidS.getValue()];
+        for(const uint32_t aid : tableS) {
+            if(aid >= alignmentCount) continue;
+            const AlignmentData& ad2 = alignmentData[aid];
+            // Find the overlap between S and tn.
+            ReadId partner;
+            uint8_t partnerState;
+            if(ad2.readIds[0] == readS) {
+                partner = ad2.readIds[1];
+                // S's perspective on this overlap.
+                partnerState = ad2.hifiasmEcMatchState0;
+            } else {
+                partner = ad2.readIds[0];
+                partnerState = ad2.hifiasmEcMatchState1;
+            }
+            if(partner != readTn) continue;
+            // In hifiasm, the overlap lives in reverse_sources[S] if S
+            // classified it as trans. We check if either side says trans.
+            if(partnerState == 2) return true;
+            // Also check the other side — if tn says trans about S.
+            uint8_t otherState = (ad2.readIds[0] == readS)
+                ? ad2.hifiasmEcMatchState1
+                : ad2.hifiasmEcMatchState0;
+            if(otherState == 2) return true;
+        }
+        return false;
+    };
+
+    // Helper: check if a weak overlap qn→tn is contradicted.
+    // Matches hifiasm's check_weak_ma_hit (returns 0 when contradicted).
+    // Searches qn's overlaps for a strong overlap qn→S that:
+    //   1) has het sites (at least one side ecMatchState != 0)
+    //   2) contains the weak overlap's interval on qn
+    //   3) S has a trans overlap to tn
+    auto isContradicted = [&](ReadId readQn, ReadId readTn,
+                              uint32_t weakQs, uint32_t weakQe) -> bool {
+        const OrientedReadId oidQn(readQn, 0);
+        if(oidQn.getValue() >= alignmentTable.size()) return false;
+        const auto& tableQn = alignmentTable[oidQn.getValue()];
+
+        for(const uint32_t aid : tableQn) {
+            if(aid >= alignmentCount) continue;
+            const AlignmentData& adStrong = alignmentData[aid];
+
+            // Get the strong overlap's properties from qn's perspective.
+            ReadId strongTarget;
+            uint8_t strongState0, strongState1;
+            uint32_t strongQs, strongQe;
+            if(adStrong.readIds[0] == readQn) {
+                strongTarget = adStrong.readIds[1];
+                strongState0 = adStrong.hifiasmEcMatchState0;
+                strongState1 = adStrong.hifiasmEcMatchState1;
+                strongQs     = adStrong.qs;
+                strongQe     = adStrong.qe;
+            } else {
+                strongTarget = adStrong.readIds[0];
+                strongState0 = adStrong.hifiasmEcMatchState1;
+                strongState1 = adStrong.hifiasmEcMatchState0;
+                strongQs     = adStrong.ts;
+                strongQe     = adStrong.te;
+            }
+
+            // Must not be deleted. Matches hifiasm's
+            // "aim_paf->buffer[i].del == 0" check.
+            if(adStrong.isDeleted0() || adStrong.isDeleted1()) continue;
+
+            // Must be strong: at least one side has a phasing label.
+            // Matches hifiasm's "aim_paf->buffer[i].ml == 1".
+            if(strongState0 == 0 && strongState1 == 0) continue;
+
+            // Must be in qn's cis array. In hifiasm, sources[qn] contains
+            // all overlaps NOT classified as trans by qn — both cis (ml==1)
+            // and unclassified (ml==0). The ml==1 check above already filters
+            // to strong overlaps. Here we just exclude overlaps that qn
+            // classified as trans (those live in reverse_sources[qn]).
+            if(strongState0 == 2) continue;
+
+            // Must contain the weak overlap's interval on qn.
+            if(strongQs > weakQs || strongQe < weakQe) continue;
+
+            // Check if the strong target S has a trans overlap to tn.
+            if(hasTransOverlap(strongTarget, readTn)) {
+                return true; // contradicted
+            }
+        }
+        return false;
+    };
+
+    // Main loop: scan all overlaps, mark weak ones that are contradicted.
+    // We collect alignment IDs to mark, then apply deletions in a second pass
+    // to avoid modifying data while iterating.
+    vector<uint32_t> toDelete;
+
+    for(uint32_t alignmentId = 0; alignmentId < alignmentCount; ++alignmentId) {
+        const AlignmentData& ad = alignmentData[alignmentId];
+
+        // Skip already-deleted overlaps. Matches hifiasm's
+        // "if(sources[i].buffer[j].del) continue" check.
+        if(ad.isDeleted0() || ad.isDeleted1()) continue;
+
+        // Weak: both sides unknown (no het sites).
+        if(ad.hifiasmEcMatchState0 != 0 || ad.hifiasmEcMatchState1 != 0) continue;
+        ++weakCount;
+
+        // Check from readIds[0]'s perspective (qn = readIds[0], tn = readIds[1]).
+        // Matches hifiasm iterating sources[i] and checking each weak overlap.
+        const ReadId qn = ad.readIds[0];
+        const ReadId tn = ad.readIds[1];
+
+        if(isContradicted(qn, tn, ad.qs, ad.qe)) {
+            toDelete.push_back(alignmentId);
+            continue;
+        }
+
+        // Also check from readIds[1]'s perspective (qn = readIds[1], tn = readIds[0]).
+        // Hifiasm processes each read independently, so both directions are checked.
+        if(isContradicted(tn, qn, ad.ts, ad.te)) {
+            toDelete.push_back(alignmentId);
+        }
+    }
+
+    // Apply deletions.
+    for(const uint32_t alignmentId : toDelete) {
+        AlignmentData& ad = alignmentData[alignmentId];
+        ad.deleteReasons0 |= AlignmentData::DeleteReasonWeakContradicted;
+        ad.deleteReasons1 |= AlignmentData::DeleteReasonWeakContradicted;
+    }
+
+    contradictedCount = toDelete.size();
+
+    cout << timestamp << "cleanWeakOverlaps: "
+         << weakCount << " weak overlaps (both sides unlabeled), "
+         << contradictedCount << " contradicted and deleted." << endl;
+}
+
+
+
+/*
+try_rescue_overlaps (hifiasm) — exact port.
+
+Resolves directional cis/trans disagreements.  phaseOverlapsKmeans processes
+each read independently, so for the same overlap A-B, read A may call it
+trans while read B calls it cis.  This function rescues the trans call when
+the evidence suggests it was wrong.
+
+For each read:
+  1. Collect "disagreement" overlaps: this read says trans, partner says cis.
+  2. If fewer than minPileup disagreements, skip.
+  3. Sweep-line on the disagreement intervals to find the peak-depth region.
+     Uses hifiasm's exact encoding: start events = (position << 1), end
+     events = (position << 1 | 1), sorted as uint32_t.  Peak tracking uses
+     >= (takes the latest start at peak depth).
+  4. If peak depth >= minPileup, rescue only disagreements whose interval
+     fully contains the peak region (containment filter).
+  5. Flip rescued overlaps from trans (2) to cis (1) on this read's side.
+
+hifiasm physically moves rescued overlaps between reverse_sources and
+sources arrays.  We flip hifiasmEcMatchState in place — equivalent because
+downstream code checks the state value, not array membership.
+
+skipDeleted maps to hifiasm's is_del parameter: false for HiFi, true for ONT.
+
+Parameters:
+  minPileup   = 4      (rescue_threshold)
+  skipDeleted = false   (is_del = 0 for HiFi)
+*/
+void Assembler::rescueTransOverlaps(uint64_t minPileup, bool skipDeleted)
+{
+    cout << timestamp << "rescueTransOverlaps begins (minPileup=" << minPileup
+         << ", skipDeleted=" << skipDeleted << ")." << endl;
+
+    checkAlignmentDataAreOpen();
+
+    const uint64_t readCount = reads->readCount();
+    const uint64_t alignmentCount = alignmentData.size();
+
+    uint64_t totalDisagreements = 0;
+    uint64_t readsRescued = 0;
+    uint64_t overlapsRescued = 0;
+    uint64_t skippedDeletedCount = 0;
+
+    struct Disagreement {
+        uint32_t ovlpStart;     // overlap start on this read's coordinate axis
+        uint32_t ovlpEnd;       // overlap end on this read's coordinate axis
+        uint32_t alignmentId;
+    };
+    vector<Disagreement> disagreements;
+    vector<uint32_t> events;
+
+    for (ReadId readId = ReadId(0); readId < readCount; ++readId) {
+
+        const OrientedReadId oid(readId, 0);
+        if (oid.getValue() >= alignmentTable.size()) continue;
+        const auto& overlaps = alignmentTable[oid.getValue()];
+
+        // ---------------------------------------------------------------
+        // Pass 1: collect disagreement overlaps.
+        //
+        // A disagreement is an overlap where this read says trans (2) but
+        // the partner says cis (1).  In hifiasm, this means the overlap
+        // is in reverse_sources[readId] (this read's trans array) AND in
+        // paf[partnerId] (partner's cis array).
+        // ---------------------------------------------------------------
+        disagreements.clear();
+        for (const uint32_t alignmentId : overlaps) {
+            if (alignmentId >= alignmentCount) continue;
+            const AlignmentData& ad = alignmentData[alignmentId];
+
+            if (skipDeleted && (ad.isDeleted0() || ad.isDeleted1())) {
+                ++skippedDeletedCount;
+                continue;
+            }
+
+            uint8_t myState, partnerState;
+            uint32_t myStart, myEnd;
+            if (ad.readIds[0] == readId) {
+                myState      = ad.hifiasmEcMatchState0;
+                partnerState = ad.hifiasmEcMatchState1;
+                myStart      = ad.qs;
+                myEnd        = ad.qe;
+            } else {
+                myState      = ad.hifiasmEcMatchState1;
+                partnerState = ad.hifiasmEcMatchState0;
+                myStart      = ad.ts;
+                myEnd        = ad.te;
+            }
+
+            if (myState == 2 && partnerState == 1 && myStart < myEnd) {
+                disagreements.push_back({myStart, myEnd, alignmentId});
+            }
+        }
+
+        totalDisagreements += disagreements.size();
+        if (disagreements.size() < minPileup) continue;
+
+        // ---------------------------------------------------------------
+        // Pass 2: sweep-line to find the peak-depth interval.
+        //
+        // Events encoded as (position << 1 | isEnd).  Sorting as uint32_t
+        // puts starts before ends at the same position.
+        //
+        // Peak tracking: dp >= maxDp (>=, not >) takes the latest start
+        // at peak depth.  When depth drops from the peak, we record the
+        // interval [start, position).
+        // ---------------------------------------------------------------
+        events.clear();
+        events.reserve(disagreements.size() * 2);
+        for (const auto& d : disagreements) {
+            events.push_back(d.ovlpStart << 1);
+            events.push_back(d.ovlpEnd << 1 | 1);
+        }
+        sort(events.begin(), events.end());
+
+        int64_t depth = 0, oldDepth = 0, peakDepth = 0;
+        uint32_t peakStart = 0;
+        uint32_t peakIntervalStart = 0, peakIntervalEnd = 0;
+
+        for (size_t j = 0; j < events.size(); ++j) {
+            oldDepth = depth;
+            if (events[j] & 1) {
+                --depth;
+            } else {
+                ++depth;
+            }
+
+            if (oldDepth < depth) {
+                if (depth >= peakDepth) {
+                    peakStart = events[j] >> 1;
+                    peakDepth = depth;
+                }
+            } else if (oldDepth > depth) {
+                if (oldDepth == peakDepth) {
+                    peakIntervalStart = peakStart;
+                    peakIntervalEnd   = events[j] >> 1;
+                }
+            }
+        }
+
+        if (static_cast<uint64_t>(peakDepth) < minPileup) continue;
+
+        // ---------------------------------------------------------------
+        // Pass 3: rescue disagreements that span the peak interval.
+        //
+        // Only overlaps whose interval fully contains [peakIntervalStart,
+        // peakIntervalEnd] are rescued.  This filters out scattered
+        // disagreements outside the coherent peak region.
+        // ---------------------------------------------------------------
+        ++readsRescued;
+        for (const auto& d : disagreements) {
+            if (d.ovlpStart <= peakIntervalStart && d.ovlpEnd >= peakIntervalEnd) {
+                AlignmentData& ad = alignmentData[d.alignmentId];
+                if (ad.readIds[0] == readId) {
+                    ad.hifiasmEcMatchState0 = 1; // trans -> cis
+                } else {
+                    ad.hifiasmEcMatchState1 = 1; // trans -> cis
+                }
+                ++overlapsRescued;
+            }
+        }
+    }
+
+    cout << timestamp << "rescueTransOverlaps: "
+         << totalDisagreements << " disagreements, rescued "
+         << overlapsRescued << " overlaps across "
+         << readsRescued << " reads." << endl;
 }
