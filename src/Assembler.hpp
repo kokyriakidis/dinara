@@ -1136,6 +1136,23 @@ public:
     void removeReadsFlaggedContained(uint64_t threadCount);
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
+
+    // Remove weak cis overlaps contradicted by strong phasing evidence.
+    // Adapted from hifiasm's clean_weak_ma_hit_t. A weak overlap (both sides
+    // ecMatchState == 0, no het sites) is deleted if a strong cis overlap of
+    // the same read contains it and has a trans connection to the weak target.
+    // Call after phaseOverlapsKmeans, before rescueTransOverlaps.
+    void cleanWeakOverlaps();
+
+    // Rescue overlaps where one side says trans but the partner says cis.
+    // Adapted from hifiasm's try_rescue_overlaps. If ≥ minPileup disagreement
+    // overlaps pile up spatially on a read, that read's trans calls are flipped
+    // to cis. Call after phaseOverlapsKmeans, before createReadGraphFromPhasingCisOverlaps.
+    // skipDeleted: when true, skip overlaps with any deleteReason set by earlier
+    // pipeline stages (chimeric, contained, weak, etc.). Maps to hifiasm's
+    // is_del parameter, which is true for ONT and false for HiFi.
+    void rescueTransOverlaps(uint64_t minPileup = 4, bool skipDeleted = false);
+
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
 
@@ -1802,6 +1819,11 @@ private:
     // Unlabeled overlaps (state 0) are kept.
     void createReadGraphFromPhasingCisOverlaps();
     void createReadGraphFromPhasingCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
+
+    // asg_arc_del_trans port: remove transitive edges from the read graph.
+    // An edge v→x is transitive if there exists v→w→x with
+    // len(v→w) + len(w→x) <= len(v→x) + fuzz.
+    uint64_t transitiveReductionOnReadGraph(int32_t fuzz = 5000);
 
     // Like createReadGraphFromEcParityCisOverlaps, but only keep cis overlaps that
     // cover at least one informative site (as recorded by AlignmentData::coversHetSite()
