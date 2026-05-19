@@ -73,6 +73,69 @@ inline int ma_hit2arc(
     return (int)l;
 }
 
+
+// Directed arc info produced by ma_hit2arc_full.
+// sourceVertex and targetVertex use hifiasm's encoding: readId<<1 | strand.
+struct DovetailArc {
+    uint32_t sourceVertex;
+    uint32_t targetVertex;
+    uint32_t arcLen;  // node length (unique extension of source read)
+};
+
+/*
+Extended version of ma_hit2arc that also outputs the directed string graph arc.
+
+Same classification as ma_hit2arc. For dovetail overlaps (return >= 0),
+populates `arc` with the source/target vertices and arc length, matching
+hifiasm's arc construction in Overlaps.h:
+
+  u = queryId<<1 | direction
+  v = targetId<<1 | direction
+  l = node length (non-overlap extension of source read)
+
+The arc direction (u=0 or u=1) determines which end of the query read
+is the source vertex:
+  u=0: query extends left  → source = (queryId, 0), target = (targetId, rev)
+  u=1: query extends right → source = (queryId, 1), target = (targetId, !rev)
+*/
+inline int ma_hit2arc_full(
+    uint32_t queryId, uint32_t targetId,
+    int32_t qs, int32_t qe, int32_t ql,
+    int32_t ts, int32_t te, int32_t tl,
+    bool rev,
+    int32_t max_hang,
+    float int_frac,
+    int32_t min_ovlp,
+    DovetailArc& arc)
+{
+    int32_t tl5, tl3, ext5, ext3;
+    uint32_t u, v, l;
+
+    if (rev) tl5 = tl - te, tl3 = ts;
+    else tl5 = ts, tl3 = tl - te;
+
+    ext5 = qs < tl5? qs : tl5;
+    ext3 = ql - qe < tl3? ql - qe : tl3;
+
+    if (ext5 > max_hang || ext3 > max_hang
+    || qe - qs < (qe - qs + ext5 + ext3) * int_frac
+    || te - ts < (te - ts + ext5 + ext3) * int_frac)
+    {
+        return MA_HT_INT;
+    }
+
+    if (qs <= tl5 && ql - qe <= tl3) return MA_HT_QCONT;
+    else if (qs >= tl5 && ql - qe >= tl3) return MA_HT_TCONT;
+    else if (qs > tl5) u = 0, v = (rev ? 1u : 0u), l = qs - tl5;
+    else u = 1, v = (rev ? 0u : 1u), l = (ql - qe) - tl3;
+    if (qe - qs + ext5 + ext3 < min_ovlp || te - ts + ext5 + ext3 < min_ovlp) return MA_HT_SHORT_OVLP;
+
+    arc.sourceVertex = (queryId << 1) | u;
+    arc.targetVertex = (targetId << 1) | v;
+    arc.arcLen = l;
+    return (int)l;
+}
+
 } // namespace dinara
 
 #endif // DINARA_OVERLAP_CLASSIFICATION_HPP
