@@ -163,6 +163,19 @@ public:
     uint64_t compressDebugLevel = 0; // 1=minimal, 2=compact, 3=detailed.
     uint64_t bubbleCleanup();
     uint64_t phaseSuperbubbleChains();
+
+    // Graph cleaning steps, to be called after the initial compress()
+    // and before simplifyAndAssemble().
+    // Adapted from MBG (Multiplex de Bruijn Graph assembler).
+    uint64_t removeLowCoverageTips(
+        double maxRemovableCoverage = 3.,
+        double minSafeCoverage = 10.,
+        uint64_t maxRemovableLength = 10000);
+    uint64_t removeLowCoverageCrosslinks(
+        double maxRemovableCoverage = 2.,
+        double minSafeCoverage = 10.);
+    uint64_t cleanByCopyNumber(
+        double estimatedAverageCoverage = 0.); // 0 means auto-estimate
     void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
 
     // Compute compressed journeys in the Shasta2AssemblyGraph.
