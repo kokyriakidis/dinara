@@ -1279,6 +1279,39 @@ void dinara::main::assemble(
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
     shasta2AssemblyGraph->write("AssemblyGraph-cleaned");
 
+    // Iterative cleaning loop adapted from MBG's resolveRound interleaved cleaning.
+    // Each round: tips -> compress -> crosslinks -> compress -> copynumber -> compress.
+    // Cleaning can expose new tips/crosslinks, so we iterate.
+    const uint64_t maxCleaningRounds = 5;
+    for(uint64_t round = 0; round < maxCleaningRounds; round++) {
+        cout << timestamp << "Cleaning round " << round << endl;
+        uint64_t changeCount = 0;
+
+        changeCount += shasta2AssemblyGraph->removeLowCoverageTips(3., 10., 10000);
+        shasta2AssemblyGraph->compress();
+
+        changeCount += shasta2AssemblyGraph->removeLowCoverageTips(2., 5., 10000);
+        shasta2AssemblyGraph->compress();
+
+        changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(1., 5.);
+        shasta2AssemblyGraph->compress();
+
+        changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(2., 10.);
+        shasta2AssemblyGraph->compress();
+
+        changeCount += shasta2AssemblyGraph->cleanByCopyNumber();
+        shasta2AssemblyGraph->compress();
+
+        cout << timestamp << "Cleaning round " << round
+             << " total changes: " << changeCount << endl;
+
+        if(changeCount == 0) {
+            break;
+        }
+    }
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-iterCleaned.gfa");
+    shasta2AssemblyGraph->write("AssemblyGraph-iterCleaned");
+
     // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
     // shasta2AssemblyGraph->simplifyAndAssemble();
 
