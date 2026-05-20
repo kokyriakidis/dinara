@@ -100,25 +100,49 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                                 break;
                             }
 
-                            const bool iIsRead0 =
-                                (readIdI.getReadId() == pair.readIds[0]);
+                            // The alignment ordinals are stored for the canonical orientation:
+                            //   [0] -> OrientedReadId(readIds[0], 0)
+                            //   [1] -> OrientedReadId(readIds[1], isSameStrand ? 0 : 1)
+                            // If readIdI or readIdJ is on a different strand, we must
+                            // convert the vertex ordinal to the canonical ordinal space.
+                            const OrientedReadId canonicalRead0(pair.readIds[0], 0);
+                            const OrientedReadId canonicalRead1(pair.readIds[1],
+                                pair.isSameStrand ? 0 : 1);
 
-                            uint32_t chainStartI, chainEndI;
-                            uint32_t chainStartJ, chainEndJ;
-                            if(iIsRead0) {
-                                chainStartI = alignment.ordinals.front()[0];
-                                chainEndI   = alignment.ordinals.back()[0];
-                                chainStartJ = alignment.ordinals.front()[1];
-                                chainEndJ   = alignment.ordinals.back()[1];
+                            // Determine which alignment slot (0 or 1) corresponds to readIdI and readIdJ.
+                            int slotI, slotJ;
+                            if(readIdI.getReadId() == pair.readIds[0]) {
+                                slotI = 0;
+                                slotJ = 1;
                             } else {
-                                chainStartI = alignment.ordinals.front()[1];
-                                chainEndI   = alignment.ordinals.back()[1];
-                                chainStartJ = alignment.ordinals.front()[0];
-                                chainEndJ   = alignment.ordinals.back()[0];
+                                slotI = 1;
+                                slotJ = 0;
                             }
 
-                            if(ordinalI < chainStartI || ordinalI > chainEndI ||
-                               ordinalJ < chainStartJ || ordinalJ > chainEndJ) {
+                            // Convert vertex ordinals to canonical ordinal space if needed.
+                            const OrientedReadId canonI = (slotI == 0) ? canonicalRead0 : canonicalRead1;
+                            const OrientedReadId canonJ = (slotJ == 0) ? canonicalRead0 : canonicalRead1;
+
+                            uint32_t canonOrdinalI = ordinalI;
+                            if(readIdI != canonI) {
+                                // readIdI is on the opposite strand from canonical.
+                                const uint32_t mc = uint32_t(markers->size(readIdI.getValue()));
+                                canonOrdinalI = mc - 1 - ordinalI;
+                            }
+
+                            uint32_t canonOrdinalJ = ordinalJ;
+                            if(readOrdinals[j].first != canonJ) {
+                                const uint32_t mc = uint32_t(markers->size(readOrdinals[j].first.getValue()));
+                                canonOrdinalJ = mc - 1 - ordinalJ;
+                            }
+
+                            const uint32_t chainStartI = alignment.ordinals.front()[slotI];
+                            const uint32_t chainEndI   = alignment.ordinals.back()[slotI];
+                            const uint32_t chainStartJ = alignment.ordinals.front()[slotJ];
+                            const uint32_t chainEndJ   = alignment.ordinals.back()[slotJ];
+
+                            if(canonOrdinalI < chainStartI || canonOrdinalI > chainEndI ||
+                               canonOrdinalJ < chainStartJ || canonOrdinalJ > chainEndJ) {
                                 foundInconsistent = true;
                             }
 
