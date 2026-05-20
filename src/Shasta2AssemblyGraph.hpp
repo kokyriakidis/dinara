@@ -182,6 +182,13 @@ public:
     uint64_t popSuperbubbles(
         uint64_t maxBubbleSize = 10,
         double maxPoppableCoverageFraction = 0.5);
+
+    // Remove weak stalks (dead-end linear chains leading to branch points).
+    // Ported from Shasta2AnchorGraph::cutWeakStalksLeadingToBranch.
+    // A stalk starts at a tip vertex (in-degree 0 or out-degree 0),
+    // follows a linear chain, and if it reaches a branch point
+    // with the read union across all edges still <= maxReadCount, it is cut.
+    uint64_t cutWeakStalks(uint64_t maxReadCount);
     void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
 
     // Compute compressed journeys in the Shasta2AssemblyGraph.
