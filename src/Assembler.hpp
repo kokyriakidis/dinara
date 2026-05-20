@@ -637,6 +637,11 @@ public:
     // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
     void filterMarkerGraphVerticesByDistinctSubkmerCount(uint64_t threadCount);
 
+    // Filter marker graph vertices where reads were grouped by transitive collapse
+    // at k-mer positions outside their chaining range.
+    // Must be called after createMarkerGraphVertices and computeCandidateTable.
+    void filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount);
+
     // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
     // overlap start/end events on each oriented read (using read-graph overlaps).
     // This produces fewer anchors than using all marker graph vertices, while preserving
