@@ -1312,6 +1312,10 @@ void dinara::main::assemble(
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-iterCleaned.gfa");
     shasta2AssemblyGraph->write("AssemblyGraph-iterCleaned");
 
+    // Cut weak stalks (dead-end chains with few reads) to expose superbubbles.
+    shasta2AssemblyGraph->cutWeakStalks(10);
+    shasta2AssemblyGraph->compress();
+
     // Pop superbubbles: remove low-coverage alternative paths.
     shasta2AssemblyGraph->popSuperbubbles();
     shasta2AssemblyGraph->compress();
