@@ -1263,10 +1263,21 @@ void dinara::main::assemble(
         shasta2AssemblyGraphOptions);
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
 
-    // Compress linear chains before simplification.
+    // Compress linear chains, then clean, then compress again.
     shasta2AssemblyGraph->compress();
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-compressed.gfa");
     shasta2AssemblyGraph->write("AssemblyGraph-compressed");
+
+    // Graph cleaning steps adapted from MBG.
+    cout << timestamp << "Cleaning Shasta2AssemblyGraph..." << endl;
+    shasta2AssemblyGraph->removeLowCoverageTips();
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->removeLowCoverageCrosslinks();
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->cleanByCopyNumber();
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
+    shasta2AssemblyGraph->write("AssemblyGraph-cleaned");
 
     // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
     // shasta2AssemblyGraph->simplifyAndAssemble();
