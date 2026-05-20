@@ -1088,7 +1088,8 @@ void dinara::main::assemble(
     //    transitively.
     //    Port of ma_hit_contained_advance.
     //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
-    assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // 6. Rescue overlaps with directional cis/trans disagreement.
     //    Port of try_rescue_overlaps.
@@ -1107,8 +1108,8 @@ void dinara::main::assemble(
     assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
 
     // Set min and max marker graph vertex coverage thresholds.
-    const uint64_t minAnchorCoverage = 2;
-    const uint64_t maxAnchorCoverage = 5 * coveragePeak;
+    const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
+    const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
 
     // Build marker graph vertices using transitive alignments collapse.
     assembler.createMarkerGraphVertices(
@@ -1122,10 +1123,10 @@ void dinara::main::assemble(
 
 
 
-    
 
-    
-    
+        
+
+
     // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
     // This reduces unreliable anchors and artifacts in repetitive regions.
     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
@@ -1156,14 +1157,21 @@ void dinara::main::assemble(
         threadCount,
         minAnchorCoverage,
         maxAnchorCoverage);
-    auto& shasta2Anchors = assembler.shasta2Anchors;
+        auto& shasta2Anchors = assembler.shasta2Anchors;
 
-    // double kmerDensity = 1.0;
-    // cout << timestamp << "Filtering Shasta2Anchors with Shasta2 hashed k-mer checker..." << endl;
-    // // shasta2Anchors->filterByShasta2HashedKmerChecker(
-    // //     assemblerOptions.kmersOptions.probability);
-    // shasta2Anchors->filterByShasta2HashedKmerChecker(
-    //     kmerDensity);
+
+    // assembler.shasta2Anchors = createShasta2AnchorsFromSplitVertices(
+    //     shasta2Owner,
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     *assembler.markers,
+    //     assembler.markerGraph,
+    //     assembler.readGraph,
+    //     threadCount,
+    //     minAnchorCoverage,
+    //     maxAnchorCoverage,
+    //     &assembler.alignmentData,
+    //     &assembler.getAlignmentTable());
 
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
