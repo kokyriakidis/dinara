@@ -1778,7 +1778,7 @@ static void kmWriteResults(
         } else if (ov.hap == 1) {
             matchState = 1; // cis
         } else {
-            matchState = 0; // unassigned — unknown
+            matchState = 2; // unassigned — treat as trans (conservative)
         }
         ad.setHifiasmEcMatchStateFromReadPerspective(backboneReadId, matchState);
     }
@@ -1973,8 +1973,8 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 }
 
                 for (const auto& ov : scratch.overlaps) {
-                    if (ov.hap == 1 || ov.hap == 0) totalCis++;
-                    else if (ov.hap == 2) totalTrans++;
+                    if (ov.hap == 1) totalCis++;
+                    else totalTrans++;
                 }
                 readsProcessed++;
                 if (readsProcessed.load() % 10000 == 0)
