@@ -1088,8 +1088,8 @@ void dinara::main::assemble(
     //    transitively.
     //    Port of ma_hit_contained_advance.
     //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
-    // assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
-    assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // 6. Rescue overlaps with directional cis/trans disagreement.
     //    Port of try_rescue_overlaps.
@@ -1102,19 +1102,22 @@ void dinara::main::assemble(
     //    Port of ma_sg_gen (string graph construction from sources[]).
     assembler.createReadGraphFromPhasingCisOverlaps();
 
-    // 8. Transitive reduction: remove redundant edges where v→x can be
-    //    reached through v→w→x within fuzz tolerance.
-    //    Port of asg_arc_del_trans.
-    assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
+    // // 8. Transitive reduction: remove redundant edges where v→x can be
+    // //    reached through v→w→x within fuzz tolerance.
+    // //    Port of asg_arc_del_trans.
+    // assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
 
     // Set min and max marker graph vertex coverage thresholds.
-    const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
-    const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
+    // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
+    // const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
+    
+    const uint64_t minVertexCoverage = 2;
+    const uint64_t maxVertexCoverage = 5 * coveragePeak;
 
     // Build marker graph vertices using transitive alignments collapse.
     assembler.createMarkerGraphVertices(
-        minAnchorCoverage,                              // minVertexCoverage
-        maxAnchorCoverage,                              // maxVertexCoverage
+        minVertexCoverage,                              // minVertexCoverage
+        maxVertexCoverage,                              // maxVertexCoverage
         0,                                              // minVertexCoveragePerStrand
         false,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
@@ -1124,7 +1127,7 @@ void dinara::main::assemble(
 
 
 
-        
+
 
 
     // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
@@ -1139,6 +1142,9 @@ void dinara::main::assemble(
     // We need the reverse complement vertices to be populated for anchor generation.
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
+
+    const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
+    const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
@@ -1158,20 +1164,6 @@ void dinara::main::assemble(
         minAnchorCoverage,
         maxAnchorCoverage);
         auto& shasta2Anchors = assembler.shasta2Anchors;
-
-
-    // assembler.shasta2Anchors = createShasta2AnchorsFromSplitVertices(
-    //     shasta2Owner,
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     *assembler.markers,
-    //     assembler.markerGraph,
-    //     assembler.readGraph,
-    //     threadCount,
-    //     minAnchorCoverage,
-    //     maxAnchorCoverage,
-    //     &assembler.alignmentData,
-    //     &assembler.getAlignmentTable());
 
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
