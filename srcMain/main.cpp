@@ -1138,6 +1138,10 @@ void dinara::main::assemble(
     // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
     assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
+    // Filter marker graph vertices where reads were grouped by transitive collapse
+    // at k-mer positions outside their chaining range.
+    assembler.filterMarkerGraphVerticesByChainConsistency(threadCount);
+
     // Find the reverse complement of each marker graph vertex.
     // We need the reverse complement vertices to be populated for anchor generation.
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
