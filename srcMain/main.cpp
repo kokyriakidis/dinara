@@ -1312,6 +1312,11 @@ void dinara::main::assemble(
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-iterCleaned.gfa");
     shasta2AssemblyGraph->write("AssemblyGraph-iterCleaned");
 
+    // Pop superbubbles: remove low-coverage alternative paths.
+    shasta2AssemblyGraph->popSuperbubbles();
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-popped.gfa");
+
     // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
     // shasta2AssemblyGraph->simplifyAndAssemble();
 
