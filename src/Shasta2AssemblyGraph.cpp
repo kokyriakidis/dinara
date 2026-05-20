@@ -1307,6 +1307,182 @@ uint64_t Shasta2AssemblyGraph::cleanByCopyNumber(
 
 
 
+// Remove weak stalks (dead-end linear chains leading to branch points).
+// Ported from Shasta2AnchorGraph::cutWeakStalksLeadingToBranch.
+//
+// A stalk starts at a tip vertex (in-degree 0 or out-degree 0),
+// follows a linear chain, and if it reaches a branch point
+// with the read union across all edge steps still <= maxReadCount, it is cut.
+// If the chain reaches a dead end (both in-degree 0 and out-degree 0),
+// it is not cut.
+uint64_t Shasta2AssemblyGraph::cutWeakStalks(uint64_t maxReadCount)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Compute the read union across a set of edges.
+    // Returns false (and stops early) if the union exceeds the threshold.
+    auto readUnionWithinThreshold = [&](
+        const vector<edge_descriptor>& edges,
+        uint64_t threshold) -> bool {
+        std::unordered_set<uint64_t> readValues;
+        readValues.reserve(threshold + 1);
+        for(const edge_descriptor e : edges) {
+            const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+            for(const Shasta2AssemblyGraphEdgeStep& step : edge) {
+                for(const OrientedReadId& orientedReadId : step.anchorPair.orientedReadIds) {
+                    readValues.insert(orientedReadId.getValue());
+                    if(readValues.size() > threshold) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    // Try to collect a weak stalk starting from vStart.
+    // forward=true: vStart has in-degree 0, walk forward.
+    // forward=false: vStart has out-degree 0, walk backward.
+    auto tryCollectWeakStalk = [&](
+        vertex_descriptor vStart,
+        bool forward,
+        vector<edge_descriptor>& candidateEdgesToCut)
+    {
+        vector<edge_descriptor> chainEdges;
+        vertex_descriptor current = vStart;
+
+        if(forward) {
+            // Source tip: in-degree must be 0, out-degree must be 1.
+            if(in_degree(current, assemblyGraph) != 0) return;
+            if(out_degree(current, assemblyGraph) != 1) return;
+        } else {
+            // Sink tip: out-degree must be 0, in-degree must be 1.
+            if(out_degree(current, assemblyGraph) != 0) return;
+            if(in_degree(current, assemblyGraph) != 1) return;
+        }
+
+        bool shouldCut = false;
+
+        while(true) {
+            if(forward) {
+                const uint64_t outDeg = out_degree(current, assemblyGraph);
+
+                // Dead end — don't cut.
+                if(outDeg == 0) {
+                    break;
+                }
+
+                // Branch point — check if we should cut.
+                if(outDeg > 1) {
+                    shouldCut = !chainEdges.empty() &&
+                        readUnionWithinThreshold(chainEdges, maxReadCount);
+                    break;
+                }
+
+                // Single out-edge — extend the chain.
+                edge_descriptor e;
+                BGL_FORALL_OUTEDGES(current, eOut, assemblyGraph, Shasta2AssemblyGraph) {
+                    e = eOut;
+                }
+                const vertex_descriptor next = target(e, assemblyGraph);
+
+                // If next is a merge point (in-degree > 1), cut here.
+                if(in_degree(next, assemblyGraph) > 1) {
+                    chainEdges.push_back(e);
+                    shouldCut = readUnionWithinThreshold(chainEdges, maxReadCount);
+                    break;
+                }
+
+                chainEdges.push_back(e);
+
+                // Check threshold early.
+                if(!readUnionWithinThreshold(chainEdges, maxReadCount)) {
+                    break;
+                }
+
+                current = next;
+            } else {
+                const uint64_t inDeg = in_degree(current, assemblyGraph);
+
+                // Dead end — don't cut.
+                if(inDeg == 0) {
+                    break;
+                }
+
+                // Branch point — check if we should cut.
+                if(inDeg > 1) {
+                    shouldCut = !chainEdges.empty() &&
+                        readUnionWithinThreshold(chainEdges, maxReadCount);
+                    break;
+                }
+
+                // Single in-edge — extend the chain.
+                edge_descriptor e;
+                BGL_FORALL_INEDGES(current, eIn, assemblyGraph, Shasta2AssemblyGraph) {
+                    e = eIn;
+                }
+                const vertex_descriptor prev = source(e, assemblyGraph);
+
+                // If prev is a fork (out-degree > 1), cut here.
+                if(out_degree(prev, assemblyGraph) > 1) {
+                    chainEdges.push_back(e);
+                    shouldCut = readUnionWithinThreshold(chainEdges, maxReadCount);
+                    break;
+                }
+
+                chainEdges.push_back(e);
+
+                // Check threshold early.
+                if(!readUnionWithinThreshold(chainEdges, maxReadCount)) {
+                    break;
+                }
+
+                current = prev;
+            }
+        }
+
+        if(shouldCut) {
+            candidateEdgesToCut.insert(
+                candidateEdgesToCut.end(),
+                chainEdges.begin(),
+                chainEdges.end());
+        }
+    };
+
+    // Collect all weak stalks.
+    vector<edge_descriptor> candidateEdgesToCut;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        tryCollectWeakStalk(v, true, candidateEdgesToCut);
+        tryCollectWeakStalk(v, false, candidateEdgesToCut);
+    }
+
+    // Remove collected edges and clean up isolated vertices.
+    // Use a set to avoid double-removal.
+    set<edge_descriptor> edgesToRemove(
+        candidateEdgesToCut.begin(), candidateEdgesToCut.end());
+
+    uint64_t cutCount = 0;
+    set<vertex_descriptor> affectedVertices;
+    for(const edge_descriptor e : edgesToRemove) {
+        affectedVertices.insert(source(e, assemblyGraph));
+        affectedVertices.insert(target(e, assemblyGraph));
+        boost::remove_edge(e, assemblyGraph);
+        ++cutCount;
+    }
+
+    for(const vertex_descriptor v : affectedVertices) {
+        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) == 0) {
+            boost::remove_vertex(v, assemblyGraph);
+        }
+    }
+
+    cout << "cutWeakStalks removed " << cutCount
+         << " edges (maxReadCount=" << maxReadCount << ")." << endl;
+    return cutCount;
+}
+
+
+
 void Shasta2AssemblyGraph::findAndConnectAssemblyPaths()
 {
     writePerformanceStatistics("Shasta2AssemblyGraph::findAndConnectAssemblyPaths begins");
