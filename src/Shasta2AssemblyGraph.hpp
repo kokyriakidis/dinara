@@ -176,11 +176,20 @@ public:
         double minSafeCoverage = 10.);
     uint64_t cleanByCopyNumber(
         double estimatedAverageCoverage = 0.); // 0 means auto-estimate
+
+    // Pop superbubbles by removing low-coverage alternative paths.
+    // Follows Verkko's approach (pop_bubbles_coverage_based.py).
+    uint64_t popSuperbubbles(
+        uint64_t maxBubbleSize = 10,
+        double maxPoppableCoverageFraction = 0.5);
     void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
 
     // Compute compressed journeys in the Shasta2AssemblyGraph.
     void computeJourneys();
+
     vector< vector<edge_descriptor> > compressedJourneys;
+
+
 
     void findAndConnectAssemblyPaths();
     bool canConnect(edge_descriptor, edge_descriptor) const;
