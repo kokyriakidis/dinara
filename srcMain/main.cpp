@@ -1221,6 +1221,272 @@ void dinara::main::assemble(
     //     assembler.shasta2Journeys,
     //     ReadId(0));
 
+
+    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
+
+
+    // Transitive reduction.
+    // Shared parameters for local path-based simplification steps.
+    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    const uint64_t transitiveReductionMaxDistance = 10;
+
+    shasta2AnchorGraph->transitiveReduction(
+        transitiveReductionMaxEdgeCoverage,
+        transitiveReductionMaxDistance);
+
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
+
+    // Post-transitive-reduction cleanup:
+    // cut low-read linear stalks that start at a tip and reach a branch point
+    // before involving more than 3 distinct oriented reads across all anchors
+    // in the traversed chain.
+    const uint64_t maxWeakTipReadCount = 3;
+    shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
+        *shasta2Anchors,
+        maxWeakTipReadCount);
+
+
+    // Save the final assembly-enabled state used by the HTTP server.
+    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
+    // shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.graph");
+
+    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
+    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
+    
+    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        *shasta2AnchorGraph,
+        shasta2AssemblyGraphOptions);
+    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+
+    // Compress linear chains before simplification.
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-compressed.gfa");
+    shasta2AssemblyGraph->write("AssemblyGraph-compressed");
+
+    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
+    // shasta2AssemblyGraph->simplifyAndAssemble();
+
+    return;
+
+
+
+
+
+
+
+
+
+    
+
+
+    // // // Declare anchors pointer here to avoid scope issues
+    // shared_ptr<mode3::Anchors> anchors;
+    // anchors = make_shared<mode3::Anchors>(
+    //     MappedMemoryOwner(assembler),
+    //     assembler.getReads(),
+    //     assembler.assemblerInfo->k,
+    //     *assembler.markers,
+    //     assembler.markerGraph,
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     true); // createFromVertices
+    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
+
+
+    
+
+    
+    
+    
+
+    
+
+    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
+    // shasta2AssemblyGraph->simplifyAndAssemble();
+
+    // return;
+
+    // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
+
+    // // Step 3: MBG-style cleaning phase
+    // cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
+    // const uint64_t maxResolveLength = 500000;
+    // const bool doRoundCleaning = true;
+    // const bool doGuessworkCleaning = true;
+    // const uint64_t maxUnconditionalResolveLength = 0;
+    // const bool copycountFilterHeuristic = false;
+    // const uint64_t maxLocalResolve = 0;
+    // const bool resolvePalindromesGlobal = false;
+
+    // // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
+    // auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
+    // if(tipStats1.nodesRemoved > 0) {
+    //     cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
+    //          << tipStats1.edgesRemoved << " edges." << endl;
+    //     dag.unitigifyAll();
+    //     cout << "  After tip removal: "
+    //          << dag.nodeCount() << " nodes, "
+    //          << dag.edgeCount() << " edges." << endl;
+    // }
+
+    // // Step 3b: Remove low-coverage crosslinks
+    // auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
+    // if(crosslinkStats.edgesRemoved > 0) {
+    //     cout << "  Removed " << crosslinkStats.edgesRemoved
+    //          << " crosslink edges." << endl;
+    //     dag.unitigifyAll();
+    //     cout << "  After crosslink removal: "
+    //          << dag.nodeCount() << " nodes, "
+    //          << dag.edgeCount() << " edges." << endl;
+    // }
+
+    // // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
+    // if(doGuessworkCleaning) {
+    //     double totalCov = 0.0;
+    //     uint64_t count = 0;
+    //     for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
+    //         if(!dag.nodeExists(segId)) continue;
+    //         totalCov += dag.getPathCoverage(segId);
+    //         count++;
+    //     }
+    //     const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
+    //     auto copyStats = dag.cleanComponentsByCopynumber(
+    //         avgCov,
+    //         50000,
+    //         0,
+    //         max(maxResolveLength, maxLocalResolve),
+    //         {},
+    //         0);
+    //     if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
+    //         cout << "  Copy-number cleaning removed "
+    //              << copyStats.nodesRemoved << " nodes, "
+    //              << copyStats.edgesRemoved << " edges." << endl;
+    //         dag.unitigifyAll();
+    //         cout << "  After copy-number cleaning: "
+    //              << dag.nodeCount() << " nodes, "
+    //              << dag.edgeCount() << " edges." << endl;
+    //     }
+    // }
+
+    // cout << timestamp << "Cleaning phase complete." << endl;
+    // dag.writeSummary(cout);
+    // dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
+
+    
+
+    // // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
+    // const uint64_t initialMinEdgeSupport = 20;
+
+    // // Step 4a: Resolve with minEdgeSupport = initial pass.
+    // cout << timestamp
+    //      << "Resolution step with minEdgeSupport="
+    //      << initialMinEdgeSupport << endl;
+    // dag.resolveRound(
+    //     initialMinEdgeSupport,
+    //     maxResolveLength,
+    //     doRoundCleaning,
+    //     doGuessworkCleaning,
+    //     maxUnconditionalResolveLength,
+    //     copycountFilterHeuristic,
+    //     maxLocalResolve,
+    //     resolvePalindromesGlobal);
+    // dag.unitigifyAll();
+    // cout << "  After resolution step " << initialMinEdgeSupport << ": "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
+
+    // // Step 4b: MBG-style second pass with minimal support.
+    // cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
+    // dag.resolveRound(
+    //     1,
+    //     maxResolveLength,
+    //     doRoundCleaning,
+    //     doGuessworkCleaning,
+    //     maxUnconditionalResolveLength,
+    //     copycountFilterHeuristic,
+    //     maxLocalResolve,
+    //     resolvePalindromesGlobal);
+    // dag.unitigifyAll();
+    // cout << "  After final low-support pass: "
+    //      << dag.nodeCount() << " nodes, "
+    //      << dag.edgeCount() << " edges, "
+    //      << dag.pathCount() << " paths." << endl;
+
+    // // Step 5: Write final graph
+    // dag.verifyEdgeConsistency();
+    // dag.writeSummary(cout);
+    // dag.writeGfa("DirectedAnchorGraph.gfa");
+    // dag.writePaths("DirectedAnchorGraph.paths.gaf");
+
+    // return;
+
+
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
+    //     minPrimaryCoverage,
+    //     maxPrimaryCoverage,
+    //     threadCount,
+    //     /*enableColinearityPeeling*/ false,
+    //     /*minDominantFractionToPeel*/ 0.9);
+
+    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
+    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
+    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
+    // assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
+    //
+    //
+    // std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
+    // for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
+    //     if (!keepForMarkerGraph[i]) continue;
+    //
+    //     const auto& ad = assembler.alignmentData[i];
+    //
+    //     // Strict rule: only keep if both sides still keep it after your extra filtering.
+    //     if (!ad.keptByBothSides()) continue;
+    //
+    //     keepForReadGraph[i] = true;
+    // }
+    //
+    // // Rebuild the read graph using the tightened keep-set.
+    // assembler.rebuildReadGraphUsingSelectedAlignments(
+    //     std::move(keepForReadGraph),
+    //     /*rebuildDirectedReadGraph*/false);
+
+
+
+
+
+
+
+
+
+
+
     return;
 
 
@@ -2048,6 +2314,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
         *shasta2Anchors,
         maxWeakTipReadCount);
+
 
     // Save the final assembly-enabled state used by the HTTP server.
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
