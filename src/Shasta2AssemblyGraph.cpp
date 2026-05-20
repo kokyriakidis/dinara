@@ -1270,6 +1270,468 @@ uint64_t Shasta2AssemblyGraph::compress()
     return compressCount;
 }
 
+
+
+// Remove low-coverage dead-end edges (tips).
+// A tip is an edge where one endpoint is a dead end (no other connections
+// on that side). Adapted from MBG's tryRemoveTip.
+//
+// For a tip edge v0->v1 with dead end at v0:
+// - The tip edge must have coverage <= maxRemovableCoverage and length <= maxRemovableLength.
+// - v1 must have at least one outgoing edge (the side away from the tip)
+//   with coverage >= minSafeCoverage, going to a vertex other than v0.
+//
+// Symmetric logic for dead end at v1 (check v0's incoming edges).
+uint64_t Shasta2AssemblyGraph::removeLowCoverageTips(
+    double maxRemovableCoverage,
+    double minSafeCoverage,
+    uint64_t maxRemovableLength)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+    uint64_t removedCount = 0;
+
+    // Collect edges to remove (can't modify graph while iterating).
+    vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+
+        // Check coverage and length thresholds.
+        if(edge.averageCoverage() > maxRemovableCoverage) {
+            continue;
+        }
+        if(edge.length() > maxRemovableLength) {
+            continue;
+        }
+
+        const vertex_descriptor v0 = source(e, assemblyGraph);
+        const vertex_descriptor v1 = target(e, assemblyGraph);
+
+        // Check if this is a tip: one end must be a dead end.
+        // A dead end at v0 means in_degree(v0)==0 and out_degree(v0)==1.
+        // A dead end at v1 means out_degree(v1)==0 and in_degree(v1)==1.
+        const bool deadEndAtSource =
+            (in_degree(v0, assemblyGraph) == 0) && (out_degree(v0, assemblyGraph) == 1);
+        const bool deadEndAtTarget =
+            (out_degree(v1, assemblyGraph) == 0) && (in_degree(v1, assemblyGraph) == 1);
+
+        if(!deadEndAtSource && !deadEndAtTarget) {
+            continue;
+        }
+
+        // MBG's tryRemoveTip checks three things for each neighbor:
+        // 1. The neighbor node must have coverage >= minSafeCoverage (hard abort).
+        // 2. The transition to the neighbor must have coverage <= maxRemovableCoverage (hard abort).
+        // 3. The neighbor must have a safe edge on its other side (not back to tip).
+        //
+        // In our directed graph:
+        // - "neighbor nodes" = edges on the other side of the non-dead-end vertex.
+        // - We don't have separate transition coverage, so check 2 is covered by
+        //   the tip edge's own coverage check above.
+        // - Check 1: ALL edges on the other side must have coverage >= minSafeCoverage.
+        // - Check 3: at least one of those edges must lead to a vertex with a safe
+        //   connection further into the graph.
+
+        bool canRemove = false;
+
+        if(deadEndAtSource) {
+            // v1 is the non-dead-end vertex. The tip arrives on v1's incoming side.
+            // "Neighbor nodes" = v1's outgoing edges (the other side).
+
+            // Check 1: ALL outgoing edges from v1 must have coverage >= minSafeCoverage.
+            bool allNeighborsSafe = true;
+            if(out_degree(v1, assemblyGraph) == 0) {
+                allNeighborsSafe = false; // No neighbors on the other side.
+            }
+            BGL_FORALL_OUTEDGES(v1, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                if(assemblyGraph[eOther].averageCoverage() < minSafeCoverage) {
+                    allNeighborsSafe = false;
+                    break;
+                }
+            }
+
+            // Check 3: At least one outgoing edge from v1 must lead to a vertex
+            // that has a safe connection further (not back to v0).
+            if(allNeighborsSafe) {
+                BGL_FORALL_OUTEDGES(v1, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                    const vertex_descriptor vOtherTarget = target(eOther, assemblyGraph);
+                    if(vOtherTarget == v0) continue;
+                    if(assemblyGraph[eOther].averageCoverage() >= minSafeCoverage) {
+                        canRemove = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(deadEndAtTarget) {
+            // v0 is the non-dead-end vertex. The tip leaves from v0's outgoing side.
+            // "Neighbor nodes" = v0's incoming edges (the other side).
+
+            // Check 1: ALL incoming edges to v0 must have coverage >= minSafeCoverage.
+            bool allNeighborsSafe = true;
+            if(in_degree(v0, assemblyGraph) == 0) {
+                allNeighborsSafe = false;
+            }
+            BGL_FORALL_INEDGES(v0, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                if(assemblyGraph[eOther].averageCoverage() < minSafeCoverage) {
+                    allNeighborsSafe = false;
+                    break;
+                }
+            }
+
+            // Check 3: At least one incoming edge to v0 must come from a vertex
+            // that has a safe connection further (not from v1).
+            if(allNeighborsSafe) {
+                BGL_FORALL_INEDGES(v0, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                    const vertex_descriptor vOtherSource = source(eOther, assemblyGraph);
+                    if(vOtherSource == v1) continue;
+                    if(assemblyGraph[eOther].averageCoverage() >= minSafeCoverage) {
+                        canRemove = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(canRemove) {
+            edgesToRemove.push_back(e);
+        }
+    }
+
+    // Remove the collected edges and their dead-end vertices.
+    for(const edge_descriptor e: edgesToRemove) {
+        const vertex_descriptor v0 = source(e, assemblyGraph);
+        const vertex_descriptor v1 = target(e, assemblyGraph);
+
+        boost::remove_edge(e, assemblyGraph);
+        ++removedCount;
+
+        // Remove the dead-end vertex if it's now isolated.
+        if(in_degree(v0, assemblyGraph) == 0 && out_degree(v0, assemblyGraph) == 0) {
+            boost::remove_vertex(v0, assemblyGraph);
+        }
+        if(in_degree(v1, assemblyGraph) == 0 && out_degree(v1, assemblyGraph) == 0) {
+            boost::remove_vertex(v1, assemblyGraph);
+        }
+    }
+
+    cout << "removeLowCoverageTips removed " << removedCount << " tips." << endl;
+    return removedCount;
+}
+
+
+
+// Remove low-coverage crosslink edges at branching vertices.
+// Adapted from MBG's tryRemoveCrosslinks.
+//
+// At a vertex v with out-degree >= 2:
+// - There must be at least one outgoing edge with coverage >= minSafeCoverage.
+// - A low-coverage outgoing edge e (coverage <= maxRemovableCoverage) is removable if:
+//   (a) The target vertex of e has out-degree >= 2 (it has connections on the
+//       other side, away from v — MBG's edges[reverse(edge)].size() >= 2).
+//   (b) The target vertex has at least one outgoing edge (not back to v)
+//       with coverage >= minSafeCoverage.
+//
+// Symmetric logic for incoming edges at vertices with in-degree >= 2.
+uint64_t Shasta2AssemblyGraph::removeLowCoverageCrosslinks(
+    double maxRemovableCoverage,
+    double minSafeCoverage)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+    uint64_t removedCount = 0;
+
+    vector<edge_descriptor> edgesToRemove;
+
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+
+        // Check outgoing edges from v.
+        if(out_degree(v, assemblyGraph) >= 2) {
+            // There must be at least one safe outgoing edge.
+            bool hasSafeOutgoing = false;
+            BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                if(assemblyGraph[e].averageCoverage() >= minSafeCoverage) {
+                    hasSafeOutgoing = true;
+                    break;
+                }
+            }
+
+            if(hasSafeOutgoing) {
+                BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                    if(assemblyGraph[e].averageCoverage() > maxRemovableCoverage) {
+                        continue;
+                    }
+                    // The target vertex must have connections on its OTHER side
+                    // (outgoing, away from v).
+                    const vertex_descriptor vTarget = target(e, assemblyGraph);
+                    if(out_degree(vTarget, assemblyGraph) < 2) {
+                        continue;
+                    }
+                    // The target must have a safe outgoing edge (not back to v).
+                    bool targetHasSafeOnOtherSide = false;
+                    BGL_FORALL_OUTEDGES(vTarget, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                        const vertex_descriptor vOtherTarget = target(eOther, assemblyGraph);
+                        if(vOtherTarget == v) continue;
+                        if(assemblyGraph[eOther].averageCoverage() >= minSafeCoverage) {
+                            targetHasSafeOnOtherSide = true;
+                            break;
+                        }
+                    }
+                    if(targetHasSafeOnOtherSide) {
+                        edgesToRemove.push_back(e);
+                    }
+                }
+            }
+        }
+
+        // Check incoming edges to v.
+        if(in_degree(v, assemblyGraph) >= 2) {
+            bool hasSafeIncoming = false;
+            BGL_FORALL_INEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                if(assemblyGraph[e].averageCoverage() >= minSafeCoverage) {
+                    hasSafeIncoming = true;
+                    break;
+                }
+            }
+
+            if(hasSafeIncoming) {
+                BGL_FORALL_INEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                    if(assemblyGraph[e].averageCoverage() > maxRemovableCoverage) {
+                        continue;
+                    }
+                    // The source vertex must have connections on its OTHER side
+                    // (incoming, away from v).
+                    const vertex_descriptor vSource = source(e, assemblyGraph);
+                    if(in_degree(vSource, assemblyGraph) < 2) {
+                        continue;
+                    }
+                    // The source must have a safe incoming edge (not from v).
+                    bool sourceHasSafeOnOtherSide = false;
+                    BGL_FORALL_INEDGES(vSource, eOther, assemblyGraph, Shasta2AssemblyGraph) {
+                        const vertex_descriptor vOtherSource = source(eOther, assemblyGraph);
+                        if(vOtherSource == v) continue;
+                        if(assemblyGraph[eOther].averageCoverage() >= minSafeCoverage) {
+                            sourceHasSafeOnOtherSide = true;
+                            break;
+                        }
+                    }
+                    if(sourceHasSafeOnOtherSide) {
+                        edgesToRemove.push_back(e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate (an edge could be flagged from both its source and target).
+    std::ranges::sort(edgesToRemove, orderById);
+    edgesToRemove.erase(
+        std::unique(edgesToRemove.begin(), edgesToRemove.end()),
+        edgesToRemove.end());
+
+    for(const edge_descriptor e: edgesToRemove) {
+        boost::remove_edge(e, assemblyGraph);
+        ++removedCount;
+    }
+
+    cout << "removeLowCoverageCrosslinks removed " << removedCount << " crosslinks." << endl;
+    return removedCount;
+}
+
+
+
+// Remove edges and vertices with estimated copy number 0.
+// Adapted from MBG's cleanComponent.
+//
+// Copy number is estimated as round(edgeCoverage / averageCoverage).
+// If estimatedAverageCoverage is 0, it is auto-estimated from long edges (>= 50kb).
+//
+// Unlike a naive global filter, this validates each connected component:
+// for every vertex, the sum of incoming edge copy counts must equal the sum
+// of outgoing edge copy counts (flow conservation). Only components where
+// the copy number model fits cleanly are cleaned.
+uint64_t Shasta2AssemblyGraph::cleanByCopyNumber(
+    double estimatedAverageCoverage)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Auto-estimate average coverage from long edges if not provided.
+    if(estimatedAverageCoverage == 0.) {
+        const uint64_t minLengthForEstimate = 50000;
+        double coverageSum = 0.;
+        double lengthSum = 0.;
+        BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+            const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+            const uint64_t edgeLength = edge.length();
+            if(edgeLength >= minLengthForEstimate) {
+                coverageSum += edge.averageCoverage() * double(edgeLength);
+                lengthSum += double(edgeLength);
+            }
+        }
+        if(lengthSum > 0.) {
+            estimatedAverageCoverage = coverageSum / lengthSum;
+        } else {
+            // Fall back to all edges.
+            BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+                const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+                const uint64_t edgeLength = edge.length();
+                coverageSum += edge.averageCoverage() * double(edgeLength);
+                lengthSum += double(edgeLength);
+            }
+            if(lengthSum > 0.) {
+                estimatedAverageCoverage = coverageSum / lengthSum;
+            } else {
+                cout << "cleanByCopyNumber: no edges to estimate coverage from." << endl;
+                return 0;
+            }
+        }
+    }
+
+    cout << "cleanByCopyNumber: estimated average coverage = " << estimatedAverageCoverage << endl;
+
+    // Helper: compute copy number for a given coverage.
+    auto getCopyNumber = [&](double coverage) -> uint64_t {
+        return uint64_t((coverage + estimatedAverageCoverage / 2.) / estimatedAverageCoverage);
+    };
+
+    // Find connected components (ignoring edge direction).
+    // Build vertex index map.
+    map<vertex_descriptor, uint64_t> vertexIndexMap;
+    vector<vertex_descriptor> vertexTable;
+    uint64_t vertexIndex = 0;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        vertexTable.push_back(v);
+        vertexIndexMap[v] = vertexIndex++;
+    }
+
+    const uint64_t n = vertexTable.size();
+    if(n == 0) {
+        cout << "cleanByCopyNumber: no vertices." << endl;
+        return 0;
+    }
+
+    // Union-Find for connected components.
+    vector<uint64_t> rank(n);
+    vector<uint64_t> parent(n);
+    boost::disjoint_sets<uint64_t*, uint64_t*> disjointSets(&rank[0], &parent[0]);
+    for(uint64_t i = 0; i < n; i++) {
+        disjointSets.make_set(i);
+    }
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const vertex_descriptor v0 = source(e, assemblyGraph);
+        const vertex_descriptor v1 = target(e, assemblyGraph);
+        disjointSets.union_set(vertexIndexMap[v0], vertexIndexMap[v1]);
+    }
+
+    // Group vertices by component.
+    map<uint64_t, vector<uint64_t>> components;
+    for(uint64_t i = 0; i < n; i++) {
+        components[disjointSets.find_set(i)].push_back(i);
+    }
+
+    // Process each component.
+    uint64_t totalEdgesRemoved = 0;
+    uint64_t totalVerticesRemoved = 0;
+
+    for(const auto& [componentId, componentVertexIndices]: components) {
+
+        // Collect all edges in this component.
+        set<edge_descriptor> componentEdges;
+        for(const uint64_t vIdx: componentVertexIndices) {
+            const vertex_descriptor v = vertexTable[vIdx];
+            BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                componentEdges.insert(e);
+            }
+        }
+
+        // Validate the component: check that copy numbers are consistent.
+        // For each edge, coverage must fit an integer copy count within ±0.4.
+        // For each vertex, sum of incoming copy counts must equal sum of outgoing.
+        bool componentValid = true;
+
+        // Check edge copy numbers are well-defined.
+        map<edge_descriptor, uint64_t> edgeCopyNumbers;
+        for(const edge_descriptor e: componentEdges) {
+            const double coverage = assemblyGraph[e].averageCoverage();
+            const uint64_t copyNum = getCopyNumber(coverage);
+            const double normalizedCov = coverage / estimatedAverageCoverage;
+            // Check that coverage is within ±0.4 of the integer copy number.
+            if(copyNum <= 1 && std::abs(normalizedCov - double(copyNum)) > 0.4) {
+                componentValid = false;
+                break;
+            }
+            edgeCopyNumbers[e] = copyNum;
+        }
+
+        if(!componentValid) {
+            continue;
+        }
+
+        // Check flow conservation at each vertex in the component.
+        for(const uint64_t vIdx: componentVertexIndices) {
+            const vertex_descriptor v = vertexTable[vIdx];
+
+            uint64_t inCopySum = 0;
+            BGL_FORALL_INEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                if(edgeCopyNumbers.contains(e)) {
+                    inCopySum += edgeCopyNumbers[e];
+                }
+            }
+
+            uint64_t outCopySum = 0;
+            BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                if(edgeCopyNumbers.contains(e)) {
+                    outCopySum += edgeCopyNumbers[e];
+                }
+            }
+
+            // At internal vertices (not sources/sinks), flow must be conserved.
+            // At sources (in_degree==0) or sinks (out_degree==0), skip the check.
+            if(in_degree(v, assemblyGraph) > 0 && out_degree(v, assemblyGraph) > 0) {
+                if(inCopySum != outCopySum) {
+                    componentValid = false;
+                    break;
+                }
+            }
+        }
+
+        if(!componentValid) {
+            continue;
+        }
+
+        // Component is valid. Remove edges and vertices with copy number 0.
+        vector<edge_descriptor> edgesToRemove;
+        for(const auto& [e, copyNum]: edgeCopyNumbers) {
+            if(copyNum == 0) {
+                edgesToRemove.push_back(e);
+            }
+        }
+
+        for(const edge_descriptor e: edgesToRemove) {
+            boost::remove_edge(e, assemblyGraph);
+            ++totalEdgesRemoved;
+        }
+    }
+
+    // Remove any vertices that became isolated.
+    vector<vertex_descriptor> verticesToRemove;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) == 0) {
+            verticesToRemove.push_back(v);
+        }
+    }
+    for(const vertex_descriptor v: verticesToRemove) {
+        boost::remove_vertex(v, assemblyGraph);
+        ++totalVerticesRemoved;
+    }
+
+    cout << "cleanByCopyNumber removed " << totalEdgesRemoved
+         << " edges and " << totalVerticesRemoved << " vertices." << endl;
+    return totalEdgesRemoved;
+}
+
+
+
 void Shasta2AssemblyGraph::findAndConnectAssemblyPaths()
 {
     writePerformanceStatistics("Shasta2AssemblyGraph::findAndConnectAssemblyPaths begins");
