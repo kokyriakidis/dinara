@@ -1017,43 +1017,6 @@ def installMinipoa():
     print("minipoa installed at " + installBinary)
 
 
-def installFastGA():
-    print("Installing FastGA...")
-
-    installBinDir = os.path.join(HOME, ".local", "bin")
-    installBinary = os.path.join(installBinDir, "FastGA")
-    sourceDir = os.path.join(HOME, "Downloads", "FASTGA")
-
-    os.makedirs(installBinDir, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as temporaryDirectory:
-        print("Building FastGA using temporary directory", temporaryDirectory)
-
-        oldDirectory = os.getcwd()
-        os.chdir(temporaryDirectory)
-
-        if os.path.isdir(sourceDir):
-            print("Updating existing FASTGA source at", sourceDir)
-            runCommand("git -C " + sourceDir + " pull --ff-only")
-        else:
-            if os.path.exists(sourceDir):
-                os.remove(sourceDir)
-            print("Cloning FASTGA source to", sourceDir)
-            runCommand("git clone https://github.com/thegenemyers/FASTGA.git " + sourceDir)
-
-        runCommand("make -C " + sourceDir + " FastGA")
-
-        builtBinary = os.path.join(sourceDir, "FastGA")
-        if not os.path.exists(builtBinary):
-            raise Exception("FastGA binary not found after build. Check build output.")
-
-        runCommand("cp " + builtBinary + " " + installBinary)
-        os.chmod(installBinary, 0o755)
-
-        os.chdir(oldDirectory)
-
-    print("FastGA installed at " + installBinary)
-
 
 # Install all Rust libraries
 installAstarpa()
@@ -1070,7 +1033,6 @@ installShasta2()
 
 installVg()
 installMinipoa()
-installFastGA()
 
 # Make sure the newly created libraries are immediately visible to the loader.
 # For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable
