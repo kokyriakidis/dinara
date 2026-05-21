@@ -337,7 +337,7 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Reads.palindromicReads.maxErrorRate",
         value<double>(&readsOptions.palindromicReads.maxErrorRate)->
-        default_value(0.03, "0.03"),
+        default_value(0.07, "0.07"),
         "Maximum edit distance rate between forward and reverse complement "
         "to flag a read as palindromic.")
 
