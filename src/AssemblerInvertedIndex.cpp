@@ -4272,6 +4272,9 @@ void Assembler::flagPalindromicReads(
                    errorRate <= maxErrorRate) {
                     reads->setPalindromicFlag(readId, true);
                     palindromicCount.fetch_add(1);
+                    cout << "Palindromic: read " << readId
+                         << " alignedFrac=" << alignedFrac
+                         << " errorRate=" << errorRate << endl;
                 }
             }
         }
