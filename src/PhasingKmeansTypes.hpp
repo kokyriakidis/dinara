@@ -253,6 +253,13 @@ struct KmPhasingOptions {
     int      minSvLen = 30;           ///< Insertions >= this length use fuzzy length-ratio collapsing.
 };
 
+// ============================================================================
+// K-means runner (defined in AssemblerPhasingKmeans.cpp)
+// ============================================================================
+
+/// Run k-means phasing on candidates matching the given category flags.
+void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uint32_t flags);
+
 } // namespace dinara
 
 #endif // DINARA_PHASING_KMEANS_TYPES_HPP
