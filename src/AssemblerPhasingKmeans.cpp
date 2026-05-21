@@ -3,6 +3,7 @@
 
 #include "Assembler.hpp"
 #include "AlignedEvidenceStore.hpp"
+#include "PhasingKmeansAlign.hpp"
 #include "PhasingKmeansTypes.hpp"
 #include "Alignment.hpp"
 #include "Reads.hpp"
@@ -1812,12 +1813,13 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
     opts.isOnt = isOnt;
     if (isOnt) cout << timestamp << "ONT mode: Fisher exact strand bias filter enabled (p < "
                     << opts.strandBiasPval << ")" << endl;
+    KmNoisyMsaOptions msaOpts;
     atomic<uint64_t> readsProcessed(0), readsWithOverlaps(0), readsWithSites(0);
     atomic<uint64_t> totalCis(0), totalTrans(0), totalNoisyRegions(0);
 
     struct alignas(64) TT {
         int64_t gather=0, unpack=0, detect=0, count=0;
-        int64_t classify=0, kmeans=0, write=0;
+        int64_t classify=0, kmeans=0, noisyMsa=0, write=0;
         // Sub-timers for profiling.
         int64_t unpackSeq=0, unpackSdust=0;
         int64_t countCollect=0, countAlleles=0, countProfiles=0;
@@ -1957,6 +1959,17 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 if (cleanHet > 0) kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
                 t1 = clk::now(); tt.kmeans += us(t0,t1);
 
+                // Step 4: noisy-region MSA variant recovery.
+                // Runs abPOA on reads spanning noisy regions, discovers hidden
+                // variants, scores reads, and merges into the candidate table.
+                // Then re-runs k-means with the expanded candidate set.
+                t0 = clk::now();
+                if (!scratch.noisyRegions.empty()) {
+                    kmNoisyMsaStep4(*this, scratch, msaOpts);
+                    kmRunKmeans(scratch, opts, KM_GERMLINE_ALL);
+                }
+                t1 = clk::now(); tt.noisyMsa += us(t0,t1);
+
                 t0 = clk::now();
                 kmWriteResults(*this, readId, scratch);
                 t1 = clk::now(); tt.write += us(t0,t1);
@@ -1990,7 +2003,8 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
         total.gather += tt.gather; total.unpack += tt.unpack;
         total.detect += tt.detect; total.count += tt.count;
         total.classify += tt.classify;
-        total.kmeans += tt.kmeans; total.write += tt.write;
+        total.kmeans += tt.kmeans; total.noisyMsa += tt.noisyMsa;
+        total.write += tt.write;
         total.unpackSeq += tt.unpackSeq; total.unpackSdust += tt.unpackSdust;
         total.countCollect += tt.countCollect; total.countAlleles += tt.countAlleles;
         total.countProfiles += tt.countProfiles;
@@ -2006,6 +2020,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
          << " profiles=" << ms(total.countProfiles) << ")" << endl;
     cout << timestamp << "  classify: " << ms(total.classify) << endl;
     cout << timestamp << "  kmeans:   " << ms(total.kmeans) << endl;
+    cout << timestamp << "  noisyMsa: " << ms(total.noisyMsa) << endl;
     cout << timestamp << "  write:    " << ms(total.write) << endl;
     cout << timestamp << "Complete. Reads=" << readsProcessed.load()
          << " withOvlp=" << readsWithOverlaps.load()
