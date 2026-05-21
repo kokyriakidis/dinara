@@ -4256,8 +4256,24 @@ void Assembler::flagPalindromicReads(
                         {h.ordinalA, h.ordinalB});
                 }
 
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " rawOrdinals=" << alignment.ordinals.size() << endl;
+                if(dbg) {
+                    cout << "PALINDROME-DBG read " << readId
+                        << " rawOrdinals=" << alignment.ordinals.size() << endl;
+                    size_t nShow = std::min(alignment.ordinals.size(), size_t(10));
+                    for(size_t i = 0; i < nShow; i++) {
+                        cout << "PALINDROME-DBG read " << readId
+                            << " ordinal[" << i << "] A=" << alignment.ordinals[i][0]
+                            << " B=" << alignment.ordinals[i][1] << endl;
+                    }
+                    if(alignment.ordinals.size() > 10) {
+                        cout << "PALINDROME-DBG read " << readId << " ..." << endl;
+                        for(size_t i = alignment.ordinals.size() - 3; i < alignment.ordinals.size(); i++) {
+                            cout << "PALINDROME-DBG read " << readId
+                                << " ordinal[" << i << "] A=" << alignment.ordinals[i][0]
+                                << " B=" << alignment.ordinals[i][1] << endl;
+                        }
+                    }
+                }
 
                 if(alignment.ordinals.size() < 2) continue;
 
@@ -4270,6 +4286,17 @@ void Assembler::flagPalindromicReads(
                        const array<uint32_t,2>& b) {
                         return a[0] < b[0];
                     });
+
+                if(dbg) {
+                    cout << "PALINDROME-DBG read " << readId
+                        << " afterSort first10:" << endl;
+                    size_t nShow = std::min(alignment.ordinals.size(), size_t(10));
+                    for(size_t i = 0; i < nShow; i++) {
+                        cout << "  A=" << alignment.ordinals[i][0]
+                            << " B=" << alignment.ordinals[i][1] << endl;
+                    }
+                }
+
                 {
                     vector<array<uint32_t,2>> filtered;
                     filtered.push_back(alignment.ordinals[0]);
