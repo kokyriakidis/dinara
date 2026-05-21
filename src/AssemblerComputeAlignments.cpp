@@ -1389,39 +1389,46 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
         uint32_t span;      // qe - qs
         int64_t score;      // span - 12 * errors
     };
-    vector<CandidateInfo> group;
-    group.reserve(8);
+    // Two groups: one for same-strand, one for opposite-strand.
+    // Matches hifiasm which stores paf and reverse_paf separately.
+    vector<CandidateInfo> group[2];
+    group[0].reserve(4);
+    group[1].reserve(4);
 
-    auto flushGroup = [&]() {
-        if(group.size() <= 1) {
-            return;
-        }
-
-        // Find best: maximize score, then span, then minimize alignmentId.
-        size_t best = 0;
-        for(size_t i = 1; i < group.size(); ++i) {
-            const auto& a = group[i];
-            const auto& b = group[best];
-
-            if(a.score != b.score) {
-                if(a.score > b.score) best = i;
+    auto flushGroups = [&]() {
+        for(int s = 0; s < 2; s++) {
+            if(group[s].size() <= 1) {
+                group[s].clear();
                 continue;
             }
-            if(a.span != b.span) {
-                if(a.span > b.span) best = i;
-                continue;
-            }
-            if(a.alignmentId < b.alignmentId) {
-                best = i;
-            }
-        }
 
-        // Mark non-best as secondary.
-        for(size_t i = 0; i < group.size(); ++i) {
-            if(i == best) continue;
-            alignmentData[group[i].alignmentId].addDeleteReasonsBoth(
-                AlignmentData::DeleteReasonSecondary);
-            ++localRemoved;
+            // Find best: maximize score, then span, then minimize alignmentId.
+            size_t best = 0;
+            for(size_t i = 1; i < group[s].size(); ++i) {
+                const auto& a = group[s][i];
+                const auto& b = group[s][best];
+
+                if(a.score != b.score) {
+                    if(a.score > b.score) best = i;
+                    continue;
+                }
+                if(a.span != b.span) {
+                    if(a.span > b.span) best = i;
+                    continue;
+                }
+                if(a.alignmentId < b.alignmentId) {
+                    best = i;
+                }
+            }
+
+            // Mark non-best as secondary.
+            for(size_t i = 0; i < group[s].size(); ++i) {
+                if(i == best) continue;
+                alignmentData[group[s][i].alignmentId].addDeleteReasonsBoth(
+                    AlignmentData::DeleteReasonSecondary);
+                ++localRemoved;
+            }
+            group[s].clear();
         }
     };
 
@@ -1433,7 +1440,8 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 continue;
             }
 
-            group.clear();
+            group[0].clear();
+            group[1].clear();
             ReadId currentPartner = invalidReadId;
 
             // Binary search: skip prefix where partner < r0.
@@ -1476,8 +1484,7 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 const ReadId partner = ad.readIds[1];
 
                 if(partner != currentPartner) {
-                    flushGroup();
-                    group.clear();
+                    flushGroups();
                     currentPartner = partner;
                 }
 
@@ -1495,10 +1502,11 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
                 const int64_t score = int64_t(span) - 12 * int64_t(err);
 
-                group.push_back(CandidateInfo{alignmentId, span, score});
+                const int strandIdx = ad.isSameStrand ? 0 : 1;
+                group[strandIdx].push_back(CandidateInfo{alignmentId, span, score});
             }
 
-            flushGroup();
+            flushGroups();
         }
     }
 
