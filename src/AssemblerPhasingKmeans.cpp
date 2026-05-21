@@ -1597,7 +1597,7 @@ static bool kmPhaseSetFlip(KmScratchpad& scratch,
 // Step 6c: K-means main loop
 // ============================================================================
 
-static void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uint32_t flags)
+void dinara::kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uint32_t flags)
 {
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
     const uint32_t numCand = uint32_t(scratch.candidates.size());
@@ -1965,8 +1965,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 // Then re-runs k-means with the expanded candidate set.
                 t0 = clk::now();
                 if (!scratch.noisyRegions.empty()) {
-                    kmNoisyMsaStep4(*this, scratch, msaOpts);
-                    kmRunKmeans(scratch, opts, KM_GERMLINE_ALL);
+                    kmNoisyMsaStep4(*this, scratch, msaOpts, opts);
                 }
                 t1 = clk::now(); tt.noisyMsa += us(t0,t1);
 
