@@ -4299,12 +4299,27 @@ void Assembler::flagPalindromicReads(
 
                 {
                     vector<array<uint32_t,2>> filtered;
+                    uint64_t droppedCount = 0;
                     filtered.push_back(alignment.ordinals[0]);
                     for(size_t i = 1; i < alignment.ordinals.size(); i++) {
                         if(alignment.ordinals[i][0] > filtered.back()[0] &&
                            alignment.ordinals[i][1] > filtered.back()[1]) {
                             filtered.push_back(alignment.ordinals[i]);
+                        } else {
+                            if(dbg && droppedCount < 10) {
+                                cout << "PALINDROME-DBG read " << readId
+                                    << " DROPPED ordinal[" << i << "] A="
+                                    << alignment.ordinals[i][0]
+                                    << " B=" << alignment.ordinals[i][1]
+                                    << " (lastKept A=" << filtered.back()[0]
+                                    << " B=" << filtered.back()[1] << ")" << endl;
+                            }
+                            droppedCount++;
                         }
+                    }
+                    if(dbg && droppedCount > 0) {
+                        cout << "PALINDROME-DBG read " << readId
+                            << " totalDropped=" << droppedCount << endl;
                     }
                     alignment.ordinals = std::move(filtered);
                 }
