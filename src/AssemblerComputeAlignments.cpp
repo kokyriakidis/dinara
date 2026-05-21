@@ -1386,8 +1386,7 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
     struct CandidateInfo {
         uint32_t alignmentId;
-        uint32_t span;      // qe - qs
-        int64_t score;      // span - 12 * errors
+        int32_t sharedSeed;  // hifiasm DP chain score (shared_seed)
     };
     // Two groups: one for same-strand, one for opposite-strand.
     // Matches hifiasm which stores paf and reverse_paf separately.
@@ -1402,21 +1401,11 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 continue;
             }
 
-            // Find best: maximize score, then span, then minimize alignmentId.
+            // Find best: maximize sharedSeed (hifiasm DP chain score).
+            // Matches hifiasm's sort by shared_seed descending.
             size_t best = 0;
             for(size_t i = 1; i < group[s].size(); ++i) {
-                const auto& a = group[s][i];
-                const auto& b = group[s][best];
-
-                if(a.score != b.score) {
-                    if(a.score > b.score) best = i;
-                    continue;
-                }
-                if(a.span != b.span) {
-                    if(a.span > b.span) best = i;
-                    continue;
-                }
-                if(a.alignmentId < b.alignmentId) {
+                if(group[s][i].sharedSeed > group[s][best].sharedSeed) {
                     best = i;
                 }
             }
@@ -1488,22 +1477,12 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                     currentPartner = partner;
                 }
 
-                // Compute score: span - 12 * errors.
-                // Matches hifiasm: sc = (x_pos_e + 1 - x_pos_s) - 12 * non_homopolymer_errors
-                const uint32_t span = ad.qe - ad.qs;
-
-                const uint32_t err =
-                    (ad.info.nonHomopolymerErrorCount != invalid<uint32_t>) ?
-                    ad.info.nonHomopolymerErrorCount :
-                    ((ad.info.mismatchCount == invalid<uint32_t>) ? 0U
-                        : ad.info.mismatchCount) +
-                    ((ad.info.gapCount == invalid<uint32_t>) ? 0U
-                        : ad.info.gapCount);
-
-                const int64_t score = int64_t(span) - 12 * int64_t(err);
+                const int32_t sharedSeed =
+                    (ad.info.sharedSeedScore != invalid<int32_t>) ?
+                    ad.info.sharedSeedScore : 0;
 
                 const int strandIdx = ad.isSameStrand ? 0 : 1;
-                group[strandIdx].push_back(CandidateInfo{alignmentId, span, score});
+                group[strandIdx].push_back(CandidateInfo{alignmentId, sharedSeed});
             }
 
             flushGroups();
