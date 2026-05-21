@@ -20,9 +20,9 @@ and the k-means clustering is re-run with the expanded variant set.
 ### Why abPOA
 
 pgphase uses abPOA with `max_n_cons=2` for de-novo haplotype clustering when
-no prior haplotype labels exist.  Theseus does not have built-in multi-
-consensus clustering.  Using abPOA for both paths (per-haplotype and combined)
-keeps the implementation uniform and faithful to the pgphase port.
+no prior haplotype labels exist.  Using abPOA for both paths (per-haplotype
+and combined) keeps the implementation uniform and faithful to the pgphase
+port.
 
 ### Why chained ordinals instead of edlib
 
@@ -31,6 +31,18 @@ subsequent read in the POA.  In Dinara, the chained alignment ordinals from
 the marker-based aligner already provide exact anchor correspondences between
 backbone and read.  These are more precise than edlib's approximate endpoint
 detection and are already computed.
+
+### Why MSA-column scoring instead of AlnStr
+
+pgphase builds intermediate `AlnStr` (pairwise alignment string) objects
+between consensus and each read, then walks those to score variants.  This
+requires tracking a cumulative `delta_ref_alt` offset to map between ref and
+consensus coordinate systems as upstream indels shift positions.
+
+Dinara scores directly from the MSA matrix.  Each variant has exact
+`msaColStart`/`msaColEnd` column indices, and each read's MSA row can be
+indexed directly.  This eliminates the fragile cumulative offset tracking
+and the intermediate AlnStr construction, while producing identical results.
 
 ---
 
@@ -47,32 +59,39 @@ detection and are already computed.
 ## Data flow
 
 ```
-kmNoisyMsaStep4 (outer loop over noisy regions)
-  └─ collectNoisyRegMsa (per region)
-       ├─ collectNoisyReadInfo
-       │    ├─ Walk chained ordinals to find flanking markers
-       │    ├─ Extract backbone seed sequence (widest envelope)
-       │    └─ Extract per-read subsequences + backbone-relative positions
+kmNoisyMsaStep4 (iterative outer loop)
+  ├─ sortNoisyRegs (by label asc, length asc)
+  └─ while(true)
+       ├─ for each undone region (in sorted order):
+       │    └─ collectNoisyVars1
+       │         ├─ collectNoisyRegMsa (per region)
+       │         │    ├─ collectNoisyReadInfo
+       │         │    │    ├─ Walk chained ordinals to find flanking markers
+       │         │    │    ├─ Extract backbone seed sequence (widest envelope)
+       │         │    │    └─ Extract per-read subsequences + backbone-relative positions
+       │         │    │
+       │         │    ├─ [has both haplotypes] Per-haplotype path
+       │         │    │    ├─ abpoaMsaRun(hap1 reads, max_n_cons=1, includeBb=true)
+       │         │    │    └─ abpoaMsaRun(hap2 reads, max_n_cons=1, includeBb=false)
+       │         │    │
+       │         │    └─ [else] Combined fallback
+       │         │         └─ abpoaMsaRun(all reads, max_n_cons=2, includeBb=true)
+       │         │
+       │         ├─ [nCons == 2] processTwoHapResults
+       │         │    ├─ extractVariantsFromMsa (hap0 MSA)
+       │         │    ├─ extractVariantsFromMsa (hap1 MSA)
+       │         │    ├─ Sorted merge → unified variant list with varFromCons bitmask
+       │         │    ├─ scoreReadsAtVariants (same-hap, full scoring)
+       │         │    ├─ crossCoverageCheck (cross-hap, coverage-only ref)
+       │         │    └─ mergeNoisyVariants into scratch
+       │         │
+       │         └─ [nCons == 1] processOneMsaResult
+       │              ├─ extractVariantsFromMsa
+       │              ├─ scoreReadsAtVariants
+       │              └─ mergeNoisyVariants into scratch
        │
-       ├─ [has both haplotypes] Per-haplotype path
-       │    ├─ abpoaMsaRun(hap1 reads, max_n_cons=1, includeBb=true)
-       │    └─ abpoaMsaRun(hap2 reads, max_n_cons=1, includeBb=false)
-       │
-       └─ [else] Combined fallback
-            └─ abpoaMsaRun(all reads, max_n_cons=2, includeBb=true)
-
-  └─ [nCons == 2] processTwoHapResults
-       ├─ extractVariantsFromMsa (hap1 MSA)
-       ├─ extractVariantsFromMsa (hap2 MSA)
-       ├─ Merge variant lists (union, dedup by KmVarKey)
-       ├─ crossScoreReads (hap1 reads at all variants)
-       ├─ crossScoreReads (hap2 reads at all variants)
-       └─ Merge into scratch.candidates + overlapProfiles
-
-  └─ [nCons == 1] processOneMsaResult
-       ├─ extractVariantsFromMsa
-       ├─ scoreReadsAtVariants
-       └─ mergeNoisyVariants into scratch
+       ├─ if any new variants: kmRunKmeans (re-phase with expanded variant set)
+       └─ if no region made progress: break
 ```
 
 ---
@@ -235,54 +254,145 @@ itself discovers the haplotype separation.
 
 Walks the MSA column by column, comparing the consensus row against the
 backbone row.  Discovers:
-- **SNPs**: backbone has base X, consensus has base Y (both non-gap)
-- **Insertions**: backbone is gap, consensus has bases
-- **Deletions**: backbone has bases, consensus is gap
+- **SNPs**: backbone has base X, consensus has base Y (both non-gap).
+  Suppressed if the next column has a gap in either row (complex indel
+  boundary — pgphase SNP adjacency filter).
+- **Insertions**: backbone is gap, consensus has bases.  Consecutive
+  insertion columns are grouped into a single variant.
+- **Deletions**: backbone has bases, consensus is gap.  Consecutive
+  deletion columns are grouped into a single variant.
 
 Each variant records:
 - `backbonePos`: absolute backbone base position
 - `msaColStart`, `msaColEnd`: MSA column range (for same-MSA scoring)
 - `refBase`/`altBase` (SNPs) or `refSeq`/`altSeq` (indels)
 
+### `readFullyCoversVariant` (partial-cover filter)
+
+Before scoring a read at an indel variant, checks that the read spans the
+variant region by finding the nearest backbone-base columns flanking the
+variant's MSA column range and verifying the read has non-gap bases there.
+Mirrors pgphase's `full_cover` (`cover_start && cover_end`) check.
+
+Reads that don't fully cover the variant get score -1 (unknown).
+
 ### `scoreReadsAtVariants` (same-MSA scoring)
 
-Used when all reads are in the same MSA (combined fallback, `nCons == 1`).
-Scores each read at each variant's MSA column range:
-- SNP: read has ref base → 0, alt base → 1, gap/other → -1
-- Insertion: all gaps → 0 (ref), all bases → 1 (alt), mixed → -1
-- Deletion: all bases → 0 (ref), all gaps → 1 (alt), mixed → -1
+Scores each read at each variant's MSA column range.  Used for same-haplotype
+scoring (reads in the same MSA as the consensus that discovered the variant).
 
-### `crossScoreReads` (cross-MSA scoring)
+**SNPs:**
+- Read has alt base → 1 (alt)
+- Read has ref base → 0 (ref)
+- Read has gap or other → -1 (unknown)
 
-Used when reads are in different MSAs (per-haplotype path, `nCons == 2`).
-The two per-haplotype MSAs have different column alignments, so we cannot use
-`msaColStart`/`msaColEnd` across MSAs.
+**Insertions:**
+- Counts `nMatch` (read base == consensus base), `nMismatch` (read has
+  different base), `nGaps` across the insertion columns.
+- All gaps → 0 (ref: read doesn't have the insertion)
+- No bases at all → -1 (unknown)
+- Long insertions (≥ `kLongIndelLen` = 10bp): `nMatch ≥ 90%` of span → 1
+  (alt); else if fully covered → 0 (ref); else -1
+- Short insertions: exact match (`nMatch == span`, `nMismatch == 0`) → 1
+  (alt); else if fully covered → 0 (ref); else -1
+- The 90% similarity threshold (`kConsSimilarityThreshold`) matches pgphase's
+  `cons_sim_thres`.
 
-Instead, we build a backbone-position-to-MSA-column map (`buildBbPosToMsaCol`)
-by walking the backbone MSA row and recording which column each non-gap base
-corresponds to.  Then for each variant, we find the corresponding column(s)
-in this MSA by backbone position and score the reads there.
+**Deletions:**
+- All bases → 0 (ref: read has the reference sequence)
+- All gaps → 1 (alt: read has the deletion)
+- Mixed → -1 (unknown)
 
-This ensures hap1 reads are scored at variants discovered from hap2's MSA
-and vice versa.
+### `crossCoverageCheck` (cross-haplotype scoring)
 
-### `processTwoHapResults` (per-haplotype path)
+Used in the two-haplotype path for variants from the OTHER consensus.
+pgphase only checks coverage and assigns ref (0) for cross-haplotype
+variants — it never does full allele scoring across haplotypes.
 
-1. Extract variants from both haplotypes' MSAs.
-2. Merge variant lists (union, deduplicated by `KmVarKey::operator==`).
-3. Determine category: variant found in only one haplotype → `NoisyCandHet`,
-   found in both → `NoisyCandHom`.
-4. Cross-score all reads from both MSAs at all variant positions.
-5. Combine scores and readIndices from both haplotypes.
-6. For each variant: create or find existing `KmCandidate`, update overlap
-   profiles.
+Uses `buildBbPosToMsaCol` to map the variant's backbone position to the
+corresponding MSA column in this haplotype's MSA.
 
-### `processOneMsaResult` (combined fallback, `nCons == 1`)
+- **Deletions**: finds the backbone-base columns spanning the deletion
+  length, then checks `readFullyCoversVariant`.  If covered → 0 (ref).
+- **SNPs/Insertions**: checks if the read has a non-gap base at the anchor
+  column.  If so → 0 (ref).
+- If not covered → -1 (unknown).
 
-Simpler path: all reads are in the same MSA.
+### `processTwoHapResults` (two-haplotype path)
+
+Port of pgphase `update_cand_var_profile_from_cons_aln_str2` +
+`update_cand_var_profile_from_cons_aln_str21`.
+
+1. Extract variants from both haplotypes' MSAs independently.
+2. Sorted merge into a unified variant list with `varFromCons` bitmask:
+   - 1 = from hap0 consensus only → `NoisyCandHet`
+   - 2 = from hap1 consensus only → `NoisyCandHet`
+   - 3 = from both consensuses → `NoisyCandHom`
+3. Full scoring (`scoreReadsAtVariants`) for same-haplotype reads.
+4. Coverage-only ref (`crossCoverageCheck`) for cross-haplotype reads.
+5. Skip variants with zero alt-allele reads.
+6. Merge via `mergeNoisyVariants`.
+
+### `processOneMsaResult` (single-consensus path)
+
+Port of pgphase `update_cand_var_profile_from_cons_aln_str1`.
+
+All reads are in the same MSA.  All variants are `NoisyCandHom`.
 1. Extract variants.
-2. Score reads using `scoreReadsAtVariants` (same-MSA, uses `msaColStart`).
-3. Merge via `mergeNoisyVariants`.
+2. Score reads using `scoreReadsAtVariants`.
+3. Skip variants with zero alt-allele reads.
+4. Merge via `mergeNoisyVariants`.
+
+---
+
+## Sorted merge — `mergeNoisyVariants`
+
+Port of pgphase `merge_var_profile` + `merge_read_var_profile_entries`.
+
+Merges new variants into `scratch.candidates` and rebuilds all overlap
+profiles with remapped indices.
+
+### Algorithm
+
+1. Sort new variants by `KmVarKey`.
+2. Two-pointer merge with existing `scratch.candidates` (already sorted).
+3. Build `oldToMerged[i]` and `newToMerged[i]` index maps.
+4. **Collision** (same `KmVarKey`): keep old candidate, `newToMerged[i]`
+   stays -1 (new variant's scores are discarded).
+5. Rebuild overlap profiles:
+   - Transfer old profile entries using `oldToMerged`.
+   - Apply new variant scores using `newToMerged` (skipped for collisions).
+6. Remap `scratch.validVarIdx` through `oldToMerged`.
+
+---
+
+## Iterative outer loop — `kmNoisyMsaStep4`
+
+Port of pgphase `collect_noisy_vars_step4`.
+
+### Region sorting
+
+`sortNoisyRegs` sorts regions by (label ascending, length ascending) using
+pgphase's bubble sort.  Label represents the number of existing variant sites
+in the region — regions with fewer known variants are processed first.
+
+### Retry loop
+
+```
+while(true):
+    for each undone region (in sorted order):
+        ret = collectNoisyVars1(region)
+        if ret >= 0:  mark done, track if new vars found
+        if ret < 0:   leave undone (MSA failed, may retry)
+    if any new vars: kmRunKmeans (re-phase)
+    if no region made progress: break
+```
+
+Regions that fail MSA (`ret == -1`) are left undone and retried on the next
+pass.  The rationale: another region's new variants may change the k-means
+phasing, which changes the haplotype labels, which may allow the failed
+region to succeed on retry (e.g., by providing enough reads per haplotype
+for the per-haplotype path).
 
 ---
 
@@ -338,6 +448,16 @@ return -1`.
 
 ---
 
+## Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `kGap` | 4 | abPOA gap value in MSA rows |
+| `kLongIndelLen` | 10 | Threshold for long vs short indel scoring |
+| `kConsSimilarityThreshold` | 0.9 | Minimum consensus-matching fraction for long insertions |
+
+---
+
 ## Verification checklist
 
 All items verified against abPOA source code, pgphase reference, and
@@ -382,15 +502,33 @@ end-to-end traces with concrete examples.
 ### Variant extraction and scoring
 
 - [x] `extractVariantsFromMsa` tracks backbone position correctly
+- [x] SNP adjacency filter suppresses SNPs at complex indel boundaries
 - [x] SNP, insertion, deletion all handled
+- [x] `readFullyCoversVariant` checks flanking backbone-base columns
+- [x] Insertion scoring uses `nMatch` (consensus-matching), not any-base
+- [x] Long insertion similarity threshold (90%) matches pgphase
+- [x] Short insertion requires exact match
 - [x] `scoreReadsAtVariants` scores all reads at MSA column ranges
-- [x] `crossScoreReads` uses backbone-position-to-MSA-column mapping
-- [x] `crossScoreReads` always appends exactly `nReads` entries per variant
-- [x] `processTwoHapResults` merges variants from both haplotypes
+- [x] `crossCoverageCheck` is coverage-only ref (matches pgphase cross-hap)
+- [x] `processTwoHapResults` merges variants with `varFromCons` bitmask
 - [x] Category: het if in one haplotype, hom if in both
 - [x] `varToKey` sets all `KmVarKey` fields correctly (refLen, altLen)
 - [x] Duplicate detection uses `KmVarKey::operator==` (all 5 fields)
 - [x] Profile extension relative to `startVarIdx`, not absolute
+
+### Sorted merge
+
+- [x] `mergeNoisyVariants` uses two-pointer sorted merge
+- [x] Collision keeps old candidate, discards new scores
+- [x] `oldToMerged`/`newToMerged` index maps rebuild profiles correctly
+- [x] `validVarIdx` remapped through `oldToMerged`
+
+### Outer loop
+
+- [x] `sortNoisyRegs` sorts by (label asc, length asc) — bubble sort
+- [x] Iterative retry: failed regions (`ret == -1`) retried on next pass
+- [x] `kmRunKmeans` called after each pass with new variants
+- [x] Loop terminates when no region makes progress
 
 ### End-to-end trace
 
@@ -411,8 +549,22 @@ end-to-end traces with concrete examples.
 | 4 | Profile extension absolute, not relative to `startVarIdx` | Use `off = candIdx - startVarIdx` |
 | 5 | Backbone included in hap2's read list | Added `includeBackboneInReads` parameter |
 | 6 | Backbone excluded from allele counting | Include in `variantToCandidate` |
-| 7 | Hap1 reads not scored at hap2's variants | Added `crossScoreReads` + `processTwoHapResults` |
+| 7 | Hap1 reads not scored at hap2's variants | Added cross-haplotype scoring |
 | 8 | `crossScoreReads` could skip variants | Always append `nReads` entries |
 | 9 | `KmVarKey.refLen` never set | Added `varToKey` helper |
 | 10 | Duplicate detection incomplete | Use `KmVarKey::operator==` |
-| 11 | Hap2 reads not profiled for shared variants | Always update profiles, even for existing candidates |
+| 11 | Dead code: `scoreReadsAtVariants` called then discarded | Removed |
+| 12 | Missing `<array>` include | Added |
+| 13 | Unused `bbRow` variable | Removed |
+| 14 | Stale comment on `readIndices` | Updated |
+| 15 | Single-pass outer loop (no retry) | Added iterative `while(true)` with done tracking |
+| 16 | No region sorting | Added `sortNoisyRegs` by (label, length) |
+| 17 | No inter-region k-means re-run | Added `kmRunKmeans` call after each pass |
+| 18 | Candidates not sorted after merge | Rewrote as sorted merge with index maps |
+| 19 | SNP adjacency filter missing | Added next-column gap check |
+| 20 | No similarity threshold for long indels | Added 90% threshold for insertions ≥10bp |
+| 21 | No partial-cover filtering | Added `readFullyCoversVariant` |
+| 22 | Cross-haplotype scoring too aggressive | Replaced with `crossCoverageCheck` (coverage-only ref) |
+| 23 | Collision merge applied new scores | `newToMerged` stays -1 on collision |
+| 24 | Insertion scoring counted any base, not consensus-matching | Changed to `nMatch` (read == consensus) |
+| 25 | Insertion mixed base/gap scored as ref instead of unknown | Added `nBases + nGaps == span` check |
