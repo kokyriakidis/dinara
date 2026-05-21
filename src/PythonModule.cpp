@@ -226,15 +226,9 @@ PYBIND11_MODULE(dinara, dinaraModule)
             arg("readId"),
             arg("strand"),
             arg("fileName") = "OverlappingReads.fasta")
-        .def("flagPalindromicReads",
-            &Assembler::flagPalindromicReads,
-            arg("maxSkip"),
-            arg("maxDrift"),
-            arg("maxMarkerFrequency"),
-            arg("alignedFractionThreshold"),
-            arg("nearDiagonalFractionThreshold"),
-            arg("deltaThreshold"),
-            arg("threadCount") = 0)
+        // flagPalindromicReads requires OverlapCandidatesOptions which is
+        // not exposed to Python. Call from C++ main or via the assembler
+        // pipeline. Binding omitted.
 
         // Alignments.
         .def("writeAlignmentCandidates",

@@ -122,6 +122,7 @@ public:
     int deltaThreshold;
     int minAlignedMarkerCount;
     int maxUncoveredBases;
+    double minIdentity;
     void write(ostream&) const;
 };
 

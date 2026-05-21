@@ -18,6 +18,7 @@
 #include "hifiasmCoordinateTransforms.hpp"
 #include "performanceLog.hpp"
 #include "OrientedReadPair.hpp"
+#include "ProjectedAlignment.hpp"
 #include "timestamp.hpp"
 #include "Reads.hpp"
 #include <algorithm>
@@ -3940,4 +3941,322 @@ void Assembler::chainPafCandidates(
     const double totalSeconds = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime)).count());
     cout << timestamp << "PAF candidate chaining completed in " << totalSeconds << " s." << endl;
     cout << timestamp << "Chained " << alignmentCandidates.candidates.size() << " candidates." << endl;
+}
+
+
+// ============================================================================
+// Palindromic read detection via inverted index + DP chaining.
+// Uses the same pipeline as overlap discovery but collects self-hits
+// (strand 0 vs strand 1) instead of partner hits, then refines with
+// ProjectedAlignment (astarpa) for base-level identity.
+// Requires buildInvertedIndex to have been called first.
+// ============================================================================
+
+void Assembler::flagPalindromicReads(
+    double maxDriftRate,
+    const OverlapCandidatesOptions& overlapCandidatesOptions,
+    double alignedFractionThreshold,
+    int maxUncoveredBases,
+    double minIdentity,
+    uint64_t threadCount)
+{
+    performanceLog << timestamp
+        << "Finding palindromic reads via inverted index chaining." << endl;
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    DINARA_ASSERT(!invertedIndexData.compactOccurrences.empty());
+
+    configureInvertedIndexDataForChaining(
+        invertedIndexData, overlapCandidatesOptions,
+        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        maxDriftRate);
+    rebuildWeightLut(invertedIndexData);
+
+    const ReadId readCount = reads->readCount();
+    const auto& allMarkers = *markers;
+    const uint64_t kmerLen = assemblerInfo->k;
+
+    const int64_t paMatch = 1;
+    const int64_t paMismatch = -5;
+    const int64_t paGapOpen = -4;
+    const int64_t paGapExtend = -2;
+
+    reads->assertReadsAndFlagsOfSameSize();
+    for(ReadId readId = 0; readId < readCount; readId++) {
+        reads->setPalindromicFlag(readId, false);
+    }
+
+    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+    const uint32_t lowFreqThreshold = uint32_t(
+        coveragePeak * invertedIndexData.lowFreqMultiplier);
+    const uint32_t highFreqThreshold = uint32_t(
+        coveragePeak * invertedIndexData.highFreqMultiplier);
+    const uint32_t highFreqWeightUnit = std::max(1u, uint32_t(coveragePeak));
+    const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
+    const double weightExponent = invertedIndexData.weightExponent;
+
+    const uint64_t hashMask = invertedIndexData.hashTable.size() - 1;
+    const auto* hashTablePtr = invertedIndexData.hashTable.data();
+
+    std::atomic<uint64_t> palindromicCount{0};
+    const uint64_t batchSize = 100;
+    std::atomic<uint64_t> nextBatch{0};
+
+    auto workerFn = [&]() {
+        vector<HifiasmKmerHit> selfHits;
+        HifiasmChainDataScratch dpScratch;
+        vector<HifiasmOverlapRegion> overlapRegions;
+        vector<uint32_t> chainHitIndexFlat;
+
+        while(true) {
+            const uint64_t batch = nextBatch.fetch_add(batchSize);
+            if(batch >= readCount) break;
+            const uint64_t batchEnd = std::min(
+                batch + batchSize, uint64_t(readCount));
+
+            for(ReadId readId = ReadId(batch);
+                readId < ReadId(batchEnd); readId++) {
+
+                const OrientedReadId oid0(readId, 0);
+                const uint64_t readLen =
+                    reads->getReadRawSequenceLength(readId);
+                if(readLen == 0) continue;
+
+                const auto& markersA = allMarkers[oid0.getValue()];
+                const uint32_t numMarkersA = uint32_t(markersA.size());
+                if(numMarkersA < 2) continue;
+
+                // Get precomputed canonical kmer IDs for strand 0.
+                const KmerId* canonicalIdsA = nullptr;
+                const uint8_t* canonicalIsRcA = nullptr;
+                bool hasCanonical =
+                    (size_t(readId) + 1 <
+                     invertedIndexData.strand0CanonicalOffsets.size());
+                if(hasCanonical) {
+                    const uint64_t b =
+                        invertedIndexData.strand0CanonicalOffsets[
+                            size_t(readId)];
+                    const uint64_t e =
+                        invertedIndexData.strand0CanonicalOffsets[
+                            size_t(readId) + 1];
+                    if(e - b == numMarkersA &&
+                       e <= invertedIndexData
+                            .strand0CanonicalKmerIds.size() &&
+                       e <= invertedIndexData
+                            .strand0CanonicalIsRc.size()) {
+                        canonicalIdsA =
+                            invertedIndexData
+                                .strand0CanonicalKmerIds.data() + b;
+                        canonicalIsRcA =
+                            invertedIndexData
+                                .strand0CanonicalIsRc.data() + b;
+                    } else {
+                        hasCanonical = false;
+                    }
+                }
+
+                // Fall back to markerKmerIds if no canonical data.
+                const auto kmerIdsA = hasCanonical
+                    ? span<const KmerId>()
+                    : (*markerKmerIds)[oid0.getValue()];
+
+                selfHits.clear();
+
+                for(uint32_t ordA = 0; ordA < numMarkersA; ordA++) {
+                    KmerId currentKId;
+                    uint8_t isRcA;
+                    if(hasCanonical) {
+                        currentKId = canonicalIdsA[ordA];
+                        isRcA = canonicalIsRcA[ordA];
+                    } else {
+                        currentKId = kmerIdsA[ordA];
+                        KmerId rcKId = getRcKmerId(currentKId, kmerLen);
+                        if(rcKId < currentKId) {
+                            currentKId = rcKId;
+                            isRcA = 1;
+                        } else {
+                            isRcA = 0;
+                        }
+                    }
+
+                    // Hash table lookup.
+                    uint64_t slotIdx =
+                        foldKmerIdToUint64(currentKId) & hashMask;
+                    bool found = false;
+                    while(true) {
+                        const auto& slot = hashTablePtr[slotIdx];
+                        if(slot.first == slot.second) break;
+                        const auto& firstOcc =
+                            invertedIndexData.compactOccurrences[
+                                slot.first];
+                        if(firstOcc.kmerId == currentKId) {
+                            found = true;
+                            break;
+                        }
+                        slotIdx = (slotIdx + 1) & hashMask;
+                    }
+                    if(!found) continue;
+
+                    const auto& slot = hashTablePtr[slotIdx];
+                    const uint64_t occBegin = slot.first;
+                    const uint64_t occEnd = slot.second;
+                    const uint32_t count = uint32_t(occEnd - occBegin);
+
+                    const uint32_t w = computeInvertedIndexHitWeight(
+                        count, lowFreqThreshold, highFreqThreshold,
+                        highFreqWeightUnit, rareKmerWeight,
+                        invertedIndexData.weightLut, weightExponent);
+                    if(w == 0) continue;
+
+                    const uint32_t posA = markersA[ordA].position;
+                    const uint32_t seedSpan = uint32_t(
+                        std::min<uint64_t>(kmerLen, 255ULL));
+
+                    for(uint64_t idx = occBegin; idx < occEnd; idx++) {
+                        const auto& occ =
+                            invertedIndexData.compactOccurrences[idx];
+                        if(occ.readId != readId) continue;
+
+                        const uint32_t posBEncoded = occ.position;
+                        const uint32_t posB = posBEncoded & 0x7fffffffU;
+                        const uint8_t isRcB =
+                            uint8_t(posBEncoded >> 31);
+
+                        // Strand of hit: isRcA ^ isRcB.
+                        // For palindrome we want opposite strand (rev=1).
+                        const uint8_t rev = isRcA ^ isRcB;
+                        if(rev == 0) continue;
+
+                        const uint32_t selfOff = posA + (seedSpan - 1U);
+                        const uint32_t offDiff = uint32_t(
+                            readLen - 1ULL - uint64_t(posB));
+
+                        HifiasmKmerHit kh{};
+                        kh.readID = readId;
+                        kh.strand = 1;
+                        kh.self_offset = selfOff;
+                        kh.offset = offDiff;
+                        kh.cnt = (std::min(w, 0xffffffu) << 8)
+                                 | seedSpan;
+                        kh.ordinalA = ordA;
+                        kh.ordinalB =
+                            std::numeric_limits<uint32_t>::max();
+                        kh.globalIndex = uint32_t(selfHits.size());
+                        selfHits.push_back(kh);
+                    }
+                }
+
+                if(selfHits.size() < 2) continue;
+
+                // Map ordinalB for each hit.
+                for(auto& kh : selfHits) {
+                    const uint32_t origPosB = uint32_t(
+                        readLen - 1ULL - uint64_t(kh.offset));
+                    for(uint32_t ord = 0; ord < numMarkersA; ord++) {
+                        if(markersA[ord].position == origPosB) {
+                            kh.ordinalB = numMarkersA - 1U - ord;
+                            break;
+                        }
+                    }
+                }
+                selfHits.erase(
+                    std::remove_if(selfHits.begin(), selfHits.end(),
+                        [](const HifiasmKmerHit& h) {
+                            return h.ordinalB ==
+                                std::numeric_limits<uint32_t>::max();
+                        }),
+                    selfHits.end());
+
+                if(selfHits.size() < 2) continue;
+
+                sortHifiasmHitsBySelfOffsetThenOffsetRuns(selfHits);
+
+                overlapRegions.clear();
+                chainHitIndexFlat.clear();
+
+                hifiasm_lchain_qdp_mcopy_fast(
+                    selfHits, dpScratch,
+                    overlapRegions, chainHitIndexFlat,
+                    25, 5000, 500,
+                    1.0, 0.05,
+                    maxDriftRate,
+                    uint32_t(readId),
+                    int64_t(readLen), int64_t(readLen),
+                    1, 1, 0.0, 0);
+
+                if(overlapRegions.empty()) continue;
+
+                const auto& best = overlapRegions[0];
+                const uint64_t off =
+                    uint64_t(best.non_homopolymer_errors);
+                const uint64_t nHit =
+                    uint64_t(best.align_length);
+
+                Alignment alignment;
+                alignment.ordinals.reserve(nHit);
+                for(uint64_t j = 0; j < nHit; j++) {
+                    if(off + j >= chainHitIndexFlat.size()) continue;
+                    const uint32_t g =
+                        chainHitIndexFlat[size_t(off + j)];
+                    if(g >= selfHits.size()) continue;
+                    const auto& h = selfHits[g];
+                    alignment.ordinals.push_back(
+                        {h.ordinalA, h.ordinalB});
+                }
+
+                if(alignment.ordinals.size() < 2) continue;
+
+                const array<OrientedReadId, 2> oids = {
+                    OrientedReadId(readId, 0),
+                    OrientedReadId(readId, 1)
+                };
+
+                ProjectedAlignment projectedAlignment(
+                    *this, oids, alignment,
+                    ProjectedAlignment::Method::QuickRawSparse,
+                    paMatch, paMismatch, paGapOpen, paGapExtend);
+
+                const uint64_t totalBases =
+                    projectedAlignment.totalLength[0];
+                if(totalBases == 0) continue;
+
+                const double identity =
+                    1.0 - projectedAlignment.errorRate();
+                const uint64_t uncovered = (readLen > totalBases)
+                    ? (readLen - totalBases) : 0;
+                const double alignedFrac =
+                    double(totalBases) / double(readLen);
+
+                const bool spanPass =
+                    (int64_t(uncovered) <= int64_t(maxUncoveredBases));
+                const bool fracPass =
+                    (alignedFrac >= alignedFractionThreshold);
+                const bool idPass = (identity >= minIdentity);
+
+                if((spanPass || fracPass) && idPass) {
+                    reads->setPalindromicFlag(readId, true);
+                    palindromicCount.fetch_add(1);
+                }
+            }
+        }
+    };
+
+    vector<std::thread> threads;
+    for(uint64_t t = 0; t < threadCount; t++) {
+        threads.emplace_back(workerFn);
+    }
+    for(auto& t : threads) {
+        t.join();
+    }
+
+    const size_t count = palindromicCount.load();
+    assemblerInfo->palindromicReadCount = count;
+    cout << "Flagged " << count
+         << " reads as palindromic out of "
+         << readCount << " total." << endl;
+    cout << "Palindromic fraction is "
+         << double(count) / double(readCount) << endl;
 }

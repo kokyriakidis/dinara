@@ -1061,32 +1061,18 @@ public:
 
 
 
-    int palindromicMinAlignedMarkerCount = 32;
-    int palindromicMaxUncoveredBases = 500;
-
     // Flag palindromic reads.
+    // Uses inverted index + DP chaining (same pipeline as overlap discovery)
+    // to find self-alignments (strand 0 vs strand 1), then ProjectedAlignment
+    // with astarpa for base-level identity.
+    // Requires buildInvertedIndex to have been called first.
     void flagPalindromicReads(
-        uint32_t maxSkip,
-        uint32_t maxDrift,
-        uint32_t maxMarkerFrequency,
+        double maxDriftRate,
+        const OverlapCandidatesOptions& overlapCandidatesOptions,
         double alignedFractionThreshold,
-        double nearDiagonalFractionThreshold,
-        uint32_t deltaThreshold,
+        int maxUncoveredBases,
+        double minIdentity,
         uint64_t threadCount);
-private:
-    void flagPalindromicReadsThreadFunction(size_t threadId);
-    class FlagPalindromicReadsData {
-    public:
-        uint32_t maxSkip;
-        uint32_t maxDrift;
-        uint32_t maxMarkerFrequency;
-        double alignedFractionThreshold;
-        double nearDiagonalFractionThreshold;
-        uint32_t deltaThreshold;
-        int minAlignedMarkerCount;
-        int maxUncoveredBases;
-    };
-    FlagPalindromicReadsData flagPalindromicReadsData;
 
 	    // Filter secondary/redundant alignments per read pair (hifiasm-style).
 		    void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
