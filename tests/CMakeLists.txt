@@ -20,6 +20,7 @@ add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 include_directories(${DINARA_ROOT}/src)
 include_directories(${DINARA_ROOT}/srcMain)
 include_directories(${DINARA_ROOT}/external/catch2)
+include_directories(${DINARA_ROOT}/src/edlib/include)
 
 # Figure out if we are on Intel (as opposed to ARM).
 set(X86_64 OFF)
@@ -48,6 +49,7 @@ add_library(catch_main OBJECT catch_main.cpp)
 file(GLOB DINARA_SRC_FILES CONFIGURE_DEPENDS
     ${DINARA_ROOT}/src/*.cpp
     ${DINARA_ROOT}/srcMain/*.cpp
+    ${DINARA_ROOT}/src/edlib/src/edlib.cpp
 )
 # Remove main.cpp (it has its own main())
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*main\\.cpp$")

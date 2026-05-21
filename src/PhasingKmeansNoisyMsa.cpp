@@ -1,18 +1,19 @@
 /// @file PhasingKmeansNoisyMsa.cpp
 /// @brief Noisy-region MSA variant calling and re-phasing (pgphase step 4).
 ///
-/// See PhasingKmeansNoisyMsa.md for the full implementation plan.
+/// Port of pgphase/longcallD collect_noisy_vars_step4.
 ///
-/// For each noisy region:
-/// 1. Run abPOA MSA via collectNoisyRegMsa (per-haplotype or combined).
-/// 2. Walk the MSA matrix to extract variants (consensus vs backbone).
-/// 3. Score all reads at the new variant positions.
-/// 4. Merge new variants into the candidate table.
-/// 5. Re-run k-means with the expanded candidate set.
+/// Key design (matching pgphase):
+/// - Variant extraction: pairwise alignment of raw backbone vs consensus
+///   sequences (edlib), NOT direct MSA row comparison. This avoids
+///   multi-sequence alignment artifacts that inflate variant counts.
+/// - Read scoring: AlnStr derived from MSA rows (strip double-gap columns),
+///   scored with delta_ref_alt offset tracking and full_cover gating.
 
 #include "PhasingKmeansAlign.hpp"
 #include "PhasingKmeansTypes.hpp"
 #include "Assembler.hpp"
+#include "edlib.h"
 
 #include <algorithm>
 #include <array>
@@ -59,74 +60,249 @@ static KmVarKey varToKey(const NoisyMsaVariant& v)
     return key;
 }
 
-/// Walk the MSA consensus vs backbone rows to extract variants.
-/// Port of pgphase make_cand_vars_from_msa / make_cand_vars_from_baln0.
+/// Extract raw (ungapped) sequence from an MSA row.
+static vector<uint8_t> extractRawSeq(const vector<uint8_t>& msaRow, int msaLen)
+{
+    vector<uint8_t> seq;
+    seq.reserve(msaLen);
+    for(int i = 0; i < msaLen; i++) {
+        if(msaRow[i] != kGap) seq.push_back(msaRow[i]);
+    }
+    return seq;
+}
+
+/// Pairwise-align backbone vs consensus sequences using edlib, then extract
+/// variants from the alignment. Port of pgphase's approach: WFA ref-vs-cons
+/// alignment followed by make_cand_vars_from_baln0.
+///
+/// Using pairwise alignment instead of MSA row comparison avoids
+/// multi-sequence alignment artifacts that inflate variant counts.
+static vector<NoisyMsaVariant> extractVariantsFromPairwise(
+    const vector<uint8_t>& bbRaw,
+    const vector<uint8_t>& consRaw,
+    uint32_t backboneStartPos)
+{
+    vector<NoisyMsaVariant> vars;
+    if(bbRaw.empty() || consRaw.empty()) return vars;
+
+    // edlib global (NW) alignment with full path.
+    EdlibAlignResult result = edlibAlign(
+        reinterpret_cast<const char*>(consRaw.data()), int(consRaw.size()),
+        reinterpret_cast<const char*>(bbRaw.data()), int(bbRaw.size()),
+        edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0));
+
+    if(result.status != EDLIB_STATUS_OK || result.alignment == nullptr) {
+        edlibFreeAlignResult(result);
+        return vars;
+    }
+
+    // Build aligned rows from edlib edit operations.
+    // edlib: query=cons, target=bb.
+    // EDLIB_EDOP_MATCH(0)    = both present, same base
+    // EDLIB_EDOP_INSERT(1)   = insertion to target = bb has base, cons has gap
+    // EDLIB_EDOP_DELETE(2)   = deletion from target = cons has base, bb has gap
+    // EDLIB_EDOP_MISMATCH(3) = both present, different base
+    vector<uint8_t> alnRef, alnCons;
+    alnRef.reserve(result.alignmentLength);
+    alnCons.reserve(result.alignmentLength);
+    int ri = 0, ci = 0;
+    for(int k = 0; k < result.alignmentLength; k++) {
+        unsigned char op = result.alignment[k];
+        switch(op) {
+            case EDLIB_EDOP_MATCH:
+            case EDLIB_EDOP_MISMATCH:
+                alnRef.push_back(bbRaw[ri++]);
+                alnCons.push_back(consRaw[ci++]);
+                break;
+            case EDLIB_EDOP_INSERT: // insertion to target: bb base, cons gap
+                alnRef.push_back(bbRaw[ri++]);
+                alnCons.push_back(kGap);
+                break;
+            case EDLIB_EDOP_DELETE: // deletion from target: cons base, bb gap
+                alnRef.push_back(kGap);
+                alnCons.push_back(consRaw[ci++]);
+                break;
+        }
+    }
+    edlibFreeAlignResult(result);
+
+    // Extract variants from aligned rows (pgphase make_cand_vars_from_baln0).
+    const char* bases = "ACGTN";
+    const int alnLen = int(alnRef.size());
+    uint32_t bbPos = backboneStartPos;
+    int i = 0;
+
+    while(i < alnLen) {
+        uint8_t rv = alnRef[i];
+        uint8_t cv = alnCons[i];
+
+        // Skip double-gap columns (shouldn't happen with edlib but be safe).
+        if(rv == kGap && cv == kGap) { i++; continue; }
+
+        // Match/same.
+        if(rv == cv) { if(rv != kGap) bbPos++; i++; continue; }
+
+        // SNP: both non-gap, different.
+        if(rv != kGap && cv != kGap) {
+            // pgphase: suppress SNP if next column has gap in either row.
+            bool nextRefNonGap = (i+1 >= alnLen) || alnRef[i+1] != kGap;
+            bool nextConsNonGap = (i+1 >= alnLen) || alnCons[i+1] != kGap;
+            if(nextRefNonGap && nextConsNonGap) {
+                NoisyMsaVariant v;
+                v.backbonePos = bbPos;
+                v.type = KmVarType::Snp;
+                v.refBase = rv;
+                v.altBase = cv;
+                vars.push_back(v);
+            }
+            bbPos++; i++;
+            continue;
+        }
+
+        // Insertion: ref gap, cons base.
+        if(rv == kGap) {
+            NoisyMsaVariant v;
+            v.backbonePos = bbPos;
+            v.type = KmVarType::Insertion;
+            while(i < alnLen && alnRef[i] == kGap && alnCons[i] != kGap) {
+                v.altSeq.push_back(bases[alnCons[i] < 4 ? alnCons[i] : 4]);
+                i++;
+            }
+            vars.push_back(v);
+            continue;
+        }
+
+        // Deletion: ref base, cons gap.
+        if(cv == kGap) {
+            NoisyMsaVariant v;
+            v.backbonePos = bbPos;
+            v.type = KmVarType::Deletion;
+            while(i < alnLen && alnRef[i] != kGap && alnCons[i] == kGap) {
+                v.refSeq.push_back(bases[alnRef[i] < 4 ? alnRef[i] : 4]);
+                bbPos++; i++;
+            }
+            vars.push_back(v);
+            continue;
+        }
+
+        if(rv != kGap) bbPos++;
+        i++;
+    }
+    return vars;
+}
+
+/// Top-level variant extraction: extract raw sequences from MSA, pairwise
+/// align, and extract variants. Also populates msaColStart/msaColEnd on each
+/// variant by mapping backbone positions back to MSA columns (needed for
+/// read scoring which still uses the MSA matrix).
 static vector<NoisyMsaVariant> extractVariantsFromMsa(
     const KmAbpoaMsaResult& result, uint32_t backboneStartPos)
 {
-    vector<NoisyMsaVariant> vars;
-    if(result.msaLen == 0) return vars;
-    const auto& bbRow = result.backboneMsaRow;
-    const auto& consRow = result.consensusMsaRow;
-    uint32_t bbPos = backboneStartPos;
-    uint32_t col = 0;
+    if(result.msaLen == 0) return {};
 
-    while(col < uint32_t(result.msaLen)) {
-        uint8_t bbVal = bbRow[col];
-        uint8_t consVal = consRow[col];
+    // Extract raw sequences.
+    vector<uint8_t> bbRaw = extractRawSeq(result.backboneMsaRow, result.msaLen);
+    vector<uint8_t> consRaw = extractRawSeq(result.consensusMsaRow, result.msaLen);
 
-        if(bbVal == consVal) {
-            if(bbVal != kGap) bbPos++;
-            col++;
-            continue;
+    // Pairwise alignment and variant extraction.
+    vector<NoisyMsaVariant> vars = extractVariantsFromPairwise(
+        bbRaw, consRaw, backboneStartPos);
+
+    // Build backbone-position-to-MSA-column map for read scoring.
+    // We need msaColStart/msaColEnd for each variant so scoreReadsAtVariants
+    // can index into the MSA matrix.
+    vector<int> bbPosToCol;
+    {
+        int maxBbPos = 0;
+        int bbIdx = 0;
+        for(int col = 0; col < result.msaLen; col++) {
+            if(result.backboneMsaRow[col] != kGap) bbIdx++;
         }
-
-        // SNP: suppress if next column has gap in either row (complex boundary).
-        if(bbVal < 4 && consVal < 4) {
-            const bool nextBbNonGap = (col + 1 >= uint32_t(result.msaLen)) || bbRow[col + 1] != kGap;
-            const bool nextConsNonGap = (col + 1 >= uint32_t(result.msaLen)) || consRow[col + 1] != kGap;
-            if(nextBbNonGap && nextConsNonGap) {
-                NoisyMsaVariant v;
-                v.backbonePos = bbPos; v.type = KmVarType::Snp;
-                v.refBase = bbVal; v.altBase = consVal;
-                v.msaColStart = col; v.msaColEnd = col + 1;
-                vars.push_back(v);
+        maxBbPos = bbIdx;
+        bbPosToCol.resize(maxBbPos, -1);
+        bbIdx = 0;
+        for(int col = 0; col < result.msaLen; col++) {
+            if(result.backboneMsaRow[col] != kGap) {
+                if(bbIdx < maxBbPos) bbPosToCol[bbIdx] = col;
+                bbIdx++;
             }
-            bbPos++; col++;
-            continue;
         }
-
-        // Insertion: backbone gap, consensus base.
-        if(bbVal == kGap && consVal < 4) {
-            NoisyMsaVariant v;
-            v.backbonePos = bbPos; v.type = KmVarType::Insertion;
-            v.msaColStart = col;
-            while(col < uint32_t(result.msaLen) && bbRow[col] == kGap && consRow[col] < 4) {
-                v.altSeq.push_back("ACGT"[consRow[col]]);
-                col++;
-            }
-            v.msaColEnd = col;
-            vars.push_back(v);
-            continue;
-        }
-
-        // Deletion: backbone base, consensus gap.
-        if(bbVal < 4 && consVal == kGap) {
-            NoisyMsaVariant v;
-            v.backbonePos = bbPos; v.type = KmVarType::Deletion;
-            v.msaColStart = col;
-            while(col < uint32_t(result.msaLen) && bbRow[col] < 4 && consRow[col] == kGap) {
-                v.refSeq.push_back("ACGT"[bbRow[col]]);
-                bbPos++; col++;
-            }
-            v.msaColEnd = col;
-            vars.push_back(v);
-            continue;
-        }
-
-        if(bbVal != kGap) bbPos++;
-        col++;
     }
+
+    // Map variant backbone positions to MSA columns.
+    for(auto& v : vars) {
+        int relPos = int(v.backbonePos - backboneStartPos);
+        if(relPos < 0 || relPos >= int(bbPosToCol.size())) {
+            v.msaColStart = v.msaColEnd = 0;
+            continue;
+        }
+
+        if(v.type == KmVarType::Snp) {
+            int col = bbPosToCol[relPos];
+            v.msaColStart = uint32_t(col);
+            v.msaColEnd = uint32_t(col) + 1;
+        }
+        else if(v.type == KmVarType::Insertion) {
+            // Insertion columns are the gap columns in the backbone row
+            // immediately after the anchor position.
+            int anchorCol = bbPosToCol[relPos];
+            // Walk backwards: insertion is BEFORE the anchor in the MSA.
+            // Actually, insertion columns are gap columns in backbone row
+            // at or after the anchor. Find the run of backbone-gap columns
+            // after the previous backbone base.
+            int startCol = anchorCol;
+            // Search backwards for insertion gap columns before this anchor.
+            // In the MSA, insertions appear as backbone-gap columns before
+            // the next backbone base.
+            if(relPos > 0) {
+                int prevCol = bbPosToCol[relPos - 1];
+                startCol = prevCol + 1;
+            } else {
+                // Insertion before first backbone base.
+                startCol = 0;
+            }
+            // Find the gap run.
+            int gapStart = -1, gapEnd = -1;
+            for(int col = startCol; col < anchorCol; col++) {
+                if(result.backboneMsaRow[col] == kGap) {
+                    if(gapStart < 0) gapStart = col;
+                    gapEnd = col + 1;
+                }
+            }
+            if(gapStart >= 0) {
+                v.msaColStart = uint32_t(gapStart);
+                v.msaColEnd = uint32_t(gapEnd);
+            } else {
+                // Fallback: look after the anchor.
+                gapStart = anchorCol + 1;
+                gapEnd = gapStart;
+                for(int col = gapStart; col < result.msaLen; col++) {
+                    if(result.backboneMsaRow[col] == kGap)
+                        gapEnd = col + 1;
+                    else break;
+                }
+                v.msaColStart = uint32_t(gapStart);
+                v.msaColEnd = uint32_t(gapEnd);
+            }
+        }
+        else if(v.type == KmVarType::Deletion) {
+            int delLen = int(v.refSeq.size());
+            v.msaColStart = uint32_t(bbPosToCol[relPos]);
+            if(relPos + delLen - 1 < int(bbPosToCol.size()))
+                v.msaColEnd = uint32_t(bbPosToCol[relPos + delLen - 1]) + 1;
+            else
+                v.msaColEnd = uint32_t(result.msaLen);
+        }
+    }
+
+    // Remove variants with invalid MSA column mappings.
+    vars.erase(
+        remove_if(vars.begin(), vars.end(),
+            [](const NoisyMsaVariant& v) {
+                return v.msaColStart >= v.msaColEnd;
+            }),
+        vars.end());
+
     return vars;
 }
 
@@ -184,10 +360,15 @@ static vector<vector<int8_t>> scoreReadsAtVariants(
 
         if(v.type == KmVarType::Snp) {
             for(int r = 0; r < nReads; r++) {
+                // pgphase full_cover gating: only score reads that span
+                // the SNP position (have non-gap flanking bases).
+                if(!readFullyCoversVariant(result.readMsaRows[r],
+                        result.backboneMsaRow, result.msaLen,
+                        v.msaColStart, v.msaColEnd))
+                    continue;
                 uint8_t readVal = result.readMsaRows[r][v.msaColStart];
                 if(readVal == v.altBase) scores[vi][r] = 1;
-                else if(readVal < 4) scores[vi][r] = 0;  // any base (ref or third allele) → ref
-                // gap → stays -1
+                else scores[vi][r] = 0;  // ref, other base, or gap at covered pos → ref
             }
         }
         else if(v.type == KmVarType::Insertion) {
