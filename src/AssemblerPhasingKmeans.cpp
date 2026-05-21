@@ -1963,10 +1963,11 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 // Runs abPOA on reads spanning noisy regions, discovers hidden
                 // variants, scores reads, and merges into the candidate table.
                 // Then re-runs k-means with the expanded candidate set.
+                // Disabled: too slow, will be replaced with a better approach.
                 t0 = clk::now();
-                if (!scratch.noisyRegions.empty()) {
-                    kmNoisyMsaStep4(*this, scratch, msaOpts, opts);
-                }
+                // if (!scratch.noisyRegions.empty()) {
+                //     kmNoisyMsaStep4(*this, scratch, msaOpts, opts);
+                // }
                 t1 = clk::now(); tt.noisyMsa += us(t0,t1);
 
                 t0 = clk::now();
