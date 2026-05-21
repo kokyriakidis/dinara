@@ -4191,13 +4191,13 @@ void Assembler::flagPalindromicReads(
 
                 if(selfHits.size() < 2) continue;
 
-                // Reassign globalIndex after erase so chain indices
-                // remain valid.
+                sortHifiasmHitsBySelfOffsetThenOffsetRuns(selfHits);
+
+                // Reassign globalIndex after sort so chain indices
+                // map back to the correct elements.
                 for(uint32_t i = 0; i < uint32_t(selfHits.size()); i++) {
                     selfHits[i].globalIndex = i;
                 }
-
-                sortHifiasmHitsBySelfOffsetThenOffsetRuns(selfHits);
 
                 overlapRegions.clear();
                 chainHitIndexFlat.clear();
