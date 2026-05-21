@@ -4218,8 +4218,33 @@ void Assembler::flagPalindromicReads(
                         chainHitIndexFlat[size_t(off + j)];
                     if(g >= selfHits.size()) continue;
                     const auto& h = selfHits[g];
+                    if(h.ordinalA >= numMarkersA) continue;
+                    if(h.ordinalB >= numMarkersA) continue;
                     alignment.ordinals.push_back(
                         {h.ordinalA, h.ordinalB});
+                }
+
+                if(alignment.ordinals.size() < 2) continue;
+
+                // Sort by ordinalA and keep only ordinals where
+                // ordinalB is strictly increasing (required by
+                // ProjectedAlignment).
+                std::sort(alignment.ordinals.begin(),
+                          alignment.ordinals.end(),
+                    [](const array<uint32_t,2>& a,
+                       const array<uint32_t,2>& b) {
+                        return a[0] < b[0];
+                    });
+                {
+                    vector<array<uint32_t,2>> filtered;
+                    filtered.push_back(alignment.ordinals[0]);
+                    for(size_t i = 1; i < alignment.ordinals.size(); i++) {
+                        if(alignment.ordinals[i][0] > filtered.back()[0] &&
+                           alignment.ordinals[i][1] > filtered.back()[1]) {
+                            filtered.push_back(alignment.ordinals[i]);
+                        }
+                    }
+                    alignment.ordinals = std::move(filtered);
                 }
 
                 if(alignment.ordinals.size() < 2) continue;
