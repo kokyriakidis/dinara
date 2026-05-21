@@ -954,17 +954,14 @@ void dinara::main::assemble(
 
 
     // // Flag palindromic reads.
-    // // These will be excluded from further processing.
+    // // Requires buildInvertedIndex to have been called first.
     // if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
-    //     assembler.palindromicMinAlignedMarkerCount = assemblerOptions.readsOptions.palindromicReads.minAlignedMarkerCount;
-    //     assembler.palindromicMaxUncoveredBases = assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases;
     //     assembler.flagPalindromicReads(
-    //         assemblerOptions.readsOptions.palindromicReads.maxSkip,
-    //         assemblerOptions.readsOptions.palindromicReads.maxDrift,
-    //         assemblerOptions.readsOptions.palindromicReads.maxMarkerFrequency,
+    //         assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+    //         assemblerOptions.overlapCandidatesOptions,
     //         assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
-    //         assemblerOptions.readsOptions.palindromicReads.nearDiagonalFractionThreshold,
-    //         assemblerOptions.readsOptions.palindromicReads.deltaThreshold,
+    //         assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases,
+    //         0.8,  // minIdentity
     //         threadCount);
     // }
 

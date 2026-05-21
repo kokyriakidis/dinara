@@ -369,6 +369,12 @@ void AssemblerOptions::addConfigurableOptions()
           default_value(500),
           "Maximum number of unaligned bases (start + end) to consider a read palindromic.")
 
+         ("Reads.palindromicReads.minIdentity",
+          value<double>(&readsOptions.palindromicReads.minIdentity)->
+          default_value(0.8),
+          "Minimum base-level identity between forward and reverse complement "
+          "to flag a read as palindromic. Use 0.9 for HiFi, 0.8 for ONT.")
+
          ("Kmers.generationMethod",
          value<int>(&kmersOptions.generationMethod)->
          default_value(0),
@@ -1614,6 +1620,7 @@ void PalindromicReadOptions::write(ostream& s) const
     s << "palindromicReads.deltaThreshold = " << deltaThreshold << "\n";
     s << "palindromicReads.minAlignedMarkerCount = " << minAlignedMarkerCount << "\n";
     s << "palindromicReads.maxUncoveredBases = " << maxUncoveredBases << "\n";
+    s << "palindromicReads.minIdentity = " << minIdentity << "\n";
 }
 
 
