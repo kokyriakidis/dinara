@@ -1379,6 +1379,25 @@ void Assembler::dedupChainsPrePhasing(uint64_t threadCount)
 
 
 
+// Per-read-pair chain dedup.
+//
+// Dinara's mcopy chaining (hifiasm_lchain_qdp_mcopy_fast) can produce
+// multiple chains between the same read pair on the same strand.
+// Hifiasm's chain_DP only produces one chain per (query, target, strand),
+// so it doesn't need this step.
+//
+// For each (readA, readB) pair we keep at most one chain per strand:
+//   - group[0]: same-strand overlaps
+//   - group[1]: opposite-strand overlaps
+// This matches hifiasm's separate paf[] / reverse_paf[] storage where
+// same-strand and opposite-strand overlaps never compete.
+//
+// Within each strand group, the chain with the highest sharedSeedScore
+// (hifiasm's shared_seed = DP chain score) wins. All others are marked
+// DeleteReasonSecondary.
+//
+// Note: this is separate from the max_n_chain per-read global cap,
+// which is already applied during chaining.
 void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 {
     uint64_t begin = 0, end = 0;
@@ -1386,14 +1405,15 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
     struct CandidateInfo {
         uint32_t alignmentId;
-        int32_t sharedSeed;  // hifiasm DP chain score (shared_seed)
+        int32_t sharedSeed;
     };
-    // Two groups: one for same-strand, one for opposite-strand.
-    // Matches hifiasm which stores paf and reverse_paf separately.
+
     vector<CandidateInfo> group[2];
     group[0].reserve(4);
     group[1].reserve(4);
 
+    // Process accumulated groups for the current partner.
+    // For each strand bucket, keep only the best chain.
     auto flushGroups = [&]() {
         for(int s = 0; s < 2; s++) {
             if(group[s].size() <= 1) {
@@ -1401,8 +1421,6 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 continue;
             }
 
-            // Find best: maximize sharedSeed (hifiasm DP chain score).
-            // Matches hifiasm's sort by shared_seed descending.
             size_t best = 0;
             for(size_t i = 1; i < group[s].size(); ++i) {
                 if(group[s][i].sharedSeed > group[s][best].sharedSeed) {
@@ -1410,7 +1428,6 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 }
             }
 
-            // Mark non-best as secondary.
             for(size_t i = 0; i < group[s].size(); ++i) {
                 if(i == best) continue;
                 alignmentData[group[s][i].alignmentId].addDeleteReasonsBoth(
@@ -1433,7 +1450,9 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
             group[1].clear();
             ReadId currentPartner = invalidReadId;
 
-            // Binary search: skip prefix where partner < r0.
+            // The alignment table is sorted by partner. Binary search
+            // to skip entries where partner < r0 (those are handled
+            // when the other read is the query).
             size_t firstIndex = 0;
             {
                 size_t lo = 0;
@@ -1457,12 +1476,12 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 const uint32_t alignmentId = table[tableIndex];
                 const auto& ad = alignmentData[alignmentId];
 
-                // Canonical ordering: only process where r0 == readIds[0].
+                // Only process each pair once: r0 must be readIds[0].
                 if(ad.readIds[0] != r0) {
                     continue;
                 }
 
-                // Skip self-overlaps.
+                // Self-overlaps should not exist; remove if found.
                 if(ad.readIds[0] == ad.readIds[1]) {
                     alignmentData[alignmentId].addDeleteReasonsBoth(
                         AlignmentData::DeleteReasonSecondary);
@@ -1472,6 +1491,7 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
                 const ReadId partner = ad.readIds[1];
 
+                // New partner — flush the previous partner's groups.
                 if(partner != currentPartner) {
                     flushGroups();
                     currentPartner = partner;
@@ -1485,6 +1505,7 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                 group[strandIdx].push_back(CandidateInfo{alignmentId, sharedSeed});
             }
 
+            // Flush the last partner's groups.
             flushGroups();
         }
     }
