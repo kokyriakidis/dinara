@@ -4092,26 +4092,20 @@ void Assembler::flagPalindromicReads(
 
                     // Hash table lookup.
                     uint64_t slotIdx =
-                        foldKmerIdToUint64(currentKId) & hashMask;
+                        hashKmer(currentKId) & hashMask;
+                    uint64_t startIdx = 0;
+                    uint32_t count = 0;
                     bool found = false;
-                    while(true) {
-                        const auto& slot = hashTablePtr[slotIdx];
-                        if(slot.first == slot.second) break;
-                        const auto& firstOcc =
-                            invertedIndexData.compactOccurrences[
-                                slot.first];
-                        if(firstOcc.kmerId == currentKId) {
+                    while(!hashTablePtr[slotIdx].empty) {
+                        if(hashTablePtr[slotIdx].key == currentKId) {
+                            startIdx = hashTablePtr[slotIdx].start;
+                            count = hashTablePtr[slotIdx].count;
                             found = true;
                             break;
                         }
                         slotIdx = (slotIdx + 1) & hashMask;
                     }
                     if(!found) continue;
-
-                    const auto& slot = hashTablePtr[slotIdx];
-                    const uint64_t occBegin = slot.first;
-                    const uint64_t occEnd = slot.second;
-                    const uint32_t count = uint32_t(occEnd - occBegin);
 
                     const uint32_t w = computeInvertedIndexHitWeight(
                         count, lowFreqThreshold, highFreqThreshold,
@@ -4123,7 +4117,7 @@ void Assembler::flagPalindromicReads(
                     const uint32_t seedSpan = uint32_t(
                         std::min<uint64_t>(kmerLen, 255ULL));
 
-                    for(uint64_t idx = occBegin; idx < occEnd; idx++) {
+                    for(uint64_t idx = startIdx; idx < startIdx + count; idx++) {
                         const auto& occ =
                             invertedIndexData.compactOccurrences[idx];
                         if(occ.readId != readId) continue;
