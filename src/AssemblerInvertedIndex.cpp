@@ -4252,6 +4252,12 @@ void Assembler::flagPalindromicReads(
                     const auto& h = selfHits[g];
                     if(h.ordinalA >= numMarkersA) continue;
                     if(h.ordinalB >= numMarkersA) continue;
+                    // Skip non-monotonic ordinals.
+                    if(!alignment.ordinals.empty()) {
+                        const auto& last = alignment.ordinals.back();
+                        if(h.ordinalA <= last[0] ||
+                           h.ordinalB <= last[1]) continue;
+                    }
                     alignment.ordinals.push_back(
                         {h.ordinalA, h.ordinalB});
                 }
