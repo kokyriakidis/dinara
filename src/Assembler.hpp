@@ -1070,8 +1070,7 @@ public:
         double maxDriftRate,
         const OverlapCandidatesOptions& overlapCandidatesOptions,
         double alignedFractionThreshold,
-        int maxUncoveredBases,
-        double minIdentity,
+        double maxErrorRate,
         uint64_t threadCount);
 
 	    // Filter secondary/redundant alignments per read pair (hifiasm-style).

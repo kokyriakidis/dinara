@@ -1625,7 +1625,6 @@ mode2.bubbleRemoval.minConcordantReadCount = 2
 representation = 0
 minReadLength = 10000
 noCache = True
-palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1663,7 +1662,6 @@ mode = 3
 representation = 0
 minReadLength = 10000
 noCache = True
-palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1703,7 +1701,6 @@ mode3.primaryGraph.maxLoss = 0.5
 representation = 0
 minReadLength = 10000
 noCache = True
-palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1749,7 +1746,6 @@ mode3.assemblyGraph.minLogP = 10
 representation = 0
 minReadLength = 1000
 noCache = True
-palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 50
@@ -1799,7 +1795,6 @@ mode3.assemblyGraph.pruneLength = 150000
 representation = 0
 minReadLength = 10000
 noCache = True
-palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 26

@@ -953,19 +953,6 @@ void dinara::main::assemble(
 
 
 
-    // // Flag palindromic reads.
-    // // Requires buildInvertedIndex to have been called first.
-    // if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
-    //     assembler.flagPalindromicReads(
-    //         assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-    //         assemblerOptions.overlapCandidatesOptions,
-    //         assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
-    //         assemblerOptions.readsOptions.palindromicReads.maxUncoveredBases,
-    //         0.8,  // minIdentity
-    //         threadCount);
-    // }
-
-
     // ========================================================================
     // HIFIASM MAX_N_CHAIN CALCULATION (Per-Read Overlap Limiting)
     // ========================================================================
@@ -991,6 +978,17 @@ void dinara::main::assemble(
 
     // Always build the inverted index for k-mer lookups (needed by both paths)
     assembler.buildInvertedIndex(threadCount);
+
+    // Flag palindromic reads before chaining so they are excluded
+    // from overlap discovery.
+    if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
+        assembler.flagPalindromicReads(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            assemblerOptions.overlapCandidatesOptions,
+            assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
+            assemblerOptions.readsOptions.palindromicReads.maxErrorRate,
+            threadCount);
+    }
 
     // Find and chain alignment candidates.
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {

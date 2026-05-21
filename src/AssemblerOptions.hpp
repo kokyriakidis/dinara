@@ -114,15 +114,8 @@ public:
 class dinara::PalindromicReadOptions {
 public:
     bool skipFlagging;
-    int maxSkip;
-    int maxDrift;
-    int maxMarkerFrequency;
     double alignedFractionThreshold;
-    double nearDiagonalFractionThreshold;
-    int deltaThreshold;
-    int minAlignedMarkerCount;
-    int maxUncoveredBases;
-    double minIdentity;
+    double maxErrorRate;
     void write(ostream&) const;
 };
 
