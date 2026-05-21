@@ -4256,76 +4256,8 @@ void Assembler::flagPalindromicReads(
                         {h.ordinalA, h.ordinalB});
                 }
 
-                if(dbg) {
-                    cout << "PALINDROME-DBG read " << readId
-                        << " rawOrdinals=" << alignment.ordinals.size() << endl;
-                    size_t nShow = std::min(alignment.ordinals.size(), size_t(10));
-                    for(size_t i = 0; i < nShow; i++) {
-                        cout << "PALINDROME-DBG read " << readId
-                            << " ordinal[" << i << "] A=" << alignment.ordinals[i][0]
-                            << " B=" << alignment.ordinals[i][1] << endl;
-                    }
-                    if(alignment.ordinals.size() > 10) {
-                        cout << "PALINDROME-DBG read " << readId << " ..." << endl;
-                        for(size_t i = alignment.ordinals.size() - 3; i < alignment.ordinals.size(); i++) {
-                            cout << "PALINDROME-DBG read " << readId
-                                << " ordinal[" << i << "] A=" << alignment.ordinals[i][0]
-                                << " B=" << alignment.ordinals[i][1] << endl;
-                        }
-                    }
-                }
-
-                if(alignment.ordinals.size() < 2) continue;
-
-                // Sort by ordinalA and keep only ordinals where
-                // ordinalB is strictly increasing (required by
-                // ProjectedAlignment).
-                std::sort(alignment.ordinals.begin(),
-                          alignment.ordinals.end(),
-                    [](const array<uint32_t,2>& a,
-                       const array<uint32_t,2>& b) {
-                        return a[0] < b[0];
-                    });
-
-                if(dbg) {
-                    cout << "PALINDROME-DBG read " << readId
-                        << " afterSort first10:" << endl;
-                    size_t nShow = std::min(alignment.ordinals.size(), size_t(10));
-                    for(size_t i = 0; i < nShow; i++) {
-                        cout << "  A=" << alignment.ordinals[i][0]
-                            << " B=" << alignment.ordinals[i][1] << endl;
-                    }
-                }
-
-                {
-                    vector<array<uint32_t,2>> filtered;
-                    uint64_t droppedCount = 0;
-                    filtered.push_back(alignment.ordinals[0]);
-                    for(size_t i = 1; i < alignment.ordinals.size(); i++) {
-                        if(alignment.ordinals[i][0] > filtered.back()[0] &&
-                           alignment.ordinals[i][1] > filtered.back()[1]) {
-                            filtered.push_back(alignment.ordinals[i]);
-                        } else {
-                            if(dbg && droppedCount < 10) {
-                                cout << "PALINDROME-DBG read " << readId
-                                    << " DROPPED ordinal[" << i << "] A="
-                                    << alignment.ordinals[i][0]
-                                    << " B=" << alignment.ordinals[i][1]
-                                    << " (lastKept A=" << filtered.back()[0]
-                                    << " B=" << filtered.back()[1] << ")" << endl;
-                            }
-                            droppedCount++;
-                        }
-                    }
-                    if(dbg && droppedCount > 0) {
-                        cout << "PALINDROME-DBG read " << readId
-                            << " totalDropped=" << droppedCount << endl;
-                    }
-                    alignment.ordinals = std::move(filtered);
-                }
-
                 if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " filteredOrdinals=" << alignment.ordinals.size() << endl;
+                    << " ordinals=" << alignment.ordinals.size() << endl;
 
                 if(alignment.ordinals.size() < 2) continue;
 
