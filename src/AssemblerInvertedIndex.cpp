@@ -4151,45 +4151,36 @@ void Assembler::flagPalindromicReads(
                     }
                 }
 
-                const bool dbg = (readId == 33);
-
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " selfHits=" << selfHits.size()
-                    << " readLen=" << readLen
-                    << " numMarkers=" << numMarkersA << endl;
-
                 if(selfHits.size() < 2) continue;
 
-                // Map ordinalB for each hit.
-                uint64_t unmappedCount = 0;
-                for(auto& kh : selfHits) {
-                    const uint32_t origPosB = uint32_t(
-                        readLen - 1ULL - uint64_t(kh.offset));
-                    for(uint32_t ord = 0; ord < numMarkersA; ord++) {
-                        if(markersA[ord].position == origPosB) {
-                            kh.ordinalB = numMarkersA - 1U - ord;
-                            break;
+                // Map ordinalB for each hit via binary search.
+                // Markers are sorted by position so this is O(n log m)
+                // with no heap allocations.
+                {
+                    bool allMapped = true;
+                    for(auto& kh : selfHits) {
+                        const uint32_t posB = uint32_t(
+                            readLen - 1ULL - uint64_t(kh.offset));
+                        // Binary search for marker at posB.
+                        uint32_t lo = 0, hi = numMarkersA;
+                        bool found = false;
+                        while(lo < hi) {
+                            const uint32_t mid = lo + (hi - lo) / 2;
+                            const uint32_t mpos = markersA[mid].position;
+                            if(mpos == posB) {
+                                kh.ordinalB = numMarkersA - 1U - mid;
+                                found = true;
+                                break;
+                            } else if(mpos < posB) {
+                                lo = mid + 1;
+                            } else {
+                                hi = mid;
+                            }
                         }
+                        if(!found) { allMapped = false; break; }
                     }
-                    if(kh.ordinalB == std::numeric_limits<uint32_t>::max())
-                        unmappedCount++;
+                    if(!allMapped) continue;
                 }
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " afterOrdinalBMap: unmapped=" << unmappedCount
-                    << " mapped=" << (selfHits.size() - unmappedCount) << endl;
-
-                selfHits.erase(
-                    std::remove_if(selfHits.begin(), selfHits.end(),
-                        [](const HifiasmKmerHit& h) {
-                            return h.ordinalB ==
-                                std::numeric_limits<uint32_t>::max();
-                        }),
-                    selfHits.end());
-
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " afterErase=" << selfHits.size() << endl;
-
-                if(selfHits.size() < 2) continue;
 
                 sortHifiasmHitsBySelfOffsetThenOffsetRuns(selfHits);
 
@@ -4212,21 +4203,6 @@ void Assembler::flagPalindromicReads(
                     int64_t(readLen), int64_t(readLen),
                     1, 1, 0.0, 0);
 
-                if(dbg) {
-                    cout << "PALINDROME-DBG read " << readId
-                        << " chains=" << overlapRegions.size() << endl;
-                    for(size_t ci = 0; ci < overlapRegions.size(); ci++) {
-                        const auto& r = overlapRegions[ci];
-                        cout << "PALINDROME-DBG read " << readId
-                            << " chain[" << ci << "]"
-                            << " x=[" << r.x_pos_s << "," << r.x_pos_e << "]"
-                            << " y=[" << r.y_pos_s << "," << r.y_pos_e << "]"
-                            << " anchors=" << r.align_length
-                            << " score=" << r.shared_seed
-                            << " span=" << (r.x_pos_e - r.x_pos_s) << endl;
-                    }
-                }
-
                 if(overlapRegions.empty()) continue;
 
                 // Pick the chain with the largest base span.
@@ -4245,25 +4221,11 @@ void Assembler::flagPalindromicReads(
                 Alignment alignment;
                 alignment.ordinals.reserve(nHit);
                 for(uint64_t j = 0; j < nHit; j++) {
-                    if(off + j >= chainHitIndexFlat.size()) continue;
-                    const uint32_t g =
-                        chainHitIndexFlat[size_t(off + j)];
-                    if(g >= selfHits.size()) continue;
-                    const auto& h = selfHits[g];
-                    if(h.ordinalA >= numMarkersA) continue;
-                    if(h.ordinalB >= numMarkersA) continue;
-                    // Skip non-monotonic ordinals.
-                    if(!alignment.ordinals.empty()) {
-                        const auto& last = alignment.ordinals.back();
-                        if(h.ordinalA <= last[0] ||
-                           h.ordinalB <= last[1]) continue;
-                    }
+                    const auto& h = selfHits[
+                        chainHitIndexFlat[size_t(off + j)]];
                     alignment.ordinals.push_back(
                         {h.ordinalA, h.ordinalB});
                 }
-
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " ordinals=" << alignment.ordinals.size() << endl;
 
                 if(alignment.ordinals.size() < 2) continue;
 
@@ -4279,11 +4241,6 @@ void Assembler::flagPalindromicReads(
 
                 const uint64_t totalBases =
                     projectedAlignment.totalLength[0];
-
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " totalBases=" << totalBases
-                    << " readLen=" << readLen << endl;
-
                 if(totalBases == 0) continue;
 
                 const double alignedFrac =
@@ -4291,19 +4248,10 @@ void Assembler::flagPalindromicReads(
                 const double errorRate =
                     projectedAlignment.errorRate();
 
-                if(dbg) cout << "PALINDROME-DBG read " << readId
-                    << " alignedFrac=" << alignedFrac
-                    << " errorRate=" << errorRate
-                    << " pass=" << (alignedFrac >= alignedFractionThreshold &&
-                                    errorRate <= maxErrorRate) << endl;
-
                 if(alignedFrac >= alignedFractionThreshold &&
                    errorRate <= maxErrorRate) {
                     reads->setPalindromicFlag(readId, true);
                     palindromicCount.fetch_add(1);
-                    cout << "Palindromic: read " << readId
-                         << " alignedFrac=" << alignedFrac
-                         << " errorRate=" << errorRate << endl;
                 }
             }
         }
