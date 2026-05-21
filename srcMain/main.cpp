@@ -1034,10 +1034,10 @@ void dinara::main::assemble(
                    reads.getReadRawSequenceLength(b);
         });
 
-    // // Keep one best chain per read pair (hifiasm dedup_chains port).
-    // // Secondary chains create extra ordinal-pair merges in the marker graph
-    // // disjoint set, amplifying transitive closure contamination.
-    // assembler.dedupChainsPrePhasing(threadCount);
+    // Keep one best chain per read pair per strand (hifiasm dedup port).
+    // Same-strand and opposite-strand overlaps are deduped independently,
+    // matching hifiasm's separate paf/reverse_paf storage.
+    assembler.dedupChainsPrePhasing(threadCount);
 
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
