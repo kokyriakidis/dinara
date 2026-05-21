@@ -72,6 +72,9 @@ private:
     // If set, use the O_DIRECT flag when opening input files (Linux only).
     bool noCache;
 
+    // True if the input file is gzip-compressed (.gz).
+    bool isGzipped = false;
+
     // The number of threads to be used for processing.
     // Reading is done single-threaded as there is usually no benefit
     // frm multithreaded reading.
@@ -99,6 +102,7 @@ private:
     MemoryMapped::Vector<char> buffer;
     void allocateBuffer();
     bool readFile(bool useODirect);
+    void readGzipFile();
     void allocateBufferAndReadFile();
 
     // Vectors where each thread stores the reads it found.

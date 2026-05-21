@@ -12,6 +12,9 @@ using namespace dinara;
 #include <filesystem>
 #include "tuple.hpp"
 
+// zlib for gzip decompression.
+#include <zlib.h>
+
 #include "MultithreadedObject.tpp"
 namespace dinara {
 template class MultithreadedObject<ReadLoader>;
@@ -51,6 +54,19 @@ ReadLoader::ReadLoader(
             " must have an extension consistent with its format.");
     }
 
+    // Handle gzip-compressed files: strip .gz and record that we need decompression.
+    if(extension == "gz" || extension == "GZ") {
+        isGzipped = true;
+        // Get the inner extension (e.g., "fastq" from "reads.fastq.gz").
+        const string nameWithoutGz = fileName.substr(0, fileName.size() - 3);
+        try {
+            extension = filesystem::extension(nameWithoutGz);
+        } catch (...) {
+            throw runtime_error("Input file " + fileName +
+                " must have a format extension before .gz (e.g., .fastq.gz, .fasta.gz).");
+        }
+    }
+
     // Fasta file. ReadLoader is more forgiving than OldFastaReadLoader.
     if(extension=="fasta" || extension=="fa" || extension=="FASTA" || extension=="FA") {
         processFastaFile();
@@ -65,7 +81,8 @@ ReadLoader::ReadLoader(
 
     // If getting here, the file extension is not supported.
     throw runtime_error("File extension " + extension + " is not supported. "
-        "Supported file extensions are .fasta, .fa, .FASTA, .FA, .fastq, .fq, .FASTQ, .FQ.");
+        "Supported file extensions are .fasta, .fa, .FASTA, .FA, .fastq, .fq, .FASTQ, .FQ "
+        "(optionally with .gz suffix).");
 }
 
 
@@ -506,6 +523,11 @@ void ReadLoader::processFastqFileThreadFunction(size_t threadId)
 
 void ReadLoader::allocateBufferAndReadFile()
 {
+    if(isGzipped) {
+        readGzipFile();
+        return;
+    }
+
     allocateBuffer();
 
     // Try reading using the requested setting of noCache/O_DIRECT.
@@ -525,6 +547,105 @@ void ReadLoader::allocateBufferAndReadFile()
 
     // If getting here, nothing worked.
     throw runtime_error("Error reading " + fileName);
+}
+
+
+
+// Read a gzip-compressed file, decompressing into the buffer.
+// Uses the raw inflate API (like htslib's BGZF) instead of gzread
+// to avoid double-buffering overhead.
+void ReadLoader::readGzipFile()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+
+    const int64_t compressedSize = std::filesystem::file_size(fileName);
+
+    // Read the entire compressed file into a temporary buffer.
+    // This gives inflate contiguous input and avoids per-chunk read syscalls.
+    vector<uint8_t> compressedData(compressedSize);
+    {
+        const int fd = ::open(fileName.c_str(), O_RDONLY);
+        if(fd == -1) {
+            throw runtime_error("Could not open " + fileName);
+        }
+        uint8_t* p = compressedData.data();
+        int64_t remaining = compressedSize;
+        while(remaining > 0) {
+            const ssize_t n = ::read(fd, p, remaining);
+            if(n <= 0) {
+                ::close(fd);
+                throw runtime_error("Error reading " + fileName);
+            }
+            p += n;
+            remaining -= n;
+        }
+        ::close(fd);
+    }
+
+    // Estimate decompressed size and allocate output buffer.
+    int64_t estimatedSize = compressedSize * 4;
+    if(estimatedSize < 1024 * 1024) {
+        estimatedSize = 1024 * 1024;
+    }
+    buffer.createNew(dataName("tmp-FastaBuffer"), pageSize);
+    buffer.reserve(estimatedSize);
+    buffer.resize(estimatedSize);
+
+    // Initialize zlib for gzip decompression.
+    // 15 + 16 = windowBits for gzip (auto-detect gzip/zlib header).
+    z_stream zs = {};
+    zs.next_in = compressedData.data();
+    zs.avail_in = compressedSize;
+    int ret = inflateInit2(&zs, 15 + 16);
+    if(ret != Z_OK) {
+        throw runtime_error("inflateInit2 failed for " + fileName);
+    }
+
+    int64_t totalOut = 0;
+    // Decompress in 64 KB output chunks (matches htslib's BGZF_MAX_BLOCK_SIZE).
+    const uint64_t outChunk = 64 * 1024;
+
+    while(true) {
+        // Grow output buffer if needed.
+        if(totalOut + int64_t(outChunk) > int64_t(buffer.size())) {
+            const int64_t newSize = max(int64_t(buffer.size()) * 2, totalOut + int64_t(outChunk));
+            buffer.resize(newSize);
+        }
+
+        zs.next_out = reinterpret_cast<Bytef*>(&buffer[totalOut]);
+        zs.avail_out = outChunk;
+
+        ret = inflate(&zs, Z_SYNC_FLUSH);
+
+        const int64_t produced = outChunk - zs.avail_out;
+        totalOut += produced;
+
+        if(ret == Z_STREAM_END) {
+            break;
+        }
+        if(ret != Z_OK && ret != Z_BUF_ERROR) {
+            inflateEnd(&zs);
+            throw runtime_error("inflate failed for " + fileName +
+                ": " + (zs.msg ? zs.msg : "unknown error"));
+        }
+        if(produced == 0 && zs.avail_in == 0) {
+            break; // No progress, no input — done.
+        }
+    }
+
+    inflateEnd(&zs);
+
+    // Trim buffer to actual decompressed size.
+    buffer.resize(totalOut);
+    fileSize = totalOut;
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double t01 = seconds(t1 - t0);
+
+    performanceLog << "Decompressed gzip file: " << compressedSize << " -> "
+        << totalOut << " bytes." << endl;
+    performanceLog << "Decompress time: " << t01 << " s." << endl;
+    performanceLog << "Decompress rate: " << double(totalOut) / t01 << " bytes/s." << endl;
 }
 
 

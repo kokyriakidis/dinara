@@ -7107,3 +7107,116 @@ TEST_CASE("DirectedAnchorGraph unitigifyAll performs secondary merges",
     REQUIRE(dagHasOutEdge(dag, fwdNodeId(segP), fwdNodeId(mergedABCD)));
     REQUIRE(dagHasOutEdge(dag, fwdNodeId(mergedABCD), fwdNodeId(segQ)));
 }
+
+
+// =============================================================================
+// Test: .fastq.gz loading produces the same reads as .fastq
+// =============================================================================
+TEST_CASE("ReadLoader handles gzip-compressed fastq files", "[readloader][gz]") {
+    // Create a small fastq in memory, write both plain and gzipped versions.
+    auto dir = makeUniqueTempDir("dinara_gz_test_");
+    auto plainPath = dir / "reads.fastq";
+    auto gzPath = dir / "reads.fastq.gz";
+
+    // Write plain fastq.
+    {
+        std::ofstream out(plainPath);
+        for(int i = 0; i < 100; i++) {
+            std::string seq(200, 'A');
+            // Make each read slightly different.
+            for(int j = 0; j < 200; j++) {
+                seq[j] = "ACGT"[(i * 7 + j * 3) % 4];
+            }
+            out << "@read_" << i << "\n" << seq << "\n+\n" << std::string(200, '~') << "\n";
+        }
+    }
+
+    // Create gzipped version using system gzip.
+    {
+        std::string cmd = "gzip -k " + plainPath.string();
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        REQUIRE(fs::exists(gzPath));
+    }
+
+    // Load from plain fastq.
+    uint64_t countPlain = 0;
+    {
+        auto subdir = dir / "plain";
+        fs::create_directories(subdir);
+        std::string prefix = subdir.string() + "/";
+        withSilencedIoInDir(subdir, [&] {
+            Assembler assembler(prefix, true, 0, 4096);
+            assembler.addReads(plainPath.string(), 0, false, 1);
+            countPlain = assembler.getReads().readCount();
+        });
+    }
+
+    // Load from gzipped fastq.
+    uint64_t countGz = 0;
+    {
+        auto subdir = dir / "gz";
+        fs::create_directories(subdir);
+        std::string prefix = subdir.string() + "/";
+        withSilencedIoInDir(subdir, [&] {
+            Assembler assembler(prefix, true, 0, 4096);
+            assembler.addReads(gzPath.string(), 0, false, 1);
+            countGz = assembler.getReads().readCount();
+        });
+    }
+
+    REQUIRE(countPlain == 100);
+    REQUIRE(countGz == 100);
+    REQUIRE(countPlain == countGz);
+
+    fs::remove_all(dir);
+}
+
+
+TEST_CASE("ReadLoader: GIAB fastq.gz matches plain fastq", "[readloader][gz][giab]") {
+    // Use the real GIAB test file if available.
+    fs::path plainPath = fs::path(__FILE__).parent_path() / "GIAB_HG002_PAW70337_RAW_chr1_15-15.4.fastq";
+    if(!fs::exists(plainPath)) {
+        WARN("Skipping: GIAB test file not found");
+        return;
+    }
+
+    auto dir = makeUniqueTempDir("dinara_gz_giab_");
+
+    // Create gzipped version.
+    fs::path gzPath = dir / "reads.fastq.gz";
+    {
+        std::string cmd = "gzip -c " + plainPath.string() + " > " + gzPath.string();
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        REQUIRE(fs::exists(gzPath));
+    }
+
+    uint64_t countPlain = 0;
+    {
+        auto subdir = dir / "plain";
+        fs::create_directories(subdir);
+        std::string prefix = subdir.string() + "/";
+        withSilencedIoInDir(subdir, [&] {
+            Assembler assembler(prefix, true, 0, 4096);
+            assembler.addReads(plainPath.string(), 0, false, 1);
+            countPlain = assembler.getReads().readCount();
+        });
+    }
+
+    uint64_t countGz = 0;
+    {
+        auto subdir = dir / "gz";
+        fs::create_directories(subdir);
+        std::string prefix = subdir.string() + "/";
+        withSilencedIoInDir(subdir, [&] {
+            Assembler assembler(prefix, true, 0, 4096);
+            assembler.addReads(gzPath.string(), 0, false, 1);
+            countGz = assembler.getReads().readCount();
+        });
+    }
+
+    REQUIRE(countPlain > 0);
+    REQUIRE(countPlain == countGz);
+    INFO("GIAB: " << countPlain << " reads from both plain and gz");
+
+    fs::remove_all(dir);
+}
