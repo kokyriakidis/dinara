@@ -4151,9 +4151,17 @@ void Assembler::flagPalindromicReads(
                     }
                 }
 
+                const bool dbg = (readId == 33);
+
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " selfHits=" << selfHits.size()
+                    << " readLen=" << readLen
+                    << " numMarkers=" << numMarkersA << endl;
+
                 if(selfHits.size() < 2) continue;
 
                 // Map ordinalB for each hit.
+                uint64_t unmappedCount = 0;
                 for(auto& kh : selfHits) {
                     const uint32_t origPosB = uint32_t(
                         readLen - 1ULL - uint64_t(kh.offset));
@@ -4163,7 +4171,13 @@ void Assembler::flagPalindromicReads(
                             break;
                         }
                     }
+                    if(kh.ordinalB == std::numeric_limits<uint32_t>::max())
+                        unmappedCount++;
                 }
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " afterOrdinalBMap: unmapped=" << unmappedCount
+                    << " mapped=" << (selfHits.size() - unmappedCount) << endl;
+
                 selfHits.erase(
                     std::remove_if(selfHits.begin(), selfHits.end(),
                         [](const HifiasmKmerHit& h) {
@@ -4171,6 +4185,9 @@ void Assembler::flagPalindromicReads(
                                 std::numeric_limits<uint32_t>::max();
                         }),
                     selfHits.end());
+
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " afterErase=" << selfHits.size() << endl;
 
                 if(selfHits.size() < 2) continue;
 
@@ -4194,6 +4211,21 @@ void Assembler::flagPalindromicReads(
                     uint32_t(readId),
                     int64_t(readLen), int64_t(readLen),
                     1, 1, 0.0, 0);
+
+                if(dbg) {
+                    cout << "PALINDROME-DBG read " << readId
+                        << " chains=" << overlapRegions.size() << endl;
+                    for(size_t ci = 0; ci < overlapRegions.size(); ci++) {
+                        const auto& r = overlapRegions[ci];
+                        cout << "PALINDROME-DBG read " << readId
+                            << " chain[" << ci << "]"
+                            << " x=[" << r.x_pos_s << "," << r.x_pos_e << "]"
+                            << " y=[" << r.y_pos_s << "," << r.y_pos_e << "]"
+                            << " anchors=" << r.align_length
+                            << " score=" << r.shared_seed
+                            << " span=" << (r.x_pos_e - r.x_pos_s) << endl;
+                    }
+                }
 
                 if(overlapRegions.empty()) continue;
 
@@ -4224,6 +4256,9 @@ void Assembler::flagPalindromicReads(
                         {h.ordinalA, h.ordinalB});
                 }
 
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " rawOrdinals=" << alignment.ordinals.size() << endl;
+
                 if(alignment.ordinals.size() < 2) continue;
 
                 // Sort by ordinalA and keep only ordinals where
@@ -4247,6 +4282,9 @@ void Assembler::flagPalindromicReads(
                     alignment.ordinals = std::move(filtered);
                 }
 
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " filteredOrdinals=" << alignment.ordinals.size() << endl;
+
                 if(alignment.ordinals.size() < 2) continue;
 
                 const array<OrientedReadId, 2> oids = {
@@ -4261,12 +4299,23 @@ void Assembler::flagPalindromicReads(
 
                 const uint64_t totalBases =
                     projectedAlignment.totalLength[0];
+
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " totalBases=" << totalBases
+                    << " readLen=" << readLen << endl;
+
                 if(totalBases == 0) continue;
 
                 const double alignedFrac =
                     double(totalBases) / double(readLen);
                 const double errorRate =
                     projectedAlignment.errorRate();
+
+                if(dbg) cout << "PALINDROME-DBG read " << readId
+                    << " alignedFrac=" << alignedFrac
+                    << " errorRate=" << errorRate
+                    << " pass=" << (alignedFrac >= alignedFractionThreshold &&
+                                    errorRate <= maxErrorRate) << endl;
 
                 if(alignedFrac >= alignedFractionThreshold &&
                    errorRate <= maxErrorRate) {
