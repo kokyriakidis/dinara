@@ -2024,6 +2024,10 @@ private:
         while(getNextBatch(startBatch, endBatch)) {
             for(ReadId readIdA = ReadId(startBatch); readIdA != ReadId(endBatch); ++readIdA) {
 
+                // Skip palindromic reads — they would produce
+                // spurious self-overlaps on the opposite strand.
+                if(reads.getFlags(readIdA).isPalindromic) continue;
+
                 const OrientedReadId orientedReadIdA(readIdA, 0);
                 const auto& markersA = markers[orientedReadIdA.getValue()];
                 const bool haveCanonicalCache =
@@ -2198,8 +2202,8 @@ private:
                     while(hitIter < scratch.flatHits.size()) {
                         const ReadId readIdB = scratch.flatHits[hitIter].partnerReadId;
 
-                        // Skip mirrored pairs and self-comparisons.
-                        if(readIdB <= readIdA) {
+                        // Skip mirrored pairs, self-comparisons, and palindromic partners.
+                        if(readIdB <= readIdA || reads.getFlags(readIdB).isPalindromic) {
                             while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) {
                                 ++hitIter;
                             }
@@ -2771,6 +2775,11 @@ void Assembler::chainPafCandidates(
                     const OrientedReadPair& pair = originalCandidates[idx];
                     const ReadId readIdA = pair.readIds[0];
                     const ReadId readIdB = pair.readIds[1];
+
+                    // Skip pairs involving palindromic reads.
+                    if(reads->getFlags(readIdA).isPalindromic ||
+                       reads->getFlags(readIdB).isPalindromic) continue;
+
                     const bool pafSameStrand = pair.isSameStrand;
 
                     const OrientedReadId orientedReadIdA(readIdA, 0);
@@ -3956,8 +3965,7 @@ void Assembler::flagPalindromicReads(
     double maxDriftRate,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
     double alignedFractionThreshold,
-    int maxUncoveredBases,
-    double minIdentity,
+    double maxErrorRate,
     uint64_t threadCount)
 {
     performanceLog << timestamp
@@ -4189,7 +4197,14 @@ void Assembler::flagPalindromicReads(
 
                 if(overlapRegions.empty()) continue;
 
-                const auto& best = overlapRegions[0];
+                // Pick the chain with the largest base span.
+                const auto& best = *std::max_element(
+                    overlapRegions.begin(), overlapRegions.end(),
+                    [](const HifiasmOverlapRegion& a,
+                       const HifiasmOverlapRegion& b) {
+                        return (a.x_pos_e - a.x_pos_s) <
+                               (b.x_pos_e - b.x_pos_s);
+                    });
                 const uint64_t off =
                     uint64_t(best.non_homopolymer_errors);
                 const uint64_t nHit =
@@ -4223,20 +4238,13 @@ void Assembler::flagPalindromicReads(
                     projectedAlignment.totalLength[0];
                 if(totalBases == 0) continue;
 
-                const double identity =
-                    1.0 - projectedAlignment.errorRate();
-                const uint64_t uncovered = (readLen > totalBases)
-                    ? (readLen - totalBases) : 0;
                 const double alignedFrac =
                     double(totalBases) / double(readLen);
+                const double errorRate =
+                    projectedAlignment.errorRate();
 
-                const bool spanPass =
-                    (int64_t(uncovered) <= int64_t(maxUncoveredBases));
-                const bool fracPass =
-                    (alignedFrac >= alignedFractionThreshold);
-                const bool idPass = (identity >= minIdentity);
-
-                if((spanPass || fracPass) && idPass) {
+                if(alignedFrac >= alignedFractionThreshold &&
+                   errorRate <= maxErrorRate) {
                     reads->setPalindromicFlag(readId, true);
                     palindromicCount.fetch_add(1);
                 }

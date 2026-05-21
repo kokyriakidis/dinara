@@ -329,51 +329,17 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(false),
         "Skip flagging palindromic reads. Oxford Nanopore reads should be flagged for better results.")
 
-        ("Reads.palindromicReads.maxSkip",
-        value<int>(&readsOptions.palindromicReads.maxSkip)->
-        default_value(100),
-        "Used for palindromic read detection.")
-
-        ("Reads.palindromicReads.maxDrift",
-        value<int>(&readsOptions.palindromicReads.maxDrift)->
-        default_value(100),
-        "Used for palindromic read detection.")
-
-        ("Reads.palindromicReads.maxMarkerFrequency",
-        value<int>(&readsOptions.palindromicReads.maxMarkerFrequency)->
-        default_value(10),
-        "Used for palindromic read detection.")
-
         ("Reads.palindromicReads.alignedFractionThreshold",
         value<double>(&readsOptions.palindromicReads.alignedFractionThreshold)->
         default_value(0.1, "0.1"),
-        "Used for palindromic read detection.")
+        "Minimum fraction of read length covered by the self-alignment chain "
+        "to flag a read as palindromic.")
 
-        ("Reads.palindromicReads.nearDiagonalFractionThreshold",
-        value<double>(&readsOptions.palindromicReads.nearDiagonalFractionThreshold)->
-        default_value(0.1, "0.1"),
-        "Used for palindromic read detection.")
-
-         ("Reads.palindromicReads.deltaThreshold",
-          value<int>(&readsOptions.palindromicReads.deltaThreshold)->
-          default_value(100),
-          "Used for palindromic read detection.")
-
-         ("Reads.palindromicReads.minAlignedMarkerCount",
-          value<int>(&readsOptions.palindromicReads.minAlignedMarkerCount)->
-          default_value(32),
-          "Minimum number of aligned markers to consider a read palindromic.")
-
-         ("Reads.palindromicReads.maxUncoveredBases",
-          value<int>(&readsOptions.palindromicReads.maxUncoveredBases)->
-          default_value(500),
-          "Maximum number of unaligned bases (start + end) to consider a read palindromic.")
-
-         ("Reads.palindromicReads.minIdentity",
-          value<double>(&readsOptions.palindromicReads.minIdentity)->
-          default_value(0.8),
-          "Minimum base-level identity between forward and reverse complement "
-          "to flag a read as palindromic. Use 0.9 for HiFi, 0.8 for ONT.")
+        ("Reads.palindromicReads.maxErrorRate",
+        value<double>(&readsOptions.palindromicReads.maxErrorRate)->
+        default_value(0.03, "0.03"),
+        "Maximum edit distance rate between forward and reverse complement "
+        "to flag a read as palindromic.")
 
          ("Kmers.generationMethod",
          value<int>(&kmersOptions.generationMethod)->
@@ -1612,15 +1578,8 @@ void AssemblerOptions::addConfigurableOptions()
 void PalindromicReadOptions::write(ostream& s) const
 {
     s << "palindromicReads.skipFlagging = " << convertBoolToPythonString(skipFlagging) << "\n";
-    s << "palindromicReads.maxSkip = " << maxSkip << "\n";
-    s << "palindromicReads.maxDrift = " << maxDrift << "\n";
-    s << "palindromicReads.maxMarkerFrequency = " << maxMarkerFrequency << "\n";
     s << "palindromicReads.alignedFractionThreshold = " << alignedFractionThreshold << "\n";
-    s << "palindromicReads.nearDiagonalFractionThreshold = " << nearDiagonalFractionThreshold << "\n";
-    s << "palindromicReads.deltaThreshold = " << deltaThreshold << "\n";
-    s << "palindromicReads.minAlignedMarkerCount = " << minAlignedMarkerCount << "\n";
-    s << "palindromicReads.maxUncoveredBases = " << maxUncoveredBases << "\n";
-    s << "palindromicReads.minIdentity = " << minIdentity << "\n";
+    s << "palindromicReads.maxErrorRate = " << maxErrorRate << "\n";
 }
 
 
