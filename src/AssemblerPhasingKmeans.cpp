@@ -1779,7 +1779,7 @@ static void kmWriteResults(
         } else if (ov.hap == 1) {
             matchState = 1; // cis
         } else {
-            matchState = 2; // unassigned — treat as trans (conservative)
+            matchState = 1; // unassigned — treat as cis
         }
         ad.setHifiasmEcMatchStateFromReadPerspective(backboneReadId, matchState);
     }
