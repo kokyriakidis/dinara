@@ -185,8 +185,9 @@ static vector<vector<int8_t>> scoreReadsAtVariants(
         if(v.type == KmVarType::Snp) {
             for(int r = 0; r < nReads; r++) {
                 uint8_t readVal = result.readMsaRows[r][v.msaColStart];
-                if(readVal == v.refBase) scores[vi][r] = 0;
-                else if(readVal == v.altBase) scores[vi][r] = 1;
+                if(readVal == v.altBase) scores[vi][r] = 1;
+                else if(readVal < 4) scores[vi][r] = 0;  // any base (ref or third allele) → ref
+                // gap → stays -1
             }
         }
         else if(v.type == KmVarType::Insertion) {
@@ -591,9 +592,7 @@ static int processOneMsaResult(
     newVars.reserve(vars.size());
 
     for(size_t vi = 0; vi < vars.size(); vi++) {
-        vector<int8_t> varScores(result.nReads);
-        for(int r = 0; r < result.nReads; r++)
-            varScores[r] = allScores[vi][r];
+        vector<int8_t>& varScores = allScores[vi];
 
         int altCount = 0;
         for(auto s : varScores) { if(s == 1) altCount++; }
