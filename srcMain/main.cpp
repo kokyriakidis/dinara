@@ -1015,11 +1015,6 @@ void dinara::main::assemble(
         );
     }
 
-    // // Experimental path: run FASTGA directly on the chained candidate spans
-    // // and store sparse differences keyed by candidate index.
-    // assembler.alignChainedCandidatesWithFastGA(threadCount);
-    // return;
-
     // // Lightweight marker-chain materialization.
     // // The marker graph vertex builder needs alignmentData/compressedAlignments,
     // // but this prototype does not need projected banded/base alignments or evidence.

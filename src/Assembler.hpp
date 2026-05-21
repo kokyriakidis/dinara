@@ -2125,7 +2125,6 @@ public:
 
 
     AlignedEvidenceStore alignedEvidenceStore;
-    AlignedEvidenceStore chainedFastgaEvidenceStore;
 
     // Per-overlap packed CIGARs (hifiasm-style uint16_t tokens).
     // Populated during computeBaseAlignmentsAndStore.
@@ -3655,8 +3654,6 @@ public:
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         ReadId focalReadId = ReadId(0));
 
-    void benchmarkFastGAOnChainedReadPairs(ReadId focalReadId, uint32_t strand);
-    void alignChainedCandidatesWithFastGA(uint64_t threadCount);
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
     std::shared_ptr<Shasta2AssemblyGraph> shasta2AssemblyGraph;
     std::map<string, std::shared_ptr<Shasta2AssemblyGraphPostprocessor> > shasta2AssemblyGraphTable;
