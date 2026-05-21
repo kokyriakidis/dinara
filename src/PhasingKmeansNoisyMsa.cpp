@@ -5,10 +5,11 @@
 ///
 /// Key design (matching pgphase):
 /// - Variant extraction: pairwise alignment of raw backbone vs consensus
-///   sequences (edlib), NOT direct MSA row comparison. This avoids
+///   sequences (edlib NW), NOT direct MSA row comparison. This avoids
 ///   multi-sequence alignment artifacts that inflate variant counts.
-/// - Read scoring: AlnStr derived from MSA rows (strip double-gap columns),
-///   scored with delta_ref_alt offset tracking and full_cover gating.
+/// - Read scoring: direct MSA column indexing with full_cover gating.
+///   Each variant carries msaColStart/msaColEnd mapped back from the
+///   pairwise alignment, so reads are scored from the original MSA matrix.
 
 #include "PhasingKmeansAlign.hpp"
 #include "PhasingKmeansTypes.hpp"
@@ -55,8 +56,12 @@ static KmVarKey varToKey(const NoisyMsaVariant& v)
     key.type = v.type;
     key.altBase = v.altBase;
     if(v.type == KmVarType::Snp) { key.refLen = 1; key.altLen = 1; }
-    else if(v.type == KmVarType::Insertion) { key.refLen = 0; key.altLen = uint32_t(v.altSeq.size()); }
-    else { key.refLen = uint32_t(v.refSeq.size()); key.altLen = 0; }
+    else if(v.type == KmVarType::Insertion) {
+        key.refLen = 0;
+        key.altLen = uint16_t(v.altSeq.size());
+        key.altSeq = v.altSeq;
+    }
+    else { key.refLen = uint16_t(v.refSeq.size()); key.altLen = 0; }
     return key;
 }
 

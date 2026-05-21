@@ -8,6 +8,7 @@
 #include "vector.hpp"
 #include <array>
 #include <cstring>
+#include <string>
 
 namespace dinara {
 
@@ -89,20 +90,25 @@ struct KmVarKey {
     uint8_t  altBase;      ///< For SNPs: 0-3. For indels: unused (0).
     uint16_t refLen;       ///< SNP=1, ins=0, del=length.
     uint16_t altLen;       ///< SNP=1, ins=length, del=0.
+    std::string altSeq;    ///< Insertion sequence (ACGT chars). Empty for SNPs/dels.
 
     bool operator<(const KmVarKey& o) const {
-        // Sort by sort_pos (indels use pos-1 like pgphase), then type, then refLen, then altLen, then altBase.
+        // Sort by sort_pos (indels use pos-1 like pgphase), then type, then
+        // refLen, then altLen, then altBase, then altSeq.
+        // Matches pgphase exact_comp_var_site ordering.
         uint32_t sp1 = (type == KmVarType::Snp) ? pos : (pos > 0 ? pos - 1 : 0);
         uint32_t sp2 = (o.type == KmVarType::Snp) ? o.pos : (o.pos > 0 ? o.pos - 1 : 0);
         if (sp1 != sp2) return sp1 < sp2;
         if (type != o.type) return type < o.type;
         if (refLen != o.refLen) return refLen < o.refLen;
         if (altLen != o.altLen) return altLen < o.altLen;
-        return altBase < o.altBase;
+        if (altBase != o.altBase) return altBase < o.altBase;
+        return altSeq < o.altSeq;
     }
     bool operator==(const KmVarKey& o) const {
         return pos == o.pos && type == o.type && altBase == o.altBase
-            && refLen == o.refLen && altLen == o.altLen;
+            && refLen == o.refLen && altLen == o.altLen
+            && altSeq == o.altSeq;
     }
 };
 

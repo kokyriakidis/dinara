@@ -652,9 +652,9 @@ static inline int kmCompareKeysFuzzy(const KmVarKey& a, const KmVarKey& b, int m
     }
     if (a.type == KmVarType::Insertion) {
         if (int(a.altLen) < minSvLen) {
-            // Short insertion: exact length + base match required.
+            // Short insertion: exact length + sequence match required.
             if (a.altLen != b.altLen) return a.altLen < b.altLen ? -1 : 1;
-            // We don't store insertion sequence, so same length = same.
+            if (a.altSeq != b.altSeq) return a.altSeq < b.altSeq ? -1 : 1;
             return 0;
         }
         // Large insertion: fuzzy length-ratio rule.
