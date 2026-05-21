@@ -28,7 +28,7 @@ using namespace std;
 // Constants
 // ============================================================================
 
-static constexpr uint8_t kGap = 4;
+static constexpr uint8_t kGap = 5;  // abPOA MSA gap value (abpt->m for nucleotide mode)
 static constexpr int kLongIndelLen = 10;
 static constexpr float kConsSimilarityThreshold = 0.9f;
 
@@ -225,20 +225,18 @@ static vector<vector<int8_t>> scoreReadsAtVariants(
             }
         }
         else if(v.type == KmVarType::Deletion) {
-            int span = int(v.msaColEnd - v.msaColStart);
             for(int r = 0; r < nReads; r++) {
                 if(!readFullyCoversVariant(result.readMsaRows[r],
                         result.backboneMsaRow, result.msaLen,
                         v.msaColStart, v.msaColEnd))
                     continue;
-                int nBases = 0, nGaps = 0;
+                int nNonGap = 0;
                 for(uint32_t col = v.msaColStart; col < v.msaColEnd; col++) {
-                    uint8_t rv = result.readMsaRows[r][col];
-                    if(rv < 4) nBases++;
-                    else if(rv == kGap) nGaps++;
+                    if(result.readMsaRows[r][col] != kGap) nNonGap++;
                 }
-                if(nBases == span) scores[vi][r] = 0;
-                else if(nGaps == span) scores[vi][r] = 1;
+                // pgphase: any non-gap base in deletion region → ref (0),
+                // all gaps → alt (1).
+                scores[vi][r] = (nNonGap == 0) ? 1 : 0;
             }
         }
     }
@@ -536,7 +534,7 @@ static int processTwoHapResults(
     newVars.reserve(allVars.size());
 
     for(size_t vi = 0; vi < allVars.size(); vi++) {
-        vector<int8_t> varScores(nReadsTotal);
+        vector<int8_t> varScores(nReadsTotal, -1);
 
         // Hap0 reads.
         for(int r = 0; r < nReads0; r++) {
