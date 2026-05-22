@@ -1172,7 +1172,9 @@ static KmVariantCategory kmClassifyVariantInitial(
 {
     c.alleleFraction = c.totalCov > 0 ? double(c.altCov) / double(c.totalCov) : 0.0;
 
-    if (c.totalCov < int(opts.minDepth) || c.altCov < int(opts.minAltDepth))
+    // pgphase: depth check includes low-quality reads.
+    const int depthWithLowQual = c.totalCov + c.lowQualCov;
+    if (depthWithLowQual < int(opts.minDepth) || c.altCov < int(opts.minAltDepth))
         return KmVariantCategory::LowCoverage;
 
     // ONT strand bias: Fisher exact on (fwd_alt, rev_alt, expected, expected).
