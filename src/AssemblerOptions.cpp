@@ -331,8 +331,8 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Reads.palindromicReads.alignedFractionThreshold",
         value<double>(&readsOptions.palindromicReads.alignedFractionThreshold)->
-        default_value(0.1, "0.1"),
-        "Minimum fraction of read length covered by the self-alignment chain "
+        default_value(0.8, "0.8"),
+        "Minimum fraction of read length covered by the self-alignment chain span "
         "to flag a read as palindromic.")
 
         ("Reads.palindromicReads.maxErrorRate",

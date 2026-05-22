@@ -4204,6 +4204,13 @@ void Assembler::flagPalindromicReads(
                         return (a.x_pos_e - a.x_pos_s) <
                                (b.x_pos_e - b.x_pos_s);
                     });
+
+                // Chain span gate: the chain must cover at least
+                // alignedFractionThreshold of the read length.
+                const uint64_t chainSpan = best.x_pos_e - best.x_pos_s + 1;
+                const double chainSpanFrac = double(chainSpan) / double(readLen);
+                if(chainSpanFrac < alignedFractionThreshold) continue;
+
                 const uint64_t off =
                     uint64_t(best.non_homopolymer_errors);
                 const uint64_t nHit =
@@ -4234,13 +4241,10 @@ void Assembler::flagPalindromicReads(
                     projectedAlignment.totalLength[0];
                 if(totalBases == 0) continue;
 
-                const double alignedFrac =
-                    double(totalBases) / double(readLen);
                 const double errorRate =
                     projectedAlignment.errorRate();
 
-                if(alignedFrac >= alignedFractionThreshold &&
-                   errorRate <= maxErrorRate) {
+                if(errorRate <= maxErrorRate) {
                     reads->setPalindromicFlag(readId, true);
                     palindromicCount.fetch_add(1);
                 }
