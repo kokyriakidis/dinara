@@ -1179,59 +1179,68 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // Detect reads whose ordinals decrease along the backbone (longest read) journey.
-    // A read that goes "backwards" relative to the backbone likely has a
-    // misoriented or chimeric overlap.
+    // Detect reads whose ordinals regress along another read's journey.
+    // For each oriented read (the "backbone"), walk its journey and check
+    // every co-occurring oriented read: its ordinals should increase
+    // monotonically along the backbone. A decrease indicates a misoriented
+    // or chimeric overlap.
     {
-        // Find the longest read and use strand 0 as the backbone.
-        const ReadId longestReadId = readIdsSortedByLength[0];
-        const OrientedReadId backboneOrientedReadId(longestReadId, 0);
-        const Shasta2Journey backboneJourney = (*shasta2Journeys)[backboneOrientedReadId];
+        cout << timestamp << "Checking for regressing ordinals across all journeys..." << endl;
 
-        cout << timestamp << "Backbone journey: read " << longestReadId
-             << " (length " << reads.getReadRawSequenceLength(longestReadId)
-             << "), " << backboneJourney.size() << " anchors." << endl;
+        // For each oriented read pair (backbone, visitor), record whether
+        // a regression was seen. Use a set to avoid duplicate reports
+        // (the same pair can regress on multiple backbones).
+        std::set<pair<OrientedReadId, OrientedReadId>> regressingPairs;
 
-        // For each oriented read that appears along the backbone journey,
-        // collect (backbonePosition, readOrdinal) pairs.
-        // Then check if ordinals are monotonically non-decreasing.
-        std::map<OrientedReadId, vector<pair<uint32_t, uint32_t>>> readAppearances;
+        for(ReadId convergenceReadId(0); convergenceReadId < readCount; ++convergenceReadId) {
+            for(Strand strand = 0; strand < 2; ++strand) {
+                const OrientedReadId backboneOrientedReadId(convergenceReadId, strand);
+                const Shasta2Journey backboneJourney = (*shasta2Journeys)[backboneOrientedReadId];
+                if(backboneJourney.size() < 2) continue;
 
-        for(uint32_t backbonePos = 0; backbonePos < backboneJourney.size(); ++backbonePos) {
-            const Shasta2AnchorId anchorId = backboneJourney[backbonePos];
-            const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
-            for(const auto& info : anchor) {
-                if(info.orientedReadId == backboneOrientedReadId) continue;
-                readAppearances[info.orientedReadId].push_back(
-                    {backbonePos, info.ordinal});
+                // Track the last ordinal seen for each visitor read along this backbone.
+                // Using a flat map (sorted vector) would be faster, but a std::map
+                // is simpler and this is a one-time diagnostic.
+                std::map<OrientedReadId, uint32_t> lastOrdinal;
+
+                for(uint32_t backbonePos = 0; backbonePos < backboneJourney.size(); ++backbonePos) {
+                    const Shasta2AnchorId anchorId = backboneJourney[backbonePos];
+                    const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
+                    for(const auto& info : anchor) {
+                        if(info.orientedReadId == backboneOrientedReadId) continue;
+                        auto it = lastOrdinal.find(info.orientedReadId);
+                        if(it == lastOrdinal.end()) {
+                            lastOrdinal[info.orientedReadId] = info.ordinal;
+                        } else {
+                            if(info.ordinal < it->second) {
+                                regressingPairs.insert({backboneOrientedReadId, info.orientedReadId});
+                            }
+                            it->second = info.ordinal;
+                        }
+                    }
+                }
             }
         }
 
-        uint64_t regressingCount = 0;
-        for(const auto& [orientedReadId, appearances] : readAppearances) {
-            if(appearances.size() < 2) continue;
-            // Appearances are already in backbone position order.
-            // Check for ordinal decreases.
-            bool regressing = false;
-            for(size_t i = 1; i < appearances.size(); ++i) {
-                if(appearances[i].second < appearances[i - 1].second) {
-                    regressing = true;
-                    break;
-                }
+        // Print results grouped by visitor read.
+        if(!regressingPairs.empty()) {
+            // Collect unique regressing visitors and their backbones.
+            std::map<OrientedReadId, vector<OrientedReadId>> visitorToBackbones;
+            for(const auto& [backbone, visitor] : regressingPairs) {
+                visitorToBackbones[visitor].push_back(backbone);
             }
-            if(regressing) {
-                ++regressingCount;
-                cout << timestamp << "Regressing read " << orientedReadId
-                     << ": ordinals along backbone:";
-                for(const auto& [bpos, ord] : appearances) {
-                    cout << " " << ord << "@" << bpos;
+            for(const auto& [visitor, backbones] : visitorToBackbones) {
+                cout << timestamp << "Regressing: " << visitor
+                     << " regresses on " << backbones.size() << " backbone(s):";
+                for(const auto& bb : backbones) {
+                    cout << " " << bb;
                 }
                 cout << endl;
             }
         }
-        cout << timestamp << "Found " << regressingCount
-             << " oriented reads with regressing ordinals along the backbone journey out of "
-             << readAppearances.size() << " total." << endl;
+
+        cout << timestamp << "Found " << regressingPairs.size()
+             << " (backbone, visitor) pairs with regressing ordinals." << endl;
     }
 
     // Create the Shasta2AnchorGraph.
