@@ -231,8 +231,7 @@ static bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
 }
 
 /// pgphase var_is_repeat_region_pg: checks if the deleted/inserted motif is a
-/// tandem repeat of the flanking reference. For insertions we don't store the
-/// alt sequence, so we can only check deletions.
+/// tandem repeat of the flanking reference.
 static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
                              const KmVarKey& key, int xid)
 {
@@ -249,8 +248,33 @@ static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
             if (seq[pos + i] != seq[pos + delLen + i]) return false;
         return true;
     }
-    // Insertion: would need alt sequence which we don't store.
-    // Skip — this is a known limitation.
+    if (key.type == KmVarType::Insertion) {
+        // pgphase: check if inserting the alt bases at pos produces a tandem
+        // repeat pattern that matches the reference.
+        if (key.altSeq.empty()) return false;
+        const int insLen = int(key.altSeq.size());
+        if (insLen > xid) return false;
+        const int len = insLen * 3;
+        const int64_t pos = int64_t(key.pos);
+        if (pos < 0 || pos + len > sn) return false;
+        // ref_b = reference bases [pos, pos+len).
+        // alt_b = alt bases placed at [0, insLen), then extended as tandem repeat.
+        // If ref_b == alt_b, the insertion is a tandem copy.
+        static const uint8_t charToBase[256] = {
+            ['A'] = 0, ['C'] = 1, ['G'] = 2, ['T'] = 3,
+            ['a'] = 0, ['c'] = 1, ['g'] = 2, ['t'] = 3
+        };
+        // Build alt_b: first insLen positions from altSeq, rest propagated.
+        std::string alt_b(size_t(len), '\0');
+        for (int j = 0; j < insLen; j++)
+            alt_b[size_t(j)] = char(charToBase[uint8_t(key.altSeq[size_t(j)])]);
+        for (int j = insLen; j < len; j++)
+            alt_b[size_t(j)] = alt_b[size_t(j - insLen)];
+        // Compare against reference.
+        for (int j = 0; j < len; j++)
+            if (seq[pos + j] != uint8_t(alt_b[size_t(j)])) return false;
+        return true;
+    }
     return false;
 }
 
@@ -470,7 +494,26 @@ static void kmParseCigars(
                         // pgphase never needs this because BAM CIGARs are reference-forward.
                         if (needsRc) anchor = backboneLen - anchor;
                         if (anchor < backboneLen) {
-                            scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len)});
+                            // Extract inserted bases from the non-backbone read.
+                            std::string insSeq;
+                            insSeq.reserve(len);
+                            // The non-backbone read's positions for this insertion:
+                            //   qIsR0: non-bb is read1, positions yk..yk+len-1
+                            //   !qIsR0: non-bb is read0, positions xk..xk+len-1
+                            const uint32_t insStart = qIsR0 ? uint32_t(yk) : uint32_t(xk);
+                            for (uint32_t b = 0; b < len; b++) {
+                                uint8_t base;
+                                if (qIsR0) {
+                                    base = kmGetBase(assembler, ReadId(ov.targetReadId),
+                                                     insStart + b, ov.isRev != 0);
+                                } else {
+                                    const auto seq = assembler.getReads().getRead(ReadId(ov.targetReadId));
+                                    base = seq[insStart + b].value;
+                                    if (ov.isRev) base = uint8_t((~base) & 3);
+                                }
+                                insSeq.push_back("ACGT"[base & 3]);
+                            }
+                            scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len), std::move(insSeq)});
                         }
                     }
                 }
@@ -679,6 +722,7 @@ static void kmCollectCandidates(KmScratchpad& scratch, int minSvLen)
         k.altBase = (d.type == KmVarType::Snp) ? d.altBase : 0;
         k.refLen = (d.type == KmVarType::Deletion) ? d.len : (d.type == KmVarType::Snp ? 1 : 0);
         k.altLen = (d.type == KmVarType::Insertion) ? d.len : (d.type == KmVarType::Snp ? 1 : 0);
+        k.altSeq = d.altSeq;
         keys.push_back(k);
     }
 

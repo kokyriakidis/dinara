@@ -65,16 +65,18 @@ struct KmDigarOp {
     KmVarType type;        ///< SNP, insertion, or deletion.
     uint8_t  altBase;      ///< For SNPs: alt base (0-3=ACGT). For indels: unused.
     uint16_t len;          ///< For indels: length. For SNPs: 1.
+    std::string altSeq;    ///< For insertions: inserted bases (ACGT chars). Empty otherwise.
 
-    /// Sort key: pos first, then type, then altBase, then len.
+    /// Sort key: pos first, then type, then altBase, then len, then altSeq.
     bool operator<(const KmDigarOp& o) const {
         if (pos != o.pos) return pos < o.pos;
         if (type != o.type) return type < o.type;
         if (altBase != o.altBase) return altBase < o.altBase;
-        return len < o.len;
+        if (len != o.len) return len < o.len;
+        return altSeq < o.altSeq;
     }
     bool operator==(const KmDigarOp& o) const {
-        return pos == o.pos && type == o.type && altBase == o.altBase && len == o.len;
+        return pos == o.pos && type == o.type && altBase == o.altBase && len == o.len && altSeq == o.altSeq;
     }
 };
 
