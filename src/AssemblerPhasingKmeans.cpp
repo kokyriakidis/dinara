@@ -261,27 +261,25 @@ static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
         if (pos < 0 || pos + len > sn) return false;
         // alt_b starts as a copy of the reference at [pos, pos+len).
         // Uses numeric encoding (0-3) to match seq[].
-        vector<uint8_t> alt_b(size_t(len));
+        vector<uint8_t> alt_b(static_cast<size_t>(len));
         for (int j = 0; j < len; j++)
-            alt_b[size_t(j)] = seq[pos + j];
+            alt_b[j] = seq[pos + j];
         // Propagate tandem repeat from ref prefix (pgphase does this first).
         for (int j = insLen; j < len; j++)
-            alt_b[size_t(j)] = alt_b[size_t(j - insLen)];
+            alt_b[j] = alt_b[j - insLen];
         // Overwrite [0, insLen) with alt bases (pgphase does this second).
-        auto charToBase = [](char c) -> uint8_t {
-            switch (c) {
-                case 'A': case 'a': return 0;
-                case 'C': case 'c': return 1;
-                case 'G': case 'g': return 2;
-                case 'T': case 't': return 3;
-                default: return 4;
-            }
-        };
-        for (int j = 0; j < insLen; j++)
-            alt_b[size_t(j)] = charToBase(key.altSeq[size_t(j)]);
+        for (int j = 0; j < insLen; j++) {
+            const char c = key.altSeq[j];
+            uint8_t b = 4;
+            if (c == 'A' || c == 'a') b = 0;
+            else if (c == 'C' || c == 'c') b = 1;
+            else if (c == 'G' || c == 'g') b = 2;
+            else if (c == 'T' || c == 't') b = 3;
+            alt_b[j] = b;
+        }
         // Compare against reference.
         for (int j = 0; j < len; j++)
-            if (seq[pos + j] != alt_b[size_t(j)]) return false;
+            if (seq[pos + j] != alt_b[j]) return false;
         return true;
     }
     return false;
@@ -484,7 +482,7 @@ static void kmParseCigars(
                             // If strands differ, complement to match backbone's frame.
                             if (ov.isRev) altBase = uint8_t((~altBase) & 3);
                         }
-                        scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1});
+                        scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1, {}});
                     }
                 } else if (op == 2 || op == 3) { // Ins/Del
                     bool bbConsumed = (op==3 && qIsR0) || (op==2 && !qIsR0);
@@ -495,7 +493,7 @@ static void kmParseCigars(
                         if (needsRc) { s = backboneLen - rawE; e = backboneLen - raw; }
                         else { s = raw; e = rawE; }
                         if (s < backboneLen) {
-                            scratch.digars.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s)});
+                            scratch.digars.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s), {}});
                         }
                     } else {
                         uint32_t anchor = qIsR0 ? uint32_t(xk) : uint32_t(yk);
@@ -673,7 +671,7 @@ static void kmParseFromEvidenceStore(
         KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
 
         for (const auto& ev : merged) {
-            scratch.digars.push_back({ev.bbPos, ev.type, ev.altBase, ev.len});
+            scratch.digars.push_back({ev.bbPos, ev.type, ev.altBase, ev.len, {}});
             if (ev.type == KmVarType::Snp) {
                 noisy.observe(ev.bbPos, 1, 1);
             } else if (ev.type == KmVarType::Deletion) {
