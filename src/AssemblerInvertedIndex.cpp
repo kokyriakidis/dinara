@@ -4196,21 +4196,35 @@ void Assembler::flagPalindromicReads(
 
                 if(overlapRegions.empty()) continue;
 
-                // Pick the chain with the largest base span.
-                const auto& best = *std::max_element(
-                    overlapRegions.begin(), overlapRegions.end(),
-                    [](const HifiasmOverlapRegion& a,
-                       const HifiasmOverlapRegion& b) {
-                        return (a.x_pos_e - a.x_pos_s) <
-                               (b.x_pos_e - b.x_pos_s);
-                    });
+                // Pick the chain with the largest raw anchor span
+                // (self_offset of last hit minus first hit).
+                // We cannot use x_pos_s/x_pos_e because push_ovlp_chain_qgen
+                // left-normalizes and right-extends them to sequence boundaries.
+                size_t bestIdx = 0;
+                uint64_t bestRawSpan = 0;
+                for(size_t ri = 0; ri < overlapRegions.size(); ++ri) {
+                    const auto& r = overlapRegions[ri];
+                    const uint64_t rOff = uint64_t(r.non_homopolymer_errors);
+                    const uint64_t rN = uint64_t(r.align_length);
+                    if(rN < 2 || rOff + rN > chainHitIndexFlat.size()) continue;
+                    const uint32_t firstSelf = selfHits[chainHitIndexFlat[rOff]].self_offset;
+                    const uint32_t lastSelf = selfHits[chainHitIndexFlat[rOff + rN - 1]].self_offset;
+                    const uint64_t span = (lastSelf >= firstSelf)
+                        ? uint64_t(lastSelf - firstSelf + 1)
+                        : uint64_t(firstSelf - lastSelf + 1);
+                    if(span > bestRawSpan) {
+                        bestRawSpan = span;
+                        bestIdx = ri;
+                    }
+                }
+                if(bestRawSpan == 0) continue;
 
                 // Chain span gate: the chain must cover at least
                 // alignedFractionThreshold of the read length.
-                const uint64_t chainSpan = best.x_pos_e - best.x_pos_s + 1;
-                const double chainSpanFrac = double(chainSpan) / double(readLen);
+                const double chainSpanFrac = double(bestRawSpan) / double(readLen);
                 if(chainSpanFrac < alignedFractionThreshold) continue;
 
+                const auto& best = overlapRegions[bestIdx];
                 const uint64_t off =
                     uint64_t(best.non_homopolymer_errors);
                 const uint64_t nHit =
