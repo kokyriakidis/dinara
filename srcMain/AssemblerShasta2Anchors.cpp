@@ -902,7 +902,12 @@ namespace dinara {
             *shastaReadsPtr,
             assembler.assemblerInfo->k,
             shastaMarkers,
-            shastaMarkerKmers);
+            shastaMarkerKmers,
+            minAnchorCoverageDinara,
+            maxAnchorCoverageDinara,
+            options.maxAnchorRepeatLength,
+            vector<uint64_t>{4, 12, 24},  // minAnchorDistinctSubkmerCount (shasta2 default)
+            threadCount);
 
         if(precomputedDinaraAnchors) {
             cout << timestamp
@@ -950,14 +955,6 @@ namespace dinara {
         }
 	        
 	        cout << timestamp << "Shasta2 Anchors created (" << shastaAnchors->size() << " anchors)." << endl;
-
-	        // The empty Anchors constructor creates the kmerToAnchorTable backing storage but does not size it.
-	        // Initialize it so any k-mer lookup/debugging code cannot go out of bounds.
-	        shastaAnchors->kmerToAnchorTable.resize(shastaMarkerKmers.size());
-	        std::fill(
-	            shastaAnchors->kmerToAnchorTable.begin(),
-	            shastaAnchors->kmerToAnchorTable.end(),
-	            shasta2::invalid<shasta2::AnchorId>);
 
 	        
 	        // 5. Downstream Assembly Pipeline (Journeys -> AnchorGraph -> AssemblyGraph).
