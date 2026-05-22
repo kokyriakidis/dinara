@@ -54,6 +54,9 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
+# Snarl finder (vendored from vg, stripped of protobuf/SnarlManager).
+add_subdirectory(external/snarls)
+
 # Add the subdirectories we need.
 if(BUILD_EXECUTABLE)
     add_subdirectory(Executable)
