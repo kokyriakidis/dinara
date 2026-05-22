@@ -12,6 +12,6 @@ if [ $? -ne 0 ] ; then
 fi
 
 scriptsDirectory="$(dirname "${BASH_SOURCE}")"
-${scriptsDirectory}/InstallPrerequisites-Ubuntu.py
+${scriptsDirectory}/InstallPrerequisites-Ubuntu.py "$@"
 
 
