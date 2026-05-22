@@ -49,6 +49,7 @@ using namespace dinara;
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include "iostream.hpp"
 #include <set>
 #include <unordered_set>
@@ -773,19 +774,19 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD closed syncmers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
-        // // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
-        // assembler.findMarkersSimdClosedSyncmers(
-        //     threadCount,
-        //     assemblerOptions.kmersOptions.k,
-        //     assemblerOptions.kmersOptions.syncmerS);
-
-        // Use SIMD-accelerated minimizers instead of closed syncmers.
-        // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
-        // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
-        assembler.findMarkersSimdMinimizers(
+        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
+        assembler.findMarkersSimdClosedSyncmers(
             threadCount,
             assemblerOptions.kmersOptions.k,
-            assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
+            assemblerOptions.kmersOptions.syncmerS);
+
+        // // Use SIMD-accelerated minimizers instead of closed syncmers.
+        // // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
+        // // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+        // assembler.findMarkersSimdMinimizers(
+        //     threadCount,
+        //     assemblerOptions.kmersOptions.k,
+        //     assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
 
         // Compute histogram using the pre-calculated KmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
@@ -1177,6 +1178,61 @@ void dinara::main::assemble(
         threadCount,
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
+
+    // Detect reads whose ordinals decrease along the backbone (longest read) journey.
+    // A read that goes "backwards" relative to the backbone likely has a
+    // misoriented or chimeric overlap.
+    {
+        // Find the longest read and use strand 0 as the backbone.
+        const ReadId longestReadId = readIdsSortedByLength[0];
+        const OrientedReadId backboneOrientedReadId(longestReadId, 0);
+        const Shasta2Journey backboneJourney = (*shasta2Journeys)[backboneOrientedReadId];
+
+        cout << timestamp << "Backbone journey: read " << longestReadId
+             << " (length " << reads.getReadRawSequenceLength(longestReadId)
+             << "), " << backboneJourney.size() << " anchors." << endl;
+
+        // For each oriented read that appears along the backbone journey,
+        // collect (backbonePosition, readOrdinal) pairs.
+        // Then check if ordinals are monotonically non-decreasing.
+        std::map<OrientedReadId, vector<pair<uint32_t, uint32_t>>> readAppearances;
+
+        for(uint32_t backbonePos = 0; backbonePos < backboneJourney.size(); ++backbonePos) {
+            const Shasta2AnchorId anchorId = backboneJourney[backbonePos];
+            const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
+            for(const auto& info : anchor) {
+                if(info.orientedReadId == backboneOrientedReadId) continue;
+                readAppearances[info.orientedReadId].push_back(
+                    {backbonePos, info.ordinal});
+            }
+        }
+
+        uint64_t regressingCount = 0;
+        for(const auto& [orientedReadId, appearances] : readAppearances) {
+            if(appearances.size() < 2) continue;
+            // Appearances are already in backbone position order.
+            // Check for ordinal decreases.
+            bool regressing = false;
+            for(size_t i = 1; i < appearances.size(); ++i) {
+                if(appearances[i].second < appearances[i - 1].second) {
+                    regressing = true;
+                    break;
+                }
+            }
+            if(regressing) {
+                ++regressingCount;
+                cout << timestamp << "Regressing read " << orientedReadId
+                     << ": ordinals along backbone:";
+                for(const auto& [bpos, ord] : appearances) {
+                    cout << " " << ord << "@" << bpos;
+                }
+                cout << endl;
+            }
+        }
+        cout << timestamp << "Found " << regressingCount
+             << " oriented reads with regressing ordinals along the backbone journey out of "
+             << readAppearances.size() << " total." << endl;
+    }
 
     // Create the Shasta2AnchorGraph.
     const uint64_t minEdgeCoverage = 2;
