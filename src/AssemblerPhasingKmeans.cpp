@@ -249,30 +249,34 @@ static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
         return true;
     }
     if (key.type == KmVarType::Insertion) {
-        // pgphase: check if inserting the alt bases at pos produces a tandem
-        // repeat pattern that matches the reference.
+        // pgphase var_is_repeat_region_pg insertion case:
+        // Build alt_b by copying the reference, propagating a tandem repeat
+        // from the ref prefix, then overwriting [0, insLen) with the alt bases.
+        // If alt_b == ref_b, the insertion is a tandem copy of the flanking ref.
         if (key.altSeq.empty()) return false;
         const int insLen = int(key.altSeq.size());
         if (insLen > xid) return false;
         const int len = insLen * 3;
         const int64_t pos = int64_t(key.pos);
         if (pos < 0 || pos + len > sn) return false;
-        // ref_b = reference bases [pos, pos+len).
-        // alt_b = alt bases placed at [0, insLen), then extended as tandem repeat.
-        // If ref_b == alt_b, the insertion is a tandem copy.
+        // alt_b starts as a copy of the reference at [pos, pos+len).
+        // Uses numeric encoding (0-3) to match seq[].
+        vector<uint8_t> alt_b(size_t(len));
+        for (int j = 0; j < len; j++)
+            alt_b[size_t(j)] = seq[pos + j];
+        // Propagate tandem repeat from ref prefix (pgphase does this first).
+        for (int j = insLen; j < len; j++)
+            alt_b[size_t(j)] = alt_b[size_t(j - insLen)];
+        // Overwrite [0, insLen) with alt bases (pgphase does this second).
         static const uint8_t charToBase[256] = {
             ['A'] = 0, ['C'] = 1, ['G'] = 2, ['T'] = 3,
             ['a'] = 0, ['c'] = 1, ['g'] = 2, ['t'] = 3
         };
-        // Build alt_b: first insLen positions from altSeq, rest propagated.
-        std::string alt_b(size_t(len), '\0');
         for (int j = 0; j < insLen; j++)
-            alt_b[size_t(j)] = char(charToBase[uint8_t(key.altSeq[size_t(j)])]);
-        for (int j = insLen; j < len; j++)
-            alt_b[size_t(j)] = alt_b[size_t(j - insLen)];
+            alt_b[size_t(j)] = charToBase[uint8_t(key.altSeq[size_t(j)])];
         // Compare against reference.
         for (int j = 0; j < len; j++)
-            if (seq[pos + j] != uint8_t(alt_b[size_t(j)])) return false;
+            if (seq[pos + j] != alt_b[size_t(j)]) return false;
         return true;
     }
     return false;
@@ -494,7 +498,8 @@ static void kmParseCigars(
                         // pgphase never needs this because BAM CIGARs are reference-forward.
                         if (needsRc) anchor = backboneLen - anchor;
                         if (anchor < backboneLen) {
-                            // Extract inserted bases from the non-backbone read.
+                            // Extract inserted bases from the non-backbone read
+                            // in the backbone's forward frame.
                             std::string insSeq;
                             insSeq.reserve(len);
                             // The non-backbone read's positions for this insertion:
@@ -512,6 +517,12 @@ static void kmParseCigars(
                                     if (ov.isRev) base = uint8_t((~base) & 3);
                                 }
                                 insSeq.push_back("ACGT"[base & 3]);
+                            }
+                            // For RC overlaps (!qIsR0 && isRev), the bases were
+                            // complemented above but are still in read0's forward
+                            // order. Reverse to put them in the backbone's frame.
+                            if (needsRc) {
+                                std::reverse(insSeq.begin(), insSeq.end());
                             }
                             scratch.digars.push_back({anchor, KmVarType::Insertion, 0, uint16_t(len), std::move(insSeq)});
                         }
