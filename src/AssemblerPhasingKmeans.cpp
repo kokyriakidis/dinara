@@ -1861,13 +1861,16 @@ static void kmRefineCis(
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
 
     // Track overlap state across refinement rounds.
-    // isCis: 1 = still in the cis pool, 0 = excluded (trans or peeled off).
+    // isCis: 1 = in the refinement pool, 0 = excluded (trans or peeled off).
+    // Round 1 cis (hap==1) and unassigned (hap==0) are both included —
+    // unassigned overlaps lacked phasing signal but could still be from
+    // a different paralogous copy.
     // wasTrans: true for overlaps that were trans (hap==2) in round 1.
     vector<uint8_t> isCis(numOv);
     vector<bool> wasTrans(numOv);
     for (uint32_t oi = 0; oi < numOv; oi++) {
-        isCis[oi] = (scratch.overlaps[oi].hap == 1) ? 1 : 0;
         wasTrans[oi] = (scratch.overlaps[oi].hap == 2);
+        isCis[oi] = wasTrans[oi] ? 0 : 1;
     }
 
     const uint32_t maxRefineRounds = 10;
