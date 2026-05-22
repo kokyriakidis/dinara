@@ -2373,7 +2373,6 @@ private:
                         const uint64_t readLenB = reads.getReadRawSequenceLength(readIdB);
                         const OrientedReadId orientedReadB(readIdB, 0);
                         const auto& mB = markers[orientedReadB.getValue()];
-                        const uint32_t markerCountA = uint32_t(markersA.size());
                         const uint32_t markerCountB = uint32_t(mB.size());
 
                         const uint32_t qS = r.x_pos_s;
@@ -2455,20 +2454,17 @@ private:
                             }
                         }
 
-                        // Canonicalize candidate so readIds[0] < readIds[1], and keep alignment consistent.
-                        ReadId cand0 = readIdA;
-                        ReadId cand1 = readIdB;
-                        canonicalizeCandidateAndAlignment(cand0, cand1, isSameStrand, al, markerCountA, markerCountB);
-
+                        // readIdA < readIdB is guaranteed by the skip guard above,
+                        // so no canonicalization is needed.
                         const uint8_t overlapType =
                             uint8_t(getOverlapType(qS, qE, uint32_t(readLenA)));
 
                         emittedForRead.push_back(EmittedChainedCandidate{
-                            OrientedReadPair(cand0, cand1, isSameStrand),
+                            OrientedReadPair(readIdA, readIdB, isSameStrand),
                             std::move(al),
                             r.shared_seed,
                             overlapType,
-                            (cand0 == readIdA) ? cand1 : cand0,
+                            readIdB,
                             0});
                         }
 
@@ -3646,20 +3642,15 @@ void Assembler::chainPafCandidates(
                             }
                         }
 
-                        // Canonicalize candidate so readIds[0] < readIds[1], and keep alignment consistent.
-                        const uint32_t markerCountA = uint32_t(markersA.size());
-                        const uint32_t markerCountB = uint32_t(markersB.size());
-                        ReadId cand0 = readIdA;
-                        ReadId cand1 = readIdB;
-                        bool isSameStrand = useSameStrand;
+                        // readIdA < readIdB is guaranteed: PAF pairs come from the
+                        // candidate table which was populated with canonical ordering.
                         const uint32_t readLenA32 = uint32_t(std::min<uint64_t>(
                             readLenA,
                             uint64_t(std::numeric_limits<uint32_t>::max())));
                         const uint8_t overlapType = uint8_t(getOverlapType(qPstart, qPend, readLenA32));
-                        canonicalizeCandidateAndAlignment(cand0, cand1, isSameStrand, al, markerCountA, markerCountB);
 
                         localResults.push_back(PafChainedCandidate{
-                            OrientedReadPair(cand0, cand1, isSameStrand),
+                            OrientedReadPair(readIdA, readIdB, useSameStrand),
                             std::move(al),
                             selectedScore,
                             overlapType,

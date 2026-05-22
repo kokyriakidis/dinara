@@ -18,7 +18,6 @@
 #include "../src/ProjectedAlignment.hpp"
 #include "../src/DINARA_ASSERT.hpp"
 #include "../src/markerAccessFunctions.hpp"
-#include "../src/AlignmentCanonicalization.hpp"
 #include "../src/MarkerGraph.hpp"
 #include "../src/mode3-DirectedAnchorGraph.hpp"
 
@@ -252,70 +251,6 @@ std::vector<std::string> collectAlignmentEvidenceFingerprints(const Assembler& a
     return fingerprints;
 }
 } // namespace
-
-TEST_CASE("Candidate canonicalization keeps alignment consistent", "[candidates][canonical]")
-{
-    SECTION("Same-strand swap")
-    {
-        ReadId readId0 = ReadId(5);
-        ReadId readId1 = ReadId(3);
-        bool isSameStrand = true;
-
-        Alignment al;
-        al.ordinals = {{1, 10}, {2, 11}, {3, 12}};
-        al.qs = 100; al.qe = 200;
-        al.ts = 300; al.te = 400;
-
-        canonicalizeCandidateAndAlignment(readId0, readId1, isSameStrand, al, 1000, 900);
-
-        REQUIRE(readId0 == ReadId(3));
-        REQUIRE(readId1 == ReadId(5));
-        REQUIRE(isSameStrand == true);
-        REQUIRE(al.ordinals.size() == 3);
-        CHECK(al.ordinals[0][0] == 10);
-        CHECK(al.ordinals[0][1] == 1);
-        CHECK(al.ordinals[2][0] == 12);
-        CHECK(al.ordinals[2][1] == 3);
-        CHECK(al.qs == 300);
-        CHECK(al.qe == 400);
-        CHECK(al.ts == 100);
-        CHECK(al.te == 200);
-        al.checkStrictlyIncreasing();
-    }
-
-    SECTION("Diff-strand swap")
-    {
-        ReadId readId0 = ReadId(5);
-        ReadId readId1 = ReadId(3);
-        bool isSameStrand = false; // (A0,B1)
-
-        Alignment al;
-        al.ordinals = {{2, 10}, {3, 11}, {4, 12}};
-        al.qs = 100; al.qe = 200;
-        al.ts = 300; al.te = 400;
-
-        const uint32_t markerCountA = 100;
-        const uint32_t markerCountB = 80;
-        canonicalizeCandidateAndAlignment(readId0, readId1, isSameStrand, al, markerCountA, markerCountB);
-
-        REQUIRE(readId0 == ReadId(3));
-        REQUIRE(readId1 == ReadId(5));
-        REQUIRE(isSameStrand == false);
-        REQUIRE(al.ordinals.size() == 3);
-
-        // Expected: reverseComplement(100,80) then swap columns.
-        CHECK(al.ordinals[0][0] == (markerCountB - 1 - 12)); // 67
-        CHECK(al.ordinals[0][1] == (markerCountA - 1 - 4));  // 95
-        CHECK(al.ordinals[2][0] == (markerCountB - 1 - 10)); // 69
-        CHECK(al.ordinals[2][1] == (markerCountA - 1 - 2));  // 97
-
-        CHECK(al.qs == 300);
-        CHECK(al.qe == 400);
-        CHECK(al.ts == 100);
-        CHECK(al.te == 200);
-        al.checkStrictlyIncreasing();
-    }
-}
 
 TEST_CASE("Marker-vertex overlap splitting removes bridge reads and peels dense cores", "[anchors][vertexSplit]")
 {
