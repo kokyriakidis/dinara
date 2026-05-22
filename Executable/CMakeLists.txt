@@ -109,7 +109,7 @@ set_source_files_properties(
 
 # Request a static executable (Linux only).
 if(NOT APPLE)
-    set_target_properties(dinaraExecutable PROPERTIES LINK_FLAGS "-static" )
+    set_target_properties(dinaraExecutable PROPERTIES LINK_FLAGS "-static -Wl,--allow-multiple-definition" )
 endif()
 
 # Libraries to link with.
