@@ -2184,10 +2184,9 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
 
                 // Step 8: second-round refinement on cis overlaps.
                 // Detects different paralogous copies within the cis set.
-                // Disabled: needs validation on real data before enabling.
                 t0 = clk::now();
-                // if (cleanHet > 0)
-                //     kmRefineCis(*this, readId, scratch, opts, bbLen, dbg);
+                if (cleanHet > 0)
+                    kmRefineCis(*this, readId, scratch, opts, bbLen, dbg);
                 t1 = clk::now(); tt.refine += us(t0,t1);
 
                 if (dbg) {
