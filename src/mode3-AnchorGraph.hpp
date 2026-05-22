@@ -206,6 +206,11 @@ public:
     // keep only two linear chains (one per inferred haplotype) in the local interval.
     void resolvePhasedSuperbubbles(uint64_t maxDistance, bool debug = false);
 
+    // Snarl decomposition using vg's IntegratedSnarlFinder (cactus graph).
+    // Returns level-0 top snarls as (boundary0, boundary1) pairs of local anchor ids.
+    void findSnarls(
+        vector<pair<uint64_t, uint64_t>>& topSnarls) const;
+
     // Superbubble detection using flow-based convergence (ported from shasta2).
     // Finds superbubbles where all forward and backward paths converge.
     void findSuperbubbles(
