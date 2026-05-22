@@ -31,7 +31,8 @@ namespace dinara {
     enum class CisTransStatus : uint8_t {
         Unknown = 0,
         Cis = 1,
-        Trans = 2
+        Trans = 2,
+        CisDifferentCopy = 3  // Cis (same haplotype) but different paralogous copy.
     };
 
     class CompressedMarker;
@@ -613,12 +614,14 @@ public:
     }
 
     // Per-read-perspective cis/trans status.
-    // Maps hifiasmEcMatchState (0=unclassified, 1=cis, 2=trans) to CisTransStatus.
+    // Maps hifiasmEcMatchState (0=unclassified, 1=cis, 2=trans, 3=cisDifferentCopy)
+    // to CisTransStatus.
     CisTransStatus getCisTransStatusFromReadPerspective(ReadId queryReadId) const
     {
         const uint8_t state = getHifiasmEcMatchStateFromReadPerspective(queryReadId);
         if(state == 2) return CisTransStatus::Trans;
         if(state == 1) return CisTransStatus::Cis;
+        if(state == 3) return CisTransStatus::CisDifferentCopy;
         return CisTransStatus::Unknown;
     }
     void setHifiasmEcMatchStateFromReadPerspective(ReadId queryReadId, uint8_t state)

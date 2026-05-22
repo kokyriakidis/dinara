@@ -1846,6 +1846,159 @@ static void kmWriteResults(
 }
 
 // ============================================================================
+// Step 8: Second-round refinement on cis overlaps
+// ============================================================================
+
+/// Recount alleles using only cis overlaps (hap==1 from round 1).
+/// Same logic as kmCountAlleles but skips overlaps where hap != 1.
+static void kmCountAllelesCisOnly(KmScratchpad& scratch, int minSvLen)
+{
+    const uint32_t numCand = uint32_t(scratch.candidates.size());
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+    if (numCand == 0 || numOv == 0) return;
+
+    // Reset counts. Backbone counts as ref (same as round 1).
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        auto& c = scratch.candidates[ci];
+        c.totalCov = 1; c.refCov = 1; c.fwdRef = 1;
+        c.altCov = 0; c.fwdAlt = 0; c.revAlt = 0; c.revRef = 0;
+    }
+
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        if (scratch.overlaps[oi].hap != 1) continue; // skip non-cis
+        const auto& ov = scratch.overlaps[oi];
+        uint32_t di = scratch.digarBegin[oi];
+        uint32_t diEnd = scratch.digarEnd[oi];
+
+        uint32_t ciStart = uint32_t(lower_bound(
+            scratch.candidates.begin(), scratch.candidates.end(), ov.qs,
+            [](const KmCandidate& c, uint32_t p) { return c.key.pos < p; })
+            - scratch.candidates.begin());
+
+        for (uint32_t ci = ciStart; ci < numCand && scratch.candidates[ci].key.pos < ov.qe; ci++) {
+            auto& c = scratch.candidates[ci];
+            c.totalCov++;
+
+            while (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) < 0)
+                di++;
+
+            bool isAlt = false;
+            if (di < diEnd && kmCompareDigarToCand(scratch.digars[di], c.key, minSvLen) == 0) {
+                isAlt = true;
+                di++;
+            }
+
+            if (isAlt) {
+                c.altCov++;
+                if (ov.isRev == 0) c.fwdAlt++; else c.revAlt++;
+            } else {
+                c.refCov++;
+                if (ov.isRev == 0) c.fwdRef++; else c.revRef++;
+            }
+        }
+    }
+
+    for (uint32_t ci = 0; ci < numCand; ci++) {
+        auto& c = scratch.candidates[ci];
+        c.alleleFraction = c.totalCov > 0 ? double(c.altCov) / double(c.totalCov) : 0.0;
+    }
+}
+
+/// Run second-round k-means on cis overlaps to detect different paralogous copies.
+/// Overlaps that were cis in round 1 but cluster into hap==2 here get matchState=3.
+static void kmRefineCis(
+    Assembler& assembler, ReadId backboneReadId,
+    KmScratchpad& scratch, const KmPhasingOptions& opts,
+    uint32_t bbLen, bool dbg)
+{
+    // Count cis overlaps from round 1.
+    uint32_t cisCount = 0;
+    for (const auto& ov : scratch.overlaps)
+        if (ov.hap == 1) cisCount++;
+
+    // Need at least 3 cis overlaps for meaningful second-round clustering.
+    if (cisCount < 3) return;
+
+    // Save round-1 hap assignments so we know which overlaps were cis.
+    const uint32_t numOv = uint32_t(scratch.overlaps.size());
+    vector<int> round1Hap(numOv);
+    for (uint32_t oi = 0; oi < numOv; oi++)
+        round1Hap[oi] = scratch.overlaps[oi].hap;
+
+    // Recount alleles using only cis overlaps.
+    kmCountAllelesCisOnly(scratch, opts.minSvLen);
+
+    // Reclassify candidates with cis-only counts.
+    // Some former hets may become hom within the cis subset.
+    kmClassifyCandidates(bbLen, scratch, opts);
+
+    uint32_t cleanHet2 = 0;
+    for (const auto& c : scratch.candidates) {
+        if (c.category == KmVariantCategory::CleanHetSnp ||
+            c.category == KmVariantCategory::CleanHetIndel) cleanHet2++;
+    }
+
+    if (dbg) {
+        cout << "DEBUG refine-cis: cisCount=" << cisCount
+             << " cleanHet=" << cleanHet2 << endl;
+    }
+
+    // No het sites in cis subset — nothing to split.
+    if (cleanHet2 == 0) {
+        // Restore round-1 hap assignments (kmClassifyCandidates doesn't touch them,
+        // but be safe).
+        for (uint32_t oi = 0; oi < numOv; oi++)
+            scratch.overlaps[oi].hap = round1Hap[oi];
+        return;
+    }
+
+    // Rebuild profiles for cis-only overlaps.
+    // Non-cis overlaps get empty profiles so k-means ignores them.
+    kmBuildOverlapProfiles(scratch, opts.minSvLen);
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        if (round1Hap[oi] != 1) {
+            auto& prof = scratch.overlapProfiles[oi];
+            prof.startVarIdx = -1;
+            prof.endVarIdx = -1;
+            prof.alleles.clear();
+        }
+    }
+
+    // Reset hap assignments for k-means.
+    for (auto& ov : scratch.overlaps) ov.hap = 0;
+
+    // Run k-means on the cis subset.
+    kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
+
+    // Write results: cis overlaps that cluster into hap==2 get matchState=3.
+    // Trans overlaps from round 1 keep matchState=2.
+    // Cis overlaps that stay hap==1 keep matchState=1.
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        auto& ad = assembler.alignmentData[scratch.overlaps[oi].alignmentId];
+        uint8_t matchState;
+        if (round1Hap[oi] == 2) {
+            matchState = 2; // trans from round 1 — unchanged
+        } else if (round1Hap[oi] == 1 && scratch.overlaps[oi].hap == 2) {
+            matchState = 3; // cis in round 1, different copy in round 2
+        } else {
+            matchState = 1; // cis
+        }
+        ad.setHifiasmEcMatchStateFromReadPerspective(backboneReadId, matchState);
+    }
+
+    if (dbg) {
+        int s1 = 0, s2 = 0, s3 = 0;
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            if (round1Hap[oi] == 2) s2++;
+            else if (round1Hap[oi] == 1 && scratch.overlaps[oi].hap == 2) s3++;
+            else s1++;
+        }
+        cout << "DEBUG refine-cis: RESULT cis=" << s1
+             << " trans=" << s2 << " cisDiffCopy=" << s3 << endl;
+    }
+}
+
+// ============================================================================
 // Public entry point
 // ============================================================================
 
@@ -1875,11 +2028,11 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                     << opts.strandBiasPval << ")" << endl;
     KmNoisyMsaOptions msaOpts;
     atomic<uint64_t> readsProcessed(0), readsWithOverlaps(0), readsWithSites(0);
-    atomic<uint64_t> totalCis(0), totalTrans(0), totalNoisyRegions(0);
+    atomic<uint64_t> totalCis(0), totalTrans(0), totalCisDiffCopy(0), totalNoisyRegions(0);
 
     struct alignas(64) TT {
         int64_t gather=0, unpack=0, detect=0, count=0;
-        int64_t classify=0, kmeans=0, noisyMsa=0, write=0;
+        int64_t classify=0, kmeans=0, noisyMsa=0, write=0, refine=0;
         // Sub-timers for profiling.
         int64_t unpackSeq=0, unpackSdust=0;
         int64_t countCollect=0, countAlleles=0, countProfiles=0;
@@ -2034,6 +2187,13 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                 kmWriteResults(*this, readId, scratch);
                 t1 = clk::now(); tt.write += us(t0,t1);
 
+                // Step 8: second-round refinement on cis overlaps.
+                // Detects different paralogous copies within the cis set.
+                t0 = clk::now();
+                if (cleanHet > 0)
+                    kmRefineCis(*this, readId, scratch, opts, bbLen, dbg);
+                t1 = clk::now(); tt.refine += us(t0,t1);
+
                 if (dbg) {
                     int hap1 = 0, hap2 = 0, hap0 = 0;
                     for (const auto& ov : scratch.overlaps) {
@@ -2045,9 +2205,13 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                          << " hap2(trans)=" << hap2 << " unassigned=" << hap0 << endl;
                 }
 
+                // Count final matchStates by reading back from alignmentData.
                 for (const auto& ov : scratch.overlaps) {
-                    if (ov.hap == 1) totalCis++;
-                    else totalTrans++;
+                    const auto& ad = alignmentData[ov.alignmentId];
+                    uint8_t ms = ad.getHifiasmEcMatchStateFromReadPerspective(readId);
+                    if (ms == 1) totalCis++;
+                    else if (ms == 2) totalTrans++;
+                    else if (ms == 3) totalCisDiffCopy++;
                 }
                 readsProcessed++;
                 if (readsProcessed.load() % 10000 == 0)
@@ -2064,7 +2228,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
         total.detect += tt.detect; total.count += tt.count;
         total.classify += tt.classify;
         total.kmeans += tt.kmeans; total.noisyMsa += tt.noisyMsa;
-        total.write += tt.write;
+        total.write += tt.write; total.refine += tt.refine;
         total.unpackSeq += tt.unpackSeq; total.unpackSdust += tt.unpackSdust;
         total.countCollect += tt.countCollect; total.countAlleles += tt.countAlleles;
         total.countProfiles += tt.countProfiles;
@@ -2082,10 +2246,12 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
     cout << timestamp << "  kmeans:   " << ms(total.kmeans) << endl;
     cout << timestamp << "  noisyMsa: " << ms(total.noisyMsa) << endl;
     cout << timestamp << "  write:    " << ms(total.write) << endl;
+    cout << timestamp << "  refine:   " << ms(total.refine) << endl;
     cout << timestamp << "Complete. Reads=" << readsProcessed.load()
          << " withOvlp=" << readsWithOverlaps.load()
          << " withSites=" << readsWithSites.load()
          << " cis=" << totalCis.load()
          << " trans=" << totalTrans.load()
+         << " cisDiffCopy=" << totalCisDiffCopy.load()
          << " noisyRegs=" << totalNoisyRegions.load() << endl;
 }
