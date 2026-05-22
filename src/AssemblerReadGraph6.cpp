@@ -96,13 +96,14 @@ void Assembler::createReadGraphFromPhasingCisOverlaps(
             continue;
         }
 
-        // hifiasmEcMatchState: 0=unlabeled, 1=cis, 2=trans.
-        // Keep if neither side is trans.  Unlabeled (0) overlaps that
-        // survived earlier stages are kept — matches hifiasm where
-        // sources[] contains both cis (ml=1) and unlabeled (ml=0) overlaps.
-        const bool trans0 = (ad.hifiasmEcMatchState0 == 2);
-        const bool trans1 = (ad.hifiasmEcMatchState1 == 2);
-        if(trans0 || trans1) {
+        // hifiasmEcMatchState: 0=unlabeled, 1=cis, 2=trans, 3=cisDifferentCopy.
+        // Keep if neither side is trans or different-copy.
+        // Unlabeled (0) overlaps that survived earlier stages are kept —
+        // matches hifiasm where sources[] contains both cis (ml=1) and
+        // unlabeled (ml=0) overlaps.
+        const bool exclude0 = (ad.hifiasmEcMatchState0 == 2 || ad.hifiasmEcMatchState0 == 3);
+        const bool exclude1 = (ad.hifiasmEcMatchState1 == 2 || ad.hifiasmEcMatchState1 == 3);
+        if(exclude0 || exclude1) {
             ++filteredTrans;
         } else {
             keepAlignmentByte[i] = 1;
