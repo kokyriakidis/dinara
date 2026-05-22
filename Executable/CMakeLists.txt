@@ -44,6 +44,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
 include_directories(../src ../src/edlib/include)
+include_directories(../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
 
 # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
@@ -115,6 +116,7 @@ endif()
 if(APPLE)
     target_link_libraries(
         dinaraExecutable
+        dinara_snarls
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
         ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB})
@@ -124,6 +126,7 @@ else()
         if(X86_64)
         target_link_libraries(
             dinaraExecutable
+            dinara_snarls
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
@@ -131,6 +134,7 @@ else()
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
+            dinara_snarls
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive

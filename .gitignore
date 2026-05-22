@@ -1,6 +1,13 @@
 build/
 tests/build_tests/
-external/
+# Ignore external deps except snarls vendored files.
+external/*
+!external/snarls/
+external/snarls/*
+!external/snarls/CMakeLists.txt
+!external/snarls/README.md
+!external/snarls/vendored/
+external/snarls/vendored/*.o
 
 # CMake build artifacts
 CMakeCache.txt
