@@ -205,7 +205,7 @@ static bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
     constexpr int maxUnitLen = 6;
     constexpr int nCheckCopyNum = 3;
     auto safeBase = [&](int64_t p) -> uint8_t {
-        if (p < 0 || p >= sn) return 255;
+        if (p < 0 || p >= sn) return 4;  // pgphase ref_nt4_at returns 4 for out-of-bounds
         return seq[p];
     };
     // Check forward from endPos.
