@@ -4261,6 +4261,15 @@ void Assembler::flagPalindromicReads(
     cout << "Flagged " << count
          << " reads as palindromic out of "
          << readCount << " total." << endl;
+    if(count > 0) {
+        cout << "Palindromic reads:";
+        for(ReadId readId = ReadId(0); readId < ReadId(readCount); ++readId) {
+            if(reads->getFlags(readId).isPalindromic) {
+                cout << " " << readId;
+            }
+        }
+        cout << endl;
+    }
     cout << "Palindromic fraction is "
          << double(count) / double(readCount) << endl;
 }
