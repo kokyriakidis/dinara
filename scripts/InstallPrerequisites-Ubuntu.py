@@ -590,17 +590,15 @@ def installBubbleFinder():
 
 
 
-# Initialize build directory (clean start)
-initializeBuildDirectory()
-
-# Install non-Rust prerequisites first
-installAptPackages() 
-installSeqan()
-installPybind11() 
-installSpoa()
-
-# Setup Rust toolchain with pinned nightly version (must be done before Rust libraries)
-setupRustToolchain()
+def installBasePrerequisites():
+    """Install apt packages, seqan, pybind11, spoa, and set up Rust toolchain."""
+    initializeBuildDirectory()
+    checkRustLibrariesConsistency()
+    installAptPackages()
+    installSeqan()
+    installPybind11()
+    installSpoa()
+    setupRustToolchain()
 
 def installAbpoa():
     print("Installing abPOA (Shared Library)...")
@@ -650,9 +648,6 @@ def installAbpoa():
 
         os.chdir(oldDirectory)
 
-
-# Check that any existing Rust libraries were built with the same toolchain
-checkRustLibrariesConsistency()
 
 def installShasta2():
     print("Installing shasta2 and dependencies (abPOA)...")
@@ -1047,25 +1042,61 @@ def installMinipoa():
 
 
 
-# Install all Rust libraries
-installAstarpa()
-installPoasta()
-installSimdMinimizers()
-installBubbleFinder()
+# All installable targets in dependency order.
+# Each entry: (name, function, description)
+INSTALL_TARGETS = [
+    ("base",             installBasePrerequisites, "apt packages, seqan, pybind11, spoa, Rust toolchain"),
+    ("astarpa",          installAstarpa,           "astarpa alignment library (Rust)"),
+    ("poasta",           installPoasta,            "poasta alignment library (Rust)"),
+    ("simd-minimizers",  installSimdMinimizers,    "SIMD minimizers library (Rust)"),
+    ("bubble-finder",    installBubbleFinder,      "bubble finder library (Rust)"),
+    ("theseus",          installTheseusLib,        "theseus-lib POA aligner (C++)"),
+    ("shasta2",          installShasta2,           "shasta2 library and abPOA"),
+    ("vg",               installVg,               "vg binary"),
+    ("minipoa",          installMinipoa,           "minipoa binary"),
+    ("snarls",           installSnarlFinderDeps,   "snarl finder dependencies (libhandlegraph, structures)"),
+]
 
-# Install theseus-lib (C++23 POA / sequence-to-graph aligner)
-# Must come before shasta2 because shasta2's theseusWrapper.cpp includes theseus headers.
-installTheseusLib()
+def main():
+    import argparse
 
-# Install shasta2 (and abpoa via shasta2 scripts)
-installShasta2()
+    parser = argparse.ArgumentParser(
+        description="Install Dinara build prerequisites.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  Install everything:          ./InstallPrerequisites-Ubuntu.py\n"
+               "  Install only shasta2:        ./InstallPrerequisites-Ubuntu.py --only shasta2\n"
+               "  Install multiple targets:    ./InstallPrerequisites-Ubuntu.py --only shasta2 snarls\n"
+               "  List available targets:      ./InstallPrerequisites-Ubuntu.py --list\n")
+    parser.add_argument("--only", nargs="+", metavar="TARGET",
+                        help="Install only the specified target(s). Skips base prerequisites unless 'base' is listed.")
+    parser.add_argument("--list", action="store_true",
+                        help="List available install targets and exit.")
+    args = parser.parse_args()
 
-installVg()
-installMinipoa()
-installSnarlFinderDeps()
+    if args.list:
+        print("Available install targets:")
+        for name, _, desc in INSTALL_TARGETS:
+            print(f"  {name:20s} {desc}")
+        return
 
-# Make sure the newly created libraries are immediately visible to the loader.
-# For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable
-# runCommand("sudo ldconfig")
+    target_map = {name: func for name, func, _ in INSTALL_TARGETS}
 
-print("Installation of Dinara prerequisites completed successfully.")
+    if args.only:
+        for name in args.only:
+            if name not in target_map:
+                print(f"Error: unknown target '{name}'. Use --list to see available targets.")
+                return
+            print(f"\n{'='*60}")
+            print(f"Installing: {name}")
+            print(f"{'='*60}")
+            target_map[name]()
+    else:
+        # Full install: run everything in order.
+        for name, func, _ in INSTALL_TARGETS:
+            func()
+
+    print("\nInstallation completed successfully.")
+
+if __name__ == "__main__":
+    main()
