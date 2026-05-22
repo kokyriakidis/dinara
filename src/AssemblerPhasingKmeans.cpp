@@ -268,12 +268,17 @@ static bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
         for (int j = insLen; j < len; j++)
             alt_b[size_t(j)] = alt_b[size_t(j - insLen)];
         // Overwrite [0, insLen) with alt bases (pgphase does this second).
-        static const uint8_t charToBase[256] = {
-            ['A'] = 0, ['C'] = 1, ['G'] = 2, ['T'] = 3,
-            ['a'] = 0, ['c'] = 1, ['g'] = 2, ['t'] = 3
+        auto charToBase = [](char c) -> uint8_t {
+            switch (c) {
+                case 'A': case 'a': return 0;
+                case 'C': case 'c': return 1;
+                case 'G': case 'g': return 2;
+                case 'T': case 't': return 3;
+                default: return 4;
+            }
         };
         for (int j = 0; j < insLen; j++)
-            alt_b[size_t(j)] = charToBase[uint8_t(key.altSeq[size_t(j)])];
+            alt_b[size_t(j)] = charToBase(key.altSeq[size_t(j)]);
         // Compare against reference.
         for (int j = 0; j < len; j++)
             if (seq[pos + j] != alt_b[size_t(j)]) return false;
