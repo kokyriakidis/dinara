@@ -835,3 +835,118 @@ On the test dataset (read 100), this removes 11 confirmed sites, reducing
 trans calls by ~43 overlaps from that read's perspective. Overall,
 `performHifiasmECParity` produces ~3,200 fewer trans labels than
 `phaseOverlaps` (15,345 vs 18,602 out of 38,542 alignments).
+
+
+---
+
+# K-means Overlap Phasing (`phaseOverlapsKmeans`)
+
+Port of pgphase/longcallD's k-means phasing pipeline. Replaces the DP-based
+`phaseOverlaps` above. Reads CIGARs from `OverlapCigarStore`.
+
+## Architecture
+
+```
+computeBaseAlignmentsAndStore()     ← populates OverlapCigarStore
+        │
+        ▼
+phaseOverlapsKmeans(threadCount)    ← entry point (AssemblerPhasingKmeans.cpp)
+        │
+        │  Per backbone read (thread-local KmScratchpad):
+        │
+        ├── 1. kmGatherOverlaps       — collect overlaps from alignmentTable
+        ├── 2. kmParseCigars          — walk CIGARs, emit KmDigarOps + noisy regions
+        │       ├── SNPs: vote-counted mismatches with actual alt base
+        │       ├── Deletions: backbone-consumed ranges
+        │       ├── Insertions: non-backbone bases with altSeq extraction
+        │       └── Noisy region sliding window (pgphase XidQueue)
+        ├── 3a. kmCollectCandidates   — sort + fuzzy dedup → KmCandidate list
+        ├── 3b. kmAlleleCounting      — merge-walk digars against candidates
+        ├── 4. kmClassifyVariants     — per-site classification + noisy region handling
+        │       ├── CleanHetSnp / CleanHetIndel → used for k-means
+        │       ├── RepeatHetIndel → excluded from k-means, seeds noisy regions
+        │       ├── CleanHom → used for k-means
+        │       └── NoisyCandHet/Hom → excluded
+        ├── 5. kmRunKmeans            — 2-means clustering on overlap profiles
+        └── 6. writeResults           — set matchState on AlignmentData
+                                        1=cis, 2=trans (unclassified → cis)
+```
+
+## Files
+
+| File | Role |
+|------|------|
+| `src/AssemblerPhasingKmeans.cpp` | Full pipeline implementation |
+| `src/PhasingKmeansTypes.hpp` | Data structures, constants, thresholds |
+| `src/PhasingKmeansNoisyMsa.cpp` | Noisy-region MSA step (currently disabled) |
+| `src/PhasingKmeansNoisyMsa.md` | Design doc for noisy MSA |
+
+## Variant Classification Thresholds (`KmPhasingOptions`)
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `minDepth` | 6 | Total coverage at site must be ≥ 6 |
+| `minAltDepth` | 3 | Alt allele coverage must be ≥ 3 |
+| `minAf` | 0.12 | Allele fraction must be ≥ 12% |
+| `maxAf` | 1.0 | Disabled (accepts any AF above minAf) |
+| `strandBiasPval` | 0.01 | (ONT only) Fisher exact test p-value threshold |
+| `noisyRegMaxXgaps` | 5 | Max indel span for repeat classification |
+
+A site passes as **CleanHet** when: `totalCov ≥ minDepth`, `altCov ≥ minAltDepth`,
+`alleleFraction ≥ minAf`, no strand bias (ONT), and for indels, not in a
+homopolymer/repeat region.
+
+## Repeat Classification (indels only)
+
+Two checks determine if a het indel is in a repetitive context, making it
+unreliable for phasing. Both are gated on indel span ≤ `noisyRegMaxXgaps` (5bp).
+
+### `kmIsHomopolymer` (pgphase `var_is_homopolymer_pg`)
+
+Checks if the indel sits adjacent to a tandem repeat of unit length 1–6bp.
+Scans both forward and backward from the indel boundary for ≥ 3 consecutive
+copies of a repeat unit. Examples: 1bp deletion next to `AAAAAAA`, 2bp
+insertion next to `ATATAT`.
+
+### `kmIsRepeatRegion` (pgphase `var_is_repeat_region_pg`)
+
+**Deletions**: compares the deleted bases `[pos, pos+delLen)` against the
+next `3 × delLen` reference bases. If they match, the deletion is in a
+tandem repeat.
+
+**Insertions**: builds an expected sequence by copying the reference at
+`[pos, pos+3*insLen)`, propagating a tandem repeat from the reference prefix,
+then overwriting `[0, insLen)` with the actual inserted bases (from
+`KmVarKey.altSeq`). If this matches the reference, the insertion is a tandem
+copy of the flanking sequence.
+
+The insertion case requires the alt sequence, which is extracted during CIGAR
+parsing and stored in `KmDigarOp.altSeq` / `KmVarKey.altSeq`. For RC overlaps,
+the inserted bases are complemented and reversed to put them in the backbone's
+forward frame.
+
+## Insertion Alt Sequence Extraction
+
+During `kmParseCigars`, insertion events extract the actual inserted bases
+from the non-backbone read:
+
+- **`qIsR0 = true`** (backbone is query/read0): inserted bases come from
+  read1 at positions `yk..yk+len-1`. `kmGetBase` handles RC conversion.
+- **`qIsR0 = false`** (backbone is target/read1): inserted bases come from
+  read0 at positions `xk..xk+len-1`. Bases are complemented if RC, then
+  reversed to match the backbone's forward frame.
+
+Stored as ACGT characters in `KmDigarOp.altSeq`, propagated to
+`KmVarKey.altSeq` during candidate construction.
+
+## Unclassified Overlaps
+
+Overlaps not assigned to either haplotype by k-means are labeled **cis**
+(`matchState = 1`), not trans. This avoids incorrectly breaking overlaps
+that simply lack phasing signal.
+
+## Noisy-Region MSA (Step 4)
+
+Currently **disabled** (commented out in `phaseOverlapsKmeans`). The step
+recovers variants in noisy regions via abPOA multiple sequence alignment.
+See `src/PhasingKmeansNoisyMsa.md` for the design.
