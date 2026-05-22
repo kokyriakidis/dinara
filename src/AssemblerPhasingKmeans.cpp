@@ -1911,14 +1911,6 @@ static void kmRefineCis(
     KmScratchpad& scratch, const KmPhasingOptions& opts,
     uint32_t bbLen, bool dbg)
 {
-    // Count cis overlaps from round 1.
-    uint32_t cisCount = 0;
-    for (const auto& ov : scratch.overlaps)
-        if (ov.hap == 1) cisCount++;
-
-    // Need at least 3 cis overlaps for meaningful second-round clustering.
-    if (cisCount < 3) return;
-
     // Save round-1 hap assignments so we know which overlaps were cis.
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
     vector<int> round1Hap(numOv);
@@ -1939,6 +1931,9 @@ static void kmRefineCis(
     }
 
     if (dbg) {
+        uint32_t cisCount = 0;
+        for (uint32_t oi = 0; oi < numOv; oi++)
+            if (round1Hap[oi] == 1) cisCount++;
         cout << "DEBUG refine-cis: cisCount=" << cisCount
              << " cleanHet=" << cleanHet2 << endl;
     }
