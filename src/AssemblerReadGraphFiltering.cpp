@@ -2648,12 +2648,12 @@ void Assembler::cleanWeakOverlaps()
             if(partner != readTn) continue;
             // In hifiasm, the overlap lives in reverse_sources[S] if S
             // classified it as trans. We check if either side says trans.
-            if(partnerState == 2) return true;
+            if(partnerState == 2 || partnerState == 3) return true;
             // Also check the other side — if tn says trans about S.
             uint8_t otherState = (ad2.readIds[0] == readS)
                 ? ad2.hifiasmEcMatchState1
                 : ad2.hifiasmEcMatchState0;
-            if(otherState == 2) return true;
+            if(otherState == 2 || otherState == 3) return true;
         }
         return false;
     };
@@ -2703,9 +2703,9 @@ void Assembler::cleanWeakOverlaps()
             // Must be in qn's cis array. In hifiasm, sources[qn] contains
             // all overlaps NOT classified as trans by qn — both cis (ml==1)
             // and unclassified (ml==0). The ml==1 check above already filters
-            // to strong overlaps. Here we just exclude overlaps that qn
-            // classified as trans (those live in reverse_sources[qn]).
-            if(strongState0 == 2) continue;
+            // to strong overlaps. Here we exclude overlaps that qn
+            // classified as trans or different-copy.
+            if(strongState0 == 2 || strongState0 == 3) continue;
 
             // Must contain the weak overlap's interval on qn.
             if(strongQs > weakQs || strongQe < weakQe) continue;
