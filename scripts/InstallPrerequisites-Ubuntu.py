@@ -927,6 +927,35 @@ def installTheseusLib():
     print("theseus-lib installed.")
 
 
+def installSnarlFinderDeps():
+    """Clone libhandlegraph and structures into external/snarls/ for the vendored snarl finder."""
+    print("Installing snarl finder dependencies...")
+
+    # Find the repo root (parent of scripts/).
+    scriptsDir = os.path.dirname(os.path.abspath(__file__))
+    repoRoot = os.path.dirname(scriptsDir)
+    snarlsDir = os.path.join(repoRoot, "external", "snarls")
+
+    os.makedirs(snarlsDir, exist_ok=True)
+
+    repos = [
+        ("libhandlegraph", "https://github.com/vgteam/libhandlegraph.git"),
+        ("structures", "https://github.com/vgteam/structures.git"),
+    ]
+
+    for name, url in repos:
+        dest = os.path.join(snarlsDir, name)
+        if os.path.isdir(os.path.join(dest, ".git")):
+            print(f"  {name} already cloned at {dest}. Skipping.")
+            continue
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        print(f"  Cloning {name} ...")
+        runCommand(f"git clone --depth 1 {url} {dest}")
+
+    print("Snarl finder dependencies installed.")
+
+
 def installVg():
     print("Installing vg (variation graph toolkit)...")
 
@@ -1033,6 +1062,7 @@ installShasta2()
 
 installVg()
 installMinipoa()
+installSnarlFinderDeps()
 
 # Make sure the newly created libraries are immediately visible to the loader.
 # For local install, we don't need ldconfig, but we might need to set LD_LIBRARY_PATH environment variable
