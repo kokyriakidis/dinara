@@ -945,6 +945,26 @@ Overlaps not assigned to either haplotype by k-means are labeled **cis**
 (`matchState = 1`), not trans. This avoids incorrectly breaking overlaps
 that simply lack phasing signal.
 
+## Second-Round Cis Refinement (Step 8)
+
+After round 1 labels overlaps as cis (hap 1) or trans (hap 2), a second
+round re-clusters the cis subset to detect different paralogous copies.
+
+1. **Filter**: skip if fewer than 3 cis overlaps.
+2. **Recount alleles** (`kmCountAllelesCisOnly`): same merge walk as
+   `kmCountAlleles` but only counts overlaps where `hap == 1`.
+3. **Reclassify candidates**: some former hets may become hom within the
+   cis-only subset (lower coverage, different allele fractions).
+4. **Rebuild profiles**: non-cis overlaps get empty profiles so k-means
+   ignores them.
+5. **Run k-means**: standard `kmRunKmeans` on the cis subset.
+6. **Write results**: cis overlaps that cluster into hap 2 in round 2 get
+   `matchState = 3` (`CisTransStatus::CisDifferentCopy`). Trans overlaps
+   from round 1 keep `matchState = 2`. All others stay `matchState = 1`.
+
+The `CisDifferentCopy` state (value 3) is defined in `Alignment.hpp` and
+mapped by `getCisTransStatusFromReadPerspective`.
+
 ## Noisy-Region MSA (Step 4)
 
 Currently **disabled** (commented out in `phaseOverlapsKmeans`). The step
