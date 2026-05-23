@@ -1179,6 +1179,9 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
+    // Test computeAnchorWindowsClean across all reads and write GFA.
+    assembler.testAnchorWindowsCleanLongestRead(threadCount);
+
     // Detect reads whose ordinals regress along another read's journey.
     // For each oriented read (the "backbone"), walk its journey and check
     // every co-occurring oriented read: its ordinals should increase
