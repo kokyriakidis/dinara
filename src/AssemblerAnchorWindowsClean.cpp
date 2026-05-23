@@ -225,10 +225,8 @@ void Assembler::computeAnchorWindowsClean(
     // For each touched read, keep only anchors shared with the backbone,
     // enforce backbone order via LIS, discard the rest.
     // ========================================================================
-    // Find anchor IDs in a journey interval whose k-mer appears more than once.
-    // Anchors at the first and last positions of the interval are never marked
-    // as duplicates, to avoid disconnecting chain endpoints.
-    auto findDuplicateKmerAnchors = [&](const auto& journey, uint32_t begin, uint32_t end) {
+    // Find k-mers that appear more than once in a journey interval.
+    auto findDuplicateKmers = [&](const auto& journey, uint32_t begin, uint32_t end) {
         std::set<Kmer> seen;
         std::set<Kmer> duplicateKmers;
         for(uint32_t pos = begin; pos < end; pos++) {
@@ -237,6 +235,14 @@ void Assembler::computeAnchorWindowsClean(
                 duplicateKmers.insert(kmer);
             }
         }
+        return duplicateKmers;
+    };
+
+    // Find anchor IDs in a journey interval whose k-mer appears more than once.
+    // Anchors at the first and last positions of the interval are never marked
+    // as duplicates, to avoid disconnecting chain endpoints.
+    auto findDuplicateKmerAnchors = [&](const auto& journey, uint32_t begin, uint32_t end) {
+        const auto duplicateKmers = findDuplicateKmers(journey, begin, end);
         std::unordered_set<uint64_t> duplicateAnchorIds;
         if(!duplicateKmers.empty()) {
             for(uint32_t pos = begin; pos < end; pos++) {
