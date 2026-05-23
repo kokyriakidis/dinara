@@ -163,8 +163,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Deduplicate by tracking which (anchorIdA, anchorIdB) pairs already have edges.
     std::set<std::pair<Shasta2AnchorId, Shasta2AnchorId>> interEdgeSet;
 
-    const uint64_t orientedReadCount = 2 * anchors.size() / anchors[Shasta2AnchorId(0)].size();
-    // Use journeys.size() for the actual oriented read count.
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
