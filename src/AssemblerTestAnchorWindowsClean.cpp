@@ -62,10 +62,11 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     cout << timestamp << "computeAnchorWindowsClean produced "
          << anchorWindows.size() << " windows." << endl;
 
-    // Build anchorId -> windowId map from backbone anchors.
+    // Build anchorId -> windowId and anchorId -> backbone position maps.
     // Only backbone anchors are "kept" (they define the window chain).
     const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
     vector<uint32_t> anchorToWindow(anchorCount, noWindow);
+    vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
     for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
@@ -73,6 +74,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
             const Shasta2AnchorId anchorId = backboneJourney[pos];
             anchorToWindow[uint64_t(anchorId)] = windowId;
+            anchorToBackbonePos[uint64_t(anchorId)] = pos;
         }
     }
 
@@ -100,9 +102,10 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         if(journey.empty()) continue;
 
         // Walk the journey, tracking the last backbone anchor seen in the
-        // current window.
+        // current window. Only move forward in backbone order within a window.
         uint32_t currentWindow = noWindow;
         Shasta2AnchorId lastAnchorInCurrentWindow = 0;
+        uint32_t lastBackbonePosInCurrentWindow = 0;
 
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
             const Shasta2AnchorId anchorId = journey[pos];
@@ -110,17 +113,24 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            if(windowId != currentWindow) {
+            const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
+
+            if(windowId == currentWindow) {
+                // Same window — only update if moving forward in backbone order.
+                if(backbonePos > lastBackbonePosInCurrentWindow) {
+                    lastAnchorInCurrentWindow = anchorId;
+                    lastBackbonePosInCurrentWindow = backbonePos;
+                }
+            } else {
                 // Window transition.
                 if(currentWindow != noWindow) {
-                    // Add connecting edge from last anchor in previous window
-                    // to this anchor (first in new window).
                     ConnectingEdge edge{lastAnchorInCurrentWindow, anchorId};
                     ++connectingEdgeCoverage[edge];
                 }
                 currentWindow = windowId;
+                lastAnchorInCurrentWindow = anchorId;
+                lastBackbonePosInCurrentWindow = backbonePos;
             }
-            lastAnchorInCurrentWindow = anchorId;
         }
     }
 
