@@ -172,6 +172,50 @@ void Assembler::testAnchorWindowsCleanLongestRead(
          << totalIntraEdges << " intra-window edges, "
          << totalInterEdges << " inter-window edges." << endl;
 
+    // Write CSV for Bandage coloring: each anchor gets a color based on its window.
+    const string csvFileName = "AnchorWindowsClean.csv";
+    ofstream csv(csvFileName);
+    if(!csv) {
+        throw runtime_error("Cannot open " + csvFileName + " for writing.");
+    }
+    csv << "Name,Color\n";
+
+    // Generate distinct colors for each window using HSL with fixed S and L.
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+        // HSL to RGB conversion with S=0.7, L=0.5.
+        const double hue = (360.0 * windowId) / windowCount;
+        const double s = 0.7;
+        const double l = 0.5;
+        const double c = (1.0 - std::abs(2.0 * l - 1.0)) * s;
+        const double x = c * (1.0 - std::abs(std::fmod(hue / 60.0, 2.0) - 1.0));
+        const double m = l - c / 2.0;
+        double r1, g1, b1;
+        if(hue < 60)       { r1 = c; g1 = x; b1 = 0; }
+        else if(hue < 120) { r1 = x; g1 = c; b1 = 0; }
+        else if(hue < 180) { r1 = 0; g1 = c; b1 = x; }
+        else if(hue < 240) { r1 = 0; g1 = x; b1 = c; }
+        else if(hue < 300) { r1 = x; g1 = 0; b1 = c; }
+        else               { r1 = c; g1 = 0; b1 = x; }
+        const int r = int((r1 + m) * 255);
+        const int g = int((g1 + m) * 255);
+        const int b = int((b1 + m) * 255);
+
+        // Write each backbone anchor with this color.
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            csv << backboneJourney[pos] << ","
+                << "#" << hex << setfill('0')
+                << setw(2) << r << setw(2) << g << setw(2) << b
+                << dec << "\n";
+        }
+    }
+
+    cout << timestamp << "Wrote " << csvFileName << endl;
+
     const auto t1 = steady_clock::now();
     const double elapsedSeconds = seconds(t1 - t0);
     cout << timestamp << "testAnchorWindowsCleanLongestRead ends."
