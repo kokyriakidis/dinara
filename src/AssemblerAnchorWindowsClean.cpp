@@ -90,6 +90,10 @@ void Assembler::computeAnchorWindowsClean(
     // Counters.
     uint64_t claimedAnchors = 0;
     uint64_t totalReadIntervals = 0;
+    uint64_t totalAltPathsBeforeFilter = 0;
+    uint64_t totalAltPathsAfterFilter = 0;
+    uint64_t totalIntermediatesConsidered = 0;
+    uint64_t totalIntermediatesKept = 0;
 
     // Compute the base span of a journey interval [begin, end).
     auto intervalBaseSpan = [&](OrientedReadId oid, const auto& journey, uint32_t begin, uint32_t end) {
@@ -334,22 +338,42 @@ void Assembler::computeAnchorWindowsClean(
                 convergentCount});
 
             // Step 5: For non-direct overlaps, extract alternate paths.
-            // Between consecutive LIS pillars, collect the non-shared anchors
-            // from the read's journey. These form alternate paths (bubbles).
+            // Between consecutive LIS pillars, collect intermediate anchors
+            // from the read's journey, but only keep those that have at least
+            // one oriented read that is not a direct cis overlap of the backbone.
+            // This filters out anchors that merely echo the backbone haplotype.
             if(!isDirectCis && lisIndices.size() >= 2) {
                 for(uint64_t li = 0; li + 1 < lisIndices.size(); li++) {
                     const uint32_t readPosA = sharedReadPositions[lisIndices[li]];
                     const uint32_t readPosB = sharedReadPositions[lisIndices[li + 1]];
-                    // Collect intermediate anchors between the two LIS pillars.
                     if(readPosB > readPosA + 1) {
                         AnchorWindowAlternatePath altPath;
                         altPath.anchorIdA = journey[readPosA];
                         altPath.anchorIdB = journey[readPosB];
                         for(uint32_t rp = readPosA + 1; rp < readPosB; rp++) {
-                            altPath.intermediateAnchorIds.push_back(journey[rp]);
+                            const Shasta2AnchorId midAnchorId = journey[rp];
+                            ++totalIntermediatesConsidered;
+                            // Keep only anchors that have at least one read
+                            // that is not the backbone and not a direct cis overlap.
+                            const auto anchor = (*shasta2Anchors)[midAnchorId];
+                            bool hasNonCisRead = false;
+                            for(const Shasta2AnchorMarkerInfo& ami : anchor) {
+                                const uint32_t readOidValue = ami.orientedReadId.getValue();
+                                if(readOidValue == backboneOid.getValue()) continue;
+                                if(directCisOverlapReads.find(readOidValue) == directCisOverlapReads.end()) {
+                                    hasNonCisRead = true;
+                                    break;
+                                }
+                            }
+                            if(hasNonCisRead) {
+                                altPath.intermediateAnchorIds.push_back(midAnchorId);
+                                ++totalIntermediatesKept;
+                            }
                         }
+                        ++totalAltPathsBeforeFilter;
                         if(!altPath.intermediateAnchorIds.empty()) {
                             window.alternatePaths.push_back(std::move(altPath));
+                            ++totalAltPathsAfterFilter;
                         }
                     }
                 }
@@ -444,4 +468,10 @@ void Assembler::computeAnchorWindowsClean(
          << " readIntervals=" << totalReadIntervals
          << " seconds=" << std::fixed << std::setprecision(2) << elapsedSeconds
          << std::defaultfloat << endl;
+    cout << timestamp << "Alternate path filter:"
+         << " pathsBefore=" << totalAltPathsBeforeFilter
+         << " pathsAfter=" << totalAltPathsAfterFilter
+         << " intermediatesConsidered=" << totalIntermediatesConsidered
+         << " intermediatesKept=" << totalIntermediatesKept
+         << endl;
 }
