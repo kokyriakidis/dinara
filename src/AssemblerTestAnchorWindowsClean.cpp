@@ -112,34 +112,16 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     // we iterate only over kept anchors and find children among them.
     cout << timestamp << "Building restricted anchor graph from kept anchors..." << endl;
 
-    // For each kept anchor, find children (minEdgeCoverage=1 to include
-    // transitions supported by even a single read) and keep only those
-    // that are also kept.
-    struct RestrictedEdge {
-        Shasta2AnchorId anchorIdA;
-        Shasta2AnchorId anchorIdB;
-        uint64_t coverage;
-    };
-    vector<RestrictedEdge> restrictedEdges;
-
-    vector<Shasta2AnchorId> children;
-    vector<uint64_t> counts;
-    for(const Shasta2AnchorId anchorIdA : keptAnchorSet) {
-        shasta2Anchors->findChildren(*shasta2Journeys, anchorIdA, children, counts, 1);
-        DINARA_ASSERT(children.size() == counts.size());
-        for(uint64_t i = 0; i < children.size(); i++) {
-            const Shasta2AnchorId anchorIdB = children[i];
-            if(keptAnchorSet.find(anchorIdB) == keptAnchorSet.end()) {
-                continue;
-            }
-            restrictedEdges.push_back(RestrictedEdge{
-                anchorIdA, anchorIdB, counts[i]});
-        }
-    }
+    // Build the graph as a simple chain: consecutive anchors in the
+    // backbone journey connected by edges.
+    const AnchorWindow& w0 = anchorWindows[0];
+    const OrientedReadId backboneOid = w0.backboneOrientedReadId;
+    const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
     cout << timestamp << "Restricted anchor graph: "
          << keptAnchorSet.size() << " vertices, "
-         << restrictedEdges.size() << " edges." << endl;
+         << (w0.backboneEnd > w0.backboneBegin ? w0.backboneEnd - w0.backboneBegin - 1 : 0)
+         << " edges." << endl;
 
     // Write GFA.
     const string gfaFileName = "LongestReadAnchorGraph.gfa";
@@ -150,16 +132,14 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     gfa << "H\tVN:Z:1.0\n";
 
     // Write vertices for kept anchors.
-    for(const Shasta2AnchorId anchorId : keptAnchorSet) {
-        gfa << "S\t" << anchorId << "\t*\tLN:i:1\n";
+    for(uint32_t pos = w0.backboneBegin; pos < w0.backboneEnd; pos++) {
+        gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
     }
 
-    // Write edges.
-    for(const RestrictedEdge& edge : restrictedEdges) {
-        gfa << "L\t" << edge.anchorIdA << "\t+\t"
-            << edge.anchorIdB << "\t+\t0M"
-            << "\tRC:i:" << edge.coverage
-            << "\n";
+    // Write edges: consecutive pairs in the backbone journey.
+    for(uint32_t pos = w0.backboneBegin; pos + 1 < w0.backboneEnd; pos++) {
+        gfa << "L\t" << backboneJourney[pos] << "\t+\t"
+            << backboneJourney[pos + 1] << "\t+\t0M\n";
     }
 
     cout << timestamp << "Wrote " << gfaFileName << endl;
