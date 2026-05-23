@@ -235,21 +235,25 @@ void Assembler::computeAnchorWindowsClean(
             backboneAnchorToPos[uint64_t(backboneJourney[pos])] = pos;
         }
 
-        // Claim backbone anchors (and their RC).
-        for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
-            const Shasta2AnchorId anchorId = backboneJourney[pos];
-            if(anchorOwner[uint64_t(anchorId)] == anchorUnclaimed) {
-                claimAnchor(uint64_t(anchorId), windowId);
-                ++window.claimedAnchorCount;
-            }
-        }
-
         // Add backbone read interval.
         window.readIntervals.push_back(AnchorWindowReadInterval{
             backboneOid,
             seedBegin,
             seedEnd,
             uint32_t(seedEnd - seedBegin)});
+
+        // Collect all anchors to claim at the end.
+        // Each entry is (orientedReadId, journey span begin, journey span end).
+        // We store the spans so we can do a single claiming pass at the end.
+        struct ReadSpan {
+            OrientedReadId oid;
+            uint32_t begin;
+            uint32_t end;
+        };
+        vector<ReadSpan> readSpans;
+
+        // The backbone span.
+        readSpans.push_back(ReadSpan{backboneOid, seedBegin, seedEnd});
 
         // Find all other oriented reads that share anchors with the backbone.
         ++epoch;
@@ -272,7 +276,7 @@ void Assembler::computeAnchorWindowsClean(
         // 1. Find shared anchors (present in both the read's journey and the backbone).
         // 2. Map them to backbone positions.
         // 3. Compute LIS of backbone positions to enforce backbone order.
-        // 4. Claim only the LIS anchors.
+        // 4. Record the span for later claiming.
         for(const uint32_t oidValue : touchedOrientedReads) {
             const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
             if(oid.getValue() >= shasta2Journeys->size()) continue;
@@ -280,8 +284,6 @@ void Assembler::computeAnchorWindowsClean(
             if(journey.empty()) continue;
 
             // Step 1-2: Find shared anchors and their backbone positions.
-            // sharedReadPositions[i] = position in the read's journey
-            // sharedBackbonePositions[i] = corresponding position in the backbone
             vector<uint32_t> sharedReadPositions;
             vector<uint32_t> sharedBackbonePositions;
 
@@ -289,7 +291,6 @@ void Assembler::computeAnchorWindowsClean(
                 const uint64_t anchorId = uint64_t(journey[readPos]);
                 auto it = backboneAnchorToPos.find(anchorId);
                 if(it != backboneAnchorToPos.end()) {
-                    // This anchor is shared with the backbone and unclaimed.
                     if(anchorOwner[anchorId] == anchorUnclaimed ||
                        anchorOwner[anchorId] == windowId) {
                         sharedReadPositions.push_back(readPos);
@@ -305,30 +306,37 @@ void Assembler::computeAnchorWindowsClean(
 
             if(lisIndices.empty()) continue;
 
-            // Step 4: Claim the LIS anchors and record the interval.
-            uint32_t convergentCount = 0;
+            // Step 4: Record the span and the read interval.
+            uint32_t convergentCount = uint32_t(lisIndices.size());
             uint32_t convergentBegin = sharedReadPositions[lisIndices.front()];
             uint32_t convergentEnd = sharedReadPositions[lisIndices.back()] + 1;
 
-            for(const uint32_t li : lisIndices) {
-                const uint32_t readPos = sharedReadPositions[li];
-                const uint64_t anchorId = uint64_t(journey[readPos]);
-                if(anchorOwner[anchorId] == anchorUnclaimed) {
-                    claimAnchor(anchorId, windowId);
-                    ++window.claimedAnchorCount;
-                }
-                ++convergentCount;
-            }
+            readSpans.push_back(ReadSpan{oid, convergentBegin, convergentEnd});
 
             window.readIntervals.push_back(AnchorWindowReadInterval{
                 oid,
                 convergentBegin,
                 convergentEnd,
                 convergentCount});
+        }
 
-            // Bump generation so stale candidates for this read are discarded.
+        // Claim all anchors across all spans (backbone + touched reads) and their RC.
+        for(const ReadSpan& span : readSpans) {
+            const auto journey = (*shasta2Journeys)[span.oid];
+            for(uint32_t readPos = span.begin; readPos < span.end; readPos++) {
+                const uint64_t anchorId = uint64_t(journey[readPos]);
+                if(anchorOwner[anchorId] == anchorUnclaimed) {
+                    claimAnchor(anchorId, windowId);
+                    ++window.claimedAnchorCount;
+                }
+            }
+        }
+
+        // Now that claiming is done, bump generations and re-push unclaimed
+        // intervals for all touched reads.
+        for(const uint32_t oidValue : touchedOrientedReads) {
+            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
             ++candidateGeneration[uint64_t(oid.getReadId())];
-            // Re-push unclaimed intervals for this read.
             pushCurrentUnclaimedIntervals(oid);
         }
 
