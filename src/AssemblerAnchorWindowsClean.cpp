@@ -426,9 +426,9 @@ void Assembler::computeAnchorWindowsClean(
 
         // Deduplicate alternate path intermediates: each intermediate anchor
         // must appear in exactly one alternate path. If the same intermediate
-        // appears in multiple paths, assign it to the path with the smallest
-        // span (pillarB - pillarA backbone positions). This keeps alternate
-        // paths local, producing tight bubbles rather than long crossing edges.
+        // appears in multiple paths, assign it to the path with the largest
+        // span (pillarB - pillarA backbone positions). Longer paths carry
+        // more long-range haplotype information for phasing decisions.
         {
             auto pathSpan = [&](const AnchorWindowAlternatePath& p) -> uint32_t {
                 auto itA = backboneAnchorToPos.find(uint64_t(p.anchorIdA));
@@ -438,10 +438,10 @@ void Assembler::computeAnchorWindowsClean(
                 return (posB > posA) ? (posB - posA) : 0;
             };
 
-            // Sort paths by span (smallest first) so tighter bubbles claim first.
+            // Sort paths by span (largest first) so longer paths claim first.
             std::sort(window.alternatePaths.begin(), window.alternatePaths.end(),
                 [&](const AnchorWindowAlternatePath& a, const AnchorWindowAlternatePath& b) {
-                    return pathSpan(a) < pathSpan(b);
+                    return pathSpan(a) > pathSpan(b);
                 });
 
             // Assign each intermediate to the first (tightest) path that contains it.
