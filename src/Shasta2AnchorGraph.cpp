@@ -195,10 +195,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
 
     // Inter-window edges: walk each read's journey and connect consecutive
-    // windows. When a read transitions from window A to window B, add an
-    // edge from the last backbone anchor in A to the first backbone anchor in B.
-    // Deduplicate by tracking which (anchorIdA, anchorIdB) pairs already have edges.
-    std::set<std::pair<Shasta2AnchorId, Shasta2AnchorId>> interEdgeSet;
+    // windows. For each ordered window pair, keep a single edge: from the
+    // latest backbone anchor in the previous window to the earliest backbone
+    // anchor in the next window, across all reads.
+    struct WindowPairEdge {
+        Shasta2AnchorId anchorIdA;
+        Shasta2AnchorId anchorIdB;
+        uint32_t backbonePosA;
+        uint32_t backbonePosB;
+    };
+    std::map<std::pair<uint32_t, uint32_t>, WindowPairEdge> windowPairEdges;
 
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
@@ -219,26 +225,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
 
             if(windowId == currentWindow) {
-                // Same window — only update if moving forward in backbone order.
                 if(backbonePos > lastBackbonePosInCurrentWindow) {
                     lastAnchorInCurrentWindow = anchorId;
                     lastBackbonePosInCurrentWindow = backbonePos;
                 }
             } else {
-                // Different window.
                 if(currentWindow != noWindow) {
-                    auto key = std::make_pair(lastAnchorInCurrentWindow, anchorId);
-                    if(interEdgeSet.find(key) == interEdgeSet.end()) {
-                        interEdgeSet.insert(key);
-                        Shasta2AnchorPair anchorPair(anchors, lastAnchorInCurrentWindow, anchorId, false);
-                        if(!anchorPair.orientedReadIds.empty()) {
-                            edge_descriptor e;
-                            tie(e, ignore) = add_edge(
-                                anchorPair.anchorIdA,
-                                anchorPair.anchorIdB,
-                                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                                anchorGraph);
-                            anchorGraph[e].useForAssembly = true;
+                    auto key = std::make_pair(currentWindow, windowId);
+                    auto it = windowPairEdges.find(key);
+                    if(it == windowPairEdges.end()) {
+                        windowPairEdges[key] = WindowPairEdge{
+                            lastAnchorInCurrentWindow, anchorId,
+                            lastBackbonePosInCurrentWindow, backbonePos};
+                    } else {
+                        if(lastBackbonePosInCurrentWindow > it->second.backbonePosA) {
+                            it->second.anchorIdA = lastAnchorInCurrentWindow;
+                            it->second.backbonePosA = lastBackbonePosInCurrentWindow;
+                        }
+                        if(backbonePos < it->second.backbonePosB) {
+                            it->second.anchorIdB = anchorId;
+                            it->second.backbonePosB = backbonePos;
                         }
                     }
                 }
@@ -246,6 +252,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 lastAnchorInCurrentWindow = anchorId;
                 lastBackbonePosInCurrentWindow = backbonePos;
             }
+        }
+    }
+
+    // Create the inter-window edges.
+    for(const auto& [windowPair, wpEdge] : windowPairEdges) {
+        Shasta2AnchorPair anchorPair(anchors, wpEdge.anchorIdA, wpEdge.anchorIdB, false);
+        if(!anchorPair.orientedReadIds.empty()) {
+            edge_descriptor e;
+            tie(e, ignore) = add_edge(
+                anchorPair.anchorIdA,
+                anchorPair.anchorIdB,
+                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[e].useForAssembly = true;
         }
     }
 

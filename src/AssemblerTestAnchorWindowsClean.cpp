@@ -83,16 +83,17 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     // belongs to. When the window changes, record a connecting edge from
     // the last backbone anchor in the previous window to the first backbone
     // anchor in the next window.
-    // Use a set to deduplicate edges and count coverage.
-    struct ConnectingEdge {
-        Shasta2AnchorId anchorIdA;  // Last backbone anchor in window A.
-        Shasta2AnchorId anchorIdB;  // First backbone anchor in window B.
-        bool operator<(const ConnectingEdge& other) const {
-            if(anchorIdA != other.anchorIdA) return anchorIdA < other.anchorIdA;
-            return anchorIdB < other.anchorIdB;
-        }
+    // For each ordered window pair (windowA, windowB), keep a single edge:
+    // from the latest backbone anchor in windowA to the earliest backbone
+    // anchor in windowB, across all reads that cross that boundary.
+    struct WindowPairEdge {
+        Shasta2AnchorId anchorIdA;  // Latest backbone anchor in window A.
+        Shasta2AnchorId anchorIdB;  // Earliest backbone anchor in window B.
+        uint32_t backbonePosA;      // Backbone position of anchorIdA.
+        uint32_t backbonePosB;      // Backbone position of anchorIdB.
     };
-    map<ConnectingEdge, uint64_t> connectingEdgeCoverage;
+    // Key: (windowA, windowB).
+    map<pair<uint32_t, uint32_t>, WindowPairEdge> windowPairEdges;
 
     const uint64_t orientedReadCount = 2 * readCount;
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
@@ -124,8 +125,24 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             } else {
                 // Window transition.
                 if(currentWindow != noWindow) {
-                    ConnectingEdge edge{lastAnchorInCurrentWindow, anchorId};
-                    ++connectingEdgeCoverage[edge];
+                    auto key = make_pair(currentWindow, windowId);
+                    auto it = windowPairEdges.find(key);
+                    if(it == windowPairEdges.end()) {
+                        windowPairEdges[key] = WindowPairEdge{
+                            lastAnchorInCurrentWindow, anchorId,
+                            lastBackbonePosInCurrentWindow, backbonePos};
+                    } else {
+                        // Keep the latest anchor in window A.
+                        if(lastBackbonePosInCurrentWindow > it->second.backbonePosA) {
+                            it->second.anchorIdA = lastAnchorInCurrentWindow;
+                            it->second.backbonePosA = lastBackbonePosInCurrentWindow;
+                        }
+                        // Keep the earliest anchor in window B.
+                        if(backbonePos < it->second.backbonePosB) {
+                            it->second.anchorIdB = anchorId;
+                            it->second.backbonePosB = backbonePos;
+                        }
+                    }
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
@@ -134,7 +151,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         }
     }
 
-    cout << timestamp << "Found " << connectingEdgeCoverage.size()
+    cout << timestamp << "Found " << windowPairEdges.size()
          << " inter-window connecting edges." << endl;
 
     // Count common oriented reads between two anchors using two-pointer merge.
@@ -221,8 +238,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
 
     // Write inter-window connecting edges.
     uint64_t totalInterEdges = 0;
-    for(const auto& [edge, coverage] : connectingEdgeCoverage) {
-        static_cast<void>(coverage);
+    for(const auto& [windowPair, edge] : windowPairEdges) {
         gfa << "L\t" << edge.anchorIdA << "\t+\t"
             << edge.anchorIdB << "\t+\t0M"
             << "\tRC:i:" << commonReadCount(edge.anchorIdA, edge.anchorIdB) << "\n";
