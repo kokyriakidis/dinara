@@ -205,20 +205,20 @@ with the backbone — their anchors between LIS pillars are redundant.
 
 After all touching reads have been processed, the same intermediate anchor may
 appear in multiple alternate paths (from different reads with different LIS
-pillar pairs). If an intermediate connects to both an earlier and a later
-backbone anchor via different paths, it creates backward-looking edges in the
-graph.
+pillar pairs). Each intermediate must belong to exactly one path to avoid
+creating edges to multiple backbone anchors.
 
-To resolve this, a post-processing pass assigns each intermediate to the
-alternate path whose pillar A has the **highest backbone position** (most
-forward). The intermediate is removed from all other paths. Paths that become
-empty after this deduplication are discarded.
+Paths are sorted by **span** (pillarB − pillarA backbone positions), largest
+first. Each intermediate is assigned to the first (longest) path that contains
+it. Longer paths carry more long-range haplotype information, which is valuable
+for downstream phasing decisions. Paths that lose all their intermediates after
+deduplication are discarded.
 
 ```
-Path 1:  A → X → B    (A at backbone pos 5)
-Path 2:  C → X → D    (C at backbone pos 8)
+Path 1:  A → X → B    (span = 3)
+Path 2:  C → X → D    (span = 7)
 
-X is kept only in Path 2 (most forward pillar A).
+X is kept only in Path 2 (largest span).
 Path 1 loses X and is discarded if no other intermediates remain.
 ```
 
