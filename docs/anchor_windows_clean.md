@@ -121,7 +121,10 @@ Given a validated backbone interval `[seedBegin, seedEnd)` on `backboneOid`:
 #### 1. Build backbone lookup
 
 Build a hash map from anchor ID to backbone journey position for the interval
-`[seedBegin, seedEnd)`.
+`[seedBegin, seedEnd)`. Anchors whose k-mer appears more than once in the
+backbone interval are excluded from the lookup (except the first and last
+anchors, which are preserved to avoid disconnecting the chain). This prevents
+repeat-induced loops in the backbone chain.
 
 #### 2. Record backbone read interval
 
@@ -149,9 +152,11 @@ contributes alternate paths.
 
 For each touching read (excluding the backbone):
 
-**a. Find shared anchors.** Walk the read's journey. For each anchor that
-appears in the backbone lookup *and* is still unclaimed, record the read
-position and the corresponding backbone position.
+**a. Find shared anchors.** First, identify anchors with duplicate k-mers in
+the read's journey (excluding edge anchors). Then walk the journey: for each
+anchor that is not a read duplicate, appears in the backbone lookup, and is
+still unclaimed, record the read position and the corresponding backbone
+position.
 
 **b. Compute LIS.** Run patience sorting (O(n log n)) on the backbone positions
 to find the longest increasing subsequence. This enforces backbone order —
@@ -165,17 +170,57 @@ LIS length.
 **d. Extract alternate paths (non-direct overlaps only).** If the read is
 *not* a direct cis overlap and the LIS has ≥ 2 anchors: for each pair of
 consecutive LIS pillars, collect the read's intermediate anchors (those between
-the two pillar positions in the read's journey). If any intermediates exist,
-create an `AnchorWindowAlternatePath` and add it to the window.
+the two pillar positions in the read's journey).
+
+Each intermediate anchor is filtered in two ways:
+
+1. **Duplicate k-mer filter.** Anchors whose k-mer appears more than once in
+   the read's journey are skipped (same duplicate detection as step 6a).
+
+2. **Non-cis read filter.** Only anchors that have at least one oriented read
+   that is **not** the backbone and **not** a direct cis overlap of the
+   backbone are kept. This removes intermediates that merely echo the backbone
+   haplotype — anchors whose reads are all cis with the backbone carry the
+   same haplotype and add no structural information. The surviving
+   intermediates are anchors visited by reads from a different haplotype or
+   structural path.
+
+If any intermediates survive both filters, an `AnchorWindowAlternatePath` is
+created and added to the window.
 
 ```
 Backbone:  ... A --------- B ...     (LIS pillars)
 Read:      ... A  x  y  z  B ...     (x, y, z are intermediates)
-                                      → alternate path: A → x → y → z → B
+
+If x has a duplicate k-mer in the read → filtered out.
+If y has only cis reads → filtered out.
+If z has a non-cis read → kept.
+                                      → alternate path: A → z → B
 ```
 
-Direct cis overlaps skip this step because they are expected to agree with the
-backbone — their anchors between LIS pillars are redundant.
+Direct cis overlaps skip this step entirely because they are expected to agree
+with the backbone — their anchors between LIS pillars are redundant.
+
+#### 6e. Deduplicate shared intermediates
+
+After all touching reads have been processed, the same intermediate anchor may
+appear in multiple alternate paths (from different reads with different LIS
+pillar pairs). If an intermediate connects to both an earlier and a later
+backbone anchor via different paths, it creates backward-looking edges in the
+graph.
+
+To resolve this, a post-processing pass assigns each intermediate to the
+alternate path whose pillar A has the **highest backbone position** (most
+forward). The intermediate is removed from all other paths. Paths that become
+empty after this deduplication are discarded.
+
+```
+Path 1:  A → X → B    (A at backbone pos 5)
+Path 2:  C → X → D    (C at backbone pos 8)
+
+X is kept only in Path 2 (most forward pillar A).
+Path 1 loses X and is discarded if no other intermediates remain.
+```
 
 #### 7. Claim anchors (deferred)
 
@@ -223,6 +268,13 @@ each anchor belongs to (via `anchorToWindow` lookup). When the window changes,
 an edge is added from the last backbone anchor seen in the previous window to
 the first backbone anchor in the new window.
 
+Only **backbone anchors** are registered in `anchorToWindow`. Alternate-path
+intermediate anchors are not registered and are invisible to the inter-window
+walk. This is correct because any read traversing an alternate path must also
+pass through the LIS pillar anchors on both sides, which are backbone anchors
+with valid window assignments. The inter-window transitions are detected at
+those pillars.
+
 Within a window, the tracker only moves **forward** in backbone order. If a
 read visits backbone anchors out of order (due to alignment inconsistencies),
 backward positions are ignored. This prevents spurious backward edges.
@@ -241,8 +293,15 @@ Inter-window edges are deduplicated by `(anchorIdA, anchorIdB)` pair.
   Anchors that would require going backward on the backbone are excluded.
 
 - **Bubble formation.** Non-direct overlap reads contribute alternate paths
-  between LIS pillars. At heterozygous sites, the backbone carries one
-  haplotype and the alternate path carries the other.
+  between LIS pillars. Intermediate anchors are filtered to keep only those
+  with non-cis reads and non-duplicate k-mers, and deduplicated across paths
+  to prevent backward connections. The result is clean bubbles representing
+  genuinely divergent haplotypes.
+
+- **Duplicate k-mer exclusion.** Anchors whose k-mer appears more than once
+  in a journey are excluded from the backbone lookup, shared anchor detection,
+  and alternate path intermediates. Edge anchors (first/last in interval) are
+  preserved to avoid disconnecting chains.
 
 - **Reads span multiple windows.** A single read may contribute intervals to
   several windows.
@@ -256,7 +315,9 @@ Inter-window edges are deduplicated by `(anchorIdA, anchorIdB)` pair.
 runs the algorithm on all reads and writes:
 
 - **AnchorWindowsClean.gfa** — backbone chains, alternate paths, and
-  inter-window connecting edges. Vertices are deduplicated.
+  inter-window connecting edges. Vertices are deduplicated. All edges carry
+  `RC:i:N` tags indicating the number of common oriented reads between the
+  two anchors, computed by two-pointer merge on sorted marker info spans.
 - **AnchorWindowsClean.csv** — per-window HSL-based colors for Bandage
   visualization.
 
