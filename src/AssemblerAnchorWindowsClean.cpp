@@ -291,8 +291,7 @@ void Assembler::computeAnchorWindowsClean(
                 const uint64_t anchorId = uint64_t(journey[readPos]);
                 auto it = backboneAnchorToPos.find(anchorId);
                 if(it != backboneAnchorToPos.end()) {
-                    if(anchorOwner[anchorId] == anchorUnclaimed ||
-                       anchorOwner[anchorId] == windowId) {
+                    if(anchorOwner[anchorId] == anchorUnclaimed) {
                         sharedReadPositions.push_back(readPos);
                         sharedBackbonePositions.push_back(it->second);
                     }
