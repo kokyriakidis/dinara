@@ -2,6 +2,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "AnchorWindows.hpp"
+#include "Kmer.hpp"
 #include "Reads.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
@@ -14,6 +15,7 @@ using namespace dinara;
 #include <iomanip>
 #include <limits>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -223,6 +225,31 @@ void Assembler::computeAnchorWindowsClean(
     // For each touched read, keep only anchors shared with the backbone,
     // enforce backbone order via LIS, discard the rest.
     // ========================================================================
+    // Find anchor IDs in a journey interval whose k-mer appears more than once.
+    // Anchors at the first and last positions of the interval are never marked
+    // as duplicates, to avoid disconnecting chain endpoints.
+    auto findDuplicateKmerAnchors = [&](const auto& journey, uint32_t begin, uint32_t end) {
+        std::set<Kmer> seen;
+        std::set<Kmer> duplicateKmers;
+        for(uint32_t pos = begin; pos < end; pos++) {
+            const Kmer kmer = shasta2Anchors->anchorKmer(journey[pos]);
+            if(!seen.insert(kmer).second) {
+                duplicateKmers.insert(kmer);
+            }
+        }
+        std::unordered_set<uint64_t> duplicateAnchorIds;
+        if(!duplicateKmers.empty()) {
+            for(uint32_t pos = begin; pos < end; pos++) {
+                if(pos == begin || pos == end - 1) continue;
+                const Kmer kmer = shasta2Anchors->anchorKmer(journey[pos]);
+                if(duplicateKmers.count(kmer)) {
+                    duplicateAnchorIds.insert(uint64_t(journey[pos]));
+                }
+            }
+        }
+        return duplicateAnchorIds;
+    };
+
     auto createWindow = [&](OrientedReadId backboneOid, uint32_t seedBegin, uint32_t seedEnd) {
         const uint32_t windowId = uint32_t(anchorWindows.size());
         AnchorWindow window;
@@ -235,8 +262,13 @@ void Assembler::computeAnchorWindowsClean(
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
         std::unordered_map<uint64_t, uint32_t> backboneAnchorToPos;
         backboneAnchorToPos.reserve(seedEnd - seedBegin);
+
+        // Find backbone anchors with duplicate k-mers and exclude them.
+        const auto backboneDuplicates = findDuplicateKmerAnchors(backboneJourney, seedBegin, seedEnd);
         for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
-            backboneAnchorToPos[uint64_t(backboneJourney[pos])] = pos;
+            if(backboneDuplicates.count(uint64_t(backboneJourney[pos])) == 0) {
+                backboneAnchorToPos[uint64_t(backboneJourney[pos])] = pos;
+            }
         }
 
         // Add backbone read interval.
@@ -302,12 +334,16 @@ void Assembler::computeAnchorWindowsClean(
 
             const bool isDirectCis = (directCisOverlapReads.find(oidValue) != directCisOverlapReads.end());
 
+            // Find anchors with duplicate k-mers in this read's journey.
+            const auto readDuplicates = findDuplicateKmerAnchors(journey, 0, uint32_t(journey.size()));
+
             // Step 1-2: Find shared anchors and their backbone positions.
             vector<uint32_t> sharedReadPositions;
             vector<uint32_t> sharedBackbonePositions;
 
             for(uint32_t readPos = 0; readPos < uint32_t(journey.size()); readPos++) {
                 const uint64_t anchorId = uint64_t(journey[readPos]);
+                if(readDuplicates.count(anchorId)) continue;
                 auto it = backboneAnchorToPos.find(anchorId);
                 if(it != backboneAnchorToPos.end()) {
                     if(anchorOwner[anchorId] == anchorUnclaimed) {
@@ -352,6 +388,8 @@ void Assembler::computeAnchorWindowsClean(
                         altPath.anchorIdB = journey[readPosB];
                         for(uint32_t rp = readPosA + 1; rp < readPosB; rp++) {
                             const Shasta2AnchorId midAnchorId = journey[rp];
+                            // Skip anchors with duplicate k-mers in this read.
+                            if(readDuplicates.count(uint64_t(midAnchorId))) continue;
                             ++totalIntermediatesConsidered;
                             // Keep only anchors that have at least one read
                             // that is not the backbone and not a direct cis overlap.
