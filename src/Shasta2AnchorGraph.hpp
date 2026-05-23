@@ -2,6 +2,7 @@
 
 // Shasta2AnchorGraph.hpp
 
+#include "AnchorWindows.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
@@ -73,6 +74,15 @@ public:
         const Shasta2Anchors&,
         const Shasta2Journeys&,
         uint64_t minEdgeCoverage,
+        uint64_t threadCount);
+
+    // Construct from anchor windows: each window becomes a chain of its
+    // backbone anchors, and inter-window edges are discovered by walking
+    // read journeys.
+    Shasta2AnchorGraph(
+        const Shasta2Anchors&,
+        const Shasta2Journeys&,
+        const vector<AnchorWindow>& anchorWindows,
         uint64_t threadCount);
 
     // Constructor from binary data.

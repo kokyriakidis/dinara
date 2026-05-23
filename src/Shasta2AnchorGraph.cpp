@@ -97,6 +97,119 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
 
 
+// Construct from anchor windows.
+// Each window becomes a chain of its backbone anchors.
+// Inter-window edges are discovered by walking read journeys.
+Shasta2AnchorGraph::Shasta2AnchorGraph(
+    const Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys,
+    const vector<AnchorWindow>& anchorWindows,
+    uint64_t threadCount) :
+    MappedMemoryOwner(anchors),
+    MultithreadedObject<Shasta2AnchorGraph>(*this)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    static_cast<void>(threadCount);
+
+    // Create vertices, one per anchor.
+    const uint64_t anchorCount = anchors.size();
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; anchorId++) {
+        add_vertex(anchorGraph);
+    }
+
+    nextEdgeId = 0;
+
+    // Build anchorId -> windowId map from backbone anchors.
+    const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    vector<uint32_t> anchorToWindow(anchorCount, noWindow);
+    for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            anchorToWindow[uint64_t(backboneJourney[pos])] = windowId;
+        }
+    }
+
+    // Intra-window edges: consecutive backbone anchor pairs.
+    for(const AnchorWindow& window : anchorWindows) {
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+        for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
+            const Shasta2AnchorId anchorIdA = backboneJourney[pos];
+            const Shasta2AnchorId anchorIdB = backboneJourney[pos + 1];
+            Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
+            if(anchorPair.orientedReadIds.empty()) {
+                continue;
+            }
+            edge_descriptor e;
+            tie(e, ignore) = add_edge(
+                anchorPair.anchorIdA,
+                anchorPair.anchorIdB,
+                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[e].useForAssembly = true;
+        }
+    }
+
+    const uint64_t intraEdgeCount = num_edges(anchorGraph);
+
+    // Inter-window edges: walk each read's journey and connect consecutive
+    // windows. When a read transitions from window A to window B, add an
+    // edge from the last backbone anchor in A to the first backbone anchor in B.
+    // Deduplicate by tracking which (anchorIdA, anchorIdB) pairs already have edges.
+    std::set<std::pair<Shasta2AnchorId, Shasta2AnchorId>> interEdgeSet;
+
+    const uint64_t orientedReadCount = 2 * anchors.size() / anchors[Shasta2AnchorId(0)].size();
+    // Use journeys.size() for the actual oriented read count.
+    const uint64_t journeyCount = journeys.size();
+    for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto journey = journeys[oid];
+        if(journey.empty()) continue;
+
+        uint32_t currentWindow = noWindow;
+        Shasta2AnchorId lastAnchorInCurrentWindow = 0;
+
+        for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+            const Shasta2AnchorId anchorId = journey[pos];
+            if(uint64_t(anchorId) >= anchorCount) continue;
+            const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
+            if(windowId == noWindow) continue;
+
+            if(windowId != currentWindow) {
+                if(currentWindow != noWindow) {
+                    auto key = std::make_pair(lastAnchorInCurrentWindow, anchorId);
+                    if(interEdgeSet.find(key) == interEdgeSet.end()) {
+                        interEdgeSet.insert(key);
+                        Shasta2AnchorPair anchorPair(anchors, lastAnchorInCurrentWindow, anchorId, false);
+                        if(!anchorPair.orientedReadIds.empty()) {
+                            edge_descriptor e;
+                            tie(e, ignore) = add_edge(
+                                anchorPair.anchorIdA,
+                                anchorPair.anchorIdB,
+                                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                                anchorGraph);
+                            anchorGraph[e].useForAssembly = true;
+                        }
+                    }
+                }
+                currentWindow = windowId;
+            }
+            lastAnchorInCurrentWindow = anchorId;
+        }
+    }
+
+    const uint64_t interEdgeCount = num_edges(anchorGraph) - intraEdgeCount;
+
+    cout << "The anchor graph has " << num_vertices(*this)
+         << " vertices, " << num_edges(*this) << " edges"
+         << " (" << intraEdgeCount << " intra-window, "
+         << interEdgeCount << " inter-window)." << endl;
+}
+
+
+
 // Constructor from binary data.
 Shasta2AnchorGraph::Shasta2AnchorGraph(const MappedMemoryOwner& mappedMemoryOwner, const string& name) :
     MappedMemoryOwner(mappedMemoryOwner),

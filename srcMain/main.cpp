@@ -1246,18 +1246,26 @@ void dinara::main::assemble(
              << " (backbone, visitor) pairs with regressing ordinals." << endl;
     }
 
-    // Create the Shasta2AnchorGraph.
-    const uint64_t minEdgeCoverage = 2;
-    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
+    // Create the Shasta2AnchorGraph from anchor windows.
+    cout << timestamp << "Computing anchor windows..." << endl;
+    vector<AnchorWindow> anchorWindows;
+    assembler.computeAnchorWindowsClean(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        readIdsSortedByLength,
+        anchorWindows,
+        threadCount);
+
+    cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
+         << " anchor windows..." << endl;
     assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
         *shasta2Anchors,
         *shasta2Journeys,
-        minEdgeCoverage,
+        anchorWindows,
         threadCount);
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
-    // can load and visualize it even when we return before later assembly stages.
+    // Save the pre-transitive-reduction Shasta2 anchor graph.
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
 
