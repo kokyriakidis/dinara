@@ -3615,9 +3615,19 @@ public:
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
         uint64_t threadCount);
-    // Partition anchor journeys into disjoint windows based on a backbone
-    // read's journey, then expanded to include intervals on reads sharing
-    // those anchors. readIdsSortedByLength controls backbone priority.
+    // Partition anchor journeys into disjoint windows.
+    // Clean version: for each touched read, keeps only anchors shared with
+    // the backbone (by anchor ID), enforces backbone order via LIS, and
+    // discards non-shared and out-of-order anchors. Guarantees strand-consistent
+    // edges in the resulting AnchorGraph.
+    void computeAnchorWindowsClean(
+        shared_ptr<Shasta2Anchors> shasta2Anchors,
+        shared_ptr<Shasta2Journeys> shasta2Journeys,
+        const vector<ReadId>& readIdsSortedByLength,
+        vector<AnchorWindow>& anchorWindows,
+        uint64_t threadCount);
+
+    // Original version: claims all unclaimed anchors in the touched range.
     void computeAnchorWindows(
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
