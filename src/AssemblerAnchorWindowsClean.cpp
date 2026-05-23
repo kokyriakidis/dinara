@@ -424,33 +424,28 @@ void Assembler::computeAnchorWindowsClean(
             }
         }
 
-        // Deduplicate alternate path intermediates: if the same anchor appears
-        // in multiple alternate paths, keep it only in the path whose pillar A
-        // has the highest backbone position (most forward). This prevents an
-        // intermediate from connecting backward to an earlier backbone anchor.
+        // Deduplicate alternate path intermediates: each intermediate anchor
+        // must appear in exactly one alternate path. Sort paths by pillar A
+        // backbone position (most forward first), then assign each intermediate
+        // to the first path that claims it.
         {
-            // For each intermediate anchor, find the highest backbone position
-            // of pillar A across all paths that contain it.
-            std::unordered_map<uint64_t, uint32_t> bestPillarAPos; // anchorId -> best backbone pos of pillar A
-            for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-                auto itA = backboneAnchorToPos.find(uint64_t(altPath.anchorIdA));
-                const uint32_t pillarAPos = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
-                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                    auto it = bestPillarAPos.find(uint64_t(mid));
-                    if(it == bestPillarAPos.end() || pillarAPos > it->second) {
-                        bestPillarAPos[uint64_t(mid)] = pillarAPos;
-                    }
-                }
-            }
+            // Sort paths by pillar A backbone position, most forward first.
+            std::sort(window.alternatePaths.begin(), window.alternatePaths.end(),
+                [&](const AnchorWindowAlternatePath& a, const AnchorWindowAlternatePath& b) {
+                    auto itA = backboneAnchorToPos.find(uint64_t(a.anchorIdA));
+                    auto itB = backboneAnchorToPos.find(uint64_t(b.anchorIdA));
+                    const uint32_t posA = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
+                    const uint32_t posB = (itB != backboneAnchorToPos.end()) ? itB->second : 0;
+                    return posA > posB;
+                });
 
-            // Remove intermediates that don't belong to the most forward path.
+            // Assign each intermediate to the first (most forward) path that contains it.
+            std::unordered_set<uint64_t> claimedIntermediates;
             vector<AnchorWindowAlternatePath> filteredPaths;
             for(AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-                auto itA = backboneAnchorToPos.find(uint64_t(altPath.anchorIdA));
-                const uint32_t pillarAPos = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
                 vector<Shasta2AnchorId> filtered;
                 for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                    if(bestPillarAPos[uint64_t(mid)] == pillarAPos) {
+                    if(claimedIntermediates.insert(uint64_t(mid)).second) {
                         filtered.push_back(mid);
                     }
                 }
