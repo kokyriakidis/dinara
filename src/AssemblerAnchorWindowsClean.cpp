@@ -359,13 +359,7 @@ void Assembler::computeAnchorWindowsClean(
         if(candidate.generation != candidateGeneration[uint64_t(readId)]) {
             continue;
         }
-        if(candidate.backboneOrientedReadId.getValue() >= shasta2Journeys->size()) {
-            continue;
-        }
         const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
-        if(journey.empty() || candidate.end > journey.size()) {
-            continue;
-        }
 
         // Check if the interval is still fully unclaimed.
         bool isStillUnclaimed = true;
