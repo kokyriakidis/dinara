@@ -4,7 +4,6 @@
 #include "AnchorWindows.hpp"
 #include "Reads.hpp"
 #include "Shasta2Anchors.hpp"
-#include "Shasta2AnchorPair.hpp"
 #include "Shasta2Journeys.hpp"
 #include "timestamp.hpp"
 using namespace dinara;
@@ -15,7 +14,7 @@ using namespace std;
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
-#include <unordered_set>
+#include <numeric>
 #include <vector>
 
 
@@ -35,114 +34,64 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     const uint64_t readCount = reads->readCount();
     DINARA_ASSERT(readCount > 0);
 
-    // Find the longest read.
-    ReadId longestReadId = 0;
-    uint64_t longestLength = 0;
-    for(ReadId readId = 0; readId < readCount; readId++) {
-        const uint64_t len = reads->getRead(readId).baseCount;
-        if(len > longestLength) {
-            longestLength = len;
-            longestReadId = readId;
-        }
-    }
+    // Sort all reads by length (longest first).
+    vector<ReadId> readIdsSortedByLength(readCount);
+    std::iota(readIdsSortedByLength.begin(), readIdsSortedByLength.end(), ReadId(0));
+    std::sort(readIdsSortedByLength.begin(), readIdsSortedByLength.end(),
+        [&](ReadId a, ReadId b) {
+            return reads->getRead(a).baseCount
+                 > reads->getRead(b).baseCount;
+        });
 
-    cout << timestamp << "Longest read: " << longestReadId
-         << " length=" << longestLength << " bases" << endl;
+    cout << timestamp << "Longest read: " << readIdsSortedByLength[0]
+         << " length=" << reads->getRead(readIdsSortedByLength[0]).baseCount
+         << " bases" << endl;
 
-    // Check that the longest read has a journey.
-    const OrientedReadId longestOid(longestReadId, 0);
-    if(longestOid.getValue() >= shasta2Journeys->size()) {
-        cout << timestamp << "Longest read has no journey. Aborting test." << endl;
-        return;
-    }
-    const auto longestJourney = (*shasta2Journeys)[longestOid];
-    cout << timestamp << "Longest read journey has " << longestJourney.size()
-         << " anchors." << endl;
-    if(longestJourney.empty()) {
-        cout << timestamp << "Longest read journey is empty. Aborting test." << endl;
-        return;
-    }
-
-    // Run computeAnchorWindowsClean with only the longest read as backbone candidate.
-    vector<ReadId> singleRead = {longestReadId};
+    // Run computeAnchorWindowsClean with all reads.
     vector<AnchorWindow> anchorWindows;
     computeAnchorWindowsClean(
         shasta2Anchors,
         shasta2Journeys,
-        singleRead,
+        readIdsSortedByLength,
         anchorWindows,
         threadCount);
 
     cout << timestamp << "computeAnchorWindowsClean produced "
-         << anchorWindows.size() << " window(s) for the longest read." << endl;
+         << anchorWindows.size() << " windows." << endl;
 
-    // Collect kept anchor IDs from Window 0 only (the longest read's window).
-    // The other windows are from touched reads that were re-pushed onto the
-    // heap and are not relevant for this test.
-    unordered_set<Shasta2AnchorId> keptAnchorSet;
-    uint64_t totalReadIntervals = 0;
-    if(!anchorWindows.empty()) {
-        const AnchorWindow& window = anchorWindows[0];
-        const OrientedReadId backboneOid = window.backboneOrientedReadId;
-        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
-        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            keptAnchorSet.insert(backboneJourney[pos]);
-        }
-        totalReadIntervals = window.readIntervals.size();
-    }
-
-    cout << timestamp << "Kept anchors: " << keptAnchorSet.size()
-         << " (out of " << shasta2Anchors->size() << " total)"
-         << " totalReadIntervals=" << totalReadIntervals << endl;
-
-    // Print per-window diagnostics.
-    for(uint64_t i = 0; i < anchorWindows.size(); i++) {
-        const AnchorWindow& w = anchorWindows[i];
-        cout << timestamp << "  Window " << i
-             << ": backbone=" << w.backboneOrientedReadId
-             << " [" << w.backboneBegin << "," << w.backboneEnd << ")"
-             << " backboneAnchors=" << (w.backboneEnd - w.backboneBegin)
-             << " claimedAnchors=" << w.claimedAnchorCount
-             << " reads=" << w.readIntervals.size()
-             << endl;
-    }
-
-    // Build a restricted anchor graph using only the kept anchors.
-    // Instead of constructing the full Shasta2AnchorGraph (expensive),
-    // we iterate only over kept anchors and find children among them.
-    cout << timestamp << "Building restricted anchor graph from kept anchors..." << endl;
-
-    // Build the graph as a simple chain: consecutive anchors in the
-    // backbone journey connected by edges.
-    const AnchorWindow& w0 = anchorWindows[0];
-    const OrientedReadId backboneOid = w0.backboneOrientedReadId;
-    const auto backboneJourney = (*shasta2Journeys)[backboneOid];
-
-    cout << timestamp << "Restricted anchor graph: "
-         << keptAnchorSet.size() << " vertices, "
-         << (w0.backboneEnd > w0.backboneBegin ? w0.backboneEnd - w0.backboneBegin - 1 : 0)
-         << " edges." << endl;
-
-    // Write GFA.
-    const string gfaFileName = "LongestReadAnchorGraph.gfa";
+    // Write GFA: each window is a chain of its backbone anchors.
+    const string gfaFileName = "AnchorWindowsClean.gfa";
     ofstream gfa(gfaFileName);
     if(!gfa) {
         throw runtime_error("Cannot open " + gfaFileName + " for writing.");
     }
     gfa << "H\tVN:Z:1.0\n";
 
-    // Write vertices for kept anchors.
-    for(uint32_t pos = w0.backboneBegin; pos < w0.backboneEnd; pos++) {
-        gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
+    uint64_t totalVertices = 0;
+    uint64_t totalEdges = 0;
+
+    for(const AnchorWindow& window : anchorWindows) {
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+        // Write vertices: backbone anchors in this window.
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
+            ++totalVertices;
+        }
+
+        // Write edges: consecutive pairs in the backbone journey.
+        for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
+            gfa << "L\t" << backboneJourney[pos] << "\t+\t"
+                << backboneJourney[pos + 1] << "\t+\t0M\n";
+            ++totalEdges;
+        }
     }
 
-    // Write edges: consecutive pairs in the backbone journey.
-    for(uint32_t pos = w0.backboneBegin; pos + 1 < w0.backboneEnd; pos++) {
-        gfa << "L\t" << backboneJourney[pos] << "\t+\t"
-            << backboneJourney[pos + 1] << "\t+\t0M\n";
-    }
-
-    cout << timestamp << "Wrote " << gfaFileName << endl;
+    cout << timestamp << "Wrote " << gfaFileName
+         << ": " << anchorWindows.size() << " chains, "
+         << totalVertices << " vertices, "
+         << totalEdges << " edges." << endl;
 
     const auto t1 = steady_clock::now();
     const double elapsedSeconds = seconds(t1 - t0);
