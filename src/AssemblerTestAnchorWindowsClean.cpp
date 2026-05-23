@@ -76,18 +76,19 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     cout << timestamp << "computeAnchorWindowsClean produced "
          << anchorWindows.size() << " window(s) for the longest read." << endl;
 
-    // Collect kept anchor IDs: only the backbone anchors (no RC pairs).
-    // RC anchors are claimed by the window algorithm to prevent reuse,
-    // but the graph should only contain the forward-strand backbone anchors.
+    // Collect kept anchor IDs from Window 0 only (the longest read's window).
+    // The other windows are from touched reads that were re-pushed onto the
+    // heap and are not relevant for this test.
     unordered_set<Shasta2AnchorId> keptAnchorSet;
     uint64_t totalReadIntervals = 0;
-    for(const AnchorWindow& window : anchorWindows) {
+    if(!anchorWindows.empty()) {
+        const AnchorWindow& window = anchorWindows[0];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
             keptAnchorSet.insert(backboneJourney[pos]);
         }
-        totalReadIntervals += window.readIntervals.size();
+        totalReadIntervals = window.readIntervals.size();
     }
 
     cout << timestamp << "Kept anchors: " << keptAnchorSet.size()
