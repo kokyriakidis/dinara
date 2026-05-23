@@ -3627,6 +3627,10 @@ public:
         vector<AnchorWindow>& anchorWindows,
         uint64_t threadCount);
 
+    // Test computeAnchorWindowsClean on the longest read, then build
+    // a restricted anchor graph from the kept anchors and write GFA.
+    void testAnchorWindowsCleanLongestRead(uint64_t threadCount);
+
     // Original version: claims all unclaimed anchors in the touched range.
     void computeAnchorWindows(
         shared_ptr<Shasta2Anchors> shasta2Anchors,

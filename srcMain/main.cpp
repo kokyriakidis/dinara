@@ -1698,6 +1698,10 @@ void dinara::main::assemble(
         anchorWindows,
         threadCount);
 
+    // Test computeAnchorWindowsClean on the longest read and build a restricted
+    // anchor graph from the kept anchors.
+    assembler.testAnchorWindowsCleanLongestRead(threadCount);
+
     // Test multi-segment MSA on one window.
     assembler.testMultiSegmentMSA(
         assembler.shasta2Anchors,
