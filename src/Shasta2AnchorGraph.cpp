@@ -119,15 +119,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     nextEdgeId = 0;
 
-    // Build anchorId -> windowId map from backbone anchors.
+    // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
     vector<uint32_t> anchorToWindow(anchorCount, noWindow);
+    vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
     for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            anchorToWindow[uint64_t(backboneJourney[pos])] = windowId;
+            const uint64_t aid = uint64_t(backboneJourney[pos]);
+            anchorToWindow[aid] = windowId;
+            anchorToBackbonePos[aid] = pos;
         }
     }
 
@@ -170,6 +173,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         uint32_t currentWindow = noWindow;
         Shasta2AnchorId lastAnchorInCurrentWindow = 0;
+        uint32_t lastBackbonePosInCurrentWindow = 0;
 
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
             const Shasta2AnchorId anchorId = journey[pos];
@@ -177,7 +181,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            if(windowId != currentWindow) {
+            const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
+
+            if(windowId == currentWindow) {
+                // Same window — only update if moving forward in backbone order.
+                if(backbonePos > lastBackbonePosInCurrentWindow) {
+                    lastAnchorInCurrentWindow = anchorId;
+                    lastBackbonePosInCurrentWindow = backbonePos;
+                }
+            } else {
+                // Different window.
                 if(currentWindow != noWindow) {
                     auto key = std::make_pair(lastAnchorInCurrentWindow, anchorId);
                     if(interEdgeSet.find(key) == interEdgeSet.end()) {
@@ -195,8 +208,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
                 currentWindow = windowId;
+                lastAnchorInCurrentWindow = anchorId;
+                lastBackbonePosInCurrentWindow = backbonePos;
             }
-            lastAnchorInCurrentWindow = anchorId;
         }
     }
 
