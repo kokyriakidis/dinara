@@ -203,6 +203,17 @@ void Assembler::computeAnchorWindowsClean(
         return result;
     };
 
+    // Claim an anchor and its reverse complement.
+    auto claimAnchor = [&](uint64_t anchorId, uint32_t windowId) {
+        if(anchorOwner[anchorId] == anchorUnclaimed) {
+            anchorOwner[anchorId] = windowId;
+            const uint64_t rcAnchorId = anchorId ^ 1ULL;
+            if(rcAnchorId < anchorCount) {
+                anchorOwner[rcAnchorId] = windowId;
+            }
+        }
+    };
+
     // ========================================================================
     // Create a window from a backbone interval.
     // For each touched read, keep only anchors shared with the backbone,
@@ -224,11 +235,11 @@ void Assembler::computeAnchorWindowsClean(
             backboneAnchorToPos[uint64_t(backboneJourney[pos])] = pos;
         }
 
-        // Claim backbone anchors.
+        // Claim backbone anchors (and their RC).
         for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
             const Shasta2AnchorId anchorId = backboneJourney[pos];
             if(anchorOwner[uint64_t(anchorId)] == anchorUnclaimed) {
-                anchorOwner[uint64_t(anchorId)] = windowId;
+                claimAnchor(uint64_t(anchorId), windowId);
                 ++window.claimedAnchorCount;
             }
         }
@@ -303,7 +314,7 @@ void Assembler::computeAnchorWindowsClean(
                 const uint32_t readPos = sharedReadPositions[li];
                 const uint64_t anchorId = uint64_t(journey[readPos]);
                 if(anchorOwner[anchorId] == anchorUnclaimed) {
-                    anchorOwner[anchorId] = windowId;
+                    claimAnchor(anchorId, windowId);
                     ++window.claimedAnchorCount;
                 }
                 ++convergentCount;
