@@ -7,6 +7,8 @@ external/snarls/*
 !external/snarls/CMakeLists.txt
 !external/snarls/README.md
 !external/snarls/vendored/
+!external/snarls/libhandlegraph/
+!external/snarls/structures/
 external/snarls/vendored/*.o
 
 # CMake build artifacts
