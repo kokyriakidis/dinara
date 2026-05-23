@@ -149,6 +149,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     uint64_t totalIntraEdges = 0;
 
     uint64_t totalAltEdges = 0;
+    unordered_set<uint64_t> emittedVertices;
 
     // Write window chains and alternate paths.
     for(const AnchorWindow& window : anchorWindows) {
@@ -157,8 +158,10 @@ void Assembler::testAnchorWindowsCleanLongestRead(
 
         // Backbone vertices.
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
-            ++totalVertices;
+            if(emittedVertices.insert(uint64_t(backboneJourney[pos])).second) {
+                gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
         }
 
         // Intra-window edges: consecutive backbone pairs.
@@ -171,8 +174,10 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         // Alternate path vertices and edges.
         for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
             for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                gfa << "S\t" << mid << "\t*\tLN:i:1\n";
-                ++totalVertices;
+                if(emittedVertices.insert(uint64_t(mid)).second) {
+                    gfa << "S\t" << mid << "\t*\tLN:i:1\n";
+                    ++totalVertices;
+                }
             }
             // Chain: anchorIdA -> intermediates -> anchorIdB.
             Shasta2AnchorId prev = altPath.anchorIdA;
