@@ -112,33 +112,28 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     // we iterate only over kept anchors and find children among them.
     cout << timestamp << "Building restricted anchor graph from kept anchors..." << endl;
 
-    const uint64_t minEdgeCoverage = 2;
-
-    // For each kept anchor, find children and keep only those that are also kept.
+    // For each kept anchor, find children (minEdgeCoverage=1 to include
+    // transitions supported by even a single read) and keep only those
+    // that are also kept.
     struct RestrictedEdge {
         Shasta2AnchorId anchorIdA;
         Shasta2AnchorId anchorIdB;
         uint64_t coverage;
-        Shasta2AnchorPair anchorPair;
     };
     vector<RestrictedEdge> restrictedEdges;
 
     vector<Shasta2AnchorId> children;
     vector<uint64_t> counts;
     for(const Shasta2AnchorId anchorIdA : keptAnchorSet) {
-        shasta2Anchors->findChildren(*shasta2Journeys, anchorIdA, children, counts, minEdgeCoverage);
+        shasta2Anchors->findChildren(*shasta2Journeys, anchorIdA, children, counts, 1);
         DINARA_ASSERT(children.size() == counts.size());
         for(uint64_t i = 0; i < children.size(); i++) {
             const Shasta2AnchorId anchorIdB = children[i];
             if(keptAnchorSet.find(anchorIdB) == keptAnchorSet.end()) {
                 continue;
             }
-            Shasta2AnchorPair anchorPair(*shasta2Anchors, anchorIdA, anchorIdB, true);
-            if(anchorPair.orientedReadIds.empty()) {
-                continue;
-            }
             restrictedEdges.push_back(RestrictedEdge{
-                anchorIdA, anchorIdB, counts[i], std::move(anchorPair)});
+                anchorIdA, anchorIdB, counts[i]});
         }
     }
 
@@ -161,17 +156,8 @@ void Assembler::testAnchorWindowsCleanLongestRead(
 
     // Write edges.
     for(const RestrictedEdge& edge : restrictedEdges) {
-        string sourceOrientation = "+";
-        string targetOrientation = "+";
-        if(!edge.anchorPair.orientedReadIds.empty()) {
-            if(edge.anchorPair.orientedReadIds[0].getStrand() == 1) {
-                sourceOrientation = "-";
-                targetOrientation = "-";
-            }
-        }
-        gfa << "L\t" << edge.anchorIdA << "\t" << sourceOrientation << "\t"
-            << edge.anchorIdB << "\t" << targetOrientation
-            << "\t0M"
+        gfa << "L\t" << edge.anchorIdA << "\t+\t"
+            << edge.anchorIdB << "\t+\t0M"
             << "\tRC:i:" << edge.coverage
             << "\n";
     }
