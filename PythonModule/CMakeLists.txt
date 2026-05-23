@@ -49,7 +49,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../src/edlib/include)
+include_directories(../src ../src/edlib/include ../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
 
 # # Additional link directory.
 # link_directories(~/.dinaraBuild/abpoa/abPOA/lib)
@@ -110,7 +110,7 @@ endif()
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule
-    atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB})
+    dinara_snarls atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)
