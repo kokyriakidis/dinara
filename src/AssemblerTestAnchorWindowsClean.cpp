@@ -137,6 +137,29 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     cout << timestamp << "Found " << connectingEdgeCoverage.size()
          << " inter-window connecting edges." << endl;
 
+    // Count common oriented reads between two anchors using two-pointer merge.
+    // Both anchors' marker info spans are sorted by orientedReadId.
+    auto commonReadCount = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> uint64_t {
+        const auto a = (*shasta2Anchors)[anchorIdA];
+        const auto b = (*shasta2Anchors)[anchorIdB];
+        uint64_t count = 0;
+        uint64_t i = 0, j = 0;
+        while(i < a.size() && j < b.size()) {
+            const auto oidA = a[i].orientedReadId;
+            const auto oidB = b[j].orientedReadId;
+            if(oidA == oidB) {
+                ++count;
+                ++i;
+                ++j;
+            } else if(oidA < oidB) {
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        return count;
+    };
+
     // Write GFA.
     const string gfaFileName = "AnchorWindowsClean.gfa";
     ofstream gfa(gfaFileName);
@@ -166,8 +189,11 @@ void Assembler::testAnchorWindowsCleanLongestRead(
 
         // Intra-window edges: consecutive backbone pairs.
         for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
-            gfa << "L\t" << backboneJourney[pos] << "\t+\t"
-                << backboneJourney[pos + 1] << "\t+\t0M\n";
+            const Shasta2AnchorId idA = backboneJourney[pos];
+            const Shasta2AnchorId idB = backboneJourney[pos + 1];
+            gfa << "L\t" << idA << "\t+\t"
+                << idB << "\t+\t0M"
+                << "\tRC:i:" << commonReadCount(idA, idB) << "\n";
             ++totalIntraEdges;
         }
 
@@ -182,11 +208,13 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             // Chain: anchorIdA -> intermediates -> anchorIdB.
             Shasta2AnchorId prev = altPath.anchorIdA;
             for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M\n";
+                gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M"
+                    << "\tRC:i:" << commonReadCount(prev, mid) << "\n";
                 ++totalAltEdges;
                 prev = mid;
             }
-            gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M\n";
+            gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M"
+                << "\tRC:i:" << commonReadCount(prev, altPath.anchorIdB) << "\n";
             ++totalAltEdges;
         }
     }
@@ -194,9 +222,10 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     // Write inter-window connecting edges.
     uint64_t totalInterEdges = 0;
     for(const auto& [edge, coverage] : connectingEdgeCoverage) {
+        static_cast<void>(coverage);
         gfa << "L\t" << edge.anchorIdA << "\t+\t"
             << edge.anchorIdB << "\t+\t0M"
-            << "\tRC:i:" << coverage << "\n";
+            << "\tRC:i:" << commonReadCount(edge.anchorIdA, edge.anchorIdB) << "\n";
         ++totalInterEdges;
     }
 
