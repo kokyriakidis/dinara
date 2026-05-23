@@ -26,3 +26,9 @@ target_link_libraries(dinara_snarls PUBLIC
 
 # Match the parent project's C++ standard.
 set_target_properties(dinara_snarls PROPERTIES CXX_STANDARD 17)
+
+# Build position-independent code so the static library can be linked
+# into shared libraries (e.g. the Python module).
+set_target_properties(dinara_snarls PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
+set_target_properties(handlegraph_static PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
+set_target_properties(structures_static PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
