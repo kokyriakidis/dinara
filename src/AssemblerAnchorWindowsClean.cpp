@@ -425,21 +425,26 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         // Deduplicate alternate path intermediates: each intermediate anchor
-        // must appear in exactly one alternate path. Sort paths by pillar A
-        // backbone position (most forward first), then assign each intermediate
-        // to the first path that claims it.
+        // must appear in exactly one alternate path. If the same intermediate
+        // appears in multiple paths, assign it to the path with the smallest
+        // span (pillarB - pillarA backbone positions). This keeps alternate
+        // paths local, producing tight bubbles rather than long crossing edges.
         {
-            // Sort paths by pillar A backbone position, most forward first.
+            auto pathSpan = [&](const AnchorWindowAlternatePath& p) -> uint32_t {
+                auto itA = backboneAnchorToPos.find(uint64_t(p.anchorIdA));
+                auto itB = backboneAnchorToPos.find(uint64_t(p.anchorIdB));
+                const uint32_t posA = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
+                const uint32_t posB = (itB != backboneAnchorToPos.end()) ? itB->second : 0;
+                return (posB > posA) ? (posB - posA) : 0;
+            };
+
+            // Sort paths by span (smallest first) so tighter bubbles claim first.
             std::sort(window.alternatePaths.begin(), window.alternatePaths.end(),
                 [&](const AnchorWindowAlternatePath& a, const AnchorWindowAlternatePath& b) {
-                    auto itA = backboneAnchorToPos.find(uint64_t(a.anchorIdA));
-                    auto itB = backboneAnchorToPos.find(uint64_t(b.anchorIdA));
-                    const uint32_t posA = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
-                    const uint32_t posB = (itB != backboneAnchorToPos.end()) ? itB->second : 0;
-                    return posA > posB;
+                    return pathSpan(a) < pathSpan(b);
                 });
 
-            // Assign each intermediate to the first (most forward) path that contains it.
+            // Assign each intermediate to the first (tightest) path that contains it.
             std::unordered_set<uint64_t> claimedIntermediates;
             vector<AnchorWindowAlternatePath> filteredPaths;
             for(AnchorWindowAlternatePath& altPath : window.alternatePaths) {
