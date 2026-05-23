@@ -148,12 +148,14 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     uint64_t totalVertices = 0;
     uint64_t totalIntraEdges = 0;
 
-    // Write window chains.
+    uint64_t totalAltEdges = 0;
+
+    // Write window chains and alternate paths.
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
-        // Vertices.
+        // Backbone vertices.
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
             gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
             ++totalVertices;
@@ -164,6 +166,23 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             gfa << "L\t" << backboneJourney[pos] << "\t+\t"
                 << backboneJourney[pos + 1] << "\t+\t0M\n";
             ++totalIntraEdges;
+        }
+
+        // Alternate path vertices and edges.
+        for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
+            for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                gfa << "S\t" << mid << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+            // Chain: anchorIdA -> intermediates -> anchorIdB.
+            Shasta2AnchorId prev = altPath.anchorIdA;
+            for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M\n";
+                ++totalAltEdges;
+                prev = mid;
+            }
+            gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M\n";
+            ++totalAltEdges;
         }
     }
 
@@ -180,6 +199,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
          << ": " << anchorWindows.size() << " chains, "
          << totalVertices << " vertices, "
          << totalIntraEdges << " intra-window edges, "
+         << totalAltEdges << " alternate-path edges, "
          << totalInterEdges << " inter-window edges." << endl;
 
     // Write CSV for Bandage coloring: each anchor gets a color based on its window.

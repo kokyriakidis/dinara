@@ -17,6 +17,16 @@ struct AnchorWindowReadInterval {
     uint32_t touchedAnchorCount = 0; // Anchors shared with the backbone in this interval.
 };
 
+// An alternate path between two consecutive LIS (backbone-shared) anchors,
+// formed by the non-shared anchors of a non-direct overlap read.
+// The path goes: anchorIdA -> intermediateAnchorIds[0] -> ... -> anchorIdB
+// where anchorIdA and anchorIdB are backbone anchors (LIS pillars).
+struct AnchorWindowAlternatePath {
+    Shasta2AnchorId anchorIdA;  // LIS pillar (backbone anchor) at start.
+    Shasta2AnchorId anchorIdB;  // LIS pillar (backbone anchor) at end.
+    std::vector<Shasta2AnchorId> intermediateAnchorIds; // Non-backbone anchors between pillars.
+};
+
 // An anchor window: a contiguous interval on a backbone read's journey,
 // plus the intervals on all other reads that share anchors with the backbone.
 struct AnchorWindow {
@@ -26,6 +36,10 @@ struct AnchorWindow {
     uint32_t backboneEnd = 0;   // Exclusive journey position on backbone.
     uint32_t claimedAnchorCount = 0;
     std::vector<AnchorWindowReadInterval> readIntervals;
+
+    // Alternate paths from non-direct overlap reads.
+    // These form parallel chains between backbone anchors at het sites.
+    std::vector<AnchorWindowAlternatePath> alternatePaths;
 };
 
 } // namespace dinara

@@ -272,16 +272,31 @@ void Assembler::computeAnchorWindowsClean(
             }
         }
 
+        // Build the set of direct cis overlap oriented read IDs for the backbone
+        // using the read graph (which contains only cis overlaps).
+        std::unordered_set<uint32_t> directCisOverlapReads;
+        {
+            const auto backboneEdges = readGraph.connectivity[backboneOid.getValue()];
+            for(const uint32_t edgeId : backboneEdges) {
+                const auto& edge = readGraph.edges[edgeId];
+                const OrientedReadId partner = edge.getOther(backboneOid);
+                directCisOverlapReads.insert(partner.getValue());
+            }
+        }
+
         // For each touched read:
         // 1. Find shared anchors (present in both the read's journey and the backbone).
         // 2. Map them to backbone positions.
         // 3. Compute LIS of backbone positions to enforce backbone order.
         // 4. Record the span for later claiming.
+        // 5. For non-direct overlaps, extract alternate paths between LIS pillars.
         for(const uint32_t oidValue : touchedOrientedReads) {
             const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
             if(oid.getValue() >= shasta2Journeys->size()) continue;
             const auto journey = (*shasta2Journeys)[oid];
             if(journey.empty()) continue;
+
+            const bool isDirectCis = (directCisOverlapReads.find(oidValue) != directCisOverlapReads.end());
 
             // Step 1-2: Find shared anchors and their backbone positions.
             vector<uint32_t> sharedReadPositions;
@@ -317,6 +332,28 @@ void Assembler::computeAnchorWindowsClean(
                 convergentBegin,
                 convergentEnd,
                 convergentCount});
+
+            // Step 5: For non-direct overlaps, extract alternate paths.
+            // Between consecutive LIS pillars, collect the non-shared anchors
+            // from the read's journey. These form alternate paths (bubbles).
+            if(!isDirectCis && lisIndices.size() >= 2) {
+                for(uint64_t li = 0; li + 1 < lisIndices.size(); li++) {
+                    const uint32_t readPosA = sharedReadPositions[lisIndices[li]];
+                    const uint32_t readPosB = sharedReadPositions[lisIndices[li + 1]];
+                    // Collect intermediate anchors between the two LIS pillars.
+                    if(readPosB > readPosA + 1) {
+                        AnchorWindowAlternatePath altPath;
+                        altPath.anchorIdA = journey[readPosA];
+                        altPath.anchorIdB = journey[readPosB];
+                        for(uint32_t rp = readPosA + 1; rp < readPosB; rp++) {
+                            altPath.intermediateAnchorIds.push_back(journey[rp]);
+                        }
+                        if(!altPath.intermediateAnchorIds.empty()) {
+                            window.alternatePaths.push_back(std::move(altPath));
+                        }
+                    }
+                }
+            }
         }
 
         // Claim all anchors across all spans (backbone + touched reads) and their RC.

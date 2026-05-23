@@ -155,7 +155,44 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    const uint64_t intraEdgeCount = num_edges(anchorGraph);
+    // Alternate path edges: for each alternate path, add a chain
+    // anchorIdA -> intermediate[0] -> ... -> intermediate[N-1] -> anchorIdB.
+    // These form parallel paths (bubbles) at het sites.
+    uint64_t alternatePathEdgeCount = 0;
+    for(const AnchorWindow& window : anchorWindows) {
+        for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
+            // Build the chain: A -> intermediates -> B.
+            Shasta2AnchorId prevAnchorId = altPath.anchorIdA;
+            for(const Shasta2AnchorId midAnchorId : altPath.intermediateAnchorIds) {
+                Shasta2AnchorPair anchorPair(anchors, prevAnchorId, midAnchorId, false);
+                if(!anchorPair.orientedReadIds.empty()) {
+                    edge_descriptor e;
+                    tie(e, ignore) = add_edge(
+                        anchorPair.anchorIdA,
+                        anchorPair.anchorIdB,
+                        Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                        anchorGraph);
+                    anchorGraph[e].useForAssembly = true;
+                    ++alternatePathEdgeCount;
+                }
+                prevAnchorId = midAnchorId;
+            }
+            // Last edge: last intermediate -> anchorIdB.
+            Shasta2AnchorPair anchorPair(anchors, prevAnchorId, altPath.anchorIdB, false);
+            if(!anchorPair.orientedReadIds.empty()) {
+                edge_descriptor e;
+                tie(e, ignore) = add_edge(
+                    anchorPair.anchorIdA,
+                    anchorPair.anchorIdB,
+                    Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+                    anchorGraph);
+                anchorGraph[e].useForAssembly = true;
+                ++alternatePathEdgeCount;
+            }
+        }
+    }
+
+    const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
 
     // Inter-window edges: walk each read's journey and connect consecutive
     // windows. When a read transitions from window A to window B, add an
@@ -217,6 +254,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "The anchor graph has " << num_vertices(*this)
          << " vertices, " << num_edges(*this) << " edges"
          << " (" << intraEdgeCount << " intra-window, "
+         << alternatePathEdgeCount << " alternate-path, "
          << interEdgeCount << " inter-window)." << endl;
 }
 
