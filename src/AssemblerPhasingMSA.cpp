@@ -1065,7 +1065,11 @@ static void msaProcessWindow(
     struct CandOrigin { uint32_t siteIdx; uint32_t altIdx; };
     vector<CandOrigin> candOrigins;
 
-    uint32_t repeatFiltered = 0;
+    constexpr uint32_t msaHpRunLen = 3;          // min homopolymer run length for SNP filtering
+    constexpr uint32_t msaNoisyFlank = 10;       // extend noisy seeds by this many bp
+
+    uint32_t repeatFiltered = 0, strandBiasFiltered = 0;
+    uint32_t indelProxFiltered = 0, hpFiltered = 0;
     for (uint32_t si = 0; si < uint32_t(allSites.size()); si++) {
         const auto& site = allSites[si];
         const int refCov = int(site.refReads.size());
@@ -1110,6 +1114,15 @@ static void msaProcessWindow(
             cand.alleCovs = {refCov, altCov};
             cand.nUniqAlles = 2;
 
+            // Count fwd/rev strand alt reads for strand bias.
+            int fwdAlt = 0, revAlt = 0;
+            for (const auto& oid : alt.reads) {
+                if (oid.getStrand() == 0) fwdAlt++;
+                else revAlt++;
+            }
+            cand.fwdAlt = fwdAlt;
+            cand.revAlt = revAlt;
+
             // Classify per-pair.
             if (af < opts.minAf) {
                 cand.category = KmVariantCategory::LowAlleleFraction;
@@ -1124,6 +1137,52 @@ static void msaProcessWindow(
                 cand.isHomopolymerIndel = true;
                 repeatFiltered++;
             } else {
+                // SNP — apply additional filters.
+
+                // 1. Strand bias: Fisher exact test on fwd/rev alt counts.
+                const int expected = (fwdAlt + revAlt) / 2;
+                if (expected > 0) {
+                    const double p = kmFisherExactTwoTail(fwdAlt, revAlt, expected, expected);
+                    if (p < opts.strandBiasPval) {
+                        cand.category = KmVariantCategory::StrandBias;
+                        cand.categoryFlag = KM_NON_VAR;
+                        strandBiasFiltered++;
+                        scratch.candidates.push_back(move(cand));
+                        candOrigins.push_back({si, ai});
+                        continue;
+                    }
+                }
+
+                // 2. Homopolymer-adjacent SNP: filter if the SNP position is
+                //    flanked by a homopolymer run of length >= msaHpRunLen.
+                if (cand.key.pos < bbLen) {
+                    uint8_t base = bbSeq[cand.key.pos];
+                    // Check forward run.
+                    uint32_t fwdRun = 0;
+                    for (uint32_t p = cand.key.pos + 1; p < bbLen && bbSeq[p] == base; p++)
+                        fwdRun++;
+                    // Check backward run.
+                    uint32_t bwdRun = 0;
+                    for (int64_t p = int64_t(cand.key.pos) - 1; p >= 0 && bbSeq[p] == base; p--)
+                        bwdRun++;
+                    // Also check if the alt base forms a homopolymer with flanking bases.
+                    uint8_t altBase = cand.key.altBase;
+                    uint32_t altFwd = 0, altBwd = 0;
+                    for (uint32_t p = cand.key.pos + 1; p < bbLen && bbSeq[p] == altBase; p++)
+                        altFwd++;
+                    for (int64_t p = int64_t(cand.key.pos) - 1; p >= 0 && bbSeq[p] == altBase; p--)
+                        altBwd++;
+
+                    if (fwdRun + bwdRun >= msaHpRunLen || altFwd + altBwd >= msaHpRunLen) {
+                        cand.category = KmVariantCategory::NonVariant;
+                        cand.categoryFlag = KM_NON_VAR;
+                        hpFiltered++;
+                        scratch.candidates.push_back(move(cand));
+                        candOrigins.push_back({si, ai});
+                        continue;
+                    }
+                }
+
                 cand.category = KmVariantCategory::CleanHetSnp;
                 cand.categoryFlag = KM_GERMLINE_CLEAN;
             }
@@ -1131,9 +1190,50 @@ static void msaProcessWindow(
             candOrigins.push_back({si, ai});
         }
     }
+    // Noisy seed containment pass (pgphase post_process_noisy_regs + apply_noisy_containment_filter).
+    // RepeatHetIndel candidates seed noisy regions. Extend, merge, then filter
+    // any CleanHetSnp fully contained within a noisy region.
+    {
+        vector<pair<uint32_t, uint32_t>> noisySeeds;
+        for (const auto& c : scratch.candidates) {
+            if (c.category == KmVariantCategory::RepeatHetIndel) {
+                uint32_t pos = c.key.pos;
+                uint32_t len = max(uint32_t(c.key.refLen), uint32_t(c.key.altLen));
+                uint32_t start = (pos > msaNoisyFlank) ? pos - msaNoisyFlank : 0;
+                uint32_t end = pos + len + msaNoisyFlank;
+                noisySeeds.push_back({start, end});
+            }
+        }
+        if (!noisySeeds.empty()) {
+            // Sort and merge.
+            sort(noisySeeds.begin(), noisySeeds.end());
+            vector<pair<uint32_t, uint32_t>> merged;
+            merged.push_back(noisySeeds[0]);
+            for (size_t i = 1; i < noisySeeds.size(); i++) {
+                if (noisySeeds[i].first <= merged.back().second)
+                    merged.back().second = max(merged.back().second, noisySeeds[i].second);
+                else
+                    merged.push_back(noisySeeds[i]);
+            }
+            // Filter CleanHetSnp candidates contained in noisy seeds.
+            for (auto& c : scratch.candidates) {
+                if (c.category != KmVariantCategory::CleanHetSnp) continue;
+                for (const auto& [s, e] : merged) {
+                    if (c.key.pos >= s && c.key.pos < e) {
+                        c.category = KmVariantCategory::NonVariant;
+                        c.categoryFlag = KM_NON_VAR;
+                        indelProxFiltered++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // Print classification summary with per-category site indices.
     uint32_t cleanHet = 0, nLowAf = 0, nCleanHom = 0;
-    vector<uint32_t> idxCleanHet, idxRepeat, idxLowAf, idxCleanHom;
+    vector<uint32_t> idxCleanHet, idxRepeat, idxLowAf, idxCleanHom,
+                     idxStrandBias, idxIndelProx, idxHpAdj;
     for (uint32_t ci = 0; ci < uint32_t(scratch.candidates.size()); ci++) {
         const auto& c = scratch.candidates[ci];
         if (c.category == KmVariantCategory::CleanHetSnp ||
@@ -1145,6 +1245,12 @@ static void msaProcessWindow(
             nLowAf++; idxLowAf.push_back(ci);
         } else if (c.category == KmVariantCategory::CleanHom) {
             nCleanHom++; idxCleanHom.push_back(ci);
+        } else if (c.category == KmVariantCategory::StrandBias) {
+            idxStrandBias.push_back(ci);
+        } else if (c.category == KmVariantCategory::NonVariant) {
+            // Could be indelProx or hpAdj — distinguish by checking position.
+            // For simplicity, just collect them all.
+            idxIndelProx.push_back(ci);
         }
     }
     auto printCandList = [&](const char* label, const vector<uint32_t>& idxs) {
@@ -1165,10 +1271,15 @@ static void msaProcessWindow(
          << " (from " << allSites.size() << " sites)"
          << " cleanHet=" << cleanHet
          << " repeatIndel=" << repeatFiltered
+         << " strandBias=" << strandBiasFiltered
+         << " indelProx=" << indelProxFiltered
+         << " hpAdj=" << hpFiltered
          << " lowAF=" << nLowAf
          << " cleanHom=" << nCleanHom << endl;
     printCandList("cleanHet", idxCleanHet);
     printCandList("repeatIndel", idxRepeat);
+    printCandList("strandBias", idxStrandBias);
+    printCandList("indelProx/hpAdj", idxIndelProx);
     printCandList("lowAF", idxLowAf);
     printCandList("cleanHom", idxCleanHom);
     counters.hetSitesUsed += cleanHet;

@@ -1004,62 +1004,7 @@ static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen,
 
 /// Log of the hypergeometric PMF term (longcallD `log_hypergeometric`, lgamma only).
 /// 2x2 table: row1 (a,b), row2 (c,d).
-static double kmLogHypergeom(int a, int b, int c, int d)
-{
-    const int n1 = a + b;
-    const int n2 = c + d;
-    const int m1 = a + c;
-    const int m2 = b + d;
-    const int N  = n1 + n2;
-    if (N <= 0) return -std::numeric_limits<double>::infinity();
-    if (n1 > n2) return kmLogHypergeom(c, d, a, b);
-    if (m1 > m2) return kmLogHypergeom(b, a, d, c);
-    return std::lgamma(double(n1 + 1)) + std::lgamma(double(n2 + 1)) +
-           std::lgamma(double(m1 + 1)) + std::lgamma(double(m2 + 1)) -
-          (std::lgamma(double(a  + 1)) + std::lgamma(double(b  + 1)) +
-           std::lgamma(double(c  + 1)) + std::lgamma(double(d  + 1)) +
-           std::lgamma(double(N  + 1)));
-}
-
-/// Two-tailed Fisher exact test (longcallD `fisher_exact`).
-/// Returns p-value in [0,1].
-static double kmFisherExactTwoTail(int a, int b, int c, int d)
-{
-    if (a + b + c + d <= 0) return 1.0;
-    const double p_observed = std::exp(kmLogHypergeom(a, b, c, d));
-    double total_p = 0.0;
-    int min_a = (0 > (a + c) - (b + d)) ? 0 : (a + c) - (b + d);
-    const int max_a = (a + b) < (a + c) ? (a + b) : (a + c);
-    const int denom = a + b + c + d;
-    const int mode_a = denom > 0
-        ? int((double(a + b) * double(a + c)) / double(denom))
-        : 0;
-    for (int delta = 0; delta <= max_a - min_a; ++delta) {
-        int cur_a = mode_a + delta;
-        if (cur_a <= max_a) {
-            int cur_b = (a + b) - cur_a;
-            int cur_c = (a + c) - cur_a;
-            int cur_d = (b + d) - cur_b;
-            if (cur_b >= 0 && cur_c >= 0 && cur_d >= 0) {
-                const double p = std::exp(kmLogHypergeom(cur_a, cur_b, cur_c, cur_d));
-                if (p <= p_observed + DBL_EPSILON) total_p += p;
-            }
-        }
-        if (delta > 0) {
-            cur_a = mode_a - delta;
-            if (cur_a >= min_a) {
-                int cur_b = (a + b) - cur_a;
-                int cur_c = (a + c) - cur_a;
-                int cur_d = (b + d) - cur_b;
-                if (cur_b >= 0 && cur_c >= 0 && cur_d >= 0) {
-                    const double p = std::exp(kmLogHypergeom(cur_a, cur_b, cur_c, cur_d));
-                    if (p <= p_observed + DBL_EPSILON) total_p += p;
-                }
-            }
-        }
-    }
-    return total_p;
-}
+// kmLogHypergeom and kmFisherExactTwoTail are now inline in PhasingKmeansTypes.hpp.
 
 // ============================================================================
 // Step 4: Classify candidates and detect noisy regions
