@@ -1481,13 +1481,6 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                     continue;
                 }
 
-                // Only consider cis (1) or unclassified (0) overlaps.
-                // Trans (2) and cisDifferentCopy (3) are from different
-                // haplotypes and should not compete in dedup.
-                if(ad.hifiasmEcMatchState0 > 1 || ad.hifiasmEcMatchState1 > 1) {
-                    continue;
-                }
-
                 // Self-overlaps should not exist; remove if found.
                 if(ad.readIds[0] == ad.readIds[1]) {
                     alignmentData[alignmentId].addDeleteReasonsBoth(
