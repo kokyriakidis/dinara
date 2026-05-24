@@ -674,6 +674,23 @@ static void msaProcessWindow(
         for (const auto& alt : s.altAlleles)
             cout << " " << alt.type << ":" << alt.sequence << "(" << alt.reads.size() << ")";
         cout << endl;
+        // For SNP sites, show which reads carry ref vs alt.
+        if (!s.altAlleles.empty()) {
+            bool hasSNP = false;
+            for (const auto& alt : s.altAlleles)
+                if (alt.type == "SNP") { hasSNP = true; break; }
+            if (hasSNP) {
+                cout << "      ref reads:";
+                for (const auto& oid : s.refReads) cout << " " << oid;
+                cout << endl;
+                for (const auto& alt : s.altAlleles) {
+                    if (alt.type != "SNP") continue;
+                    cout << "      alt " << alt.sequence << " reads:";
+                    for (const auto& oid : alt.reads) cout << " " << oid;
+                    cout << endl;
+                }
+            }
+        }
     }
 
     if (allSites.empty()) { counters.windowsProcessed++; return; }
