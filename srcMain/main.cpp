@@ -1041,7 +1041,7 @@ void dinara::main::assemble(
 
 
     // assembler.phaseOverlaps(threadCount);
-    assembler.phaseOverlapsKmeans(threadCount);
+    // assembler.phaseOverlapsKmeans(threadCount);
 
     // Keep one best chain per read pair per strand (hifiasm dedup port).
     // Same-strand and opposite-strand overlaps are deduped independently,
@@ -1062,31 +1062,15 @@ void dinara::main::assemble(
     //    Port of ma_hit_sub. Default min_dp=0 (asm_opt.min_overlap_coverage)
     //    makes this a no-op (just initializes validReadIntervals to full read
     //    length), but it must run because steps 3-5 depend on the intervals.
-    assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
+    // assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
 
-    // 3. Chimeric read detection: flag reads where left-side and right-side
-    //    overlaps don't connect (gap in the middle).
-    //    Port of detect_chimeric_reads. Uses max_ov_diff_final*2.0 = 0.06.
-    assembler.detectChimericReads(threadCount);
+    // assembler.detectChimericReads(threadCount);
 
-    // 4. Clip overlap coordinates to trimmed coverage_cut intervals and delete
-    //    internal/short overlaps via ma_hit2arc classification.
-    //    Port of ma_hit_cut + ma_hit_flt.
-    //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
-    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
-    // 5. Flag and remove contained reads. For each containment overlap, the
-    //    contained read is deleted entirely. Containment chains resolved
-    //    transitively.
-    //    Port of ma_hit_contained_advance.
-    //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
-    // assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
-    assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
-    // 6. Rescue overlaps with directional cis/trans disagreement.
-    //    Port of try_rescue_overlaps.
-    //    skipDeleted=true for ONT (hifiasm's is_del=1).
-    assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
+    // assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
 
     // 7. Build read graph from surviving overlaps.
     //    Keeps overlaps that are not deleted and not trans on either side.
@@ -1116,19 +1100,14 @@ void dinara::main::assemble(
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
 
-
-
-
-
-
-
     // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
     // This reduces unreliable anchors and artifacts in repetitive regions.
     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
 
     // Filter marker graph vertices whose marker k-mers have low sequence complexity
     // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
-    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    // DISABLED: removes ~99% of vertices, leaving too few anchors for MSA phasing.
+    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
     // Filter marker graph vertices where reads were grouped by transitive collapse
     // at k-mer positions outside their chaining range.
@@ -1139,8 +1118,8 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
-    const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
+    const uint64_t minAnchorCoverage = 2;
+    const uint64_t maxAnchorCoverage = 5 * coveragePeak;
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
@@ -1179,6 +1158,10 @@ void dinara::main::assemble(
         threadCount,
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
+
+    // MSA-based overlap phasing (runs after journeys are available).
+    // Overwrites hifiasmEcMatchState for overlaps it can classify.
+    assembler.phaseOverlapsMSA(threadCount);
 
     // Test computeAnchorWindowsClean across all reads and write GFA.
     assembler.testAnchorWindowsCleanLongestRead(threadCount);

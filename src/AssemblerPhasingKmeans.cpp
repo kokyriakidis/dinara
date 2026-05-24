@@ -1824,7 +1824,7 @@ void dinara::kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, ui
 // Step 7: Write results
 // ============================================================================
 
-static void kmWriteResults(
+void dinara::kmWriteResults(
     Assembler& assembler, ReadId backboneReadId, const KmScratchpad& scratch)
 {
     // Check if any overlap was actually phased (hap 1 or 2).
@@ -1858,7 +1858,7 @@ static void kmWriteResults(
 /// Each round recounts alleles from the remaining cis set, reclassifies,
 /// and runs k-means. Overlaps that split into hap 2 are peeled off as
 /// matchState=3. Repeats until no overlaps split or no het sites remain.
-static void kmRefineCis(
+void dinara::kmRefineCis(
     Assembler& assembler, ReadId backboneReadId,
     KmScratchpad& scratch, const KmPhasingOptions& opts,
     uint32_t bbLen, bool dbg)
