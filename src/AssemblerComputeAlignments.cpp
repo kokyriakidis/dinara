@@ -1481,6 +1481,14 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                     continue;
                 }
 
+                // Only dedup cis (1) or unclassified (0) chains.
+                // Trans (2) and cisDifferentCopy (3) chains represent
+                // different structural relationships and should not
+                // compete with cis chains.
+                if(ad.hifiasmEcMatchState0 > 1 || ad.hifiasmEcMatchState1 > 1) {
+                    continue;
+                }
+
                 // Self-overlaps should not exist; remove if found.
                 if(ad.readIds[0] == ad.readIds[1]) {
                     alignmentData[alignmentId].addDeleteReasonsBoth(
