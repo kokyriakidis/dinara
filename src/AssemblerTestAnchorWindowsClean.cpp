@@ -62,6 +62,31 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     cout << timestamp << "computeAnchorWindowsClean produced "
          << anchorWindows.size() << " windows." << endl;
 
+    // Run CIGAR-based SNP detection on each window.
+    {
+        cout << timestamp << "Running CIGAR-based SNP detection on "
+             << anchorWindows.size() << " windows..." << endl;
+        const auto t0 = steady_clock::now();
+        uint64_t hetWindows = 0;
+        uint64_t totalSnps = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            window.cleanHetSnpCount = cigarDetectSnpsInWindow(
+                window, *shasta2Anchors, *shasta2Journeys);
+            if(window.cleanHetSnpCount > 0) {
+                hetWindows++;
+                totalSnps += window.cleanHetSnpCount;
+            }
+        }
+        const auto t1 = steady_clock::now();
+        const double secs = seconds(t1 - t0);
+        cout << timestamp << "CIGAR-based SNP detection complete."
+             << " hetWindows=" << hetWindows
+             << " homWindows=" << (anchorWindows.size() - hetWindows)
+             << " totalCleanHetSnps=" << totalSnps
+             << " seconds=" << fixed << setprecision(2) << secs
+             << defaultfloat << endl;
+    }
+
     // Build anchorId -> windowId and anchorId -> backbone position maps.
     // Only backbone anchors are "kept" (they define the window chain).
     const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
@@ -214,25 +239,27 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             ++totalIntraEdges;
         }
 
-        // Alternate path vertices and edges.
-        for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-            for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                if(emittedVertices.insert(uint64_t(mid)).second) {
-                    gfa << "S\t" << mid << "\t*\tLN:i:1\n";
-                    ++totalVertices;
+        // Alternate path vertices and edges — only for het windows.
+        if(window.cleanHetSnpCount > 0) {
+            for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
+                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                    if(emittedVertices.insert(uint64_t(mid)).second) {
+                        gfa << "S\t" << mid << "\t*\tLN:i:1\n";
+                        ++totalVertices;
+                    }
                 }
-            }
-            // Chain: anchorIdA -> intermediates -> anchorIdB.
-            Shasta2AnchorId prev = altPath.anchorIdA;
-            for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M"
-                    << "\tRC:i:" << commonReadCount(prev, mid) << "\n";
+                // Chain: anchorIdA -> intermediates -> anchorIdB.
+                Shasta2AnchorId prev = altPath.anchorIdA;
+                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                    gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M"
+                        << "\tRC:i:" << commonReadCount(prev, mid) << "\n";
+                    ++totalAltEdges;
+                    prev = mid;
+                }
+                gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M"
+                    << "\tRC:i:" << commonReadCount(prev, altPath.anchorIdB) << "\n";
                 ++totalAltEdges;
-                prev = mid;
             }
-            gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M"
-                << "\tRC:i:" << commonReadCount(prev, altPath.anchorIdB) << "\n";
-            ++totalAltEdges;
         }
     }
 
@@ -301,4 +328,224 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     cout << timestamp << "testAnchorWindowsCleanLongestRead ends."
          << " seconds=" << fixed << setprecision(2) << elapsedSeconds
          << defaultfloat << endl;
+}
+
+
+// Write AnchorWindowsClean.gfa and .csv from pre-computed windows.
+void Assembler::writeAnchorWindowsCleanGfa(
+    const vector<AnchorWindow>& anchorWindows)
+{
+    DINARA_ASSERT(shasta2Anchors);
+    DINARA_ASSERT(shasta2Journeys);
+
+    const uint64_t readCount = reads->readCount();
+    const uint64_t anchorCount = shasta2Anchors->size();
+
+    // Build anchorId -> windowId and anchorId -> backbone position maps.
+    const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    vector<uint32_t> anchorToWindow(anchorCount, noWindow);
+    vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
+    for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            const Shasta2AnchorId anchorId = backboneJourney[pos];
+            anchorToWindow[uint64_t(anchorId)] = windowId;
+            anchorToBackbonePos[uint64_t(anchorId)] = pos;
+        }
+    }
+
+    // Find inter-window connecting edges by walking read journeys.
+    struct WindowPairEdge {
+        Shasta2AnchorId anchorIdA;
+        Shasta2AnchorId anchorIdB;
+        uint32_t backbonePosA;
+        uint32_t backbonePosB;
+    };
+    map<pair<uint32_t, uint32_t>, WindowPairEdge> windowPairEdges;
+
+    const uint64_t orientedReadCount = 2 * readCount;
+    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
+        const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+        if(oid.getValue() >= shasta2Journeys->size()) continue;
+        const auto journey = (*shasta2Journeys)[oid];
+        if(journey.empty()) continue;
+
+        uint32_t currentWindow = noWindow;
+        Shasta2AnchorId lastAnchorInCurrentWindow = 0;
+        uint32_t lastBackbonePosInCurrentWindow = 0;
+
+        for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+            const Shasta2AnchorId anchorId = journey[pos];
+            if(uint64_t(anchorId) >= anchorCount) continue;
+            const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
+            if(windowId == noWindow) continue;
+
+            const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
+
+            if(windowId == currentWindow) {
+                if(backbonePos > lastBackbonePosInCurrentWindow) {
+                    lastAnchorInCurrentWindow = anchorId;
+                    lastBackbonePosInCurrentWindow = backbonePos;
+                }
+            } else {
+                if(currentWindow != noWindow) {
+                    auto key = make_pair(currentWindow, windowId);
+                    auto it = windowPairEdges.find(key);
+                    if(it == windowPairEdges.end()) {
+                        windowPairEdges[key] = WindowPairEdge{
+                            lastAnchorInCurrentWindow, anchorId,
+                            lastBackbonePosInCurrentWindow, backbonePos};
+                    } else {
+                        if(lastBackbonePosInCurrentWindow > it->second.backbonePosA) {
+                            it->second.anchorIdA = lastAnchorInCurrentWindow;
+                            it->second.backbonePosA = lastBackbonePosInCurrentWindow;
+                        }
+                        if(backbonePos < it->second.backbonePosB) {
+                            it->second.anchorIdB = anchorId;
+                            it->second.backbonePosB = backbonePos;
+                        }
+                    }
+                }
+                currentWindow = windowId;
+                lastAnchorInCurrentWindow = anchorId;
+                lastBackbonePosInCurrentWindow = backbonePos;
+            }
+        }
+    }
+
+    cout << timestamp << "Found " << windowPairEdges.size()
+         << " inter-window connecting edges." << endl;
+
+    // Count common oriented reads between two anchors.
+    auto commonReadCount = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> uint64_t {
+        const auto a = (*shasta2Anchors)[anchorIdA];
+        const auto b = (*shasta2Anchors)[anchorIdB];
+        uint64_t count = 0;
+        uint64_t i = 0, j = 0;
+        while(i < a.size() && j < b.size()) {
+            const auto oidA = a[i].orientedReadId;
+            const auto oidB = b[j].orientedReadId;
+            if(oidA == oidB) { ++count; ++i; ++j; }
+            else if(oidA < oidB) { ++i; }
+            else { ++j; }
+        }
+        return count;
+    };
+
+    // Write GFA.
+    const string gfaFileName = "AnchorWindowsClean.gfa";
+    ofstream gfa(gfaFileName);
+    if(!gfa) {
+        throw runtime_error("Cannot open " + gfaFileName + " for writing.");
+    }
+    gfa << "H\tVN:Z:1.0\n";
+
+    uint64_t totalVertices = 0;
+    uint64_t totalIntraEdges = 0;
+    uint64_t totalAltEdges = 0;
+    unordered_set<uint64_t> emittedVertices;
+
+    for(const AnchorWindow& window : anchorWindows) {
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+        // Backbone vertices.
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            if(emittedVertices.insert(uint64_t(backboneJourney[pos])).second) {
+                gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+        }
+
+        // Intra-window edges: consecutive backbone pairs.
+        for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
+            const Shasta2AnchorId idA = backboneJourney[pos];
+            const Shasta2AnchorId idB = backboneJourney[pos + 1];
+            gfa << "L\t" << idA << "\t+\t"
+                << idB << "\t+\t0M"
+                << "\tRC:i:" << commonReadCount(idA, idB) << "\n";
+            ++totalIntraEdges;
+        }
+
+        // Alternate path vertices and edges — only for het windows.
+        if(window.cleanHetSnpCount > 0) {
+            for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
+                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                    if(emittedVertices.insert(uint64_t(mid)).second) {
+                        gfa << "S\t" << mid << "\t*\tLN:i:1\n";
+                        ++totalVertices;
+                    }
+                }
+                Shasta2AnchorId prev = altPath.anchorIdA;
+                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                    gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M"
+                        << "\tRC:i:" << commonReadCount(prev, mid) << "\n";
+                    ++totalAltEdges;
+                    prev = mid;
+                }
+                gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M"
+                    << "\tRC:i:" << commonReadCount(prev, altPath.anchorIdB) << "\n";
+                ++totalAltEdges;
+            }
+        }
+    }
+
+    // Inter-window connecting edges.
+    uint64_t totalInterEdges = 0;
+    for(const auto& [windowPair, edge] : windowPairEdges) {
+        gfa << "L\t" << edge.anchorIdA << "\t+\t"
+            << edge.anchorIdB << "\t+\t0M"
+            << "\tRC:i:" << commonReadCount(edge.anchorIdA, edge.anchorIdB) << "\n";
+        ++totalInterEdges;
+    }
+
+    cout << timestamp << "Wrote " << gfaFileName
+         << ": " << anchorWindows.size() << " chains, "
+         << totalVertices << " vertices, "
+         << totalIntraEdges << " intra-window edges, "
+         << totalAltEdges << " alternate-path edges, "
+         << totalInterEdges << " inter-window edges." << endl;
+
+    // Write CSV for Bandage coloring.
+    const string csvFileName = "AnchorWindowsClean.csv";
+    ofstream csv(csvFileName);
+    if(!csv) {
+        throw runtime_error("Cannot open " + csvFileName + " for writing.");
+    }
+    csv << "Name,Color\n";
+
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+        const double hue = (360.0 * windowId) / windowCount;
+        const double s = 0.7;
+        const double l = 0.5;
+        const double c = (1.0 - std::abs(2.0 * l - 1.0)) * s;
+        const double x = c * (1.0 - std::abs(std::fmod(hue / 60.0, 2.0) - 1.0));
+        const double m = l - c / 2.0;
+        double r1, g1, b1;
+        if(hue < 60)       { r1 = c; g1 = x; b1 = 0; }
+        else if(hue < 120) { r1 = x; g1 = c; b1 = 0; }
+        else if(hue < 180) { r1 = 0; g1 = c; b1 = x; }
+        else if(hue < 240) { r1 = 0; g1 = x; b1 = c; }
+        else if(hue < 300) { r1 = x; g1 = 0; b1 = c; }
+        else               { r1 = c; g1 = 0; b1 = x; }
+        const int r = int((r1 + m) * 255);
+        const int g = int((g1 + m) * 255);
+        const int b = int((b1 + m) * 255);
+
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+            csv << backboneJourney[pos] << ","
+                << "#" << hex << setfill('0')
+                << setw(2) << r << setw(2) << g << setw(2) << b
+                << dec << "\n";
+        }
+    }
+
+    cout << timestamp << "Wrote " << csvFileName << endl;
 }
