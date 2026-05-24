@@ -1406,6 +1406,7 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
     struct CandidateInfo {
         uint32_t alignmentId;
         int32_t sharedSeed;
+        bool isCis;  // true if both sides are cis (1), false if either is unclassified (0).
     };
 
     vector<CandidateInfo> group[2];
@@ -1414,6 +1415,8 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
     // Process accumulated groups for the current partner.
     // For each strand bucket, keep only the best chain.
+    // Cis chains always win over unclassified ones regardless of score.
+    // Among chains of the same class, the highest sharedSeed wins.
     auto flushGroups = [&]() {
         for(int s = 0; s < 2; s++) {
             if(group[s].size() <= 1) {
@@ -1423,7 +1426,13 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
             size_t best = 0;
             for(size_t i = 1; i < group[s].size(); ++i) {
-                if(group[s][i].sharedSeed > group[s][best].sharedSeed) {
+                const auto& curr = group[s][i];
+                const auto& bestCandidate = group[s][best];
+                // Cis always wins over unclassified.
+                if(curr.isCis && !bestCandidate.isCis) {
+                    best = i;
+                } else if(curr.isCis == bestCandidate.isCis &&
+                          curr.sharedSeed > bestCandidate.sharedSeed) {
                     best = i;
                 }
             }
@@ -1481,11 +1490,11 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                     continue;
                 }
 
-                // Only dedup cis (1) or unclassified (0) chains.
-                // Trans (2) and cisDifferentCopy (3) chains represent
-                // different structural relationships and should not
-                // compete with cis chains.
+                // Delete trans (2) and cisDifferentCopy (3) chains.
                 if(ad.hifiasmEcMatchState0 > 1 || ad.hifiasmEcMatchState1 > 1) {
+                    alignmentData[alignmentId].addDeleteReasonsBoth(
+                        AlignmentData::DeleteReasonSecondary);
+                    ++localRemoved;
                     continue;
                 }
 
@@ -1509,8 +1518,10 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
                     (ad.info.sharedSeedScore != invalid<int32_t>) ?
                     ad.info.sharedSeedScore : 0;
 
+                const bool isCis = (ad.hifiasmEcMatchState0 == 1 && ad.hifiasmEcMatchState1 == 1);
+
                 const int strandIdx = ad.isSameStrand ? 0 : 1;
-                group[strandIdx].push_back(CandidateInfo{alignmentId, sharedSeed});
+                group[strandIdx].push_back(CandidateInfo{alignmentId, sharedSeed, isCis});
             }
 
             // Flush the last partner's groups.
