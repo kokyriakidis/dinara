@@ -1035,11 +1035,6 @@ void dinara::main::assemble(
                    reads.getReadRawSequenceLength(b);
         });
 
-    // Keep one best chain per read pair per strand (hifiasm dedup port).
-    // Same-strand and opposite-strand overlaps are deduped independently,
-    // matching hifiasm's separate paf/reverse_paf storage.
-    assembler.dedupChainsPrePhasing(threadCount);
-
     // For http server and debugging/development purposes, generate an exhaustive table of candidates.
     // This can be done after alignment computation (it depends only on the candidate list).
     assembler.computeCandidateTable();
@@ -1047,6 +1042,12 @@ void dinara::main::assemble(
 
     // assembler.phaseOverlaps(threadCount);
     assembler.phaseOverlapsKmeans(threadCount);
+
+    // Keep one best chain per read pair per strand (hifiasm dedup port).
+    // Same-strand and opposite-strand overlaps are deduped independently,
+    // matching hifiasm's separate paf/reverse_paf storage.
+    // Runs after phasing so that only cis and unclassified overlaps compete.
+    assembler.dedupChainsPrePhasing(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);
 
