@@ -1103,16 +1103,14 @@ static KmVariantCategory kmClassifyVariantInitial(
     if (c.alleleFraction > opts.maxAf)
         return KmVariantCategory::CleanHom;
 
-    // pgphase: repeat check only for insertions and deletions, not SNPs.
-    // Uses var_is_homopolymer_pg || var_is_repeat_region_pg, gated on
-    // span <= noisyRegMaxXgaps (default 5).
+    // Filter all small indels — nanopore indel noise dominates.
+    // Only SNPs and large SVs (>= minSvLen) are used for phasing.
     if (c.key.type == KmVarType::Insertion || c.key.type == KmVarType::Deletion) {
-        // pgphase: var_is_homopolymer_pg || var_is_repeat_region_pg,
-        // both gated on span <= noisyRegMaxXgaps internally.
-        if (kmIsHomopolymer(bbSeq, bbLen, c.key, int(opts.noisyRegMaxXgaps)) ||
-            kmIsRepeatRegion(bbSeq, bbLen, c.key, int(opts.noisyRegMaxXgaps)))
-            return KmVariantCategory::RepeatHetIndel;
-        return KmVariantCategory::CleanHetIndel;
+        const int indelLen = (c.key.type == KmVarType::Insertion)
+            ? int(c.key.altLen) : int(c.key.refLen);
+        if (indelLen >= opts.minSvLen)
+            return KmVariantCategory::CleanHetIndel;
+        return KmVariantCategory::RepeatHetIndel;
     }
     return KmVariantCategory::CleanHetSnp;
 }
