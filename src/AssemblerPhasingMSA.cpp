@@ -1079,7 +1079,23 @@ static void msaProcessWindow(
             if (alt.reads.size() < msaMinSnpAltSupport) continue;
 
             KmCandidate cand;
-            cand.key.pos = site.backbonePosition;
+
+            // Trim common prefix/suffix between ref and alt to find the
+            // minimal indel motif and its true position on the backbone.
+            // This is needed so kmIsHomopolymer/kmIsRepeatRegion check
+            // the correct flanking context.
+            const string& refA = site.refAllele;
+            const string& altA = alt.sequence;
+            uint32_t pfx = 0;
+            while (pfx < refA.size() && pfx < altA.size() && refA[pfx] == altA[pfx]) pfx++;
+            uint32_t sfx = 0;
+            while (sfx < refA.size() - pfx && sfx < altA.size() - pfx &&
+                   refA[refA.size() - 1 - sfx] == altA[altA.size() - 1 - sfx]) sfx++;
+            // Trimmed ref/alt lengths after removing shared prefix/suffix.
+            const uint32_t trimRefLen = uint32_t(refA.size()) - pfx - sfx;
+            const uint32_t trimAltLen = uint32_t(altA.size()) - pfx - sfx;
+
+            cand.key.pos = site.backbonePosition + pfx;
 
             if (alt.type == "SNP") {
                 cand.key.type = KmVarType::Snp;
@@ -1090,16 +1106,17 @@ static void msaProcessWindow(
             } else if (alt.type == "INS") {
                 cand.key.type = KmVarType::Insertion;
                 cand.key.refLen = 0;
-                cand.key.altLen = uint16_t(alt.sequence.size());
-                cand.key.altSeq = alt.sequence;
+                cand.key.altLen = uint16_t(trimAltLen);
+                // Extract the inserted motif (trimmed alt bases).
+                cand.key.altSeq = altA.substr(pfx, trimAltLen);
             } else if (alt.type == "DEL") {
                 cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(alt.sequence.size());
+                cand.key.refLen = uint16_t(trimRefLen);
                 cand.key.altLen = 0;
             } else {
                 // MNP — treat as indel for filtering purposes.
                 cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(alt.sequence.size());
+                cand.key.refLen = uint16_t(trimRefLen);
                 cand.key.altLen = 0;
             }
 
@@ -1132,9 +1149,18 @@ static void msaProcessWindow(
                 cand.categoryFlag = KM_NON_VAR;
             } else if (cand.key.type == KmVarType::Insertion ||
                        cand.key.type == KmVarType::Deletion) {
-                cand.category = KmVariantCategory::RepeatHetIndel;
-                cand.categoryFlag = KM_REP_HET_VAR;
-                cand.isHomopolymerIndel = true;
+                // Repeat/homopolymer check (pgphase logic).
+                // Only true repeat indels seed noisy regions.
+                if (kmIsHomopolymer(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps) ||
+                    kmIsRepeatRegion(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps)) {
+                    cand.category = KmVariantCategory::RepeatHetIndel;
+                    cand.categoryFlag = KM_REP_HET_VAR;
+                    cand.isHomopolymerIndel = true;
+                } else {
+                    // Non-repeat indel — not used for phasing but doesn't seed noisy regions.
+                    cand.category = KmVariantCategory::CleanHetIndel;
+                    cand.categoryFlag = KM_REP_HET_VAR; // still excluded from phasing
+                }
                 repeatFiltered++;
             } else {
                 // SNP — apply additional filters.
