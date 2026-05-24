@@ -466,6 +466,88 @@ static vector<MsaVariantSite> msaDetectVariantSites(
         }
         bo = eo + 1;
     }
+
+    // Second pass: detect het sites in insertion columns (where backbone has '-').
+    // The backbone doesn't participate here — we look for disagreements among
+    // non-backbone reads. The consensus allele among spanning reads serves as "ref".
+    {
+        size_t insStart = SIZE_MAX;
+        for (size_t c = 0; c <= colCount; c++) {
+            bool isIns = (c < colCount && alignedSeqs[0][c] == '-');
+            if (isIns && insStart == SIZE_MAX) insStart = c;
+            if ((!isIns || c == colCount) && insStart != SIZE_MAX) {
+                size_t insEnd = c; // exclusive
+
+                // Find the backbone position to anchor this insertion site.
+                // Use the preceding ref column's backbone offset.
+                uint32_t anchorPos = focalBegin; // fallback
+                for (size_t j = insStart; j > 0; --j) {
+                    if (alignedSeqs[0][j - 1] != '-') {
+                        auto it = lower_bound(colByOff.begin(), colByOff.end(), j - 1);
+                        if (it != colByOff.end() && *it == j - 1)
+                            anchorPos = focalBegin + uint32_t(it - colByOff.begin());
+                        break;
+                    }
+                }
+
+                // Extract alleles from non-backbone reads spanning this insertion.
+                map<string, vector<OrientedReadId>> alleleMap;
+                for (size_t r = 1; r < alignedSeqs.size(); r++) {
+                    if (!hasB[r]) continue;
+                    // Check if read spans the insertion region.
+                    if (insStart < firstNG[r] || insEnd - 1 > lastNG[r]) continue;
+                    string allele;
+                    for (size_t j = insStart; j < insEnd; j++) {
+                        char b = alignedSeqs[r][j];
+                        if (msaIsBase(b)) allele.push_back(b);
+                    }
+                    // Empty allele = read has all gaps in insertion = no insertion.
+                    // Use "-" to represent no-insertion.
+                    if (allele.empty()) allele = "-";
+                    alleleMap[allele].push_back(seqInfos[r].oid);
+                }
+
+                if (alleleMap.size() < 2) { insStart = SIZE_MAX; continue; }
+
+                // Find consensus (most common allele).
+                string consensus;
+                size_t maxCount = 0;
+                for (const auto& [allele, reads_vec] : alleleMap) {
+                    if (reads_vec.size() > maxCount) {
+                        maxCount = reads_vec.size();
+                        consensus = allele;
+                    }
+                }
+
+                // Build ref/alt from consensus.
+                vector<OrientedReadId> refReads2 = alleleMap[consensus];
+                vector<MsaAltAllele> reportable2;
+                uint64_t maxAS2 = 0;
+                for (const auto& [allele, reads_vec] : alleleMap) {
+                    if (allele == consensus) continue;
+                    if (reads_vec.size() < msaMinSnpAltSupport) continue;
+                    string tp;
+                    if (consensus == "-") tp = "INS";
+                    else if (allele == "-") tp = "DEL";
+                    else if (allele.size() == consensus.size() && allele.size() == 1) tp = "SNP";
+                    else tp = "MNP";
+                    reportable2.push_back(MsaAltAllele{tp, allele, reads_vec});
+                    maxAS2 = max(maxAS2, uint64_t(reads_vec.size()));
+                }
+
+                if (refReads2.size() >= msaMinSnpRefSupport && maxAS2 >= msaMinSnpAltSupport) {
+                    string refStr = (consensus == "-") ? string("*") : consensus;
+                    uint32_t tot = uint32_t(refReads2.size() + maxAS2);
+                    double af = tot > 0 ? double(maxAS2) / double(tot) : 0.0;
+                    sites.push_back(MsaVariantSite{anchorPos, refStr, move(reportable2),
+                        move(refReads2), tot, uint32_t(maxAS2), af});
+                }
+
+                insStart = SIZE_MAX;
+            }
+        }
+    }
+
     return sites;
 }
 
