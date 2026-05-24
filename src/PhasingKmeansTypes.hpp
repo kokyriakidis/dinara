@@ -4,6 +4,7 @@
 /// @file PhasingKmeansTypes.hpp
 /// @brief Data structures for k-means overlap phasing (pgphase/longcallD-style).
 
+#include "ReadId.hpp"
 #include "cstdint.hpp"
 #include "vector.hpp"
 #include <array>
@@ -11,6 +12,8 @@
 #include <string>
 
 namespace dinara {
+
+class Assembler;
 
 // ============================================================================
 // Variant categories
@@ -267,6 +270,14 @@ struct KmPhasingOptions {
 
 /// Run k-means phasing on candidates matching the given category flags.
 void kmRunKmeans(KmScratchpad& scratch, const KmPhasingOptions& opts, uint32_t flags);
+
+/// Write phasing results from scratchpad to AlignmentData.
+void kmWriteResults(Assembler& assembler, ReadId backboneReadId, const KmScratchpad& scratch);
+
+/// Cis refinement: detect cisDifferentCopy within the cis set.
+void kmRefineCis(Assembler& assembler, ReadId backboneReadId,
+    KmScratchpad& scratch, const KmPhasingOptions& opts,
+    uint32_t bbLen, bool debug);
 
 } // namespace dinara
 
