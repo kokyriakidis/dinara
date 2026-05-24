@@ -721,7 +721,11 @@ static void msaProcessWindow(
     for (uint32_t i = 0; i < bbLen; i++)
         bbSeqVec[i] = reads.getOrientedReadBase(bbOid, i).value;
     const uint8_t* bbSeq = bbSeqVec.data();
-    const int noisyRegMaxXgaps = int(opts.noisyRegMaxXgaps);
+    // Raise the indel length gate for repeat/homopolymer detection.
+    // pgphase uses 5, but nanopore homopolymer errors routinely produce
+    // indels of 6-10+ bases in long runs. The MSA path lacks the CIGAR-based
+    // noisy region detector that compensates in the k-means path.
+    constexpr int msaNoisyRegMaxXgaps = 20;
 
     // Build KmScratchpad.candidates — one per variant site.
     // Sort by position to match k-means expectations.
@@ -777,8 +781,8 @@ static void msaProcessWindow(
         } else if (cand.key.type == KmVarType::Insertion ||
                    cand.key.type == KmVarType::Deletion) {
             // Repeat/homopolymer check for indels (pgphase logic).
-            if (kmIsHomopolymer(bbSeq, bbLen, cand.key, noisyRegMaxXgaps) ||
-                kmIsRepeatRegion(bbSeq, bbLen, cand.key, noisyRegMaxXgaps)) {
+            if (kmIsHomopolymer(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps) ||
+                kmIsRepeatRegion(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps)) {
                 cand.category = KmVariantCategory::RepeatHetIndel;
                 cand.categoryFlag = KM_REP_HET_VAR;
                 cand.isHomopolymerIndel = true;
