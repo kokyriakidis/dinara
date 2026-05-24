@@ -921,70 +921,81 @@ static void msaProcessWindow(
     // noisy region detector that compensates in the k-means path.
     constexpr int msaNoisyRegMaxXgaps = 20;
 
-    // Build KmScratchpad.candidates — one per variant site.
-    // Sort by position to match k-means expectations.
+    // Decompose multiallelic sites into biallelic pairs (pgphase style).
+    // Each alt allele with sufficient read support becomes its own candidate.
+    // Track (siteIdx, altIdx) per candidate for profile building.
     sort(allSites.begin(), allSites.end(),
         [](const MsaVariantSite& a, const MsaVariantSite& b) {
             return a.backbonePosition < b.backbonePosition; });
 
+    struct CandOrigin { uint32_t siteIdx; uint32_t altIdx; };
+    vector<CandOrigin> candOrigins;
+
     uint32_t repeatFiltered = 0;
-    for (const auto& site : allSites) {
-        KmCandidate cand;
-        cand.key.pos = site.backbonePosition;
-        // Determine variant type from the highest-coverage alt allele.
-        if (!site.altAlleles.empty()) {
-            size_t bestIdx = 0;
-            for (size_t ai = 1; ai < site.altAlleles.size(); ai++)
-                if (site.altAlleles[ai].reads.size() > site.altAlleles[bestIdx].reads.size())
-                    bestIdx = ai;
-            const auto& bestAlt = site.altAlleles[bestIdx];
-            if (bestAlt.type == "SNP") {
+    for (uint32_t si = 0; si < uint32_t(allSites.size()); si++) {
+        const auto& site = allSites[si];
+        const int refCov = int(site.refReads.size());
+
+        for (uint32_t ai = 0; ai < uint32_t(site.altAlleles.size()); ai++) {
+            const auto& alt = site.altAlleles[ai];
+            if (alt.reads.size() < msaMinSnpAltSupport) continue;
+
+            KmCandidate cand;
+            cand.key.pos = site.backbonePosition;
+
+            if (alt.type == "SNP") {
                 cand.key.type = KmVarType::Snp;
-                cand.key.altBase = bestAlt.sequence.empty() ? 0 :
-                    (bestAlt.sequence[0] == 'C' ? 1 : bestAlt.sequence[0] == 'G' ? 2 :
-                     bestAlt.sequence[0] == 'T' ? 3 : 0);
+                cand.key.altBase = alt.sequence.empty() ? 0 :
+                    (alt.sequence[0] == 'C' ? 1 : alt.sequence[0] == 'G' ? 2 :
+                     alt.sequence[0] == 'T' ? 3 : 0);
                 cand.key.refLen = 1; cand.key.altLen = 1;
-            } else if (bestAlt.type == "INS") {
+            } else if (alt.type == "INS") {
                 cand.key.type = KmVarType::Insertion;
                 cand.key.refLen = 0;
-                cand.key.altLen = uint16_t(bestAlt.sequence.size());
-                cand.key.altSeq = bestAlt.sequence;
-            } else {
+                cand.key.altLen = uint16_t(alt.sequence.size());
+                cand.key.altSeq = alt.sequence;
+            } else if (alt.type == "DEL") {
                 cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(bestAlt.sequence.size());
+                cand.key.refLen = uint16_t(alt.sequence.size());
+                cand.key.altLen = 0;
+            } else {
+                // MNP — treat as indel for filtering purposes.
+                cand.key.type = KmVarType::Deletion;
+                cand.key.refLen = uint16_t(alt.sequence.size());
                 cand.key.altLen = 0;
             }
-        } else {
-            cand.key.type = KmVarType::Snp;
-            cand.key.refLen = 1; cand.key.altLen = 1;
-        }
-        cand.totalCov = int(site.totalCov);
-        cand.refCov = int(site.refReads.size());
-        cand.altCov = int(site.altCov);
-        cand.alleleFraction = site.af;
-        cand.alleCovs = {cand.refCov, cand.altCov};
-        cand.nUniqAlles = 2;
 
-        // Classify using the same logic as kmClassifyVariantInitial.
-        if (site.af < opts.minAf) {
-            cand.category = KmVariantCategory::LowAlleleFraction;
-            cand.categoryFlag = KM_NON_VAR;
-        } else if (site.af > opts.maxAf) {
-            cand.category = KmVariantCategory::CleanHom;
-            cand.categoryFlag = KM_NON_VAR;
-        } else if (cand.key.type == KmVarType::Insertion ||
-                   cand.key.type == KmVarType::Deletion) {
-            // Filter all indels — nanopore indel noise dominates in MSA.
-            // Only SNPs are used for phasing.
-            cand.category = KmVariantCategory::RepeatHetIndel;
-            cand.categoryFlag = KM_REP_HET_VAR;
-            cand.isHomopolymerIndel = true;
-            repeatFiltered++;
-        } else {
-            cand.category = KmVariantCategory::CleanHetSnp;
-            cand.categoryFlag = KM_GERMLINE_CLEAN;
+            const int altCov = int(alt.reads.size());
+            const int totalCov = refCov + altCov;
+            const double af = totalCov > 0 ? double(altCov) / double(totalCov) : 0.0;
+
+            cand.totalCov = totalCov;
+            cand.refCov = refCov;
+            cand.altCov = altCov;
+            cand.alleleFraction = af;
+            cand.alleCovs = {refCov, altCov};
+            cand.nUniqAlles = 2;
+
+            // Classify per-pair.
+            if (af < opts.minAf) {
+                cand.category = KmVariantCategory::LowAlleleFraction;
+                cand.categoryFlag = KM_NON_VAR;
+            } else if (af > opts.maxAf) {
+                cand.category = KmVariantCategory::CleanHom;
+                cand.categoryFlag = KM_NON_VAR;
+            } else if (cand.key.type == KmVarType::Insertion ||
+                       cand.key.type == KmVarType::Deletion) {
+                cand.category = KmVariantCategory::RepeatHetIndel;
+                cand.categoryFlag = KM_REP_HET_VAR;
+                cand.isHomopolymerIndel = true;
+                repeatFiltered++;
+            } else {
+                cand.category = KmVariantCategory::CleanHetSnp;
+                cand.categoryFlag = KM_GERMLINE_CLEAN;
+            }
+            scratch.candidates.push_back(move(cand));
+            candOrigins.push_back({si, ai});
         }
-        scratch.candidates.push_back(move(cand));
     }
     // Print classification summary with per-category site indices.
     uint32_t cleanHet = 0, nLowAf = 0, nCleanHom = 0;
@@ -1002,23 +1013,30 @@ static void msaProcessWindow(
             nCleanHom++; idxCleanHom.push_back(ci);
         }
     }
-    auto printSiteList = [&](const char* label, const vector<uint32_t>& idxs) {
+    auto printCandList = [&](const char* label, const vector<uint32_t>& idxs) {
         if (idxs.empty()) return;
         cout << "      " << label << ": ";
         for (size_t j = 0; j < idxs.size(); j++) {
             if (j) cout << ", ";
-            cout << "site[" << idxs[j] << "] pos=" << scratch.candidates[idxs[j]].key.pos;
+            const auto& c = scratch.candidates[idxs[j]];
+            const auto& o = candOrigins[idxs[j]];
+            const auto& alt = allSites[o.siteIdx].altAlleles[o.altIdx];
+            cout << "cand[" << idxs[j] << "] pos=" << c.key.pos
+                 << " " << alt.type << ":" << alt.sequence
+                 << " AF=" << fixed << setprecision(3) << c.alleleFraction;
         }
         cout << endl;
     };
-    cout << "    classification: cleanHet=" << cleanHet
+    cout << "    candidates=" << scratch.candidates.size()
+         << " (from " << allSites.size() << " sites)"
+         << " cleanHet=" << cleanHet
          << " repeatIndel=" << repeatFiltered
          << " lowAF=" << nLowAf
          << " cleanHom=" << nCleanHom << endl;
-    printSiteList("cleanHet", idxCleanHet);
-    printSiteList("repeatIndel", idxRepeat);
-    printSiteList("lowAF", idxLowAf);
-    printSiteList("cleanHom", idxCleanHom);
+    printCandList("cleanHet", idxCleanHet);
+    printCandList("repeatIndel", idxRepeat);
+    printCandList("lowAF", idxLowAf);
+    printCandList("cleanHom", idxCleanHom);
     counters.hetSitesUsed += cleanHet;
     if (cleanHet == 0) { counters.windowsProcessed++; return; }
 
@@ -1034,12 +1052,23 @@ static void msaProcessWindow(
         scratch.overlapProfiles[oi].endVarIdx = -1;
     }
 
-    // For each candidate, find which overlaps carry ref/alt.
+    // For each candidate (biallelic pair), find which overlaps carry ref/alt.
+    // Ref reads at the site get allele=0 for this candidate.
+    // Only the alt reads matching this candidate's specific alt allele get allele=1.
+    // Reads carrying a different alt at the same site get allele=0 (they're ref
+    // with respect to this particular biallelic pair).
     for (uint32_t ci = 0; ci < numCand; ci++) {
         if (scratch.candidates[ci].categoryFlag == KM_NON_VAR) continue;
-        const auto& site = allSites[ci];
+        const auto& origin = candOrigins[ci];
+        const auto& site = allSites[origin.siteIdx];
+        const auto& matchingAlt = site.altAlleles[origin.altIdx];
 
-        // Ref reads.
+        // Build set of reads carrying the matching alt for fast lookup.
+        unordered_set<uint64_t> matchingAltReads;
+        for (const auto& oid : matchingAlt.reads)
+            matchingAltReads.insert(oid.getValue());
+
+        // Ref reads → allele 0.
         for (const auto& oid : site.refReads) {
             auto it = readToOvIdx.find(oid.getValue());
             if (it == readToOvIdx.end()) continue;
@@ -1048,9 +1077,9 @@ static void msaProcessWindow(
             while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
                 prof.alleles.push_back(-1);
             prof.endVarIdx = int(ci);
-            prof.alleles.push_back(0); // ref
+            prof.alleles.push_back(0);
         }
-        // Alt reads.
+        // All alt reads at this site.
         for (const auto& alt : site.altAlleles) {
             for (const auto& oid : alt.reads) {
                 auto it = readToOvIdx.find(oid.getValue());
@@ -1060,7 +1089,8 @@ static void msaProcessWindow(
                 while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
                     prof.alleles.push_back(-1);
                 prof.endVarIdx = int(ci);
-                prof.alleles.push_back(1); // alt
+                // Matching alt → allele 1; other alts → allele 0 (ref for this pair).
+                prof.alleles.push_back(matchingAltReads.count(oid.getValue()) ? 1 : 0);
             }
         }
     }
