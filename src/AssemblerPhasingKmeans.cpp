@@ -1019,7 +1019,8 @@ static inline bool kmDigarOverlapsCand(const KmDigarOp& d, const KmVarKey& k) {
     return !(dBeg >= kEnd || kBeg >= dEnd);
 }
 
-static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen)
+static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen,
+    const vector<uint8_t>* skipMask = nullptr)
 {
     const uint32_t numCand = uint32_t(scratch.candidates.size());
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
@@ -1028,11 +1029,15 @@ static void kmBuildOverlapProfiles(KmScratchpad& scratch, int minSvLen)
     scratch.overlapProfiles.resize(numOv);
 
     for (uint32_t oi = 0; oi < numOv; oi++) {
-        const auto& ov = scratch.overlaps[oi];
         auto& prof = scratch.overlapProfiles[oi];
         prof.overlapIdx = oi;
         prof.startVarIdx = -1; prof.endVarIdx = -1;
         prof.alleles.clear();
+
+        // Skip overlaps excluded by the mask.
+        if (skipMask && !(*skipMask)[oi]) continue;
+
+        const auto& ov = scratch.overlaps[oi];
 
         uint32_t di = scratch.digarBegin[oi];
         uint32_t diEnd = scratch.digarEnd[oi];
@@ -1929,15 +1934,7 @@ static void kmRefineCis(
         if (cleanHet == 0) break;
 
         // Rebuild profiles for cis-only overlaps.
-        kmBuildOverlapProfiles(scratch, opts.minSvLen);
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (!isCis[oi]) {
-                auto& prof = scratch.overlapProfiles[oi];
-                prof.startVarIdx = -1;
-                prof.endVarIdx = -1;
-                prof.alleles.clear();
-            }
-        }
+        kmBuildOverlapProfiles(scratch, opts.minSvLen, &isCis);
 
         // Reset hap assignments for k-means.
         for (auto& ov : scratch.overlaps) ov.hap = 0;
