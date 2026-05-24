@@ -49,15 +49,16 @@ constexpr uint64_t msaMinHomopolymerRun = 3;
 constexpr double   msaMinAf = 0.20;
 constexpr double   msaMaxAf = 0.80;
 
-// Noisy region detection from MSA dirty column density.
-// A sliding window of msaNoisyWindowBp backbone positions is scanned.
-// If the fraction of dirty columns in the window exceeds msaNoisyDirtyFraction,
-// the window is flagged as noisy. Overlapping noisy windows are merged,
-// then extended by msaNoisyFlankBp on each side.
-constexpr uint32_t msaNoisyWindowBp = 100;
-constexpr double   msaNoisyDirtyFraction = 0.15;
-constexpr uint32_t msaNoisyFlankBp = 10;
-constexpr uint32_t msaNoisyMergeDis = 50;
+// Per-row noisy region detection (mirrors k-means KmNoisyBuilder).
+// For each MSA row, a sliding window scans for dense disagreements.
+// Per-row noisy intervals are merged into chunk-level regions requiring
+// ≥ msaNoisyMinReads rows and ≥ msaNoisyMinRatio of spanning rows.
+constexpr int      msaNoisyWindow = 25;       // sliding window size in backbone offsets (ONT)
+constexpr int      msaNoisyMaxEvents = 5;     // max event weight before flagging (noisyRegMaxXgaps)
+constexpr uint32_t msaNoisyMergeDis = 500;    // merge distance for per-row intervals
+constexpr uint32_t msaNoisyMinReads = 3;      // min rows with noisy intervals
+constexpr double   msaNoisyMinRatio = 0.20;   // min fraction of spanning rows that are noisy
+constexpr uint32_t msaNoisyFlankBp = 10;      // extend each side
 
 // --- Structured variant site ---
 struct MsaAltAllele {
@@ -177,39 +178,151 @@ static vector<string> msaParseFasta(const string& text) {
 }
 
 
-// Detect noisy regions from MSA dirty column density.
-// Returns intervals [start, end) in backbone offset space.
+// Detect noisy regions from MSA, per-row sliding window (mirrors k-means CIGAR path).
+// For each row, scan backbone offsets for dense disagreements using a sliding window.
+// Merge per-row noisy intervals into chunk-level regions with read support filtering.
 static vector<pair<uint32_t, uint32_t>> msaDetectNoisyRegions(
-    const vector<uint8_t>& isDirty, uint32_t focalBegin)
+    const vector<MsaSeqInfo>& seqInfos,
+    const vector<string>& alignedSeqs,
+    const vector<size_t>& colByOff,
+    const vector<size_t>& firstNG,
+    const vector<size_t>& lastNG,
+    const vector<uint8_t>& hasB,
+    uint32_t focalBegin)
 {
     vector<pair<uint32_t, uint32_t>> regions;
-    if (isDirty.size() < msaNoisyWindowBp) return regions;
+    if (colByOff.empty() || alignedSeqs.size() < 2) return regions;
+    const size_t nOff = colByOff.size();
 
-    // Sliding window: count dirty columns in [i, i+windowBp).
-    uint32_t dirtyInWin = 0;
-    for (uint32_t j = 0; j < msaNoisyWindowBp && j < isDirty.size(); j++)
-        dirtyInWin += isDirty[j];
+    // Per-row noisy intervals: flat buffer with per-row ranges.
+    vector<pair<uint32_t, uint32_t>> allRowNoisy;
+    vector<uint32_t> rowNoisyBegin(alignedSeqs.size());
+    vector<uint32_t> rowNoisyEnd(alignedSeqs.size());
 
-    for (uint32_t i = 0; i + msaNoisyWindowBp <= isDirty.size(); i++) {
-        double frac = double(dirtyInWin) / double(msaNoisyWindowBp);
-        if (frac >= msaNoisyDirtyFraction) {
-            uint32_t start = focalBegin + i;
-            uint32_t end = focalBegin + i + msaNoisyWindowBp;
-            if (!regions.empty() && start <= regions.back().second + msaNoisyMergeDis)
-                regions.back().second = max(regions.back().second, end);
-            else
-                regions.push_back({start, end});
+    for (size_t r = 1; r < alignedSeqs.size(); r++) {
+        rowNoisyBegin[r] = uint32_t(allRowNoisy.size());
+        if (!hasB[r]) { rowNoisyEnd[r] = rowNoisyBegin[r]; continue; }
+
+        // Sliding window over backbone offsets for this row.
+        // Event queue: positions and weights of disagreements.
+        struct Event { uint32_t off; int weight; };
+        vector<Event> events;
+        int front = 0, totalWeight = 0;
+        int32_t curStart = -1, curEnd = -1;
+
+        for (size_t off = 0; off < nOff; off++) {
+            size_t c = colByOff[off];
+            if (c < firstNG[r] || c > lastNG[r]) continue;
+
+            char ref = alignedSeqs[0][c];
+            char b = alignedSeqs[r][c];
+            if (!msaIsBase(ref)) continue;
+
+            int w = 0;
+            if (b == '-') w = 1;  // deletion
+            else if (msaIsBase(b) && b != ref) w = 1;  // substitution
+
+            // Check for insertion: gap columns between this ref col and next.
+            if (off + 1 < nOff) {
+                size_t nextC = colByOff[off + 1];
+                int insLen = 0;
+                for (size_t gc = c + 1; gc < nextC; gc++) {
+                    if (alignedSeqs[0][gc] == '-' && msaIsBase(alignedSeqs[r][gc]))
+                        insLen++;
+                }
+                if (insLen > 0) w += insLen;
+            }
+
+            if (w == 0) continue;
+
+            uint32_t bbPos = focalBegin + uint32_t(off);
+            events.push_back({bbPos, w});
+            totalWeight += w;
+
+            // Evict events outside the window.
+            while (front < int(events.size()) &&
+                   int64_t(events[front].off) <= int64_t(bbPos) - msaNoisyWindow) {
+                totalWeight -= events[front].weight;
+                front++;
+            }
+
+            if (totalWeight <= msaNoisyMaxEvents) continue;
+
+            int32_t nStart = int32_t(events[front].off);
+            int32_t nEnd = int32_t(bbPos + 1);
+
+            if (curStart == -1) {
+                curStart = nStart; curEnd = nEnd;
+            } else if (nStart <= curEnd) {
+                curEnd = max(curEnd, nEnd);
+            } else {
+                allRowNoisy.push_back({uint32_t(curStart), uint32_t(curEnd)});
+                curStart = nStart; curEnd = nEnd;
+            }
         }
-        // Slide: remove left, add right.
-        dirtyInWin -= isDirty[i];
-        if (i + msaNoisyWindowBp < isDirty.size())
-            dirtyInWin += isDirty[i + msaNoisyWindowBp];
+        if (curStart != -1)
+            allRowNoisy.push_back({uint32_t(curStart), uint32_t(curEnd)});
+        rowNoisyEnd[r] = uint32_t(allRowNoisy.size());
     }
 
-    // Extend flanks.
-    for (auto& [s, e] : regions) {
-        s = (s > focalBegin + msaNoisyFlankBp) ? s - msaNoisyFlankBp : focalBegin;
-        e += msaNoisyFlankBp;
+    if (allRowNoisy.empty()) return regions;
+
+    // Collect all per-row intervals, merge.
+    vector<pair<uint32_t, uint32_t>> merged;
+    for (const auto& iv : allRowNoisy)
+        merged.push_back(iv);
+    sort(merged.begin(), merged.end());
+    {
+        vector<pair<uint32_t, uint32_t>> tmp;
+        tmp.push_back(merged[0]);
+        for (size_t i = 1; i < merged.size(); i++) {
+            auto& last = tmp.back();
+            if (merged[i].first <= last.second + msaNoisyMergeDis)
+                last.second = max(last.second, merged[i].second);
+            else
+                tmp.push_back(merged[i]);
+        }
+        merged = move(tmp);
+    }
+
+    // For each merged region, count how many rows have noisy intervals
+    // overlapping it, and how many rows span it.
+    for (const auto& [mStart, mEnd] : merged) {
+        int nTotal = 0, nNoisy = 0;
+        for (size_t r = 1; r < alignedSeqs.size(); r++) {
+            if (!hasB[r]) continue;
+            // Does this row span the region?
+            // Use firstNG/lastNG mapped to backbone offsets.
+            // Approximate: check if the row's first/last non-gap columns
+            // bracket the region's backbone positions.
+            uint32_t rStart = focalBegin;
+            uint32_t rEnd = focalBegin + uint32_t(nOff);
+            // Find backbone offset of firstNG[r] and lastNG[r].
+            for (size_t off = 0; off < nOff; off++) {
+                if (colByOff[off] >= firstNG[r]) { rStart = focalBegin + uint32_t(off); break; }
+            }
+            for (size_t off = nOff; off > 0; off--) {
+                if (colByOff[off - 1] <= lastNG[r]) { rEnd = focalBegin + uint32_t(off); break; }
+            }
+            if (rStart >= mEnd || rEnd <= mStart) continue;
+            nTotal++;
+            // Does this row have a noisy interval overlapping the merged region?
+            for (uint32_t ni = rowNoisyBegin[r]; ni < rowNoisyEnd[r]; ni++) {
+                if (allRowNoisy[ni].first < mEnd && allRowNoisy[ni].second > mStart) {
+                    nNoisy++;
+                    break;
+                }
+            }
+        }
+        if (nNoisy < int(msaNoisyMinReads)) continue;
+        if (nTotal > 0 && double(nNoisy) / double(nTotal) < msaNoisyMinRatio) continue;
+        // Extend flanks.
+        uint32_t s = (mStart > msaNoisyFlankBp) ? mStart - msaNoisyFlankBp : 0;
+        uint32_t e = mEnd + msaNoisyFlankBp;
+        if (!regions.empty() && s <= regions.back().second)
+            regions.back().second = max(regions.back().second, e);
+        else
+            regions.push_back({s, e});
     }
 
     return regions;
@@ -225,12 +338,12 @@ static bool msaIsInNoisyRegion(
 }
 
 // Detect variant sites from an MSA of one anchor pair.
-// Also outputs the dirty column vector for noisy region detection.
+// Also detects per-row noisy regions and merges them into chunk-level regions.
 static vector<MsaVariantSite> msaDetectVariantSites(
     const vector<MsaSeqInfo>& seqInfos,
     const vector<string>& alignedSeqs,
     uint32_t focalBegin, uint32_t focalEnd,
-    vector<uint8_t>* dirtyOut = nullptr)
+    vector<pair<uint32_t, uint32_t>>* noisyOut = nullptr)
 {
     vector<MsaVariantSite> sites;
     if (focalEnd <= focalBegin) return sites;
@@ -303,8 +416,10 @@ static vector<MsaVariantSite> msaDetectVariantSites(
         }
     }
 
-    // Export dirty vector for noisy region detection.
-    if (dirtyOut) *dirtyOut = isDirty;
+    // Detect per-row noisy regions and merge into chunk-level regions.
+    if (noisyOut)
+        *noisyOut = msaDetectNoisyRegions(
+            seqInfos, alignedSeqs, colByOff, firstNG, lastNG, hasB, focalBegin);
 
     // Walk dirty runs → variant sites.
     using AKey = tuple<string, string, string>;
@@ -638,13 +753,10 @@ static void msaProcessWindow(
     uint32_t fullFocalBegin = segFocalBegin[0];
     uint32_t fullFocalEnd = segFocalEnd[nSegments - 1];
 
-    vector<uint8_t> dirtyVec;
-    auto allSites = msaDetectVariantSites(fullSeqInfos, alignedSeqs, fullFocalBegin, fullFocalEnd, &dirtyVec);
+    vector<pair<uint32_t, uint32_t>> noisyRegions;
+    auto allSites = msaDetectVariantSites(fullSeqInfos, alignedSeqs, fullFocalBegin, fullFocalEnd, &noisyRegions);
     counters.sitesDetected += allSites.size();
     counters.pairsProcessed += nSegments;
-
-    // Detect noisy regions from dirty column density.
-    auto noisyRegions = msaDetectNoisyRegions(dirtyVec, fullFocalBegin);
 
     // Count unique reads across all backbone anchors (before any filtering).
     unordered_set<uint64_t> allAnchorReads;
