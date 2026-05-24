@@ -40,6 +40,10 @@ struct AnchorWindow {
     // Alternate paths from non-direct overlap reads.
     // These form parallel chains between backbone anchors at het sites.
     std::vector<AnchorWindowAlternatePath> alternatePaths;
+
+    // Set by msaDetectSnpsInWindow: number of clean het SNPs found.
+    // 0 means the window is homozygous — only backbone anchors should be kept.
+    uint32_t cleanHetSnpCount = 0;
 };
 
 } // namespace dinara

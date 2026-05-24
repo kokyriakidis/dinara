@@ -1159,78 +1159,10 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // MSA-based overlap phasing (runs after journeys are available).
-    // Overwrites hifiasmEcMatchState for overlaps it can classify.
-    assembler.phaseOverlapsMSA(threadCount);
+    // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
+    // assembler.phaseOverlapsMSA(threadCount);
 
-    // Test computeAnchorWindowsClean across all reads and write GFA.
-    assembler.testAnchorWindowsCleanLongestRead(threadCount);
-
-    // Detect reads whose ordinals regress along another read's journey.
-    // For each oriented read (the "backbone"), walk its journey and check
-    // every co-occurring oriented read: its ordinals should increase
-    // monotonically along the backbone. A decrease indicates a misoriented
-    // or chimeric overlap.
-    {
-        cout << timestamp << "Checking for regressing ordinals across all journeys..." << endl;
-
-        // For each oriented read pair (backbone, visitor), record whether
-        // a regression was seen. Use a set to avoid duplicate reports
-        // (the same pair can regress on multiple backbones).
-        std::set<pair<OrientedReadId, OrientedReadId>> regressingPairs;
-
-        for(ReadId convergenceReadId(0); convergenceReadId < readCount; ++convergenceReadId) {
-            for(Strand strand = 0; strand < 2; ++strand) {
-                const OrientedReadId backboneOrientedReadId(convergenceReadId, strand);
-                const Shasta2Journey backboneJourney = (*shasta2Journeys)[backboneOrientedReadId];
-                if(backboneJourney.size() < 2) continue;
-
-                // Track the last ordinal seen for each visitor read along this backbone.
-                // Using a flat map (sorted vector) would be faster, but a std::map
-                // is simpler and this is a one-time diagnostic.
-                std::map<OrientedReadId, uint32_t> lastOrdinal;
-
-                for(uint32_t backbonePos = 0; backbonePos < backboneJourney.size(); ++backbonePos) {
-                    const Shasta2AnchorId anchorId = backboneJourney[backbonePos];
-                    const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
-                    for(const auto& info : anchor) {
-                        if(info.orientedReadId == backboneOrientedReadId) continue;
-                        auto it = lastOrdinal.find(info.orientedReadId);
-                        if(it == lastOrdinal.end()) {
-                            lastOrdinal[info.orientedReadId] = info.ordinal;
-                        } else {
-                            if(info.ordinal < it->second) {
-                                regressingPairs.insert({backboneOrientedReadId, info.orientedReadId});
-                            }
-                            it->second = info.ordinal;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Print results grouped by visitor read.
-        if(!regressingPairs.empty()) {
-            // Collect unique regressing visitors and their backbones.
-            std::map<OrientedReadId, vector<OrientedReadId>> visitorToBackbones;
-            for(const auto& [backbone, visitor] : regressingPairs) {
-                visitorToBackbones[visitor].push_back(backbone);
-            }
-            for(const auto& [visitor, backbones] : visitorToBackbones) {
-                cout << timestamp << "Regressing: " << visitor
-                     << " regresses on " << backbones.size() << " backbone(s):";
-                for(const auto& bb : backbones) {
-                    cout << " " << bb;
-                }
-                cout << endl;
-            }
-        }
-
-        cout << timestamp << "Found " << regressingPairs.size()
-             << " (backbone, visitor) pairs with regressing ordinals." << endl;
-    }
-
-    // Create the Shasta2AnchorGraph from anchor windows.
+    // Compute anchor windows and run CIGAR-based SNP detection.
     cout << timestamp << "Computing anchor windows..." << endl;
     vector<AnchorWindow> anchorWindows;
     assembler.computeAnchorWindowsClean(
@@ -1239,6 +1171,34 @@ void dinara::main::assemble(
         readIdsSortedByLength,
         anchorWindows,
         threadCount);
+
+    // CIGAR-based het SNP detection per window.
+    {
+        cout << timestamp << "Running CIGAR-based SNP detection on "
+             << anchorWindows.size() << " windows..." << endl;
+        const auto tSnp0 = steady_clock::now();
+        uint64_t hetWindows = 0;
+        uint64_t totalSnps = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
+                window, *shasta2Anchors, *shasta2Journeys);
+            if(window.cleanHetSnpCount > 0) {
+                hetWindows++;
+                totalSnps += window.cleanHetSnpCount;
+            }
+        }
+        const auto tSnp1 = steady_clock::now();
+        const double snpSecs = seconds(tSnp1 - tSnp0);
+        cout << timestamp << "CIGAR-based SNP detection complete."
+             << " hetWindows=" << hetWindows
+             << " homWindows=" << (anchorWindows.size() - hetWindows)
+             << " totalCleanHetSnps=" << totalSnps
+             << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
+             << std::defaultfloat << endl;
+    }
+
+    // Write AnchorWindowsClean GFA with het/hom-gated alternate paths.
+    assembler.writeAnchorWindowsCleanGfa(anchorWindows);
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;

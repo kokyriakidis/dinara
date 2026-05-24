@@ -3632,9 +3632,28 @@ public:
         vector<AnchorWindow>& anchorWindows,
         uint64_t threadCount);
 
+    // Detect clean het SNPs in an anchor window using Theseus MSA.
+    // Returns the number of SNPs passing strand bias and repeat filtering.
+    uint32_t msaDetectSnpsInWindow(
+        const AnchorWindow& window,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys) const;
+
+    // Detect clean het SNPs in an anchor window using CIGAR-based variant parsing.
+    // Uses pairwise CIGARs from OverlapCigarStore instead of Theseus MSA.
+    uint32_t cigarDetectSnpsInWindow(
+        const AnchorWindow& window,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys) const;
+
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.
     void testAnchorWindowsCleanLongestRead(uint64_t threadCount);
+
+    // Write AnchorWindowsClean.gfa and .csv from pre-computed windows.
+    // Uses cleanHetSnpCount to gate alternate-path output.
+    void writeAnchorWindowsCleanGfa(
+        const vector<AnchorWindow>& anchorWindows);
 
     // Original version: claims all unclaimed anchors in the touched range.
     void computeAnchorWindows(

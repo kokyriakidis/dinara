@@ -617,6 +617,269 @@ static vector<MsaVariantSite> msaDetectVariantSites(
 } // anonymous namespace
 
 // ============================================================================
+// Detect clean het SNPs in an anchor window using Theseus MSA.
+// Returns the number of SNPs that pass strand bias and homopolymer/repeat
+// filtering. Uses the window's readIntervals (already LIS-filtered by
+// computeAnchorWindowsClean) instead of re-discovering reads via the
+// alignment table.
+// ============================================================================
+uint32_t Assembler::msaDetectSnpsInWindow(
+    const AnchorWindow& window,
+    const Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys) const
+{
+    constexpr uint32_t msaMaxChunkSegments = 100;
+
+    const Reads& rds = getReads();
+    const auto& mkrs = *markers;
+    const uint64_t k = assemblerInfo->k;
+    const uint32_t kh = uint32_t(k / 2);
+    const OrientedReadId bbOid = window.backboneOrientedReadId;
+    const auto bbJ = journeys[bbOid];
+    const uint32_t nBbAnchors = window.backboneEnd - window.backboneBegin;
+    if (nBbAnchors < 2) return 0;
+    const uint32_t nSegments = nBbAnchors - 1;
+
+    // Determine chunks.
+    const uint32_t nChunks = (nSegments + msaMaxChunkSegments - 1) / msaMaxChunkSegments;
+
+    // Build backbone sequence once for repeat/homopolymer detection.
+    const uint32_t bbLen = uint32_t(rds.getRead(bbOid.getReadId()).baseCount);
+    vector<uint8_t> bbSeqVec(bbLen);
+    for (uint32_t i = 0; i < bbLen; i++)
+        bbSeqVec[i] = rds.getOrientedReadBase(bbOid, i).value;
+    const uint8_t* bbSeq = bbSeqVec.data();
+
+    KmPhasingOptions opts;
+    uint32_t totalCleanHetSnps = 0;
+
+    cout << "    msaDetectSnps bb=" << bbOid
+         << " segs=" << nSegments
+         << " chunks=" << nChunks << flush;
+
+    // Process each chunk independently.
+    for (uint32_t chunk = 0; chunk < nChunks; chunk++) {
+        const uint32_t chunkSegBegin = chunk * msaMaxChunkSegments;
+        const uint32_t chunkSegEnd = min(chunkSegBegin + msaMaxChunkSegments, nSegments);
+        const uint32_t chunkSegs = chunkSegEnd - chunkSegBegin;
+        const uint32_t chunkAnchors = chunkSegs + 1; // boundary anchors
+
+        // Build backbone segments for this chunk.
+        vector<string> segStrings;
+        segStrings.reserve(chunkSegs);
+        vector<uint32_t> segFocalBegin(chunkSegs), segFocalEnd(chunkSegs);
+        bool badSeg = false;
+
+        for (uint32_t i = 0; i < chunkSegs; i++) {
+            uint32_t jp0 = window.backboneBegin + chunkSegBegin + i;
+            uint32_t jp1 = jp0 + 1;
+            Shasta2AnchorId aL = bbJ[jp0], aR = bbJ[jp1];
+            uint32_t oL = anchors.getOrdinal(aL, bbOid);
+            uint32_t oR = anchors.getOrdinal(aR, bbOid);
+            if (oL == invalid<uint32_t> || oR == invalid<uint32_t>) { badSeg = true; break; }
+            string seg = msaExtractSegment(rds, mkrs, k, bbOid, oL, oR);
+            if (seg.empty()) { badSeg = true; break; }
+            segFocalBegin[i] = mkrs[bbOid.getValue()][oL].position + kh;
+            segFocalEnd[i] = mkrs[bbOid.getValue()][oR].position + kh;
+            segStrings.push_back(move(seg));
+        }
+        if (badSeg) continue;
+
+        // Skip pathologically long chunks.
+        size_t totalBases = 0;
+        for (const auto& s : segStrings) totalBases += s.size();
+        if (totalBases > msaMaxFocalSeqLen * chunkSegs) continue;
+
+        // Build POA graph for this chunk.
+        vector<string_view> segViews;
+        segViews.reserve(chunkSegs);
+        for (const auto& s : segStrings) segViews.push_back(s);
+
+        theseus::Penalties pen(0, 2, 3, 1);
+        theseus::Heuristics heur(false, false);
+        vector<theseus::Graph::NodeId> nodeIds;
+        theseus::TheseusMSA aligner(pen, heur, segViews, nodeIds, 1);
+
+        // Build chunk-local anchorId → boundaryIndex lookup.
+        unordered_map<uint64_t, uint32_t> bbAnchorToBoundary;
+        bbAnchorToBoundary.reserve(chunkAnchors);
+        for (uint32_t bi = 0; bi < chunkAnchors; bi++) {
+            uint32_t jp = window.backboneBegin + chunkSegBegin + bi;
+            if (jp >= bbJ.size()) break;
+            bbAnchorToBoundary[uint64_t(bbJ[jp])] = bi;
+        }
+
+        struct BoundaryHit { uint32_t boundaryIndex; uint32_t ordinal; };
+
+        // Collect reads with >=2 hits in this chunk from readIntervals.
+        struct ReadEntry {
+            OrientedReadId oid;
+            vector<BoundaryHit> hits;
+            uint32_t span;
+        };
+        vector<ReadEntry> readEntries;
+
+        for (size_t ri = 1; ri < window.readIntervals.size(); ri++) {
+            const auto& interval = window.readIntervals[ri];
+            const OrientedReadId oid = interval.orientedReadId;
+            if (oid.getValue() >= journeys.size()) continue;
+            const auto rj = journeys[oid];
+
+            vector<BoundaryHit> hits;
+            for (uint32_t pos = interval.begin; pos < interval.end; pos++) {
+                if (pos >= rj.size()) break;
+                auto it = bbAnchorToBoundary.find(uint64_t(rj[pos]));
+                if (it != bbAnchorToBoundary.end()) {
+                    uint32_t ord = anchors.getOrdinal(rj[pos], oid);
+                    if (ord != invalid<uint32_t>)
+                        hits.push_back({it->second, ord});
+                }
+            }
+            sort(hits.begin(), hits.end(),
+                [](const BoundaryHit& a, const BoundaryHit& b) {
+                    return a.boundaryIndex < b.boundaryIndex; });
+            if (hits.size() < 2) continue;
+
+            const auto rm = mkrs[oid.getValue()];
+            uint32_t fp = rm[hits.front().ordinal].position;
+            uint32_t lp = rm[hits.back().ordinal].position;
+            readEntries.push_back({oid, move(hits), (lp > fp) ? (lp - fp) : 0});
+        }
+
+        sort(readEntries.begin(), readEntries.end(),
+            [](const ReadEntry& a, const ReadEntry& b) { return a.span > b.span; });
+
+        // Align reads into the chunk MSA.
+        int readSeqId = 1;
+        vector<OrientedReadId> alignedReadIds;
+        alignedReadIds.push_back(bbOid);
+
+        // Cap reads per chunk to avoid Theseus issues.
+        const size_t maxReadsPerChunk = msaMaxReadsPerPair;
+        size_t readsAligned = 0;
+        for (const auto& entry : readEntries) {
+            if (readsAligned >= maxReadsPerChunk) break;
+            bool aligned = false;
+            size_t hi = 0;
+            while (hi + 1 < entry.hits.size()) {
+                uint32_t startBI  = entry.hits[hi].boundaryIndex;
+                uint32_t startOrd = entry.hits[hi].ordinal;
+                if (startBI >= nodeIds.size()) { hi++; continue; }
+
+                size_t best = hi;
+                const auto rm = mkrs[entry.oid.getValue()];
+                if (startOrd >= rm.size()) { hi++; continue; }
+                uint32_t beg = rm[startOrd].position + kh;
+                for (size_t hj = hi + 1; hj < entry.hits.size(); hj++) {
+                    if (entry.hits[hj].boundaryIndex <= startBI) continue;
+                    if (entry.hits[hj].ordinal <= startOrd) continue;
+                    if (entry.hits[hj].ordinal >= rm.size()) continue;
+                    best = hj;
+                    uint32_t end = rm[entry.hits[hj].ordinal].position + kh;
+                    if (end > beg && (end - beg) >= msaMinSegmentBases) break;
+                }
+                if (best == hi) { hi++; continue; }
+
+                uint32_t endBI  = entry.hits[best].boundaryIndex;
+                uint32_t endOrd = entry.hits[best].ordinal;
+                if (endOrd >= rm.size()) { hi = best; continue; }
+                string seg = msaExtractSegment(rds, mkrs, k, entry.oid, startOrd, endOrd);
+                if (seg.empty()) { hi = best; continue; }
+
+                int endNode = (endBI < nodeIds.size())
+                    ? static_cast<int>(nodeIds[endBI]) : -1;
+                aligner.align_from(seg, nodeIds[startBI], 1, true, 0, endNode, readSeqId);
+                aligned = true;
+                hi = best;
+            }
+            if (aligned) {
+                alignedReadIds.push_back(entry.oid);
+                readSeqId++;
+                readsAligned++;
+            }
+        }
+
+        if (alignedReadIds.size() < msaMinAnchorCoverage) continue;
+
+        // Get MSA matrix and detect variant sites.
+        auto msaMat = aligner.get_msa_matrix(readSeqId);
+        vector<string> alignedSeqs(msaMat.n_rows);
+        for (int r = 0; r < msaMat.n_rows; r++) {
+            alignedSeqs[r].resize(msaMat.n_cols);
+            for (int c = 0; c < msaMat.n_cols; c++)
+                alignedSeqs[r][c] = static_cast<char>(msaMat(r, c));
+        }
+
+        vector<MsaSeqInfo> seqInfos;
+        seqInfos.reserve(alignedReadIds.size());
+        for (const auto& oid : alignedReadIds)
+            seqInfos.push_back(MsaSeqInfo{oid, {}, 0, 0, true, 'B'});
+
+        if (alignedSeqs.size() < seqInfos.size())
+            seqInfos.resize(alignedSeqs.size());
+        else if (alignedSeqs.size() > seqInfos.size())
+            alignedSeqs.resize(seqInfos.size());
+
+        uint32_t chunkFocalBegin = segFocalBegin[0];
+        uint32_t chunkFocalEnd = segFocalEnd[chunkSegs - 1];
+        auto allSites = msaDetectVariantSites(seqInfos, alignedSeqs, chunkFocalBegin, chunkFocalEnd);
+
+        if (allSites.empty()) continue;
+
+        // Classify SNPs in this chunk.
+        for (const auto& site : allSites) {
+            const int refCov = int(site.refReads.size());
+            for (const auto& alt : site.altAlleles) {
+                if (alt.reads.size() < msaMinSnpAltSupport) continue;
+                if (alt.type != "SNP") continue;
+
+                KmVarKey key;
+                key.type = KmVarType::Snp;
+                key.refLen = 1; key.altLen = 1;
+                if (site.isInsertionColumn) {
+                    key.pos = site.backbonePosition;
+                    key.altBase = alt.sequence.empty() ? uint8_t(0) :
+                        (alt.sequence[0] == 'C' ? 1 : alt.sequence[0] == 'G' ? 2 :
+                         alt.sequence[0] == 'T' ? 3 : 0);
+                } else {
+                    const string& refA = site.refAllele;
+                    const string& altA = alt.sequence;
+                    uint32_t pfx = 0;
+                    while (pfx < refA.size() && pfx < altA.size() && refA[pfx] == altA[pfx]) pfx++;
+                    key.pos = site.backbonePosition + pfx;
+                    key.altBase = altA.empty() ? uint8_t(0) :
+                        (altA[0] == 'C' ? 1 : altA[0] == 'G' ? 2 :
+                         altA[0] == 'T' ? 3 : 0);
+                }
+
+                const int altCov = int(alt.reads.size());
+                const int totalCov = refCov + altCov;
+                const double af = totalCov > 0 ? double(altCov) / double(totalCov) : 0.0;
+                if (af < opts.minAf || af > opts.maxAf) continue;
+
+                int fwdAlt = 0, revAlt = 0;
+                for (const auto& oid : alt.reads) {
+                    if (oid.getStrand() == 0) fwdAlt++; else revAlt++;
+                }
+                const int expected = (fwdAlt + revAlt) / 2;
+                if (expected > 0) {
+                    const double p = kmFisherExactTwoTail(fwdAlt, revAlt, expected, expected);
+                    if (p < opts.strandBiasPval) continue;
+                }
+
+                if (kmIsHomopolymer(bbSeq, bbLen, key, 0) ||
+                    kmIsRepeatRegion(bbSeq, bbLen, key, 0)) continue;
+
+                totalCleanHetSnps++;
+            }
+        }
+    } // end chunk loop
+
+    cout << " cleanHetSnps=" << totalCleanHetSnps << endl;
+    return totalCleanHetSnps;
+}
+
+// ============================================================================
 // Process one anchor window using multi-segment Theseus MSA.
 // Builds one POA graph spanning all backbone segments, then aligns each
 // read via align_from between its shared anchor nodes. Any read sharing
