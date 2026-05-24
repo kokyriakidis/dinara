@@ -789,18 +789,39 @@ static void msaProcessWindow(
         }
         scratch.candidates.push_back(move(cand));
     }
-    // Print classification summary.
+    // Print classification summary with per-category site indices.
     uint32_t cleanHet = 0, nLowAf = 0, nCleanHom = 0;
-    for (const auto& c : scratch.candidates) {
+    vector<uint32_t> idxCleanHet, idxRepeat, idxLowAf, idxCleanHom;
+    for (uint32_t ci = 0; ci < uint32_t(scratch.candidates.size()); ci++) {
+        const auto& c = scratch.candidates[ci];
         if (c.category == KmVariantCategory::CleanHetSnp ||
-            c.category == KmVariantCategory::CleanHetIndel) cleanHet++;
-        else if (c.category == KmVariantCategory::LowAlleleFraction) nLowAf++;
-        else if (c.category == KmVariantCategory::CleanHom) nCleanHom++;
+            c.category == KmVariantCategory::CleanHetIndel) {
+            cleanHet++; idxCleanHet.push_back(ci);
+        } else if (c.category == KmVariantCategory::RepeatHetIndel) {
+            idxRepeat.push_back(ci);
+        } else if (c.category == KmVariantCategory::LowAlleleFraction) {
+            nLowAf++; idxLowAf.push_back(ci);
+        } else if (c.category == KmVariantCategory::CleanHom) {
+            nCleanHom++; idxCleanHom.push_back(ci);
+        }
     }
+    auto printSiteList = [&](const char* label, const vector<uint32_t>& idxs) {
+        if (idxs.empty()) return;
+        cout << "      " << label << ": ";
+        for (size_t j = 0; j < idxs.size(); j++) {
+            if (j) cout << ", ";
+            cout << "site[" << idxs[j] << "] pos=" << scratch.candidates[idxs[j]].key.pos;
+        }
+        cout << endl;
+    };
     cout << "    classification: cleanHet=" << cleanHet
          << " repeatIndel=" << repeatFiltered
          << " lowAF=" << nLowAf
          << " cleanHom=" << nCleanHom << endl;
+    printSiteList("cleanHet", idxCleanHet);
+    printSiteList("repeatIndel", idxRepeat);
+    printSiteList("lowAF", idxLowAf);
+    printSiteList("cleanHom", idxCleanHom);
     counters.hetSitesUsed += cleanHet;
     if (cleanHet == 0) { counters.windowsProcessed++; return; }
 
