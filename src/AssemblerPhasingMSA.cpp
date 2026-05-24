@@ -546,6 +546,8 @@ static vector<MsaVariantSite> msaDetectVariantSites(
                 // Per-column SNP scan within the insertion block.
                 // Look at each individual column for single-base disagreements
                 // among reads that have bases there.
+                // Skip single-column blocks — already handled by block-level scan above.
+                if (insEnd - insStart < 2) { insStart = SIZE_MAX; continue; }
                 for (size_t j = insStart; j < insEnd; j++) {
                     // Count bases at this column among non-backbone reads.
                     uint32_t baseCounts[4] = {0, 0, 0, 0}; // A C G T
