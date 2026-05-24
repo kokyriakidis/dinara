@@ -42,6 +42,7 @@ namespace {
 constexpr uint64_t msaMinAnchorCoverage = 6;
 constexpr uint64_t msaMaxReadsPerPair = 200;
 constexpr uint32_t msaMaxFocalSeqLen = 5000;
+constexpr uint32_t msaMinSegmentBases = 500;
 constexpr uint64_t msaMinSnpRefSupport = 3;
 constexpr uint64_t msaMinSnpAltSupport = 3;
 constexpr uint64_t msaMinHomopolymerRun = 3;
@@ -458,27 +459,67 @@ static void msaProcessWindow(
         const auto& hits = readHits[rv];
         OrientedReadId oid = OrientedReadId::fromValue(ReadId(rv));
         bool aligned = false;
+        uint32_t segCount = 0;
+        uint32_t totalSegBases = 0;
+        uint32_t skippedShort = 0;
 
-        for (size_t hi = 0; hi + 1 < hits.size(); hi++) {
-            uint32_t prevBI = hits[hi].boundaryIndex;
-            uint32_t nextBI = hits[hi + 1].boundaryIndex;
-            if (nextBI <= prevBI || prevBI >= nodeIds.size()) continue;
-            uint32_t prevOrd = hits[hi].ordinal;
-            uint32_t nextOrd = hits[hi + 1].ordinal;
-            if (nextOrd <= prevOrd) continue;
+        // Merge consecutive short inter-anchor spans: walk forward from
+        // each anchor hit, skipping intermediate anchors until the
+        // accumulated span reaches msaMinSegmentBases.  If no span
+        // reaches the threshold, align the longest available span so
+        // that short reads still contribute to the MSA.
+        size_t hi = 0;
+        while (hi + 1 < hits.size()) {
+            uint32_t startBI  = hits[hi].boundaryIndex;
+            uint32_t startOrd = hits[hi].ordinal;
+            if (startBI >= nodeIds.size()) { hi++; continue; }
 
-            string seg = msaExtractSegment(reads, mkrs, k, oid, prevOrd, nextOrd);
-            if (seg.empty()) continue;
+            // Scan forward for the first anchor that gives a span
+            // >= msaMinSegmentBases.  Track the farthest valid anchor
+            // in case none reaches the threshold.
+            size_t best = hi;
+            bool reached = false;
+            const auto rm = mkrs[rv];
+            uint32_t kh2 = uint32_t(k / 2);
+            uint32_t beg = rm[startOrd].position + kh2;
+            for (size_t hj = hi + 1; hj < hits.size(); hj++) {
+                if (hits[hj].boundaryIndex <= startBI) continue;
+                if (hits[hj].ordinal <= startOrd) continue;
+                best = hj;
+                uint32_t end = rm[hits[hj].ordinal].position + kh2;
+                if (end > beg && (end - beg) >= msaMinSegmentBases) {
+                    reached = true;
+                    break;
+                }
+            }
+            if (best == hi) { hi++; continue; }
 
-            int endNode = (nextBI < nodeIds.size())
-                ? static_cast<int>(nodeIds[nextBI]) : -1;
-            aligner.align_from(seg, nodeIds[prevBI], 1, true, 0, endNode, readSeqId);
+            // If we didn't reach the threshold, best is the farthest
+            // valid anchor — align whatever we have.
+            uint32_t endBI  = hits[best].boundaryIndex;
+            uint32_t endOrd = hits[best].ordinal;
+
+            string seg = msaExtractSegment(reads, mkrs, k, oid, startOrd, endOrd);
+            if (seg.empty()) { hi = best; continue; }
+
+            if (!reached) skippedShort++;
+
+            int endNode = (endBI < nodeIds.size())
+                ? static_cast<int>(nodeIds[endBI]) : -1;
+            aligner.align_from(seg, nodeIds[startBI], 1, true, 0, endNode, readSeqId);
             aligned = true;
+            segCount++;
+            totalSegBases += uint32_t(seg.size());
+            hi = best;
         }
         if (aligned) {
             alignedReadIds.push_back(oid);
             readSeqId++;
         }
+        cout << "    read " << oid << " hits=" << hits.size()
+             << " segs=" << segCount << " bases=" << totalSegBases
+             << " skippedShort=" << skippedShort
+             << (aligned ? " ALIGNED" : " DROPPED") << endl;
     }
 
     if (alignedReadIds.size() < msaMinAnchorCoverage) {
@@ -560,6 +601,8 @@ static void msaProcessWindow(
          << " msaRows=" << alignedSeqs.size()
          << " seqInfos=" << fullSeqInfos.size()
          << " msaCols=" << (alignedSeqs.empty() ? 0 : alignedSeqs[0].size())
+         << " focalBegin=" << fullFocalBegin
+         << " focalEnd=" << fullFocalEnd
          << " focalSpan=" << (fullFocalEnd - fullFocalBegin)
          << " variantSites=" << allSites.size()
          << " uniqueReadsInAnchors=" << allAnchorReads.size()
