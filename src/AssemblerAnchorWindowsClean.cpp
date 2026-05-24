@@ -426,22 +426,19 @@ void Assembler::computeAnchorWindowsClean(
 
         // Deduplicate alternate path intermediates: each intermediate anchor
         // must appear in exactly one alternate path. If the same intermediate
-        // appears in multiple paths, assign it to the path with the largest
-        // span (pillarB - pillarA backbone positions). Longer paths carry
-        // more long-range haplotype information for phasing decisions.
+        // appears in multiple paths, assign it to the path with the furthest
+        // pillar B (highest backbone position). This maximizes forward
+        // connectivity for long-range phasing decisions.
         {
-            auto pathSpan = [&](const AnchorWindowAlternatePath& p) -> uint32_t {
-                auto itA = backboneAnchorToPos.find(uint64_t(p.anchorIdA));
-                auto itB = backboneAnchorToPos.find(uint64_t(p.anchorIdB));
-                const uint32_t posA = (itA != backboneAnchorToPos.end()) ? itA->second : 0;
-                const uint32_t posB = (itB != backboneAnchorToPos.end()) ? itB->second : 0;
-                return (posB > posA) ? (posB - posA) : 0;
+            auto pillarBPos = [&](const AnchorWindowAlternatePath& p) -> uint32_t {
+                auto it = backboneAnchorToPos.find(uint64_t(p.anchorIdB));
+                return (it != backboneAnchorToPos.end()) ? it->second : 0;
             };
 
-            // Sort paths by span (largest first) so longer paths claim first.
+            // Sort paths by pillar B position (furthest first).
             std::sort(window.alternatePaths.begin(), window.alternatePaths.end(),
                 [&](const AnchorWindowAlternatePath& a, const AnchorWindowAlternatePath& b) {
-                    return pathSpan(a) > pathSpan(b);
+                    return pillarBPos(a) > pillarBPos(b);
                 });
 
             // Assign each intermediate to the first (tightest) path that contains it.

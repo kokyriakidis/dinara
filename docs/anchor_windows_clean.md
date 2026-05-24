@@ -208,17 +208,17 @@ appear in multiple alternate paths (from different reads with different LIS
 pillar pairs). Each intermediate must belong to exactly one path to avoid
 creating edges to multiple backbone anchors.
 
-Paths are sorted by **span** (pillarB − pillarA backbone positions), largest
-first. Each intermediate is assigned to the first (longest) path that contains
-it. Longer paths carry more long-range haplotype information, which is valuable
-for downstream phasing decisions. Paths that lose all their intermediates after
-deduplication are discarded.
+Paths are sorted by **pillar B backbone position**, furthest first. Each
+intermediate is assigned to the first path that contains it — the one whose
+pillar B reaches furthest forward on the backbone. This maximizes forward
+connectivity for long-range phasing decisions. Paths that lose all their
+intermediates after deduplication are discarded.
 
 ```
-Path 1:  A → X → B    (span = 3)
-Path 2:  C → X → D    (span = 7)
+Path 1:  A → X → B    (B at backbone pos 8)
+Path 2:  C → X → D    (D at backbone pos 15)
 
-X is kept only in Path 2 (largest span).
+X is kept only in Path 2 (furthest pillar B).
 Path 1 loses X and is discarded if no other intermediates remain.
 ```
 
