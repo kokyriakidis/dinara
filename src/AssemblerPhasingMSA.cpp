@@ -543,6 +543,56 @@ static vector<MsaVariantSite> msaDetectVariantSites(
                         move(refReads2), tot, uint32_t(maxAS2), af});
                 }
 
+                // Per-column SNP scan within the insertion block.
+                // Look at each individual column for single-base disagreements
+                // among reads that have bases there.
+                for (size_t j = insStart; j < insEnd; j++) {
+                    // Count bases at this column among non-backbone reads.
+                    uint32_t baseCounts[4] = {0, 0, 0, 0}; // A C G T
+                    vector<OrientedReadId> baseReads[4];
+                    for (size_t r = 1; r < alignedSeqs.size(); r++) {
+                        if (!hasB[r] || j < firstNG[r] || j > lastNG[r]) continue;
+                        char b = alignedSeqs[r][j];
+                        int bi = -1;
+                        if (b == 'A' || b == 'a') bi = 0;
+                        else if (b == 'C' || b == 'c') bi = 1;
+                        else if (b == 'G' || b == 'g') bi = 2;
+                        else if (b == 'T' || b == 't') bi = 3;
+                        if (bi >= 0) {
+                            baseCounts[bi]++;
+                            baseReads[bi].push_back(seqInfos[r].oid);
+                        }
+                    }
+                    // Find consensus base and check for alt bases.
+                    int consBase = -1;
+                    uint32_t consCount = 0;
+                    for (int bi = 0; bi < 4; bi++) {
+                        if (baseCounts[bi] > consCount) {
+                            consCount = baseCounts[bi];
+                            consBase = bi;
+                        }
+                    }
+                    if (consBase < 0 || consCount < msaMinSnpRefSupport) continue;
+
+                    vector<MsaAltAllele> colAlts;
+                    uint64_t colMaxAS = 0;
+                    const char baseChars[] = "ACGT";
+                    for (int bi = 0; bi < 4; bi++) {
+                        if (bi == consBase) continue;
+                        if (baseCounts[bi] < msaMinSnpAltSupport) continue;
+                        string altStr(1, baseChars[bi]);
+                        colAlts.push_back(MsaAltAllele{"SNP", altStr, baseReads[bi]});
+                        colMaxAS = max(colMaxAS, uint64_t(baseCounts[bi]));
+                    }
+                    if (colAlts.empty()) continue;
+
+                    uint32_t colTot = uint32_t(consCount + colMaxAS);
+                    double colAf = colTot > 0 ? double(colMaxAS) / double(colTot) : 0.0;
+                    string colRef(1, baseChars[consBase]);
+                    sites.push_back(MsaVariantSite{anchorPos, colRef, move(colAlts),
+                        baseReads[consBase], colTot, uint32_t(colMaxAS), colAf});
+                }
+
                 insStart = SIZE_MAX;
             }
         }
