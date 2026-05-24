@@ -246,7 +246,7 @@ struct KmScratchpad {
 struct KmPhasingOptions {
     uint32_t minDepth = 6;
     uint32_t minAltDepth = 3;
-    double   minAf = 0.12;
+    double   minAf = 0.20;
     double   maxAf = 1.0;  // Disabled (accepts any allele fraction above minAf).
     bool     isOnt = false;           ///< ONT mode: enables Fisher exact strand bias test.
     double   strandBiasPval = 0.01;   ///< p-value threshold for ONT strand bias (pgphase default).
