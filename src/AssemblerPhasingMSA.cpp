@@ -75,6 +75,7 @@ struct MsaVariantSite {
     uint32_t totalCov = 0;
     uint32_t altCov = 0;
     double af = 0.0;
+    bool isInsertionColumn = false; // true for pass 2 (insertion-column) sites
 };
 
 // --- Per-read allele observation across all sites in a window ---
@@ -547,8 +548,9 @@ static vector<MsaVariantSite> msaDetectVariantSites(
                 if (refReads2.size() >= msaMinSnpRefSupport && maxAS2 >= msaMinSnpAltSupport) {
                     uint32_t tot = uint32_t(refReads2.size() + maxAS2);
                     double af = tot > 0 ? double(maxAS2) / double(tot) : 0.0;
-                    sites.push_back(MsaVariantSite{anchorPos, refStr, move(reportable2),
-                        move(refReads2), tot, uint32_t(maxAS2), af});
+                    MsaVariantSite vs{anchorPos, refStr, move(reportable2),
+                        move(refReads2), tot, uint32_t(maxAS2), af, true};
+                    sites.push_back(move(vs));
                 }
 
                 // Per-column SNP scan within the insertion block.
@@ -599,8 +601,9 @@ static vector<MsaVariantSite> msaDetectVariantSites(
                     uint32_t colTot = uint32_t(consCount + colMaxAS);
                     double colAf = colTot > 0 ? double(colMaxAS) / double(colTot) : 0.0;
                     string colRef(1, baseChars[consBase]);
-                    sites.push_back(MsaVariantSite{anchorPos, colRef, move(colAlts),
-                        baseReads[consBase], colTot, uint32_t(colMaxAS), colAf});
+                    MsaVariantSite vs{anchorPos, colRef, move(colAlts),
+                        baseReads[consBase], colTot, uint32_t(colMaxAS), colAf, true};
+                    sites.push_back(move(vs));
                 }
 
                 insStart = SIZE_MAX;
@@ -1088,44 +1091,94 @@ static void msaProcessWindow(
 
             KmCandidate cand;
 
-            // Trim common prefix/suffix between ref and alt to find the
-            // minimal indel motif and its true position on the backbone.
-            // This is needed so kmIsHomopolymer/kmIsRepeatRegion check
-            // the correct flanking context.
-            const string& refA = site.refAllele;
-            const string& altA = alt.sequence;
-            uint32_t pfx = 0;
-            while (pfx < refA.size() && pfx < altA.size() && refA[pfx] == altA[pfx]) pfx++;
-            uint32_t sfx = 0;
-            while (sfx < refA.size() - pfx && sfx < altA.size() - pfx &&
-                   refA[refA.size() - 1 - sfx] == altA[altA.size() - 1 - sfx]) sfx++;
-            // Trimmed ref/alt lengths after removing shared prefix/suffix.
-            const uint32_t trimRefLen = uint32_t(refA.size()) - pfx - sfx;
-            const uint32_t trimAltLen = uint32_t(altA.size()) - pfx - sfx;
+            if (site.isInsertionColumn) {
+                // Pass 2 (insertion-column) sites: the variant lives in
+                // columns where the backbone has gaps.  key.pos stays at
+                // the anchor position (the preceding backbone base) so
+                // kmIsHomopolymer/kmIsRepeatRegion check the correct
+                // flanking reference context — matching pgphase semantics.
+                // The anchor base was prepended to both ref and alt during
+                // site construction, so strip it to get the raw content.
+                cand.key.pos = site.backbonePosition;
+                const string& refA = site.refAllele;
+                const string& altA = alt.sequence;
+                // Both refA and altA start with the anchor base.
+                const uint32_t rawRefLen = uint32_t(refA.size()) - 1; // consensus length
+                const uint32_t rawAltLen = uint32_t(altA.size()) - 1; // alt content length
 
-            cand.key.pos = site.backbonePosition + pfx;
-
-            if (alt.type == "SNP") {
-                cand.key.type = KmVarType::Snp;
-                cand.key.altBase = alt.sequence.empty() ? 0 :
-                    (alt.sequence[0] == 'C' ? 1 : alt.sequence[0] == 'G' ? 2 :
-                     alt.sequence[0] == 'T' ? 3 : 0);
-                cand.key.refLen = 1; cand.key.altLen = 1;
-            } else if (alt.type == "INS") {
-                cand.key.type = KmVarType::Insertion;
-                cand.key.refLen = 0;
-                cand.key.altLen = uint16_t(trimAltLen);
-                // Extract the inserted motif (trimmed alt bases).
-                cand.key.altSeq = altA.substr(pfx, trimAltLen);
-            } else if (alt.type == "DEL") {
-                cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(trimRefLen);
-                cand.key.altLen = 0;
+                if (alt.type == "SNP") {
+                    cand.key.type = KmVarType::Snp;
+                    // Per-column SNPs: alt.sequence is a single base (no anchor prefix).
+                    cand.key.altBase = altA.empty() ? 0 :
+                        (altA[0] == 'C' ? 1 : altA[0] == 'G' ? 2 :
+                         altA[0] == 'T' ? 3 : 0);
+                    cand.key.refLen = 1; cand.key.altLen = 1;
+                } else if (rawRefLen == 0 && rawAltLen > 0) {
+                    // Pure insertion (consensus was "-", reads have bases).
+                    cand.key.type = KmVarType::Insertion;
+                    cand.key.refLen = 0;
+                    cand.key.altLen = uint16_t(rawAltLen);
+                    cand.key.altSeq = altA.substr(1); // strip anchor base
+                } else if (rawAltLen == 0 && rawRefLen > 0) {
+                    // Pure deletion (read has "-", consensus has bases).
+                    cand.key.type = KmVarType::Deletion;
+                    cand.key.refLen = uint16_t(rawRefLen);
+                    cand.key.altLen = 0;
+                } else {
+                    // Length difference or MNP within insertion columns.
+                    if (rawRefLen > rawAltLen) {
+                        cand.key.type = KmVarType::Deletion;
+                        cand.key.refLen = uint16_t(rawRefLen - rawAltLen);
+                        cand.key.altLen = 0;
+                    } else if (rawAltLen > rawRefLen) {
+                        cand.key.type = KmVarType::Insertion;
+                        cand.key.refLen = 0;
+                        cand.key.altLen = uint16_t(rawAltLen - rawRefLen);
+                        cand.key.altSeq = altA.substr(1 + rawRefLen);
+                    } else {
+                        // Same length MNP — treat as deletion for filtering.
+                        cand.key.type = KmVarType::Deletion;
+                        cand.key.refLen = uint16_t(rawRefLen);
+                        cand.key.altLen = 0;
+                    }
+                }
             } else {
-                // MNP — treat as indel for filtering purposes.
-                cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(trimRefLen);
-                cand.key.altLen = 0;
+                // Pass 1 (backbone dirty-run) sites: trim common prefix/suffix
+                // between ref and alt to find the minimal indel motif and its
+                // true position on the backbone.
+                const string& refA = site.refAllele;
+                const string& altA = alt.sequence;
+                uint32_t pfx = 0;
+                while (pfx < refA.size() && pfx < altA.size() && refA[pfx] == altA[pfx]) pfx++;
+                uint32_t sfx = 0;
+                while (sfx < refA.size() - pfx && sfx < altA.size() - pfx &&
+                       refA[refA.size() - 1 - sfx] == altA[altA.size() - 1 - sfx]) sfx++;
+                const uint32_t trimRefLen = uint32_t(refA.size()) - pfx - sfx;
+                const uint32_t trimAltLen = uint32_t(altA.size()) - pfx - sfx;
+
+                cand.key.pos = site.backbonePosition + pfx;
+
+                if (alt.type == "SNP") {
+                    cand.key.type = KmVarType::Snp;
+                    cand.key.altBase = altA.empty() ? 0 :
+                        (altA[0] == 'C' ? 1 : altA[0] == 'G' ? 2 :
+                         altA[0] == 'T' ? 3 : 0);
+                    cand.key.refLen = 1; cand.key.altLen = 1;
+                } else if (alt.type == "INS") {
+                    cand.key.type = KmVarType::Insertion;
+                    cand.key.refLen = 0;
+                    cand.key.altLen = uint16_t(trimAltLen);
+                    cand.key.altSeq = altA.substr(pfx, trimAltLen);
+                } else if (alt.type == "DEL") {
+                    cand.key.type = KmVarType::Deletion;
+                    cand.key.refLen = uint16_t(trimRefLen);
+                    cand.key.altLen = 0;
+                } else {
+                    // MNP — treat as indel for filtering purposes.
+                    cand.key.type = KmVarType::Deletion;
+                    cand.key.refLen = uint16_t(trimRefLen);
+                    cand.key.altLen = 0;
+                }
             }
 
             const int altCov = int(alt.reads.size());
