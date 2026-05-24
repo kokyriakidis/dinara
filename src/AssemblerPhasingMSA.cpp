@@ -1060,11 +1060,7 @@ static void msaProcessWindow(
     for (uint32_t i = 0; i < bbLen; i++)
         bbSeqVec[i] = reads.getOrientedReadBase(bbOid, i).value;
     const uint8_t* bbSeq = bbSeqVec.data();
-    // Raise the indel length gate for repeat/homopolymer detection.
-    // pgphase uses 5, but nanopore homopolymer errors routinely produce
-    // indels of 6-10+ bases in long runs. The MSA path lacks the CIGAR-based
-    // noisy region detector that compensates in the k-means path.
-    constexpr int msaNoisyRegMaxXgaps = 20;
+
 
     // Decompose multiallelic sites into biallelic pairs (pgphase style).
     // Each alt allele with sufficient read support becomes its own candidate.
@@ -1210,17 +1206,18 @@ static void msaProcessWindow(
                 cand.categoryFlag = KM_NON_VAR;
             } else if (cand.key.type == KmVarType::Insertion ||
                        cand.key.type == KmVarType::Deletion) {
-                // Repeat/homopolymer check (pgphase logic).
-                // Only true repeat indels seed noisy regions.
-                if (kmIsHomopolymer(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps) ||
-                    kmIsRepeatRegion(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps)) {
+                // Match k-means path: all small indels (< minSvLen) are
+                // excluded from phasing — nanopore indel noise dominates.
+                // Only large SVs (>= minSvLen) get CleanHetIndel.
+                const int indelLen = (cand.key.type == KmVarType::Insertion)
+                    ? int(cand.key.altLen) : int(cand.key.refLen);
+                if (indelLen >= opts.minSvLen) {
+                    cand.category = KmVariantCategory::CleanHetIndel;
+                    cand.categoryFlag = KM_REP_HET_VAR;
+                } else {
                     cand.category = KmVariantCategory::RepeatHetIndel;
                     cand.categoryFlag = KM_REP_HET_VAR;
                     cand.isHomopolymerIndel = true;
-                } else {
-                    // Non-repeat indel — not used for phasing but doesn't seed noisy regions.
-                    cand.category = KmVariantCategory::CleanHetIndel;
-                    cand.categoryFlag = KM_REP_HET_VAR; // still excluded from phasing
                 }
                 repeatFiltered++;
             } else {
