@@ -247,7 +247,7 @@ struct KmPhasingOptions {
     uint32_t minDepth = 6;
     uint32_t minAltDepth = 3;
     double   minAf = 0.20;
-    double   maxAf = 1.0;  // Disabled (accepts any allele fraction above minAf).
+    double   maxAf = 0.8;
     bool     isOnt = false;           ///< ONT mode: enables Fisher exact strand bias test.
     double   strandBiasPval = 0.01;   ///< p-value threshold for ONT strand bias (pgphase default).
     uint32_t noisyRegMaxXgaps = 5;    ///< Max indel span for repeat check (pgphase kDefaultNoisyRegMaxXgaps).
