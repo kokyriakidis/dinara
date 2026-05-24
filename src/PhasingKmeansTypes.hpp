@@ -265,6 +265,104 @@ struct KmPhasingOptions {
 };
 
 // ============================================================================
+// Repeat / homopolymer detection (pgphase var_is_homopolymer_pg,
+// var_is_repeat_region_pg). Used by both k-means and MSA phasing.
+// Backbone sequence is numeric: 0=A, 1=C, 2=G, 3=T.
+// ============================================================================
+
+/// Check if a variant sits in a homopolymer or short tandem repeat context.
+/// Looks for a repeat unit of length 1..6 with ≥3 copies flanking the variant.
+inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
+                            const KmVarKey& key, int xid)
+{
+    if (seqLen == 0) return false;
+    const int64_t sn = int64_t(seqLen);
+    int64_t startPos, endPos;
+    if (key.type == KmVarType::Snp) {
+        startPos = int64_t(key.pos) - 1;
+        endPos   = int64_t(key.pos) + 1;
+    } else if (key.type == KmVarType::Insertion) {
+        if (int(key.altLen) > xid) return false;
+        startPos = int64_t(key.pos) - 1;
+        endPos   = int64_t(key.pos);
+    } else { // Deletion
+        if (int(key.refLen) > xid) return false;
+        startPos = int64_t(key.pos) + int64_t(key.refLen) - 1;
+        endPos   = int64_t(key.pos);
+    }
+    constexpr int maxUnitLen = 6;
+    constexpr int nCheckCopyNum = 3;
+    auto safeBase = [&](int64_t p) -> uint8_t {
+        if (p < 0 || p >= sn) return 4;
+        return seq[p];
+    };
+    // Check forward from endPos.
+    uint8_t refBases[6];
+    for (int i = 0; i < 6; i++) refBases[i] = safeBase(endPos + i);
+    for (int r = 1; r <= maxUnitLen; r++) {
+        bool isHp = true;
+        for (int i = 1; i < nCheckCopyNum && isHp; i++)
+            for (int j = 0; j < r && isHp; j++)
+                if (safeBase(endPos + i * r + j) != refBases[j]) isHp = false;
+        if (isHp) return true;
+    }
+    // Check backward from startPos.
+    for (int i = 0; i < 6; i++) refBases[i] = safeBase(startPos - i);
+    for (int r = 1; r <= maxUnitLen; r++) {
+        bool isHp = true;
+        for (int i = 1; i < nCheckCopyNum && isHp; i++)
+            for (int j = 0; j < r && isHp; j++)
+                if (safeBase(startPos - i * r - j) != refBases[j]) isHp = false;
+        if (isHp) return true;
+    }
+    return false;
+}
+
+/// Check if the deleted/inserted motif is a tandem repeat of the flanking reference.
+inline bool kmIsRepeatRegion(const uint8_t* seq, uint32_t seqLen,
+                             const KmVarKey& key, int xid)
+{
+    if (seqLen == 0) return false;
+    const int64_t sn = int64_t(seqLen);
+    if (key.type == KmVarType::Deletion) {
+        const int delLen = int(key.refLen);
+        if (delLen > xid) return false;
+        const int len = delLen * 3;
+        const int64_t pos = int64_t(key.pos);
+        if (pos < 0 || pos + delLen + len > sn) return false;
+        for (int i = 0; i < len; i++)
+            if (seq[pos + i] != seq[pos + delLen + i]) return false;
+        return true;
+    }
+    if (key.type == KmVarType::Insertion) {
+        if (key.altSeq.empty()) return false;
+        const int insLen = int(key.altSeq.size());
+        if (insLen > xid) return false;
+        const int len = insLen * 3;
+        const int64_t pos = int64_t(key.pos);
+        if (pos < 0 || pos + len > sn) return false;
+        std::vector<uint8_t> alt_b(static_cast<size_t>(len));
+        for (int j = 0; j < len; j++)
+            alt_b[j] = seq[pos + j];
+        for (int j = insLen; j < len; j++)
+            alt_b[j] = alt_b[j - insLen];
+        for (int j = 0; j < insLen; j++) {
+            const char c = key.altSeq[j];
+            uint8_t b = 4;
+            if (c == 'A' || c == 'a') b = 0;
+            else if (c == 'C' || c == 'c') b = 1;
+            else if (c == 'G' || c == 'g') b = 2;
+            else if (c == 'T' || c == 't') b = 3;
+            alt_b[j] = b;
+        }
+        for (int j = 0; j < len; j++)
+            if (seq[pos + j] != alt_b[j]) return false;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
 // K-means runner (defined in AssemblerPhasingKmeans.cpp)
 // ============================================================================
 

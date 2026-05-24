@@ -713,12 +713,23 @@ static void msaProcessWindow(
     }
     if (scratch.overlaps.empty()) { counters.windowsProcessed++; return; }
 
+    // Build numeric backbone sequence for repeat/homopolymer detection.
+    // Uses the same 0-3 encoding as the k-means path (A=0, C=1, G=2, T=3).
+    // Must use oriented read bases since MSA positions are oriented-read positions.
+    const uint32_t bbLen = uint32_t(reads.getRead(bbOid.getReadId()).baseCount);
+    vector<uint8_t> bbSeqVec(bbLen);
+    for (uint32_t i = 0; i < bbLen; i++)
+        bbSeqVec[i] = reads.getOrientedReadBase(bbOid, i).value;
+    const uint8_t* bbSeq = bbSeqVec.data();
+    const int noisyRegMaxXgaps = int(opts.noisyRegMaxXgaps);
+
     // Build KmScratchpad.candidates — one per variant site.
     // Sort by position to match k-means expectations.
     sort(allSites.begin(), allSites.end(),
         [](const MsaVariantSite& a, const MsaVariantSite& b) {
             return a.backbonePosition < b.backbonePosition; });
 
+    uint32_t repeatFiltered = 0;
     for (const auto& site : allSites) {
         KmCandidate cand;
         cand.key.pos = site.backbonePosition;
@@ -752,22 +763,44 @@ static void msaProcessWindow(
         cand.alleCovs = {cand.refCov, cand.altCov};
         cand.nUniqAlles = 2;
 
-        // Classify: AF-based, matching kmClassifyCandidates logic.
-        if (site.af >= opts.minAf && site.af <= opts.maxAf) {
-            cand.category = (cand.key.type == KmVarType::Snp)
-                ? KmVariantCategory::CleanHetSnp : KmVariantCategory::CleanHetIndel;
-            cand.categoryFlag = KM_GERMLINE_CLEAN;
-        } else {
+        // Classify using the same logic as kmClassifyVariantInitial.
+        if (site.af < opts.minAf) {
             cand.category = KmVariantCategory::LowAlleleFraction;
             cand.categoryFlag = KM_NON_VAR;
+        } else if (site.af > opts.maxAf) {
+            cand.category = KmVariantCategory::CleanHom;
+            cand.categoryFlag = KM_NON_VAR;
+        } else if (cand.key.type == KmVarType::Insertion ||
+                   cand.key.type == KmVarType::Deletion) {
+            // Repeat/homopolymer check for indels (pgphase logic).
+            if (kmIsHomopolymer(bbSeq, bbLen, cand.key, noisyRegMaxXgaps) ||
+                kmIsRepeatRegion(bbSeq, bbLen, cand.key, noisyRegMaxXgaps)) {
+                cand.category = KmVariantCategory::RepeatHetIndel;
+                cand.categoryFlag = KM_REP_HET_VAR;
+                cand.isHomopolymerIndel = true;
+                repeatFiltered++;
+            } else {
+                cand.category = KmVariantCategory::CleanHetIndel;
+                cand.categoryFlag = KM_GERMLINE_CLEAN;
+            }
+        } else {
+            cand.category = KmVariantCategory::CleanHetSnp;
+            cand.categoryFlag = KM_GERMLINE_CLEAN;
         }
         scratch.candidates.push_back(move(cand));
     }
-
-    uint32_t cleanHet = 0;
-    for (const auto& c : scratch.candidates)
+    // Print classification summary.
+    uint32_t cleanHet = 0, nLowAf = 0, nCleanHom = 0;
+    for (const auto& c : scratch.candidates) {
         if (c.category == KmVariantCategory::CleanHetSnp ||
             c.category == KmVariantCategory::CleanHetIndel) cleanHet++;
+        else if (c.category == KmVariantCategory::LowAlleleFraction) nLowAf++;
+        else if (c.category == KmVariantCategory::CleanHom) nCleanHom++;
+    }
+    cout << "    classification: cleanHet=" << cleanHet
+         << " repeatIndel=" << repeatFiltered
+         << " lowAF=" << nLowAf
+         << " cleanHom=" << nCleanHom << endl;
     counters.hetSitesUsed += cleanHet;
     if (cleanHet == 0) { counters.windowsProcessed++; return; }
 
@@ -828,7 +861,6 @@ static void msaProcessWindow(
     kmWriteResults(assembler, bbRid, scratch);
 
     // Step 8: Cis refinement.
-    uint32_t bbLen = uint32_t(reads.getRead(bbRid).baseCount);
     kmRefineCis(assembler, bbRid, scratch, opts, bbLen, false);
 
     // Count and log per-window results.
