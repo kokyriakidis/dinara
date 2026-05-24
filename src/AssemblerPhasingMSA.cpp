@@ -753,8 +753,7 @@ static void msaProcessWindow(
     uint32_t fullFocalBegin = segFocalBegin[0];
     uint32_t fullFocalEnd = segFocalEnd[nSegments - 1];
 
-    vector<pair<uint32_t, uint32_t>> noisyRegions;
-    auto allSites = msaDetectVariantSites(fullSeqInfos, alignedSeqs, fullFocalBegin, fullFocalEnd, &noisyRegions);
+    auto allSites = msaDetectVariantSites(fullSeqInfos, alignedSeqs, fullFocalBegin, fullFocalEnd);
     counters.sitesDetected += allSites.size();
     counters.pairsProcessed += nSegments;
 
@@ -783,12 +782,8 @@ static void msaProcessWindow(
          << " focalEnd=" << fullFocalEnd
          << " focalSpan=" << (fullFocalEnd - fullFocalBegin)
          << " variantSites=" << allSites.size()
-         << " noisyRegions=" << noisyRegions.size()
          << " uniqueReadsInAnchors=" << allAnchorReads.size()
          << endl;
-    for (size_t ni = 0; ni < noisyRegions.size(); ni++)
-        cout << "    noisyRegion[" << ni << "] [" << noisyRegions[ni].first
-             << ", " << noisyRegions[ni].second << ")" << endl;
     // Check column consistency.
     if (!alignedSeqs.empty()) {
         bool colConsistent = true;
@@ -932,7 +927,7 @@ static void msaProcessWindow(
         [](const MsaVariantSite& a, const MsaVariantSite& b) {
             return a.backbonePosition < b.backbonePosition; });
 
-    uint32_t repeatFiltered = 0, noisyFiltered = 0;
+    uint32_t repeatFiltered = 0;
     for (const auto& site : allSites) {
         KmCandidate cand;
         cand.key.pos = site.backbonePosition;
@@ -986,21 +981,14 @@ static void msaProcessWindow(
             cand.isHomopolymerIndel = true;
             repeatFiltered++;
         } else {
-            // SNP — check if it falls in a noisy region.
-            if (msaIsInNoisyRegion(cand.key.pos, noisyRegions)) {
-                cand.category = KmVariantCategory::NonVariant;
-                cand.categoryFlag = KM_NON_VAR;
-                noisyFiltered++;
-            } else {
-                cand.category = KmVariantCategory::CleanHetSnp;
-                cand.categoryFlag = KM_GERMLINE_CLEAN;
-            }
+            cand.category = KmVariantCategory::CleanHetSnp;
+            cand.categoryFlag = KM_GERMLINE_CLEAN;
         }
         scratch.candidates.push_back(move(cand));
     }
     // Print classification summary with per-category site indices.
     uint32_t cleanHet = 0, nLowAf = 0, nCleanHom = 0;
-    vector<uint32_t> idxCleanHet, idxRepeat, idxLowAf, idxCleanHom, idxNoisy;
+    vector<uint32_t> idxCleanHet, idxRepeat, idxLowAf, idxCleanHom;
     for (uint32_t ci = 0; ci < uint32_t(scratch.candidates.size()); ci++) {
         const auto& c = scratch.candidates[ci];
         if (c.category == KmVariantCategory::CleanHetSnp ||
@@ -1012,8 +1000,6 @@ static void msaProcessWindow(
             nLowAf++; idxLowAf.push_back(ci);
         } else if (c.category == KmVariantCategory::CleanHom) {
             nCleanHom++; idxCleanHom.push_back(ci);
-        } else if (c.category == KmVariantCategory::NonVariant) {
-            idxNoisy.push_back(ci);
         }
     }
     auto printSiteList = [&](const char* label, const vector<uint32_t>& idxs) {
@@ -1027,12 +1013,10 @@ static void msaProcessWindow(
     };
     cout << "    classification: cleanHet=" << cleanHet
          << " repeatIndel=" << repeatFiltered
-         << " noisyRegion=" << noisyFiltered
          << " lowAF=" << nLowAf
          << " cleanHom=" << nCleanHom << endl;
     printSiteList("cleanHet", idxCleanHet);
     printSiteList("repeatIndel", idxRepeat);
-    printSiteList("noisyRegion", idxNoisy);
     printSiteList("lowAF", idxLowAf);
     printSiteList("cleanHom", idxCleanHom);
     counters.hetSitesUsed += cleanHet;
