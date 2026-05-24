@@ -1079,8 +1079,8 @@ void dinara::main::assemble(
     //    transitively.
     //    Port of ma_hit_contained_advance.
     //    Parameters: max_hang_Len=1000, max_hang_rate=0.8, min_overlap_Len=50.
-    assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
-    // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.flagContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // 6. Rescue overlaps with directional cis/trans disagreement.
     //    Port of try_rescue_overlaps.

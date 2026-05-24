@@ -2065,6 +2065,11 @@ void Assembler::removeContainedReads(uint64_t maxHang, double maxHangRate, uint6
             // Hifiasm ma_hit_contained_advance: only consider overlaps kept by both sides (h->del == 0)
             if(!ad.keptByBothSides()) continue;
 
+            // Only consider cis (1) or unclassified (0) overlaps for containment.
+            // Trans (2) and cisDifferentCopy (3) overlaps are from different
+            // haplotypes and should not cause a read to be marked as contained.
+            if(ad.hifiasmEcMatchState0 > 1 || ad.hifiasmEcMatchState1 > 1) continue;
+
             // Get target read
             const ReadId tn = (ad.readIds[0] == qn) ? ad.readIds[1] : ad.readIds[0];
 
