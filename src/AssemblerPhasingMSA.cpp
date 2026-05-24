@@ -781,8 +781,28 @@ static void msaProcessWindow(
         } else if (cand.key.type == KmVarType::Insertion ||
                    cand.key.type == KmVarType::Deletion) {
             // Repeat/homopolymer check for indels (pgphase logic).
-            if (kmIsHomopolymer(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps) ||
-                kmIsRepeatRegion(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps)) {
+            bool isHp = kmIsHomopolymer(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps);
+            bool isRp = kmIsRepeatRegion(bbSeq, bbLen, cand.key, msaNoisyRegMaxXgaps);
+            {
+                // Debug: show backbone context around variant.
+                const char* bases = "ACGT";
+                int64_t p = int64_t(cand.key.pos);
+                int64_t lo = max(int64_t(0), p - 5);
+                int64_t hi = min(int64_t(bbLen), p + 10);
+                string ctx;
+                for (int64_t j = lo; j < hi; j++) {
+                    if (j == p) ctx += '[';
+                    ctx += (bbSeq[j] < 4 ? bases[bbSeq[j]] : 'N');
+                    if (j == p) ctx += ']';
+                }
+                cout << "      repCheck pos=" << cand.key.pos
+                     << " type=" << (cand.key.type == KmVarType::Insertion ? "INS" : "DEL")
+                     << " refLen=" << cand.key.refLen
+                     << " altLen=" << cand.key.altLen
+                     << " isHp=" << isHp << " isRp=" << isRp
+                     << " ctx=" << ctx << endl;
+            }
+            if (isHp || isRp) {
                 cand.category = KmVariantCategory::RepeatHetIndel;
                 cand.categoryFlag = KM_REP_HET_VAR;
                 cand.isHomopolymerIndel = true;
