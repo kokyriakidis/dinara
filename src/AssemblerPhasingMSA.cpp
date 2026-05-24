@@ -1095,47 +1095,210 @@ static void msaProcessWindow(
         }
     }
 
-    // Dummy digar/noisy region arrays (not used but kmRefineCis may reference).
-    scratch.digarBegin.assign(numOv, 0);
-    scratch.digarEnd.assign(numOv, 0);
-    scratch.overlapNoisyBegin.assign(numOv, 0);
-    scratch.overlapNoisyEnd.assign(numOv, 0);
-
-    // Step 6: Run shared k-means.
+    // Step 6: Run shared k-means (round 1).
     kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
 
-    // Step 7: Write results.
+    // Step 7: Write initial results.
     const ReadId bbRid = bbOid.getReadId();
     kmWriteResults(assembler, bbRid, scratch);
 
-    // Step 8: Cis refinement.
-    kmRefineCis(assembler, bbRid, scratch, opts, bbLen, false);
+    // Step 8: Iterative refinement of both cis and trans groups.
+    // Each group is independently re-examined: recount alleles within the group,
+    // reclassify, rebuild profiles, run k-means, peel off trans reads.
+    // This can separate 3+ collapsed copies.
+
+    // Assign each overlap to a group. Groups are numbered starting from 0.
+    // After round 1: group 0 = cis (hap 1 or unassigned), group 1 = trans (hap 2).
+    vector<int> groupId(numOv);
+    for (uint32_t oi = 0; oi < numOv; oi++)
+        groupId[oi] = (scratch.overlaps[oi].hap == 2) ? 1 : 0;
+    int nextGroupId = 2;
+
+    // Helper: refine a single group. Returns the number of reads peeled off.
+    auto refineGroup = [&](int gid, const char* label) -> uint32_t {
+        constexpr uint32_t maxRefineRounds = 10;
+        uint32_t totalPeeled = 0;
+
+        for (uint32_t round = 0; round < maxRefineRounds; round++) {
+            // Count group members.
+            uint32_t groupSize = 0;
+            for (uint32_t oi = 0; oi < numOv; oi++)
+                if (groupId[oi] == gid) groupSize++;
+            if (groupSize < 6) break; // need at least 3 ref + 3 alt
+
+            // Recount alleles using only this group's overlaps.
+            for (auto& c : scratch.candidates) {
+                c.totalCov = 1; c.refCov = 1; c.fwdRef = 1;
+                c.altCov = 0; c.fwdAlt = 0; c.revAlt = 0; c.revRef = 0;
+            }
+            for (uint32_t ci = 0; ci < numCand; ci++) {
+                const auto& origin = candOrigins[ci];
+                const auto& site = allSites[origin.siteIdx];
+                const auto& matchingAlt = site.altAlleles[origin.altIdx];
+                unordered_set<uint64_t> matchAltSet;
+                for (const auto& oid : matchingAlt.reads)
+                    matchAltSet.insert(oid.getValue());
+
+                auto& c = scratch.candidates[ci];
+                for (const auto& oid : site.refReads) {
+                    auto it = readToOvIdx.find(oid.getValue());
+                    if (it == readToOvIdx.end() || groupId[it->second] != gid) continue;
+                    c.totalCov++; c.refCov++;
+                }
+                for (const auto& alt : site.altAlleles) {
+                    for (const auto& oid : alt.reads) {
+                        auto it = readToOvIdx.find(oid.getValue());
+                        if (it == readToOvIdx.end() || groupId[it->second] != gid) continue;
+                        c.totalCov++;
+                        if (matchAltSet.count(oid.getValue())) c.altCov++;
+                        else c.refCov++;
+                    }
+                }
+                c.alleleFraction = c.totalCov > 0 ? double(c.altCov) / double(c.totalCov) : 0.0;
+            }
+
+            // Reclassify with group-only counts.
+            uint32_t roundCleanHet = 0;
+            for (uint32_t ci = 0; ci < numCand; ci++) {
+                auto& c = scratch.candidates[ci];
+                if (c.alleleFraction < opts.minAf || c.alleleFraction > opts.maxAf) {
+                    c.categoryFlag = KM_NON_VAR;
+                } else if (c.key.type == KmVarType::Snp) {
+                    c.category = KmVariantCategory::CleanHetSnp;
+                    c.categoryFlag = KM_GERMLINE_CLEAN;
+                    roundCleanHet++;
+                } else {
+                    c.categoryFlag = KM_REP_HET_VAR;
+                }
+            }
+
+            cout << "    refine " << label << " round " << round
+                 << ": groupSize=" << groupSize
+                 << " cleanHet=" << roundCleanHet << endl;
+
+            if (roundCleanHet == 0) break;
+
+            // Rebuild profiles for this group's overlaps.
+            scratch.overlapProfiles.clear();
+            scratch.overlapProfiles.resize(numOv);
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                scratch.overlapProfiles[oi].overlapIdx = oi;
+                scratch.overlapProfiles[oi].startVarIdx = -1;
+                scratch.overlapProfiles[oi].endVarIdx = -1;
+                scratch.overlapProfiles[oi].alleles.clear();
+            }
+            for (uint32_t ci = 0; ci < numCand; ci++) {
+                if (scratch.candidates[ci].categoryFlag == KM_NON_VAR) continue;
+                const auto& origin = candOrigins[ci];
+                const auto& site = allSites[origin.siteIdx];
+                const auto& matchingAlt = site.altAlleles[origin.altIdx];
+                unordered_set<uint64_t> matchAltSet;
+                for (const auto& oid : matchingAlt.reads)
+                    matchAltSet.insert(oid.getValue());
+
+                for (const auto& oid : site.refReads) {
+                    auto it = readToOvIdx.find(oid.getValue());
+                    if (it == readToOvIdx.end() || groupId[it->second] != gid) continue;
+                    auto& prof = scratch.overlapProfiles[it->second];
+                    if (prof.startVarIdx < 0) prof.startVarIdx = int(ci);
+                    while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
+                        prof.alleles.push_back(-1);
+                    prof.endVarIdx = int(ci);
+                    prof.alleles.push_back(0);
+                }
+                for (const auto& alt : site.altAlleles) {
+                    for (const auto& oid : alt.reads) {
+                        auto it = readToOvIdx.find(oid.getValue());
+                        if (it == readToOvIdx.end() || groupId[it->second] != gid) continue;
+                        auto& prof = scratch.overlapProfiles[it->second];
+                        if (prof.startVarIdx < 0) prof.startVarIdx = int(ci);
+                        while (prof.startVarIdx + int(prof.alleles.size()) < int(ci))
+                            prof.alleles.push_back(-1);
+                        prof.endVarIdx = int(ci);
+                        prof.alleles.push_back(matchAltSet.count(oid.getValue()) ? 1 : 0);
+                    }
+                }
+            }
+
+            // Reset hap assignments and run k-means.
+            for (auto& ov : scratch.overlaps) ov.hap = 0;
+            kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
+
+            // Peel off trans overlaps into a new group.
+            uint32_t peeled = 0;
+            int newGid = nextGroupId;
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                if (groupId[oi] == gid && scratch.overlaps[oi].hap == 2) {
+                    groupId[oi] = newGid;
+                    peeled++;
+                }
+            }
+            if (peeled > 0) nextGroupId++;
+            totalPeeled += peeled;
+
+            cout << "    refine " << label << " round " << round
+                 << ": peeled=" << peeled
+                 << " -> group " << newGid << endl;
+
+            if (peeled == 0) break;
+        }
+        return totalPeeled;
+    };
+
+    // Refine both initial groups.
+    refineGroup(0, "cis");
+    refineGroup(1, "trans");
+
+    // Recursively refine any new groups that were created.
+    // (Groups created by peeling may themselves contain multiple copies.)
+    for (int gid = 2; gid < nextGroupId; gid++) {
+        string label = "group" + to_string(gid);
+        refineGroup(gid, label.c_str());
+    }
+
+    // Write final matchStates.
+    // Group 0 = cis (matchState 1), group 1 = trans (matchState 2),
+    // groups 2+ = additional copies (matchState 3+, capped at 255).
+    for (uint32_t oi = 0; oi < numOv; oi++) {
+        auto& ad = assembler.alignmentData[scratch.overlaps[oi].alignmentId];
+        int g = groupId[oi];
+        uint8_t matchState;
+        if (g == 0) matchState = 1;       // cis
+        else if (g == 1) matchState = 2;  // trans
+        else matchState = 3;              // additional copy
+        ad.setHifiasmEcMatchStateFromReadPerspective(bbRid, matchState);
+    }
 
     // Count and log per-window results.
-    uint32_t wCis = 0, wTrans = 0, wCisDiffCopy = 0, wUnclass = 0;
+    // Count reads per group.
+    map<int, uint32_t> groupCounts;
+    for (uint32_t oi = 0; oi < numOv; oi++)
+        groupCounts[groupId[oi]]++;
+
+    uint32_t wCis = groupCounts.count(0) ? groupCounts[0] : 0;
+    uint32_t wTrans = groupCounts.count(1) ? groupCounts[1] : 0;
+    uint32_t wOther = 0;
+    for (const auto& [g, cnt] : groupCounts)
+        if (g >= 2) wOther += cnt;
+
     for (const auto& ov : scratch.overlaps) {
-        const auto& ad = assembler.alignmentData[ov.alignmentId];
-        uint8_t ms = ad.getHifiasmEcMatchStateFromReadPerspective(bbRid);
-        const char* label = (ms == 1) ? "cis" : (ms == 2) ? "trans" : (ms == 3) ? "cisDiffCopy" : "unclass";
-        if (ms == 1) { counters.cisCount++; wCis++; }
-        else if (ms == 2) { counters.transCount++; wTrans++; }
-        else if (ms == 3) { wCisDiffCopy++; }
-        else { wUnclass++; }
+        OrientedReadId partner = assembler.alignmentData[ov.alignmentId].getOther(bbOid);
+        int g = groupId[&ov - &scratch.overlaps[0]];
+        cout << "    read=" << partner << " -> group" << g << endl;
         counters.readsPhased++;
-        // Find the OrientedReadId for this overlap.
-        OrientedReadId partner = ad.getOther(bbOid);
-        cout << "    read=" << partner << " -> " << label << endl;
+        if (g == 0) counters.cisCount++;
+        else if (g == 1) counters.transCount++;
     }
     cout << "  MSA window bb=" << bbOid
          << " segs=" << nSegments
          << " reads=" << scratch.overlaps.size()
          << " sites=" << allSites.size()
          << " het=" << cleanHet
-         << " cis=" << wCis
-         << " trans=" << wTrans
-         << " cisDiffCopy=" << wCisDiffCopy
-         << " unclass=" << wUnclass
-         << endl;
+         << " groups=" << nextGroupId
+         << " group0(cis)=" << wCis
+         << " group1(trans)=" << wTrans;
+    if (wOther > 0) cout << " otherGroups=" << wOther;
+    cout << endl;
     counters.windowsProcessed++;
 }
 
