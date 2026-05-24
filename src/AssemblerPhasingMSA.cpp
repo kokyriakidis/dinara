@@ -478,11 +478,13 @@ static vector<MsaVariantSite> msaDetectVariantSites(
             if ((!isIns || c == colCount) && insStart != SIZE_MAX) {
                 size_t insEnd = c; // exclusive
 
-                // Find the backbone position to anchor this insertion site.
-                // Use the preceding ref column's backbone offset.
+                // Find the backbone position and base to anchor this insertion site.
+                // Use the preceding ref column's backbone offset and base.
                 uint32_t anchorPos = focalBegin; // fallback
+                char anchorBase = 'N';
                 for (size_t j = insStart; j > 0; --j) {
                     if (alignedSeqs[0][j - 1] != '-') {
+                        anchorBase = alignedSeqs[0][j - 1];
                         auto it = lower_bound(colByOff.begin(), colByOff.end(), j - 1);
                         if (it != colByOff.end() && *it == j - 1)
                             anchorPos = focalBegin + uint32_t(it - colByOff.begin());
@@ -519,24 +521,30 @@ static vector<MsaVariantSite> msaDetectVariantSites(
                     }
                 }
 
-                // Build ref/alt from consensus.
+                // Build ref/alt from consensus, anchored with the preceding
+                // backbone base (VCF-style).  This makes ref/alt comparable
+                // strings so prefix/suffix trimming works correctly downstream.
+                string anchorStr(1, anchorBase);
+                string refStr = (consensus == "-")
+                    ? anchorStr
+                    : anchorStr + consensus;
+
                 vector<OrientedReadId> refReads2 = alleleMap[consensus];
                 vector<MsaAltAllele> reportable2;
                 uint64_t maxAS2 = 0;
                 for (const auto& [allele, reads_vec] : alleleMap) {
                     if (allele == consensus) continue;
                     if (reads_vec.size() < msaMinSnpAltSupport) continue;
-                    string tp;
-                    if (consensus == "-") tp = "INS";
-                    else if (allele == "-") tp = "DEL";
-                    else if (allele.size() == consensus.size() && allele.size() == 1) tp = "SNP";
-                    else tp = "MNP";
-                    reportable2.push_back(MsaAltAllele{tp, allele, reads_vec});
+                    // Anchor the alt allele with the backbone base.
+                    string anchoredAlt = (allele == "-")
+                        ? anchorStr
+                        : anchorStr + allele;
+                    string tp = msaAlleleType(refStr, anchoredAlt);
+                    reportable2.push_back(MsaAltAllele{tp, anchoredAlt, reads_vec});
                     maxAS2 = max(maxAS2, uint64_t(reads_vec.size()));
                 }
 
                 if (refReads2.size() >= msaMinSnpRefSupport && maxAS2 >= msaMinSnpAltSupport) {
-                    string refStr = (consensus == "-") ? string("*") : consensus;
                     uint32_t tot = uint32_t(refReads2.size() + maxAS2);
                     double af = tot > 0 ? double(maxAS2) / double(tot) : 0.0;
                     sites.push_back(MsaVariantSite{anchorPos, refStr, move(reportable2),
