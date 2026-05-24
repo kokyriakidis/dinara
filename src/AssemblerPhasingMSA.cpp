@@ -733,23 +733,27 @@ static void msaProcessWindow(
     for (const auto& site : allSites) {
         KmCandidate cand;
         cand.key.pos = site.backbonePosition;
-        // Determine variant type from first alt allele.
+        // Determine variant type from the highest-coverage alt allele.
         if (!site.altAlleles.empty()) {
-            const auto& alt0 = site.altAlleles[0];
-            if (alt0.type == "SNP") {
+            size_t bestIdx = 0;
+            for (size_t ai = 1; ai < site.altAlleles.size(); ai++)
+                if (site.altAlleles[ai].reads.size() > site.altAlleles[bestIdx].reads.size())
+                    bestIdx = ai;
+            const auto& bestAlt = site.altAlleles[bestIdx];
+            if (bestAlt.type == "SNP") {
                 cand.key.type = KmVarType::Snp;
-                cand.key.altBase = alt0.sequence.empty() ? 0 :
-                    (alt0.sequence[0] == 'C' ? 1 : alt0.sequence[0] == 'G' ? 2 :
-                     alt0.sequence[0] == 'T' ? 3 : 0);
+                cand.key.altBase = bestAlt.sequence.empty() ? 0 :
+                    (bestAlt.sequence[0] == 'C' ? 1 : bestAlt.sequence[0] == 'G' ? 2 :
+                     bestAlt.sequence[0] == 'T' ? 3 : 0);
                 cand.key.refLen = 1; cand.key.altLen = 1;
-            } else if (alt0.type == "INS") {
+            } else if (bestAlt.type == "INS") {
                 cand.key.type = KmVarType::Insertion;
                 cand.key.refLen = 0;
-                cand.key.altLen = uint16_t(alt0.sequence.size());
-                cand.key.altSeq = alt0.sequence;
+                cand.key.altLen = uint16_t(bestAlt.sequence.size());
+                cand.key.altSeq = bestAlt.sequence;
             } else {
                 cand.key.type = KmVarType::Deletion;
-                cand.key.refLen = uint16_t(site.refAllele.size());
+                cand.key.refLen = uint16_t(bestAlt.sequence.size());
                 cand.key.altLen = 0;
             }
         } else {
