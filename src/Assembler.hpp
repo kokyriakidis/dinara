@@ -3642,7 +3642,7 @@ public:
     // Detect clean het SNPs in an anchor window using CIGAR-based variant parsing.
     // Uses pairwise CIGARs from OverlapCigarStore instead of Theseus MSA.
     uint32_t cigarDetectSnpsInWindow(
-        const AnchorWindow& window,
+        AnchorWindow& window,
         const Shasta2Anchors& anchors,
         const Shasta2Journeys& journeys) const;
 

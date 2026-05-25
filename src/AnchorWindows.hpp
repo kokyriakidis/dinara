@@ -41,9 +41,17 @@ struct AnchorWindow {
     // These form parallel chains between backbone anchors at het sites.
     std::vector<AnchorWindowAlternatePath> alternatePaths;
 
-    // Set by msaDetectSnpsInWindow: number of clean het SNPs found.
+    // Set by cigarDetectSnpsInWindow: number of clean het SNPs found.
     // 0 means the window is homozygous — only backbone anchors should be kept.
     uint32_t cleanHetSnpCount = 0;
+
+    // Per-read haplotype assignment from k-means phasing.
+    // hap: 0 = unassigned, 1 = haplotype 1 (cis with backbone), 2 = haplotype 2 (trans).
+    struct ReadHaplotype {
+        OrientedReadId orientedReadId;
+        int hap = 0;
+    };
+    std::vector<ReadHaplotype> readHaplotypes;
 };
 
 } // namespace dinara

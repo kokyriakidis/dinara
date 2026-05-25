@@ -46,6 +46,22 @@ struct CwReadProfile {
     bool isDirect;              // true if directly overlaps backbone
     uint32_t bbCovBegin = 0;    // backbone coverage range [begin, end)
     uint32_t bbCovEnd = 0;      // in oriented backbone coordinates
+
+    // Backbone positions where this read has a deletion (no bases).
+    // Sorted, non-overlapping [begin, end) ranges in oriented backbone frame.
+    vector<pair<uint32_t, uint32_t>> deletionRanges;
+
+    // Check if a backbone position falls within a deletion in this read.
+    bool isDeleted(uint32_t pos) const {
+        // Binary search for the first range whose end > pos.
+        auto it = upper_bound(deletionRanges.begin(), deletionRanges.end(), pos,
+            [](uint32_t p, const pair<uint32_t, uint32_t>& r) { return p < r.first; });
+        if (it != deletionRanges.begin()) {
+            --it;
+            if (pos >= it->first && pos < it->second) return true;
+        }
+        return false;
+    }
 };
 
 // A mapping from intermediary read positions to backbone positions,
@@ -253,7 +269,8 @@ static void cwParseCigarForOverlap(
     uint32_t windowBbEnd,
     vector<CwVariant>& variants,
     uint32_t& covBeginOut,
-    uint32_t& covEndOut)
+    uint32_t& covEndOut,
+    vector<pair<uint32_t, uint32_t>>& deletionRanges)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
     const auto& ad = assembler.alignmentData[alignmentId];
@@ -357,6 +374,7 @@ static void cwParseCigarForOverlap(
                     e = min(e, windowBbEnd);
                     if (s < backboneLen) {
                         variants.push_back({s, KmVarType::Deletion, 0, uint16_t(e - s), {}});
+                        deletionRanges.push_back({s, e});
                     }
                 } else {
                     // Insertion at backbone position
@@ -397,6 +415,22 @@ static void cwParseCigarForOverlap(
 
     sort(variants.begin(), variants.end(),
         [](const CwVariant& a, const CwVariant& b) { return a.bbPos < b.bbPos; });
+
+    // Sort and merge overlapping deletion ranges so isDeleted binary search
+    // works correctly (it only checks the range with the largest start <= pos).
+    sort(deletionRanges.begin(), deletionRanges.end());
+    if (deletionRanges.size() > 1) {
+        vector<pair<uint32_t, uint32_t>> merged;
+        merged.push_back(deletionRanges[0]);
+        for (size_t i = 1; i < deletionRanges.size(); i++) {
+            if (deletionRanges[i].first <= merged.back().second) {
+                merged.back().second = max(merged.back().second, deletionRanges[i].second);
+            } else {
+                merged.push_back(deletionRanges[i]);
+            }
+        }
+        deletionRanges = move(merged);
+    }
 }
 
 
@@ -405,7 +439,7 @@ static void cwParseCigarForOverlap(
 // Returns the number of SNPs passing strand bias and homopolymer/repeat filters.
 // ============================================================================
 uint32_t Assembler::cigarDetectSnpsInWindow(
-    const AnchorWindow& window,
+    AnchorWindow& window,
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys) const
 {
@@ -513,7 +547,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         cwParseCigarForOverlap(
             *this, bbReadId, bbLen, bbOid.getStrand() == 1, bestAlnId,
             windowBbBegin, windowBbEnd, profile.variants,
-            profile.bbCovBegin, profile.bbCovEnd);
+            profile.bbCovBegin, profile.bbCovEnd,
+            profile.deletionRanges);
 
         readToProfile[oid.getValue()] = profiles.size();
         profiles.push_back(move(profile));
@@ -862,7 +897,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         int running = 0;
         size_t ei = 0; // event index
         for (uint32_t pos : sortedSnpPositions) {
-            // Process all events at positions <= pos.
             while (ei < covEvents.size() && covEvents[ei].pos <= pos) {
                 running += covEvents[ei].delta;
                 ei++;
@@ -871,13 +905,34 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         }
     }
 
-    // Classify SNPs.
+    // Classify SNPs and collect passing het SNPs for phasing.
+    struct PassingSnp {
+        uint32_t pos;
+        uint8_t altBase;
+        uint32_t altCov;
+        uint32_t refCov;
+        uint32_t spanning;
+        uint32_t fwd;
+        uint32_t rev;
+    };
+    vector<PassingSnp> passingSnps;
+
     KmPhasingOptions opts;
     uint32_t cleanHetSnps = 0;
 
     for (uint32_t pos : snpPositions) {
         const uint32_t spanning = spanningCount[pos];
         if (spanning == 0) continue;
+
+        // Count reads with a deletion at this position.
+        uint32_t delCount = 0;
+        for (const auto& prof : profiles) {
+            if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.isDeleted(pos))
+                delCount++;
+        }
+        // Effective spanning: reads that actually have bases at this position.
+        const uint32_t effSpanning = (spanning > delCount) ? spanning - delCount : 0;
+        if (effSpanning == 0) continue;
 
         // For each alt allele at this position.
         for (uint8_t alt = 0; alt < 4; alt++) {
@@ -888,11 +943,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
 
             if (acc.total < cwMinSnpAltSupport) continue;
 
-            // Ref support = reads spanning this position minus alt reads.
-            const uint32_t refCov = (spanning > acc.total) ? spanning - acc.total : 0;
+            // Ref support = reads with bases at this position minus alt reads.
+            const uint32_t refCov = (effSpanning > acc.total) ? effSpanning - acc.total : 0;
             if (refCov < cwMinSnpRefSupport) continue;
 
-            const double af = double(acc.total) / double(spanning);
+            const double af = double(acc.total) / double(effSpanning);
             if (af < opts.minAf || af > opts.maxAf) continue;
 
             // Strand bias.
@@ -913,6 +968,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             if (kmIsHomopolymer(bbSeq, bbLen, vkey, 0) ||
                 kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) continue;
 
+            passingSnps.push_back({pos, alt, acc.total, refCov, effSpanning,
+                                   acc.fwd, acc.rev});
             cleanHetSnps++;
         }
     }
@@ -922,6 +979,143 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
          << " reads=" << profiles.size()
          << " snpPositions=" << snpPositions.size()
          << " cleanHetSnps=" << cleanHetSnps << endl;
+
+    // Phase reads using k-means if we have het SNPs.
+    if (cleanHetSnps > 0 && profiles.size() >= 2) {
+        // Sort passing SNPs by position (KmVarKey ordering).
+        sort(passingSnps.begin(), passingSnps.end(),
+            [](const PassingSnp& a, const PassingSnp& b) {
+                return a.pos < b.pos || (a.pos == b.pos && a.altBase < b.altBase);
+            });
+
+        const uint32_t numCand = uint32_t(passingSnps.size());
+        const uint32_t numOv = uint32_t(profiles.size());
+
+        // Build KmScratchpad from our profiles and passing SNPs.
+        KmScratchpad scratch;
+
+        // Candidates: one per passing het SNP.
+        scratch.candidates.resize(numCand);
+        for (uint32_t ci = 0; ci < numCand; ci++) {
+            const auto& ps = passingSnps[ci];
+            auto& c = scratch.candidates[ci];
+            c.key.pos = ps.pos;
+            c.key.type = KmVarType::Snp;
+            c.key.altBase = ps.altBase;
+            c.key.refLen = 1;
+            c.key.altLen = 1;
+            c.totalCov = int(ps.spanning);
+            c.refCov = int(ps.refCov);
+            c.altCov = int(ps.altCov);
+            c.fwdAlt = int(ps.fwd);
+            c.revAlt = int(ps.rev);
+            c.fwdRef = int(ps.spanning - ps.altCov) / 2; // approximate
+            c.revRef = int(ps.spanning - ps.altCov) - c.fwdRef;
+            c.alleleFraction = double(ps.altCov) / double(ps.spanning);
+            c.category = KmVariantCategory::CleanHetSnp;
+            c.categoryFlag = kmCategoryToFlag(KmVariantCategory::CleanHetSnp);
+            c.nUniqAlles = 2;
+            c.isHomopolymerIndel = false;
+            c.phaseSet = 0;
+        }
+
+        // Overlaps: one per read profile.
+        scratch.overlaps.resize(numOv);
+        scratch.overlapProfiles.resize(numOv);
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            auto& ov = scratch.overlaps[oi];
+            ov.hap = 0;
+            ov.phaseSet = -1;
+            // Other fields (alignmentId etc.) are not used by kmRunKmeans.
+
+            const auto& prof = profiles[oi];
+            auto& op = scratch.overlapProfiles[oi];
+            op.overlapIdx = oi;
+
+            // Build allele array: for each candidate, check if this read
+            // has a matching SNP variant.
+            // First, find the range of candidates this read covers
+            // (based on its coverage range).
+            int firstCi = -1, lastCi = -1;
+            for (uint32_t ci = 0; ci < numCand; ci++) {
+                uint32_t cPos = passingSnps[ci].pos;
+                if (cPos >= prof.bbCovBegin && cPos < prof.bbCovEnd) {
+                    if (firstCi < 0) firstCi = int(ci);
+                    lastCi = int(ci);
+                }
+            }
+
+            if (firstCi < 0) {
+                op.startVarIdx = -1;
+                op.endVarIdx = -1;
+                continue;
+            }
+
+            op.startVarIdx = firstCi;
+            op.endVarIdx = lastCi;
+            op.alleles.assign(lastCi - firstCi + 1, 0); // default: ref (0)
+
+            // Build a set of this read's SNP variants for fast lookup.
+            unordered_map<uint64_t, uint8_t> readSnps;
+            for (const auto& v : prof.variants) {
+                if (v.type != KmVarType::Snp) continue;
+                readSnps[snpKey(v.bbPos, v.altBase)] = 1;
+            }
+
+            // Fill allele array.
+            for (int ci = firstCi; ci <= lastCi; ci++) {
+                uint32_t cPos = passingSnps[ci].pos;
+                // Check if position is within read's coverage.
+                if (cPos < prof.bbCovBegin || cPos >= prof.bbCovEnd) {
+                    op.alleles[ci - firstCi] = -1; // missing
+                    continue;
+                }
+                // Check if read has a deletion at this position.
+                if (prof.isDeleted(cPos)) {
+                    op.alleles[ci - firstCi] = -1; // no bases here
+                    continue;
+                }
+
+                // Check if read has the alt allele at this position.
+                uint64_t sk = snpKey(cPos, passingSnps[ci].altBase);
+                if (readSnps.count(sk)) {
+                    op.alleles[ci - firstCi] = 1; // alt
+                } else {
+                    // Check if read has a DIFFERENT alt at this position.
+                    // pgphase treats overlapping variants at the same position
+                    // as no observation (-1), not ref.
+                    bool hasDiffAlt = false;
+                    for (uint8_t a = 0; a < 4; a++) {
+                        if (a == passingSnps[ci].altBase) continue;
+                        if (readSnps.count(snpKey(cPos, a))) {
+                            hasDiffAlt = true;
+                            break;
+                        }
+                    }
+                    op.alleles[ci - firstCi] = hasDiffAlt ? -1 : 0; // -1=no observation, 0=ref
+                }
+            }
+        }
+
+        // Run k-means phasing.
+        kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
+
+        // Extract per-read haplotype assignments.
+        window.readHaplotypes.resize(numOv);
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
+            window.readHaplotypes[oi].hap = scratch.overlaps[oi].hap;
+        }
+
+        uint32_t hap1 = 0, hap2 = 0, unassigned = 0;
+        for (const auto& rh : window.readHaplotypes) {
+            if (rh.hap == 1) hap1++;
+            else if (rh.hap == 2) hap2++;
+            else unassigned++;
+        }
+        cout << "    phasing: hap1=" << hap1 << " hap2=" << hap2
+             << " unassigned=" << unassigned << endl;
+    }
 
     return cleanHetSnps;
 }
