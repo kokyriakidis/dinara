@@ -354,6 +354,10 @@ static void cwParseCigarForOverlap(
                         altBase = seq[tPos].value;
                         if (isRev) altBase = uint8_t((~altBase) & 3);
                     }
+                    // When mirrorBb is set, bbPos was mirrored to the backbone's
+                    // RC frame. The alt base must also be complemented to match.
+                    if (mirrorBb) altBase = uint8_t((~altBase) & 3);
+
                     variants.push_back({bbPos, KmVarType::Snp, altBase, 1, {}});
                 }
             } else if (op == 2 || op == 3) { // Ins/Del
