@@ -920,6 +920,13 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     KmPhasingOptions opts;
     uint32_t cleanHetSnps = 0;
 
+    // Filter counters.
+    uint32_t passAltSupport = 0;
+    uint32_t failRefSupport = 0;
+    uint32_t failAf = 0;
+    uint32_t failStrandBias = 0;
+    uint32_t failHomopolymer = 0;
+
     for (uint32_t pos : snpPositions) {
         const uint32_t spanning = spanningCount[pos];
         if (spanning == 0) continue;
@@ -942,20 +949,21 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             const auto& acc = it->second;
 
             if (acc.total < cwMinSnpAltSupport) continue;
+            passAltSupport++;
 
             // Ref support = reads with bases at this position minus alt reads.
             const uint32_t refCov = (effSpanning > acc.total) ? effSpanning - acc.total : 0;
-            if (refCov < cwMinSnpRefSupport) continue;
+            if (refCov < cwMinSnpRefSupport) { failRefSupport++; continue; }
 
             const double af = double(acc.total) / double(effSpanning);
-            if (af < opts.minAf || af > opts.maxAf) continue;
+            if (af < opts.minAf || af > opts.maxAf) { failAf++; continue; }
 
             // Strand bias.
             const int expected = int(acc.total) / 2;
             if (expected > 0) {
                 const double p = kmFisherExactTwoTail(
                     int(acc.fwd), int(acc.rev), expected, expected);
-                if (p < opts.strandBiasPval) continue;
+                if (p < opts.strandBiasPval) { failStrandBias++; continue; }
             }
 
             // Homopolymer / repeat context.
@@ -966,7 +974,7 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             vkey.refLen = 1;
             vkey.altLen = 1;
             if (kmIsHomopolymer(bbSeq, bbLen, vkey, 0) ||
-                kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) continue;
+                kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) { failHomopolymer++; continue; }
 
             passingSnps.push_back({pos, alt, acc.total, refCov, effSpanning,
                                    acc.fwd, acc.rev});
@@ -978,6 +986,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
          << " window=[" << windowBbBegin << "," << windowBbEnd << ")"
          << " reads=" << profiles.size()
          << " snpPositions=" << snpPositions.size()
+         << " passAltSupport=" << passAltSupport
+         << " failRefSupport=" << failRefSupport
+         << " failAF=" << failAf
+         << " failStrandBias=" << failStrandBias
+         << " failHomopolymer=" << failHomopolymer
          << " cleanHetSnps=" << cleanHetSnps << endl;
 
     // Phase reads using k-means if we have het SNPs.
