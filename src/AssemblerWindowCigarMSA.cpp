@@ -310,45 +310,10 @@ static void cwParseCigarForOverlap(
         if (e > covMax) covMax = e;
     };
 
-    // DEBUG: trace CIGAR ops for reads 530 and 540.
-    const bool debugThisRead = (targetReadId == 530 || targetReadId == 540 ||
-                                backboneReadId == 530 || backboneReadId == 540);
-
     cigarStore.forEachOpWithPositions(
         info.cigarOffset, info.cigarTokenCount,
         ad.qs, cwCigarRead1Start(assembler, ad),
         [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
-            // DEBUG: print CIGAR ops near position 38749 for reads 530/540.
-            if (debugThisRead) {
-                // Compute the bbPos range this op covers.
-                uint32_t bbRawStart = bbIsRead0 ? uint32_t(xk) : uint32_t(yk);
-                uint32_t bbRawEnd = bbRawStart + len;
-                // Check if this op's raw range could map near 38749.
-                // (We check a wide range to catch nearby ops.)
-                bool nearTarget = false;
-                if (op == 0 || op == 1 || (op == 3 && bbIsRead0) || (op == 2 && !bbIsRead0)) {
-                    // Convert raw range to oriented frame to check.
-                    uint32_t s = bbRawStart, e = min(bbRawEnd, backboneLen);
-                    if (needsRc) { s = backboneLen - e; e = backboneLen - bbRawStart; }
-                    if (mirrorBb) { uint32_t ms = backboneLen - e, me = backboneLen - s; s = ms; e = me; }
-                    nearTarget = (s <= 38760 && e >= 38740);
-                }
-                if (nearTarget) {
-                    const char* opNames[] = {"M", "X", "I(yk)", "D(xk)"};
-                    cout << "DEBUG CIGAR read0=" << ad.readIds[0]
-                         << " read1=" << ad.readIds[1]
-                         << " bb=" << backboneReadId
-                         << " target=" << targetReadId
-                         << " op=" << opNames[op]
-                         << " len=" << len
-                         << " xk=" << xk << " yk=" << yk
-                         << " bbIsRead0=" << bbIsRead0
-                         << " needsRc=" << needsRc
-                         << " mirrorBb=" << mirrorBb
-                         << endl;
-                }
-            }
-
             // Update coverage range for backbone-consuming ops.
             // Op 0/1 (match/mismatch): both reads consumed.
             // Op 3: only read0 (xk) consumed — backbone-consuming iff bbIsRead0.
@@ -388,19 +353,6 @@ static void cwParseCigarForOverlap(
                         const auto seq = assembler.getReads().getRead(targetReadId);
                         altBase = seq[tPos].value;
                         if (isRev) altBase = uint8_t((~altBase) & 3);
-                    }
-                    // DEBUG: trace mismatch at/near position 38749.
-                    if (debugThisRead && bbPos >= 38740 && bbPos <= 38760) {
-                        const char* baseChar = "ACGT";
-                        cout << "DEBUG MISMATCH target=" << targetReadId
-                             << " bbPos=" << bbPos
-                             << " tPos=" << tPos
-                             << " altBase=" << baseChar[altBase & 3]
-                             << " isRev=" << isRev
-                             << " bbIsRead0=" << bbIsRead0
-                             << " needsRc=" << needsRc
-                             << " xk=" << xk << " yk=" << yk << " b=" << b
-                             << endl;
                     }
                     variants.push_back({bbPos, KmVarType::Snp, altBase, 1, {}});
                 }
@@ -597,44 +549,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             windowBbBegin, windowBbEnd, profile.variants,
             profile.bbCovBegin, profile.bbCovEnd,
             profile.deletionRanges);
-
-        // DEBUG: trace reads 530 and 540 at position 38749.
-        {
-            const uint32_t debugReadId = oid.getReadId();
-            if (debugReadId == 530 || debugReadId == 540) {
-                const char* baseChar = "ACGT";
-                cout << "DEBUG cwParse read=" << oid
-                     << " bbRead=" << bbReadId
-                     << " bbStrand1=" << (bbOid.getStrand() == 1)
-                     << " alnId=" << bestAlnId
-                     << " covRange=[" << profile.bbCovBegin << "," << profile.bbCovEnd << ")"
-                     << " nVariants=" << profile.variants.size()
-                     << " nDelRanges=" << profile.deletionRanges.size()
-                     << endl;
-                const auto& ad = alignmentData[bestAlnId];
-                cout << "DEBUG   alignment: read0=" << ad.readIds[0]
-                     << " read1=" << ad.readIds[1]
-                     << " sameStrand=" << ad.isSameStrand
-                     << " qs=" << ad.qs << " qe=" << ad.qe
-                     << " ts=" << ad.ts << " te=" << ad.te
-                     << endl;
-                for (const auto& v : profile.variants) {
-                    if (v.bbPos >= 38740 && v.bbPos <= 38760) {
-                        cout << "DEBUG   variant bbPos=" << v.bbPos
-                             << " type=" << (v.type == KmVarType::Snp ? "SNP" :
-                                             v.type == KmVarType::Deletion ? "DEL" : "INS")
-                             << " altBase=" << baseChar[v.altBase & 3]
-                             << " len=" << v.len
-                             << endl;
-                    }
-                }
-                // Also print what base the backbone has at 38749.
-                if (38749 >= windowBbBegin && 38749 < windowBbEnd) {
-                    uint8_t bbBase = rds.getOrientedReadBase(bbOid, 38749).value;
-                    cout << "DEBUG   backbone base at 38749: " << baseChar[bbBase & 3] << endl;
-                }
-            }
-        }
 
         readToProfile[oid.getValue()] = profiles.size();
         profiles.push_back(move(profile));
@@ -1044,12 +958,41 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             const double af = double(acc.total) / double(effSpanning);
             if (af < opts.minAf || af > opts.maxAf) { failAf++; continue; }
 
-            // Strand bias.
-            const int expected = int(acc.total) / 2;
-            if (expected > 0) {
-                const double p = kmFisherExactTwoTail(
-                    int(acc.fwd), int(acc.rev), expected, expected);
-                if (p < opts.strandBiasPval) { failStrandBias++; continue; }
+            // Strand bias: 2x2 Fisher exact test comparing alt vs ref
+            // strand distributions. This catches systematic alignment
+            // artifacts where all alt reads come from one strand.
+            {
+                // Count ref reads by strand at this position.
+                uint32_t refFwd = 0, refRev = 0;
+                for (const auto& prof : profiles) {
+                    if (pos < prof.bbCovBegin || pos >= prof.bbCovEnd) continue;
+                    if (prof.isDeleted(pos)) continue;
+                    // Check if this read has the specific alt allele.
+                    bool hasThisAlt = false;
+                    for (const auto& v : prof.variants) {
+                        if (v.type == KmVarType::Snp && v.bbPos == pos
+                            && v.altBase == alt) {
+                            hasThisAlt = true;
+                            break;
+                        }
+                    }
+                    if (!hasThisAlt) {
+                        if (prof.oid.getStrand() == 0) refFwd++;
+                        else refRev++;
+                    }
+                }
+                // Add backbone (always ref, strand from bbOid).
+                if (pos >= windowBbBegin && pos < windowBbEnd) {
+                    if (bbOid.getStrand() == 0) refFwd++;
+                    else refRev++;
+                }
+                // Fisher exact on [[alt_fwd, alt_rev], [ref_fwd, ref_rev]].
+                const int totalCells = int(acc.fwd) + int(acc.rev) + int(refFwd) + int(refRev);
+                if (totalCells > 0) {
+                    const double p = kmFisherExactTwoTail(
+                        int(acc.fwd), int(acc.rev), int(refFwd), int(refRev));
+                    if (p < opts.strandBiasPval) { failStrandBias++; continue; }
+                }
             }
 
             // Homopolymer / repeat context.
@@ -1108,30 +1051,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
                     && v.altBase == passingSnps[i].altBase) {
                     hasAlt = true;
                     break;
-                }
-            }
-            // DEBUG: trace classification of reads 530/540 at position 38749.
-            if (passingSnps[i].pos == 38749 &&
-                (prof.oid.getReadId() == 530 || prof.oid.getReadId() == 540)) {
-                const char* baseChar = "ACGT";
-                cout << "DEBUG classify read=" << prof.oid
-                     << " at bbPos=38749"
-                     << " hasAlt=" << hasAlt
-                     << " covRange=[" << prof.bbCovBegin << "," << prof.bbCovEnd << ")"
-                     << " isDeleted=" << prof.isDeleted(38749)
-                     << " nVariants=" << prof.variants.size()
-                     << endl;
-                // Print all variants near 38749 for this read.
-                for (const auto& v : prof.variants) {
-                    if (v.bbPos >= 38740 && v.bbPos <= 38760) {
-                        cout << "DEBUG   read " << prof.oid
-                             << " variant bbPos=" << v.bbPos
-                             << " type=" << (v.type == KmVarType::Snp ? "SNP" :
-                                             v.type == KmVarType::Deletion ? "DEL" : "INS")
-                             << " altBase=" << baseChar[v.altBase & 3]
-                             << " len=" << v.len
-                             << endl;
-                    }
                 }
             }
             if (hasAlt) hs.altReads.push_back(prof.oid);
