@@ -66,10 +66,14 @@ struct AnchorWindow {
     };
     std::vector<ReadHaplotype> readHaplotypes;
 
-    // Read clusters from iterative k-means refinement.
+    // Read clusters from phasing.
     // Each cluster is a set of reads that phase together.
     // Cluster 0 contains the backbone read.
     std::vector<std::vector<OrientedReadId>> readClusters;
+
+    // True if the cluster at the same index contains unclassified reads
+    // (reads that don't span any het sites and belong to both haplotypes).
+    std::vector<bool> clusterIsUnclassified;
 };
 
 } // namespace dinara
