@@ -1207,9 +1207,10 @@ void dinara::main::assemble(
             const string snpFileName = "WindowHetSnps.csv";
             ofstream snpFile(snpFileName);
             if (snpFile) {
-                snpFile << "BbPos,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
+                snpFile << "BbPos,RefBase,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
                 for (const auto& s : w0.hetSnps) {
                     snpFile << s.bbPos << ","
+                            << baseChar[s.refBase] << ","
                             << baseChar[s.altBase] << ","
                             << s.altCov << ","
                             << s.refCov << ","
