@@ -1197,6 +1197,24 @@ void dinara::main::assemble(
              << std::defaultfloat << endl;
     }
 
+    // Write per-read haplotype assignments for the first window (longest read).
+    if (!anchorWindows.empty() && !anchorWindows[0].readHaplotypes.empty()) {
+        const auto& w0 = anchorWindows[0];
+        const string hapFileName = "WindowHaplotypes.csv";
+        ofstream hapFile(hapFileName);
+        if (hapFile) {
+            hapFile << "OrientedReadId,Haplotype\n";
+            // Backbone read is hap 1 by convention.
+            hapFile << w0.backboneOrientedReadId << ",1\n";
+            for (const auto& rh : w0.readHaplotypes) {
+                hapFile << rh.orientedReadId << "," << rh.hap << "\n";
+            }
+            cout << timestamp << "Wrote " << hapFileName
+                 << " (" << w0.readHaplotypes.size() << " reads, window bb="
+                 << w0.backboneOrientedReadId << ")" << endl;
+        }
+    }
+
     // Write AnchorWindowsClean GFA with het/hom-gated alternate paths.
     assembler.writeAnchorWindowsCleanGfa(anchorWindows);
 
