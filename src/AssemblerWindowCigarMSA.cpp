@@ -1020,17 +1020,24 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             // Skip reads with a deletion at this position.
             if (prof.isDeleted(passingSnps[i].pos)) continue;
 
-            // Check if this read has the alt allele.
-            bool hasAlt = false;
+            // Check if this read has any SNP variant at this position.
+            // A read with a different alt allele is neither ref nor alt
+            // for this specific variant — skip it entirely.
+            bool hasThisAlt = false;
+            bool hasOtherAlt = false;
             for (const auto& v : prof.variants) {
-                if (v.type == KmVarType::Snp && v.bbPos == passingSnps[i].pos
-                    && v.altBase == passingSnps[i].altBase) {
-                    hasAlt = true;
+                if (v.type == KmVarType::Snp && v.bbPos == passingSnps[i].pos) {
+                    if (v.altBase == passingSnps[i].altBase) {
+                        hasThisAlt = true;
+                    } else {
+                        hasOtherAlt = true;
+                    }
                     break;
                 }
             }
-            if (hasAlt) hs.altReads.push_back(prof.oid);
-            else hs.refReads.push_back(prof.oid);
+            if (hasThisAlt) hs.altReads.push_back(prof.oid);
+            else if (!hasOtherAlt) hs.refReads.push_back(prof.oid);
+            // else: read has a different alt allele — excluded from both lists
         }
     }
 
