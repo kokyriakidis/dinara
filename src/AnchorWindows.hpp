@@ -65,6 +65,11 @@ struct AnchorWindow {
         int hap = 0;
     };
     std::vector<ReadHaplotype> readHaplotypes;
+
+    // Read clusters from iterative k-means refinement.
+    // Each cluster is a set of reads that phase together.
+    // Cluster 0 contains the backbone read.
+    std::vector<std::vector<OrientedReadId>> readClusters;
 };
 
 } // namespace dinara
