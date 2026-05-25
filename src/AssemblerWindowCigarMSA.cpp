@@ -1089,8 +1089,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         result.assign(nReads, 0);
         if (nReads < 4) return false;
 
-        // Don't try to split a group that's already at haplotype coverage.
-        if (nReads <= hetCov) return false;
+        // Only split groups with at least diploid-level coverage.
+        if (nReads < uint32_t(coverageHom / 1.5)) return false;
 
         // ── Step 1: Detect het SNPs within the subset ──
         struct SubSnpAccum { uint32_t fwd = 0, rev = 0, total = 0; };
@@ -1452,9 +1452,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         }
         cout << endl;
 
-        // Reject splits where the smaller group has fewer than 6 reads.
-        if (min(nC, nT) < 6) return false;
-
         // Report which positions were used for this split.
         if (nC > 0 && nT > 0) {
             for (uint32_t vi = 0; vi < nValid; vi++)
@@ -1538,7 +1535,7 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             vector<uint32_t> r1usedPos;
 
             bool r1split = false;
-            if (r1idx.size() > hetCov) {
+            if (r1idx.size() >= uint64_t(coverageHom / 1.5)) {
                 r1split = cwPhaseSplit(r1idx, r1bbBegin, r1bbEnd,
                                        r1exclude, r1result, r1usedPos);
             }
