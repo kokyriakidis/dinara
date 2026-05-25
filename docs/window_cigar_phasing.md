@@ -195,15 +195,22 @@ both rounds. They are compatible with all haplotype clusters.
 
 ## Multi-Allelic Handling
 
-At each het site, reads may carry a different alt allele than the one
-that passed filtering. These reads get `allele = -2` and are excluded
-from both ref and alt counts:
+Multi-allelic positions are decomposed: each qualifying alt allele at the
+same backbone position becomes a separate het site with its own
+`PassingSnp` entry. For example, position 100 with both C→G and C→T
+passing filters produces two independent sites.
+
+For each site, reads are classified relative to that site's specific alt:
 
 ```cpp
-if (hasThisAlt) allele = 1;       // matches passing alt
-else if (hasOtherAlt) allele = -2; // different alt — excluded
+if (hasThisAlt) allele = 1;       // matches this site's alt
+else if (hasOtherAlt) allele = -2; // carries a different alt — excluded
 else allele = 0;                   // ref
 ```
+
+Reads with `allele = -2` are excluded from both ref and alt counts for
+that site. They are not missing — they have a base at the position, but
+it's a different variant.
 
 ## Output
 
