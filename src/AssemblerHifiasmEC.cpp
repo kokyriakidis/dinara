@@ -65,7 +65,7 @@ Per query read, the pipeline is:
         (Ref bits, Alt bits, and AnyOther bits).
       - Run a dynamic program that chains sites when there is both ref-ref and alt-alt support
         across overlaps and no conflicting “other allele” evidence.
-      - Apply hifiasm-style cc filtering based on coveragePeak and n_hap=2 (cut_rate=0.7,
+      - Apply hifiasm-style cc filtering based on coverageHet and n_hap=2 (cut_rate=0.7,
         cut_bd=6).
       - Compact SNP rows down to the DP-retained set and reset score semantics to match hifiasm:
         DP selects rows, but downstream trans-closure starts with score = -1 again.
@@ -1039,7 +1039,7 @@ KEY CONCEPTS:
   E. CC CUTOFF (Coverage Cutoff):
      Hifiasm defines cc = max(cut_bd, (hom_cov / n_hap) * cut_rate)
      Where:
-       - hom_cov = coveragePeak (from k-mer distribution)
+       - hom_cov = coverageHet (from k-mer distribution)
        - n_hap = 2 (diploid assumption)
        - cut_rate = 0.7 (70% of expected haploid coverage)
        - cut_bd = 6 (minimum absolute cutoff)
@@ -1337,7 +1337,7 @@ void gen_rphase_dp(
       cc = max(cc, cut_bd);
 
     In this parity implementation:
-      - het_cov is not used (we use hom_cov derived from coveragePeak).
+      - het_cov is not used (we use hom_cov derived from coverageHet).
       - n_hap is fixed at 2.
       - cut_rate is 0.7 (represented as 7/10).
       - cut_bd is 6.
@@ -1352,7 +1352,7 @@ void gen_rphase_dp(
         constexpr uint64_t n_hap = 2;
 
         const uint64_t hom_cov = assembler.assemblerInfo.isOpen ?
-            assembler.assemblerInfo->kmerDistributionInfo.coveragePeak :
+            assembler.assemblerInfo->kmerDistributionInfo.coverageHet :
             invalid<uint64_t>;
 
         uint64_t base = 0;

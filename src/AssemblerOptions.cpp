@@ -499,7 +499,7 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint32_t>(&overlapCandidatesOptions.invertedIndexMaxKmerCount)->
         default_value(2000),
         "Hard cutoff: k-mers occurring more than this many times are excluded from markers. "
-        "Hifiasm default: 2000 (max_kmer_cnt). K-mers between 5*coveragePeak and this threshold "
+        "Hifiasm default: 2000 (max_kmer_cnt). K-mers between 5*coverageHet and this threshold "
         "are kept but downsampled during chaining.")
 
         ("OverlapCandidates.invertedIndexWeightExponent",
@@ -510,12 +510,12 @@ void AssemblerOptions::addConfigurableOptions()
         ("OverlapCandidates.invertedIndexLowFreqMultiplier",
         value<double>(&overlapCandidatesOptions.invertedIndexLowFreqMultiplier)->
         default_value(0.333),
-        "InvertedIndex chaining: low-frequency threshold multiplier (lowFreq = coveragePeak * multiplier).")
+        "InvertedIndex chaining: low-frequency threshold multiplier (lowFreq = coverageHet * multiplier).")
 
         ("OverlapCandidates.invertedIndexHighFreqMultiplier",
         value<double>(&overlapCandidatesOptions.invertedIndexHighFreqMultiplier)->
         default_value(1.667),
-        "InvertedIndex chaining: high-frequency threshold multiplier (highFreq = coveragePeak * multiplier).")
+        "InvertedIndex chaining: high-frequency threshold multiplier (highFreq = coverageHet * multiplier).")
 
         ("OverlapCandidates.invertedIndexRareKmerWeight",
         value<uint32_t>(&overlapCandidatesOptions.invertedIndexRareKmerWeight)->

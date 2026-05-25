@@ -384,32 +384,32 @@ void KmerCounter::getHistogramInfo(KmerDistributionInfo& info) const
 
 
 
-    // Set coveragePeak to the value grater than coverageLow at which the histogram
+    // Set coverageHet to the value grater than coverageLow at which the histogram
     // reaches its maximum.
-    info.coveragePeak = info.coverageLow;
+    info.coverageHet = info.coverageLow;
     uint64_t maxFrequency = frequencyAtCoverageLow;
     for(; it!=histogram.end(); ++it) {
         const uint64_t coverage = it->first;
         const uint64_t frequency = it->second;
         if(frequency > maxFrequency) {
-            info.coveragePeak = coverage;
+            info.coverageHet = coverage;
             maxFrequency = frequency;
         }
     }
 
-    // Set coverageHigh to the last coverage with frequency
+    // Set coverageHom to the last coverage with frequency
     // at least equal to frequencyAtCoverageLow.
-    info.coverageHigh = invalid<uint64_t>;
+    info.coverageHom = invalid<uint64_t>;
     for(uint64_t i=histogram.size()-1; i>0; i--) {
         const uint64_t coverage = histogram[i].first;
         const uint64_t frequency = histogram[i].second;
         if(frequency >= frequencyAtCoverageLow) {
-            info.coverageHigh = coverage;
+            info.coverageHom = coverage;
             break;
         }
     }
-    if(info.coverageHigh == invalid<uint64_t>) {
-        info.coverageHigh = info.coveragePeak;
+    if(info.coverageHom == invalid<uint64_t>) {
+        info.coverageHom = info.coverageHet;
     }
 }
 

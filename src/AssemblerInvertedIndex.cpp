@@ -1791,11 +1791,11 @@ template<class InvertedIndexData>
 static inline void configureInvertedIndexDataForChaining(
     InvertedIndexData& data,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
-    const uint64_t coveragePeak,
+    const uint64_t coverageHet,
     const double maxDriftRate)
 {
     data.maxDriftRate = maxDriftRate;
-    data.coveragePeak = coveragePeak;
+    data.coverageHet = coverageHet;
     data.weightExponent = overlapCandidatesOptions.invertedIndexWeightExponent;
     data.lowFreqMultiplier = overlapCandidatesOptions.invertedIndexLowFreqMultiplier;
     data.highFreqMultiplier = overlapCandidatesOptions.invertedIndexHighFreqMultiplier;
@@ -1996,13 +1996,13 @@ private:
         const auto* hashTablePtr = invertedIndexData.hashTable.data();
         const uint64_t kmerLen = invertedIndexData.k;
         const double maxDriftRate = invertedIndexData.maxDriftRate;
-        const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+        const uint64_t coverageHet = invertedIndexData.coverageHet;
         const double weightExponent = invertedIndexData.weightExponent;
         const double lowFreqMultiplier = invertedIndexData.lowFreqMultiplier;
         const double highFreqMultiplier = invertedIndexData.highFreqMultiplier;
         const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
-        const uint64_t lowFreqThreshold = std::max<uint64_t>(2ULL, uint64_t(double(coveragePeak) * lowFreqMultiplier));
-        const uint64_t highFreqThreshold = std::max<uint64_t>(1ULL, uint64_t(double(coveragePeak) * highFreqMultiplier));
+        const uint64_t lowFreqThreshold = std::max<uint64_t>(2ULL, uint64_t(double(coverageHet) * lowFreqMultiplier));
+        const uint64_t highFreqThreshold = std::max<uint64_t>(1ULL, uint64_t(double(coverageHet) * highFreqMultiplier));
         // Gate downsampling behind an absolute minimum (3) to avoid treating
         // nearly all k-mers as high-frequency in low-coverage datasets.
         const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
@@ -2557,7 +2557,7 @@ void Assembler::chainAlignmentCandidates(
     configureInvertedIndexDataForChaining(
         invertedIndexData,
         overlapCandidatesOptions,
-        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        assemblerInfo->kmerDistributionInfo.coverageHet,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 
@@ -2669,7 +2669,7 @@ void Assembler::chainPafCandidates(
     configureInvertedIndexDataForChaining(
         invertedIndexData,
         overlapCandidatesOptions,
-        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        assemblerInfo->kmerDistributionInfo.coverageHet,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 
@@ -2707,11 +2707,11 @@ void Assembler::chainPafCandidates(
     const auto* hashTablePtr = invertedIndexData.hashTable.data();
     const uint64_t kmerLen = invertedIndexData.k;
     const double maxDriftRateLocal = invertedIndexData.maxDriftRate;
-    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+    const uint64_t coverageHet = invertedIndexData.coverageHet;
     const uint64_t lowFreqThreshold = std::max<uint64_t>(
-        2ULL, uint64_t(double(coveragePeak) * invertedIndexData.lowFreqMultiplier));
+        2ULL, uint64_t(double(coverageHet) * invertedIndexData.lowFreqMultiplier));
     const uint64_t highFreqThreshold = std::max<uint64_t>(
-        1ULL, uint64_t(double(coveragePeak) * invertedIndexData.highFreqMultiplier));
+        1ULL, uint64_t(double(coverageHet) * invertedIndexData.highFreqMultiplier));
     const uint64_t highFreqDownsampleThreshold = std::max<uint64_t>(3ULL, highFreqThreshold);
     const uint64_t highFreqWeightUnit = std::max<uint64_t>(1ULL, highFreqThreshold * 2ULL);
     const bool downsampleHighFrequencyMarkers =
@@ -3970,7 +3970,7 @@ void Assembler::flagPalindromicReads(
 
     configureInvertedIndexDataForChaining(
         invertedIndexData, overlapCandidatesOptions,
-        assemblerInfo->kmerDistributionInfo.coveragePeak,
+        assemblerInfo->kmerDistributionInfo.coverageHet,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 
@@ -3988,12 +3988,12 @@ void Assembler::flagPalindromicReads(
         reads->setPalindromicFlag(readId, false);
     }
 
-    const uint64_t coveragePeak = invertedIndexData.coveragePeak;
+    const uint64_t coverageHet = invertedIndexData.coverageHet;
     const uint32_t lowFreqThreshold = uint32_t(
-        coveragePeak * invertedIndexData.lowFreqMultiplier);
+        coverageHet * invertedIndexData.lowFreqMultiplier);
     const uint32_t highFreqThreshold = uint32_t(
-        coveragePeak * invertedIndexData.highFreqMultiplier);
-    const uint32_t highFreqWeightUnit = std::max(1u, uint32_t(coveragePeak));
+        coverageHet * invertedIndexData.highFreqMultiplier);
+    const uint32_t highFreqWeightUnit = std::max(1u, uint32_t(coverageHet));
     const uint32_t rareKmerWeight = invertedIndexData.rareKmerWeight;
     const double weightExponent = invertedIndexData.weightExponent;
 

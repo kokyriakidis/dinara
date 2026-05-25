@@ -18,12 +18,12 @@ public:
 
     // The coverage greater than coverageLow at which the histogram
     // of the k-mer distribution reaches its maximum.
-    uint64_t coveragePeak = invalid<uint64_t>;
+    uint64_t coverageHet = invalid<uint64_t>;
 
-    // The highest coverage greater than coveragePeak at which the histogram
+    // The highest coverage greater than coverageHet at which the histogram
     // had a larger value than at coverageLow.
-    uint64_t coverageHigh = invalid<uint64_t>;
+    uint64_t coverageHom = invalid<uint64_t>;
 
     // The following holds:
-    // coverageLow <= coveragePeak <= coverageHigh
+    // coverageLow <= coverageHet <= coverageHom
 };

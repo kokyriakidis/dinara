@@ -1242,8 +1242,8 @@ void Assembler::countKmers(
 
     cout << "Marker k-mer coverage distribution:"
         " low "   << assemblerInfo->kmerDistributionInfo.coverageLow <<
-        ", peak " << assemblerInfo->kmerDistributionInfo.coveragePeak <<
-        ", high " << assemblerInfo->kmerDistributionInfo.coverageHigh << endl;
+        ", het " << assemblerInfo->kmerDistributionInfo.coverageHet <<
+        ", hom " << assemblerInfo->kmerDistributionInfo.coverageHom << endl;
 }
 
 
@@ -1305,8 +1305,8 @@ void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
 
     cout << "Marker k-mer coverage distribution:"
         " low "   << assemblerInfo->kmerDistributionInfo.coverageLow <<
-        ", peak " << assemblerInfo->kmerDistributionInfo.coveragePeak <<
-        ", high " << assemblerInfo->kmerDistributionInfo.coverageHigh << endl;
+        ", het " << assemblerInfo->kmerDistributionInfo.coverageHet <<
+        ", hom " << assemblerInfo->kmerDistributionInfo.coverageHom << endl;
 }
 
 /**
