@@ -51,6 +51,19 @@ struct CwReadProfile {
     // Sorted, non-overlapping [begin, end) ranges in oriented backbone frame.
     vector<pair<uint32_t, uint32_t>> deletionRanges;
 
+    // Per-overlap noisy regions: backbone ranges where the alignment has
+    // too many mismatches/indels in a sliding window. Variants in these
+    // regions are unreliable and should be treated as no-observation.
+    vector<KmNoisyRegion> noisyRegions;
+
+    // Check if a backbone position falls within a noisy region for this read.
+    bool isNoisy(uint32_t pos) const {
+        for (const auto& nr : noisyRegions) {
+            if (pos >= nr.start && pos < nr.end) return true;
+        }
+        return false;
+    }
+
     // Check if a backbone position falls within a deletion in this read.
     bool isDeleted(uint32_t pos) const {
         // Binary search for the first range whose end > pos.
@@ -259,6 +272,73 @@ static void cwParseTransitiveCigar(
 // within [windowBbBegin, windowBbEnd) backbone coordinates.
 // Follows the same CIGAR walking logic as kmParseCigars.
 // ============================================================================
+// Sliding window noisy region detector for per-overlap CIGAR walks.
+// Mirrors KmNoisyBuilder from AssemblerPhasingKmeans.cpp.
+// Tracks variant events in a sliding window and flags regions where
+// the total event weight exceeds a threshold.
+struct CwNoisyBuilder {
+    vector<uint32_t> pos;
+    vector<uint32_t> lens;
+    vector<int>      counts;
+    int front = 0;
+    int rear = -1;
+    int totalCount = 0;
+    int maxS;
+    int win;
+    int32_t curStart = -1, curEnd = -1;
+    int curQStart = -1, curQEnd = -1;
+    vector<KmNoisyRegion>& noisyOut;
+
+    CwNoisyBuilder(int maxSites, int maxSIn, int winIn, vector<KmNoisyRegion>& out)
+        : pos(max(1, maxSites)), lens(max(1, maxSites)), counts(max(1, maxSites)),
+          maxS(maxSIn), win(winIn), noisyOut(out) {}
+
+    void observe(uint32_t p, uint32_t len, int count) {
+        if (size_t(rear + 1) >= pos.size()) {
+            size_t nc = pos.size() * 2;
+            pos.resize(nc); lens.resize(nc); counts.resize(nc);
+        }
+        ++rear;
+        pos[rear] = p; lens[rear] = len; counts[rear] = count;
+        totalCount += count;
+        while (front <= rear &&
+               int64_t(pos[front]) + int64_t(lens[front]) - 1 <= int64_t(p) - win) {
+            totalCount -= counts[front];
+            ++front;
+        }
+        if (count <= 0) return;
+        if (totalCount <= maxS) return;
+        int32_t ns = int32_t(pos[front]);
+        int32_t ne = int32_t(pos[rear] + lens[rear]);
+        if (curStart == -1) {
+            curStart = ns; curEnd = ne;
+            curQStart = front; curQEnd = rear;
+            return;
+        }
+        if (ns <= curEnd) {
+            curEnd = ne; curQEnd = rear;
+            return;
+        }
+        int varSize = 0;
+        for (int i = curQStart; i <= curQEnd; i++) varSize += counts[i];
+        int span = int(curEnd - curStart + 1);
+        if (varSize < span) varSize = span;
+        noisyOut.push_back({uint32_t(curStart), uint32_t(curEnd), varSize, false});
+        curStart = ns; curEnd = ne;
+        curQStart = front; curQEnd = rear;
+    }
+
+    void flush() {
+        if (curStart == -1) return;
+        int varSize = 0;
+        for (int i = curQStart; i <= curQEnd; i++) varSize += counts[i];
+        int span = int(curEnd - curStart + 1);
+        if (varSize < span) varSize = span;
+        noisyOut.push_back({uint32_t(curStart), uint32_t(curEnd), varSize, false});
+        curStart = -1;
+    }
+};
+
 static void cwParseCigarForOverlap(
     const Assembler& assembler,
     ReadId backboneReadId,
@@ -270,7 +350,8 @@ static void cwParseCigarForOverlap(
     vector<CwVariant>& variants,
     uint32_t& covBeginOut,
     uint32_t& covEndOut,
-    vector<pair<uint32_t, uint32_t>>& deletionRanges)
+    vector<pair<uint32_t, uint32_t>>& deletionRanges,
+    vector<KmNoisyRegion>& noisyRegions)
 {
     const auto& cigarStore = assembler.getOverlapCigarStore();
     const auto& ad = assembler.alignmentData[alignmentId];
@@ -420,6 +501,21 @@ static void cwParseCigarForOverlap(
     sort(variants.begin(), variants.end(),
         [](const CwVariant& a, const CwVariant& b) { return a.bbPos < b.bbPos; });
 
+    // Run sliding window noisy region detection on sorted variants.
+    // ONT: window=25bp, threshold=4 (matching pgphase defaults).
+    {
+        const int noisyWin = 25;
+        const int noisyMaxS = 4;
+        CwNoisyBuilder noisy(max(1, int(variants.size())), noisyMaxS, noisyWin, noisyRegions);
+        for (const auto& v : variants) {
+            uint32_t refLen = (v.type == KmVarType::Snp) ? 1 :
+                              (v.type == KmVarType::Deletion) ? v.len : 0;
+            int weight = (v.type == KmVarType::Snp) ? 1 : int(v.len);
+            noisy.observe(v.bbPos, refLen, weight);
+        }
+        noisy.flush();
+    }
+
     // Sort and merge overlapping deletion ranges so isDeleted binary search
     // works correctly (it only checks the range with the largest start <= pos).
     sort(deletionRanges.begin(), deletionRanges.end());
@@ -552,7 +648,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             *this, bbReadId, bbLen, bbOid.getStrand() == 1, bestAlnId,
             windowBbBegin, windowBbEnd, profile.variants,
             profile.bbCovBegin, profile.bbCovEnd,
-            profile.deletionRanges);
+            profile.deletionRanges,
+            profile.noisyRegions);
 
         readToProfile[oid.getValue()] = profiles.size();
         profiles.push_back(move(profile));
@@ -859,6 +956,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     for (const auto& prof : profiles) {
         for (const auto& v : prof.variants) {
             if (v.type != KmVarType::Snp) continue;
+            // pgphase: skip variants in per-overlap noisy regions.
+            if (prof.isNoisy(v.bbPos)) continue;
             uint64_t key = snpKey(v.bbPos, v.altBase);
             auto& acc = snpCounts[key];
             if (prof.oid.getStrand() == 0) acc.fwd++;
@@ -935,14 +1034,18 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         const uint32_t spanning = spanningCount[pos];
         if (spanning == 0) continue;
 
-        // Count reads with a deletion at this position.
+        // Count reads with a deletion or noisy alignment at this position.
         uint32_t delCount = 0;
+        uint32_t noisyCount = 0;
         for (const auto& prof : profiles) {
-            if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.isDeleted(pos))
-                delCount++;
+            if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd) {
+                if (prof.isDeleted(pos)) delCount++;
+                else if (prof.isNoisy(pos)) noisyCount++;
+            }
         }
-        // Effective spanning: reads that actually have bases at this position.
-        const uint32_t effSpanning = (spanning > delCount) ? spanning - delCount : 0;
+        // Effective spanning: reads with reliable bases at this position.
+        const uint32_t excludeCount = delCount + noisyCount;
+        const uint32_t effSpanning = (spanning > excludeCount) ? spanning - excludeCount : 0;
         if (effSpanning == 0) continue;
 
         // For each alt allele at this position.
@@ -1016,8 +1119,9 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             // Skip reads that don't cover this position.
             if (passingSnps[i].pos < prof.bbCovBegin ||
                 passingSnps[i].pos >= prof.bbCovEnd) continue;
-            // Skip reads with a deletion at this position.
+            // Skip reads with a deletion or noisy alignment at this position.
             if (prof.isDeleted(passingSnps[i].pos)) continue;
+            if (prof.isNoisy(passingSnps[i].pos)) continue;
 
             // Check if this read has the alt allele.
             bool hasAlt = false;
@@ -1123,9 +1227,9 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
                     op.alleles[ci - firstCi] = -1; // missing
                     continue;
                 }
-                // Check if read has a deletion at this position.
-                if (prof.isDeleted(cPos)) {
-                    op.alleles[ci - firstCi] = -1; // no bases here
+                // Check if read has a deletion or noisy alignment at this position.
+                if (prof.isDeleted(cPos) || prof.isNoisy(cPos)) {
+                    op.alleles[ci - firstCi] = -1; // no observation
                     continue;
                 }
 
