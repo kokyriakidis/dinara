@@ -1250,6 +1250,27 @@ void dinara::main::assemble(
                      << w0.backboneOrientedReadId << ")" << endl;
             }
         }
+
+        // Read clusters from iterative refinement.
+        if (!w0.readClusters.empty()) {
+            const string clusterFileName = "WindowClusters.csv";
+            ofstream clusterFile(clusterFileName);
+            if (clusterFile) {
+                clusterFile << "Cluster,OrientedReadId\n";
+                // Backbone read is in cluster 0.
+                clusterFile << 0 << "," << w0.backboneOrientedReadId << "\n";
+                for (size_t ci = 0; ci < w0.readClusters.size(); ci++) {
+                    for (const auto& oid : w0.readClusters[ci]) {
+                        clusterFile << ci << "," << oid << "\n";
+                    }
+                }
+                uint64_t totalReads = 0;
+                for (const auto& c : w0.readClusters) totalReads += c.size();
+                cout << timestamp << "Wrote " << clusterFileName
+                     << " (" << w0.readClusters.size() << " clusters, "
+                     << totalReads << " reads)" << endl;
+            }
+        }
     }
 
     // Write AnchorWindowsClean GFA with het/hom-gated alternate paths.

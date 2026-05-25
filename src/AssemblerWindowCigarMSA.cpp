@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1041,141 +1042,294 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         }
     }
 
-    // Phase reads using k-means if we have het SNPs.
-    if (cleanHetSnps > 0 && profiles.size() >= 2) {
-        // Sort passing SNPs by position (KmVarKey ordering).
+    // ── Hifiasm-style DP chaining + transitive closure ──
+    // 1. Build per-site evidence: which reads are ref/alt at each passing SNP
+    // 2. DP chain to select consistent het SNP sites
+    // 3. Transitive closure to classify overlaps as cis/trans
+    // 4. Collect read clusters
+
+    const uint32_t numOv = uint32_t(profiles.size());
+
+
+    // Per-site evidence: for each passing SNP, which reads are ref/alt.
+    // readAllele[siteIdx][profileIdx] = 0 (ref), 1 (alt), -1 (no observation).
+    struct SiteEvidence {
+        uint32_t snpIdx;       // index into passingSnps
+        vector<int8_t> allele; // per-profile: 0=ref, 1=alt, -1=missing
+        uint32_t nRef = 0;
+        uint32_t nAlt = 0;
+    };
+
+    if (cleanHetSnps > 0 && numOv >= 2) {
+
+        // Sort passing SNPs by position.
         sort(passingSnps.begin(), passingSnps.end(),
             [](const PassingSnp& a, const PassingSnp& b) {
                 return a.pos < b.pos || (a.pos == b.pos && a.altBase < b.altBase);
             });
 
-        const uint32_t numCand = uint32_t(passingSnps.size());
-        const uint32_t numOv = uint32_t(profiles.size());
+        const uint32_t numSites = uint32_t(passingSnps.size());
 
-        // Build KmScratchpad from our profiles and passing SNPs.
-        KmScratchpad scratch;
-
-        // Candidates: one per passing het SNP.
-        scratch.candidates.resize(numCand);
-        for (uint32_t ci = 0; ci < numCand; ci++) {
-            const auto& ps = passingSnps[ci];
-            auto& c = scratch.candidates[ci];
-            c.key.pos = ps.pos;
-            c.key.type = KmVarType::Snp;
-            c.key.altBase = ps.altBase;
-            c.key.refLen = 1;
-            c.key.altLen = 1;
-            c.totalCov = int(ps.spanning);
-            c.refCov = int(ps.refCov);
-            c.altCov = int(ps.altCov);
-            c.fwdAlt = int(ps.fwd);
-            c.revAlt = int(ps.rev);
-            c.fwdRef = int(ps.spanning - ps.altCov) / 2; // approximate
-            c.revRef = int(ps.spanning - ps.altCov) - c.fwdRef;
-            c.alleleFraction = double(ps.altCov) / double(ps.spanning);
-            c.category = KmVariantCategory::CleanHetSnp;
-            c.categoryFlag = kmCategoryToFlag(KmVariantCategory::CleanHetSnp);
-            c.nUniqAlles = 2;
-            c.isHomopolymerIndel = false;
-            c.phaseSet = 0;
+        // Build per-site evidence.
+        vector<SiteEvidence> sites(numSites);
+        for (uint32_t si = 0; si < numSites; si++) {
+            sites[si].snpIdx = si;
+            sites[si].allele.assign(numOv, -1);
         }
 
-        // Overlaps: one per read profile.
-        scratch.overlaps.resize(numOv);
-        scratch.overlapProfiles.resize(numOv);
         for (uint32_t oi = 0; oi < numOv; oi++) {
-            auto& ov = scratch.overlaps[oi];
-            ov.hap = 0;
-            ov.phaseSet = -1;
-            // Other fields (alignmentId etc.) are not used by kmRunKmeans.
-
             const auto& prof = profiles[oi];
-            auto& op = scratch.overlapProfiles[oi];
-            op.overlapIdx = oi;
 
-            // Build allele array: for each candidate, check if this read
-            // has a matching SNP variant.
-            // First, find the range of candidates this read covers
-            // (based on its coverage range).
-            int firstCi = -1, lastCi = -1;
-            for (uint32_t ci = 0; ci < numCand; ci++) {
-                uint32_t cPos = passingSnps[ci].pos;
-                if (cPos >= prof.bbCovBegin && cPos < prof.bbCovEnd) {
-                    if (firstCi < 0) firstCi = int(ci);
-                    lastCi = int(ci);
-                }
-            }
-
-            if (firstCi < 0) {
-                op.startVarIdx = -1;
-                op.endVarIdx = -1;
-                continue;
-            }
-
-            op.startVarIdx = firstCi;
-            op.endVarIdx = lastCi;
-            op.alleles.assign(lastCi - firstCi + 1, 0); // default: ref (0)
-
-            // Build a set of this read's SNP variants for fast lookup.
+            // Build set of this read's SNP variants.
             unordered_map<uint64_t, uint8_t> readSnps;
             for (const auto& v : prof.variants) {
                 if (v.type != KmVarType::Snp) continue;
                 readSnps[snpKey(v.bbPos, v.altBase)] = 1;
             }
 
-            // Fill allele array.
-            for (int ci = firstCi; ci <= lastCi; ci++) {
-                uint32_t cPos = passingSnps[ci].pos;
-                // Check if position is within read's coverage.
-                if (cPos < prof.bbCovBegin || cPos >= prof.bbCovEnd) {
-                    op.alleles[ci - firstCi] = -1; // missing
-                    continue;
-                }
-                // Check if read has a deletion at this position.
-                if (prof.isDeleted(cPos)) {
-                    op.alleles[ci - firstCi] = -1; // no bases here
-                    continue;
-                }
+            for (uint32_t si = 0; si < numSites; si++) {
+                uint32_t pos = passingSnps[si].pos;
+                if (pos < prof.bbCovBegin || pos >= prof.bbCovEnd) continue;
+                if (prof.isDeleted(pos)) continue;
 
-                // Check if read has the alt allele at this position.
-                uint64_t sk = snpKey(cPos, passingSnps[ci].altBase);
+                uint64_t sk = snpKey(pos, passingSnps[si].altBase);
                 if (readSnps.count(sk)) {
-                    op.alleles[ci - firstCi] = 1; // alt
+                    sites[si].allele[oi] = 1; // alt
+                    sites[si].nAlt++;
                 } else {
-                    // Check if read has a DIFFERENT alt at this position.
-                    // pgphase treats overlapping variants at the same position
-                    // as no observation (-1), not ref.
+                    // Check for different alt allele at same position.
                     bool hasDiffAlt = false;
                     for (uint8_t a = 0; a < 4; a++) {
-                        if (a == passingSnps[ci].altBase) continue;
-                        if (readSnps.count(snpKey(cPos, a))) {
+                        if (a == passingSnps[si].altBase) continue;
+                        if (readSnps.count(snpKey(pos, a))) {
                             hasDiffAlt = true;
                             break;
                         }
                     }
-                    op.alleles[ci - firstCi] = hasDiffAlt ? -1 : 0; // -1=no observation, 0=ref
+                    if (hasDiffAlt) {
+                        sites[si].allele[oi] = -1; // different alt = no observation
+                    } else {
+                        sites[si].allele[oi] = 0; // ref
+                        sites[si].nRef++;
+                    }
                 }
             }
         }
 
-        // Run k-means phasing.
-        kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
+        // ── DP chaining (hifiasm gen_rphase_dp0_single_path) ──
+        // Score function: two sites are consistent if reads that share
+        // both sites have matching allele patterns (both ref or both alt).
+        // Inconsistent pairs (ref at one, alt at other) get INT64_MIN.
 
-        // Extract per-read haplotype assignments.
+        auto dpScore = [&](uint32_t si, uint32_t sj) -> int64_t {
+            // si < sj (position order).
+            if (passingSnps[si].pos == passingSnps[sj].pos) return INT64_MIN;
+
+            int nSame = 0;  // reads with same allele at both sites
+            int nDiff = 0;  // reads with different allele
+            int nShared = 0;
+
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                int8_t ai = sites[si].allele[oi];
+                int8_t aj = sites[sj].allele[oi];
+                if (ai < 0 || aj < 0) continue;
+                nShared++;
+                if (ai == aj) nSame++;
+                else nDiff++;
+            }
+
+            if (nShared < 2) return INT64_MIN;
+
+            // Consistent: all shared reads agree (all same or all diff).
+            // "All same" means both sites are on the same haplotype.
+            // "All diff" means they're on opposite haplotypes — still consistent
+            // for phasing (just means one site's alt is on hap1, other on hap2).
+            // Mixed = inconsistent.
+            if (nSame > 0 && nDiff > 0) {
+                // Allow minor disagreement (sequencing errors).
+                int minority = min(nSame, nDiff);
+                if (minority * 5 > nShared) return INT64_MIN; // >20% disagreement
+            }
+
+            return int64_t(nShared);
+        };
+
+        // DP: find longest chain of consistent sites.
+        vector<int64_t> dpF(numSites, 0);   // best score ending at site i
+        vector<int32_t> dpP(numSites, -1);   // predecessor
+        for (uint32_t i = 0; i < numSites; i++) {
+            dpF[i] = int64_t(sites[i].nAlt + sites[i].nRef); // base score
+            dpP[i] = -1;
+            for (uint32_t j = 0; j < i; j++) {
+                int64_t sc = dpScore(j, i);
+                if (sc == INT64_MIN) continue;
+                int64_t candidate = dpF[j] + sc + int64_t(sites[i].nAlt + sites[i].nRef);
+                if (candidate > dpF[i]) {
+                    dpF[i] = candidate;
+                    dpP[i] = int32_t(j);
+                }
+            }
+        }
+
+        // Traceback: extract best chain.
+        int64_t bestScore = INT64_MIN;
+        int32_t bestEnd = -1;
+        for (uint32_t i = 0; i < numSites; i++) {
+            if (dpF[i] > bestScore) {
+                bestScore = dpF[i];
+                bestEnd = int32_t(i);
+            }
+        }
+
+        vector<bool> inChain(numSites, false);
+        uint32_t chainLen = 0;
+        for (int32_t i = bestEnd; i >= 0; i = dpP[i]) {
+            inChain[i] = true;
+            chainLen++;
+        }
+
+        cout << "    DP chain: " << chainLen << " / " << numSites
+             << " sites selected (score=" << bestScore << ")" << endl;
+
+
+        // ── Transitive closure (hifiasm generate_haplotypes_naive_HiFi) ──
+        // For each read, count alt alleles at chain sites. Reads with the
+        // most alt alleles are seeded as trans. Then propagate: any site
+        // where a trans read has alt gets "promoted", and any other read
+        // with alt at a promoted site also becomes trans.
+
+        // Collect chain sites.
+        vector<uint32_t> chainSites;
+        for (uint32_t si = 0; si < numSites; si++) {
+            if (inChain[si]) chainSites.push_back(si);
+        }
+
+        if (chainSites.empty()) {
+            // No consistent chain — all reads in one cluster.
+            window.readClusters.resize(1);
+            window.readClusters[0].reserve(numOv);
+            for (const auto& prof : profiles) {
+                window.readClusters[0].push_back(prof.oid);
+            }
+            return cleanHetSnps;
+        }
+
+        const uint32_t nChain = uint32_t(chainSites.size());
+
+        // Per-read: count alt alleles at chain sites, and total observed.
+        struct ReadInfo {
+            uint32_t nAlt = 0;
+            uint32_t nObs = 0;
+            int isMatch = 0; // 0=unset, 1=cis, 2=trans
+        };
+        vector<ReadInfo> readInfo(numOv);
+
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            for (uint32_t ci = 0; ci < nChain; ci++) {
+                int8_t a = sites[chainSites[ci]].allele[oi];
+                if (a < 0) continue;
+                readInfo[oi].nObs++;
+                if (a == 1) readInfo[oi].nAlt++;
+            }
+        }
+
+        // Sort reads by informativeness (most alt alleles first).
+        vector<uint32_t> readOrder(numOv);
+        iota(readOrder.begin(), readOrder.end(), 0);
+        sort(readOrder.begin(), readOrder.end(),
+            [&](uint32_t a, uint32_t b) {
+                return readInfo[a].nAlt > readInfo[b].nAlt;
+            });
+
+        // Per-site: promoted flag. A site is promoted when a trans read
+        // carries alt at that site.
+        vector<bool> promoted(nChain, false);
+
+        // Seed: mark reads with the most alt alleles as trans.
+        // A read is seeded as trans if it has alt at ≥50% of observed chain sites.
+        for (uint32_t oi : readOrder) {
+            if (readInfo[oi].nObs == 0) continue;
+            if (readInfo[oi].isMatch != 0) continue;
+
+            double altFrac = double(readInfo[oi].nAlt) / double(readInfo[oi].nObs);
+            if (altFrac >= 0.5 && readInfo[oi].nAlt >= 2) {
+                readInfo[oi].isMatch = 2; // trans
+                // Promote sites where this read has alt.
+                for (uint32_t ci = 0; ci < nChain; ci++) {
+                    if (sites[chainSites[ci]].allele[oi] == 1) {
+                        promoted[ci] = true;
+                    }
+                }
+            }
+        }
+
+        // Propagate: any unset read with alt at a promoted site → trans.
+        for (uint32_t oi : readOrder) {
+            if (readInfo[oi].isMatch != 0) continue;
+            if (readInfo[oi].nObs == 0) continue;
+
+            bool hitsPromoted = false;
+            for (uint32_t ci = 0; ci < nChain; ci++) {
+                if (promoted[ci] && sites[chainSites[ci]].allele[oi] == 1) {
+                    hitsPromoted = true;
+                    break;
+                }
+            }
+            if (hitsPromoted) {
+                readInfo[oi].isMatch = 2; // trans
+                // Promote additional sites.
+                for (uint32_t ci = 0; ci < nChain; ci++) {
+                    if (sites[chainSites[ci]].allele[oi] == 1) {
+                        promoted[ci] = true;
+                    }
+                }
+            }
+        }
+
+        // Remaining unset reads with observations → cis.
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            if (readInfo[oi].isMatch == 0 && readInfo[oi].nObs > 0) {
+                readInfo[oi].isMatch = 1; // cis
+            }
+        }
+
+        // Store per-read haplotype (backward compat).
         window.readHaplotypes.resize(numOv);
+        uint32_t nCis = 0, nTrans = 0, nUnset = 0;
         for (uint32_t oi = 0; oi < numOv; oi++) {
             window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
-            window.readHaplotypes[oi].hap = scratch.overlaps[oi].hap;
+            window.readHaplotypes[oi].hap = readInfo[oi].isMatch;
+            if (readInfo[oi].isMatch == 1) nCis++;
+            else if (readInfo[oi].isMatch == 2) nTrans++;
+            else nUnset++;
+        }
+        cout << "    transitive closure: cis=" << nCis << " trans=" << nTrans
+             << " unclassified=" << nUnset << endl;
+
+        // Build clusters: cis, trans, unclassified.
+        vector<OrientedReadId> cisCluster, transCluster, uncCluster;
+        for (uint32_t oi = 0; oi < numOv; oi++) {
+            if (readInfo[oi].isMatch == 1)
+                cisCluster.push_back(profiles[oi].oid);
+            else if (readInfo[oi].isMatch == 2)
+                transCluster.push_back(profiles[oi].oid);
+            else
+                uncCluster.push_back(profiles[oi].oid);
         }
 
-        uint32_t hap1 = 0, hap2 = 0, unassigned = 0;
-        for (const auto& rh : window.readHaplotypes) {
-            if (rh.hap == 1) hap1++;
-            else if (rh.hap == 2) hap2++;
-            else unassigned++;
+        // Cluster 0 = cis (backbone side), cluster 1 = trans.
+        if (!cisCluster.empty())
+            window.readClusters.push_back(std::move(cisCluster));
+        if (!transCluster.empty())
+            window.readClusters.push_back(std::move(transCluster));
+        if (!uncCluster.empty())
+            window.readClusters.push_back(std::move(uncCluster));
+
+        cout << "    clusters: " << window.readClusters.size();
+        for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+            cout << " [" << ci << "]=" << window.readClusters[ci].size();
         }
-        cout << "    phasing: hap1=" << hap1 << " hap2=" << hap2
-             << " unassigned=" << unassigned << endl;
+        cout << endl;
     }
 
     return cleanHetSnps;
