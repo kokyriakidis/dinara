@@ -52,6 +52,8 @@ struct AnchorWindow {
         uint32_t altCov;      // alt read count
         uint32_t refCov;      // ref read count
         uint32_t spanning;    // total reads with bases at this position
+        std::vector<OrientedReadId> altReads;  // reads carrying alt
+        std::vector<OrientedReadId> refReads;  // reads carrying ref
     };
     std::vector<HetSnp> hetSnps;
 
