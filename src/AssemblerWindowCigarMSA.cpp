@@ -936,6 +936,8 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         bbSeqVec[i] = rds.getOrientedReadBase(bbOid, i).value;
     const uint8_t* bbSeq = bbSeqVec.data();
 
+    KmPhasingOptions opts;
+
     // Aggregate SNP candidates across all profiles.
     // Key: backbone position → alt base → {fwdCount, revCount, totalCount}
     struct SnpAccum {
@@ -1020,7 +1022,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     };
     vector<PassingSnp> passingSnps;
 
-    KmPhasingOptions opts;
     uint32_t cleanHetSnps = 0;
 
     // Filter counters.
