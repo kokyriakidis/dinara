@@ -993,12 +993,36 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
          << " failHomopolymer=" << failHomopolymer
          << " cleanHetSnps=" << cleanHetSnps << endl;
 
-    // Store passing het SNPs in the window.
+    // Store passing het SNPs in the window, with per-read alt/ref lists.
     window.hetSnps.resize(passingSnps.size());
     for (size_t i = 0; i < passingSnps.size(); i++) {
-        window.hetSnps[i] = {passingSnps[i].pos, passingSnps[i].altBase,
-                             passingSnps[i].altCov, passingSnps[i].refCov,
-                             passingSnps[i].spanning};
+        auto& hs = window.hetSnps[i];
+        hs.bbPos = passingSnps[i].pos;
+        hs.altBase = passingSnps[i].altBase;
+        hs.altCov = passingSnps[i].altCov;
+        hs.refCov = passingSnps[i].refCov;
+        hs.spanning = passingSnps[i].spanning;
+
+        const uint64_t sk = snpKey(passingSnps[i].pos, passingSnps[i].altBase);
+        for (const auto& prof : profiles) {
+            // Skip reads that don't cover this position.
+            if (passingSnps[i].pos < prof.bbCovBegin ||
+                passingSnps[i].pos >= prof.bbCovEnd) continue;
+            // Skip reads with a deletion at this position.
+            if (prof.isDeleted(passingSnps[i].pos)) continue;
+
+            // Check if this read has the alt allele.
+            bool hasAlt = false;
+            for (const auto& v : prof.variants) {
+                if (v.type == KmVarType::Snp && v.bbPos == passingSnps[i].pos
+                    && v.altBase == passingSnps[i].altBase) {
+                    hasAlt = true;
+                    break;
+                }
+            }
+            if (hasAlt) hs.altReads.push_back(prof.oid);
+            else hs.refReads.push_back(prof.oid);
+        }
     }
 
     // Phase reads using k-means if we have het SNPs.

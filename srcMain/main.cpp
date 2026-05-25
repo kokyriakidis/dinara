@@ -1207,7 +1207,7 @@ void dinara::main::assemble(
             const string snpFileName = "WindowHetSnps.csv";
             ofstream snpFile(snpFileName);
             if (snpFile) {
-                snpFile << "BbPos,AltBase,AltCov,RefCov,Spanning,AF\n";
+                snpFile << "BbPos,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
                 for (const auto& s : w0.hetSnps) {
                     snpFile << s.bbPos << ","
                             << baseChar[s.altBase] << ","
@@ -1216,7 +1216,17 @@ void dinara::main::assemble(
                             << s.spanning << ","
                             << std::fixed << std::setprecision(3)
                             << (s.spanning > 0 ? double(s.altCov) / double(s.spanning) : 0.0)
-                            << std::defaultfloat << "\n";
+                            << std::defaultfloat << ",";
+                    for (size_t i = 0; i < s.altReads.size(); i++) {
+                        if (i > 0) snpFile << " ";
+                        snpFile << s.altReads[i];
+                    }
+                    snpFile << ",";
+                    for (size_t i = 0; i < s.refReads.size(); i++) {
+                        if (i > 0) snpFile << " ";
+                        snpFile << s.refReads[i];
+                    }
+                    snpFile << "\n";
                 }
                 cout << timestamp << "Wrote " << snpFileName
                      << " (" << w0.hetSnps.size() << " het SNPs)" << endl;
