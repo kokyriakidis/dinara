@@ -1435,7 +1435,9 @@ void dinara::main::assemble(
              << originalAnchorCount << " -> " << anchors.size() << endl;
 
         // Rebuild journeys with the new anchors.
+        // Release old journeys first to free their memory-mapped file.
         cout << timestamp << "  rebuilding journeys..." << endl;
+        assembler.shasta2Journeys.reset();
         assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
             2 * assembler.getReads().readCount(),
             shasta2Anchors,
