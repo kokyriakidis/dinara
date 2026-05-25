@@ -1042,448 +1042,449 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         }
     }
 
-    // ── Hifiasm-style DP chaining + transitive closure ──
-    // 1. Build per-site evidence: which reads are ref/alt at each passing SNP
-    // 2. DP chain to select consistent het SNP sites
-    // 3. Transitive closure to classify overlaps as cis/trans
-    // ── Hifiasm-style DP chaining + transitive closure ──
-    // Port of gen_rphase_dp0_single_path and generate_haplotypes_naive_HiFi.
 
+    // cc = min ref support threshold for singleton/dense sites.
+    // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
+    const uint64_t coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
+    const uint64_t hetCov = coveragePeak / 2;
+    uint32_t cc = uint32_t(hetCov * 0.7);
+    if (cc < 6) cc = 6;
 
-    // ── Hifiasm-style DP chaining + transitive closure ──
-    // Port of gen_rphase_dp0_single_path and generate_haplotypes_naive_HiFi.
+    // ── Reusable DP chaining + transitive closure ──
+    // Runs the full hifiasm-style phasing pipeline on a subset of reads.
+    // Returns true if a split occurred. On return, result[i] is the
+    // classification for subsetIdx[i]: 1=cis, 2=trans, 0=unclassified.
+    //
+    // Parameters:
+    //   subsetIdx   — indices into profiles[]
+    //   bbCovBegin/End — backbone coverage range (for virtual backbone entry;
+    //                    pass 0,0 to disable backbone as evidence)
+    //   result      — output: per-subset-read classification
 
-    const uint32_t numOv = uint32_t(profiles.size());
+    auto cwPhaseSplit = [&](
+        const vector<uint32_t>& subsetIdx,
+        uint32_t bbCovBegin, uint32_t bbCovEnd,
+        vector<uint8_t>& result) -> bool
+    {
+        const uint32_t nReads = uint32_t(subsetIdx.size());
+        result.assign(nReads, 0);
+        if (nReads < 4) return false;
 
-    // Per-site evidence.
-    // Allele values: 0=ref, 1=alt (matching this site), -1=missing (no coverage),
-    // -2=different alt (has a variant but not this one).
-    struct SiteEvidence {
-        vector<int8_t> allele;
-        uint32_t nRef = 0;
-        uint32_t nAlt = 0;
-    };
+        // ── Step 1: Detect het SNPs within the subset ──
+        struct SubSnpAccum { uint32_t fwd = 0, rev = 0, total = 0; };
+        unordered_map<uint64_t, SubSnpAccum> subSnpCounts;
+        unordered_set<uint32_t> subSnpPositions;
 
-    if (cleanHetSnps > 0 && numOv >= 2) {
+        for (uint32_t ri = 0; ri < nReads; ri++) {
+            const auto& prof = profiles[subsetIdx[ri]];
+            for (const auto& v : prof.variants) {
+                if (v.type != KmVarType::Snp) continue;
+                uint64_t key = snpKey(v.bbPos, v.altBase);
+                auto& acc = subSnpCounts[key];
+                if (prof.oid.getStrand() == 0) acc.fwd++;
+                else acc.rev++;
+                acc.total++;
+                subSnpPositions.insert(v.bbPos);
+            }
+        }
+        if (subSnpPositions.empty()) return false;
 
-        // Sort passing SNPs by position.
-        sort(passingSnps.begin(), passingSnps.end(),
+        // Sweep-line coverage for the subset.
+        vector<CovEvent> subCovEvents;
+        subCovEvents.reserve(nReads * 2);
+        for (uint32_t ri = 0; ri < nReads; ri++) {
+            const auto& prof = profiles[subsetIdx[ri]];
+            if (prof.bbCovBegin < prof.bbCovEnd) {
+                subCovEvents.push_back({prof.bbCovBegin, +1});
+                subCovEvents.push_back({prof.bbCovEnd, -1});
+            }
+        }
+        sort(subCovEvents.begin(), subCovEvents.end(),
+            [](const CovEvent& a, const CovEvent& b) {
+                return a.pos < b.pos || (a.pos == b.pos && a.delta > b.delta);
+            });
+
+        vector<uint32_t> sortedPos(subSnpPositions.begin(), subSnpPositions.end());
+        sort(sortedPos.begin(), sortedPos.end());
+
+        unordered_map<uint32_t, uint32_t> subSpanning;
+        subSpanning.reserve(sortedPos.size());
+        {
+            int running = 0;
+            size_t ei = 0;
+            for (uint32_t pos : sortedPos) {
+                while (ei < subCovEvents.size() && subCovEvents[ei].pos <= pos) {
+                    running += subCovEvents[ei].delta;
+                    ei++;
+                }
+                subSpanning[pos] = uint32_t(max(running, 0));
+            }
+        }
+
+        // Filter SNPs.
+        vector<PassingSnp> subPassing;
+        for (uint32_t pos : subSnpPositions) {
+            const uint32_t spanning = subSpanning[pos];
+            if (spanning == 0) continue;
+
+            uint32_t delCount = 0;
+            for (uint32_t ri = 0; ri < nReads; ri++) {
+                const auto& prof = profiles[subsetIdx[ri]];
+                if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.isDeleted(pos))
+                    delCount++;
+            }
+            const uint32_t effSpanning = (spanning > delCount) ? spanning - delCount : 0;
+            if (effSpanning == 0) continue;
+
+            for (uint8_t alt = 0; alt < 4; alt++) {
+                auto it = subSnpCounts.find(snpKey(pos, alt));
+                if (it == subSnpCounts.end()) continue;
+                const auto& acc = it->second;
+                if (acc.total < cwMinSnpAltSupport) continue;
+                const uint32_t refCov = (effSpanning > acc.total) ? effSpanning - acc.total : 0;
+                if (refCov < cwMinSnpRefSupport) continue;
+                const double af = double(acc.total) / double(effSpanning);
+                if (af < opts.minAf || af > opts.maxAf) continue;
+
+                const int expected = int(acc.total) / 2;
+                if (expected > 0) {
+                    const double p = kmFisherExactTwoTail(
+                        int(acc.fwd), int(acc.rev), expected, expected);
+                    if (p < opts.strandBiasPval) continue;
+                }
+
+                KmVarKey vkey;
+                vkey.pos = pos; vkey.type = KmVarType::Snp;
+                vkey.altBase = alt; vkey.refLen = 1; vkey.altLen = 1;
+                if (kmIsHomopolymer(bbSeq, bbLen, vkey, 0) ||
+                    kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) continue;
+
+                subPassing.push_back({pos, alt, acc.total, refCov, effSpanning,
+                                      acc.fwd, acc.rev});
+            }
+        }
+        if (subPassing.size() < 2) return false;
+
+        sort(subPassing.begin(), subPassing.end(),
             [](const PassingSnp& a, const PassingSnp& b) {
                 return a.pos < b.pos || (a.pos == b.pos && a.altBase < b.altBase);
             });
 
-        const uint32_t numSites = uint32_t(passingSnps.size());
+        const uint32_t numSites = uint32_t(subPassing.size());
 
-        // Build per-site evidence.
-        // profiles[] does NOT include the backbone read. We add it as a
-        // virtual entry at index numOv (allele=0 at all covered sites).
-        const uint32_t bbIdx = numOv;
-        const uint32_t numEvidence = numOv + 1;
+        // ── Step 2: Build per-site evidence ──
+        // If backbone coverage is provided, add it as virtual entry (always ref).
+        const bool hasBb = (bbCovBegin < bbCovEnd);
+        const uint32_t numEvidence = hasBb ? nReads + 1 : nReads;
+        const uint32_t bbEvIdx = nReads; // virtual backbone index
 
-        vector<SiteEvidence> sites(numSites);
+        struct SiteEv {
+            vector<int8_t> allele;
+            uint32_t nRef = 0, nAlt = 0;
+        };
+        vector<SiteEv> sites(numSites);
         for (uint32_t si = 0; si < numSites; si++) {
             sites[si].allele.assign(numEvidence, -1);
-            if (passingSnps[si].pos >= windowBbBegin && passingSnps[si].pos < windowBbEnd) {
-                sites[si].allele[bbIdx] = 0;
+            if (hasBb && subPassing[si].pos >= bbCovBegin && subPassing[si].pos < bbCovEnd) {
+                sites[si].allele[bbEvIdx] = 0;
                 sites[si].nRef++;
             }
         }
 
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            const auto& prof = profiles[oi];
-
+        for (uint32_t ri = 0; ri < nReads; ri++) {
+            const auto& prof = profiles[subsetIdx[ri]];
             unordered_map<uint64_t, uint8_t> readSnps;
             for (const auto& v : prof.variants) {
                 if (v.type != KmVarType::Snp) continue;
                 readSnps[snpKey(v.bbPos, v.altBase)] = 1;
             }
-
             for (uint32_t si = 0; si < numSites; si++) {
-                uint32_t pos = passingSnps[si].pos;
+                uint32_t pos = subPassing[si].pos;
                 if (pos < prof.bbCovBegin || pos >= prof.bbCovEnd) continue;
                 if (prof.isDeleted(pos)) continue;
-
-                uint64_t sk = snpKey(pos, passingSnps[si].altBase);
-                if (readSnps.count(sk)) {
-                    sites[si].allele[oi] = 1;
+                if (readSnps.count(snpKey(pos, subPassing[si].altBase))) {
+                    sites[si].allele[ri] = 1;
                     sites[si].nAlt++;
                 } else {
                     bool hasDiffAlt = false;
                     for (uint8_t a = 0; a < 4; a++) {
-                        if (a == passingSnps[si].altBase) continue;
-                        if (readSnps.count(snpKey(pos, a))) {
-                            hasDiffAlt = true;
-                            break;
-                        }
+                        if (a == subPassing[si].altBase) continue;
+                        if (readSnps.count(snpKey(pos, a))) { hasDiffAlt = true; break; }
                     }
-                    if (hasDiffAlt) {
-                        sites[si].allele[oi] = -2; // different alt
-                    } else {
-                        sites[si].allele[oi] = 0;
-                        sites[si].nRef++;
-                    }
+                    sites[si].allele[ri] = hasDiffAlt ? int8_t(-2) : int8_t(0);
+                    if (!hasDiffAlt) sites[si].nRef++;
                 }
             }
         }
 
-        // ── comput_sc_rphase port ──
-        // Allele classification per read per site pair:
-        //   0 = ref, 1 = alt (matching this site's alt), 2 = ambiguous
-        // Hifiasm special case: if BOTH sites are ambiguous (fi==2, fj==2)
-        // but both have valid overlapSite (i.e., different alt, not missing),
-        // treat as ref (fi=fj=0). In our model: allele==-2 means different alt.
-        auto computScRphase = [&](uint32_t si, uint32_t sj) -> int64_t {
-            if (passingSnps[si].pos == passingSnps[sj].pos) return INT64_MIN;
-
-            int nn0 = 0;
-            int nn1 = 0;
-
-            for (uint32_t oi = 0; oi < numEvidence; oi++) {
-                int8_t ai = sites[si].allele[oi];
-                int8_t aj = sites[sj].allele[oi];
-
-                // Map to hifiasm's fi/fj: 0=ref, 1=alt, 2=ambiguous
+        // ── Step 3: comput_sc_rphase ──
+        auto computSc = [&](uint32_t si, uint32_t sj) -> int64_t {
+            if (subPassing[si].pos == subPassing[sj].pos) return INT64_MIN;
+            int nn0 = 0, nn1 = 0;
+            for (uint32_t ei = 0; ei < numEvidence; ei++) {
+                int8_t ai = sites[si].allele[ei], aj = sites[sj].allele[ei];
                 uint8_t fi, fj;
-
-                if (ai == 0) fi = 0;
-                else if (ai == 1) fi = 1;
-                else if (ai == -2) fi = 2; // different alt
-                else continue; // -1 = missing, skip
-
-                if (aj == 0) fj = 0;
-                else if (aj == 1) fj = 1;
-                else if (aj == -2) fj = 2;
-                else continue;
-
-                // Hifiasm special case: both ambiguous with valid overlapSite
-                // → treat as ref.
-                if (fi == 2 && fj == 2) {
-                    fi = fj = 0;
-                }
-
+                if (ai == 0) fi = 0; else if (ai == 1) fi = 1;
+                else if (ai == -2) fi = 2; else continue;
+                if (aj == 0) fj = 0; else if (aj == 1) fj = 1;
+                else if (aj == -2) fj = 2; else continue;
+                if (fi == 2 && fj == 2) { fi = fj = 0; }
                 if (fi == 2 || fj == 2) return INT64_MIN;
                 if (fi != fj) return INT64_MIN;
-                if (fi == 0) nn0++;
-                else nn1++;
+                if (fi == 0) nn0++; else nn1++;
             }
-
-            if (nn0 > 0 && nn1 > 0) return 1;
-            return INT64_MIN;
+            return (nn0 > 0 && nn1 > 0) ? 1 : INT64_MIN;
         };
 
-        // ── gen_rphase_dp0_single_path port ──
-        // cc = min ref support threshold.
-        // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
-        const uint64_t coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
-        const uint64_t hetCov = coveragePeak / 2;
-        uint32_t cc = uint32_t(hetCov * 0.7);
-        if (cc < 6) cc = 6;
-
-        // DP runs on ALL sites (no adjacent filter here — that's in the
-        // transitive closure step, matching hifiasm's structure).
-        vector<int32_t> dpF(numSites, 1);
-        vector<int32_t> dpP(numSites, -1);
+        // ── Step 4: gen_rphase_dp0_single_path ──
+        vector<int32_t> dpF(numSites, 1), dpP(numSites, -1);
         vector<bool> dpUsed(numSites, false);
 
         for (uint32_t i = 0; i < numSites; i++) {
-            int32_t maxF = 1;
-            int32_t maxJ = -1;
             for (int32_t j = int32_t(i) - 1; j >= 0; j--) {
-                int64_t sc = computScRphase(i, j);
+                int64_t sc = computSc(i, j);
                 if (sc == INT64_MIN) continue;
-                int32_t candidate = dpF[j] + int32_t(sc);
-                if (candidate > maxF) {
-                    maxF = candidate;
-                    maxJ = j;
-                }
+                int32_t cand = dpF[j] + int32_t(sc);
+                if (cand > dpF[i]) { dpF[i] = cand; dpP[i] = j; }
             }
-            dpF[i] = maxF;
-            dpP[i] = maxJ;
         }
 
-        // Normalize scores (hifiasm: f[i] -= plus where plus = min score).
-        int32_t minScore = *min_element(dpF.begin(), dpF.end());
-        for (uint32_t i = 0; i < numSites; i++) dpF[i] -= minScore;
-
-        // Sort by score descending for greedy path extraction.
+        // Sort by score descending, extract disjoint paths.
         vector<uint32_t> dpOrder(numSites);
         iota(dpOrder.begin(), dpOrder.end(), 0);
         sort(dpOrder.begin(), dpOrder.end(),
             [&](uint32_t a, uint32_t b) { return dpF[a] > dpF[b]; });
 
-        // Greedy disjoint path extraction.
-        struct DpPath {
-            vector<uint32_t> siteIndices; // indices into passingSnps
-        };
-        vector<DpPath> paths;
+        vector<int8_t> siteScore(numSites, -1);
 
         for (uint32_t idx = 0; idx < numSites; idx++) {
             uint32_t start = dpOrder[idx];
             if (dpUsed[start]) continue;
 
-            DpPath path;
+            vector<uint32_t> pathSites;
             for (int32_t k = int32_t(start); k >= 0 && !dpUsed[k]; ) {
-                path.siteIndices.push_back(uint32_t(k));
+                pathSites.push_back(uint32_t(k));
                 dpUsed[k] = true;
                 k = dpP[k];
             }
-            if (path.siteIndices.empty()) continue;
+            reverse(pathSites.begin(), pathSites.end());
+            const uint32_t pLen = uint32_t(pathSites.size());
 
-            reverse(path.siteIndices.begin(), path.siteIndices.end());
-            paths.push_back(std::move(path));
-        }
-
-        // Score paths — ONT branch of gen_rphase_dp0_single_path.
-        // Without base quality values, we substitute occ_0-based checks.
-        //
-        // Step 1: Dense check — if ALL consecutive sites in a path are
-        //   within distance 8, set krn=1 (treat as singleton-like).
-        // Step 2: Per-site scoring:
-        //   krn > 1 (real chain): score=1 if nRef >= 2 (lenient)
-        //   krn == 1 (dense/singleton): score=1 if nRef >= cc (strict)
-        // Step 3: Consecutive-position run rejection — if any site in a
-        //   run of consecutive positions has score=-1, reject the whole run.
-        vector<int8_t> siteScore(numSites, -1);
-
-        for (const auto& path : paths) {
-            const uint32_t pathLen = uint32_t(path.siteIndices.size());
-
-            // Step 1: Dense check.
-            // Sites are in forward position order (we reversed after traceback).
-            uint32_t krn = pathLen;
-            if (pathLen > 1) {
-                uint32_t i;
-                for (i = 1; i < pathLen &&
-                     passingSnps[path.siteIndices[i-1]].pos + 8 >=
-                     passingSnps[path.siteIndices[i]].pos; i++);
-                if (i >= pathLen) krn = 1;
+            // Dense check.
+            uint32_t krn = pLen;
+            if (pLen > 1) {
+                uint32_t di;
+                for (di = 1; di < pLen &&
+                     subPassing[pathSites[di-1]].pos + 8 >=
+                     subPassing[pathSites[di]].pos; di++);
+                if (di >= pLen) krn = 1;
             }
 
-            // Step 2: Per-site scoring.
-            for (uint32_t pi = 0; pi < pathLen; pi++) {
-                uint32_t si = path.siteIndices[pi];
-                if (krn > 1) {
-                    // Real chain: lenient check.
-                    siteScore[si] = (sites[si].nRef >= 2 && sites[si].nAlt >= 2)
-                                    ? 1 : -1;
-                } else {
-                    // Dense cluster or singleton: strict check.
-                    siteScore[si] = (sites[si].nRef >= cc && sites[si].nAlt >= 2)
-                                    ? 1 : -1;
-                }
+            // Per-site scoring.
+            for (uint32_t pi = 0; pi < pLen; pi++) {
+                uint32_t si = pathSites[pi];
+                if (krn > 1)
+                    siteScore[si] = (sites[si].nRef >= 2 && sites[si].nAlt >= 2) ? 1 : -1;
+                else
+                    siteScore[si] = (sites[si].nRef >= cc && sites[si].nAlt >= 2) ? 1 : -1;
             }
 
-            // Step 3: Consecutive-position run rejection.
-            // Within a path, find runs of sites at consecutive positions.
-            // If any site in a run has score=-1, reject the entire run.
-            for (uint32_t pi = 0; pi < pathLen; ) {
-                int8_t runScore = siteScore[path.siteIndices[pi]];
-                uint32_t runEnd = pi + 1;
-                while (runEnd < pathLen &&
-                       passingSnps[path.siteIndices[runEnd]].pos ==
-                       passingSnps[path.siteIndices[runEnd-1]].pos + 1) {
-                    if (siteScore[path.siteIndices[runEnd]] == -1)
-                        runScore = -1;
-                    runEnd++;
+            // Consecutive-position run rejection.
+            for (uint32_t pi = 0; pi < pLen; ) {
+                int8_t rs = siteScore[pathSites[pi]];
+                uint32_t re = pi + 1;
+                while (re < pLen &&
+                       subPassing[pathSites[re]].pos == subPassing[pathSites[re-1]].pos + 1) {
+                    if (siteScore[pathSites[re]] == -1) rs = -1;
+                    re++;
                 }
-                if (runScore == -1) {
-                    for (uint32_t ri = pi; ri < runEnd; ri++) {
-                        siteScore[path.siteIndices[ri]] = -1;
-                    }
+                if (rs == -1) {
+                    for (uint32_t ri = pi; ri < re; ri++) siteScore[pathSites[ri]] = -1;
                 }
-                pi = runEnd;
+                pi = re;
             }
         }
 
-        // Collect validated sites.
+        // Collect validated sites + adjacent filter.
         vector<uint32_t> validSites;
         for (uint32_t si = 0; si < numSites; si++) {
             if (siteScore[si] == 1) validSites.push_back(si);
         }
-
-        cout << "    DP chain: " << validSites.size() << " / " << numSites
-             << " sites validated (" << paths.size() << " paths)" << endl;
-
-        // ── generate_haplotypes_naive_HiFi port ──
-
-        if (validSites.empty()) {
-            window.readClusters.resize(1);
-            window.readClusters[0].reserve(numOv);
-            for (const auto& prof : profiles) {
-                window.readClusters[0].push_back(prof.oid);
-            }
-            return cleanHetSnps;
-        }
-
-        // Adjacent-site filter (hifiasm: in generate_haplotypes_naive_HiFi,
-        // not in gen_rphase_dp). Drop validated sites at distance 1 from
-        // another validated site.
         {
             vector<uint32_t> filtered;
             for (size_t i = 0; i < validSites.size(); i++) {
-                uint32_t pos = passingSnps[validSites[i]].pos;
-                bool adjLeft = (i > 0 &&
-                    passingSnps[validSites[i-1]].pos + 1 == pos);
-                bool adjRight = (i + 1 < validSites.size() &&
-                    pos + 1 == passingSnps[validSites[i+1]].pos);
-                if (!adjLeft && !adjRight) {
-                    filtered.push_back(validSites[i]);
-                }
+                uint32_t pos = subPassing[validSites[i]].pos;
+                bool adjL = (i > 0 && subPassing[validSites[i-1]].pos + 1 == pos);
+                bool adjR = (i + 1 < validSites.size() && pos + 1 == subPassing[validSites[i+1]].pos);
+                if (!adjL && !adjR) filtered.push_back(validSites[i]);
             }
             validSites = std::move(filtered);
         }
+        if (validSites.empty()) return false;
 
-        if (validSites.empty()) {
-            window.readClusters.resize(1);
-            window.readClusters[0].reserve(numOv);
-            for (const auto& prof : profiles) {
-                window.readClusters[0].push_back(prof.oid);
-            }
-            return cleanHetSnps;
-        }
-
+        // ── Step 5: generate_haplotypes_naive_HiFi ──
         const uint32_t nValid = uint32_t(validSites.size());
 
-        // Per-read: count alt alleles at validated sites.
-        struct ReadAltInfo {
-            uint32_t oi;
-            uint32_t nAlt = 0;
-            uint32_t nObs = 0;
-        };
-        vector<ReadAltInfo> readAlts(numOv);
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            readAlts[oi].oi = oi;
+        struct ReadInfo { uint32_t nAlt = 0, nObs = 0; };
+        vector<ReadInfo> ri(nReads);
+        for (uint32_t r = 0; r < nReads; r++) {
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                int8_t a = sites[validSites[vi]].allele[oi];
-                if (a < 0) continue; // -1 (missing) or -2 (different alt)
-                readAlts[oi].nObs++;
-                if (a == 1) readAlts[oi].nAlt++;
+                int8_t a = sites[validSites[vi]].allele[r];
+                if (a < 0) continue;
+                ri[r].nObs++;
+                if (a == 1) ri[r].nAlt++;
             }
         }
 
-        // Sort by nAlt descending (most informative first).
-        vector<uint32_t> readOrder(numOv);
+        vector<uint32_t> readOrder(nReads);
         iota(readOrder.begin(), readOrder.end(), 0);
         sort(readOrder.begin(), readOrder.end(),
-            [&](uint32_t a, uint32_t b) {
-                return readAlts[a].nAlt > readAlts[b].nAlt;
-            });
+            [&](uint32_t a, uint32_t b) { return ri[a].nAlt > ri[b].nAlt; });
 
-        // Per-read: is_match. 0=unset, 1=cis, 2=trans.
-        vector<uint8_t> isMatch(numOv, 0);
-
-        // Mutable ref support for "not real allele" adjustment.
         vector<uint32_t> siteRefCov(nValid);
-        for (uint32_t vi = 0; vi < nValid; vi++) {
+        for (uint32_t vi = 0; vi < nValid; vi++)
             siteRefCov[vi] = sites[validSites[vi]].nRef;
-        }
 
-        // Step 1: Seed trans from most-informative overlaps.
-        for (uint32_t ri = 0; ri < numOv; ri++) {
-            uint32_t oi = readOrder[ri];
-            if (readAlts[oi].nAlt == 0) break;
-            if (readAlts[oi].nObs == 0) continue;
-
-            uint32_t qualifiedAlts = 0;
+        // Seed trans.
+        for (uint32_t ro = 0; ro < nReads; ro++) {
+            uint32_t r = readOrder[ro];
+            if (ri[r].nAlt == 0) break;
+            if (ri[r].nObs == 0) continue;
+            uint32_t qa = 0;
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                uint32_t si = validSites[vi];
-                if (sites[si].allele[oi] != 1) continue;
-                if (siteRefCov[vi] >= 2 && sites[si].nAlt >= 2) {
-                    qualifiedAlts++;
-                }
+                if (sites[validSites[vi]].allele[r] == 1 &&
+                    siteRefCov[vi] >= 2 && sites[validSites[vi]].nAlt >= 2) qa++;
             }
-            if (qualifiedAlts == 0) continue;
-
-            isMatch[oi] = 2; // trans
-
-            // Promote sites and apply "not real allele" adjustment.
+            if (qa == 0) continue;
+            result[r] = 2;
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                uint32_t si = validSites[vi];
-                int8_t a = sites[si].allele[oi];
-                if (a == 1) {
-                    siteScore[si] = 1; // promote
-                } else if (a == 0) {
-                    // Not real allele: this trans read's ref support is noise.
-                    if (siteRefCov[vi] > 1) siteRefCov[vi]--;
-                }
+                int8_t a = sites[validSites[vi]].allele[r];
+                if (a == 1) siteScore[validSites[vi]] = 1;
+                else if (a == 0 && siteRefCov[vi] > 1) siteRefCov[vi]--;
             }
         }
 
-        // Step 2: De-promote sites where CIS reads have alt.
-        // hifiasm: for each cis overlap, set score=-1 for its alt sites.
-        // A cis read with alt at a site means that site's alt is noise.
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (isMatch[oi] == 2) continue; // skip trans
-            if (readAlts[oi].nObs == 0) continue;
+        // De-promote sites where cis reads have alt.
+        for (uint32_t r = 0; r < nReads; r++) {
+            if (result[r] == 2 || ri[r].nObs == 0) continue;
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                uint32_t si = validSites[vi];
-                if (sites[si].allele[oi] == 1) {
-                    siteScore[si] = -1; // de-promote
-                }
+                if (sites[validSites[vi]].allele[r] == 1)
+                    siteScore[validSites[vi]] = -1;
             }
         }
 
-        // Step 3: Propagate — any unset read with alt at a promoted site → trans.
-        for (uint32_t ri = 0; ri < numOv; ri++) {
-            uint32_t oi = readOrder[ri];
-            if (isMatch[oi] == 2) continue;
-            if (readAlts[oi].nObs == 0) continue;
-
-            bool hitsPromoted = false;
+        // Propagate.
+        for (uint32_t ro = 0; ro < nReads; ro++) {
+            uint32_t r = readOrder[ro];
+            if (result[r] == 2 || ri[r].nObs == 0) continue;
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                uint32_t si = validSites[vi];
-                if (siteScore[si] == 1 && sites[si].allele[oi] == 1) {
-                    hitsPromoted = true;
+                if (siteScore[validSites[vi]] == 1 &&
+                    sites[validSites[vi]].allele[r] == 1) {
+                    result[r] = 2;
                     break;
                 }
             }
-            if (hitsPromoted) {
-                isMatch[oi] = 2;
-            }
         }
 
-        // Remaining reads with observations → cis.
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (isMatch[oi] == 0 && readAlts[oi].nObs > 0) {
-                isMatch[oi] = 1;
-            }
+        // Remaining observed → cis.
+        for (uint32_t r = 0; r < nReads; r++) {
+            if (result[r] == 0 && ri[r].nObs > 0) result[r] = 1;
         }
+
+        uint32_t nC = 0, nT = 0;
+        for (uint32_t r = 0; r < nReads; r++) {
+            if (result[r] == 1) nC++;
+            else if (result[r] == 2) nT++;
+        }
+        return (nC > 0 && nT > 0);
+    };
+
+
+    // ── Phase reads ──
+    const uint32_t numOv = uint32_t(profiles.size());
+
+    if (cleanHetSnps > 0 && numOv >= 2) {
+
+        // Initial round: all reads.
+        vector<uint32_t> allIdx(numOv);
+        iota(allIdx.begin(), allIdx.end(), 0);
+        vector<uint8_t> result;
+        bool didSplit = cwPhaseSplit(allIdx, windowBbBegin, windowBbEnd, result);
 
         // Store per-read haplotype.
         window.readHaplotypes.resize(numOv);
-        uint32_t nCis = 0, nTrans = 0, nUnset = 0;
         for (uint32_t oi = 0; oi < numOv; oi++) {
             window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
-            window.readHaplotypes[oi].hap = isMatch[oi];
-            if (isMatch[oi] == 1) nCis++;
-            else if (isMatch[oi] == 2) nTrans++;
-            else nUnset++;
-        }
-        cout << "    transitive closure: cis=" << nCis << " trans=" << nTrans
-             << " unclassified=" << nUnset << endl;
-
-        // Build clusters.
-        vector<OrientedReadId> cisCluster, transCluster, uncCluster;
-        for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (isMatch[oi] == 1)
-                cisCluster.push_back(profiles[oi].oid);
-            else if (isMatch[oi] == 2)
-                transCluster.push_back(profiles[oi].oid);
-            else
-                uncCluster.push_back(profiles[oi].oid);
+            window.readHaplotypes[oi].hap = result[oi];
         }
 
-        if (!cisCluster.empty())
-            window.readClusters.push_back(std::move(cisCluster));
-        if (!transCluster.empty())
-            window.readClusters.push_back(std::move(transCluster));
-        if (!uncCluster.empty())
-            window.readClusters.push_back(std::move(uncCluster));
+        if (didSplit) {
+            // Collect groups.
+            vector<uint32_t> cisIdx, transIdx, uncIdx;
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                if (result[oi] == 1) cisIdx.push_back(oi);
+                else if (result[oi] == 2) transIdx.push_back(oi);
+                else uncIdx.push_back(oi);
+            }
+
+            uint32_t nCis = uint32_t(cisIdx.size());
+            uint32_t nTrans = uint32_t(transIdx.size());
+            uint32_t nUnc = uint32_t(uncIdx.size());
+            cout << "    phasing: cis=" << nCis << " trans=" << nTrans
+                 << " unclassified=" << nUnc << endl;
+
+            // Cis → cluster 0.
+            {
+                vector<OrientedReadId> c;
+                c.reserve(nCis);
+                for (uint32_t oi : cisIdx) c.push_back(profiles[oi].oid);
+                window.readClusters.push_back(std::move(c));
+            }
+
+            // Refine trans: run DP+TC again on trans reads.
+            // No backbone evidence (pass 0,0) since these reads all
+            // differ from the backbone.
+            vector<uint8_t> transResult;
+            bool transSplit = cwPhaseSplit(transIdx, 0, 0, transResult);
+
+            if (transSplit) {
+                vector<OrientedReadId> tCis, tTrans;
+                for (uint32_t ti = 0; ti < uint32_t(transIdx.size()); ti++) {
+                    if (transResult[ti] == 1)
+                        tCis.push_back(profiles[transIdx[ti]].oid);
+                    else if (transResult[ti] == 2)
+                        tTrans.push_back(profiles[transIdx[ti]].oid);
+                    // unclassified within trans → stays with larger group
+                }
+                cout << "    refine trans: " << transIdx.size()
+                     << " -> " << tCis.size() << " + " << tTrans.size() << endl;
+                window.readClusters.push_back(std::move(tCis));
+                window.readClusters.push_back(std::move(tTrans));
+            } else {
+                vector<OrientedReadId> c;
+                c.reserve(nTrans);
+                for (uint32_t oi : transIdx) c.push_back(profiles[oi].oid);
+                window.readClusters.push_back(std::move(c));
+            }
+
+            // Unclassified → last cluster.
+            if (nUnc > 0) {
+                vector<OrientedReadId> c;
+                c.reserve(nUnc);
+                for (uint32_t oi : uncIdx) c.push_back(profiles[oi].oid);
+                window.readClusters.push_back(std::move(c));
+            }
+        } else {
+            // No split — one cluster.
+            window.readClusters.resize(1);
+            window.readClusters[0].reserve(numOv);
+            for (const auto& prof : profiles)
+                window.readClusters[0].push_back(prof.oid);
+        }
 
         cout << "    clusters: " << window.readClusters.size();
-        for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+        for (size_t ci = 0; ci < window.readClusters.size(); ci++)
             cout << " [" << ci << "]=" << window.readClusters[ci].size();
-        }
         cout << endl;
     }
 
