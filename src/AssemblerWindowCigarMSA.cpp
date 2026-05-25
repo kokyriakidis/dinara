@@ -933,6 +933,9 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     uint32_t failStrandBias = 0;
     uint32_t failHomopolymer = 0;
 
+    // Positions rejected by strand bias or homopolymer — excluded from round 1.
+    unordered_set<uint32_t> strandBiasOrHomopolymerPositions;
+
     for (uint32_t pos : snpPositions) {
         const uint32_t spanning = spanningCount[pos];
         if (spanning == 0) continue;
@@ -969,7 +972,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             if (expected > 0) {
                 const double p = kmFisherExactTwoTail(
                     int(acc.fwd), int(acc.rev), expected, expected);
-                if (p < opts.strandBiasPval) { failStrandBias++; continue; }
+                if (p < opts.strandBiasPval) {
+                    failStrandBias++;
+                    strandBiasOrHomopolymerPositions.insert(pos);
+                    continue;
+                }
             }
 
             // Homopolymer / repeat context.
@@ -980,7 +987,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             vkey.refLen = 1;
             vkey.altLen = 1;
             if (kmIsHomopolymer(bbSeq, bbLen, vkey, 0) ||
-                kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) { failHomopolymer++; continue; }
+                kmIsRepeatRegion(bbSeq, bbLen, vkey, 0)) {
+                failHomopolymer++;
+                strandBiasOrHomopolymerPositions.insert(pos);
+                continue;
+            }
 
             passingSnps.push_back({pos, alt, acc.total, refCov, effSpanning,
                                    acc.fwd, acc.rev});
@@ -1454,103 +1465,144 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     };
 
 
-    // ── Phase reads: iterative splitting until convergence ──
-    // Work queue of index sets. Each entry is a (indices, useBb) pair.
-    // The initial round uses backbone evidence; refinement rounds don't.
-    // Cis groups go directly to final clusters. Trans groups go back
-    // into the queue for further splitting. Unclassified reads are
-    // collected separately.
+    // ── Phase reads: two-round splitting ──
+    // Round 0: split all reads using backbone evidence and strict filters.
+    // Round 1: re-split trans+unclassified reads with relaxed AF/coverage
+    //          filters (strand bias and homopolymer filters still apply),
+    //          excluding sites used in round 0, no backbone evidence.
 
     const uint32_t numOv = uint32_t(profiles.size());
 
     if (cleanHetSnps > 0 && numOv >= 2) {
 
-        struct WorkItem {
-            vector<uint32_t> idx;
-            bool useBb;
-            unordered_set<uint32_t> excludePos;
-        };
+        // Round 0: all reads, strict filters, backbone evidence.
+        vector<uint32_t> allIdx(numOv);
+        iota(allIdx.begin(), allIdx.end(), 0);
+        unordered_set<uint32_t> emptyExclude;
+        vector<uint8_t> r0result;
+        vector<uint32_t> r0usedPos;
+        bool r0split = cwPhaseSplit(allIdx, windowBbBegin, windowBbEnd,
+                                    emptyExclude, r0result, r0usedPos);
 
-        vector<WorkItem> queue;
-        {
-            vector<uint32_t> allIdx(numOv);
-            iota(allIdx.begin(), allIdx.end(), 0);
-            queue.push_back({std::move(allIdx), true, {}});
-        }
+        if (r0split) {
+            // Collect cis, trans, unclassified from round 0.
+            vector<uint32_t> cisIdx, transIdx, uncIdx;
+            for (uint32_t i = 0; i < numOv; i++) {
+                if (r0result[i] == 1) cisIdx.push_back(i);
+                else if (r0result[i] == 2) transIdx.push_back(i);
+                else uncIdx.push_back(i);
+            }
 
-        vector<uint32_t> allUnclassified;
-        constexpr uint32_t maxRounds = 10;
-        uint32_t round = 0;
+            cout << "    split (round 0): " << numOv
+                 << " -> cis=" << cisIdx.size()
+                 << " trans=" << transIdx.size() << endl;
 
-        while (!queue.empty() && round < maxRounds) {
-            vector<WorkItem> nextQueue;
+            // Cis → final cluster.
+            {
+                vector<OrientedReadId> c;
+                c.reserve(cisIdx.size());
+                for (uint32_t oi : cisIdx) c.push_back(profiles[oi].oid);
+                window.readClusters.push_back(std::move(c));
+                window.clusterIsUnclassified.push_back(false);
+            }
 
-            for (auto& item : queue) {
-                uint32_t bbBegin = item.useBb ? windowBbBegin : 0;
-                uint32_t bbEnd = item.useBb ? windowBbEnd : 0;
+            // Round 1: trans + unclassified from round 0.
+            // Unclassified reads had no observations at round 0's valid sites,
+            // but may have observations at the new sites found in round 1.
+            // Use the longest-spanning trans read as virtual backbone evidence.
+            vector<uint32_t> r1idx;
+            r1idx.reserve(transIdx.size() + uncIdx.size());
+            r1idx.insert(r1idx.end(), transIdx.begin(), transIdx.end());
+            r1idx.insert(r1idx.end(), uncIdx.begin(), uncIdx.end());
 
-                vector<uint8_t> result;
-                vector<uint32_t> usedPositions;
-                bool didSplit = cwPhaseSplit(item.idx, bbBegin, bbEnd,
-                                            item.excludePos, result, usedPositions);
-
-                if (!didSplit) {
-                    // No split — this group is a final cluster.
-                    vector<OrientedReadId> c;
-                    c.reserve(item.idx.size());
-                    for (uint32_t oi : item.idx) c.push_back(profiles[oi].oid);
-                    window.readClusters.push_back(std::move(c));
-                    continue;
-                }
-
-                // Collect cis, trans, unclassified.
-                vector<uint32_t> cisIdx, transIdx;
-                for (uint32_t i = 0; i < uint32_t(item.idx.size()); i++) {
-                    if (result[i] == 1) cisIdx.push_back(item.idx[i]);
-                    else if (result[i] == 2) transIdx.push_back(item.idx[i]);
-                    else allUnclassified.push_back(item.idx[i]);
-                }
-
-                cout << "    split (round " << round << "): "
-                     << item.idx.size() << " -> cis=" << cisIdx.size()
-                     << " trans=" << transIdx.size() << endl;
-
-                // Cis → final cluster.
-                {
-                    vector<OrientedReadId> c;
-                    c.reserve(cisIdx.size());
-                    for (uint32_t oi : cisIdx) c.push_back(profiles[oi].oid);
-                    window.readClusters.push_back(std::move(c));
-                }
-
-                // Trans → back into queue (no backbone evidence).
-                // Carry forward excluded positions + positions used in this round.
-                if (!transIdx.empty()) {
-                    unordered_set<uint32_t> nextExclude = item.excludePos;
-                    for (uint32_t p : usedPositions) nextExclude.insert(p);
-                    nextQueue.push_back({std::move(transIdx), false,
-                                         std::move(nextExclude)});
+            // Find longest-spanning read in trans group.
+            uint32_t r1bbBegin = 0, r1bbEnd = 0;
+            {
+                uint32_t bestSpan = 0;
+                for (uint32_t oi : transIdx) {
+                    const auto& prof = profiles[oi];
+                    uint32_t span = (prof.bbCovEnd > prof.bbCovBegin) ?
+                                    prof.bbCovEnd - prof.bbCovBegin : 0;
+                    if (span > bestSpan) {
+                        bestSpan = span;
+                        r1bbBegin = prof.bbCovBegin;
+                        r1bbEnd = prof.bbCovEnd;
+                    }
                 }
             }
 
-            queue = std::move(nextQueue);
-            round++;
-        }
+            // Exclude only round 0 valid sites. Strand bias / homopolymer
+            // positions are re-evaluated with full filters on the trans subset.
+            unordered_set<uint32_t> r1exclude(r0usedPos.begin(), r0usedPos.end());
+            vector<uint8_t> r1result;
+            vector<uint32_t> r1usedPos;
 
-        // Any remaining unsplit groups in the queue → final clusters.
-        for (auto& item : queue) {
-            vector<OrientedReadId> c;
-            c.reserve(item.idx.size());
-            for (uint32_t oi : item.idx) c.push_back(profiles[oi].oid);
-            window.readClusters.push_back(std::move(c));
-        }
+            bool r1split = false;
+            if (r1idx.size() > hetCov) {
+                r1split = cwPhaseSplit(r1idx, r1bbBegin, r1bbEnd,
+                                       r1exclude, r1result, r1usedPos);
+            }
 
-        // Unclassified → last cluster.
-        if (!allUnclassified.empty()) {
-            vector<OrientedReadId> c;
-            c.reserve(allUnclassified.size());
-            for (uint32_t oi : allUnclassified) c.push_back(profiles[oi].oid);
-            window.readClusters.push_back(std::move(c));
+            if (r1split) {
+                vector<uint32_t> r1cis, r1trans, r1unc;
+                for (uint32_t i = 0; i < uint32_t(r1idx.size()); i++) {
+                    if (r1result[i] == 1) r1cis.push_back(r1idx[i]);
+                    else if (r1result[i] == 2) r1trans.push_back(r1idx[i]);
+                    else r1unc.push_back(r1idx[i]);
+                }
+
+                cout << "    split (round 1): " << r1idx.size()
+                     << " -> cis=" << r1cis.size()
+                     << " trans=" << r1trans.size() << endl;
+
+                // Round 1 cis → cluster.
+                {
+                    vector<OrientedReadId> c;
+                    c.reserve(r1cis.size());
+                    for (uint32_t oi : r1cis) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    window.clusterIsUnclassified.push_back(false);
+                }
+                // Round 1 trans → cluster.
+                {
+                    vector<OrientedReadId> c;
+                    c.reserve(r1trans.size());
+                    for (uint32_t oi : r1trans) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    window.clusterIsUnclassified.push_back(false);
+                }
+                // Round 1 unclassified → separate cluster.
+                if (!r1unc.empty()) {
+                    vector<OrientedReadId> c;
+                    c.reserve(r1unc.size());
+                    for (uint32_t oi : r1unc) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    window.clusterIsUnclassified.push_back(true);
+                }
+            } else {
+                // No further split — keep trans and unclassified separate.
+                {
+                    vector<OrientedReadId> c;
+                    c.reserve(transIdx.size());
+                    for (uint32_t oi : transIdx) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    window.clusterIsUnclassified.push_back(false);
+                }
+                if (!uncIdx.empty()) {
+                    vector<OrientedReadId> c;
+                    c.reserve(uncIdx.size());
+                    for (uint32_t oi : uncIdx) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    window.clusterIsUnclassified.push_back(true);
+                }
+            }
+        } else {
+            // No split — one cluster.
+            window.readClusters.resize(1);
+            window.readClusters[0].reserve(numOv);
+            for (const auto& prof : profiles)
+                window.readClusters[0].push_back(prof.oid);
+            window.clusterIsUnclassified.push_back(false);
         }
 
         // Store per-read haplotype (cluster index).
@@ -1559,7 +1611,6 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
             window.readHaplotypes[oi].hap = 0;
         }
-        // Map each read to its cluster index.
         for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
             for (const auto& oid : window.readClusters[ci]) {
                 for (uint32_t oi = 0; oi < numOv; oi++) {
@@ -1572,8 +1623,10 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         }
 
         cout << "    clusters: " << window.readClusters.size();
-        for (size_t ci = 0; ci < window.readClusters.size(); ci++)
+        for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
             cout << " [" << ci << "]=" << window.readClusters[ci].size();
+            if (window.clusterIsUnclassified[ci]) cout << "(unc)";
+        }
         cout << endl;
     }
 
