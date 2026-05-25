@@ -1233,62 +1233,65 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             paths.push_back(std::move(path));
         }
 
-        // Score paths (no qual_a branch — use HiFi-like logic).
-        // Multi-site chains: plus=1. Singletons: plus=1 only if occ_0 >= cc.
-        // Per-site: score=plus if occ_0 >= cc, else score=-1.
-        // Then: consecutive-position run rejection (ONT behavior).
+        // Score paths — ONT branch of gen_rphase_dp0_single_path.
+        // Without base quality values, we substitute occ_0-based checks.
+        //
+        // Step 1: Dense check — if ALL consecutive sites in a path are
+        //   within distance 8, set krn=1 (treat as singleton-like).
+        // Step 2: Per-site scoring:
+        //   krn > 1 (real chain): score=1 if nRef >= 2 (lenient)
+        //   krn == 1 (dense/singleton): score=1 if nRef >= cc (strict)
+        // Step 3: Consecutive-position run rejection — if any site in a
+        //   run of consecutive positions has score=-1, reject the whole run.
         vector<int8_t> siteScore(numSites, -1);
 
         for (const auto& path : paths) {
             const uint32_t pathLen = uint32_t(path.siteIndices.size());
 
-            int8_t plus;
+            // Step 1: Dense check.
+            // Sites are in forward position order (we reversed after traceback).
+            uint32_t krn = pathLen;
             if (pathLen > 1) {
-                plus = 1;
-            } else {
-                // Singleton: validate only if sufficient ref support.
-                uint32_t si = path.siteIndices[0];
-                plus = (sites[si].nRef >= cc) ? 1 : -1;
+                uint32_t i;
+                for (i = 1; i < pathLen &&
+                     passingSnps[path.siteIndices[i-1]].pos + 8 >=
+                     passingSnps[path.siteIndices[i]].pos; i++);
+                if (i >= pathLen) krn = 1;
             }
 
+            // Step 2: Per-site scoring.
             for (uint32_t pi = 0; pi < pathLen; pi++) {
                 uint32_t si = path.siteIndices[pi];
-                if (sites[si].nRef >= cc) {
-                    siteScore[si] = plus;
+                if (krn > 1) {
+                    // Real chain: lenient check.
+                    siteScore[si] = (sites[si].nRef >= 2 && sites[si].nAlt >= 2)
+                                    ? 1 : -1;
                 } else {
-                    siteScore[si] = -1;
+                    // Dense cluster or singleton: strict check.
+                    siteScore[si] = (sites[si].nRef >= cc && sites[si].nAlt >= 2)
+                                    ? 1 : -1;
                 }
             }
 
-            // Consecutive-position run rejection (hifiasm ONT behavior):
+            // Step 3: Consecutive-position run rejection.
             // Within a path, find runs of sites at consecutive positions.
             // If any site in a run has score=-1, reject the entire run.
-            if (pathLen > 1) {
-                for (uint32_t pi = 0; pi < pathLen; ) {
-                    uint32_t runStart = pi;
-                    uint32_t runEnd = pi + 1;
-                    while (runEnd < pathLen &&
-                           passingSnps[path.siteIndices[runEnd]].pos ==
-                           passingSnps[path.siteIndices[runEnd-1]].pos + 1) {
-                        runEnd++;
-                    }
-                    if (runEnd - runStart > 1) {
-                        // Check if any site in this run is rejected.
-                        bool anyBad = false;
-                        for (uint32_t ri = runStart; ri < runEnd; ri++) {
-                            if (siteScore[path.siteIndices[ri]] == -1) {
-                                anyBad = true;
-                                break;
-                            }
-                        }
-                        if (anyBad) {
-                            for (uint32_t ri = runStart; ri < runEnd; ri++) {
-                                siteScore[path.siteIndices[ri]] = -1;
-                            }
-                        }
-                    }
-                    pi = runEnd;
+            for (uint32_t pi = 0; pi < pathLen; ) {
+                int8_t runScore = siteScore[path.siteIndices[pi]];
+                uint32_t runEnd = pi + 1;
+                while (runEnd < pathLen &&
+                       passingSnps[path.siteIndices[runEnd]].pos ==
+                       passingSnps[path.siteIndices[runEnd-1]].pos + 1) {
+                    if (siteScore[path.siteIndices[runEnd]] == -1)
+                        runScore = -1;
+                    runEnd++;
                 }
+                if (runScore == -1) {
+                    for (uint32_t ri = pi; ri < runEnd; ri++) {
+                        siteScore[path.siteIndices[ri]] = -1;
+                    }
+                }
+                pi = runEnd;
             }
         }
 
