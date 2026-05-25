@@ -52,6 +52,7 @@ using namespace dinara;
 #include <map>
 #include "iostream.hpp"
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "stdexcept.hpp"
@@ -1274,8 +1275,184 @@ void dinara::main::assemble(
         }
     }
 
+    // ── Split anchors by phasing clusters ──
+    // For each anchor covered by a phased window, split it into N anchors
+    // (one per non-unclassified cluster), each also including the
+    // unclassified reads. Anchors not covered by any phased window are
+    // kept as-is.
+    //
+    // An anchor may be covered by multiple windows. We use per-read
+    // cluster labels that are consistent across windows: the backbone
+    // read is always in cluster 0, and other clusters are numbered 1..N-1.
+    // When windows disagree on a read, the last window wins — this is
+    // acceptable because overlapping windows share most of the same reads
+    // and phasing signal.
+    {
+        cout << timestamp << "Splitting anchors by phasing clusters..." << endl;
+        auto& anchors = *shasta2Anchors;
+        const auto& journeys = *shasta2Journeys;
+        const uint64_t originalAnchorCount = anchors.size();
+
+        // Per-anchor split info.
+        // readCluster[ri]: -1 = unassigned, -2 = unclassified, >=0 = cluster label.
+        // Cluster 0 always contains the backbone read.
+        struct AnchorSplitInfo {
+            uint32_t nClusters = 0;  // number of distinct non-unclassified clusters with reads
+            vector<int> readCluster;
+        };
+        vector<AnchorSplitInfo> splitInfo(originalAnchorCount);
+
+        for (const auto& window : anchorWindows) {
+            if (window.readClusters.size() <= 1) continue;
+
+            // Map window-local cluster indices to consistent labels.
+            // Backbone's cluster → label 0, other non-unclassified clusters
+            // get labels 1, 2, ... in order. Unclassified clusters → -2.
+            int backboneWindowCluster = -1;
+            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+                if (window.clusterIsUnclassified[ci]) continue;
+                for (const auto& oid : window.readClusters[ci]) {
+                    if (oid == window.backboneOrientedReadId) {
+                        backboneWindowCluster = int(ci);
+                        break;
+                    }
+                }
+                if (backboneWindowCluster >= 0) break;
+            }
+            if (backboneWindowCluster < 0) backboneWindowCluster = 0;
+
+            vector<int> clusterToLabel(window.readClusters.size(), -2);
+            int nextLabel = 0;
+            // Backbone cluster first → label 0.
+            clusterToLabel[backboneWindowCluster] = nextLabel++;
+            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+                if (window.clusterIsUnclassified[ci]) continue;
+                if (int(ci) == backboneWindowCluster) continue;
+                clusterToLabel[ci] = nextLabel++;
+            }
+
+            // Build read → label map for this window.
+            std::unordered_map<uint32_t, int> readToLabel;
+            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+                int label = clusterToLabel[ci];
+                for (const auto& oid : window.readClusters[ci]) {
+                    readToLabel[oid.getValue()] = label;
+                }
+            }
+            // Backbone is always label 0.
+            readToLabel[window.backboneOrientedReadId.getValue()] = 0;
+
+            // Apply to anchors in this window.
+            const auto bbJ = journeys[window.backboneOrientedReadId];
+            for (uint32_t jp = window.backboneBegin; jp < window.backboneEnd; jp++) {
+                const Shasta2AnchorId anchorId = bbJ[jp];
+                auto& info = splitInfo[anchorId];
+                const auto anchor = anchors[anchorId];
+
+                if (info.readCluster.empty()) {
+                    info.readCluster.assign(anchor.size(), -1);
+                }
+
+                std::set<int> labelsPresent;
+                for (uint64_t ri = 0; ri < anchor.size(); ri++) {
+                    auto it = readToLabel.find(anchor[ri].orientedReadId.getValue());
+                    if (it != readToLabel.end()) {
+                        info.readCluster[ri] = it->second;
+                        if (it->second >= 0)
+                            labelsPresent.insert(it->second);
+                    }
+                }
+                info.nClusters = uint32_t(labelsPresent.size());
+            }
+        }
+
+        // Count anchors to split.
+        uint64_t newAnchorCount = 0;
+        uint64_t splitAnchorCount = 0;
+        for (uint64_t anchorId = 0; anchorId < originalAnchorCount; anchorId++) {
+            const auto& info = splitInfo[anchorId];
+            if (info.nClusters >= 2) {
+                newAnchorCount += info.nClusters;
+                splitAnchorCount++;
+            } else {
+                newAnchorCount++;
+            }
+        }
+
+        cout << timestamp << "  anchors to split: " << splitAnchorCount
+             << " / " << originalAnchorCount
+             << " -> " << newAnchorCount << " total" << endl;
+
+        // Build new anchor vectors.
+        vector<vector<Shasta2AnchorMarkerInfo>> newAnchors;
+        newAnchors.reserve(newAnchorCount);
+
+        for (uint64_t anchorId = 0; anchorId < originalAnchorCount; anchorId++) {
+            const auto anchor = anchors[anchorId];
+            const auto& info = splitInfo[anchorId];
+
+            if (info.nClusters < 2) {
+                newAnchors.emplace_back(anchor.begin(), anchor.end());
+                continue;
+            }
+
+            // Find which cluster labels are present.
+            std::set<int> labelsPresent;
+            for (int c : info.readCluster) {
+                if (c >= 0) labelsPresent.insert(c);
+            }
+
+            // Collect unclassified (-2) + unassigned (-1) reads.
+            vector<Shasta2AnchorMarkerInfo> uncReads;
+            for (uint64_t ri = 0; ri < anchor.size(); ri++) {
+                if (info.readCluster[ri] < 0) {
+                    uncReads.push_back(anchor[ri]);
+                }
+            }
+
+            // Create one anchor per cluster label.
+            for (int label : labelsPresent) {
+                vector<Shasta2AnchorMarkerInfo> newAnchor;
+                for (uint64_t ri = 0; ri < anchor.size(); ri++) {
+                    if (info.readCluster[ri] == label) {
+                        newAnchor.push_back(anchor[ri]);
+                    }
+                }
+                // Add unclassified reads to all split anchors.
+                newAnchor.insert(newAnchor.end(), uncReads.begin(), uncReads.end());
+                sort(newAnchor.begin(), newAnchor.end());
+                newAnchors.push_back(std::move(newAnchor));
+            }
+        }
+
+        // Replace anchorMarkerInfos.
+        anchors.anchorMarkerInfos.clear();
+        for (const auto& a : newAnchors) {
+            anchors.anchorMarkerInfos.appendVector(a);
+        }
+
+        cout << timestamp << "  anchor splitting complete: "
+             << originalAnchorCount << " -> " << anchors.size() << endl;
+
+        // Rebuild journeys with the new anchors.
+        cout << timestamp << "  rebuilding journeys..." << endl;
+        assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
+            2 * assembler.getReads().readCount(),
+            shasta2Anchors,
+            threadCount,
+            shasta2Owner);
+        shasta2Journeys = assembler.shasta2Journeys;
+        cout << timestamp << "  journeys rebuilt." << endl;
+    }
+
     // Write AnchorWindowsClean GFA with het/hom-gated alternate paths.
-    assembler.writeAnchorWindowsCleanGfa(anchorWindows);
+    // DISABLED: replaced by anchor splitting above.
+    // assembler.writeAnchorWindowsCleanGfa(anchorWindows);
+
+    // Clear alternate paths — no longer needed since anchors are split directly.
+    for (auto& window : anchorWindows) {
+        window.alternatePaths.clear();
+    }
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;
