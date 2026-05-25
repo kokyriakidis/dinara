@@ -1045,11 +1045,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
 
     // cc = min ref support threshold for singleton/dense sites.
     // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
-    // coveragePeak is the haploid (het) k-mer coverage peak.
-    // coverageHigh is the homozygous k-mer coverage.
-    const uint64_t coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
-    const uint64_t coverageHigh = assemblerInfo->kmerDistributionInfo.coverageHigh;
-    const uint64_t hetCov = coveragePeak;  // haploid coverage
+    // coverageHet is the haploid (het) k-mer coverage peak.
+    // coverageHom is the homozygous k-mer coverage.
+    const uint64_t coverageHet = assemblerInfo->kmerDistributionInfo.coverageHet;
+    const uint64_t coverageHom = assemblerInfo->kmerDistributionInfo.coverageHom;
+    const uint64_t hetCov = coverageHet;  // haploid coverage
     uint32_t cc = uint32_t(hetCov * 0.7);
     if (cc < 6) cc = 6;
 

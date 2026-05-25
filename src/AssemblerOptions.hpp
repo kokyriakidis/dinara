@@ -206,7 +206,7 @@ public:
     // --- Marker frequency hard cutoff (hifiasm htab.cpp max_kmer_cnt) ---
     // K-mers occurring more than this many times are excluded entirely from
     // the marker set. Hifiasm default: 2000 (CommandLines.cpp:270).
-    // K-mers between 5*coveragePeak and this threshold are kept but subject
+    // K-mers between 5*coverageHet and this threshold are kept but subject
     // to per-streak downsampling during chaining.
     uint32_t invertedIndexMaxKmerCount = 2000;
 

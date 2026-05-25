@@ -793,9 +793,9 @@ void dinara::main::assemble(
         
         // Retrieve peak and set thresholds.
         // Hifiasm hard-filters k-mers above max_kmer_cnt (default 2000) during
-        // sketching. K-mers between highFreqThreshold (coveragePeak * 1.667)
+        // sketching. K-mers between highFreqThreshold (coverageHet * 1.667)
         // and this cutoff are kept but downsampled per-streak during chaining.
-        const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+        const uint64_t coverageHet = assembler.assemblerInfo->kmerDistributionInfo.coverageHet;
         const uint64_t minFreq = 2;
         const uint64_t maxFreq = uint64_t(
             assemblerOptions.overlapCandidatesOptions.invertedIndexMaxKmerCount);
@@ -806,7 +806,7 @@ void dinara::main::assemble(
         }
 
         cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
-        cout << "Filtering minimizers: Peak coverage is " << coveragePeak << "." << endl;
+        cout << "Filtering minimizers: Peak coverage is " << coverageHet << "." << endl;
         cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "]";
         if(removePalindromicKmers) {
             cout << " and excluding palindromic k-mers";
@@ -946,7 +946,7 @@ void dinara::main::assemble(
         // The SIMD path already creates these, but findMarkers does not.
         assembler.computeMarkerKmerIds(threadCount);
 
-        // Compute k-mer histogram to get coveragePeak (needed by phasing).
+        // Compute k-mer histogram to get coverageHet (needed by phasing).
         // The SIMD path does this via countKmersFromMarkerKmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
     }
@@ -972,10 +972,10 @@ void dinara::main::assemble(
     //
     // Example: coverage = 30x → max(100, 30*5) = 150 overlaps per read
     //
-    const uint64_t coveragePeak = assembler.assemblerInfo->kmerDistributionInfo.coveragePeak;
+    const uint64_t coverageHet = assembler.assemblerInfo->kmerDistributionInfo.coverageHet;
     const uint64_t maxChainLimit = std::max<uint64_t>(
         assemblerOptions.overlapCandidatesOptions.invertedIndexMinNChain,     // MIN_N_CHAIN = 100
-        uint64_t(double(coveragePeak) * assemblerOptions.overlapCandidatesOptions.invertedIndexHighFactor + 0.499));  // hom_cov * 5.0
+        uint64_t(double(coverageHet) * assemblerOptions.overlapCandidatesOptions.invertedIndexHighFactor + 0.499));  // hom_cov * 5.0
 
     // Always build the inverted index for k-mer lookups (needed by both paths)
     assembler.buildInvertedIndex(threadCount);
@@ -1084,11 +1084,11 @@ void dinara::main::assemble(
     // assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
 
     // Set min and max marker graph vertex coverage thresholds.
-    // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coveragePeak) / 2));
-    // const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coveragePeak));
+    // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coverageHet) / 2));
+    // const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coverageHet));
     
     const uint64_t minVertexCoverage = 2;
-    const uint64_t maxVertexCoverage = 5 * coveragePeak;
+    const uint64_t maxVertexCoverage = 5 * coverageHet;
 
     // Build marker graph vertices using transitive alignments collapse.
     assembler.createMarkerGraphVertices(
@@ -1119,7 +1119,7 @@ void dinara::main::assemble(
 
 
     const uint64_t minAnchorCoverage = 2;
-    const uint64_t maxAnchorCoverage = 5 * coveragePeak;
+    const uint64_t maxAnchorCoverage = 5 * coverageHet;
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
@@ -1663,9 +1663,9 @@ void dinara::main::assemble(
     // return;
 
 
-    // coveragePeak already defined above (line ~979).
+    // coverageHet already defined above (line ~979).
     const uint64_t minFreq = 8;
-    const uint64_t maxFreq = 5 * coveragePeak;
+    const uint64_t maxFreq = 5 * coverageHet;
 
 
     // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
@@ -1686,7 +1686,7 @@ void dinara::main::assemble(
     // Same Shasta2 anchor/journey coverage as the main assembly path (see shasta2 block
     // later in this file): reuse these objects when wiring Theseus to Shasta2.
     const uint64_t minPrimaryCoverage = 8;
-    const uint64_t maxPrimaryCoverage = 5 * coveragePeak;
+    const uint64_t maxPrimaryCoverage = 5 * coverageHet;
     const MappedMemoryOwner shasta2OwnerEarly = assembler.shasta2MappedMemoryOwner();
     cout << timestamp << "Creating Shasta2Anchors for Theseus read-window prototype..." << endl;
     assembler.shasta2Anchors = make_shared<Shasta2Anchors>(

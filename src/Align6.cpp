@@ -42,7 +42,7 @@ Align6::Align6(
     if((align6Options.minGlobalFrequency == 0) and (align6Options.maxGlobalFrequency == 0)) {
         minGlobalFrequency = kmerDistributionInfo.coverageLow;
         maxGlobalFrequency = uint64_t(std::round(
-            align6Options.maxGlobalFrequencyMultiplier * double(kmerDistributionInfo.coverageHigh)));
+            align6Options.maxGlobalFrequencyMultiplier * double(kmerDistributionInfo.coverageHom)));
     } else {
         minGlobalFrequency = align6Options.minGlobalFrequency;
         maxGlobalFrequency = align6Options.maxGlobalFrequency;

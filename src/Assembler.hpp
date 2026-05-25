@@ -2598,7 +2598,7 @@ public:
 	    public:
 	         double maxDriftRate;
 	         uint64_t k; // k-mer length for canonicalization
-	         uint64_t coveragePeak; // Added for Hifiasm Parity (Gradient Scoring)
+	         uint64_t coverageHet; // Added for Hifiasm Parity (Gradient Scoring)
              // InvertedIndex chaining configuration (see OverlapCandidatesOptions for meaning).
              double weightExponent = 1.1;
              double lowFreqMultiplier = 0.333;

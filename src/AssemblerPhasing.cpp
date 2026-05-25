@@ -1844,9 +1844,9 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                     readsWithSites++;
 
                     // 5. DP phasing.
-                    const uint64_t coveragePeak =
-                        assemblerInfo->kmerDistributionInfo.coveragePeak;
-                    const uint32_t hetCov = uint32_t(coveragePeak / 2);
+                    const uint64_t coverageHet =
+                        assemblerInfo->kmerDistributionInfo.coverageHet;
+                    const uint32_t hetCov = uint32_t(coverageHet / 2);
                     tp0 = clk::now();
                     runDpPhasing(scratch, hetCov);
                     tp1 = clk::now();
@@ -1873,8 +1873,8 @@ void Assembler::phaseOverlaps(uint64_t threadCount)
                         for (const auto& s : scratch.sites) {
                             if (s.dpChainId >= 0) confirmed++;
                         }
-                        cout << timestamp << "[PHASING-DBG] coveragePeak="
-                             << coveragePeak << " hetCov=" << hetCov
+                        cout << timestamp << "[PHASING-DBG] coverageHet="
+                             << coverageHet << " hetCov=" << hetCov
                              << " confirmed=" << confirmed
                              << "/" << scratch.sites.size() << endl;
                         for (uint32_t si = 0; si < scratch.sites.size(); si++) {

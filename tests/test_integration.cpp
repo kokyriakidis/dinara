@@ -5402,7 +5402,7 @@ TEST_CASE("Integration: comput_sc_rphase_strict requires both haplotype supports
     }
 }
 
-TEST_CASE("Integration: high coveragePeak suppresses DP site retention (singleton site)", "[integration][hifiasm][ec][parity][cc]") {
+TEST_CASE("Integration: high coverageHet suppresses DP site retention (singleton site)", "[integration][hifiasm][ec][parity][cc]") {
     AssemblerIntegrationFixture fixture;
 
     // Build exactly one informative SNP site on read_0 (singleton chain):
@@ -5434,10 +5434,10 @@ TEST_CASE("Integration: high coveragePeak suppresses DP site retention (singleto
     fixture.chainCandidates(0.1, 200);
     fixture.computeAlignments();
 
-    // Force a very high coveragePeak (cc becomes very large in DP).
+    // Force a very high coverageHet (cc becomes very large in DP).
     // With DP enabled, hifiasm compacts the SNP list to score==1 sites (occ_0>=cc),
     // so this should eliminate SNP sites before trans-closure runs (no overlaps removed).
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 200;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 200;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -5477,7 +5477,7 @@ TEST_CASE("Integration: high coveragePeak suppresses DP site retention (singleto
     REQUIRE(sawAltAtP);
 }
 
-TEST_CASE("Integration: high coveragePeak suppresses DP site retention (chained sites)", "[integration][hifiasm][ec][parity][cc]") {
+TEST_CASE("Integration: high coverageHet suppresses DP site retention (chained sites)", "[integration][hifiasm][ec][parity][cc]") {
     AssemblerIntegrationFixture fixture;
 
     // Two SNP sites on read_0 that form a valid DP chain (alt-alt and ref-ref support exist).
@@ -5518,7 +5518,7 @@ TEST_CASE("Integration: high coveragePeak suppresses DP site retention (chained 
     fixture.computeAlignments();
 
     // Make cc very large in DP. With DP enabled, no SNP sites survive into trans-closure.
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 200;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 200;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -5609,7 +5609,7 @@ TEST_CASE("Integration: homopolymer context can suppress singleton DP sites (tar
 
     // cc is hifiasm-style (cut_rate=0.7, cut_bd=6). For small coverage peaks it floors to 6;
     // the extra ref overlaps above ensure the singleton passes occ_0>=cc so the HP check is exercised.
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 4;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -6054,9 +6054,9 @@ TEST_CASE("Integration: performHifiasmECParity removes trans overlaps (ALT-suppo
     fixture.chainCandidates(0.1, 200);
     fixture.computeAlignments();
 
-    // cc is computed like hifiasm (cut_rate=0.7, cut_bd=6) from coveragePeak; for low peaks
+    // cc is computed like hifiasm (cut_rate=0.7, cut_bd=6) from coverageHet; for low peaks
     // it still floors to 6, so coverage must come from overlaps (already ensured above).
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 4;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -6158,7 +6158,7 @@ TEST_CASE("Integration: performHifiasmECParity drops adjacent SNP sites like hif
     fixture.chainCandidates(0.1, 200);
     fixture.computeAlignments();
 
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 4;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -6226,7 +6226,7 @@ TEST_CASE("Integration: performHifiasmECParity multi_check rescues weak sites an
 
     // cc is hifiasm-style (cut_bd=6), but multi_check is independent of DP validation and
     // should still rescue repeated weak sites.
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 4;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
@@ -6331,7 +6331,7 @@ TEST_CASE("Integration: multi_check does not use ref support from trans overlaps
     fixture.chainCandidates(0.1, 200);
     fixture.computeAlignments();
 
-    fixture.assembler->assemblerInfo->kmerDistributionInfo.coveragePeak = 4;
+    fixture.assembler->assemblerInfo->kmerDistributionInfo.coverageHet = 4;
 
     withSilencedIoInDir(fixture.testDir, [&] {
         fixture.assembler->performHifiasmECParity(1);
