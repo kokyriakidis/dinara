@@ -1108,8 +1108,7 @@ void dinara::main::assemble(
 
     // Filter marker graph vertices whose marker k-mers have low sequence complexity
     // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
-    // DISABLED: removes ~99% of vertices, leaving too few anchors for MSA phasing.
-    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
     // Filter marker graph vertices where reads were grouped by transitive collapse
     // at k-mer positions outside their chaining range.
