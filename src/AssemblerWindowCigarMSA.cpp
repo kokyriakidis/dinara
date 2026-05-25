@@ -1166,17 +1166,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         // DP to find best chain of consistent sites.
         // cc = min ref support threshold.
         // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
-        // We estimate het_cov from the median spanning coverage of our sites.
-        // For diploid: het_cov ≈ spanning/2. cc = het_cov * 0.7, min 2.
-        vector<uint32_t> spanVals;
-        for (uint32_t si = 0; si < numSites; si++) {
-            spanVals.push_back(passingSnps[si].spanning);
-        }
-        sort(spanVals.begin(), spanVals.end());
-        uint32_t medianSpan = spanVals[spanVals.size() / 2];
-        uint32_t estHetCov = medianSpan / 2;
-        uint32_t cc = uint32_t(estHetCov * 0.7);
-        if (cc < 2) cc = 2;
+        // coveragePeak is homozygous coverage; het_cov = coveragePeak / 2.
+        const uint64_t coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
+        const uint64_t hetCov = coveragePeak / 2;
+        uint32_t cc = uint32_t(hetCov * 0.7);
+        if (cc < 6) cc = 6;
 
         // Filter out adjacent-dropped sites for DP.
         vector<uint32_t> dpSites;
