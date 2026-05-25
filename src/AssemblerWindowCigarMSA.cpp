@@ -993,6 +993,14 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
          << " failHomopolymer=" << failHomopolymer
          << " cleanHetSnps=" << cleanHetSnps << endl;
 
+    // Store passing het SNPs in the window.
+    window.hetSnps.resize(passingSnps.size());
+    for (size_t i = 0; i < passingSnps.size(); i++) {
+        window.hetSnps[i] = {passingSnps[i].pos, passingSnps[i].altBase,
+                             passingSnps[i].altCov, passingSnps[i].refCov,
+                             passingSnps[i].spanning};
+    }
+
     // Phase reads using k-means if we have het SNPs.
     if (cleanHetSnps > 0 && profiles.size() >= 2) {
         // Sort passing SNPs by position (KmVarKey ordering).

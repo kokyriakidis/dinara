@@ -45,6 +45,16 @@ struct AnchorWindow {
     // 0 means the window is homozygous — only backbone anchors should be kept.
     uint32_t cleanHetSnpCount = 0;
 
+    // Passing het SNP positions (in oriented backbone coordinates).
+    struct HetSnp {
+        uint32_t bbPos;       // backbone position
+        uint8_t altBase;      // alt allele (0=A, 1=C, 2=G, 3=T)
+        uint32_t altCov;      // alt read count
+        uint32_t refCov;      // ref read count
+        uint32_t spanning;    // total reads with bases at this position
+    };
+    std::vector<HetSnp> hetSnps;
+
     // Per-read haplotype assignment from k-means phasing.
     // hap: 0 = unassigned, 1 = haplotype 1 (cis with backbone), 2 = haplotype 2 (trans).
     struct ReadHaplotype {

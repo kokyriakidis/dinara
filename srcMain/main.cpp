@@ -1197,21 +1197,47 @@ void dinara::main::assemble(
              << std::defaultfloat << endl;
     }
 
-    // Write per-read haplotype assignments for the first window (longest read).
-    if (!anchorWindows.empty() && !anchorWindows[0].readHaplotypes.empty()) {
+    // Write per-read haplotype assignments and het SNP info for the first window.
+    if (!anchorWindows.empty()) {
         const auto& w0 = anchorWindows[0];
-        const string hapFileName = "WindowHaplotypes.csv";
-        ofstream hapFile(hapFileName);
-        if (hapFile) {
-            hapFile << "OrientedReadId,Haplotype\n";
-            // Backbone read is hap 1 by convention.
-            hapFile << w0.backboneOrientedReadId << ",1\n";
-            for (const auto& rh : w0.readHaplotypes) {
-                hapFile << rh.orientedReadId << "," << rh.hap << "\n";
+        const char* baseChar = "ACGT";
+
+        // Het SNP positions.
+        if (!w0.hetSnps.empty()) {
+            const string snpFileName = "WindowHetSnps.csv";
+            ofstream snpFile(snpFileName);
+            if (snpFile) {
+                snpFile << "BbPos,AltBase,AltCov,RefCov,Spanning,AF\n";
+                for (const auto& s : w0.hetSnps) {
+                    snpFile << s.bbPos << ","
+                            << baseChar[s.altBase] << ","
+                            << s.altCov << ","
+                            << s.refCov << ","
+                            << s.spanning << ","
+                            << std::fixed << std::setprecision(3)
+                            << (s.spanning > 0 ? double(s.altCov) / double(s.spanning) : 0.0)
+                            << std::defaultfloat << "\n";
+                }
+                cout << timestamp << "Wrote " << snpFileName
+                     << " (" << w0.hetSnps.size() << " het SNPs)" << endl;
             }
-            cout << timestamp << "Wrote " << hapFileName
-                 << " (" << w0.readHaplotypes.size() << " reads, window bb="
-                 << w0.backboneOrientedReadId << ")" << endl;
+        }
+
+        // Per-read haplotype assignments.
+        if (!w0.readHaplotypes.empty()) {
+            const string hapFileName = "WindowHaplotypes.csv";
+            ofstream hapFile(hapFileName);
+            if (hapFile) {
+                hapFile << "OrientedReadId,Haplotype\n";
+                // Backbone read is hap 1 by convention.
+                hapFile << w0.backboneOrientedReadId << ",1\n";
+                for (const auto& rh : w0.readHaplotypes) {
+                    hapFile << rh.orientedReadId << "," << rh.hap << "\n";
+                }
+                cout << timestamp << "Wrote " << hapFileName
+                     << " (" << w0.readHaplotypes.size() << " reads, window bb="
+                     << w0.backboneOrientedReadId << ")" << endl;
+            }
         }
     }
 
