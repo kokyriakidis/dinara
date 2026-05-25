@@ -1045,8 +1045,11 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
 
     // cc = min ref support threshold for singleton/dense sites.
     // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
+    // coveragePeak is the haploid (het) k-mer coverage peak.
+    // coverageHigh is the homozygous k-mer coverage.
     const uint64_t coveragePeak = assemblerInfo->kmerDistributionInfo.coveragePeak;
-    const uint64_t hetCov = coveragePeak / 2;
+    const uint64_t coverageHigh = assemblerInfo->kmerDistributionInfo.coverageHigh;
+    const uint64_t hetCov = coveragePeak;  // haploid coverage
     uint32_t cc = uint32_t(hetCov * 0.7);
     if (cc < 6) cc = 6;
 
@@ -1056,19 +1059,27 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     // classification for subsetIdx[i]: 1=cis, 2=trans, 0=unclassified.
     //
     // Parameters:
-    //   subsetIdx   — indices into profiles[]
+    //   subsetIdx      — indices into profiles[]
     //   bbCovBegin/End — backbone coverage range (for virtual backbone entry;
     //                    pass 0,0 to disable backbone as evidence)
-    //   result      — output: per-subset-read classification
+    //   excludePos     — backbone positions to skip (already used in prior rounds)
+    //   result         — output: per-subset-read classification
+    //   usedPositions  — output: backbone positions of valid sites used in this split
 
     auto cwPhaseSplit = [&](
         const vector<uint32_t>& subsetIdx,
         uint32_t bbCovBegin, uint32_t bbCovEnd,
-        vector<uint8_t>& result) -> bool
+        const unordered_set<uint32_t>& excludePos,
+        vector<uint8_t>& result,
+        vector<uint32_t>& usedPositions) -> bool
     {
+        usedPositions.clear();
         const uint32_t nReads = uint32_t(subsetIdx.size());
         result.assign(nReads, 0);
         if (nReads < 4) return false;
+
+        // Don't try to split a group that's already at haplotype coverage.
+        if (nReads <= hetCov) return false;
 
         // ── Step 1: Detect het SNPs within the subset ──
         struct SubSnpAccum { uint32_t fwd = 0, rev = 0, total = 0; };
@@ -1079,6 +1090,7 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             const auto& prof = profiles[subsetIdx[ri]];
             for (const auto& v : prof.variants) {
                 if (v.type != KmVarType::Snp) continue;
+                if (excludePos.count(v.bbPos)) continue;
                 uint64_t key = snpKey(v.bbPos, v.altBase);
                 auto& acc = subSnpCounts[key];
                 if (prof.oid.getStrand() == 0) acc.fwd++;
@@ -1364,16 +1376,28 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             }
         }
 
+        uint32_t nSeeded = 0;
+        for (uint32_t r = 0; r < nReads; r++)
+            if (result[r] == 2) nSeeded++;
+
         // De-promote sites where cis reads have alt.
+        uint32_t nDemoted = 0;
         for (uint32_t r = 0; r < nReads; r++) {
             if (result[r] == 2 || ri[r].nObs == 0) continue;
             for (uint32_t vi = 0; vi < nValid; vi++) {
-                if (sites[validSites[vi]].allele[r] == 1)
+                if (sites[validSites[vi]].allele[r] == 1) {
+                    if (siteScore[validSites[vi]] == 1) nDemoted++;
                     siteScore[validSites[vi]] = -1;
+                }
             }
         }
 
+        uint32_t nSitesStillValid = 0;
+        for (uint32_t vi = 0; vi < nValid; vi++)
+            if (siteScore[validSites[vi]] == 1) nSitesStillValid++;
+
         // Propagate.
+        uint32_t nPropagated = 0;
         for (uint32_t ro = 0; ro < nReads; ro++) {
             uint32_t r = readOrder[ro];
             if (result[r] == 2 || ri[r].nObs == 0) continue;
@@ -1381,6 +1405,7 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
                 if (siteScore[validSites[vi]] == 1 &&
                     sites[validSites[vi]].allele[r] == 1) {
                     result[r] = 2;
+                    nPropagated++;
                     break;
                 }
             }
@@ -1396,90 +1421,154 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             if (result[r] == 1) nC++;
             else if (result[r] == 2) nT++;
         }
+
+        cout << "        transClose: seeded=" << nSeeded
+             << " demotedSites=" << nDemoted
+             << " sitesStillValid=" << nSitesStillValid
+             << " propagated=" << nPropagated << endl;
+
+        // Diagnostics.
+        cout << "      cwPhaseSplit: nReads=" << nReads
+             << " hetSites=" << numSites
+             << " validSites=" << nValid
+             << " cc=" << cc
+             << " cis=" << nC << " trans=" << nT << endl;
+        cout << "        validPositions:";
+        for (uint32_t vi = 0; vi < nValid; vi++) {
+            uint32_t si = validSites[vi];
+            cout << " " << subPassing[si].pos
+                 << "(r" << sites[si].nRef << "/a" << sites[si].nAlt << ")";
+        }
+        cout << endl;
+
+        // Reject splits where the smaller group has fewer than 6 reads.
+        if (min(nC, nT) < 6) return false;
+
+        // Report which positions were used for this split.
+        if (nC > 0 && nT > 0) {
+            for (uint32_t vi = 0; vi < nValid; vi++)
+                usedPositions.push_back(subPassing[validSites[vi]].pos);
+        }
+
         return (nC > 0 && nT > 0);
     };
 
 
-    // ── Phase reads ──
+    // ── Phase reads: iterative splitting until convergence ──
+    // Work queue of index sets. Each entry is a (indices, useBb) pair.
+    // The initial round uses backbone evidence; refinement rounds don't.
+    // Cis groups go directly to final clusters. Trans groups go back
+    // into the queue for further splitting. Unclassified reads are
+    // collected separately.
+
     const uint32_t numOv = uint32_t(profiles.size());
 
     if (cleanHetSnps > 0 && numOv >= 2) {
 
-        // Initial round: all reads.
-        vector<uint32_t> allIdx(numOv);
-        iota(allIdx.begin(), allIdx.end(), 0);
-        vector<uint8_t> result;
-        bool didSplit = cwPhaseSplit(allIdx, windowBbBegin, windowBbEnd, result);
+        struct WorkItem {
+            vector<uint32_t> idx;
+            bool useBb;
+            unordered_set<uint32_t> excludePos;
+        };
 
-        // Store per-read haplotype.
+        vector<WorkItem> queue;
+        {
+            vector<uint32_t> allIdx(numOv);
+            iota(allIdx.begin(), allIdx.end(), 0);
+            queue.push_back({std::move(allIdx), true, {}});
+        }
+
+        vector<uint32_t> allUnclassified;
+        constexpr uint32_t maxRounds = 10;
+        uint32_t round = 0;
+
+        while (!queue.empty() && round < maxRounds) {
+            vector<WorkItem> nextQueue;
+
+            for (auto& item : queue) {
+                uint32_t bbBegin = item.useBb ? windowBbBegin : 0;
+                uint32_t bbEnd = item.useBb ? windowBbEnd : 0;
+
+                vector<uint8_t> result;
+                vector<uint32_t> usedPositions;
+                bool didSplit = cwPhaseSplit(item.idx, bbBegin, bbEnd,
+                                            item.excludePos, result, usedPositions);
+
+                if (!didSplit) {
+                    // No split — this group is a final cluster.
+                    vector<OrientedReadId> c;
+                    c.reserve(item.idx.size());
+                    for (uint32_t oi : item.idx) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                    continue;
+                }
+
+                // Collect cis, trans, unclassified.
+                vector<uint32_t> cisIdx, transIdx;
+                for (uint32_t i = 0; i < uint32_t(item.idx.size()); i++) {
+                    if (result[i] == 1) cisIdx.push_back(item.idx[i]);
+                    else if (result[i] == 2) transIdx.push_back(item.idx[i]);
+                    else allUnclassified.push_back(item.idx[i]);
+                }
+
+                cout << "    split (round " << round << "): "
+                     << item.idx.size() << " -> cis=" << cisIdx.size()
+                     << " trans=" << transIdx.size() << endl;
+
+                // Cis → final cluster.
+                {
+                    vector<OrientedReadId> c;
+                    c.reserve(cisIdx.size());
+                    for (uint32_t oi : cisIdx) c.push_back(profiles[oi].oid);
+                    window.readClusters.push_back(std::move(c));
+                }
+
+                // Trans → back into queue (no backbone evidence).
+                // Carry forward excluded positions + positions used in this round.
+                if (!transIdx.empty()) {
+                    unordered_set<uint32_t> nextExclude = item.excludePos;
+                    for (uint32_t p : usedPositions) nextExclude.insert(p);
+                    nextQueue.push_back({std::move(transIdx), false,
+                                         std::move(nextExclude)});
+                }
+            }
+
+            queue = std::move(nextQueue);
+            round++;
+        }
+
+        // Any remaining unsplit groups in the queue → final clusters.
+        for (auto& item : queue) {
+            vector<OrientedReadId> c;
+            c.reserve(item.idx.size());
+            for (uint32_t oi : item.idx) c.push_back(profiles[oi].oid);
+            window.readClusters.push_back(std::move(c));
+        }
+
+        // Unclassified → last cluster.
+        if (!allUnclassified.empty()) {
+            vector<OrientedReadId> c;
+            c.reserve(allUnclassified.size());
+            for (uint32_t oi : allUnclassified) c.push_back(profiles[oi].oid);
+            window.readClusters.push_back(std::move(c));
+        }
+
+        // Store per-read haplotype (cluster index).
         window.readHaplotypes.resize(numOv);
         for (uint32_t oi = 0; oi < numOv; oi++) {
             window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
-            window.readHaplotypes[oi].hap = result[oi];
+            window.readHaplotypes[oi].hap = 0;
         }
-
-        if (didSplit) {
-            // Collect groups.
-            vector<uint32_t> cisIdx, transIdx, uncIdx;
-            for (uint32_t oi = 0; oi < numOv; oi++) {
-                if (result[oi] == 1) cisIdx.push_back(oi);
-                else if (result[oi] == 2) transIdx.push_back(oi);
-                else uncIdx.push_back(oi);
-            }
-
-            uint32_t nCis = uint32_t(cisIdx.size());
-            uint32_t nTrans = uint32_t(transIdx.size());
-            uint32_t nUnc = uint32_t(uncIdx.size());
-            cout << "    phasing: cis=" << nCis << " trans=" << nTrans
-                 << " unclassified=" << nUnc << endl;
-
-            // Cis → cluster 0.
-            {
-                vector<OrientedReadId> c;
-                c.reserve(nCis);
-                for (uint32_t oi : cisIdx) c.push_back(profiles[oi].oid);
-                window.readClusters.push_back(std::move(c));
-            }
-
-            // Refine trans: run DP+TC again on trans reads.
-            // No backbone evidence (pass 0,0) since these reads all
-            // differ from the backbone.
-            vector<uint8_t> transResult;
-            bool transSplit = cwPhaseSplit(transIdx, 0, 0, transResult);
-
-            if (transSplit) {
-                vector<OrientedReadId> tCis, tTrans;
-                for (uint32_t ti = 0; ti < uint32_t(transIdx.size()); ti++) {
-                    if (transResult[ti] == 1)
-                        tCis.push_back(profiles[transIdx[ti]].oid);
-                    else if (transResult[ti] == 2)
-                        tTrans.push_back(profiles[transIdx[ti]].oid);
-                    // unclassified within trans → stays with larger group
+        // Map each read to its cluster index.
+        for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+            for (const auto& oid : window.readClusters[ci]) {
+                for (uint32_t oi = 0; oi < numOv; oi++) {
+                    if (profiles[oi].oid == oid) {
+                        window.readHaplotypes[oi].hap = int(ci);
+                        break;
+                    }
                 }
-                cout << "    refine trans: " << transIdx.size()
-                     << " -> " << tCis.size() << " + " << tTrans.size() << endl;
-                window.readClusters.push_back(std::move(tCis));
-                window.readClusters.push_back(std::move(tTrans));
-            } else {
-                vector<OrientedReadId> c;
-                c.reserve(nTrans);
-                for (uint32_t oi : transIdx) c.push_back(profiles[oi].oid);
-                window.readClusters.push_back(std::move(c));
             }
-
-            // Unclassified → last cluster.
-            if (nUnc > 0) {
-                vector<OrientedReadId> c;
-                c.reserve(nUnc);
-                for (uint32_t oi : uncIdx) c.push_back(profiles[oi].oid);
-                window.readClusters.push_back(std::move(c));
-            }
-        } else {
-            // No split — one cluster.
-            window.readClusters.resize(1);
-            window.readClusters[0].reserve(numOv);
-            for (const auto& prof : profiles)
-                window.readClusters[0].push_back(prof.oid);
         }
 
         cout << "    clusters: " << window.readClusters.size();
