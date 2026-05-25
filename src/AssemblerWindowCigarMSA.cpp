@@ -998,12 +998,16 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     for (size_t i = 0; i < passingSnps.size(); i++) {
         auto& hs = window.hetSnps[i];
         hs.bbPos = passingSnps[i].pos;
+        hs.refBase = bbSeqVec[passingSnps[i].pos];
         hs.altBase = passingSnps[i].altBase;
         hs.altCov = passingSnps[i].altCov;
         hs.refCov = passingSnps[i].refCov;
         hs.spanning = passingSnps[i].spanning;
 
-        const uint64_t sk = snpKey(passingSnps[i].pos, passingSnps[i].altBase);
+        // Backbone is always ref at every position.
+        if (passingSnps[i].pos >= windowBbBegin && passingSnps[i].pos < windowBbEnd)
+            hs.refReads.push_back(bbOid);
+
         for (const auto& prof : profiles) {
             // Skip reads that don't cover this position.
             if (passingSnps[i].pos < prof.bbCovBegin ||

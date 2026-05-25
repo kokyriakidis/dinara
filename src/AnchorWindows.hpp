@@ -48,6 +48,7 @@ struct AnchorWindow {
     // Passing het SNP positions (in oriented backbone coordinates).
     struct HetSnp {
         uint32_t bbPos;       // backbone position
+        uint8_t refBase;      // ref allele (0=A, 1=C, 2=G, 3=T) — backbone base
         uint8_t altBase;      // alt allele (0=A, 1=C, 2=G, 3=T)
         uint32_t altCov;      // alt read count
         uint32_t refCov;      // ref read count
