@@ -1046,15 +1046,13 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
     // 1. Build per-site evidence: which reads are ref/alt at each passing SNP
     // 2. DP chain to select consistent het SNP sites
     // 3. Transitive closure to classify overlaps as cis/trans
-    // 4. Collect read clusters
+    // ── Hifiasm-style DP chaining + transitive closure ──
+    // Port of gen_rphase_dp0_single_path and generate_haplotypes_naive_HiFi.
 
     const uint32_t numOv = uint32_t(profiles.size());
 
-
     // Per-site evidence: for each passing SNP, which reads are ref/alt.
-    // readAllele[siteIdx][profileIdx] = 0 (ref), 1 (alt), -1 (no observation).
     struct SiteEvidence {
-        uint32_t snpIdx;       // index into passingSnps
         vector<int8_t> allele; // per-profile: 0=ref, 1=alt, -1=missing
         uint32_t nRef = 0;
         uint32_t nAlt = 0;
@@ -1070,11 +1068,35 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
 
         const uint32_t numSites = uint32_t(passingSnps.size());
 
+        // Adjacent-site filter (hifiasm: skip sites at distance 1).
+        // A site is dropped if its neighbor is at distance 1 on either side.
+        vector<bool> adjDrop(numSites, false);
+        for (uint32_t si = 0; si < numSites; si++) {
+            if (si > 0 && passingSnps[si].pos == passingSnps[si-1].pos + 1) {
+                adjDrop[si] = true;
+                adjDrop[si-1] = true;
+            }
+            if (si + 1 < numSites && passingSnps[si].pos + 1 == passingSnps[si+1].pos) {
+                adjDrop[si] = true;
+                adjDrop[si+1] = true;
+            }
+        }
+
         // Build per-site evidence.
+        // profiles[] does NOT include the backbone read. We add it as a
+        // virtual entry at index numOv (allele=0 at all covered sites).
+        // This matches hifiasm where the query read is part of the evidence.
+        const uint32_t bbIdx = numOv; // virtual backbone index
+        const uint32_t numEvidence = numOv + 1; // profiles + backbone
+
         vector<SiteEvidence> sites(numSites);
         for (uint32_t si = 0; si < numSites; si++) {
-            sites[si].snpIdx = si;
-            sites[si].allele.assign(numOv, -1);
+            sites[si].allele.assign(numEvidence, -1);
+            // Backbone is ref at all sites it covers.
+            if (passingSnps[si].pos >= windowBbBegin && passingSnps[si].pos < windowBbEnd) {
+                sites[si].allele[bbIdx] = 0;
+                sites[si].nRef++;
+            }
         }
 
         for (uint32_t oi = 0; oi < numOv; oi++) {
@@ -1107,7 +1129,7 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
                         }
                     }
                     if (hasDiffAlt) {
-                        sites[si].allele[oi] = -1; // different alt = no observation
+                        sites[si].allele[oi] = -1; // different alt = ambiguous
                     } else {
                         sites[si].allele[oi] = 0; // ref
                         sites[si].nRef++;
@@ -1116,96 +1138,175 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             }
         }
 
-        // ── DP chaining (hifiasm gen_rphase_dp0_single_path) ──
-        // Score function: two sites are consistent if reads that share
-        // both sites have matching allele patterns (both ref or both alt).
-        // Inconsistent pairs (ref at one, alt at other) get INT64_MIN.
-
-        auto dpScore = [&](uint32_t si, uint32_t sj) -> int64_t {
-            // si < sj (position order).
+        // ── comput_sc_rphase port ──
+        // Two sites are consistent if shared reads agree on allele pattern:
+        // need ≥1 read that is ref at both AND ≥1 read that is alt at both.
+        // Any read that is ambiguous (allele=-1) at either site is skipped.
+        // Any read with fi != fj (ref at one, alt at other) → INT64_MIN.
+        auto computScRphase = [&](uint32_t si, uint32_t sj) -> int64_t {
             if (passingSnps[si].pos == passingSnps[sj].pos) return INT64_MIN;
 
-            int nSame = 0;  // reads with same allele at both sites
-            int nDiff = 0;  // reads with different allele
-            int nShared = 0;
+            int nn0 = 0; // reads that are ref at both sites
+            int nn1 = 0; // reads that are alt at both sites
 
-            for (uint32_t oi = 0; oi < numOv; oi++) {
-                int8_t ai = sites[si].allele[oi];
-                int8_t aj = sites[sj].allele[oi];
-                if (ai < 0 || aj < 0) continue;
-                nShared++;
-                if (ai == aj) nSame++;
-                else nDiff++;
+            for (uint32_t oi = 0; oi < numEvidence; oi++) {
+                int8_t fi = sites[si].allele[oi];
+                int8_t fj = sites[sj].allele[oi];
+                if (fi < 0 || fj < 0) continue; // missing/ambiguous at either
+                if (fi != fj) return INT64_MIN;  // inconsistent
+                if (fi == 0) nn0++;
+                else nn1++;
             }
 
-            if (nShared < 2) return INT64_MIN;
-
-            // Consistent: all shared reads agree (all same or all diff).
-            // "All same" means both sites are on the same haplotype.
-            // "All diff" means they're on opposite haplotypes — still consistent
-            // for phasing (just means one site's alt is on hap1, other on hap2).
-            // Mixed = inconsistent.
-            if (nSame > 0 && nDiff > 0) {
-                // Allow minor disagreement (sequencing errors).
-                int minority = min(nSame, nDiff);
-                if (minority * 5 > nShared) return INT64_MIN; // >20% disagreement
-            }
-
-            return int64_t(nShared);
+            if (nn0 > 0 && nn1 > 0) return 1;
+            return INT64_MIN;
         };
 
-        // DP: find longest chain of consistent sites.
-        vector<int64_t> dpF(numSites, 0);   // best score ending at site i
-        vector<int32_t> dpP(numSites, -1);   // predecessor
-        for (uint32_t i = 0; i < numSites; i++) {
-            dpF[i] = int64_t(sites[i].nAlt + sites[i].nRef); // base score
-            dpP[i] = -1;
-            for (uint32_t j = 0; j < i; j++) {
-                int64_t sc = dpScore(j, i);
+        // ── gen_rphase_dp0_single_path port ──
+        // DP to find best chain of consistent sites.
+        // cc = min ref support threshold.
+        // hifiasm: cc = het_cov * cut_rate (cut_rate=0.7), min cut_bd (=6).
+        // We estimate het_cov from the median spanning coverage of our sites.
+        // For diploid: het_cov ≈ spanning/2. cc = het_cov * 0.7, min 2.
+        vector<uint32_t> spanVals;
+        for (uint32_t si = 0; si < numSites; si++) {
+            spanVals.push_back(passingSnps[si].spanning);
+        }
+        sort(spanVals.begin(), spanVals.end());
+        uint32_t medianSpan = spanVals[spanVals.size() / 2];
+        uint32_t estHetCov = medianSpan / 2;
+        uint32_t cc = uint32_t(estHetCov * 0.7);
+        if (cc < 2) cc = 2;
+
+        // Filter out adjacent-dropped sites for DP.
+        vector<uint32_t> dpSites;
+        for (uint32_t si = 0; si < numSites; si++) {
+            if (!adjDrop[si]) dpSites.push_back(si);
+        }
+        const uint32_t dpN = uint32_t(dpSites.size());
+
+        vector<int32_t> dpF(dpN, 1);   // best score ending here
+        vector<int32_t> dpP(dpN, -1);  // predecessor index in dpSites
+        vector<bool> dpUsed(dpN, false);
+
+        for (uint32_t i = 0; i < dpN; i++) {
+            int32_t maxF = 1;
+            int32_t maxJ = -1;
+            for (int32_t j = int32_t(i) - 1; j >= 0; j--) {
+                int64_t sc = computScRphase(dpSites[i], dpSites[j]);
                 if (sc == INT64_MIN) continue;
-                int64_t candidate = dpF[j] + sc + int64_t(sites[i].nAlt + sites[i].nRef);
-                if (candidate > dpF[i]) {
-                    dpF[i] = candidate;
-                    dpP[i] = int32_t(j);
+                int32_t candidate = dpF[j] + int32_t(sc);
+                if (candidate > maxF) {
+                    maxF = candidate;
+                    maxJ = j;
+                }
+            }
+            dpF[i] = maxF;
+            dpP[i] = maxJ;
+        }
+
+        // Extract disjoint paths by greedy traceback from highest scores.
+        // Sort indices by score descending.
+        vector<uint32_t> dpOrder(dpN);
+        iota(dpOrder.begin(), dpOrder.end(), 0);
+        sort(dpOrder.begin(), dpOrder.end(),
+            [&](uint32_t a, uint32_t b) { return dpF[a] > dpF[b]; });
+
+        // Greedy path extraction (hifiasm: extract non-overlapping chains).
+        struct DpPath {
+            vector<uint32_t> siteIndices; // indices into dpSites
+        };
+        vector<DpPath> paths;
+
+        for (uint32_t idx = 0; idx < dpN; idx++) {
+            uint32_t start = dpOrder[idx];
+            if (dpUsed[start]) continue;
+
+            DpPath path;
+            for (int32_t k = int32_t(start); k >= 0 && !dpUsed[k]; ) {
+                path.siteIndices.push_back(k);
+                dpUsed[k] = true;
+                k = dpP[k];
+            }
+            if (path.siteIndices.empty()) continue;
+
+            // Reverse so sites are in position order.
+            reverse(path.siteIndices.begin(), path.siteIndices.end());
+            paths.push_back(std::move(path));
+        }
+
+        // Score each path's sites (hifiasm logic):
+        // - Chains with length > 1: mark score=1 if occ_0 >= cc, else score=-1
+        // - Singletons: mark score=1 only if occ_0 >= cc (and not homopolymer,
+        //   already filtered earlier)
+        // - Dense clusters (all sites within distance 8): treat as singleton
+        //   with stricter filtering.
+        vector<int8_t> siteScore(numSites, -1); // -1 = rejected, 1 = validated
+
+        for (const auto& path : paths) {
+            const uint32_t pathLen = uint32_t(path.siteIndices.size());
+
+            // Check if all sites in path are within distance 8 of each other
+            // (hifiasm: adjacent sites within distance 8 → stricter filtering).
+            bool isDense = true;
+            if (pathLen > 1) {
+                for (uint32_t pi = 1; pi < pathLen; pi++) {
+                    uint32_t si0 = dpSites[path.siteIndices[pi-1]];
+                    uint32_t si1 = dpSites[path.siteIndices[pi]];
+                    if (passingSnps[si1].pos - passingSnps[si0].pos > 8) {
+                        isDense = false;
+                        break;
+                    }
+                }
+            }
+
+            int8_t plus;
+            if (pathLen > 1 && !isDense) {
+                plus = 1; // multi-site chain, not dense → validated
+            } else {
+                plus = -1; // singleton or dense cluster → needs extra check
+            }
+
+            for (uint32_t pi = 0; pi < pathLen; pi++) {
+                uint32_t si = dpSites[path.siteIndices[pi]];
+                if (sites[si].nRef >= cc) {
+                    siteScore[si] = plus;
+                } else {
+                    siteScore[si] = -1;
+                }
+            }
+
+            // Dense cluster: if any site in a run of consecutive positions
+            // is rejected, reject the whole run (hifiasm behavior).
+            if (isDense && pathLen > 1) {
+                bool anyBad = false;
+                for (uint32_t pi = 0; pi < pathLen; pi++) {
+                    uint32_t si = dpSites[path.siteIndices[pi]];
+                    if (siteScore[si] == -1) { anyBad = true; break; }
+                }
+                if (anyBad) {
+                    for (uint32_t pi = 0; pi < pathLen; pi++) {
+                        siteScore[dpSites[path.siteIndices[pi]]] = -1;
+                    }
                 }
             }
         }
 
-        // Traceback: extract best chain.
-        int64_t bestScore = INT64_MIN;
-        int32_t bestEnd = -1;
-        for (uint32_t i = 0; i < numSites; i++) {
-            if (dpF[i] > bestScore) {
-                bestScore = dpF[i];
-                bestEnd = int32_t(i);
-            }
-        }
-
-        vector<bool> inChain(numSites, false);
-        uint32_t chainLen = 0;
-        for (int32_t i = bestEnd; i >= 0; i = dpP[i]) {
-            inChain[i] = true;
-            chainLen++;
-        }
-
-        cout << "    DP chain: " << chainLen << " / " << numSites
-             << " sites selected (score=" << bestScore << ")" << endl;
-
-
-        // ── Transitive closure (hifiasm generate_haplotypes_naive_HiFi) ──
-        // For each read, count alt alleles at chain sites. Reads with the
-        // most alt alleles are seeded as trans. Then propagate: any site
-        // where a trans read has alt gets "promoted", and any other read
-        // with alt at a promoted site also becomes trans.
-
-        // Collect chain sites.
-        vector<uint32_t> chainSites;
+        // Collect validated sites.
+        vector<uint32_t> validSites;
         for (uint32_t si = 0; si < numSites; si++) {
-            if (inChain[si]) chainSites.push_back(si);
+            if (siteScore[si] == 1) validSites.push_back(si);
         }
 
-        if (chainSites.empty()) {
-            // No consistent chain — all reads in one cluster.
+        cout << "    DP chain: " << validSites.size() << " / " << numSites
+             << " sites validated (" << paths.size() << " paths, "
+             << dpN << " after adj filter)" << endl;
+
+        // ── generate_haplotypes_naive_HiFi port ──
+        // Transitive closure to classify reads as cis/trans.
+
+        if (validSites.empty()) {
+            // No validated sites — all reads in one cluster.
             window.readClusters.resize(1);
             window.readClusters[0].reserve(numOv);
             for (const auto& prof : profiles) {
@@ -1214,82 +1315,130 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             return cleanHetSnps;
         }
 
-        const uint32_t nChain = uint32_t(chainSites.size());
+        const uint32_t nValid = uint32_t(validSites.size());
 
-        // Per-read: count alt alleles at chain sites, and total observed.
-        struct ReadInfo {
-            uint32_t nAlt = 0;
-            uint32_t nObs = 0;
-            int isMatch = 0; // 0=unset, 1=cis, 2=trans
+        // Step 1: Per-read, count alt alleles at validated sites.
+        // Build (overlapIdx, altCount) sorted by altCount descending.
+        // This corresponds to hifiasm's snp_srt: sort overlaps by how many
+        // alt alleles they carry at validated sites (most informative first).
+        struct ReadAltInfo {
+            uint32_t oi;
+            uint32_t nAlt = 0;   // alt alleles at validated sites
+            uint32_t nObs = 0;   // total observations at validated sites
         };
-        vector<ReadInfo> readInfo(numOv);
-
+        vector<ReadAltInfo> readAlts(numOv);
         for (uint32_t oi = 0; oi < numOv; oi++) {
-            for (uint32_t ci = 0; ci < nChain; ci++) {
-                int8_t a = sites[chainSites[ci]].allele[oi];
+            readAlts[oi].oi = oi;
+            for (uint32_t vi = 0; vi < nValid; vi++) {
+                int8_t a = sites[validSites[vi]].allele[oi];
                 if (a < 0) continue;
-                readInfo[oi].nObs++;
-                if (a == 1) readInfo[oi].nAlt++;
+                readAlts[oi].nObs++;
+                if (a == 1) readAlts[oi].nAlt++;
             }
         }
 
-        // Sort reads by informativeness (most alt alleles first).
+        // Sort by nAlt descending (most informative first).
+        // hifiasm: radix_sort_bc64 on ((uint32_t)-1 - o) << 32 | l
         vector<uint32_t> readOrder(numOv);
         iota(readOrder.begin(), readOrder.end(), 0);
         sort(readOrder.begin(), readOrder.end(),
             [&](uint32_t a, uint32_t b) {
-                return readInfo[a].nAlt > readInfo[b].nAlt;
+                return readAlts[a].nAlt > readAlts[b].nAlt;
             });
 
-        // Per-site: promoted flag. A site is promoted when a trans read
-        // carries alt at that site.
-        vector<bool> promoted(nChain, false);
+        // Per-read: is_match. 0=unset, 1=cis, 2=trans.
+        vector<uint8_t> isMatch(numOv, 0);
 
-        // Seed: mark reads with the most alt alleles as trans.
-        // A read is seeded as trans if it has alt at ≥50% of observed chain sites.
-        for (uint32_t oi : readOrder) {
-            if (readInfo[oi].nObs == 0) continue;
-            if (readInfo[oi].isMatch != 0) continue;
+        // Per-site: score tracking for "not real allele" adjustment.
+        // We make a mutable copy of nRef for decrementing.
+        vector<uint32_t> siteRefCov(nValid);
+        for (uint32_t vi = 0; vi < nValid; vi++) {
+            siteRefCov[vi] = sites[validSites[vi]].nRef;
+        }
 
-            double altFrac = double(readInfo[oi].nAlt) / double(readInfo[oi].nObs);
-            if (altFrac >= 0.5 && readInfo[oi].nAlt >= 2) {
-                readInfo[oi].isMatch = 2; // trans
-                // Promote sites where this read has alt.
-                for (uint32_t ci = 0; ci < nChain; ci++) {
-                    if (sites[chainSites[ci]].allele[oi] == 1) {
-                        promoted[ci] = true;
-                    }
+        // Step 2: First pass — seed trans from most-informative overlaps.
+        // hifiasm: for each overlap sorted by alt count, if it has alt alleles
+        // at validated sites with sufficient support, mark as trans.
+        // Then promote those sites (score=1) and decrement ref support
+        // ("not real allele" adjustment).
+        for (uint32_t ri = 0; ri < numOv; ri++) {
+            uint32_t oi = readOrder[ri];
+            if (readAlts[oi].nAlt == 0) break; // sorted desc, no more alts
+            if (readAlts[oi].nObs == 0) continue;
+
+            // Count alt alleles at validated sites with sufficient support.
+            // hifiasm: occ_0 >= s_hap_cov && occ_1 >= infor_cov
+            // We use nRef >= 2 && nAlt >= 2 (already filtered in passingSnps).
+            uint32_t qualifiedAlts = 0;
+            for (uint32_t vi = 0; vi < nValid; vi++) {
+                uint32_t si = validSites[vi];
+                if (sites[si].allele[oi] != 1) continue;
+                if (siteRefCov[vi] >= 2 && sites[si].nAlt >= 2) {
+                    qualifiedAlts++;
+                }
+            }
+            if (qualifiedAlts == 0) continue;
+
+            // Mark as trans.
+            isMatch[oi] = 2;
+
+            // Promote sites and apply "not real allele" adjustment.
+            // hifiasm: for alt sites, set score=1 (promote).
+            // For ref sites of this overlap, decrement occ_0 (ref support).
+            for (uint32_t vi = 0; vi < nValid; vi++) {
+                uint32_t si = validSites[vi];
+                int8_t a = sites[si].allele[oi];
+                if (a == 1) {
+                    siteScore[si] = 1; // promote (already 1, but explicit)
+                } else if (a == 0) {
+                    // "Not real allele" adjustment: this read is ref at this
+                    // site but trans overall, so its ref support is not real.
+                    if (siteRefCov[vi] > 1) siteRefCov[vi]--;
                 }
             }
         }
 
-        // Propagate: any unset read with alt at a promoted site → trans.
-        for (uint32_t oi : readOrder) {
-            if (readInfo[oi].isMatch != 0) continue;
-            if (readInfo[oi].nObs == 0) continue;
+        // Step 3: Second pass — propagate.
+        // hifiasm: for each overlap sorted by alt count, if still cis (is_match==1)
+        // but has alt at a promoted site → mark as trans.
+        for (uint32_t ri = 0; ri < numOv; ri++) {
+            uint32_t oi = readOrder[ri];
+            if (isMatch[oi] == 2) continue; // already trans
+            if (readAlts[oi].nObs == 0) continue;
 
-            bool hitsPromoted = false;
-            for (uint32_t ci = 0; ci < nChain; ci++) {
-                if (promoted[ci] && sites[chainSites[ci]].allele[oi] == 1) {
-                    hitsPromoted = true;
+            uint32_t promotedAlts = 0;
+            for (uint32_t vi = 0; vi < nValid; vi++) {
+                uint32_t si = validSites[vi];
+                if (sites[si].allele[oi] == 1 && siteScore[si] == 1) {
+                    promotedAlts++;
+                }
+            }
+            if (promotedAlts > 0) {
+                isMatch[oi] = 2;
+            }
+        }
+
+        // Step 4: Reset score for sites where all remaining cis overlaps
+        // have ref (hifiasm: if overlap is cis, its alt sites get score=-1).
+        // This prevents false promotions from propagating further.
+        for (uint32_t vi = 0; vi < nValid; vi++) {
+            uint32_t si = validSites[vi];
+            bool anyCisAlt = false;
+            for (uint32_t oi = 0; oi < numOv; oi++) {
+                if (isMatch[oi] != 2 && sites[si].allele[oi] == 1) {
+                    anyCisAlt = true;
                     break;
                 }
             }
-            if (hitsPromoted) {
-                readInfo[oi].isMatch = 2; // trans
-                // Promote additional sites.
-                for (uint32_t ci = 0; ci < nChain; ci++) {
-                    if (sites[chainSites[ci]].allele[oi] == 1) {
-                        promoted[ci] = true;
-                    }
-                }
+            if (!anyCisAlt) {
+                siteScore[si] = -1;
             }
         }
 
-        // Remaining unset reads with observations → cis.
+        // Remaining reads with observations → cis.
         for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (readInfo[oi].isMatch == 0 && readInfo[oi].nObs > 0) {
-                readInfo[oi].isMatch = 1; // cis
+            if (isMatch[oi] == 0 && readAlts[oi].nObs > 0) {
+                isMatch[oi] = 1;
             }
         }
 
@@ -1298,9 +1447,9 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         uint32_t nCis = 0, nTrans = 0, nUnset = 0;
         for (uint32_t oi = 0; oi < numOv; oi++) {
             window.readHaplotypes[oi].orientedReadId = profiles[oi].oid;
-            window.readHaplotypes[oi].hap = readInfo[oi].isMatch;
-            if (readInfo[oi].isMatch == 1) nCis++;
-            else if (readInfo[oi].isMatch == 2) nTrans++;
+            window.readHaplotypes[oi].hap = isMatch[oi];
+            if (isMatch[oi] == 1) nCis++;
+            else if (isMatch[oi] == 2) nTrans++;
             else nUnset++;
         }
         cout << "    transitive closure: cis=" << nCis << " trans=" << nTrans
@@ -1309,15 +1458,14 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
         // Build clusters: cis, trans, unclassified.
         vector<OrientedReadId> cisCluster, transCluster, uncCluster;
         for (uint32_t oi = 0; oi < numOv; oi++) {
-            if (readInfo[oi].isMatch == 1)
+            if (isMatch[oi] == 1)
                 cisCluster.push_back(profiles[oi].oid);
-            else if (readInfo[oi].isMatch == 2)
+            else if (isMatch[oi] == 2)
                 transCluster.push_back(profiles[oi].oid);
             else
                 uncCluster.push_back(profiles[oi].oid);
         }
 
-        // Cluster 0 = cis (backbone side), cluster 1 = trans.
         if (!cisCluster.empty())
             window.readClusters.push_back(std::move(cisCluster));
         if (!transCluster.empty())
