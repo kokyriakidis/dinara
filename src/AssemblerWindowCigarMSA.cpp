@@ -962,41 +962,12 @@ uint32_t Assembler::cigarDetectSnpsInWindow(
             const double af = double(acc.total) / double(effSpanning);
             if (af < opts.minAf || af > opts.maxAf) { failAf++; continue; }
 
-            // Strand bias: 2x2 Fisher exact test comparing alt vs ref
-            // strand distributions. This catches systematic alignment
-            // artifacts where all alt reads come from one strand.
-            {
-                // Count ref reads by strand at this position.
-                uint32_t refFwd = 0, refRev = 0;
-                for (const auto& prof : profiles) {
-                    if (pos < prof.bbCovBegin || pos >= prof.bbCovEnd) continue;
-                    if (prof.isDeleted(pos)) continue;
-                    // Check if this read has the specific alt allele.
-                    bool hasThisAlt = false;
-                    for (const auto& v : prof.variants) {
-                        if (v.type == KmVarType::Snp && v.bbPos == pos
-                            && v.altBase == alt) {
-                            hasThisAlt = true;
-                            break;
-                        }
-                    }
-                    if (!hasThisAlt) {
-                        if (prof.oid.getStrand() == 0) refFwd++;
-                        else refRev++;
-                    }
-                }
-                // Add backbone (always ref, strand from bbOid).
-                if (pos >= windowBbBegin && pos < windowBbEnd) {
-                    if (bbOid.getStrand() == 0) refFwd++;
-                    else refRev++;
-                }
-                // Fisher exact on [[alt_fwd, alt_rev], [ref_fwd, ref_rev]].
-                const int totalCells = int(acc.fwd) + int(acc.rev) + int(refFwd) + int(refRev);
-                if (totalCells > 0) {
-                    const double p = kmFisherExactTwoTail(
-                        int(acc.fwd), int(acc.rev), int(refFwd), int(refRev));
-                    if (p < opts.strandBiasPval) { failStrandBias++; continue; }
-                }
+            // Strand bias.
+            const int expected = int(acc.total) / 2;
+            if (expected > 0) {
+                const double p = kmFisherExactTwoTail(
+                    int(acc.fwd), int(acc.rev), expected, expected);
+                if (p < opts.strandBiasPval) { failStrandBias++; continue; }
             }
 
             // Homopolymer / repeat context.
