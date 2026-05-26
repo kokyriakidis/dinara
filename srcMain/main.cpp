@@ -1050,7 +1050,12 @@ void dinara::main::assemble(
     // Same-strand and opposite-strand overlaps are deduped independently,
     // matching hifiasm's separate paf/reverse_paf storage.
     // Runs after phasing so that only cis and unclassified overlaps compete.
-    assembler.dedupChainsPrePhasing(threadCount);
+    // assembler.dedupChainsPrePhasing(threadCount);
+
+    // Remove all chains for read pairs that have multiple chains on the
+    // same strand. Such multi-chain pairs are likely repeat-induced and
+    // can corrupt the marker graph during transitive collapse.
+    assembler.removeMultiChainAlignments(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);
 
