@@ -69,7 +69,7 @@ Shasta2AnchorPair::Shasta2AnchorPair(
 
 
 
-// Get positions in journey, ordinals, and base positions
+// Get positions in journey and base positions
 // for each of the two reads and for each of the two anchors.
 // The positions returned are the midpoint of the markers
 // corresponding to anchorIdA and anchorIdB.
@@ -124,8 +124,8 @@ void Shasta2AnchorPair::get(
             const uint32_t positionB = orientedReadMarkers[ordinalB].position + kHalf;
 
             positions.push_back(make_pair(
-                Positions(positionInJourneyA, ordinalA, positionA),
-                Positions(positionInJourneyB, ordinalB, positionB)
+                Positions(positionInJourneyA, positionA),
+                Positions(positionInJourneyB, positionB)
                 ));
         }
 
