@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 
@@ -520,6 +521,162 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
         }
         ++exportedCount;
     }
+
+    return exportedCount;
+}
+
+
+// Write external anchors and return a mapping from dinara anchor ID
+// to shasta2 anchor ID.
+uint64_t Shasta2Anchors::writeExternalAnchors(
+    const string& name,
+    vector<Shasta2AnchorId>& dinaraToShasta2AnchorIdMap,
+    bool canonicalOnly) const
+{
+    const uint64_t anchorCount = size();
+
+    // Initialize the mapping with invalid values.
+    dinaraToShasta2AnchorIdMap.assign(anchorCount, invalid<Shasta2AnchorId>);
+
+    // Build lookup maps to find RC partners.
+    // Use vertex ID map when anchorVertexIds is available (matches canonical check),
+    // otherwise fall back to k-mer map.
+    std::unordered_map<uint64_t, Shasta2AnchorId> kmerToAnchorId;
+    std::unordered_map<MarkerGraphVertexId, Shasta2AnchorId> vertexToAnchorId;
+    const bool useVertexIds = !anchorVertexIds.empty() && markerGraph.reverseComplementVertex.isOpen;
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; ++anchorId) {
+        const Shasta2Anchor anchor = (*this)[anchorId];
+        if(anchor.empty()) continue;
+        if(useVertexIds) {
+            vertexToAnchorId[anchorVertexIds[anchorId]] = anchorId;
+        } else {
+            const Kmer kmerValue = anchorKmer(anchorId);
+            kmerToAnchorId[kmerValue.id(k)] = anchorId;
+        }
+    }
+
+    // Write external anchors using the same logic as the original method,
+    // but also record the mapping.
+    MemoryMapped::VectorOfVectors<ExternalAnchorOrientedRead, uint64_t> data;
+    MemoryMapped::VectorOfVectors<char, uint64_t> names;
+    data.createNew(name, 4096);
+    names.createNew(name + "-Names", 4096);
+
+    uint64_t exportedCount = 0;
+
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; ++anchorId) {
+        const Shasta2Anchor anchor = (*this)[anchorId];
+        if(anchor.empty()) continue;
+
+        if(canonicalOnly) {
+            bool skip = false;
+            if(!anchorVertexIds.empty() && markerGraph.reverseComplementVertex.isOpen) {
+                const MarkerGraphVertexId vertexId = anchorVertexIds[anchorId];
+                const MarkerGraphVertexId vertexIdRc = markerGraph.reverseComplementVertex[vertexId];
+                skip = vertexIdRc < vertexId;
+            } else {
+                const Kmer kmerValue = anchorKmer(anchorId);
+                const Kmer kmerRc = kmerValue.reverseComplement(k);
+                skip = kmerRc.id(k) < kmerValue.id(k);
+            }
+            if(skip) continue;
+        }
+
+        const Kmer expectedKmer = getKmer(anchor.front().orientedReadId, anchor.front().ordinal);
+        vector<ReadId> readIds;
+        readIds.reserve(anchor.size());
+        for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const Kmer kmerValue = getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+            if(kmerValue != expectedKmer) {
+                throw runtime_error(
+                    "Shasta2 external-anchor export failed: anchor " +
+                    shasta2AnchorIdToString(anchorId) +
+                    " contains inconsistent marker k-mers.");
+            }
+            const ReadId readId = markerInfo.orientedReadId.getReadId();
+            if(std::find(readIds.begin(), readIds.end(), readId) != readIds.end()) {
+                throw runtime_error(
+                    "Shasta2 external-anchor export failed: anchor " +
+                    shasta2AnchorIdToString(anchorId) +
+                    " contains the same ReadId on both strands.");
+            }
+            readIds.push_back(readId);
+        }
+
+        const string anchorName = "anchor-" + shasta2AnchorIdToString(anchorId);
+        data.appendVector();
+        names.appendVector(anchorName.begin(), anchorName.end());
+        for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const uint32_t position = markers[markerInfo.orientedReadId.getValue()][markerInfo.ordinal].position;
+            data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, position));
+        }
+
+        // Record the mapping: canonical anchor -> shasta2 2*i
+        const Shasta2AnchorId shasta2Forward = Shasta2AnchorId(2 * exportedCount);
+        const Shasta2AnchorId shasta2Rc = Shasta2AnchorId(2 * exportedCount + 1);
+        dinaraToShasta2AnchorIdMap[anchorId] = shasta2Forward;
+
+        // Find the RC partner and map it to 2*i+1.
+        // Use the same RC detection method as the canonical check.
+        if(useVertexIds) {
+            const MarkerGraphVertexId vertexId = anchorVertexIds[anchorId];
+            const MarkerGraphVertexId vertexIdRc = markerGraph.reverseComplementVertex[vertexId];
+            auto it = vertexToAnchorId.find(vertexIdRc);
+            if(it != vertexToAnchorId.end() && it->second != anchorId) {
+                dinaraToShasta2AnchorIdMap[it->second] = shasta2Rc;
+            }
+        } else {
+            const Kmer kmerValue = anchorKmer(anchorId);
+            const Kmer kmerRc = kmerValue.reverseComplement(k);
+            auto it = kmerToAnchorId.find(kmerRc.id(k));
+            if(it != kmerToAnchorId.end() && it->second != anchorId) {
+                dinaraToShasta2AnchorIdMap[it->second] = shasta2Rc;
+            }
+        }
+
+        ++exportedCount;
+    }
+
+    // Second pass: map any remaining unmapped non-empty anchors.
+    // For each unmapped anchor, find its RC partner. If the RC partner
+    // is mapped to shasta2 ID 2*i, map this anchor to 2*i+1, and vice versa.
+    uint64_t secondPassMapped = 0;
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; ++anchorId) {
+        if(dinaraToShasta2AnchorIdMap[anchorId] != invalid<Shasta2AnchorId>) continue;
+        if((*this)[anchorId].empty()) continue;
+
+        const Kmer kmerValue = anchorKmer(anchorId);
+        const Kmer kmerRc = kmerValue.reverseComplement(k);
+        auto it = kmerToAnchorId.find(kmerRc.id(k));
+        if(it == kmerToAnchorId.end() || it->second == anchorId) continue;
+
+        const Shasta2AnchorId rcAnchorId = it->second;
+        const Shasta2AnchorId rcShasta2Id = dinaraToShasta2AnchorIdMap[uint64_t(rcAnchorId)];
+        if(rcShasta2Id == invalid<Shasta2AnchorId>) continue;
+
+        // RC partner is mapped to 2*i → this anchor gets 2*i+1, or vice versa.
+        if(rcShasta2Id % 2 == 0) {
+            dinaraToShasta2AnchorIdMap[anchorId] = Shasta2AnchorId(rcShasta2Id + 1);
+        } else {
+            dinaraToShasta2AnchorIdMap[anchorId] = Shasta2AnchorId(rcShasta2Id - 1);
+        }
+        ++secondPassMapped;
+    }
+
+    // Diagnostic: count mapped vs unmapped anchors.
+    uint64_t mappedCount = 0;
+    uint64_t unmappedNonEmpty = 0;
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; ++anchorId) {
+        if(dinaraToShasta2AnchorIdMap[anchorId] != invalid<Shasta2AnchorId>) {
+            ++mappedCount;
+        } else if(!(*this)[anchorId].empty()) {
+            ++unmappedNonEmpty;
+        }
+    }
+    cout << "Anchor ID mapping: " << mappedCount << " mapped"
+         << " (" << secondPassMapped << " in second pass), "
+         << unmappedNonEmpty << " unmapped non-empty out of "
+         << anchorCount << " total." << endl;
 
     return exportedCount;
 }

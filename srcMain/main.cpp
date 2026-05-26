@@ -1233,8 +1233,10 @@ void dinara::main::assemble(
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
+    vector<Shasta2AnchorId> dinaraToShasta2AnchorIdMap;
     const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+        shasta2Anchors->writeExternalAnchors(
+            externalAnchorsName, dinaraToShasta2AnchorIdMap);
     cout << timestamp << "Wrote " << exportedExternalAnchorCount
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
@@ -1700,6 +1702,21 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
     // shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.graph");
+
+    // Save a remapped copy for shasta2 consumption.
+    // Shasta2 uses 2*i / 2*i+1 anchor IDs from readExternalAnchors.
+    {
+        const uint64_t shasta2AnchorCount = 2 * exportedExternalAnchorCount;
+        cout << timestamp << "Remapping anchor graph for shasta2 ("
+             << shasta2AnchorCount << " anchors)..." << endl;
+        Shasta2AnchorGraph remapped;
+        shasta2AnchorGraph->remapForShasta2(
+            dinaraToShasta2AnchorIdMap, shasta2AnchorCount, remapped);
+        remapped.largeDataFileNamePrefix = shasta2AnchorGraph->largeDataFileNamePrefix;
+        remapped.largeDataPageSize = shasta2AnchorGraph->largeDataPageSize;
+        remapped.saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
+        cout << timestamp << "Saved remapped anchor graph as Shasta2-Shasta2AnchorGraph." << endl;
+    }
 
     // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
     cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
@@ -2733,8 +2750,10 @@ void dinara::main::assemble(
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
+    vector<Shasta2AnchorId> dinaraToShasta2AnchorIdMap;
     const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+        shasta2Anchors->writeExternalAnchors(
+            externalAnchorsName, dinaraToShasta2AnchorIdMap);
     cout << timestamp << "Wrote " << exportedExternalAnchorCount
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
@@ -2828,6 +2847,20 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
     // shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.graph");
+
+    // Save a remapped copy for shasta2 consumption.
+    {
+        const uint64_t shasta2AnchorCount = 2 * exportedExternalAnchorCount;
+        cout << timestamp << "Remapping anchor graph for shasta2 ("
+             << shasta2AnchorCount << " anchors)..." << endl;
+        Shasta2AnchorGraph remapped;
+        shasta2AnchorGraph->remapForShasta2(
+            dinaraToShasta2AnchorIdMap, shasta2AnchorCount, remapped);
+        remapped.largeDataFileNamePrefix = shasta2AnchorGraph->largeDataFileNamePrefix;
+        remapped.largeDataPageSize = shasta2AnchorGraph->largeDataPageSize;
+        remapped.saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
+        cout << timestamp << "Saved remapped anchor graph as Shasta2-Shasta2AnchorGraph." << endl;
+    }
 
     // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
     cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
