@@ -3,6 +3,7 @@
 // Shasta2AnchorGraph.hpp
 
 #include "AnchorWindows.hpp"
+#include "Reads.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
@@ -84,7 +85,8 @@ public:
         const Shasta2Journeys&,
         const vector<AnchorWindow>& anchorWindows,
         uint64_t minInterWindowCoverage,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        const Reads* reads = nullptr);
 
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}

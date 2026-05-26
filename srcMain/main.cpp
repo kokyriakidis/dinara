@@ -1251,6 +1251,10 @@ void dinara::main::assemble(
     // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
     // assembler.phaseOverlapsMSA(threadCount);
 
+    // Flag contained reads so they can be excluded from inter-window edge discovery.
+    cout << timestamp << "Flagging contained reads..." << endl;
+    assembler.flagContainedReads(1000, 0.8, 0, threadCount);
+
     // Compute anchor windows and run CIGAR-based SNP detection.
     cout << timestamp << "Computing anchor windows..." << endl;
     vector<AnchorWindow> anchorWindows;
@@ -1648,7 +1652,8 @@ void dinara::main::assemble(
         *shasta2Journeys,
         anchorWindows,
         minInterWindowCoverage,
-        threadCount);
+        threadCount,
+        &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
     // Save the pre-transitive-reduction Shasta2 anchor graph.

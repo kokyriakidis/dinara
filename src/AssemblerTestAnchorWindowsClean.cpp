@@ -125,6 +125,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
         if(oid.getValue() >= shasta2Journeys->size()) continue;
+
         const auto journey = (*shasta2Journeys)[oid];
         if(journey.empty()) continue;
 
@@ -407,6 +408,7 @@ void Assembler::writeAnchorWindowsCleanGfa(
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
         if(oid.getValue() >= shasta2Journeys->size()) continue;
+
         const auto journey = (*shasta2Journeys)[oid];
         if(journey.empty()) continue;
 
