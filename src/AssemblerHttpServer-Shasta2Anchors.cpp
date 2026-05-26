@@ -293,9 +293,7 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
         const auto journey = journeys[orientedReadId];
 
         const uint32_t ordinal = markerInfo.ordinal;
-
-        const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
-        const uint32_t position = orientedReadMarkers[ordinal].position;
+        const uint32_t position = markerInfo.position - uint32_t(anchors.k / 2);
 
         Shasta2AnchorId previousAnchorInJourney = invalid<Shasta2AnchorId>;
         if(markerInfo.positionInJourney > 0) {
@@ -613,9 +611,7 @@ void Assembler::exploreShasta2Journey(const vector<string>& request, ostream& ht
         const string anchorIdString = shasta2AnchorIdToString(anchorId);
 
         const uint64_t ordinal = anchors.getOrdinal(anchorId, orientedReadId);
-
-        const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
-        const uint32_t position = orientedReadMarkers[ordinal].position;
+        const uint32_t position = anchors.getPosition(anchorId, orientedReadId) - uint32_t(anchors.k / 2);
         const Shasta2AnchorId previousAnchorId =
             (positionInJourney > 0) ? journey[positionInJourney - 1] : invalid<Shasta2AnchorId>;
         const Shasta2AnchorId nextAnchorId =

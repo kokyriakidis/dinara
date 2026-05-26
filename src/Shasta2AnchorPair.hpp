@@ -104,8 +104,8 @@ public:
         vector< pair<Positions, Positions> >& positions,
         vector< vector<Base> >&) const;
 
-    // Just return the ordinals.
-    void getOrdinals(const Shasta2Anchors&, vector< pair<uint32_t, uint32_t> >&) const;
+    // Just return the anchor positions (midpoints).
+    void getAnchorPositions(const Shasta2Anchors&, vector< pair<uint32_t, uint32_t> >&) const;
 
     // Just return the positions in journeys.
     void getPositionsInJourneys(const Shasta2Anchors&, vector< pair<uint32_t, uint32_t> >&) const;
