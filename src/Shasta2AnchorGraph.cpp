@@ -726,56 +726,5 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
 }
 
 
-// Create a remapped copy of this graph using shasta2's anchor ID scheme.
-void Shasta2AnchorGraph::remapForShasta2(
-    const vector<Shasta2AnchorId>& dinaraToShasta2,
-    uint64_t shasta2AnchorCount,
-    Shasta2AnchorGraph& remapped) const
-{
-    // Create vertices in the remapped graph (one per shasta2 anchor).
-    for(uint64_t i = 0; i < shasta2AnchorCount; i++) {
-        add_vertex(remapped);
-    }
-
-    // Copy edges with remapped anchor IDs.
-    uint64_t skippedEdgeCount = 0;
-    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
-        const Shasta2AnchorId dinaraA = source(e, *this);
-        const Shasta2AnchorId dinaraB = target(e, *this);
-
-        if(uint64_t(dinaraA) >= dinaraToShasta2.size() ||
-           uint64_t(dinaraB) >= dinaraToShasta2.size()) {
-            ++skippedEdgeCount;
-            continue;
-        }
-        const Shasta2AnchorId shasta2A = dinaraToShasta2[uint64_t(dinaraA)];
-        const Shasta2AnchorId shasta2B = dinaraToShasta2[uint64_t(dinaraB)];
-        if(shasta2A == invalid<Shasta2AnchorId> ||
-           shasta2B == invalid<Shasta2AnchorId>) {
-            ++skippedEdgeCount;
-            continue;
-        }
-
-        const Shasta2AnchorGraphEdge& edgeData = (*this)[e];
-        Shasta2AnchorPair remappedPair = edgeData.anchorPair;
-        remappedPair.anchorIdA = shasta2A;
-        remappedPair.anchorIdB = shasta2B;
-
-        edge_descriptor eNew;
-        tie(eNew, ignore) = add_edge(
-            shasta2A, shasta2B,
-            Shasta2AnchorGraphEdge(remappedPair, edgeData.offset, remapped.nextEdgeId++),
-            remapped);
-        remapped[eNew].useForAssembly = edgeData.useForAssembly;
-    }
-
-    cout << "Remapped anchor graph for shasta2: "
-         << shasta2AnchorCount << " vertices, "
-         << num_edges(remapped) << " edges";
-    if(skippedEdgeCount > 0) {
-        cout << " (" << skippedEdgeCount << " edges skipped due to unmapped anchors)";
-    }
-    cout << "." << endl;
-}
 
 

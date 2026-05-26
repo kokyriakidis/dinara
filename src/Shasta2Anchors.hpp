@@ -149,16 +149,6 @@ public:
     uint64_t filterByShasta2HashedKmerChecker(double markerDensity);
     uint64_t writeExternalAnchors(const string& name, bool canonicalOnly = true) const;
 
-    // Write external anchors and return a mapping from dinara anchor ID
-    // to shasta2 anchor ID (using shasta2's 2*i / 2*i+1 numbering).
-    // The mapping vector is indexed by dinara anchor ID and contains
-    // the corresponding shasta2 anchor ID, or invalid<Shasta2AnchorId>
-    // for anchors that were not exported.
-    uint64_t writeExternalAnchors(
-        const string& name,
-        vector<Shasta2AnchorId>& dinaraToShasta2AnchorIdMap,
-        bool canonicalOnly = true) const;
-
 
     // Read composition analysis.
     uint64_t countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId anchorId1) const;
