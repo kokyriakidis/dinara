@@ -255,6 +255,61 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
 
+    // Per-read window transition tracking: for each read in each window,
+    // record which window it came from and which it goes to.
+    // Walk each read's journey and collect the sequence of (normalized) windows visited.
+    {
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        // For each oriented read, collect the sequence of normalized windows it visits.
+        // Then update the readIntervals in each window.
+        // Build a lookup: (windowId, orientedReadId) -> index in readIntervals.
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> windowReadIndex;
+        for(uint32_t wid = 0; wid < windowCount; wid++) {
+            auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
+            for(uint64_t ri = 0; ri < window.readIntervals.size(); ri++) {
+                const auto& interval = window.readIntervals[ri];
+                windowReadIndex[{wid, interval.orientedReadId.getValue()}] = ri;
+            }
+        }
+
+        const uint64_t journeyCount = journeys.size();
+        for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
+            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+            const auto journey = journeys[oid];
+            if(journey.empty()) continue;
+
+            // Collect the sequence of distinct normalized windows this read visits.
+            std::vector<uint32_t> windowSequence;
+            for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                const Shasta2AnchorId anchorId = journey[pos];
+                if(uint64_t(anchorId) >= anchorCount) continue;
+                const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
+                if(windowId == noWindow) continue;
+                const uint32_t normW = normalize(windowId);
+                if(windowSequence.empty() || windowSequence.back() != normW) {
+                    windowSequence.push_back(normW);
+                }
+            }
+
+            // For each window in the sequence, set previousWindow and nextWindow.
+            for(uint64_t i = 0; i < windowSequence.size(); i++) {
+                const uint32_t wid = windowSequence[i];
+                auto it = windowReadIndex.find({wid, oidValue});
+                if(it == windowReadIndex.end()) continue;
+                auto& interval = const_cast<AnchorWindow&>(anchorWindows[wid]).readIntervals[it->second];
+                if(i > 0) {
+                    interval.previousWindow = windowSequence[i - 1];
+                }
+                if(i + 1 < windowSequence.size()) {
+                    interval.nextWindow = windowSequence[i + 1];
+                }
+            }
+        }
+    }
+
     // Inter-window edges: walk each read's journey and collect candidate
     // anchor pairs (lastAnchorInWindowA, firstAnchorInWindowB) for each
     // ordered window pair. Pick the candidate with the highest shared
@@ -382,38 +437,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Per-window connectivity summary.
+    // Per-window connectivity summary using per-read transition data.
     {
-        // Normalize window ID to original (fw) window.
-        auto normalize = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : w;
-        };
-
-        // Collect incoming and outgoing connections per normalized window.
-        std::map<uint32_t, std::set<uint32_t>> incoming, outgoing;
-        for(const auto& [wp, bestSize] : createdEdges) {
-            const uint32_t from = normalize(wp.first);
-            const uint32_t to = normalize(wp.second);
-            outgoing[from].insert(to);
-            incoming[to].insert(from);
-        }
-
-        cout << "Per-window connectivity (normalized to original windows):" << endl;
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+        cout << "Per-window connectivity (per-read transitions):" << endl;
         for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& in = incoming[w];
-            const auto& out = outgoing[w];
-            cout << "  Window " << w << ": incoming=[";
+            const auto& window = anchorWindows[w];
+
+            // Count reads by (previousWindow, nextWindow) pair.
+            std::map<uint32_t, uint64_t> incomingCounts, outgoingCounts;
+            for(const auto& ri : window.readIntervals) {
+                if(ri.previousWindow != noW) {
+                    incomingCounts[ri.previousWindow]++;
+                }
+                if(ri.nextWindow != noW) {
+                    outgoingCounts[ri.nextWindow]++;
+                }
+            }
+
+            cout << "  Window " << w
+                 << " (" << window.readIntervals.size() << " reads): incoming=[";
             bool first = true;
-            for(uint32_t iw : in) {
-                if(!first) cout << ",";
-                cout << iw;
+            for(const auto& [fromW, count] : incomingCounts) {
+                if(!first) cout << ", ";
+                cout << fromW << ":" << count;
                 first = false;
             }
             cout << "] outgoing=[";
             first = true;
-            for(uint32_t ow : out) {
-                if(!first) cout << ",";
-                cout << ow;
+            for(const auto& [toW, count] : outgoingCounts) {
+                if(!first) cout << ", ";
+                cout << toW << ":" << count;
                 first = false;
             }
             cout << "]" << endl;
