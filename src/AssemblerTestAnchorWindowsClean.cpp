@@ -314,12 +314,19 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         const int g = int((g1 + m) * 255);
         const int b = int((b1 + m) * 255);
 
-        // Write each backbone anchor with this color.
+        // Write each backbone anchor and its RC mirror with this color.
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
             csv << backboneJourney[pos] << ","
                 << "#" << hex << setfill('0')
                 << setw(2) << r << setw(2) << g << setw(2) << b
                 << dec << "\n";
+            const uint64_t rcId = uint64_t(backboneJourney[pos]) ^ 1ULL;
+            if(rcId < anchorCount) {
+                csv << rcId << ","
+                    << "#" << hex << setfill('0')
+                    << setw(2) << r << setw(2) << g << setw(2) << b
+                    << dec << "\n";
+            }
         }
     }
 
@@ -593,6 +600,13 @@ void Assembler::writeAnchorWindowsCleanGfa(
                 << "#" << hex << setfill('0')
                 << setw(2) << r << setw(2) << g << setw(2) << b
                 << dec << "\n";
+            const uint64_t rcId = uint64_t(backboneJourney[pos]) ^ 1ULL;
+            if(rcId < anchorCount) {
+                csv << rcId << ","
+                    << "#" << hex << setfill('0')
+                    << setw(2) << r << setw(2) << g << setw(2) << b
+                    << dec << "\n";
+            }
         }
     }
 
