@@ -424,6 +424,17 @@ void Assembler::computeAnchorWindowsClean(
             }
         }
 
+        // TODO: revisit alternate path filtering:
+        // 1. The direct-cis filter removes intermediates that only have
+        //    direct-cis reads. This may be too aggressive or too lenient
+        //    depending on the phasing context.
+        // 2. The deduplication assigns each intermediate to one path
+        //    (furthest pillar B). This is arbitrary and may discard
+        //    valid alternate paths.
+        // 3. Paths with no surviving intermediates are dropped entirely.
+        // These heuristics should be revisited once phasing-aware
+        // alternate paths are working.
+
         // Deduplicate alternate path intermediates: each intermediate anchor
         // must appear in exactly one alternate path. If the same intermediate
         // appears in multiple paths, assign it to the path with the furthest
