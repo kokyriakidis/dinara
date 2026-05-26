@@ -113,19 +113,13 @@ void Shasta2AnchorPair::get(
         if(orientedReadId == *it) {
             ++it;
 
-            const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
-
             const uint32_t positionInJourneyA = itA->positionInJourney;
             const uint32_t positionInJourneyB = itB->positionInJourney;
             DINARA_ASSERT(positionInJourneyB >= positionInJourneyA);    // Allow degenerate Shasta2AnchorPair witn anchorIdA==anchorIdB
-            const uint32_t ordinalA = itA->ordinal;
-            const uint32_t ordinalB = itB->ordinal;
-            const uint32_t positionA = orientedReadMarkers[ordinalA].position + kHalf;
-            const uint32_t positionB = orientedReadMarkers[ordinalB].position + kHalf;
 
             positions.push_back(make_pair(
-                Positions(positionInJourneyA, positionA),
-                Positions(positionInJourneyB, positionB)
+                Positions(positionInJourneyA, itA->position),
+                Positions(positionInJourneyB, itB->position)
                 ));
         }
 
@@ -139,13 +133,13 @@ void Shasta2AnchorPair::get(
 // Remove from the Shasta2AnchorPair OrientedReadIds that have negative offsets.
 void Shasta2AnchorPair::removeNegativeOffsets(const Shasta2Anchors& anchors)
 {
-    vector< pair<uint32_t, uint32_t> > ordinals;
-    getOrdinals(anchors, ordinals);
-    DINARA_ASSERT(ordinals.size() == orientedReadIds.size());
+    vector< pair<uint32_t, uint32_t> > anchorPositions;
+    getAnchorPositions(anchors, anchorPositions);
+    DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
 
     vector<OrientedReadId> newOrientedReadIds;
     for(uint64_t i=0; i<orientedReadIds.size(); i++) {
-        const auto& p = ordinals[i];
+        const auto& p = anchorPositions[i];
         if(p.second >= p.first) {
             newOrientedReadIds.push_back(orientedReadIds[i]);
         }
@@ -176,8 +170,8 @@ void Shasta2AnchorPair::get(
         const auto& positionsAB = positions[i];
         vector<Base>& sequence = sequences[i];
 
-        const uint32_t positionA = positionsAB.first.basePosition + kHalf;
-        const uint32_t positionB = positionsAB.second.basePosition + kHalf;
+        const uint32_t positionA = positionsAB.first.basePosition;
+        const uint32_t positionB = positionsAB.second.basePosition;
 
         for(uint32_t position=positionA; position!=positionB; position++) {
             sequence.push_back(reads.getOrientedReadBase(orientedReadId, position));
@@ -187,12 +181,12 @@ void Shasta2AnchorPair::get(
 
 
 
-// Same as the above, but only compute the ordinals.
-void Shasta2AnchorPair::getOrdinals(
+// Same as the above, but only compute the anchor positions (midpoints).
+void Shasta2AnchorPair::getAnchorPositions(
     const Shasta2Anchors& anchors,
-    vector< pair<uint32_t, uint32_t> >& ordinals) const
+    vector< pair<uint32_t, uint32_t> >& anchorPositions) const
 {
-    ordinals.clear();
+    anchorPositions.clear();
 
     const Shasta2Anchor anchorA = anchors[anchorIdA];
     const Shasta2Anchor anchorB = anchors[anchorIdB];
@@ -226,10 +220,7 @@ void Shasta2AnchorPair::getOrdinals(
         if(orientedReadId == *it) {
             ++it;
 
-            const uint32_t ordinalA = itA->ordinal;
-            const uint32_t ordinalB = itB->ordinal;
-
-            ordinals.push_back(make_pair(ordinalA, ordinalB));
+            anchorPositions.push_back(make_pair(itA->position, itB->position));
         }
 
         ++itA;

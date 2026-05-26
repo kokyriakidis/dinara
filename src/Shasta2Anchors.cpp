@@ -306,12 +306,15 @@ void Shasta2Anchors::constructThreadFunctionPass2(uint64_t threadId)
             buffer.clear();
             
             // Add markers from this vertex only.
-            // Keep the OrientedReadId and ordinal exactly as stored in markers.
+            // Store both the midpoint position (marker position + k/2, matching
+            // shasta2's MarkerInfo::position) and the ordinal (for internal use).
             for(const MarkerId markerId : markerGraph.getVertexMarkerIds(vertexId)) {
                 OrientedReadId orientedReadId;
                 uint32_t ordinal;
                 tie(orientedReadId, ordinal) = findMarkerId(markerId, markers);
-                buffer.emplace_back(orientedReadId, ordinal);
+                const uint32_t position =
+                    markers[orientedReadId.getValue()][ordinal].position + uint32_t(kHalf);
+                buffer.emplace_back(orientedReadId, position, ordinal);
             }
             
             // Sort by OrientedReadId to ensure canonical order for the Anchor.
@@ -345,6 +348,31 @@ uint64_t Shasta2Anchors::size() const {
 }
 
 // Helpers.
+Kmer Shasta2Anchors::getKmerAtPosition(OrientedReadId orientedReadId, uint32_t midpointPosition) const {
+    // The midpoint position is marker position + k/2.
+    // The raw position (first base of k-mer) is midpointPosition - k/2.
+    const uint32_t kHalf = uint32_t(k / 2);
+    const uint32_t rawPosition = midpointPosition - kHalf;
+    const auto read = reads.getRead(orientedReadId.getReadId());
+
+    if(orientedReadId.getStrand() == 0) {
+        Kmer kmer;
+        for(uint64_t i = 0; i < k; i++) {
+            kmer.set(i, read[rawPosition + i]);
+        }
+        return kmer;
+    } else {
+        // For strand 1, convert to strand 0 position and RC.
+        const uint64_t readLength = reads.getReadRawSequenceLength(orientedReadId.getReadId());
+        const uint32_t rawPosition0 = uint32_t(readLength) - rawPosition - uint32_t(k);
+        Kmer kmer0;
+        for(uint64_t i = 0; i < k; i++) {
+            kmer0.set(i, read[rawPosition0 + i]);
+        }
+        return kmer0.reverseComplement(k);
+    }
+}
+
 Kmer Shasta2Anchors::getKmer(OrientedReadId orientedReadId, uint32_t ordinal) const {
     if(orientedReadId.getStrand() == 0) {
         return getKmerStrand0(orientedReadId.getReadId(), ordinal);
@@ -390,7 +418,7 @@ vector<Base> Shasta2Anchors::anchorKmerSequence(Shasta2AnchorId anchorId) const
     }
 
     const Shasta2AnchorMarkerInfo& markerInfo = anchor.front();
-    const Kmer kmerValue = getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+    const Kmer kmerValue = getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
     sequence.reserve(k);
     for(uint64_t i=0; i<k; i++) {
         sequence.push_back(kmerValue[i]);
@@ -406,7 +434,7 @@ Kmer Shasta2Anchors::anchorKmer(Shasta2AnchorId anchorId) const
         return Kmer();
     }
     const Shasta2AnchorMarkerInfo& markerInfo = anchor.front();
-    return getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+    return getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
 }
 
 
@@ -426,7 +454,7 @@ uint64_t Shasta2Anchors::filterByShasta2HashedKmerChecker(double markerDensity)
         }
 
         const uint32_t position0 =
-            markers[anchor.front().orientedReadId.getValue()][anchor.front().ordinal].position;
+            anchor.front().position - uint32_t(k / 2);
         Shasta2StyleKmer shasta2Kmer;
         for(uint64_t i=0; i<k; i++) {
             shasta2Kmer.set(
@@ -460,7 +488,7 @@ uint64_t Shasta2Anchors::filterByShasta2HashedKmerChecker(double markerDensity)
             }
 
             const uint32_t position0 =
-                markers[anchor.front().orientedReadId.getValue()][anchor.front().ordinal].position;
+                anchor.front().position - uint32_t(k / 2);
             Shasta2StyleKmer shasta2Kmer;
             for(uint64_t i=0; i<k; i++) {
                 shasta2Kmer.set(
@@ -510,11 +538,11 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             continue;
         }
 
-        const Kmer expectedKmer = getKmer(anchor.front().orientedReadId, anchor.front().ordinal);
+        const Kmer expectedKmer = getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
         vector<ReadId> readIds;
         readIds.reserve(anchor.size());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
-            const Kmer kmerValue = getKmer(markerInfo.orientedReadId, markerInfo.ordinal);
+            const Kmer kmerValue = getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
             if(kmerValue != expectedKmer) {
                 throw runtime_error(
                     "Shasta2 external-anchor export failed: anchor " +
@@ -536,8 +564,9 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
-            const uint32_t position = markers[markerInfo.orientedReadId.getValue()][markerInfo.ordinal].position;
-            data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, position));
+            // External anchors store the raw position (first base of k-mer).
+            const uint32_t rawPosition = markerInfo.position - uint32_t(k / 2);
+            data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
     }
@@ -609,7 +638,6 @@ void Shasta2Anchors::analyzeAnchorPair(
     info.totalB = end1 - begin1;
 
     info.common = 0;
-    int64_t sumMarkerOffsets = 0;
     int64_t sumBaseOffsets = 0;
 
     auto it0 = begin0;
@@ -625,15 +653,9 @@ void Shasta2Anchors::analyzeAnchorPair(
         }
 
         ++info.common;
-        const OrientedReadId orientedReadId = it0->orientedReadId;
-        const auto orientedReadMarkers = markers[orientedReadId.getValue()];
 
-        const uint32_t ordinal0 = it0->ordinal;
-        const uint32_t ordinal1 = it1->ordinal;
-        sumMarkerOffsets += int64_t(ordinal1) - int64_t(ordinal0);
-
-        const int64_t basePosition0 = int64_t(orientedReadMarkers[ordinal0].position) + int64_t(kHalf);
-        const int64_t basePosition1 = int64_t(orientedReadMarkers[ordinal1].position) + int64_t(kHalf);
+        const int64_t basePosition0 = int64_t(it0->position);
+        const int64_t basePosition1 = int64_t(it1->position);
         sumBaseOffsets += basePosition1 - basePosition0;
 
         ++it0;
@@ -651,7 +673,7 @@ void Shasta2Anchors::analyzeAnchorPair(
         return;
     }
 
-    info.offsetInMarkers = int64_t(std::llround(double(sumMarkerOffsets) / double(info.common)));
+    info.offsetInMarkers = invalid<int64_t>;  // Ordinals no longer stored.
     info.offsetInBases = int64_t(std::llround(double(sumBaseOffsets) / double(info.common)));
 
     it0 = begin0;
@@ -671,8 +693,7 @@ void Shasta2Anchors::analyzeAnchorPair(
             const auto orientedReadMarkers = markers[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
 
-            const uint32_t ordinal0 = it0->ordinal;
-            const int64_t basePosition0 = int64_t(orientedReadMarkers[ordinal0].position) + int64_t(kHalf);
+            const int64_t basePosition0 = int64_t(it0->position);
             const int64_t hypotheticalPosition1 = basePosition0 + info.offsetInBases;
             if(hypotheticalPosition1 < 0 || hypotheticalPosition1 >= lengthInBases) {
                 ++info.onlyAShort;
@@ -688,8 +709,7 @@ void Shasta2Anchors::analyzeAnchorPair(
             const auto orientedReadMarkers = markers[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
 
-            const uint32_t ordinal1 = it1->ordinal;
-            const int64_t basePosition1 = int64_t(orientedReadMarkers[ordinal1].position) + int64_t(kHalf);
+            const int64_t basePosition1 = int64_t(it1->position);
             const int64_t hypotheticalPosition0 = basePosition1 - info.offsetInBases;
             if(hypotheticalPosition0 < 0 || hypotheticalPosition0 >= lengthInBases) {
                 ++info.onlyBShort;
@@ -727,8 +747,8 @@ uint64_t Shasta2Anchors::countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId 
             ++it1;
         } else {
              // Same read.
-             // Only count if ordinal on 1 > ordinal on 0 (forward flow).
-            if(it0->ordinal < it1->ordinal) {
+             // Only count if position on 1 > position on 0 (forward flow).
+            if(it0->position < it1->position) {
                 ++count;
             }
             ++it0;
@@ -739,6 +759,16 @@ uint64_t Shasta2Anchors::countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId 
 }
 
 
+
+uint32_t Shasta2Anchors::getPosition(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
+    const Shasta2Anchor anchor = (*this)[anchorId];
+    for(const auto& info: anchor) {
+        if(info.orientedReadId == orientedReadId) {
+            return info.position;
+        }
+    }
+    return invalid<uint32_t>;
+}
 
 uint32_t Shasta2Anchors::getOrdinal(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
     const Shasta2Anchor anchor = (*this)[anchorId];

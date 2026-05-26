@@ -38,13 +38,25 @@ namespace dinara {
 class dinara::Shasta2AnchorMarkerInfo {
 public:
     OrientedReadId orientedReadId;
-    uint32_t ordinal;
+
+    // The position of the middle of the marker relative to the beginning
+    // of the oriented read. This equals the position of the first base
+    // of the marker plus k/2. Matches shasta2's MarkerInfo::position.
+    // This is the field that gets serialized for shasta2 compatibility.
+    uint32_t position;
+
     uint32_t positionInJourney = invalid<uint32_t>;
+
+    // The marker ordinal (index into the oriented read's markers array).
+    // Not serialized for shasta2 — kept for internal use (alignment chaining,
+    // k-mer lookups, HTTP server display).
+    uint32_t ordinal = invalid<uint32_t>;
 
     Shasta2AnchorMarkerInfo() {}
 
-    Shasta2AnchorMarkerInfo(OrientedReadId orientedReadId, uint32_t ordinal) :
+    Shasta2AnchorMarkerInfo(OrientedReadId orientedReadId, uint32_t position, uint32_t ordinal) :
         orientedReadId(orientedReadId),
+        position(position),
         ordinal(ordinal)
     {}
 
@@ -137,8 +149,11 @@ public:
     Shasta2Anchor operator[](Shasta2AnchorId) const;
     uint64_t size() const;
     
-    // Kmer helpers (mimicking Markers::getKmer).
+    // Kmer helpers.
+    // getKmer takes an ordinal (index into the markers array).
     Kmer getKmer(OrientedReadId, uint32_t ordinal) const;
+    // getKmerAtPosition takes a midpoint position (as stored in Shasta2AnchorMarkerInfo::position).
+    Kmer getKmerAtPosition(OrientedReadId, uint32_t midpointPosition) const;
     // Helper to get sequence (for debug/display).
     vector<Base> anchorKmerSequence(Shasta2AnchorId) const;
     Kmer anchorKmer(Shasta2AnchorId) const;
@@ -160,6 +175,7 @@ public:
 
     MemoryMapped::VectorOfVectors<Shasta2AnchorMarkerInfo, uint64_t> anchorMarkerInfos;
 
+    uint32_t getPosition(Shasta2AnchorId, OrientedReadId) const;
     uint32_t getOrdinal(Shasta2AnchorId, OrientedReadId) const;
     uint32_t getPositionInJourney(Shasta2AnchorId, OrientedReadId) const;
     const Shasta2AnchorMarkerInfo& getAnchorMarkerInfo(Shasta2AnchorId, OrientedReadId) const;
