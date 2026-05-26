@@ -1116,6 +1116,14 @@ private:
     void dedupChainsPrePhasingThreadFunction(size_t threadId);
     std::atomic<uint64_t> removedPrePhasingDedupCount;
 public:
+
+    // Remove all chains for read pairs that have multiple chains on the
+    // same strand. Such multi-chain pairs are likely repeat-induced.
+    void removeMultiChainAlignments(uint64_t threadCount);
+private:
+    void removeMultiChainAlignmentsThreadFunction(size_t threadId);
+    std::atomic<uint64_t> removedMultiChainCount;
+public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);

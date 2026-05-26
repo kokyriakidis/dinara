@@ -1531,3 +1531,85 @@ void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
 
     removedPrePhasingDedupCount += localRemoved;
 }
+
+
+// Remove all chains for read pairs that have multiple chains on the same
+// strand. Such multi-chain pairs are likely repeat-induced and can corrupt
+// the marker graph during transitive collapse.
+void Assembler::removeMultiChainAlignments(uint64_t threadCount)
+{
+    const auto tBegin = steady_clock::now();
+    cout << timestamp << "Removing multi-chain alignments begins." << endl;
+
+    removedMultiChainCount = 0;
+
+    const uint64_t readCount = reads->readCount();
+    setupLoadBalancing(readCount, 100);
+    runThreads(&Assembler::removeMultiChainAlignmentsThreadFunction, threadCount);
+
+    const auto tEnd = steady_clock::now();
+    const double tSeconds = seconds(tEnd - tBegin);
+    cout << timestamp << "Removing multi-chain alignments ends in " << tSeconds << " s. Removed "
+         << removedMultiChainCount.load() << " alignments from multi-chain pairs." << endl;
+}
+
+
+void Assembler::removeMultiChainAlignmentsThreadFunction(size_t)
+{
+    uint64_t begin = 0, end = 0;
+    uint64_t localRemoved = 0;
+
+    // For each (partner, strandBucket) pair, collect alignment IDs.
+    struct PairKey {
+        ReadId partner;
+        int strandBucket;
+        bool operator<(const PairKey& o) const {
+            if (partner != o.partner) return partner < o.partner;
+            return strandBucket < o.strandBucket;
+        }
+    };
+    std::map<PairKey, vector<uint32_t>> pairAlignments;
+
+    while(getNextBatch(begin, end)) {
+        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); ++r0) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto& table = alignmentTable[orientedR0.getValue()];
+            if(table.empty()) continue;
+
+            pairAlignments.clear();
+
+            for(size_t tableIndex = 0; tableIndex < table.size(); ++tableIndex) {
+                const uint32_t alignmentId = table[tableIndex];
+                const auto& ad = alignmentData[alignmentId];
+
+                // Only process each pair once: r0 must be readIds[0].
+                if(ad.readIds[0] != r0) continue;
+
+                // Skip self-overlaps.
+                if(ad.readIds[0] == ad.readIds[1]) continue;
+
+                // Skip already-deleted alignments.
+                if(ad.deleteReasons0 || ad.deleteReasons1) continue;
+
+                const ReadId partner = ad.readIds[1];
+                const int strandIdx = ad.isSameStrand ? 0 : 1;
+                pairAlignments[PairKey{partner, strandIdx}].push_back(alignmentId);
+            }
+
+            // For each (partner, strand) group with >1 chain, delete all.
+            for(const auto& [key, alignmentIds] : pairAlignments) {
+                if(alignmentIds.size() <= 1) continue;
+
+                for(uint32_t alignmentId : alignmentIds) {
+                    alignmentData[alignmentId].addDeleteReasonsBoth(
+                        AlignmentData::DeleteReasonSecondary);
+                    ++localRemoved;
+                }
+            }
+        }
+    }
+
+    removedMultiChainCount += localRemoved;
+}
+
+
