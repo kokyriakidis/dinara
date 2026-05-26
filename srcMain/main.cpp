@@ -19,6 +19,7 @@
 #include "mode3-AnchorGraph.hpp"
 #include "mode3-AnchorGraphSuperbubbles.hpp"
 #include "Shasta2Anchors.hpp"
+#include "Shasta2AnchorPair.hpp"
 #include "Shasta2AnchorsFromSplitVertices.hpp"
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
@@ -1274,6 +1275,8 @@ void dinara::main::assemble(
         }
     }
 
+    // DISABLED: cluster-aware alternate paths — under development.
+    if(false)
     // Build cluster-aware alternate paths by creating new anchor copies.
     // For each het window with >=2 haplotype clusters, for each non-backbone
     // cluster: find which backbone pillars contain reads from that cluster,
@@ -1315,15 +1318,8 @@ void dinara::main::assemble(
             }
             if (pillars.size() < 3) continue;  // Need at least 3 pillars for interior copies.
 
-            // Build set of cluster read IDs for fast membership test.
-            // Also collect unclassified reads.
-            std::set<uint32_t> uncReadIds;
-            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
-                if (window.clusterIsUnclassified[ci]) {
-                    for (const auto& oid : window.readClusters[ci])
-                        uncReadIds.insert(oid.getValue());
-                }
-            }
+            // (Unclassified reads are not included in new anchor copies
+            // to avoid polluting other windows' backbone journeys.)
 
             bool windowHasAltPaths = false;
 
@@ -1383,7 +1379,7 @@ void dinara::main::assemble(
                     std::set<uint32_t> copyReadIds;
                     for (const auto& ami : anchor) {
                         uint32_t rv = ami.orientedReadId.getValue();
-                        if (clusterReadIds.count(rv) || uncReadIds.count(rv)) {
+                        if (clusterReadIds.count(rv)) {
                             newAnchor.push_back(ami);
                             copyReadIds.insert(rv);
                         }
@@ -1401,34 +1397,86 @@ void dinara::main::assemble(
 
                 if (copies.empty()) continue;
 
-                // Build the intermediate chain. Between consecutive new copies,
-                // check if they share reads. If not, insert the original pillar
-                // of the second copy as a bridge (it contains all reads, so it
-                // connects to both the previous and next copy).
-                AnchorWindowAlternatePath altPath;
-                altPath.anchorIdA = pillars[firstIdx];
-                altPath.anchorIdB = pillars[lastIdx];
+                // Build alternate paths. Break into separate paths where
+                // consecutive copies don't share reads — each path must
+                // have connectivity through shared reads.
+                // A "run" is a maximal sequence of consecutive copies where
+                // each pair shares reads. Each run becomes one alternate path,
+                // with the original pillar before the first copy as anchorIdA
+                // and the original pillar after the last copy as anchorIdB.
+                size_t runStart = 0;
+                while (runStart < copies.size()) {
+                    size_t runEnd = runStart + 1;
+                    while (runEnd < copies.size()) {
+                        bool sharesReads = false;
+                        for (uint32_t rv : copies[runEnd].readIds) {
+                            if (copies[runEnd - 1].readIds.count(rv)) {
+                                sharesReads = true;
+                                break;
+                            }
+                        }
+                        if (!sharesReads) break;
+                        runEnd++;
+                    }
 
-                altPath.intermediateAnchorIds.push_back(copies[0].newId);
-                for (size_t k = 1; k < copies.size(); k++) {
-                    // Check if copies[k-1] and copies[k] share any reads.
-                    bool sharesReads = false;
-                    for (uint32_t rv : copies[k].readIds) {
-                        if (copies[k - 1].readIds.count(rv)) {
-                            sharesReads = true;
-                            break;
+                    // Build alternate path for this run.
+                    // anchorIdA: the original pillar just before the run's
+                    // first copy in clusterPillarIndices. For the first run,
+                    // this is pillars[firstIdx]. For subsequent runs, it's
+                    // the original pillar of the previous run's last copy.
+                    // anchorIdB: the original pillar just after the run's
+                    // last copy. For the last run, this is pillars[lastIdx].
+
+                    // The copies correspond to clusterPillarIndices[1..N-2]
+                    // (interior pillars). Copy index k corresponds to
+                    // clusterPillarIndices[k+1]. So:
+                    // - anchorIdA = pillar at clusterPillarIndices[runStart]
+                    //   (which is clusterPillarIndices[runStart+1 - 1])
+                    // - anchorIdB = pillar at clusterPillarIndices[runEnd+1]
+
+                    // copies[k] corresponds to clusterPillarIndices[k+1].
+                    // anchorIdA = pillar at clusterPillarIndices[runStart+1 - 1] = clusterPillarIndices[runStart]
+                    // anchorIdB = pillar at clusterPillarIndices[runEnd+1 - 1 + 1] = clusterPillarIndices[runEnd + 1]
+                    uint32_t aIdx = clusterPillarIndices[runStart];      // pillar before first copy in run
+                    uint32_t bIdx = clusterPillarIndices[runEnd + 1];    // pillar after last copy in run
+
+                    // Also check that anchorIdA shares reads with the first copy,
+                    // and anchorIdB shares reads with the last copy.
+                    bool aConnects = false;
+                    {
+                        const auto anchorA = anchors[pillars[aIdx]];
+                        for (const auto& ami : anchorA) {
+                            if (copies[runStart].readIds.count(ami.orientedReadId.getValue())) {
+                                aConnects = true;
+                                break;
+                            }
                         }
                     }
-                    if (!sharesReads) {
-                        // Insert original pillar as bridge.
-                        altPath.intermediateAnchorIds.push_back(copies[k].originalPillar);
+                    bool bConnects = false;
+                    {
+                        const auto anchorB = anchors[pillars[bIdx]];
+                        for (const auto& ami : anchorB) {
+                            if (copies[runEnd - 1].readIds.count(ami.orientedReadId.getValue())) {
+                                bConnects = true;
+                                break;
+                            }
+                        }
                     }
-                    altPath.intermediateAnchorIds.push_back(copies[k].newId);
-                }
 
-                window.alternatePaths.push_back(std::move(altPath));
-                totalAltPaths++;
-                windowHasAltPaths = true;
+                    if (aConnects && bConnects) {
+                        AnchorWindowAlternatePath altPath;
+                        altPath.anchorIdA = pillars[aIdx];
+                        altPath.anchorIdB = pillars[bIdx];
+                        for (size_t k = runStart; k < runEnd; k++) {
+                            altPath.intermediateAnchorIds.push_back(copies[k].newId);
+                        }
+                        window.alternatePaths.push_back(std::move(altPath));
+                        totalAltPaths++;
+                        windowHasAltPaths = true;
+                    }
+
+                    runStart = runEnd;
+                }
             }
 
             if (windowHasAltPaths)
@@ -1458,6 +1506,40 @@ void dinara::main::assemble(
                 shasta2Owner);
             shasta2Journeys = assembler.shasta2Journeys;
             cout << timestamp << "  journeys rebuilt." << endl;
+
+            // Validate alternate paths: drop any path where an edge has
+            // no shared reads with correct journey ordering.
+            uint64_t droppedPaths = 0;
+            for (auto& window : anchorWindows) {
+                vector<AnchorWindowAlternatePath> validPaths;
+                for (const auto& altPath : window.alternatePaths) {
+                    bool valid = true;
+                    Shasta2AnchorId prev = altPath.anchorIdA;
+                    for (const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
+                        Shasta2AnchorPair pair(anchors, prev, mid, false);
+                        if (pair.orientedReadIds.empty()) {
+                            valid = false;
+                            break;
+                        }
+                        prev = mid;
+                    }
+                    if (valid) {
+                        Shasta2AnchorPair pair(anchors, prev, altPath.anchorIdB, false);
+                        if (pair.orientedReadIds.empty())
+                            valid = false;
+                    }
+                    if (valid) {
+                        validPaths.push_back(altPath);
+                    } else {
+                        droppedPaths++;
+                    }
+                }
+                window.alternatePaths = std::move(validPaths);
+            }
+            if (droppedPaths > 0) {
+                cout << timestamp << "  dropped " << droppedPaths
+                     << " alternate paths with broken edges" << endl;
+            }
         }
     }
 
