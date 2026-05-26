@@ -5,6 +5,7 @@
 #include "Shasta2Anchors.hpp"
 #include "cstdint.hpp"
 
+#include <limits>
 #include <vector>
 
 namespace dinara {
@@ -15,6 +16,12 @@ struct AnchorWindowReadInterval {
     uint32_t begin = 0; // Inclusive position in the oriented read journey.
     uint32_t end = 0;   // Exclusive position in the oriented read journey.
     uint32_t touchedAnchorCount = 0; // Anchors shared with the backbone in this interval.
+
+    // Window transitions: which window this read came from and goes to.
+    // noWindow means the read starts/ends here (no adjacent window).
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    uint32_t previousWindow = noWindow; // Window this read was in before this one.
+    uint32_t nextWindow = noWindow;     // Window this read goes to after this one.
 };
 
 // An alternate path between two consecutive LIS (backbone-shared) anchors,
