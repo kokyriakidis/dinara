@@ -1631,7 +1631,9 @@ void dinara::main::assemble(
     }
 
     // Write AnchorWindowsClean GFA.
-    assembler.writeAnchorWindowsCleanGfa(anchorWindows);
+    const uint64_t minInterWindowCoverage =
+        assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
+    assembler.writeAnchorWindowsCleanGfa(anchorWindows, minInterWindowCoverage);
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;
@@ -1639,6 +1641,7 @@ void dinara::main::assemble(
         *shasta2Anchors,
         *shasta2Journeys,
         anchorWindows,
+        minInterWindowCoverage,
         threadCount);
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
@@ -2088,7 +2091,8 @@ void dinara::main::assemble(
 
     // Test computeAnchorWindowsClean on the longest read and build a restricted
     // anchor graph from the kept anchors.
-    assembler.testAnchorWindowsCleanLongestRead(threadCount);
+    assembler.testAnchorWindowsCleanLongestRead(threadCount,
+        assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage);
 
     // Test multi-segment MSA on one window.
     assembler.testMultiSegmentMSA(

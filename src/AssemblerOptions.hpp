@@ -557,6 +557,10 @@ public:
 
 
 
+    // Minimum shared read count for an inter-window edge to be created.
+    // Candidates with fewer shared reads are discarded.
+    uint64_t minInterWindowCoverage;
+
     // Options used by class mode3::LocalAssembly
     class LocalAssemblyOptions {
     public:

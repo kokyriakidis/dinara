@@ -83,6 +83,7 @@ public:
         const Shasta2Anchors&,
         const Shasta2Journeys&,
         const vector<AnchorWindow>& anchorWindows,
+        uint64_t minInterWindowCoverage,
         uint64_t threadCount);
 
     // Constructor from binary data.

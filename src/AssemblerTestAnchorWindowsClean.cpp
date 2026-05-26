@@ -22,7 +22,8 @@ using namespace std;
 
 
 void Assembler::testAnchorWindowsCleanLongestRead(
-    uint64_t threadCount)
+    uint64_t threadCount,
+    uint64_t minInterWindowCoverage)
 {
     cout << timestamp << "testAnchorWindowsCleanLongestRead begins." << endl;
     const auto t0 = steady_clock::now();
@@ -244,7 +245,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     }
 
     // Write inter-window connecting edges: pick the candidate with the
-    // highest commonReadCount (shared reads between the two anchors).
+    // highest commonReadCount, skip if below minInterWindowCoverage.
     uint64_t totalInterEdges = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         // Find the candidate with the highest RC.
@@ -257,7 +258,7 @@ void Assembler::testAnchorWindowsCleanLongestRead(
                 bestApk = &apk;
             }
         }
-        if(bestApk && bestRc > 0) {
+        if(bestApk && bestRc >= minInterWindowCoverage) {
             if(emittedVertices.insert(uint64_t(bestApk->anchorIdA)).second) {
                 gfa << "S\t" << bestApk->anchorIdA << "\t*\tLN:i:1\n";
                 ++totalVertices;
@@ -334,7 +335,8 @@ void Assembler::testAnchorWindowsCleanLongestRead(
 
 // Write AnchorWindowsClean.gfa and .csv from pre-computed windows.
 void Assembler::writeAnchorWindowsCleanGfa(
-    const vector<AnchorWindow>& anchorWindows)
+    const vector<AnchorWindow>& anchorWindows,
+    uint64_t minInterWindowCoverage)
 {
     DINARA_ASSERT(shasta2Anchors);
     DINARA_ASSERT(shasta2Journeys);
@@ -483,7 +485,7 @@ void Assembler::writeAnchorWindowsCleanGfa(
     }
 
     // Inter-window connecting edges: pick the candidate with the
-    // highest commonReadCount (shared reads between the two anchors).
+    // highest commonReadCount, skip if below minInterWindowCoverage.
     uint64_t totalInterEdges = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         const AnchorPairKey* bestApk = nullptr;
@@ -495,7 +497,7 @@ void Assembler::writeAnchorWindowsCleanGfa(
                 bestApk = &apk;
             }
         }
-        if(bestApk && bestRc > 0) {
+        if(bestApk && bestRc >= minInterWindowCoverage) {
             if(emittedVertices.insert(uint64_t(bestApk->anchorIdA)).second) {
                 gfa << "S\t" << bestApk->anchorIdA << "\t*\tLN:i:1\n";
                 ++totalVertices;

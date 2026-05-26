@@ -104,6 +104,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
     const vector<AnchorWindow>& anchorWindows,
+    uint64_t minInterWindowCoverage,
     uint64_t threadCount) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
@@ -251,7 +252,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 bestPair = std::move(anchorPair);
             }
         }
-        if(bestSize > 0) {
+        if(bestSize >= minInterWindowCoverage) {
             edge_descriptor e;
             tie(e, ignore) = add_edge(
                 bestPair.anchorIdA,
