@@ -156,11 +156,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Alternate path edges: for each alternate path, add a chain
+    // Alternate path edges: for each het window, add a chain
     // anchorIdA -> intermediate[0] -> ... -> intermediate[N-1] -> anchorIdB.
     // These form parallel paths (bubbles) at het sites.
+    // Only emit for windows with detected het SNPs.
     uint64_t alternatePathEdgeCount = 0;
     for(const AnchorWindow& window : anchorWindows) {
+        if(window.cleanHetSnpCount == 0) continue;
         for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
             // Build the chain: A -> intermediates -> B.
             Shasta2AnchorId prevAnchorId = altPath.anchorIdA;
@@ -263,10 +265,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    const uint64_t interEdgeCount = num_edges(anchorGraph) - intraEdgeCount;
+    const uint64_t interEdgeCount =
+        num_edges(anchorGraph) - intraEdgeCount - alternatePathEdgeCount;
 
-    cout << "The anchor graph has " << num_vertices(*this)
-         << " vertices, " << num_edges(*this) << " edges"
+    // Count non-isolated vertices (vertices with at least one edge).
+    uint64_t nonIsolatedVertexCount = 0;
+    for(Shasta2AnchorId v = 0; v < anchorCount; v++) {
+        if(in_degree(v, anchorGraph) > 0 || out_degree(v, anchorGraph) > 0) {
+            ++nonIsolatedVertexCount;
+        }
+    }
+
+    cout << "The anchor graph has " << nonIsolatedVertexCount
+         << " non-isolated vertices (" << num_vertices(*this) << " total), "
+         << num_edges(*this) << " edges"
          << " (" << intraEdgeCount << " intra-window, "
          << alternatePathEdgeCount << " alternate-path, "
          << interEdgeCount << " inter-window)." << endl;
