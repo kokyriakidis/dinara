@@ -1274,7 +1274,133 @@ void dinara::main::assemble(
         }
     }
 
-    // Write AnchorWindowsClean GFA with het/hom-gated alternate paths.
+    // Replace alternate paths with cluster-aware paths.
+    // For each het window with >=2 non-unclassified clusters, build alternate
+    // paths from representative reads of non-backbone clusters.
+    {
+        cout << timestamp << "Building cluster-aware alternate paths..." << endl;
+        const auto& journeys = *shasta2Journeys;
+        uint64_t totalAltPaths = 0;
+        uint64_t windowsWithAltPaths = 0;
+
+        for (auto& window : anchorWindows) {
+            // Clear old structural alternate paths.
+            window.alternatePaths.clear();
+
+            // Skip windows without phasing.
+            if (window.readClusters.size() <= 1) continue;
+
+            // Count non-unclassified clusters.
+            uint32_t hapClusterCount = 0;
+            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+                if (!window.clusterIsUnclassified[ci])
+                    hapClusterCount++;
+            }
+            if (hapClusterCount < 2) continue;
+
+            // Build set of backbone anchors in this window for fast lookup.
+            const auto bbJ = journeys[window.backboneOrientedReadId];
+            std::set<Shasta2AnchorId> backboneAnchors;
+            for (uint32_t jp = window.backboneBegin; jp < window.backboneEnd; jp++) {
+                backboneAnchors.insert(bbJ[jp]);
+            }
+
+            bool windowHasAltPaths = false;
+
+            // For each non-backbone, non-unclassified cluster, walk all reads
+            // and collect alternate paths. Between each pair of consecutive
+            // backbone pillars, gather intermediate anchors from all reads
+            // in the cluster so we don't miss divergences that only appear
+            // in some reads.
+            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
+                if (window.clusterIsUnclassified[ci]) continue;
+
+                // Skip the backbone cluster.
+                bool isBackboneCluster = false;
+                for (const auto& oid : window.readClusters[ci]) {
+                    if (oid == window.backboneOrientedReadId) {
+                        isBackboneCluster = true;
+                        break;
+                    }
+                }
+                if (isBackboneCluster) continue;
+
+                // For each pair of consecutive backbone pillars, collect
+                // intermediate anchors from all reads in this cluster.
+                // Key: (anchorIdA, anchorIdB) → set of intermediate anchor IDs.
+                std::map<std::pair<Shasta2AnchorId, Shasta2AnchorId>,
+                         vector<Shasta2AnchorId>> pillarGaps;
+
+                for (const auto& oid : window.readClusters[ci]) {
+                    // Find this read's interval in the window.
+                    uint32_t readBegin = 0, readEnd = 0;
+                    bool found = false;
+                    for (const auto& ri : window.readIntervals) {
+                        if (ri.orientedReadId == oid) {
+                            readBegin = ri.begin;
+                            readEnd = ri.end;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found || readEnd <= readBegin) continue;
+
+                    // Walk the read's journey: find backbone pillars and
+                    // intermediates between them.
+                    const auto readJ = journeys[oid];
+                    vector<Shasta2AnchorId> sharedAnchors;
+                    vector<vector<Shasta2AnchorId>> gaps;
+                    vector<Shasta2AnchorId> currentGap;
+
+                    for (uint32_t rp = readBegin; rp < readEnd; rp++) {
+                        const Shasta2AnchorId aid = readJ[rp];
+                        if (backboneAnchors.count(aid)) {
+                            sharedAnchors.push_back(aid);
+                            gaps.push_back(std::move(currentGap));
+                            currentGap.clear();
+                        } else {
+                            currentGap.push_back(aid);
+                        }
+                    }
+
+                    // Merge this read's intermediates into the cluster-level map.
+                    for (size_t si = 0; si + 1 < sharedAnchors.size(); si++) {
+                        const auto& intermediates = gaps[si + 1];
+                        if (intermediates.empty()) continue;
+                        auto key = std::make_pair(sharedAnchors[si], sharedAnchors[si + 1]);
+                        auto& existing = pillarGaps[key];
+                        // Add new intermediates not already present.
+                        std::set<Shasta2AnchorId> existingSet(existing.begin(), existing.end());
+                        for (const auto& mid : intermediates) {
+                            if (existingSet.insert(mid).second) {
+                                existing.push_back(mid);
+                            }
+                        }
+                    }
+                }
+
+                // Emit alternate paths from the collected pillar gaps.
+                for (const auto& [pillarPair, intermediates] : pillarGaps) {
+                    AnchorWindowAlternatePath altPath;
+                    altPath.anchorIdA = pillarPair.first;
+                    altPath.anchorIdB = pillarPair.second;
+                    altPath.intermediateAnchorIds = intermediates;
+                    window.alternatePaths.push_back(std::move(altPath));
+                    totalAltPaths++;
+                    windowHasAltPaths = true;
+                }
+            }
+
+            if (windowHasAltPaths)
+                windowsWithAltPaths++;
+        }
+
+        cout << timestamp << "  cluster-aware alternate paths: "
+             << totalAltPaths << " paths in "
+             << windowsWithAltPaths << " windows" << endl;
+    }
+
+    // Write AnchorWindowsClean GFA with cluster-aware alternate paths.
     assembler.writeAnchorWindowsCleanGfa(anchorWindows);
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
