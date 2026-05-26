@@ -152,7 +152,6 @@ namespace dinara {
                         shasta2::OrientedReadId sReadId = shasta2::OrientedReadId::fromValue(dReadId.getValue());
                         shasta2::AnchorMarkerInfo ami;
                         ami.orientedReadId = sReadId;
-                        ami.ordinal = ordinal;
                         ami.positionInJourney = shasta2::invalid<uint32_t>;
                         amis.push_back(ami);
                     }
@@ -237,7 +236,6 @@ namespace dinara {
                     for(const auto& mi : a) {
                         shasta2::AnchorMarkerInfo ami;
                         ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
-                        ami.ordinal = mi.ordinal0;
                         ami.positionInJourney = shasta2::invalid<uint32_t>;
                         amis.push_back(ami);
                     }
@@ -275,7 +273,6 @@ namespace dinara {
                     for(const auto& mi : a) {
                         shasta2::AnchorMarkerInfo ami;
                         ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
-                        ami.ordinal = mi.ordinal0;
                         ami.positionInJourney = shasta2::invalid<uint32_t>;
                         amis.push_back(ami);
                     }
@@ -443,7 +440,6 @@ namespace dinara {
             for(const auto& mi : a) {
                 shasta2::AnchorMarkerInfo ami;
                 ami.orientedReadId = shasta2::OrientedReadId::fromValue(mi.orientedReadId.getValue());
-                ami.ordinal = mi.ordinal0;
                 ami.positionInJourney = shasta2::invalid<uint32_t>;
                 amis.push_back(ami);
             }
@@ -981,8 +977,7 @@ namespace dinara {
                  // Put it on strand 0.
                  const shasta2::OrientedReadId orientedReadId(readId, 0);
 
-                 // Get markers and journey.
-                 const auto orientedReadMarkers = shastaMarkers[orientedReadId.getValue()];
+                 // Get journey.
                  const auto journey = journeys[orientedReadId];
 
                  if(journey.empty()) {
@@ -999,11 +994,8 @@ namespace dinara {
                      const shasta2::AnchorId anchorId0 = journey[i0];
                      const shasta2::AnchorId anchorId1 = journey[i1];
                      
-                     const uint32_t ordinal0 = shastaAnchors->getOrdinal(anchorId0, orientedReadId);
-                     const uint32_t ordinal1 = shastaAnchors->getOrdinal(anchorId1, orientedReadId);
-
-                     const uint32_t position0 = orientedReadMarkers[ordinal0].position + kHalf;
-                     const uint32_t position1 = orientedReadMarkers[ordinal1].position + kHalf;
+                     const uint32_t position0 = shastaAnchors->getPosition(anchorId0, orientedReadId);
+                     const uint32_t position1 = shastaAnchors->getPosition(anchorId1, orientedReadId);
                      
                      if (position1 > position0) {
                         const uint32_t gap = position1 - position0;
@@ -1014,14 +1006,14 @@ namespace dinara {
 
                  // Initial gap.
                  const shasta2::AnchorId anchorId0 = journey.front();
-                 const uint32_t ordinal0 = shastaAnchors->getOrdinal(anchorId0, orientedReadId);
-                 readSummary.initialAnchorGap = orientedReadMarkers[ordinal0].position + kHalf;
+                 const uint32_t position0 = shastaAnchors->getPosition(anchorId0, orientedReadId);
+                 readSummary.initialAnchorGap = position0;
 
                  // Final gap.
                  const shasta2::AnchorId anchorId1 = journey.back();
-                 const uint32_t ordinal1 = shastaAnchors->getOrdinal(anchorId1, orientedReadId);
-                 if (readLength > (orientedReadMarkers[ordinal1].position + kHalf)) {
-                    readSummary.finalAnchorGap = readLength - orientedReadMarkers[ordinal1].position - kHalf;
+                 const uint32_t position1 = shastaAnchors->getPosition(anchorId1, orientedReadId);
+                 if (readLength > position1) {
+                    readSummary.finalAnchorGap = readLength - position1;
                  } else {
                     readSummary.finalAnchorGap = 0;
                  }
