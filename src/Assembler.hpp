@@ -3631,7 +3631,9 @@ public:
         shared_ptr<Shasta2Journeys> shasta2Journeys,
         const vector<ReadId>& readIdsSortedByLength,
         vector<AnchorWindow>& anchorWindows,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        uint64_t minCommonForBackbone = 2,
+        uint64_t maxSkipForBackbone = 10);
 
     // Detect clean het SNPs in an anchor window using Theseus MSA.
     // Returns the number of SNPs passing strand bias and repeat filtering.

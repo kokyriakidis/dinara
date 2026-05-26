@@ -51,7 +51,9 @@ void Assembler::computeAnchorWindowsClean(
     shared_ptr<Shasta2Journeys> shasta2Journeys,
     const vector<ReadId>& readIdsSortedByLength,
     vector<AnchorWindow>& anchorWindows,
-    uint64_t threadCount)
+    uint64_t threadCount,
+    uint64_t minCommonForBackbone,
+    uint64_t maxSkipForBackbone)
 {
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
@@ -259,9 +261,6 @@ void Assembler::computeAnchorWindowsClean(
     // Filter a backbone journey interval to keep the longest subsequence
     // where every consecutive pair has at least minCommonForBackbone common reads.
     // Uses dynamic programming on a DAG with limited forward look.
-    const uint64_t minCommonForBackbone = 2;
-    const uint32_t maxSkipForBackbone = 10;
-
     auto filterBackboneJourney = [&](
         OrientedReadId backboneOid,
         uint32_t seedBegin,
@@ -285,7 +284,7 @@ void Assembler::computeAnchorWindowsClean(
         for(uint32_t i = 1; i < n; i++) {
             const Shasta2AnchorId anchorI = journey[seedBegin + i];
             // Look back up to maxSkipForBackbone positions.
-            const uint32_t lookBack = min(i, maxSkipForBackbone);
+            const uint32_t lookBack = min(uint64_t(i), maxSkipForBackbone);
             for(uint32_t step = 1; step <= lookBack; step++) {
                 const uint32_t j = i - step;
                 const Shasta2AnchorId anchorJ = journey[seedBegin + j];

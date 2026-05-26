@@ -1254,12 +1254,18 @@ void dinara::main::assemble(
     // Compute anchor windows and run CIGAR-based SNP detection.
     cout << timestamp << "Computing anchor windows..." << endl;
     vector<AnchorWindow> anchorWindows;
+    const uint64_t minCommonForBackbone =
+        assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
+    const uint64_t maxSkipForBackbone =
+        assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
     assembler.computeAnchorWindowsClean(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         readIdsSortedByLength,
         anchorWindows,
-        threadCount);
+        threadCount,
+        minCommonForBackbone,
+        maxSkipForBackbone);
 
     // // CIGAR-based het SNP detection per window.
     // {
