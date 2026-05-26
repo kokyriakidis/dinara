@@ -255,23 +255,23 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
 
-    // Per-read window transition tracking: for each read in each window,
-    // record which window it came from and which it goes to.
-    // Walk each read's journey and collect the sequence of (normalized) windows visited.
+    // Per-read window transition tracking.
+    // Walk each read's journey, collect the sequence of normalized windows,
+    // then populate:
+    //   - AnchorWindowReadInterval::previousWindow / nextWindow
+    //   - AnchorWindow::transitionReads[(prev, next)] -> read list
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
-        // For each oriented read, collect the sequence of normalized windows it visits.
-        // Then update the readIntervals in each window.
-        // Build a lookup: (windowId, orientedReadId) -> index in readIntervals.
+        // Build lookup: (windowId, orientedReadId) -> index in readIntervals.
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> windowReadIndex;
         for(uint32_t wid = 0; wid < windowCount; wid++) {
             auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
             for(uint64_t ri = 0; ri < window.readIntervals.size(); ri++) {
-                const auto& interval = window.readIntervals[ri];
-                windowReadIndex[{wid, interval.orientedReadId.getValue()}] = ri;
+                windowReadIndex[{wid, window.readIntervals[ri].orientedReadId.getValue()}] = ri;
             }
         }
 
@@ -294,18 +294,23 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
 
-            // For each window in the sequence, set previousWindow and nextWindow.
+            // For each window in the sequence, update per-read fields and transition map.
             for(uint64_t i = 0; i < windowSequence.size(); i++) {
                 const uint32_t wid = windowSequence[i];
+                const uint32_t prev = (i > 0) ? windowSequence[i - 1] : noW;
+                const uint32_t next = (i + 1 < windowSequence.size()) ? windowSequence[i + 1] : noW;
+
                 auto it = windowReadIndex.find({wid, oidValue});
-                if(it == windowReadIndex.end()) continue;
-                auto& interval = const_cast<AnchorWindow&>(anchorWindows[wid]).readIntervals[it->second];
-                if(i > 0) {
-                    interval.previousWindow = windowSequence[i - 1];
+                if(it != windowReadIndex.end()) {
+                    auto& interval = const_cast<AnchorWindow&>(anchorWindows[wid]).readIntervals[it->second];
+                    interval.previousWindow = prev;
+                    interval.nextWindow = next;
                 }
-                if(i + 1 < windowSequence.size()) {
-                    interval.nextWindow = windowSequence[i + 1];
-                }
+
+                // Always add to transitionReads (even if read isn't in readIntervals,
+                // it still provides transition evidence).
+                const_cast<AnchorWindow&>(anchorWindows[wid])
+                    .transitionReads[{prev, next}].push_back(oid);
             }
         }
     }
@@ -437,26 +442,28 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Per-window connectivity summary using per-read transition data.
+    // Per-window connectivity summary using transitionReads.
     {
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+        const uint32_t noW = AnchorWindow::noWindow;
         cout << "Per-window connectivity (per-read transitions):" << endl;
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
 
-            // Count reads by (previousWindow, nextWindow) pair.
+            // Aggregate incoming and outgoing counts from transitionReads.
             std::map<uint32_t, uint64_t> incomingCounts, outgoingCounts;
-            for(const auto& ri : window.readIntervals) {
-                if(ri.previousWindow != noW) {
-                    incomingCounts[ri.previousWindow]++;
+            uint64_t totalTransitionReads = 0;
+            for(const auto& [key, reads] : window.transitionReads) {
+                totalTransitionReads += reads.size();
+                if(key.first != noW) {
+                    incomingCounts[key.first] += reads.size();
                 }
-                if(ri.nextWindow != noW) {
-                    outgoingCounts[ri.nextWindow]++;
+                if(key.second != noW) {
+                    outgoingCounts[key.second] += reads.size();
                 }
             }
 
             cout << "  Window " << w
-                 << " (" << window.readIntervals.size() << " reads): incoming=[";
+                 << " (" << totalTransitionReads << " reads): incoming=[";
             bool first = true;
             for(const auto& [fromW, count] : incomingCounts) {
                 if(!first) cout << ", ";
@@ -470,7 +477,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 cout << toW << ":" << count;
                 first = false;
             }
-            cout << "]" << endl;
+            cout << "]";
+
+            // Show transition flows if there are multiple distinct patterns.
+            if(window.transitionReads.size() > 1) {
+                cout << " flows={";
+                first = true;
+                for(const auto& [key, reads] : window.transitionReads) {
+                    if(!first) cout << ", ";
+                    cout << "(";
+                    if(key.first == noW) cout << "-"; else cout << key.first;
+                    cout << "→";
+                    if(key.second == noW) cout << "-"; else cout << key.second;
+                    cout << "):" << reads.size();
+                    first = false;
+                }
+                cout << "}";
+            }
+            cout << endl;
         }
     }
 

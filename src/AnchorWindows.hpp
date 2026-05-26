@@ -6,6 +6,8 @@
 #include "cstdint.hpp"
 
 #include <limits>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace dinara {
@@ -80,6 +82,13 @@ struct AnchorWindow {
         int hap = 0;
     };
     std::vector<ReadHaplotype> readHaplotypes;
+
+    // Per-read window transition map: groups reads by their (previousWindow, nextWindow)
+    // transition pattern. Used for detangling decisions.
+    // Key: (previousWindow, nextWindow). noWindow means the read starts/ends here.
+    // Value: oriented read IDs following that transition.
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<OrientedReadId>> transitionReads;
 
     // Read clusters from phasing.
     // Each cluster is a set of reads that phase together.
