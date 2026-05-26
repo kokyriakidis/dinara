@@ -1120,20 +1120,26 @@ void dinara::main::assemble(
 
     // ---- Post-phasing overlap cleaning (hifiasm order: Overlaps.cpp:39390-39726) ----
 
-    // // 1. Remove weak overlaps (no het sites) contradicted by strong+trans chains.
-    // //    Port of clean_weak_ma_hit_t. HiFi only (hifiasm skips for ONT).
-    // assembler.cleanWeakOverlaps();
+    // Initialize per-read valid intervals. With minCoverage=0 this sets
+    // every read's interval to [0, readLen). Must run before the next two
+    // steps which read validReadIntervals to compute hangs and classify
+    // overlaps.
+    assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
 
-    // 2. Coverage-based read trimming: compute per-read coverage profile from
-    //    overlaps, find longest contiguous region with coverage >= min_dp.
-    //    Port of ma_hit_sub. Default min_dp=0 (asm_opt.min_overlap_coverage)
-    //    makes this a no-op (just initializes validReadIntervals to full read
-    //    length), but it must run because steps 3-5 depend on the intervals.
-    // assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
+    // Flag chimeric reads — reads whose overlaps don't form a consistent
+    // linear arrangement. A chimeric read has left-side and right-side
+    // overlaps that come from different genomic locations (artifact of
+    // library prep joining unrelated fragments). All overlaps of flagged
+    // reads are deleted. The chimeric flag is also checked by
+    // createMarkerGraphVertices, which skips chimeric reads.
+    assembler.detectChimericReads(threadCount);
 
-    // assembler.detectChimericReads(threadCount);
-
-    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // Delete internal overlaps — overlaps where both reads extend
+    // significantly beyond the aligned region on the same side. These
+    // are not dovetail overlaps but interior matches, typically from
+    // shared repeat elements. Also removes overlaps shorter than
+    // minOverlapLength. Uses the extended qs/qe/ts/te coordinates.
+    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
