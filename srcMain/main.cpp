@@ -1654,106 +1654,108 @@ void dinara::main::assemble(
 
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
 
-
-    // Transitive reduction.
-    // Shared parameters for local path-based simplification steps.
-    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
-    const uint64_t transitiveReductionMaxDistance = 10;
-
-    shasta2AnchorGraph->transitiveReduction(
-        transitiveReductionMaxEdgeCoverage,
-        transitiveReductionMaxDistance);
-
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
-
-    // Post-transitive-reduction cleanup:
-    // cut low-read linear stalks that start at a tip and reach a branch point
-    // before involving more than 3 distinct oriented reads across all anchors
-    // in the traversed chain.
-    const uint64_t maxWeakTipReadCount = 3;
-    shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
-        *shasta2Anchors,
-        maxWeakTipReadCount);
-
-
-    // Save the final assembly-enabled state used by the HTTP server.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
-
-    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
-    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
-    
-    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        *shasta2AnchorGraph,
-        shasta2AssemblyGraphOptions);
-    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
-
-    // Compress linear chains, then clean, then compress again.
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-compressed.gfa");
-    shasta2AssemblyGraph->write("AssemblyGraph-compressed");
-
-    // Graph cleaning steps adapted from MBG.
-    cout << timestamp << "Cleaning Shasta2AssemblyGraph..." << endl;
-    shasta2AssemblyGraph->removeLowCoverageTips();
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->removeLowCoverageCrosslinks();
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->cleanByCopyNumber();
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
-    shasta2AssemblyGraph->write("AssemblyGraph-cleaned");
-
-    // Iterative cleaning loop adapted from MBG's resolveRound interleaved cleaning.
-    // Each round: tips -> compress -> crosslinks -> compress -> copynumber -> compress.
-    // Cleaning can expose new tips/crosslinks, so we iterate.
-    const uint64_t maxCleaningRounds = 5;
-    for(uint64_t round = 0; round < maxCleaningRounds; round++) {
-        cout << timestamp << "Cleaning round " << round << endl;
-        uint64_t changeCount = 0;
-
-        changeCount += shasta2AssemblyGraph->removeLowCoverageTips(3., 10., 10000);
-        shasta2AssemblyGraph->compress();
-
-        changeCount += shasta2AssemblyGraph->removeLowCoverageTips(2., 5., 10000);
-        shasta2AssemblyGraph->compress();
-
-        changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(1., 5.);
-        shasta2AssemblyGraph->compress();
-
-        changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(2., 10.);
-        shasta2AssemblyGraph->compress();
-
-        changeCount += shasta2AssemblyGraph->cleanByCopyNumber();
-        shasta2AssemblyGraph->compress();
-
-        cout << timestamp << "Cleaning round " << round
-             << " total changes: " << changeCount << endl;
-
-        if(changeCount == 0) {
-            break;
-        }
-    }
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-iterCleaned.gfa");
-    shasta2AssemblyGraph->write("AssemblyGraph-iterCleaned");
-
-    // Cut weak stalks (dead-end chains with few reads) to expose superbubbles.
-    shasta2AssemblyGraph->cutWeakStalks(10);
-    shasta2AssemblyGraph->compress();
-
-    // Pop superbubbles: remove low-coverage alternative paths.
-    shasta2AssemblyGraph->popSuperbubbles();
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-popped.gfa");
-
-    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
-    // shasta2AssemblyGraph->simplifyAndAssemble();
-
     return;
+
+
+    // // Transitive reduction.
+    // // Shared parameters for local path-based simplification steps.
+    // const uint64_t transitiveReductionMaxEdgeCoverage = 10;
+    // const uint64_t transitiveReductionMaxDistance = 10;
+
+    // shasta2AnchorGraph->transitiveReduction(
+    //     transitiveReductionMaxEdgeCoverage,
+    //     transitiveReductionMaxDistance);
+
+    // shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
+
+    // // Post-transitive-reduction cleanup:
+    // // cut low-read linear stalks that start at a tip and reach a branch point
+    // // before involving more than 3 distinct oriented reads across all anchors
+    // // in the traversed chain.
+    // const uint64_t maxWeakTipReadCount = 3;
+    // shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
+    //     *shasta2Anchors,
+    //     maxWeakTipReadCount);
+
+
+    // // Save the final assembly-enabled state used by the HTTP server.
+    // shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
+    // shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
+
+    // // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
+    // cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    // Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    // shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
+    
+    // assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+    //     *shasta2Anchors,
+    //     *shasta2Journeys,
+    //     *shasta2AnchorGraph,
+    //     shasta2AssemblyGraphOptions);
+    // auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+
+    // // Compress linear chains, then clean, then compress again.
+    // shasta2AssemblyGraph->compress();
+    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-compressed.gfa");
+    // shasta2AssemblyGraph->write("AssemblyGraph-compressed");
+
+    // // Graph cleaning steps adapted from MBG.
+    // cout << timestamp << "Cleaning Shasta2AssemblyGraph..." << endl;
+    // shasta2AssemblyGraph->removeLowCoverageTips();
+    // shasta2AssemblyGraph->compress();
+    // shasta2AssemblyGraph->removeLowCoverageCrosslinks();
+    // shasta2AssemblyGraph->compress();
+    // shasta2AssemblyGraph->cleanByCopyNumber();
+    // shasta2AssemblyGraph->compress();
+    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
+    // shasta2AssemblyGraph->write("AssemblyGraph-cleaned");
+
+    // // Iterative cleaning loop adapted from MBG's resolveRound interleaved cleaning.
+    // // Each round: tips -> compress -> crosslinks -> compress -> copynumber -> compress.
+    // // Cleaning can expose new tips/crosslinks, so we iterate.
+    // const uint64_t maxCleaningRounds = 5;
+    // for(uint64_t round = 0; round < maxCleaningRounds; round++) {
+    //     cout << timestamp << "Cleaning round " << round << endl;
+    //     uint64_t changeCount = 0;
+
+    //     changeCount += shasta2AssemblyGraph->removeLowCoverageTips(3., 10., 10000);
+    //     shasta2AssemblyGraph->compress();
+
+    //     changeCount += shasta2AssemblyGraph->removeLowCoverageTips(2., 5., 10000);
+    //     shasta2AssemblyGraph->compress();
+
+    //     changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(1., 5.);
+    //     shasta2AssemblyGraph->compress();
+
+    //     changeCount += shasta2AssemblyGraph->removeLowCoverageCrosslinks(2., 10.);
+    //     shasta2AssemblyGraph->compress();
+
+    //     changeCount += shasta2AssemblyGraph->cleanByCopyNumber();
+    //     shasta2AssemblyGraph->compress();
+
+    //     cout << timestamp << "Cleaning round " << round
+    //          << " total changes: " << changeCount << endl;
+
+    //     if(changeCount == 0) {
+    //         break;
+    //     }
+    // }
+    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-iterCleaned.gfa");
+    // shasta2AssemblyGraph->write("AssemblyGraph-iterCleaned");
+
+    // // Cut weak stalks (dead-end chains with few reads) to expose superbubbles.
+    // shasta2AssemblyGraph->cutWeakStalks(10);
+    // shasta2AssemblyGraph->compress();
+
+    // // Pop superbubbles: remove low-coverage alternative paths.
+    // shasta2AssemblyGraph->popSuperbubbles();
+    // shasta2AssemblyGraph->compress();
+    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-popped.gfa");
+
+    // // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
+    // // shasta2AssemblyGraph->simplifyAndAssemble();
+
+    // return;
 
 
 
