@@ -349,6 +349,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowBelowCoverage = 0;
     uint64_t interWindowCreated = 0;
+    std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> createdEdges;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
@@ -372,6 +373,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
                 anchorGraph);
             anchorGraph[e].useForAssembly = true;
+            createdEdges.push_back({windowPair, bestSize});
             ++interWindowCreated;
         }
     }
@@ -379,6 +381,44 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowZeroPairs << " rejected (zero forward-flow reads), "
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
+
+    // Per-window connectivity summary.
+    {
+        // Normalize window ID to original (fw) window.
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        // Collect incoming and outgoing connections per normalized window.
+        std::map<uint32_t, std::set<uint32_t>> incoming, outgoing;
+        for(const auto& [wp, bestSize] : createdEdges) {
+            const uint32_t from = normalize(wp.first);
+            const uint32_t to = normalize(wp.second);
+            outgoing[from].insert(to);
+            incoming[to].insert(from);
+        }
+
+        cout << "Per-window connectivity (normalized to original windows):" << endl;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& in = incoming[w];
+            const auto& out = outgoing[w];
+            cout << "  Window " << w << ": incoming=[";
+            bool first = true;
+            for(uint32_t iw : in) {
+                if(!first) cout << ",";
+                cout << iw;
+                first = false;
+            }
+            cout << "] outgoing=[";
+            first = true;
+            for(uint32_t ow : out) {
+                if(!first) cout << ",";
+                cout << ow;
+                first = false;
+            }
+            cout << "]" << endl;
+        }
+    }
 
     // Validate: check that every edge has shared oriented reads.
     {
