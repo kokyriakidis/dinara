@@ -1126,20 +1126,20 @@ void dinara::main::assemble(
     // overlaps.
     assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
 
-    // Flag chimeric reads — reads whose overlaps don't form a consistent
-    // linear arrangement. A chimeric read has left-side and right-side
-    // overlaps that come from different genomic locations (artifact of
-    // library prep joining unrelated fragments). All overlaps of flagged
-    // reads are deleted. The chimeric flag is also checked by
-    // createMarkerGraphVertices, which skips chimeric reads.
-    assembler.detectChimericReads(threadCount);
+    // // Flag chimeric reads — reads whose overlaps don't form a consistent
+    // // linear arrangement. A chimeric read has left-side and right-side
+    // // overlaps that come from different genomic locations (artifact of
+    // // library prep joining unrelated fragments). All overlaps of flagged
+    // // reads are deleted. The chimeric flag is also checked by
+    // // createMarkerGraphVertices, which skips chimeric reads.
+    // assembler.detectChimericReads(threadCount);
 
-    // Delete internal overlaps — overlaps where both reads extend
-    // significantly beyond the aligned region on the same side. These
-    // are not dovetail overlaps but interior matches, typically from
-    // shared repeat elements. Also removes overlaps shorter than
-    // minOverlapLength. Uses the extended qs/qe/ts/te coordinates.
-    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // // Delete internal overlaps — overlaps where both reads extend
+    // // significantly beyond the aligned region on the same side. These
+    // // are not dovetail overlaps but interior matches, typically from
+    // // shared repeat elements. Also removes overlaps shorter than
+    // // minOverlapLength. Uses the extended qs/qe/ts/te coordinates.
+    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
@@ -1261,106 +1261,106 @@ void dinara::main::assemble(
         anchorWindows,
         threadCount);
 
-    // CIGAR-based het SNP detection per window.
-    {
-        cout << timestamp << "Running CIGAR-based SNP detection on "
-             << anchorWindows.size() << " windows..." << endl;
-        const auto tSnp0 = steady_clock::now();
-        uint64_t hetWindows = 0;
-        uint64_t totalSnps = 0;
-        for(AnchorWindow& window : anchorWindows) {
-            window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
-                window, *shasta2Anchors, *shasta2Journeys);
-            if(window.cleanHetSnpCount > 0) {
-                hetWindows++;
-                totalSnps += window.cleanHetSnpCount;
-            }
-        }
-        const auto tSnp1 = steady_clock::now();
-        const double snpSecs = seconds(tSnp1 - tSnp0);
-        cout << timestamp << "CIGAR-based SNP detection complete."
-             << " hetWindows=" << hetWindows
-             << " homWindows=" << (anchorWindows.size() - hetWindows)
-             << " totalCleanHetSnps=" << totalSnps
-             << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
-             << std::defaultfloat << endl;
-    }
+    // // CIGAR-based het SNP detection per window.
+    // {
+    //     cout << timestamp << "Running CIGAR-based SNP detection on "
+    //          << anchorWindows.size() << " windows..." << endl;
+    //     const auto tSnp0 = steady_clock::now();
+    //     uint64_t hetWindows = 0;
+    //     uint64_t totalSnps = 0;
+    //     for(AnchorWindow& window : anchorWindows) {
+    //         window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
+    //             window, *shasta2Anchors, *shasta2Journeys);
+    //         if(window.cleanHetSnpCount > 0) {
+    //             hetWindows++;
+    //             totalSnps += window.cleanHetSnpCount;
+    //         }
+    //     }
+    //     const auto tSnp1 = steady_clock::now();
+    //     const double snpSecs = seconds(tSnp1 - tSnp0);
+    //     cout << timestamp << "CIGAR-based SNP detection complete."
+    //          << " hetWindows=" << hetWindows
+    //          << " homWindows=" << (anchorWindows.size() - hetWindows)
+    //          << " totalCleanHetSnps=" << totalSnps
+    //          << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
+    //          << std::defaultfloat << endl;
+    // }
 
-    // Write per-read haplotype assignments and het SNP info for the first window.
-    if (!anchorWindows.empty()) {
-        const auto& w0 = anchorWindows[0];
-        const char* baseChar = "ACGT";
+    // // Write per-read haplotype assignments and het SNP info for the first window.
+    // if (!anchorWindows.empty()) {
+    //     const auto& w0 = anchorWindows[0];
+    //     const char* baseChar = "ACGT";
 
-        // Het SNP positions.
-        if (!w0.hetSnps.empty()) {
-            const string snpFileName = "WindowHetSnps.csv";
-            ofstream snpFile(snpFileName);
-            if (snpFile) {
-                snpFile << "BbPos,RefBase,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
-                for (const auto& s : w0.hetSnps) {
-                    snpFile << s.bbPos << ","
-                            << baseChar[s.refBase] << ","
-                            << baseChar[s.altBase] << ","
-                            << s.altCov << ","
-                            << s.refCov << ","
-                            << s.spanning << ","
-                            << std::fixed << std::setprecision(3)
-                            << (s.spanning > 0 ? double(s.altCov) / double(s.spanning) : 0.0)
-                            << std::defaultfloat << ",";
-                    for (size_t i = 0; i < s.altReads.size(); i++) {
-                        if (i > 0) snpFile << " ";
-                        snpFile << s.altReads[i];
-                    }
-                    snpFile << ",";
-                    for (size_t i = 0; i < s.refReads.size(); i++) {
-                        if (i > 0) snpFile << " ";
-                        snpFile << s.refReads[i];
-                    }
-                    snpFile << "\n";
-                }
-                cout << timestamp << "Wrote " << snpFileName
-                     << " (" << w0.hetSnps.size() << " het SNPs)" << endl;
-            }
-        }
+    //     // Het SNP positions.
+    //     if (!w0.hetSnps.empty()) {
+    //         const string snpFileName = "WindowHetSnps.csv";
+    //         ofstream snpFile(snpFileName);
+    //         if (snpFile) {
+    //             snpFile << "BbPos,RefBase,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
+    //             for (const auto& s : w0.hetSnps) {
+    //                 snpFile << s.bbPos << ","
+    //                         << baseChar[s.refBase] << ","
+    //                         << baseChar[s.altBase] << ","
+    //                         << s.altCov << ","
+    //                         << s.refCov << ","
+    //                         << s.spanning << ","
+    //                         << std::fixed << std::setprecision(3)
+    //                         << (s.spanning > 0 ? double(s.altCov) / double(s.spanning) : 0.0)
+    //                         << std::defaultfloat << ",";
+    //                 for (size_t i = 0; i < s.altReads.size(); i++) {
+    //                     if (i > 0) snpFile << " ";
+    //                     snpFile << s.altReads[i];
+    //                 }
+    //                 snpFile << ",";
+    //                 for (size_t i = 0; i < s.refReads.size(); i++) {
+    //                     if (i > 0) snpFile << " ";
+    //                     snpFile << s.refReads[i];
+    //                 }
+    //                 snpFile << "\n";
+    //             }
+    //             cout << timestamp << "Wrote " << snpFileName
+    //                  << " (" << w0.hetSnps.size() << " het SNPs)" << endl;
+    //         }
+    //     }
 
-        // Per-read haplotype assignments.
-        if (!w0.readHaplotypes.empty()) {
-            const string hapFileName = "WindowHaplotypes.csv";
-            ofstream hapFile(hapFileName);
-            if (hapFile) {
-                hapFile << "OrientedReadId,Haplotype\n";
-                // Backbone read is hap 1 by convention.
-                hapFile << w0.backboneOrientedReadId << ",1\n";
-                for (const auto& rh : w0.readHaplotypes) {
-                    hapFile << rh.orientedReadId << "," << rh.hap << "\n";
-                }
-                cout << timestamp << "Wrote " << hapFileName
-                     << " (" << w0.readHaplotypes.size() << " reads, window bb="
-                     << w0.backboneOrientedReadId << ")" << endl;
-            }
-        }
+    //     // Per-read haplotype assignments.
+    //     if (!w0.readHaplotypes.empty()) {
+    //         const string hapFileName = "WindowHaplotypes.csv";
+    //         ofstream hapFile(hapFileName);
+    //         if (hapFile) {
+    //             hapFile << "OrientedReadId,Haplotype\n";
+    //             // Backbone read is hap 1 by convention.
+    //             hapFile << w0.backboneOrientedReadId << ",1\n";
+    //             for (const auto& rh : w0.readHaplotypes) {
+    //                 hapFile << rh.orientedReadId << "," << rh.hap << "\n";
+    //             }
+    //             cout << timestamp << "Wrote " << hapFileName
+    //                  << " (" << w0.readHaplotypes.size() << " reads, window bb="
+    //                  << w0.backboneOrientedReadId << ")" << endl;
+    //         }
+    //     }
 
-        // Read clusters from iterative refinement.
-        if (!w0.readClusters.empty()) {
-            const string clusterFileName = "WindowClusters.csv";
-            ofstream clusterFile(clusterFileName);
-            if (clusterFile) {
-                clusterFile << "Cluster,OrientedReadId\n";
-                // Backbone read is in cluster 0.
-                clusterFile << 0 << "," << w0.backboneOrientedReadId << "\n";
-                for (size_t ci = 0; ci < w0.readClusters.size(); ci++) {
-                    for (const auto& oid : w0.readClusters[ci]) {
-                        clusterFile << ci << "," << oid << "\n";
-                    }
-                }
-                uint64_t totalReads = 0;
-                for (const auto& c : w0.readClusters) totalReads += c.size();
-                cout << timestamp << "Wrote " << clusterFileName
-                     << " (" << w0.readClusters.size() << " clusters, "
-                     << totalReads << " reads)" << endl;
-            }
-        }
-    }
+    //     // Read clusters from iterative refinement.
+    //     if (!w0.readClusters.empty()) {
+    //         const string clusterFileName = "WindowClusters.csv";
+    //         ofstream clusterFile(clusterFileName);
+    //         if (clusterFile) {
+    //             clusterFile << "Cluster,OrientedReadId\n";
+    //             // Backbone read is in cluster 0.
+    //             clusterFile << 0 << "," << w0.backboneOrientedReadId << "\n";
+    //             for (size_t ci = 0; ci < w0.readClusters.size(); ci++) {
+    //                 for (const auto& oid : w0.readClusters[ci]) {
+    //                     clusterFile << ci << "," << oid << "\n";
+    //                 }
+    //             }
+    //             uint64_t totalReads = 0;
+    //             for (const auto& c : w0.readClusters) totalReads += c.size();
+    //             cout << timestamp << "Wrote " << clusterFileName
+    //                  << " (" << w0.readClusters.size() << " clusters, "
+    //                  << totalReads << " reads)" << endl;
+    //         }
+    //     }
+    // }
 
     // DISABLED: cluster-aware alternate paths — under development.
     if(false)
