@@ -152,23 +152,6 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         }
     }
 
-
-    // Remove contradictory window pairs: if both (W1,W2) and (W2,W1) exist,
-    // the connection is unreliable — remove both directions.
-    {
-        std::set<std::pair<uint32_t, uint32_t>> toRemove;
-        for(const auto& [wp, cands] : windowPairCandidates) {
-            auto reverse = std::make_pair(wp.second, wp.first);
-            if(windowPairCandidates.count(reverse)) {
-                toRemove.insert(wp);
-                toRemove.insert(reverse);
-            }
-        }
-        for(const auto& wp : toRemove) {
-            windowPairCandidates.erase(wp);
-        }
-    }
-
     // Count total candidate edges across all window pairs.
     uint64_t totalCandidateEdges = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
@@ -449,22 +432,6 @@ void Assembler::writeAnchorWindowsCleanGfa(
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
             }
-        }
-    }
-
-    // Remove contradictory window pairs: if both (W1,W2) and (W2,W1) exist,
-    // the connection is unreliable — remove both directions.
-    {
-        std::set<std::pair<uint32_t, uint32_t>> toRemove;
-        for(const auto& [wp, cands] : windowPairCandidates) {
-            auto reverse = std::make_pair(wp.second, wp.first);
-            if(windowPairCandidates.count(reverse)) {
-                toRemove.insert(wp);
-                toRemove.insert(reverse);
-            }
-        }
-        for(const auto& wp : toRemove) {
-            windowPairCandidates.erase(wp);
         }
     }
 
