@@ -34,6 +34,14 @@ struct AnchorWindow {
     OrientedReadId backboneOrientedReadId;
     uint32_t backboneBegin = 0; // Inclusive journey position on backbone.
     uint32_t backboneEnd = 0;   // Exclusive journey position on backbone.
+
+    // Filtered backbone positions: the longest subsequence of journey
+    // positions in [backboneBegin, backboneEnd) where every consecutive
+    // pair has sufficient common read support. Intra-window edges should
+    // be created between consecutive entries in this vector.
+    // If empty, use all positions in [backboneBegin, backboneEnd).
+    std::vector<uint32_t> filteredBackbonePositions;
+
     uint32_t claimedAnchorCount = 0;
     std::vector<AnchorWindowReadInterval> readIntervals;
 
