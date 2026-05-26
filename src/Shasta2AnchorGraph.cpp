@@ -271,48 +271,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
-    // Walk only backbone reads' journeys (and their RC) for inter-window
-    // edge discovery. Each backbone read's full journey is walked, not just
-    // the window interval, so it can discover transitions to other windows.
-    for(const AnchorWindow& window : anchorWindows) {
-        // Walk the backbone read on both strands.
-        const OrientedReadId backboneOid = window.backboneOrientedReadId;
-        const OrientedReadId rcOid(backboneOid.getReadId(),
-            1 - backboneOid.getStrand());
-
-        for(const OrientedReadId oid : {backboneOid, rcOid}) {
-            if(oid.getValue() >= journeys.size()) continue;
-            const auto journey = journeys[oid];
-            if(journey.empty()) continue;
-
-            uint32_t currentWindow = noWindow;
-            Shasta2AnchorId lastAnchorInCurrentWindow = 0;
-
-            for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
-                const Shasta2AnchorId anchorId = journey[pos];
-                if(uint64_t(anchorId) >= anchorCount) continue;
-                const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
-                if(windowId == noWindow) continue;
-
-                if(windowId == currentWindow) {
-                    lastAnchorInCurrentWindow = anchorId;
-                } else {
-                    if(currentWindow != noWindow) {
-                        auto key = std::make_pair(currentWindow, windowId);
-                        AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
-                        windowPairCandidates[key][apk]++;
-                    }
-                    currentWindow = windowId;
-                    lastAnchorInCurrentWindow = anchorId;
-                }
-            }
-        }
-    }
-
-    // Alternative: walk ALL reads' journeys for inter-window edge discovery.
-    // This finds more inter-window connections but is slower.
-    // Uncomment to use all reads instead of backbone-only.
-    /*
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
@@ -341,7 +299,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
     }
-    */
 
     // Diagnostic: count window pairs and candidates.
     {
