@@ -362,15 +362,30 @@ void Assembler::writeAnchorWindowsCleanGfa(
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
-        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            const Shasta2AnchorId anchorId = backboneJourney[pos];
-            anchorToWindow[uint64_t(anchorId)] = windowId;
-            anchorToBackbonePos[uint64_t(anchorId)] = pos;
-            // Mirror RC window.
-            const uint64_t rcAid = uint64_t(anchorId) ^ 1ULL;
-            if(rcAid < anchorCount) {
-                anchorToWindow[rcAid] = windowId + windowCount;
-                anchorToBackbonePos[rcAid] = pos;
+
+        // Use filtered backbone positions if available.
+        const auto& positions = window.filteredBackbonePositions;
+        if(!positions.empty()) {
+            for(const uint32_t pos : positions) {
+                const Shasta2AnchorId anchorId = backboneJourney[pos];
+                anchorToWindow[uint64_t(anchorId)] = windowId;
+                anchorToBackbonePos[uint64_t(anchorId)] = pos;
+                const uint64_t rcAid = uint64_t(anchorId) ^ 1ULL;
+                if(rcAid < anchorCount) {
+                    anchorToWindow[rcAid] = windowId + windowCount;
+                    anchorToBackbonePos[rcAid] = pos;
+                }
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                const Shasta2AnchorId anchorId = backboneJourney[pos];
+                anchorToWindow[uint64_t(anchorId)] = windowId;
+                anchorToBackbonePos[uint64_t(anchorId)] = pos;
+                const uint64_t rcAid = uint64_t(anchorId) ^ 1ULL;
+                if(rcAid < anchorCount) {
+                    anchorToWindow[rcAid] = windowId + windowCount;
+                    anchorToBackbonePos[rcAid] = pos;
+                }
             }
         }
     }
@@ -475,26 +490,47 @@ void Assembler::writeAnchorWindowsCleanGfa(
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
+        // Use filtered backbone positions if available.
+        const auto& positions = window.filteredBackbonePositions;
+        const bool hasFiltered = !positions.empty();
+
         // Backbone vertices and their RC mirrors.
-        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            emitVertex(backboneJourney[pos]);
-            const Shasta2AnchorId rcId = Shasta2AnchorId(uint64_t(backboneJourney[pos]) ^ 1ULL);
-            if(uint64_t(rcId) < anchorCount) {
-                emitVertex(rcId);
+        if(hasFiltered) {
+            for(const uint32_t pos : positions) {
+                emitVertex(backboneJourney[pos]);
+                const Shasta2AnchorId rcId = Shasta2AnchorId(uint64_t(backboneJourney[pos]) ^ 1ULL);
+                if(uint64_t(rcId) < anchorCount) emitVertex(rcId);
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                emitVertex(backboneJourney[pos]);
+                const Shasta2AnchorId rcId = Shasta2AnchorId(uint64_t(backboneJourney[pos]) ^ 1ULL);
+                if(uint64_t(rcId) < anchorCount) emitVertex(rcId);
             }
         }
 
-        // Intra-window edges: consecutive backbone pairs + RC mirrors.
-        for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
-            const Shasta2AnchorId idA = backboneJourney[pos];
-            const Shasta2AnchorId idB = backboneJourney[pos + 1];
-            // Original edge.
-            emitLink(idA, idB, totalIntraEdges);
-            // RC mirror edge (reversed direction).
-            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(idA) ^ 1ULL);
-            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(idB) ^ 1ULL);
-            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                emitLink(rcB, rcA, totalIntraEdges);
+        // Intra-window edges: consecutive filtered backbone pairs + RC mirrors.
+        if(hasFiltered) {
+            for(uint64_t i = 0; i + 1 < positions.size(); i++) {
+                const Shasta2AnchorId idA = backboneJourney[positions[i]];
+                const Shasta2AnchorId idB = backboneJourney[positions[i + 1]];
+                emitLink(idA, idB, totalIntraEdges);
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(idA) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(idB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    emitLink(rcB, rcA, totalIntraEdges);
+                }
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
+                const Shasta2AnchorId idA = backboneJourney[pos];
+                const Shasta2AnchorId idB = backboneJourney[pos + 1];
+                emitLink(idA, idB, totalIntraEdges);
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(idA) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(idB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    emitLink(rcB, rcA, totalIntraEdges);
+                }
             }
         }
 
@@ -595,7 +631,9 @@ void Assembler::writeAnchorWindowsCleanGfa(
         const int g = int((g1 + m) * 255);
         const int b = int((b1 + m) * 255);
 
-        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+        // Use filtered backbone positions if available.
+        const auto& positions = window.filteredBackbonePositions;
+        auto emitCsvEntry = [&](uint32_t pos) {
             csv << backboneJourney[pos] << ","
                 << "#" << hex << setfill('0')
                 << setw(2) << r << setw(2) << g << setw(2) << b
@@ -606,6 +644,16 @@ void Assembler::writeAnchorWindowsCleanGfa(
                     << "#" << hex << setfill('0')
                     << setw(2) << r << setw(2) << g << setw(2) << b
                     << dec << "\n";
+            }
+        };
+
+        if(!positions.empty()) {
+            for(const uint32_t pos : positions) {
+                emitCsvEntry(pos);
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                emitCsvEntry(pos);
             }
         }
     }

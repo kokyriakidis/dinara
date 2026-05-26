@@ -134,7 +134,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
-        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+
+        // Use filtered backbone positions if available, otherwise all positions.
+        const auto& positions = window.filteredBackbonePositions.empty()
+            ? [&]() -> const vector<uint32_t>& {
+                // Build a temporary vector of all positions (stored per-window).
+                static thread_local vector<uint32_t> allPositions;
+                allPositions.clear();
+                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                    allPositions.push_back(pos);
+                }
+                return allPositions;
+            }()
+            : window.filteredBackbonePositions;
+
+        for(const uint32_t pos : positions) {
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             anchorToWindow[aid] = windowId;
             anchorToBackbonePos[aid] = pos;
@@ -164,22 +178,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return true;
     };
 
-    // Intra-window edges: consecutive backbone anchor pairs,
+    // Intra-window edges: consecutive filtered backbone anchor pairs,
     // for both the original windows and their RC mirrors.
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
-        for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
-            const Shasta2AnchorId anchorIdA = backboneJourney[pos];
-            const Shasta2AnchorId anchorIdB = backboneJourney[pos + 1];
-            // Original window edge.
-            addEdgeIfValid(anchorIdA, anchorIdB);
-            // RC mirror window edge.
-            const Shasta2AnchorId rcAnchorIdA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
-            const Shasta2AnchorId rcAnchorIdB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
-            if(uint64_t(rcAnchorIdA) < anchorCount && uint64_t(rcAnchorIdB) < anchorCount) {
-                // RC reverses direction: B' -> A' (since the RC of A->B is B'->A').
-                addEdgeIfValid(rcAnchorIdB, rcAnchorIdA);
+
+        // Use filtered backbone positions if available.
+        const auto& positions = window.filteredBackbonePositions;
+        if(!positions.empty()) {
+            for(uint64_t i = 0; i + 1 < positions.size(); i++) {
+                const Shasta2AnchorId anchorIdA = backboneJourney[positions[i]];
+                const Shasta2AnchorId anchorIdB = backboneJourney[positions[i + 1]];
+                addEdgeIfValid(anchorIdA, anchorIdB);
+                // RC mirror edge.
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    addEdgeIfValid(rcB, rcA);
+                }
+            }
+        } else {
+            // Fallback: all consecutive positions.
+            for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
+                const Shasta2AnchorId anchorIdA = backboneJourney[pos];
+                const Shasta2AnchorId anchorIdB = backboneJourney[pos + 1];
+                addEdgeIfValid(anchorIdA, anchorIdB);
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    addEdgeIfValid(rcB, rcA);
+                }
             }
         }
     }

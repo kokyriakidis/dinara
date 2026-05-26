@@ -256,33 +256,110 @@ void Assembler::computeAnchorWindowsClean(
         return duplicateAnchorIds;
     };
 
+    // Filter a backbone journey interval to keep the longest subsequence
+    // where every consecutive pair has at least minCommonForBackbone common reads.
+    // Uses dynamic programming on a DAG with limited forward look.
+    const uint64_t minCommonForBackbone = 2;
+    const uint32_t maxSkipForBackbone = 10;
+
+    auto filterBackboneJourney = [&](
+        OrientedReadId backboneOid,
+        uint32_t seedBegin,
+        uint32_t seedEnd,
+        vector<uint32_t>& filteredPositions)
+    {
+        filteredPositions.clear();
+        const auto journey = (*shasta2Journeys)[backboneOid];
+        const uint32_t n = seedEnd - seedBegin;
+        if(n == 0) return;
+        if(n == 1) {
+            filteredPositions.push_back(seedBegin);
+            return;
+        }
+
+        // dp[i] = length of longest consistent subsequence ending at position i.
+        // prev[i] = predecessor index in the subsequence (-1 if none).
+        vector<uint32_t> dp(n, 1);
+        vector<int32_t> prev(n, -1);
+
+        for(uint32_t i = 1; i < n; i++) {
+            const Shasta2AnchorId anchorI = journey[seedBegin + i];
+            // Look back up to maxSkipForBackbone positions.
+            const uint32_t lookBack = min(i, maxSkipForBackbone);
+            for(uint32_t step = 1; step <= lookBack; step++) {
+                const uint32_t j = i - step;
+                const Shasta2AnchorId anchorJ = journey[seedBegin + j];
+                if(shasta2Anchors->countCommon(anchorJ, anchorI) >= minCommonForBackbone) {
+                    if(dp[j] + 1 > dp[i]) {
+                        dp[i] = dp[j] + 1;
+                        prev[i] = int32_t(j);
+                    }
+                }
+            }
+        }
+
+        // Find the position with the longest subsequence.
+        uint32_t bestEnd = 0;
+        for(uint32_t i = 1; i < n; i++) {
+            if(dp[i] > dp[bestEnd]) {
+                bestEnd = i;
+            }
+        }
+
+        // Reconstruct the subsequence.
+        vector<uint32_t> reversePath;
+        for(int32_t idx = int32_t(bestEnd); idx >= 0; idx = prev[idx]) {
+            reversePath.push_back(seedBegin + uint32_t(idx));
+        }
+        filteredPositions.assign(reversePath.rbegin(), reversePath.rend());
+    };
+
     auto createWindow = [&](OrientedReadId backboneOid, uint32_t seedBegin, uint32_t seedEnd) {
+        // Filter the backbone journey to keep only the longest subsequence
+        // where consecutive pairs have sufficient common read support.
+        vector<uint32_t> filteredPositions;
+        filterBackboneJourney(backboneOid, seedBegin, seedEnd, filteredPositions);
+
+        if(filteredPositions.size() < minBackboneWindowAnchors) {
+            return; // Too few anchors after filtering.
+        }
+
         const uint32_t windowId = uint32_t(anchorWindows.size());
         AnchorWindow window;
         window.windowId = windowId;
         window.backboneOrientedReadId = backboneOid;
-        window.backboneBegin = seedBegin;
-        window.backboneEnd = seedEnd;
+        // Use the filtered positions: first and last define the span.
+        window.backboneBegin = filteredPositions.front();
+        window.backboneEnd = filteredPositions.back() + 1;
+        window.filteredBackbonePositions = filteredPositions;
 
         // Get backbone journey and build a lookup: anchorId -> position in backbone.
+        // Only include anchors that survived filtering and don't have duplicate k-mers.
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
         std::unordered_map<uint64_t, uint32_t> backboneAnchorToPos;
-        backboneAnchorToPos.reserve(seedEnd - seedBegin);
+        backboneAnchorToPos.reserve(filteredPositions.size());
 
         // Find backbone anchors with duplicate k-mers and exclude them.
-        const auto backboneDuplicates = findDuplicateKmerAnchors(backboneJourney, seedBegin, seedEnd);
-        for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
-            if(backboneDuplicates.count(uint64_t(backboneJourney[pos])) == 0) {
-                backboneAnchorToPos[uint64_t(backboneJourney[pos])] = pos;
+        const auto backboneDuplicates = findDuplicateKmerAnchors(
+            backboneJourney, window.backboneBegin, window.backboneEnd);
+        // Build the lookup from filtered positions only.
+        std::unordered_set<uint64_t> filteredAnchorSet;
+        for(const uint32_t pos : filteredPositions) {
+            filteredAnchorSet.insert(uint64_t(backboneJourney[pos]));
+        }
+        for(const uint32_t pos : filteredPositions) {
+            const uint64_t aid = uint64_t(backboneJourney[pos]);
+            if(backboneDuplicates.count(aid) == 0) {
+                backboneAnchorToPos[aid] = pos;
             }
         }
 
-        // Add backbone read interval.
+        // Add backbone read interval (covers the full filtered span).
         window.readIntervals.push_back(AnchorWindowReadInterval{
             backboneOid,
-            seedBegin,
-            seedEnd,
-            uint32_t(seedEnd - seedBegin)});
+            window.backboneBegin,
+            window.backboneEnd,
+            uint32_t(filteredPositions.size())});
 
         // Collect all anchors to claim at the end.
         // Each entry is (orientedReadId, journey span begin, journey span end).
