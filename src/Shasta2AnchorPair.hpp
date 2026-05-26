@@ -73,28 +73,24 @@ public:
         uint32_t& minBaseOffset,
         uint32_t& maxBaseOffset) const;
 
-    // Get positions in journey, ordinals, base positions
+    // Get positions in journey and base positions
     // for each of the two reads and for each of the two anchors.
     // The positions returned are the midpoint of the markers
     // corresponding to anchorIdA and anchorIdB.
     class Positions {
     public:
         uint32_t positionInJourney;
-        uint32_t ordinal;
         uint32_t basePosition;
         Positions(
             uint32_t positionInJourney,
-            uint32_t ordinal,
             uint32_t basePosition) :
             positionInJourney(positionInJourney),
-            ordinal(ordinal),
             basePosition(basePosition)
         {}
 
         template<class Archive> void serialize(Archive& ar, unsigned int /* version */)
         {
             ar & positionInJourney;
-            ar & ordinal;
             ar & basePosition;
         }
     };
