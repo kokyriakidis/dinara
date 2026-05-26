@@ -1140,13 +1140,6 @@ public:
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
 
-    // Remove weak cis overlaps contradicted by strong phasing evidence.
-    // Adapted from hifiasm's clean_weak_ma_hit_t. A weak overlap (both sides
-    // ecMatchState == 0, no het sites) is deleted if a strong cis overlap of
-    // the same read contains it and has a trans connection to the weak target.
-    // Call after phaseOverlapsKmeans, before rescueTransOverlaps.
-    void cleanWeakOverlaps();
-
     // Rescue overlaps where one side says trans but the partner says cis.
     // Adapted from hifiasm's try_rescue_overlaps. If ≥ minPileup disagreement
     // overlaps pile up spatially on a read, that read's trans calls are flipped
