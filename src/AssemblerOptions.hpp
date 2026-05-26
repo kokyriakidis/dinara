@@ -561,6 +561,15 @@ public:
     // Candidates with fewer shared reads are discarded.
     uint64_t minInterWindowCoverage;
 
+    // Minimum common reads between consecutive backbone anchors.
+    // Backbone journeys are filtered to keep the longest subsequence
+    // where every consecutive pair meets this threshold.
+    uint64_t minCommonForBackbone;
+
+    // Maximum number of positions to look back when filtering
+    // backbone journeys for well-supported consecutive pairs.
+    uint64_t maxSkipForBackbone;
+
     // Options used by class mode3::LocalAssembly
     class LocalAssemblyOptions {
     public:

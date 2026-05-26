@@ -1428,6 +1428,21 @@ void AssemblerOptions::addConfigurableOptions()
         "Candidates with fewer shared reads are discarded. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minCommonForBackbone",
+        value<uint64_t>(&assemblyOptions.mode3Options.minCommonForBackbone)->
+        default_value(2),
+        "Minimum common reads between consecutive backbone anchors. "
+        "Backbone journeys are filtered to keep the longest subsequence "
+        "where every consecutive pair meets this threshold. "
+        "(Mode 3 assembly only).")
+
+        ("Assembly.mode3.maxSkipForBackbone",
+        value<uint64_t>(&assemblyOptions.mode3Options.maxSkipForBackbone)->
+        default_value(10),
+        "Maximum positions to look back when filtering backbone journeys "
+        "for well-supported consecutive anchor pairs. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
         default_value(0),
@@ -1869,6 +1884,8 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minAnchorCoverageMultiplier = " << minAnchorCoverageMultiplier << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
     s << "mode3.minInterWindowCoverage = " << minInterWindowCoverage << "\n";
+    s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
+    s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);
