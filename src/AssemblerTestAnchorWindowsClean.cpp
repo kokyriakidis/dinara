@@ -104,21 +104,21 @@ void Assembler::testAnchorWindowsCleanLongestRead(
     }
 
     // Find inter-window connecting edges by walking read journeys.
-    // For each read, walk its journey and track which window each anchor
-    // belongs to. When the window changes, record a connecting edge from
-    // the last backbone anchor in the previous window to the first backbone
-    // anchor in the next window.
-    // For each ordered window pair (windowA, windowB), keep a single edge:
-    // from the latest backbone anchor in windowA to the earliest backbone
-    // anchor in windowB, across all reads that cross that boundary.
-    struct WindowPairEdge {
-        Shasta2AnchorId anchorIdA;  // Latest backbone anchor in window A.
-        Shasta2AnchorId anchorIdB;  // Earliest backbone anchor in window B.
-        uint32_t backbonePosA;      // Backbone position of anchorIdA.
-        uint32_t backbonePosB;      // Backbone position of anchorIdB.
+    // For each read, when it crosses from window A to window B, record
+    // the (lastAnchorInA, firstAnchorInB) pair. Collect all such pairs
+    // per window pair and emit edges for all of them.
+    struct AnchorPairKey {
+        Shasta2AnchorId anchorIdA;
+        Shasta2AnchorId anchorIdB;
+        bool operator<(const AnchorPairKey& o) const {
+            if(anchorIdA != o.anchorIdA) return anchorIdA < o.anchorIdA;
+            return anchorIdB < o.anchorIdB;
+        }
     };
-    // Key: (windowA, windowB).
-    map<pair<uint32_t, uint32_t>, WindowPairEdge> windowPairEdges;
+    // For each window pair, collect all candidate (anchorA, anchorB) pairs
+    // with the number of reads that suggested each pair.
+    std::map<std::pair<uint32_t, uint32_t>,
+             std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
     const uint64_t orientedReadCount = 2 * readCount;
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
@@ -127,11 +127,8 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         const auto journey = (*shasta2Journeys)[oid];
         if(journey.empty()) continue;
 
-        // Walk the journey, tracking the last backbone anchor seen in the
-        // current window. Only move forward in backbone order within a window.
         uint32_t currentWindow = noWindow;
         Shasta2AnchorId lastAnchorInCurrentWindow = 0;
-        uint32_t lastBackbonePosInCurrentWindow = 0;
 
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
             const Shasta2AnchorId anchorId = journey[pos];
@@ -139,45 +136,28 @@ void Assembler::testAnchorWindowsCleanLongestRead(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
-
             if(windowId == currentWindow) {
-                // Same window — only update if moving forward in backbone order.
-                if(backbonePos > lastBackbonePosInCurrentWindow) {
-                    lastAnchorInCurrentWindow = anchorId;
-                    lastBackbonePosInCurrentWindow = backbonePos;
-                }
+                lastAnchorInCurrentWindow = anchorId;
             } else {
-                // Window transition.
                 if(currentWindow != noWindow) {
                     auto key = make_pair(currentWindow, windowId);
-                    auto it = windowPairEdges.find(key);
-                    if(it == windowPairEdges.end()) {
-                        windowPairEdges[key] = WindowPairEdge{
-                            lastAnchorInCurrentWindow, anchorId,
-                            lastBackbonePosInCurrentWindow, backbonePos};
-                    } else {
-                        // Keep the latest anchor in window A.
-                        if(lastBackbonePosInCurrentWindow > it->second.backbonePosA) {
-                            it->second.anchorIdA = lastAnchorInCurrentWindow;
-                            it->second.backbonePosA = lastBackbonePosInCurrentWindow;
-                        }
-                        // Keep the earliest anchor in window B.
-                        if(backbonePos < it->second.backbonePosB) {
-                            it->second.anchorIdB = anchorId;
-                            it->second.backbonePosB = backbonePos;
-                        }
-                    }
+                    AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
+                    windowPairCandidates[key][apk]++;
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
-                lastBackbonePosInCurrentWindow = backbonePos;
             }
         }
     }
 
-    cout << timestamp << "Found " << windowPairEdges.size()
-         << " inter-window connecting edges." << endl;
+    // Count total candidate edges across all window pairs.
+    uint64_t totalCandidateEdges = 0;
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        totalCandidateEdges += candidates.size();
+    }
+    cout << timestamp << "Found " << windowPairCandidates.size()
+         << " window pairs with " << totalCandidateEdges
+         << " candidate inter-window edges." << endl;
 
     // Count common oriented reads between two anchors using two-pointer merge.
     // Both anchors' marker info spans are sorted by orientedReadId.
@@ -263,13 +243,25 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         }
     }
 
-    // Write inter-window connecting edges.
+    // Write inter-window connecting edges for all candidate anchor pairs.
     uint64_t totalInterEdges = 0;
-    for(const auto& [windowPair, edge] : windowPairEdges) {
-        gfa << "L\t" << edge.anchorIdA << "\t+\t"
-            << edge.anchorIdB << "\t+\t0M"
-            << "\tRC:i:" << commonReadCount(edge.anchorIdA, edge.anchorIdB) << "\n";
-        ++totalInterEdges;
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        for(const auto& [apk, count] : candidates) {
+            const uint64_t rc = commonReadCount(apk.anchorIdA, apk.anchorIdB);
+            // Emit vertex for any inter-window anchor not already emitted.
+            if(emittedVertices.insert(uint64_t(apk.anchorIdA)).second) {
+                gfa << "S\t" << apk.anchorIdA << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+            if(emittedVertices.insert(uint64_t(apk.anchorIdB)).second) {
+                gfa << "S\t" << apk.anchorIdB << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+            gfa << "L\t" << apk.anchorIdA << "\t+\t"
+                << apk.anchorIdB << "\t+\t0M"
+                << "\tRC:i:" << rc << "\n";
+            ++totalInterEdges;
+        }
     }
 
     cout << timestamp << "Wrote " << gfaFileName
@@ -357,13 +349,17 @@ void Assembler::writeAnchorWindowsCleanGfa(
     }
 
     // Find inter-window connecting edges by walking read journeys.
-    struct WindowPairEdge {
+    // Collect all candidate (anchorA, anchorB) pairs per window pair.
+    struct AnchorPairKey {
         Shasta2AnchorId anchorIdA;
         Shasta2AnchorId anchorIdB;
-        uint32_t backbonePosA;
-        uint32_t backbonePosB;
+        bool operator<(const AnchorPairKey& o) const {
+            if(anchorIdA != o.anchorIdA) return anchorIdA < o.anchorIdA;
+            return anchorIdB < o.anchorIdB;
+        }
     };
-    map<pair<uint32_t, uint32_t>, WindowPairEdge> windowPairEdges;
+    std::map<std::pair<uint32_t, uint32_t>,
+             std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
     const uint64_t orientedReadCount = 2 * readCount;
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
@@ -374,7 +370,6 @@ void Assembler::writeAnchorWindowsCleanGfa(
 
         uint32_t currentWindow = noWindow;
         Shasta2AnchorId lastAnchorInCurrentWindow = 0;
-        uint32_t lastBackbonePosInCurrentWindow = 0;
 
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
             const Shasta2AnchorId anchorId = journey[pos];
@@ -382,41 +377,27 @@ void Assembler::writeAnchorWindowsCleanGfa(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            const uint32_t backbonePos = anchorToBackbonePos[uint64_t(anchorId)];
-
             if(windowId == currentWindow) {
-                if(backbonePos > lastBackbonePosInCurrentWindow) {
-                    lastAnchorInCurrentWindow = anchorId;
-                    lastBackbonePosInCurrentWindow = backbonePos;
-                }
+                lastAnchorInCurrentWindow = anchorId;
             } else {
                 if(currentWindow != noWindow) {
                     auto key = make_pair(currentWindow, windowId);
-                    auto it = windowPairEdges.find(key);
-                    if(it == windowPairEdges.end()) {
-                        windowPairEdges[key] = WindowPairEdge{
-                            lastAnchorInCurrentWindow, anchorId,
-                            lastBackbonePosInCurrentWindow, backbonePos};
-                    } else {
-                        if(lastBackbonePosInCurrentWindow > it->second.backbonePosA) {
-                            it->second.anchorIdA = lastAnchorInCurrentWindow;
-                            it->second.backbonePosA = lastBackbonePosInCurrentWindow;
-                        }
-                        if(backbonePos < it->second.backbonePosB) {
-                            it->second.anchorIdB = anchorId;
-                            it->second.backbonePosB = backbonePos;
-                        }
-                    }
+                    AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
+                    windowPairCandidates[key][apk]++;
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
-                lastBackbonePosInCurrentWindow = backbonePos;
             }
         }
     }
 
-    cout << timestamp << "Found " << windowPairEdges.size()
-         << " inter-window connecting edges." << endl;
+    uint64_t totalCandidateEdges = 0;
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        totalCandidateEdges += candidates.size();
+    }
+    cout << timestamp << "Found " << windowPairCandidates.size()
+         << " window pairs with " << totalCandidateEdges
+         << " candidate inter-window edges." << endl;
 
     // Count common oriented reads between two anchors.
     auto commonReadCount = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> uint64_t {
@@ -492,13 +473,24 @@ void Assembler::writeAnchorWindowsCleanGfa(
         }
     }
 
-    // Inter-window connecting edges.
+    // Inter-window connecting edges for all candidate anchor pairs.
     uint64_t totalInterEdges = 0;
-    for(const auto& [windowPair, edge] : windowPairEdges) {
-        gfa << "L\t" << edge.anchorIdA << "\t+\t"
-            << edge.anchorIdB << "\t+\t0M"
-            << "\tRC:i:" << commonReadCount(edge.anchorIdA, edge.anchorIdB) << "\n";
-        ++totalInterEdges;
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        for(const auto& [apk, count] : candidates) {
+            const uint64_t rc = commonReadCount(apk.anchorIdA, apk.anchorIdB);
+            if(emittedVertices.insert(uint64_t(apk.anchorIdA)).second) {
+                gfa << "S\t" << apk.anchorIdA << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+            if(emittedVertices.insert(uint64_t(apk.anchorIdB)).second) {
+                gfa << "S\t" << apk.anchorIdB << "\t*\tLN:i:1\n";
+                ++totalVertices;
+            }
+            gfa << "L\t" << apk.anchorIdA << "\t+\t"
+                << apk.anchorIdB << "\t+\t0M"
+                << "\tRC:i:" << rc << "\n";
+            ++totalInterEdges;
+        }
     }
 
     cout << timestamp << "Wrote " << gfaFileName
