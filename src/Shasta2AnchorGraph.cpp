@@ -345,6 +345,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Remove contradictory window pairs: if both (W1,W2) and (W2,W1) exist,
+    // the connection is unreliable — remove both directions.
+    {
+        std::set<std::pair<uint32_t, uint32_t>> toRemove;
+        for(const auto& [wp, candidates] : windowPairCandidates) {
+            auto reverse = std::make_pair(wp.second, wp.first);
+            if(windowPairCandidates.count(reverse)) {
+                toRemove.insert(wp);
+                toRemove.insert(reverse);
+            }
+        }
+        if(!toRemove.empty()) {
+            cout << "Removed " << toRemove.size()
+                 << " contradictory inter-window pairs (both directions present)." << endl;
+            for(const auto& wp : toRemove) {
+                windowPairCandidates.erase(wp);
+            }
+        }
+    }
+
     // For each window pair, pick the candidate with the most shared reads.
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowBelowCoverage = 0;
