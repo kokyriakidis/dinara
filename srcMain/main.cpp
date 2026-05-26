@@ -1258,8 +1258,8 @@ void dinara::main::assemble(
     // Compute anchor windows and run CIGAR-based SNP detection.
     cout << timestamp << "Computing anchor windows..." << endl;
     vector<AnchorWindow> anchorWindows;
-    const uint64_t minCommonForBackbone = 4;
-        // assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
+    const uint64_t minCommonForBackbone =
+        assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
     assembler.computeAnchorWindowsClean(
@@ -1641,8 +1641,8 @@ void dinara::main::assemble(
     }
 
     // Write AnchorWindowsClean GFA.
-    const uint64_t minInterWindowCoverage = 4;
-        // assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
+    const uint64_t minInterWindowCoverage =
+        assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
     assembler.writeAnchorWindowsCleanGfa(anchorWindows, minInterWindowCoverage);
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
