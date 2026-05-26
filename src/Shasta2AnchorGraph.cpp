@@ -106,7 +106,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const Shasta2Journeys& journeys,
     const vector<AnchorWindow>& anchorWindows,
     uint64_t minInterWindowCoverage,
-    uint64_t threadCount) :
+    uint64_t threadCount,
+    const Reads* reads) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
@@ -271,11 +272,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
+    uint64_t containedSkipCount = 0;
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
         const auto journey = journeys[oid];
         if(journey.empty()) continue;
+
+        // Skip contained reads for inter-window edge discovery.
+        if(reads) {
+            const ReadId readId = oid.getReadId();
+            if(readId < reads->readCount() && reads->getFlags(readId).isContained) {
+                ++containedSkipCount;
+                continue;
+            }
+        }
 
         uint32_t currentWindow = noWindow;
         Shasta2AnchorId lastAnchorInCurrentWindow = 0;
@@ -328,6 +339,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "anchorToWindow: " << mappedCount << " of " << anchorCount
              << " anchors mapped to " << windowCount << " original + "
              << windowCount << " RC mirror windows." << endl;
+        if(reads) {
+            cout << "Skipped " << containedSkipCount
+                 << " contained oriented reads for inter-window edge discovery." << endl;
+        }
     }
 
     // For each window pair, pick the candidate with the most shared reads.
