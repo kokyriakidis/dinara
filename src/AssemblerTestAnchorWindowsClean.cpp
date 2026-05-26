@@ -345,10 +345,13 @@ void Assembler::writeAnchorWindowsCleanGfa(
     const uint64_t anchorCount = shasta2Anchors->size();
 
     // Build anchorId -> windowId and anchorId -> backbone position maps.
+    // For each original window W (windowId), also create a mirror RC window
+    // (windowId + windowCount) whose backbone anchors are the RC of the originals.
     const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
     vector<uint32_t> anchorToWindow(anchorCount, noWindow);
     vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
-    for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
@@ -356,6 +359,12 @@ void Assembler::writeAnchorWindowsCleanGfa(
             const Shasta2AnchorId anchorId = backboneJourney[pos];
             anchorToWindow[uint64_t(anchorId)] = windowId;
             anchorToBackbonePos[uint64_t(anchorId)] = pos;
+            // Mirror RC window.
+            const uint64_t rcAid = uint64_t(anchorId) ^ 1ULL;
+            if(rcAid < anchorCount) {
+                anchorToWindow[rcAid] = windowId + windowCount;
+                anchorToBackbonePos[rcAid] = pos;
+            }
         }
     }
 
@@ -439,47 +448,76 @@ void Assembler::writeAnchorWindowsCleanGfa(
     uint64_t totalAltEdges = 0;
     unordered_set<uint64_t> emittedVertices;
 
+    // Helper to emit a vertex if not already emitted.
+    auto emitVertex = [&](Shasta2AnchorId anchorId) {
+        if(emittedVertices.insert(uint64_t(anchorId)).second) {
+            gfa << "S\t" << anchorId << "\t*\tLN:i:1\n";
+            ++totalVertices;
+        }
+    };
+
+    // Helper to emit a link.
+    auto emitLink = [&](Shasta2AnchorId idA, Shasta2AnchorId idB, uint64_t& counter) {
+        gfa << "L\t" << idA << "\t+\t"
+            << idB << "\t+\t0M"
+            << "\tRC:i:" << commonReadCount(idA, idB) << "\n";
+        ++counter;
+    };
+
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
-        // Backbone vertices.
+        // Backbone vertices and their RC mirrors.
         for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-            if(emittedVertices.insert(uint64_t(backboneJourney[pos])).second) {
-                gfa << "S\t" << backboneJourney[pos] << "\t*\tLN:i:1\n";
-                ++totalVertices;
+            emitVertex(backboneJourney[pos]);
+            const Shasta2AnchorId rcId = Shasta2AnchorId(uint64_t(backboneJourney[pos]) ^ 1ULL);
+            if(uint64_t(rcId) < anchorCount) {
+                emitVertex(rcId);
             }
         }
 
-        // Intra-window edges: consecutive backbone pairs.
+        // Intra-window edges: consecutive backbone pairs + RC mirrors.
         for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
             const Shasta2AnchorId idA = backboneJourney[pos];
             const Shasta2AnchorId idB = backboneJourney[pos + 1];
-            gfa << "L\t" << idA << "\t+\t"
-                << idB << "\t+\t0M"
-                << "\tRC:i:" << commonReadCount(idA, idB) << "\n";
-            ++totalIntraEdges;
+            // Original edge.
+            emitLink(idA, idB, totalIntraEdges);
+            // RC mirror edge (reversed direction).
+            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(idA) ^ 1ULL);
+            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(idB) ^ 1ULL);
+            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                emitLink(rcB, rcA, totalIntraEdges);
+            }
         }
 
         // Alternate path vertices and edges — only for het windows.
+        // Also create RC mirror edges.
         if(window.cleanHetSnpCount > 0) {
             for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
+                // Forward chain: collect vertices and edges.
+                vector<Shasta2AnchorId> forwardChain;
+                forwardChain.push_back(altPath.anchorIdA);
                 for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                    if(emittedVertices.insert(uint64_t(mid)).second) {
-                        gfa << "S\t" << mid << "\t*\tLN:i:1\n";
-                        ++totalVertices;
+                    emitVertex(mid);
+                    const Shasta2AnchorId rcMid = Shasta2AnchorId(uint64_t(mid) ^ 1ULL);
+                    if(uint64_t(rcMid) < anchorCount) emitVertex(rcMid);
+                    forwardChain.push_back(mid);
+                }
+                forwardChain.push_back(altPath.anchorIdB);
+
+                // Forward edges.
+                for(uint64_t i = 0; i + 1 < forwardChain.size(); i++) {
+                    emitLink(forwardChain[i], forwardChain[i+1], totalAltEdges);
+                }
+                // RC mirror edges (reversed).
+                for(uint64_t i = forwardChain.size() - 1; i > 0; i--) {
+                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(forwardChain[i]) ^ 1ULL);
+                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(forwardChain[i-1]) ^ 1ULL);
+                    if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                        emitLink(rcA, rcB, totalAltEdges);
                     }
                 }
-                Shasta2AnchorId prev = altPath.anchorIdA;
-                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                    gfa << "L\t" << prev << "\t+\t" << mid << "\t+\t0M"
-                        << "\tRC:i:" << commonReadCount(prev, mid) << "\n";
-                    ++totalAltEdges;
-                    prev = mid;
-                }
-                gfa << "L\t" << prev << "\t+\t" << altPath.anchorIdB << "\t+\t0M"
-                    << "\tRC:i:" << commonReadCount(prev, altPath.anchorIdB) << "\n";
-                ++totalAltEdges;
             }
         }
     }
@@ -528,7 +566,6 @@ void Assembler::writeAnchorWindowsCleanGfa(
     }
     csv << "Name,Color\n";
 
-    const uint32_t windowCount = uint32_t(anchorWindows.size());
     for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;

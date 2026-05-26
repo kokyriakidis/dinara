@@ -122,10 +122,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     nextEdgeId = 0;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
+    // For each original window W (windowId), we also create a mirror RC window
+    // (windowId + windowCount) whose backbone anchors are the RC (anchorId ^ 1)
+    // of the original backbone anchors. This lets strand-1 reads discover
+    // inter-window transitions through the RC windows.
     const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
     vector<uint32_t> anchorToWindow(anchorCount, noWindow);
     vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
-    for(uint32_t windowId = 0; windowId < uint32_t(anchorWindows.size()); windowId++) {
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
@@ -133,34 +138,49 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             anchorToWindow[aid] = windowId;
             anchorToBackbonePos[aid] = pos;
-            // Also map the RC anchor so strand-1 journeys can find this window.
+            // Mirror RC window: map the RC anchor to windowId + windowCount.
             const uint64_t rcAid = aid ^ 1ULL;
             if(rcAid < anchorCount) {
-                anchorToWindow[rcAid] = windowId;
+                anchorToWindow[rcAid] = windowId + windowCount;
                 anchorToBackbonePos[rcAid] = pos;
             }
         }
     }
 
-    // Intra-window edges: consecutive backbone anchor pairs.
+    // Helper to add an edge if the anchor pair has shared oriented reads.
+    auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
+        Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
+        if(anchorPair.orientedReadIds.empty()) {
+            return false;
+        }
+        DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
+        edge_descriptor e;
+        tie(e, ignore) = add_edge(
+            anchorPair.anchorIdA,
+            anchorPair.anchorIdB,
+            Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+            anchorGraph);
+        anchorGraph[e].useForAssembly = true;
+        return true;
+    };
+
+    // Intra-window edges: consecutive backbone anchor pairs,
+    // for both the original windows and their RC mirrors.
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
         for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
             const Shasta2AnchorId anchorIdA = backboneJourney[pos];
             const Shasta2AnchorId anchorIdB = backboneJourney[pos + 1];
-            Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
-            if(anchorPair.orientedReadIds.empty()) {
-                continue;
+            // Original window edge.
+            addEdgeIfValid(anchorIdA, anchorIdB);
+            // RC mirror window edge.
+            const Shasta2AnchorId rcAnchorIdA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
+            const Shasta2AnchorId rcAnchorIdB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
+            if(uint64_t(rcAnchorIdA) < anchorCount && uint64_t(rcAnchorIdB) < anchorCount) {
+                // RC reverses direction: B' -> A' (since the RC of A->B is B'->A').
+                addEdgeIfValid(rcAnchorIdB, rcAnchorIdA);
             }
-            DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
-            edge_descriptor e;
-            tie(e, ignore) = add_edge(
-                anchorPair.anchorIdA,
-                anchorPair.anchorIdB,
-                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                anchorGraph);
-            anchorGraph[e].useForAssembly = true;
         }
     }
 
@@ -168,39 +188,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // anchorIdA -> intermediate[0] -> ... -> intermediate[N-1] -> anchorIdB.
     // These form parallel paths (bubbles) at het sites.
     // Only emit for windows with detected het SNPs.
+    // Also create RC mirror edges.
     uint64_t alternatePathEdgeCount = 0;
     for(const AnchorWindow& window : anchorWindows) {
         if(window.cleanHetSnpCount == 0) continue;
         for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-            // Build the chain: A -> intermediates -> B.
+            // Build the forward chain: A -> intermediates -> B.
             Shasta2AnchorId prevAnchorId = altPath.anchorIdA;
+            vector<Shasta2AnchorId> forwardChain;
+            forwardChain.push_back(prevAnchorId);
             for(const Shasta2AnchorId midAnchorId : altPath.intermediateAnchorIds) {
-                Shasta2AnchorPair anchorPair(anchors, prevAnchorId, midAnchorId, false);
-                if(!anchorPair.orientedReadIds.empty()) {
-                    DINARA_ASSERT(anchors.countCommon(prevAnchorId, midAnchorId) > 0);
-                    edge_descriptor e;
-                    tie(e, ignore) = add_edge(
-                        anchorPair.anchorIdA,
-                        anchorPair.anchorIdB,
-                        Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                        anchorGraph);
-                    anchorGraph[e].useForAssembly = true;
+                if(addEdgeIfValid(prevAnchorId, midAnchorId)) {
                     ++alternatePathEdgeCount;
                 }
+                forwardChain.push_back(midAnchorId);
                 prevAnchorId = midAnchorId;
             }
             // Last edge: last intermediate -> anchorIdB.
-            Shasta2AnchorPair anchorPair(anchors, prevAnchorId, altPath.anchorIdB, false);
-            if(!anchorPair.orientedReadIds.empty()) {
-                DINARA_ASSERT(anchors.countCommon(prevAnchorId, altPath.anchorIdB) > 0);
-                edge_descriptor e;
-                tie(e, ignore) = add_edge(
-                    anchorPair.anchorIdA,
-                    anchorPair.anchorIdB,
-                    Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                    anchorGraph);
-                anchorGraph[e].useForAssembly = true;
+            if(addEdgeIfValid(prevAnchorId, altPath.anchorIdB)) {
                 ++alternatePathEdgeCount;
+            }
+            forwardChain.push_back(altPath.anchorIdB);
+
+            // RC mirror: reverse the chain and flip each anchor ID.
+            for(uint64_t i = forwardChain.size() - 1; i > 0; i--) {
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(forwardChain[i]) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(forwardChain[i-1]) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    if(addEdgeIfValid(rcA, rcB)) {
+                        ++alternatePathEdgeCount;
+                    }
+                }
             }
         }
     }
@@ -224,11 +242,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
-    // Helper to get the canonical anchor ID (even-indexed member of the pair).
-    auto canonicalAnchorId = [](Shasta2AnchorId anchorId) -> Shasta2AnchorId {
-        return Shasta2AnchorId(uint64_t(anchorId) & ~1ULL);
-    };
-
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
@@ -248,12 +261,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 lastAnchorInCurrentWindow = anchorId;
             } else {
                 if(currentWindow != noWindow) {
-                    // Normalize to canonical anchor IDs so inter-window edges
-                    // connect the same vertices as intra-window backbone chains.
-                    const Shasta2AnchorId canonA = canonicalAnchorId(lastAnchorInCurrentWindow);
-                    const Shasta2AnchorId canonB = canonicalAnchorId(anchorId);
                     auto key = std::make_pair(currentWindow, windowId);
-                    AnchorPairKey apk{canonA, canonB};
+                    AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
                     windowPairCandidates[key][apk]++;
                 }
                 currentWindow = windowId;
@@ -262,7 +271,40 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Diagnostic: count window pairs and candidates.
+    {
+        uint64_t totalCandidateEdges = 0;
+        uint64_t fwFwPairs = 0, fwRcPairs = 0, rcFwPairs = 0, rcRcPairs = 0;
+        for(const auto& [wp, cands] : windowPairCandidates) {
+            totalCandidateEdges += cands.size();
+            const bool aIsRc = (wp.first >= windowCount);
+            const bool bIsRc = (wp.second >= windowCount);
+            if(!aIsRc && !bIsRc) ++fwFwPairs;
+            else if(!aIsRc && bIsRc) ++fwRcPairs;
+            else if(aIsRc && !bIsRc) ++rcFwPairs;
+            else ++rcRcPairs;
+        }
+        cout << "Inter-window edge discovery: " << windowPairCandidates.size()
+             << " window pairs (" << fwFwPairs << " fw-fw, "
+             << rcRcPairs << " rc-rc, "
+             << fwRcPairs << " fw-rc, "
+             << rcFwPairs << " rc-fw) with "
+             << totalCandidateEdges << " candidate anchor pairs." << endl;
+
+        // Count how many anchors are mapped vs total.
+        uint64_t mappedCount = 0;
+        for(uint64_t i = 0; i < anchorCount; i++) {
+            if(anchorToWindow[i] != noWindow) mappedCount++;
+        }
+        cout << "anchorToWindow: " << mappedCount << " of " << anchorCount
+             << " anchors mapped to " << windowCount << " original + "
+             << windowCount << " RC mirror windows." << endl;
+    }
+
     // For each window pair, pick the candidate with the most shared reads.
+    uint64_t interWindowZeroPairs = 0;
+    uint64_t interWindowBelowCoverage = 0;
+    uint64_t interWindowCreated = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
@@ -273,7 +315,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 bestPair = std::move(anchorPair);
             }
         }
-        if(bestSize >= minInterWindowCoverage) {
+        if(bestSize == 0) {
+            ++interWindowZeroPairs;
+        } else if(bestSize < minInterWindowCoverage) {
+            ++interWindowBelowCoverage;
+        } else {
             DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
             edge_descriptor e;
             tie(e, ignore) = add_edge(
@@ -282,8 +328,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
                 anchorGraph);
             anchorGraph[e].useForAssembly = true;
+            ++interWindowCreated;
         }
     }
+    cout << "Inter-window edges: " << interWindowCreated << " created, "
+         << interWindowZeroPairs << " rejected (zero forward-flow reads), "
+         << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
+         << minInterWindowCoverage << ")." << endl;
 
     // Validate: check that every edge has shared oriented reads.
     {
