@@ -133,6 +133,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             anchorToWindow[aid] = windowId;
             anchorToBackbonePos[aid] = pos;
+            // Also map the RC anchor so strand-1 journeys can find this window.
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount) {
+                anchorToWindow[rcAid] = windowId;
+                anchorToBackbonePos[rcAid] = pos;
+            }
         }
     }
 
@@ -218,6 +224,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
+    // Helper to get the canonical anchor ID (even-indexed member of the pair).
+    auto canonicalAnchorId = [](Shasta2AnchorId anchorId) -> Shasta2AnchorId {
+        return Shasta2AnchorId(uint64_t(anchorId) & ~1ULL);
+    };
+
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
@@ -237,8 +248,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 lastAnchorInCurrentWindow = anchorId;
             } else {
                 if(currentWindow != noWindow) {
+                    // Normalize to canonical anchor IDs so inter-window edges
+                    // connect the same vertices as intra-window backbone chains.
+                    const Shasta2AnchorId canonA = canonicalAnchorId(lastAnchorInCurrentWindow);
+                    const Shasta2AnchorId canonB = canonicalAnchorId(anchorId);
                     auto key = std::make_pair(currentWindow, windowId);
-                    AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
+                    AnchorPairKey apk{canonA, canonB};
                     windowPairCandidates[key][apk]++;
                 }
                 currentWindow = windowId;
