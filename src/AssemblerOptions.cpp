@@ -1421,6 +1421,13 @@ void AssemblerOptions::addConfigurableOptions()
         "High coverage threshold for cross edge removal in the anchor graph. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minInterWindowCoverage",
+        value<uint64_t>(&assemblyOptions.mode3Options.minInterWindowCoverage)->
+        default_value(2),
+        "Minimum shared read count for an inter-window edge. "
+        "Candidates with fewer shared reads are discarded. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
         default_value(0),
@@ -1861,6 +1868,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.maxAnchorCoverage = " << maxAnchorCoverage << "\n";
     s << "mode3.minAnchorCoverageMultiplier = " << minAnchorCoverageMultiplier << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
+    s << "mode3.minInterWindowCoverage = " << minInterWindowCoverage << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);

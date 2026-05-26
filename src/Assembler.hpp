@@ -3649,12 +3649,15 @@ public:
 
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.
-    void testAnchorWindowsCleanLongestRead(uint64_t threadCount);
+    void testAnchorWindowsCleanLongestRead(
+        uint64_t threadCount,
+        uint64_t minInterWindowCoverage);
 
     // Write AnchorWindowsClean.gfa and .csv from pre-computed windows.
     // Uses cleanHetSnpCount to gate alternate-path output.
     void writeAnchorWindowsCleanGfa(
-        const vector<AnchorWindow>& anchorWindows);
+        const vector<AnchorWindow>& anchorWindows,
+        uint64_t minInterWindowCoverage);
 
     // Original version: claims all unclaimed anchors in the touched range.
     void computeAnchorWindows(
