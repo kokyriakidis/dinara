@@ -980,11 +980,15 @@ void dinara::main::assemble(
         assemblerOptions.overlapCandidatesOptions.invertedIndexMinNChain,     // MIN_N_CHAIN = 100
         uint64_t(double(coverageHet) * assemblerOptions.overlapCandidatesOptions.invertedIndexHighFactor + 0.499));  // hom_cov * 5.0
 
-    // Always build the inverted index for k-mer lookups (needed by both paths)
+    // Build the inverted index: for each k-mer, store which reads contain
+    // it and at what position. Used for overlap candidate discovery and
+    // for chaining marker matches into alignments.
     assembler.buildInvertedIndex(threadCount);
 
-    // Flag palindromic reads before chaining so they are excluded
-    // from overlap discovery.
+    // Detect palindromic reads — reads whose reverse complement aligns well
+    // to themselves. These cause spurious overlaps because both strands map
+    // to the same genomic location. Flagged reads are excluded from overlap
+    // candidate discovery.
     if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
         assembler.flagPalindromicReads(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
@@ -994,9 +998,14 @@ void dinara::main::assemble(
             threadCount);
     }
 
-    // Find and chain alignment candidates.
+    // Discover overlapping read pairs and chain their shared markers into
+    // alignments. Each chain represents a collinear sequence of marker
+    // matches between two reads, scored by the number of shared seeds.
+    // Two paths are supported:
+    // - PAF: read pairs are imported from an external PAF file, then chained.
+    // - Inverted index: read pairs are discovered by shared k-mer lookups,
+    //   then chained. This is the default path.
     if(!assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile.empty()) {
-        // PAF path: Import candidate pairs from PAF, then chain them using the inverted index.
         assembler.importAlignmentCandidatesFromPaf(assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile);
         assembler.chainPafCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
@@ -1005,7 +1014,6 @@ void dinara::main::assemble(
             threadCount
         );
     } else {
-        // Inverted Index path: Discover candidate pairs via k-mer matches and chain them.
         assembler.chainAlignmentCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
@@ -1021,8 +1029,9 @@ void dinara::main::assemble(
     //     assemblerOptions.alignOptions,
     //     threadCount);
 
-    // Previous full evidence path. Use this instead of the lightweight path
-    // when base-level projected alignments and SNP/indel evidence are needed.
+    // Compute base-level pairwise alignments for all overlaps and store
+    // the resulting CIGARs. These are used downstream for CIGAR-based
+    // SNP/indel detection in the phasing windows.
     assembler.computeBaseAlignmentsAndStore(
         assemblerOptions.alignOptions,
         threadCount);
@@ -1052,10 +1061,60 @@ void dinara::main::assemble(
     // Runs after phasing so that only cis and unclassified overlaps compete.
     // assembler.dedupChainsPrePhasing(threadCount);
 
-    // Remove all chains for read pairs that have multiple chains on the
-    // same strand. Such multi-chain pairs are likely repeat-induced and
-    // can corrupt the marker graph during transitive collapse.
+    // For each read pair, if there are multiple chains on the same strand,
+    // delete all of them. A legitimate overlap produces one chain per strand.
+    // Multiple chains indicate the reads overlap in a repeat region where
+    // the chainer found multiple plausible paths. Keeping any of them risks
+    // merging distinct repeat copies during transitive collapse.
     assembler.removeMultiChainAlignments(threadCount);
+
+    // Count read pairs that have alignments on both strands.
+    {
+        const auto& alignmentTable = assembler.getAlignmentTable();
+        const auto& alignmentData = assembler.alignmentData;
+        const uint64_t readCount = assembler.getReads().readCount();
+        uint64_t bothStrandsPairCount = 0;
+        uint64_t bothStrandsAlignmentCount = 0;
+
+        for (ReadId r0 = ReadId(0); r0 < ReadId(readCount); ++r0) {
+            const OrientedReadId orientedR0(r0, 0);
+            const auto table = alignmentTable[orientedR0.getValue()];
+
+            // Group by partner ReadId, track which strands are present.
+            std::map<ReadId, std::pair<bool, bool>> partnerStrands;  // {hasSame, hasOpposite}
+            for (uint64_t i = 0; i < table.size(); ++i) {
+                const uint32_t alignmentId = table[i];
+                const auto& ad = alignmentData[alignmentId];
+                if (ad.readIds[0] != r0) continue;
+                if (ad.deleteReasons0 || ad.deleteReasons1) continue;
+                const ReadId partner = ad.readIds[1];
+                auto& strands = partnerStrands[partner];
+                if (ad.isSameStrand)
+                    strands.first = true;
+                else
+                    strands.second = true;
+            }
+
+            for (const auto& [partner, strands] : partnerStrands) {
+                if (strands.first && strands.second) {
+                    bothStrandsPairCount++;
+                    // Count alignments for this pair.
+                    for (uint64_t i = 0; i < table.size(); ++i) {
+                        const uint32_t alignmentId = table[i];
+                        const auto& ad = alignmentData[alignmentId];
+                        if (ad.readIds[0] != r0) continue;
+                        if (ad.readIds[1] != partner) continue;
+                        if (ad.deleteReasons0 || ad.deleteReasons1) continue;
+                        bothStrandsAlignmentCount++;
+                    }
+                }
+            }
+        }
+
+        cout << timestamp << "Read pairs with alignments on both strands: "
+             << bothStrandsPairCount << " pairs, "
+             << bothStrandsAlignmentCount << " alignments." << endl;
+    }
 
     // assembler.performHifiasmECParity(threadCount);
 
@@ -1080,10 +1139,13 @@ void dinara::main::assemble(
 
     // assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
 
-    // 7. Build read graph from surviving overlaps.
-    //    Keeps overlaps that are not deleted and not trans on either side.
-    //    Unlabeled (state 0) overlaps that survived earlier stages are kept.
-    //    Port of ma_sg_gen (string graph construction from sources[]).
+    // Build the read graph used for marker graph vertex construction.
+    // Includes only alignments that:
+    // - Are not deleted (no deleteReasons on either side — filters out
+    //   chimeric reads, multi-chain pairs, and other earlier removals).
+    // - Are not trans (state 2) or cisDifferentCopy (state 3) on either side.
+    // Cis (state 1) and unlabeled (state 0) alignments are kept.
+    // The read graph edges drive the disjoint set merges in createMarkerGraphVertices.
     assembler.createReadGraphFromPhasingCisOverlaps();
 
     // // 8. Transitive reduction: remove redundant edges where v→x can be
@@ -1095,37 +1157,51 @@ void dinara::main::assemble(
     // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coverageHet) / 2));
     // const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coverageHet));
     
-    const uint64_t minVertexCoverage = 2;
+    const uint64_t minVertexCoverage = 4;
     const uint64_t maxVertexCoverage = 5 * coverageHet;
 
-    // Build marker graph vertices using transitive alignments collapse.
+    // Build marker graph vertices by transitive alignment collapse.
+    // Each alignment merges its aligned marker pairs into a disjoint set.
+    // Connected components become vertices. Vertices are then filtered by:
+    // - Coverage: must have [minVertexCoverage, maxVertexCoverage] markers.
+    // - No duplicate reads: a vertex cannot contain two markers from the
+    //   same readId (either strand). This prevents collapsing both strands
+    //   of a read into the same vertex.
     assembler.createMarkerGraphVertices(
-        minVertexCoverage,                              // minVertexCoverage
-        maxVertexCoverage,                              // maxVertexCoverage
-        0,                                              // minVertexCoveragePerStrand
+        minVertexCoverage,
+        maxVertexCoverage,
+        0,                                              // minVertexCoveragePerStrand (disabled)
         false,                                          // allowDuplicateMarkers
         std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
 
-    // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
-    // This reduces unreliable anchors and artifacts in repetitive regions.
+    // Remove vertices whose k-mer is a short-period tandem repeat (period 1-5,
+    // including homopolymers). These k-mers match many genomic positions and
+    // produce unreliable marker graph vertices. Thresholds: {6, 4, 4, 4, 4}
+    // consecutive repeat units for periods 1-5. Removes ~18.5% of vertices.
     assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
 
-    // Filter marker graph vertices whose marker k-mers have low sequence complexity
-    // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
+    // Remove vertices whose k-mer has low sequence complexity, measured by
+    // counting distinct sub-k-mers of lengths 1, 2, 3. Thresholds: {4, 12, 24}.
+    // A k-mer with fewer distinct sub-k-mers than the threshold at any length
+    // is considered low-complexity. Removes ~4.5% of vertices with k=50.
     assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
-    // Filter marker graph vertices where reads were grouped by transitive collapse
-    // at k-mer positions outside their chaining range.
+    // Remove vertices where the transitive collapse grouped reads at k-mer
+    // positions outside their direct chaining range. For each pair of reads
+    // in a vertex, check that the vertex ordinal falls within the chain
+    // start/end for both reads. Vertices failing this check were created by
+    // indirect transitive paths (A→B→C) where A and C have no direct
+    // alignment support at that position — typically false merges in repeats.
     assembler.filterMarkerGraphVerticesByChainConsistency(threadCount);
 
-    // Find the reverse complement of each marker graph vertex.
-    // We need the reverse complement vertices to be populated for anchor generation.
+    // Pair each marker graph vertex with its reverse complement vertex.
+    // Required before anchor generation, which needs RC-consistent vertices.
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    const uint64_t minAnchorCoverage = 2;
+    const uint64_t minAnchorCoverage = 4;
     const uint64_t maxAnchorCoverage = 5 * coverageHet;
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
