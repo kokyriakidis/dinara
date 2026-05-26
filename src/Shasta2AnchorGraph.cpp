@@ -195,10 +195,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
 
     // Inter-window edges: walk each read's journey and collect candidate
-    // anchor pairs (anchorA in window A, anchorB in window B) for each
-    // ordered window pair. Then pick the pair with the most shared reads.
-    // This avoids weak connections where independently-chosen anchors
-    // happen to share few reads.
+    // anchor pairs (lastAnchorInWindowA, firstAnchorInWindowB) for each
+    // ordered window pair. Create edges for all candidates that have
+    // shared reads, preserving alternative connections between windows.
 
     // For each window pair, collect all candidate (anchorA, anchorB) pairs.
     struct AnchorPairKey {
