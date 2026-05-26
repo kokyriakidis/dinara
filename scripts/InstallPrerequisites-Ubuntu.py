@@ -674,7 +674,7 @@ def installShasta2():
         os.chdir(temporaryDirectory)
         
         # Clone repo
-        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
+        runCommand("git clone https://github.com/kokyriakidis/shasta2.git")
         
         # Cleanup existing build directory to prevent BuildAbpoa.py failure
         home = os.path.expanduser("~")
