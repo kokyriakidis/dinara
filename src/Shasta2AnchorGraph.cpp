@@ -81,6 +81,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(anchorPair.orientedReadIds.empty()) {
                 continue;
             }
+            DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
             edge_descriptor e;
             tie(e, ignore) = add_edge(
                 anchorPair.anchorIdA,
@@ -146,6 +147,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(anchorPair.orientedReadIds.empty()) {
                 continue;
             }
+            DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
             edge_descriptor e;
             tie(e, ignore) = add_edge(
                 anchorPair.anchorIdA,
@@ -169,6 +171,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             for(const Shasta2AnchorId midAnchorId : altPath.intermediateAnchorIds) {
                 Shasta2AnchorPair anchorPair(anchors, prevAnchorId, midAnchorId, false);
                 if(!anchorPair.orientedReadIds.empty()) {
+                    DINARA_ASSERT(anchors.countCommon(prevAnchorId, midAnchorId) > 0);
                     edge_descriptor e;
                     tie(e, ignore) = add_edge(
                         anchorPair.anchorIdA,
@@ -183,6 +186,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             // Last edge: last intermediate -> anchorIdB.
             Shasta2AnchorPair anchorPair(anchors, prevAnchorId, altPath.anchorIdB, false);
             if(!anchorPair.orientedReadIds.empty()) {
+                DINARA_ASSERT(anchors.countCommon(prevAnchorId, altPath.anchorIdB) > 0);
                 edge_descriptor e;
                 tie(e, ignore) = add_edge(
                     anchorPair.anchorIdA,
@@ -255,6 +259,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
         if(bestSize >= minInterWindowCoverage) {
+            DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
             edge_descriptor e;
             tie(e, ignore) = add_edge(
                 bestPair.anchorIdA,
