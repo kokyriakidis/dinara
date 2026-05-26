@@ -345,15 +345,31 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Remove contradictory window pairs: if both (W1,W2) and (W2,W1) exist,
-    // the connection is unreliable — remove both directions.
+    // Remove contradictory window pairs: if both (W1,W2) and (W2,W1) exist
+    // (considering that fw window W and its RC mirror W+windowCount represent
+    // the same genomic region), the connection is unreliable — remove both.
     {
-        std::set<std::pair<uint32_t, uint32_t>> toRemove;
+        // Normalize a window ID to its original (fw) window.
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        // Build a set of normalized directed pairs.
+        std::map<std::pair<uint32_t, uint32_t>,
+                 std::vector<std::pair<uint32_t, uint32_t>>> normalizedToPairs;
         for(const auto& [wp, candidates] : windowPairCandidates) {
-            auto reverse = std::make_pair(wp.second, wp.first);
-            if(windowPairCandidates.count(reverse)) {
-                toRemove.insert(wp);
-                toRemove.insert(reverse);
+            auto normPair = std::make_pair(normalize(wp.first), normalize(wp.second));
+            normalizedToPairs[normPair].push_back(wp);
+        }
+
+        // Find contradictions: normalized (A,B) and (B,A) both exist.
+        std::set<std::pair<uint32_t, uint32_t>> toRemove;
+        for(const auto& [normPair, rawPairs] : normalizedToPairs) {
+            auto reverse = std::make_pair(normPair.second, normPair.first);
+            if(normPair != reverse && normalizedToPairs.count(reverse)) {
+                for(const auto& rp : rawPairs) {
+                    toRemove.insert(rp);
+                }
             }
         }
         if(!toRemove.empty()) {
