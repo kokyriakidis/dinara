@@ -124,11 +124,5 @@ public:
     // Save binary data (Shasta2 compatibility).
     void saveAnchorGraph(const string& name = "Shasta2AnchorGraph") const { save(name); }
 
-    // Create a remapped copy of this graph using shasta2's anchor ID scheme.
-    // The mapping vector maps dinara anchor IDs to shasta2 anchor IDs.
-    // The output graph has shasta2AnchorCount vertices.
-    void remapForShasta2(
-        const vector<Shasta2AnchorId>& dinaraToShasta2,
-        uint64_t shasta2AnchorCount,
-        Shasta2AnchorGraph& remapped) const;
+
 };
