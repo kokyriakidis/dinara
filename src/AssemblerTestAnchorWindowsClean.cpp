@@ -243,23 +243,32 @@ void Assembler::testAnchorWindowsCleanLongestRead(
         }
     }
 
-    // Write inter-window connecting edges for all candidate anchor pairs.
+    // Write inter-window connecting edges: pick the candidate with the
+    // highest commonReadCount (shared reads between the two anchors).
     uint64_t totalInterEdges = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        // Find the candidate with the highest RC.
+        const AnchorPairKey* bestApk = nullptr;
+        uint64_t bestRc = 0;
         for(const auto& [apk, count] : candidates) {
             const uint64_t rc = commonReadCount(apk.anchorIdA, apk.anchorIdB);
-            // Emit vertex for any inter-window anchor not already emitted.
-            if(emittedVertices.insert(uint64_t(apk.anchorIdA)).second) {
-                gfa << "S\t" << apk.anchorIdA << "\t*\tLN:i:1\n";
+            if(rc > bestRc) {
+                bestRc = rc;
+                bestApk = &apk;
+            }
+        }
+        if(bestApk && bestRc > 0) {
+            if(emittedVertices.insert(uint64_t(bestApk->anchorIdA)).second) {
+                gfa << "S\t" << bestApk->anchorIdA << "\t*\tLN:i:1\n";
                 ++totalVertices;
             }
-            if(emittedVertices.insert(uint64_t(apk.anchorIdB)).second) {
-                gfa << "S\t" << apk.anchorIdB << "\t*\tLN:i:1\n";
+            if(emittedVertices.insert(uint64_t(bestApk->anchorIdB)).second) {
+                gfa << "S\t" << bestApk->anchorIdB << "\t*\tLN:i:1\n";
                 ++totalVertices;
             }
-            gfa << "L\t" << apk.anchorIdA << "\t+\t"
-                << apk.anchorIdB << "\t+\t0M"
-                << "\tRC:i:" << rc << "\n";
+            gfa << "L\t" << bestApk->anchorIdA << "\t+\t"
+                << bestApk->anchorIdB << "\t+\t0M"
+                << "\tRC:i:" << bestRc << "\n";
             ++totalInterEdges;
         }
     }
@@ -473,22 +482,31 @@ void Assembler::writeAnchorWindowsCleanGfa(
         }
     }
 
-    // Inter-window connecting edges for all candidate anchor pairs.
+    // Inter-window connecting edges: pick the candidate with the
+    // highest commonReadCount (shared reads between the two anchors).
     uint64_t totalInterEdges = 0;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        const AnchorPairKey* bestApk = nullptr;
+        uint64_t bestRc = 0;
         for(const auto& [apk, count] : candidates) {
             const uint64_t rc = commonReadCount(apk.anchorIdA, apk.anchorIdB);
-            if(emittedVertices.insert(uint64_t(apk.anchorIdA)).second) {
-                gfa << "S\t" << apk.anchorIdA << "\t*\tLN:i:1\n";
+            if(rc > bestRc) {
+                bestRc = rc;
+                bestApk = &apk;
+            }
+        }
+        if(bestApk && bestRc > 0) {
+            if(emittedVertices.insert(uint64_t(bestApk->anchorIdA)).second) {
+                gfa << "S\t" << bestApk->anchorIdA << "\t*\tLN:i:1\n";
                 ++totalVertices;
             }
-            if(emittedVertices.insert(uint64_t(apk.anchorIdB)).second) {
-                gfa << "S\t" << apk.anchorIdB << "\t*\tLN:i:1\n";
+            if(emittedVertices.insert(uint64_t(bestApk->anchorIdB)).second) {
+                gfa << "S\t" << bestApk->anchorIdB << "\t*\tLN:i:1\n";
                 ++totalVertices;
             }
-            gfa << "L\t" << apk.anchorIdA << "\t+\t"
-                << apk.anchorIdB << "\t+\t0M"
-                << "\tRC:i:" << rc << "\n";
+            gfa << "L\t" << bestApk->anchorIdA << "\t+\t"
+                << bestApk->anchorIdB << "\t+\t0M"
+                << "\tRC:i:" << bestRc << "\n";
             ++totalInterEdges;
         }
     }

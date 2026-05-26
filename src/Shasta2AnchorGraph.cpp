@@ -196,8 +196,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Inter-window edges: walk each read's journey and collect candidate
     // anchor pairs (lastAnchorInWindowA, firstAnchorInWindowB) for each
-    // ordered window pair. Create edges for all candidates that have
-    // shared reads, preserving alternative connections between windows.
+    // ordered window pair. Pick the candidate with the highest shared
+    // read count (commonReadCount).
 
     // For each window pair, collect all candidate (anchorA, anchorB) pairs.
     struct AnchorPairKey {
@@ -240,19 +240,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // For each window pair, create edges for all candidate anchor pairs.
+    // For each window pair, pick the candidate with the most shared reads.
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        Shasta2AnchorPair bestPair;
+        uint64_t bestSize = 0;
         for(const auto& [apk, count] : candidates) {
             Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
-            if(!anchorPair.orientedReadIds.empty()) {
-                edge_descriptor e;
-                tie(e, ignore) = add_edge(
-                    anchorPair.anchorIdA,
-                    anchorPair.anchorIdB,
-                    Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                    anchorGraph);
-                anchorGraph[e].useForAssembly = true;
+            if(anchorPair.size() > bestSize) {
+                bestSize = anchorPair.size();
+                bestPair = std::move(anchorPair);
             }
+        }
+        if(bestSize > 0) {
+            edge_descriptor e;
+            tie(e, ignore) = add_edge(
+                bestPair.anchorIdA,
+                bestPair.anchorIdB,
+                Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[e].useForAssembly = true;
         }
     }
 
