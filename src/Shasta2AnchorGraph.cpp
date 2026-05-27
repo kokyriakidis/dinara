@@ -729,55 +729,70 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << finalAltPathCount << " alternate-path, "
          << finalInterCount << " inter-window)." << endl;
 
-    // Verify all edges have positive average base offset.
+    // Verify all edges: for each orientedReadId, check its base position
+    // on both anchors. Report edges where any read has negative base offset
+    // or is missing from one of the anchors.
     {
         uint64_t backwardEdgeCount = 0;
+        uint64_t missingReadEdgeCount = 0;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
             const auto& dEdge = anchorGraph[e];
             const auto& ap = dEdge.anchorPair;
             if(ap.orientedReadIds.empty()) continue;
 
-            // Compute per-read base offsets.
-            vector< pair<uint32_t, uint32_t> > anchorPositions;
-            ap.getAnchorPositions(anchors, anchorPositions);
+            const Shasta2Anchor anchorA = anchors[ap.anchorIdA];
+            const Shasta2Anchor anchorB = anchors[ap.anchorIdB];
 
             uint64_t forwardCount = 0;
             uint64_t backwardCount = 0;
-            for(const auto& p : anchorPositions) {
-                if(p.second >= p.first) {
-                    ++forwardCount;
+            uint64_t onlyACount = 0;
+            uint64_t onlyBCount = 0;
+            uint64_t neitherCount = 0;
+
+            auto itA = anchorA.begin();
+            auto itB = anchorB.begin();
+
+            for(const OrientedReadId orientedReadId : ap.orientedReadIds) {
+                // Find this read on anchor A.
+                while(itA != anchorA.end() && itA->orientedReadId < orientedReadId) ++itA;
+                const bool isOnA = (itA != anchorA.end() && itA->orientedReadId == orientedReadId);
+
+                // Find this read on anchor B.
+                while(itB != anchorB.end() && itB->orientedReadId < orientedReadId) ++itB;
+                const bool isOnB = (itB != anchorB.end() && itB->orientedReadId == orientedReadId);
+
+                if(isOnA && isOnB) {
+                    if(itB->position >= itA->position) {
+                        ++forwardCount;
+                    } else {
+                        ++backwardCount;
+                    }
+                } else if(isOnA) {
+                    ++onlyACount;
+                } else if(isOnB) {
+                    ++onlyBCount;
                 } else {
-                    ++backwardCount;
+                    ++neitherCount;
                 }
             }
 
-            if(backwardCount > 0) {
-                ++backwardEdgeCount;
-                if(backwardEdgeCount <= 10) {
-                    cout << "BACKWARD EDGE " << ap.anchorIdA << " -> " << ap.anchorIdB
-                         << ": " << forwardCount << " forward, " << backwardCount << " backward"
-                         << " out of " << ap.orientedReadIds.size() << " reads"
+            if(backwardCount > 0 || neitherCount > 0) {
+                if(backwardCount > 0) ++backwardEdgeCount;
+                if(neitherCount > 0) ++missingReadEdgeCount;
+                if(backwardEdgeCount + missingReadEdgeCount <= 10) {
+                    cout << "EDGE CHECK " << ap.anchorIdA << " -> " << ap.anchorIdB
+                         << ": forward=" << forwardCount
+                         << " backward=" << backwardCount
+                         << " onlyA=" << onlyACount
+                         << " onlyB=" << onlyBCount
+                         << " neither=" << neitherCount
+                         << " total=" << ap.orientedReadIds.size()
                          << " (offset=" << dEdge.offset << ")" << endl;
-                    // Print details for first few backward reads.
-                    uint64_t printed = 0;
-                    for(uint64_t i = 0; i < anchorPositions.size() && printed < 3; i++) {
-                        const auto& p = anchorPositions[i];
-                        if(p.second < p.first) {
-                            cout << "  " << ap.orientedReadIds[i]
-                                 << " posA=" << p.first << " posB=" << p.second
-                                 << " (offset=" << int64_t(p.second) - int64_t(p.first) << ")"
-                                 << endl;
-                            ++printed;
-                        }
-                    }
                 }
             }
         }
-        if(backwardEdgeCount > 0) {
-            cout << "WARNING: " << backwardEdgeCount << " edges have reads with negative base offsets." << endl;
-        } else {
-            cout << "All edges have positive base offsets." << endl;
-        }
+        cout << "Edge verification: " << backwardEdgeCount << " edges with backward reads, "
+             << missingReadEdgeCount << " edges with reads on neither anchor." << endl;
     }
 }
 
