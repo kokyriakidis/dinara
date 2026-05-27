@@ -1694,13 +1694,7 @@ void dinara::main::assemble(
     //       }
     //   }
     //
-    // --- 3. Backbone read's transition: ---
-    //
-    //   cout << "Backbone: " << window.backbonePreviousWindow
-    //        << " -> " << window.windowId
-    //        << " -> " << window.backboneNextWindow << endl;
-    //
-    // --- 4. All transition flows through a window (for detangling): ---
+    // --- 3. All transition flows through a window (for detangling): ---
     //
     //   for(const auto& [key, reads] : window.transitionReads) {
     //       cout << "(";
