@@ -3596,8 +3596,8 @@ void dinara::main::svanchors(
     // ========================================================================
     // A k-mer that appears more than once in the reference cannot serve as
     // an unambiguous anchor. Remove it from all reads (and the reference).
-    // cout << timestamp << "Removing non-unique reference k-mers." << endl;
-    // assembler.removeNonUniqueReferenceMarkers(referenceReadCount, threadCount);
+    cout << timestamp << "Removing non-unique reference k-mers." << endl;
+    assembler.removeNonUniqueReferenceMarkers(referenceReadCount, threadCount);
 
     // ========================================================================
     // Step 4: Build the inverted index.
