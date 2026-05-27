@@ -573,80 +573,92 @@ void Assembler::buildSvMSA(
             const auto readNameSpan = readsRef.getReadName(readId);
             const string readName(readNameSpan.data(), readNameSpan.size());
 
-            bool anyAligned = false;
-            seqNames.push_back(readName);
+            // Merge all ordinal pairs from all chains (primary + supplementary)
+            // for this read. We need the oriented read on a consistent strand.
+            // Use the strand from the first chain (primary, since chains are
+            // sorted by score). All chains for the same read should be on the
+            // same strand relative to the reference.
+            if(rg.chainIndicesInRef.empty()) continue;
+            const auto& firstCe = chainsForRef[rg.chainIndicesInRef[0]];
+            const Strand readStrand = firstCe.isSameStrand ? 0 : 1;
+            const OrientedReadId readOid(readId, readStrand);
+            const auto readMarkers = markersRef[readOid.getValue()];
 
-            // Align all chains for this read.
+            // Collect all {boundaryIndex, readOrdinal} pairs across all chains.
+            vector<pair<uint32_t, uint32_t>> allBoundaryAndReadOrdinal;
             for(size_t ci : rg.chainIndicesInRef) {
                 const auto& ce = chainsForRef[ci];
                 const auto& al = alignments[ce.chainIndex];
 
-                const Strand readStrand = ce.isSameStrand ? 0 : 1;
-                const OrientedReadId readOid(readId, readStrand);
-                const auto readMarkers = markersRef[readOid.getValue()];
+                // Skip chains on a different strand than the primary.
+                const Strand thisStrand = ce.isSameStrand ? 0 : 1;
+                if(thisStrand != readStrand) continue;
 
-                const auto& ordinals = al.ordinals;
-
-                // Map each ordinal to its boundary index.
-                vector<pair<uint32_t, uint32_t>> boundaryAndReadOrdinal;
-                for(const auto& ord : ordinals) {
+                for(const auto& ord : al.ordinals) {
                     auto it = ordinalToBoundary.find(ord[0]);
                     if(it != ordinalToBoundary.end()) {
-                        boundaryAndReadOrdinal.push_back({it->second, ord[1]});
+                        allBoundaryAndReadOrdinal.push_back({it->second, ord[1]});
                     }
-                }
-
-                if(boundaryAndReadOrdinal.size() < 2) continue;
-
-                sort(boundaryAndReadOrdinal.begin(), boundaryAndReadOrdinal.end());
-
-                for(size_t j = 0; j + 1 < boundaryAndReadOrdinal.size(); ++j) {
-                    const uint32_t bLeft = boundaryAndReadOrdinal[j].first;
-                    const uint32_t bRight = boundaryAndReadOrdinal[j + 1].first;
-                    const uint32_t readOrdLeft = boundaryAndReadOrdinal[j].second;
-                    const uint32_t readOrdRight = boundaryAndReadOrdinal[j + 1].second;
-
-                    if(bRight <= bLeft) continue;
-                    if(readOrdRight <= readOrdLeft) continue;
-                    if(readOrdLeft >= readMarkers.size() || readOrdRight >= readMarkers.size()) continue;
-
-                    const uint32_t readPosLeft = readMarkers[readOrdLeft].position + kHalf;
-                    const uint32_t readPosRight = readMarkers[readOrdRight].position + kHalf;
-                    if(readPosRight <= readPosLeft) continue;
-
-                    string readSeg;
-                    readSeg.reserve(readPosRight - readPosLeft);
-                    for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
-                        readSeg.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
-                    }
-
-                    if(readSeg.empty()) continue;
-
-                    if(bLeft >= nodeIds.size()) continue;
-                    int endNode = (bRight < nodeIds.size())
-                        ? static_cast<int>(nodeIds[bRight])
-                        : -1;
-
-                    aligner.align_from(
-                        readSeg,
-                        nodeIds[bLeft],
-                        1,      // weight
-                        true,   // is_ends_free
-                        0,      // start_offset
-                        endNode,
-                        seqId);
-
-                    anyAligned = true;
-                    ++totalAlignedSegments;
                 }
             }
 
-            if(anyAligned) {
-                ++seqId;
-                ++totalAlignedReads;
-            } else {
-                seqNames.pop_back();
+            if(allBoundaryAndReadOrdinal.size() < 2) continue;
+
+            // Sort by boundary index (reference position).
+            sort(allBoundaryAndReadOrdinal.begin(), allBoundaryAndReadOrdinal.end());
+
+            // Deduplicate (same boundary might appear in multiple chains).
+            allBoundaryAndReadOrdinal.erase(
+                unique(allBoundaryAndReadOrdinal.begin(), allBoundaryAndReadOrdinal.end()),
+                allBoundaryAndReadOrdinal.end());
+
+            // Find the leftmost and rightmost boundary indices.
+            const uint32_t bMin = allBoundaryAndReadOrdinal.front().first;
+            const uint32_t bMax = allBoundaryAndReadOrdinal.back().first;
+            if(bMax <= bMin) continue;
+
+            // Find the read ordinals at the extremes.
+            const uint32_t readOrdMin = allBoundaryAndReadOrdinal.front().second;
+            const uint32_t readOrdMax = allBoundaryAndReadOrdinal.back().second;
+            if(readOrdMax <= readOrdMin) continue;
+            if(readOrdMin >= readMarkers.size() || readOrdMax >= readMarkers.size()) continue;
+
+            // Extract the full read sequence from leftmost to rightmost anchor.
+            const uint32_t readPosLeft = readMarkers[readOrdMin].position + kHalf;
+            const uint32_t readPosRight = readMarkers[readOrdMax].position + kHalf;
+            if(readPosRight <= readPosLeft) continue;
+
+            string readSeq;
+            readSeq.reserve(readPosRight - readPosLeft);
+            for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
+                readSeq.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
             }
+
+            if(readSeq.empty()) continue;
+            if(bMin >= nodeIds.size()) continue;
+
+            int endNode = (bMax < nodeIds.size())
+                ? static_cast<int>(nodeIds[bMax])
+                : -1;
+
+            // Single align_from call spanning the full reference backbone range.
+            // For a read with a deletion: the read sequence is shorter than the
+            // backbone span, so the aligner creates a shortcut path.
+            // For a read with an insertion: the read sequence is longer, so the
+            // aligner creates a longer alternative path.
+            seqNames.push_back(readName);
+            aligner.align_from(
+                readSeq,
+                nodeIds[bMin],
+                1,      // weight
+                true,   // is_ends_free
+                0,      // start_offset
+                endNode,
+                seqId);
+
+            ++seqId;
+            ++totalAlignedReads;
+            ++totalAlignedSegments;
         }
 
         // -----------------------------------------------------------------
