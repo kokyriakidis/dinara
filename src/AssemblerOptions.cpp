@@ -211,7 +211,7 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         value<string>(&commandLineOnlyOptions.command)->
         default_value("assemble"),
         "Command to run. Must be one of: "
-        "assemble, saveBinaryData, cleanupBinaryData, explore, createBashCompletionScript")
+        "assemble, saveBinaryData, cleanupBinaryData, explore, svanchors, createBashCompletionScript")
 
         ("memoryMode",
         value<string>(&commandLineOnlyOptions.memoryMode)->
@@ -271,6 +271,12 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->
         default_value(false),
         "Save binary data (Mode 3 assembly only).")
+
+        ("reference",
+        value<string>(&commandLineOnlyOptions.referenceFileName),
+        "Reference FASTA for the target subregion. "
+        "Required for --command svanchors. "
+        "The reference is loaded as read 0; short reads from --input follow.")
         ;
 
 }
@@ -393,6 +399,13 @@ void AssemblerOptions::addConfigurableOptions()
         value<int>(&kmersOptions.syncmerS)->
         default_value(11),
         "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
+
+        ("Kmers.minimizerW",
+        value<int>(&kmersOptions.minimizerW)->
+        default_value(1),
+        "Minimizer window size for --command svanchors. "
+        "w=1 selects every k-mer position (no subsampling). "
+        "Larger values subsample: density ~ 2/w.")
 
         ("MinHash.version",
         value<int>(&minHashOptions.version)->
@@ -551,6 +564,27 @@ void AssemblerOptions::addConfigurableOptions()
         value<double>(&overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction)->
         default_value(1.0),
         "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction. Default 1.0 (disabled) matches hifiasm r484 commented-out state.")
+
+        ("OverlapCandidates.chainingMode",
+        value<int>(&overlapCandidatesOptions.chainingMode)->
+        default_value(0),
+        "Chaining scoring mode: 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty), "
+        "1 = minimap2-sr (fixed bandwidth, log gap penalty). Mode 1 is used by --command svanchors.")
+
+        ("OverlapCandidates.minimap2Bw",
+        value<int32_t>(&overlapCandidatesOptions.minimap2Bw)->
+        default_value(100),
+        "Fixed bandwidth for minimap2-sr chaining mode (minimap2 -r). Only used when chainingMode=1.")
+
+        ("OverlapCandidates.minimap2MaxGap",
+        value<int32_t>(&overlapCandidatesOptions.minimap2MaxGap)->
+        default_value(5000),
+        "Max gap for minimap2-sr chaining mode (minimap2 -g). Only used when chainingMode=1.")
+
+        ("OverlapCandidates.minimap2MinChainScore",
+        value<int32_t>(&overlapCandidatesOptions.minimap2MinChainScore)->
+        default_value(25),
+        "Min chain score for minimap2-sr chaining mode (minimap2 -m). Only used when chainingMode=1.")
 
         ("OverlapCandidates.invertedIndexLchainIsAccurate",
         value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
@@ -1632,6 +1666,7 @@ void KmersOptions::write(ostream& s) const
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
     s << "syncmerS = " << syncmerS << "\n";
+    s << "minimizerW = " << minimizerW << "\n";
 }
 
 
@@ -1671,6 +1706,10 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "invertedIndexHighFactor = " << invertedIndexHighFactor << "\n";
     s << "invertedIndexMinNChain = " << invertedIndexMinNChain << "\n";
     s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
+    s << "chainingMode = " << chainingMode << "\n";
+    s << "minimap2Bw = " << minimap2Bw << "\n";
+    s << "minimap2MaxGap = " << minimap2MaxGap << "\n";
+    s << "minimap2MinChainScore = " << minimap2MinChainScore << "\n";
     s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
     s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";
     s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";

@@ -91,6 +91,7 @@ namespace dinara {
         void saveBinaryData(const AssemblerOptions&);
         void cleanupBinaryData(const AssemblerOptions&);
         void explore(const AssemblerOptions&);
+        void svanchors(const AssemblerOptions&);
         void listCommands();
 
         const std::set<string> commands = {
@@ -98,6 +99,7 @@ namespace dinara {
             "saveBinaryData",
             "cleanupBinaryData",
             "explore",
+            "svanchors",
             "listCommands"};
 
 
@@ -451,6 +453,9 @@ void dinara::main::main(int argumentCount, const char** arguments)
         return;
     } else if(assemblerOptions.commandLineOnlyOptions.command == "explore") {
         explore(assemblerOptions);
+        return;
+    } else if(assemblerOptions.commandLineOnlyOptions.command == "svanchors") {
+        svanchors(assemblerOptions);
         return;
     } else if(assemblerOptions.commandLineOnlyOptions.command == "listCommands") {
         listCommands();
@@ -3447,6 +3452,243 @@ void dinara::main::explore(
         sameUserOnly);
 }
 
+
+
+
+// Implementation of --command svanchors.
+// Loads a reference FASTA (as read 0) and short reads, finds minimizer
+// markers, counts k-mer frequencies, filters, and builds the inverted index.
+// This is the first stage of an SV-anchoring pipeline: downstream steps
+// will chain reads against the reference and use shared anchors for MSA.
+void dinara::main::svanchors(
+    const AssemblerOptions& assemblerOptions)
+{
+    DINARA_ASSERT(assemblerOptions.commandLineOnlyOptions.command == "svanchors");
+
+    // Validate inputs.
+    if(assemblerOptions.commandLineOnlyOptions.referenceFileName.empty()) {
+        throw runtime_error("--reference is required for --command svanchors.");
+    }
+    if(assemblerOptions.commandLineOnlyOptions.inputFileNames.empty()) {
+        throw runtime_error("Specify at least one input file (short reads) using --input.");
+    }
+
+    const int k = assemblerOptions.kmersOptions.k;
+    if(k > 62 or k < 6) {
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and 62.");
+    }
+    if((k % 2) == 1) {
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be even.");
+    }
+
+    // Resolve absolute paths before changing directory.
+    const string referenceAbsolutePath =
+        filesystem::getAbsolutePath(assemblerOptions.commandLineOnlyOptions.referenceFileName);
+    if(!std::filesystem::exists(referenceAbsolutePath)) {
+        throw runtime_error("Reference file not found: " +
+            assemblerOptions.commandLineOnlyOptions.referenceFileName);
+    }
+
+    vector<string> inputFileAbsolutePaths;
+    for(const string& inputFileName: assemblerOptions.commandLineOnlyOptions.inputFileNames) {
+        if(!std::filesystem::exists(inputFileName)) {
+            throw runtime_error("Input file not found: " + inputFileName);
+        }
+        inputFileAbsolutePaths.push_back(filesystem::getAbsolutePath(inputFileName));
+    }
+
+    // Create the output directory.
+    const string& outputDir = assemblerOptions.commandLineOnlyOptions.assemblyDirectory;
+    if(std::filesystem::exists(outputDir)) {
+        throw runtime_error(outputDir +
+            " already exists. Remove it first or use --assemblyDirectory to specify a different directory.");
+    }
+    DINARA_ASSERT(std::filesystem::create_directory(outputDir));
+    std::filesystem::current_path(outputDir);
+
+    // Open the performance log.
+    openPerformanceLog("performance.log");
+    performanceLog << timestamp << "svanchors begins." << endl;
+
+    // Open stdout.log and tee stdout to it.
+    if(not assemblerOptions.commandLineOnlyOptions.suppressStdoutLog) {
+        dinaraLog.open("stdout.log");
+        tee.duplicate(cout, dinaraLog);
+    }
+
+    cout << timestamp << "svanchors begins." << endl;
+
+    // Thread count.
+    uint64_t threadCount = assemblerOptions.commandLineOnlyOptions.threadCount;
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+    cout << "Using " << threadCount << " threads." << endl;
+
+    // Set up the run directory (memory mode).
+    size_t pageSize = 0;
+    string dataDirectory;
+    setupRunDirectory(
+        assemblerOptions.commandLineOnlyOptions.memoryMode,
+        assemblerOptions.commandLineOnlyOptions.memoryBacking,
+        pageSize,
+        dataDirectory);
+
+    // Write options to dinara.conf.
+    {
+        ofstream configurationFile("dinara.conf");
+        assemblerOptions.write(configurationFile);
+    }
+
+    // Create the Assembler.
+    Assembler assembler(dataDirectory, true, assemblerOptions.readsOptions.representation, pageSize);
+
+    // ========================================================================
+    // Step 1: Load the reference FASTA as read 0.
+    // ========================================================================
+    cout << timestamp << "Loading reference from " << referenceAbsolutePath << endl;
+    assembler.addReads(
+        referenceAbsolutePath,
+        0,  // minReadLength = 0: accept the reference regardless of length.
+        assemblerOptions.readsOptions.noCache,
+        threadCount);
+
+    const uint64_t referenceReadCount = assembler.getReads().readCount();
+    if(referenceReadCount == 0) {
+        throw runtime_error("No sequences found in reference file.");
+    }
+    cout << "Loaded " << referenceReadCount << " reference sequence(s) as read(s) 0.."
+         << (referenceReadCount - 1) << "." << endl;
+    for(ReadId refId = 0; refId < ReadId(referenceReadCount); ++refId) {
+        cout << "  Reference read " << refId
+             << ": length " << assembler.getReads().getRead(refId).baseCount
+             << " bases." << endl;
+    }
+
+    // ========================================================================
+    // Step 2: Load short reads from --input files.
+    // ========================================================================
+    cout << timestamp << "Loading short reads." << endl;
+    for(const string& inputFileName: inputFileAbsolutePaths) {
+        assembler.addReads(
+            inputFileName,
+            0,  // minReadLength = 0: accept all reads regardless of length.
+            assemblerOptions.readsOptions.noCache,
+            threadCount);
+    }
+
+    const uint64_t totalReadCount = assembler.getReads().readCount();
+    const uint64_t shortReadCount = totalReadCount - referenceReadCount;
+    if(shortReadCount == 0) {
+        throw runtime_error("No short reads loaded from input files.");
+    }
+    cout << "Loaded " << shortReadCount << " short reads. Total reads (including reference): "
+         << totalReadCount << "." << endl;
+
+    assembler.computeReadIdsSortedByName();
+    assembler.histogramReadLength("ReadLengthHistogram.csv");
+
+    // ========================================================================
+    // Step 3: Find markers using SIMD minimizers.
+    // ========================================================================
+    // Window size w controls density: smaller w = denser markers.
+    // w=1 selects every k-mer position (no subsampling).
+    // Tunable via --Kmers.minimizerW (default 1 = all positions).
+    const int w = assemblerOptions.kmersOptions.minimizerW;
+    cout << timestamp << "Finding minimizer markers (k=" << k << ", w=" << w << ")." << endl;
+    assembler.findMarkersSimdMinimizers(threadCount, k, w);
+
+    // ========================================================================
+    // Step 3b: Remove markers whose k-mer is non-unique in the reference.
+    // ========================================================================
+    // A k-mer that appears more than once in the reference cannot serve as
+    // an unambiguous anchor. Remove it from all reads (and the reference).
+    cout << timestamp << "Removing non-unique reference k-mers." << endl;
+    assembler.removeNonUniqueReferenceMarkers(referenceReadCount, threadCount);
+
+    // ========================================================================
+    // Step 4: Build the inverted index.
+    // ========================================================================
+    // The inverted index maps each canonical k-mer to the set of (readId, position)
+    // occurrences. This covers all reads including the reference (read 0).
+    // Downstream chaining will query the index to find shared markers between
+    // each short read and the reference.
+    cout << timestamp << "Building inverted index." << endl;
+    assembler.buildInvertedIndex(threadCount);
+
+    // ========================================================================
+    // Step 5: DP chaining with multi-chain extraction.
+    // ========================================================================
+    // Use the same DP chaining as the assembly pipeline, but with parameters
+    // tuned for short accurate reads and SV detection.
+    //
+    // Guided by minimap2 -x sr preset:
+    //   -k21 -w11 -g100 -r100 -n2 -m25 -p.5 -N20
+    //
+    // Parameter mapping:
+    //   minimap2 -g100 (max gap)     -> maxDist is hardcoded at 5000 in the DP,
+    //                                   but driftRateTolerance=0.02 enforces a
+    //                                   tight bandwidth that rejects distant anchors.
+    //   minimap2 -r100 (bandwidth)   -> bw_rate derived from driftRateTolerance.
+    //   minimap2 -n2   (min anchors) -> minChainMarkerCount=2.
+    //   minimap2 -p.5  (sec ratio)   -> mcopyRate=0.50.
+    //   minimap2 -N20  (max sec)     -> mcopyNum=10 (generous for SV breakpoints).
+    //
+    // HiFi error model (lchainIsAccurate=false) uses div=0.1 for gap penalty
+    // decay, appropriate for substitution-dominated short-read errors.
+    // mcopyKhitCutoff lowered to 3 because short reads have few markers.
+    //
+    // Multiple chains per read-vs-reference pair capture the collinear
+    // segments on each side of an SV breakpoint.
+    cout << timestamp << "Running DP chaining with multi-chain extraction." << endl;
+
+    OverlapCandidatesOptions svOpts = assemblerOptions.overlapCandidatesOptions;
+    svOpts.chainingMode = 1;                          // minimap2-sr scoring mode.
+    svOpts.minimap2Bw = 100;                          // minimap2 -r100 fixed bandwidth.
+    svOpts.minimap2MaxGap = 5000;                     // Large to allow SV detection.
+    svOpts.minimap2MinChainScore = 25;                // minimap2 -m25.
+    svOpts.driftRateTolerance = 0.02;                 // Used as bw_rate fallback.
+    svOpts.invertedIndexLchainIsAccurate = false;     // HiFi error model (div=0.1).
+    svOpts.invertedIndexMcopyKhitCutoff = 3;          // Short reads have few markers.
+    svOpts.invertedIndexMcopyNum = 10;                // Generous: capture multiple SV breakpoints.
+    svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
+    svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
+
+    const double maxDriftRate = svOpts.driftRateTolerance;
+    const uint64_t maxChainLimit = 0;  // No limit on chains per read.
+
+    assembler.chainAlignmentCandidates(
+        maxDriftRate,
+        maxChainLimit,
+        svOpts,
+        threadCount);
+
+    // ========================================================================
+    // Step 6: Classify chains as primary/supplementary/secondary.
+    // ========================================================================
+    // Chains covering non-overlapping query regions are supplementary
+    // (split-read SV signal). Chains overlapping a primary on the query
+    // are secondary. Uses minimap2's mask_level=0.5 threshold.
+    cout << timestamp << "Classifying split alignments." << endl;
+    assembler.classifySplitAlignments(
+        referenceReadCount,
+        0.5,    // maskLevel: max query overlap fraction to be supplementary.
+        "sv_split_reads.tsv");
+
+    // ========================================================================
+    // Summary.
+    // ========================================================================
+    cout << timestamp << "svanchors completed." << endl;
+    cout << "  Reference sequences: " << referenceReadCount << endl;
+    cout << "  Short reads: " << shortReadCount << endl;
+    cout << "  k-mer length (k): " << k << endl;
+    cout << "  Minimizer window (w): " << w << endl;
+    cout << "  Total markers after filtering: " << assembler.markers->totalSize() << endl;
+    cout << "  Alignment candidates: "
+         << assembler.alignmentCandidates.candidates.size() << endl;
+
+    performanceLog << timestamp << "svanchors ends." << endl;
+}
 
 
 

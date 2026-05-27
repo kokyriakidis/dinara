@@ -1115,6 +1115,61 @@ static inline int32_t hifiasm_comput_sc_ch_ec(
     return sc;
 }
 
+/// Minimap2-style chaining score between two anchors.
+///
+/// Uses fixed bandwidth and logarithmic gap penalty instead of hifiasm's
+/// adaptive bandwidth and linear/adaptive penalty.
+///
+/// Score = min(q_span, dg) - gap_penalty
+/// gap_penalty = 0.01 * span * dd + 0.5 * log2(dd + 1)
+///
+/// Returns INT32_MIN if connection is invalid (monotonicity violation,
+/// bandwidth exceeded, or max gap exceeded).
+///
+/// @reference minimap2 lchain.c:mg_chain_dp_score (simplified for sr preset)
+static inline int32_t minimap2_comput_sc(
+    const HifiasmKmerHit* ai,
+    const HifiasmKmerHit* aj,
+    int32_t bw,             // Fixed bandwidth (minimap2 -r).
+    int32_t maxGap,         // Max gap (minimap2 -g).
+    double chn_pen_gap,     // Gap penalty coefficient.
+    double chn_pen_skip     // Skip penalty coefficient.
+) noexcept
+{
+    // Monotonicity: both query and target must advance.
+    const int64_t dq = static_cast<int64_t>(ai->self_offset) - static_cast<int64_t>(aj->self_offset);
+    if(dq <= 0) return INT32_MIN;
+
+    const int64_t dr = static_cast<int64_t>(ai->offset) - static_cast<int64_t>(aj->offset);
+    if(dr <= 0) return INT32_MIN;
+
+    // Max gap check.
+    if(dq > maxGap || dr > maxGap) return INT32_MIN;
+
+    // Diagonal deviation.
+    const int64_t dd = (dr > dq) ? (dr - dq) : (dq - dr);
+
+    // Fixed bandwidth check.
+    if(dd > bw) return INT32_MIN;
+
+    // Base score.
+    const int64_t dg = std::min(dq, dr);
+    const int32_t q_span = static_cast<int32_t>(ai->cnt & 0xFFu);
+    int32_t sc = std::min(q_span, static_cast<int32_t>(dg));
+    sc = hifiasm_normal_w(sc, static_cast<int32_t>(ai->cnt >> 8));
+
+    // Minimap2 gap penalty: linear + logarithmic.
+    // minimap2 uses: pen = 0.01 * avg_qspan * dd + log2(dd) / 2
+    // chn_pen_gap is used as the linear coefficient (0.01 * avg_qspan).
+    if(dd > 0) {
+        const double lin_pen = chn_pen_gap * static_cast<double>(dd);
+        const double log_pen = 0.5 * log2(static_cast<double>(dd) + 1.0);
+        sc -= static_cast<int32_t>(lin_pen + log_pen);
+    }
+
+    return sc;
+}
+
 /// Compute effective overlap length after left-normalizing and right-extending
 /// the chain coordinates to sequence boundaries. Used for tie-breaking when
 /// chains have identical scores (prefer shorter effective length = tighter fit).
@@ -1303,6 +1358,8 @@ static inline void hifiasm_quick_ck_lchain(
 /// pruning strategies: lookback window (max_iter), max-skip (max_skip), and
 /// sliding distance window (max_ii). Updates msc/msc_i/movl/plus in place.
 ///
+/// chainingMode: 0 = hifiasm scoring, 1 = minimap2-sr scoring.
+///
 /// @reference Hifiasm Hash_Table.cpp:2097-2170 (main DP loop in lchain_qdp_mcopy_fast)
 static inline void run_main_dp_loop(
     HifiasmKmerHit* a, int64_t si, int64_t ei,
@@ -1310,10 +1367,22 @@ static inline void run_main_dp_loop(
     double chn_pen_gap, double chn_pen_skip, double bw_rate,
     int64_t xl, int64_t yl,
     int64_t* p, int32_t* f, int64_t* t, int32_t* ii,
-    int64_t* msc, int64_t* msc_i, int64_t* movl, int64_t* plus) noexcept
+    int64_t* msc, int64_t* msc_i, int64_t* movl, int64_t* plus,
+    int chainingMode = 0,
+    int32_t minimap2Bw = 100,
+    int32_t minimap2MaxGap = 5000) noexcept
 {
     int64_t max_f, n_skip, st, max_j, end_j, sc, max_ii = -1, ovl;
     int32_t max, tmp;
+
+    // Lambda to compute score between two anchors using the selected mode.
+    auto computeScore = [&](const HifiasmKmerHit* ai, const HifiasmKmerHit* aj) -> int32_t {
+        if(chainingMode == 1) {
+            return minimap2_comput_sc(ai, aj, minimap2Bw, minimap2MaxGap, chn_pen_gap, chn_pen_skip);
+        } else {
+            return hifiasm_comput_sc_ch_ec(ai, aj, bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
+        }
+    };
 
     int64_t i, j;
     for (i = st = si; i < ei; ++i) {
@@ -1326,7 +1395,7 @@ static inline void run_main_dp_loop(
 
         // Inner loop: find best predecessor j for anchor i.
         for (j = i - 1; j >= st; --j) {
-            sc = hifiasm_comput_sc_ch_ec(&a[i], &a[j], bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
+            sc = computeScore(&a[i], &a[j]);
             if (sc == INT32_MIN) continue;
             sc += f[j];
 
@@ -1341,7 +1410,6 @@ static inline void run_main_dp_loop(
         end_j = j;
 
         // Sliding distance window: cache best score within max_dis.
-        // Recompute if stale (out of range, wrong strand, or uninitialized).
         if ((max_ii < 0) ||
             (a[i].self_offset > a[max_ii].self_offset + max_dis) ||
             (a[i].strand != a[max_ii].strand)) {
@@ -1355,7 +1423,7 @@ static inline void run_main_dp_loop(
 
         // Fallback: try max_ii if it was skipped by max-skip pruning.
         if ((max_ii >= 0) && (max_ii < end_j) && (a[i].strand == a[max_ii].strand)) {
-            tmp = hifiasm_comput_sc_ch_ec(&a[i], &a[max_ii], bw_rate, chn_pen_gap, chn_pen_skip, xl, yl);
+            tmp = computeScore(&a[i], &a[max_ii]);
             if (tmp != INT32_MIN && max_f < tmp + f[max_ii]) {
                 max_f = tmp + f[max_ii]; max_j = max_ii;
             }
@@ -1418,12 +1486,143 @@ static inline void emit_best_chain_as_overlap(
     res.push_back(z);
 }
 
+/// Z-drop backtracking: walk back from a chain endpoint, stop when the
+/// score drops by more than max_drop from the running maximum.
+/// Returns the anchor index where the chain should be cut.
+///
+/// @reference minimap2 lchain.c:mg_chain_bk_end
+static inline int64_t zdrop_chain_bk_end(
+    int32_t max_drop,
+    const int32_t* f,       // DP scores.
+    const int64_t* p,       // Predecessor pointers.
+    int32_t* t,             // Temporary marker array (0 = unvisited).
+    int32_t k_score,        // Score at the chain endpoint.
+    int64_t k_idx           // Anchor index of the chain endpoint.
+) noexcept
+{
+    int64_t i = k_idx, end_i = -1, max_i = i;
+    int32_t max_s = 0;
+    if(i < 0 || t[i] != 0) return i;
+    do {
+        t[i] = 2;
+        end_i = i = p[i];
+        const int32_t s = (i < 0) ? k_score : k_score - f[i];
+        if(s > max_s) { max_s = s; max_i = i; }
+        else if(max_s - s > max_drop) break;
+    } while(i >= 0 && t[i] == 0);
+    // Reset temporary marks.
+    for(i = k_idx; i >= 0 && i != end_i; i = p[i])
+        t[i] = 0;
+    return max_i;
+}
+
+/// Z-drop chain extraction: extract multiple chains from the DP table by
+/// processing endpoints in descending score order. Each chain is cut at
+/// Z-drop boundaries, naturally splitting at SV breakpoints.
+///
+/// @reference minimap2 lchain.c:mg_chain_backtrack
+static inline void zdrop_chain_backtrack(
+    HifiasmKmerHit* a,
+    int64_t a_n,
+    const int32_t* f,       // DP scores.
+    const int64_t* p,       // Predecessor pointers.
+    int32_t max_drop,       // Z-drop threshold (= bandwidth for minimap2-sr).
+    int32_t min_cnt,        // Min anchors per chain (minimap2 -n).
+    int32_t min_sc,         // Min chain score (minimap2 -m).
+    uint32_t xid,
+    int64_t xl, int64_t yl,
+    vector<HifiasmOverlapRegion>& res,
+    vector<uint32_t>& chainHitIndexFlat
+)
+{
+    // Collect endpoints with score >= min_sc, sorted by score ascending.
+    struct ScoreIdx { int32_t score; int64_t idx; };
+    vector<ScoreIdx> z;
+    z.reserve(size_t(a_n));
+    for(int64_t i = 0; i < a_n; ++i) {
+        if(f[i] >= min_sc) {
+            z.push_back({f[i], i});
+        }
+    }
+    if(z.empty()) return;
+
+    // Sort ascending by score (we process from the end = descending).
+    std::sort(z.begin(), z.end(), [](const ScoreIdx& a, const ScoreIdx& b) {
+        return a.score < b.score;
+    });
+
+    // Temporary marker: 0 = available, 1 = claimed by a chain.
+    vector<int32_t> t(size_t(a_n), 0);
+
+    // Temporary storage for chain anchor indices (reversed order).
+    vector<int32_t> v;
+    v.reserve(size_t(a_n));
+
+    // Process endpoints in descending score order.
+    for(int64_t k = int64_t(z.size()) - 1; k >= 0; --k) {
+        if(t[z[k].idx] != 0) continue;  // Already claimed.
+
+        // Find where to cut this chain (Z-drop).
+        int64_t end_i = zdrop_chain_bk_end(
+            max_drop, f, p, t.data(), int32_t(z[k].score), z[k].idx);
+
+        // Collect anchors from endpoint to cut point.
+        size_t n_v0 = v.size();
+        for(int64_t i = z[k].idx; i != end_i && i >= 0; i = p[i]) {
+            if(t[i] != 0) break;  // Hit a claimed anchor.
+            v.push_back(int32_t(i));
+            t[i] = 1;
+        }
+
+        size_t chain_len = v.size() - n_v0;
+        if(chain_len == 0) continue;
+
+        // Compute chain score (score at endpoint minus score at cut point).
+        int32_t sc;
+        int64_t last_i = v.back();
+        int64_t pred_of_last = p[last_i];
+        sc = (pred_of_last < 0 || t[pred_of_last] != 0)
+            ? f[z[k].idx]
+            : f[z[k].idx] - f[pred_of_last];
+
+        // Filter by min score and min anchor count.
+        if(sc >= min_sc && int32_t(chain_len) >= min_cnt) {
+            // Emit chain as overlap region.
+            // Anchors in v are in reverse order (endpoint first).
+            int64_t first_anchor = v[n_v0 + chain_len - 1];
+            int64_t last_anchor = v[n_v0];
+
+            HifiasmOverlapRegion region{};
+            hifiasm_push_ovlp_chain_qgen(
+                region, xid, xl, yl, int64_t(sc),
+                &a[first_anchor], &a[last_anchor]);
+
+            region.align_length = uint32_t(chain_len);
+            region.non_homopolymer_errors = uint32_t(chainHitIndexFlat.size());
+
+            // Store hit indices in forward order.
+            for(size_t j = 0; j < chain_len; ++j) {
+                chainHitIndexFlat.push_back(
+                    a[v[n_v0 + (chain_len - 1 - j)]].globalIndex);
+            }
+            res.push_back(region);
+        } else {
+            // Reject chain — unmark anchors.
+            for(size_t j = n_v0; j < v.size(); ++j) {
+                t[v[j]] = 0;
+            }
+            v.resize(n_v0);
+        }
+    }
+}
+
 /// Full DP chaining pipeline with optional quick-check and multi-copy extraction.
 ///
 /// Phase 1: Optional O(N) quick-check for collinear hits (narrows DP range).
 /// Phase 2: O(N * max_iter) DP with max-skip and distance-window pruning.
 /// Phase 3: Backtrack best chain from predecessor pointers.
 /// Phase 4: Optional mcopy extraction (up to mcopy_num secondary chains).
+///          In minimap2-sr mode (chainingMode=1), uses Z-drop backtracking instead.
 /// Phase 5: Emit best chain as overlap region (fallback if mcopy disabled/failed).
 ///
 /// @reference Hifiasm Hash_Table.cpp:2097-2284 (lchain_qdp_mcopy_fast)
@@ -1436,7 +1635,11 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
     double chn_pen_gap, double chn_pen_skip, double bw_rate,
     uint32_t xid, int64_t xl, int64_t yl,
     int64_t quick_check,
-    int64_t mcopy_num, double mcopy_rate, int64_t mcopy_khit_cutoff)
+    int64_t mcopy_num, double mcopy_rate, int64_t mcopy_khit_cutoff,
+    int chainingMode = 0,
+    int32_t minimap2Bw = 100,
+    int32_t minimap2MaxGap = 5000,
+    int32_t minimap2MinChainScore = 25)
 {
     const int64_t a_n = static_cast<int64_t>(a.size());
     if (a_n <= 0) return;
@@ -1451,8 +1654,8 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
     int64_t min_sc, ch_n, si, ei;
     int64_t i, k, cL = 0, sc;
 
-    // Phase 1: Quick check.
-    if (quick_check) {
+    // Phase 1: Quick check (hifiasm mode only — uses hifiasm-specific scoring).
+    if (quick_check && chainingMode == 0) {
         hifiasm_quick_ck_lchain(
             a.data(), a_n, xl, yl, chn_pen_gap, chn_pen_skip, bw_rate,
             p, t, f, ii, &plus, &msc, &msc_i, &movl, &si, &ei);
@@ -1468,7 +1671,20 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
     run_main_dp_loop(
         a.data(), si, ei, max_skip, max_iter, max_dis,
         chn_pen_gap, chn_pen_skip, bw_rate, xl, yl,
-        p, f, t, ii, &msc, &msc_i, &movl, &plus);
+        p, f, t, ii, &msc, &msc_i, &movl, &plus,
+        chainingMode, minimap2Bw, minimap2MaxGap);
+
+    // minimap2-sr mode: use Z-drop backtracking instead of mcopy.
+    if(chainingMode == 1) {
+        zdrop_chain_backtrack(
+            a.data(), a_n, f, p,
+            minimap2Bw,             // max_drop = bandwidth (minimap2 convention).
+            int32_t(mcopy_khit_cutoff > 0 ? mcopy_khit_cutoff : 2),  // min_cnt.
+            minimap2MinChainScore,  // min_sc (minimap2 -m25).
+            xid, xl, yl,
+            res, chainHitIndexFlat);
+        return;
+    }
 
     // Phase 3: Backtrack best chain.
     cL = backtrack_best_chain(msc_i, p, t, ii);
@@ -1816,6 +2032,10 @@ static inline void configureInvertedIndexDataForChaining(
     data.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
     data.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
     data.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
+    data.chainingMode = overlapCandidatesOptions.chainingMode;
+    data.minimap2Bw = overlapCandidatesOptions.minimap2Bw;
+    data.minimap2MaxGap = overlapCandidatesOptions.minimap2MaxGap;
+    data.minimap2MinChainScore = overlapCandidatesOptions.minimap2MinChainScore;
 }
 
 // ============================================================================
@@ -2019,6 +2239,10 @@ private:
         const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
         const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
         const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
+        const int chainingMode = invertedIndexData.chainingMode;
+        const int32_t minimap2Bw = invertedIndexData.minimap2Bw;
+        const int32_t minimap2MaxGap = invertedIndexData.minimap2MaxGap;
+        const int32_t minimap2MinChainScore = invertedIndexData.minimap2MinChainScore;
 
         uint64_t startBatch, endBatch;
         while(getNextBatch(startBatch, endBatch)) {
@@ -2330,7 +2554,11 @@ private:
                             dpOpt.quickCheck ? 1 : 0,
                             mcopy_num,
                             mcopy_rate,
-                            int64_t(mcopyKhitCutoff));
+                            int64_t(mcopyKhitCutoff),
+                            chainingMode,
+                            minimap2Bw,
+                            minimap2MaxGap,
+                            minimap2MinChainScore);
                     }
 
                     if (isOverlapDebugRead) {

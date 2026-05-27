@@ -108,6 +108,7 @@ public:
     string alignmentsPafFile;
     string overlapsFromPafFile;
     bool saveBinaryData;
+    string referenceFileName;  // Reference FASTA for --command svanchors.
 };
 
 
@@ -165,6 +166,10 @@ public:
     // Options for SIMD closed syncmer-based marker generation.
     bool useSimdClosedSyncmers;
     int syncmerS;
+
+    // Minimizer window size for --command svanchors.
+    // w=1 selects every k-mer position (no subsampling).
+    int minimizerW;
 
     void write(ostream&) const;
 };
@@ -232,6 +237,14 @@ public:
     // Setting to 1.0 disables this filtering to match hifiasm's current behavior (no interval filtering).
     // If hifiasm's r484 were active, it would use 0.95 threshold.
     double invertedIndexNonRedundantOverlapFraction = 1.0;   // Disabled (was 0.5) - matches hifiasm r484 commented-out state
+
+    // --- Chaining scoring mode ---
+    // 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty)
+    // 1 = minimap2-sr (fixed bandwidth, log gap penalty)
+    int chainingMode = 0;
+    int32_t minimap2Bw = 100;       // Fixed bandwidth for minimap2-sr mode (minimap2 -r100).
+    int32_t minimap2MaxGap = 5000;  // Max gap for minimap2-sr mode (minimap2 -g100, but we use 5000 for large SVs).
+    int32_t minimap2MinChainScore = 25; // Min chain score (minimap2 -m25).
 
     // --- Chaining parameters (hifiasm lchain) ---
     bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
