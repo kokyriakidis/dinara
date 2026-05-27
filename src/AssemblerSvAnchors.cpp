@@ -257,6 +257,22 @@ void Assembler::classifySplitAlignments(
     }
     cout << "  Reads with split alignments: " << nSplitReads << endl;
 
+    // Store classifications for use by buildSvMSA.
+    chainClassifications.resize(n);
+    for(uint64_t i = 0; i < n; ++i) {
+        switch(chains[i].classification) {
+            case ChainInfo::Primary:
+                chainClassifications[i] = ChainClassification::Primary;
+                break;
+            case ChainInfo::Supplementary:
+                chainClassifications[i] = ChainClassification::Supplementary;
+                break;
+            case ChainInfo::Secondary:
+                chainClassifications[i] = ChainClassification::Secondary;
+                break;
+        }
+    }
+
     performanceLog << timestamp
         << "Split-read classification completed in " << tTotal << " s." << endl;
 }
@@ -326,6 +342,13 @@ void Assembler::buildSvMSA(
         const auto& cand = candidates[i];
         const auto& al = alignments[i];
         if(al.ordinals.size() < 2) continue;  // Need at least 2 anchors for a segment.
+
+        // Skip secondary chains — they overlap a primary on the query
+        // and would double-align the same read region.
+        if(i < chainClassifications.size()
+           && chainClassifications[i] == ChainClassification::Secondary) {
+            continue;
+        }
 
         ReadId refId, readId;
         if(cand.readIds[0] < ReadId(referenceReadCount)) {

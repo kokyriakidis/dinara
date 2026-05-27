@@ -2579,6 +2579,11 @@ public:
     // Chains covering non-overlapping query regions are supplementary (split-read SV signal).
     // Chains overlapping an existing primary on the query are secondary.
     // Writes a TSV with per-chain classification.
+    // Per-chain classification from classifySplitAlignments.
+    // Indexed in parallel with alignmentCandidates.candidates / alignments.
+    enum class ChainClassification : uint8_t { Primary = 0, Supplementary = 1, Secondary = 2 };
+    vector<ChainClassification> chainClassifications;
+
     void buildSvMSA(
         uint64_t referenceReadCount,
         const string& outputPrefix);
