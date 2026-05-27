@@ -3676,6 +3676,12 @@ void dinara::main::svanchors(
         "sv_split_reads.tsv");
 
     // ========================================================================
+    // Step 7: Build Theseus MSA using chain anchors as segment boundaries.
+    // ========================================================================
+    cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
+    assembler.buildSvMSA(referenceReadCount, "sv_msa");
+
+    // ========================================================================
     // Summary.
     // ========================================================================
     cout << timestamp << "svanchors completed." << endl;
