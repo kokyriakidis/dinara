@@ -475,6 +475,7 @@ void Assembler::buildSvMSA(
         struct ReadGroup {
             ReadId readId;
             SvType svType;
+            int64_t svSize;  // |refSpan - readSpan|, larger = bigger SV.
             vector<size_t> chainIndicesInRef;  // Indices into chainsForRef.
         };
 
@@ -491,76 +492,71 @@ void Assembler::buildSvMSA(
             ReadGroup rg;
             rg.readId = ReadId(rid);
             rg.chainIndicesInRef = std::move(indices);
+            rg.svSize = 0;
 
-            if(rg.chainIndicesInRef.size() <= 1) {
-                // Single chain — reference-like.
-                rg.svType = SvType::ReferenceLike;
-            } else {
-                // Multiple chains — classify by comparing reference vs query gaps.
-                // Sort chains by reference start position.
-                sort(rg.chainIndicesInRef.begin(), rg.chainIndicesInRef.end(),
-                    [&](size_t a, size_t b) {
-                        const auto& alA = alignments[chainsForRef[a].chainIndex];
-                        const auto& alB = alignments[chainsForRef[b].chainIndex];
-                        if(alA.ordinals.empty()) return false;
-                        if(alB.ordinals.empty()) return true;
-                        return refMarkers[alA.ordinals.front()[0]].position
-                             < refMarkers[alB.ordinals.front()[0]].position;
-                    });
+            // Compute the reference span and read span across all chains
+            // to classify SV type and measure SV size.
+            // First, collect all ordinal pairs across all chains for this read.
+            const auto& firstCeClassify = chainsForRef[rg.chainIndicesInRef[0]];
+            const Strand classifyStrand = firstCeClassify.isSameStrand ? 0 : 1;
+            const OrientedReadId classifyOid(rg.readId, classifyStrand);
+            const auto classifyReadMarkers = markersRef[classifyOid.getValue()];
 
-                // Compare gaps between consecutive chains.
-                int64_t totalRefGap = 0;
-                int64_t totalQueryGap = 0;
-                for(size_t i = 0; i + 1 < rg.chainIndicesInRef.size(); ++i) {
-                    const auto& alCurr = alignments[chainsForRef[rg.chainIndicesInRef[i]].chainIndex];
-                    const auto& alNext = alignments[chainsForRef[rg.chainIndicesInRef[i + 1]].chainIndex];
-                    if(alCurr.ordinals.empty() || alNext.ordinals.empty()) continue;
+            uint32_t minRefOrd = UINT32_MAX, maxRefOrd = 0;
+            uint32_t minReadOrd = UINT32_MAX, maxReadOrd = 0;
 
-                    const auto& ceCurr = chainsForRef[rg.chainIndicesInRef[i]];
-                    const auto& ceNext = chainsForRef[rg.chainIndicesInRef[i + 1]];
+            for(size_t ci : rg.chainIndicesInRef) {
+                const auto& ce = chainsForRef[ci];
+                const auto& al = alignments[ce.chainIndex];
+                const Strand thisStrand = ce.isSameStrand ? 0 : 1;
+                if(thisStrand != classifyStrand) continue;
 
-                    // Reference gap: from end of current chain to start of next.
-                    uint32_t refEndOrd = alCurr.ordinals.back()[0];
-                    uint32_t refStartOrd = alNext.ordinals.front()[0];
-                    if(refEndOrd < refMarkers.size() && refStartOrd < refMarkers.size()) {
-                        int64_t refEnd = refMarkers[refEndOrd].position + k;
-                        int64_t refStart = refMarkers[refStartOrd].position;
-                        totalRefGap += std::max(int64_t(0), refStart - refEnd);
+                for(const auto& ord : al.ordinals) {
+                    if(ord[0] < refMarkers.size()) {
+                        minRefOrd = std::min(minRefOrd, ord[0]);
+                        maxRefOrd = std::max(maxRefOrd, ord[0]);
                     }
-
-                    // Query gap: from end of current chain to start of next on the read.
-                    const Strand sCurr = ceCurr.isSameStrand ? 0 : 1;
-                    const Strand sNext = ceNext.isSameStrand ? 0 : 1;
-                    const OrientedReadId oidCurr(ceCurr.readId, sCurr);
-                    const OrientedReadId oidNext(ceNext.readId, sNext);
-                    const auto mCurr = markersRef[oidCurr.getValue()];
-                    const auto mNext = markersRef[oidNext.getValue()];
-
-                    uint32_t qEndOrd = alCurr.ordinals.back()[1];
-                    uint32_t qStartOrd = alNext.ordinals.front()[1];
-                    if(qEndOrd < mCurr.size() && qStartOrd < mNext.size()) {
-                        int64_t qEnd = mCurr[qEndOrd].position + k;
-                        int64_t qStart = mNext[qStartOrd].position;
-                        totalQueryGap += std::max(int64_t(0), qStart - qEnd);
+                    if(ord[1] < classifyReadMarkers.size()) {
+                        minReadOrd = std::min(minReadOrd, ord[1]);
+                        maxReadOrd = std::max(maxReadOrd, ord[1]);
                     }
                 }
+            }
 
-                if(totalRefGap > totalQueryGap) {
+            if(minRefOrd < refMarkers.size() && maxRefOrd < refMarkers.size()
+               && minReadOrd < classifyReadMarkers.size() && maxReadOrd < classifyReadMarkers.size()
+               && maxRefOrd > minRefOrd && maxReadOrd > minReadOrd) {
+
+                const int64_t refSpan = int64_t(refMarkers[maxRefOrd].position)
+                                      - int64_t(refMarkers[minRefOrd].position);
+                const int64_t readSpan = int64_t(classifyReadMarkers[maxReadOrd].position)
+                                       - int64_t(classifyReadMarkers[minReadOrd].position);
+
+                rg.svSize = std::abs(refSpan - readSpan);
+
+                if(refSpan > readSpan) {
                     rg.svType = SvType::Deletion;
-                } else if(totalQueryGap > totalRefGap) {
+                } else if(readSpan > refSpan) {
                     rg.svType = SvType::Insertion;
                 } else {
                     rg.svType = SvType::ReferenceLike;
                 }
+            } else {
+                rg.svType = SvType::ReferenceLike;
             }
 
             readGroups.push_back(std::move(rg));
         }
 
-        // Sort: deletions first, then insertions, then reference-like.
+        // Sort: deletions first (largest first), then insertions (largest
+        // first), then reference-like. Within each SV type, larger SVs
+        // come first so they establish the graph paths before smaller ones.
         sort(readGroups.begin(), readGroups.end(),
             [](const ReadGroup& a, const ReadGroup& b) {
-                return static_cast<int>(a.svType) < static_cast<int>(b.svType);
+                if(a.svType != b.svType)
+                    return static_cast<int>(a.svType) < static_cast<int>(b.svType);
+                // Within same type, larger SV first.
+                return a.svSize > b.svSize;
             });
 
         // Now align reads in the sorted order.
