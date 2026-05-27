@@ -23,6 +23,7 @@
 #include <chrono>
 #include <fstream>
 #include <queue>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_map>
@@ -2547,25 +2548,21 @@ void Assembler::buildSvMSA(
                         if(overlapsVntr || overlapsInsertion) continue;
 
                         // -------------------------------------------------
-                        // Adaptive k-mer refinement for short reads.
+                        // Adaptive multi-k anchor filling.
                         //
-                        // Short reads can't span both flanks of the
-                        // coverage-drop region. Instead, collect
-                        // diagonals from reads anchoring on each flank
-                        // separately. For a het deletion, left-flank
-                        // reads and right-flank reads will show two
-                        // diagonal modes: ref-like and del-carrying.
-                        // The difference between modes = deletion size.
+                        // Progressively fill the coverage-drop region
+                        // and flanks with unique anchors at increasing
+                        // k values. At each k, only scan gaps where no
+                        // anchors exist yet. Build a per-read anchor
+                        // map, then analyze diagonal shifts.
                         // -------------------------------------------------
                         const uint32_t flankSize = 200;
                         const uint32_t refSeqLen = uint32_t(
                             readsRef.getRead(refId).baseCount);
-                        const uint32_t leftFlankStart =
+                        const uint32_t regionStart =
                             cdc.startPos > flankSize
                             ? cdc.startPos - flankSize : 0;
-                        const uint32_t leftFlankEnd = cdc.startPos;
-                        const uint32_t rightFlankStart = cdc.endPos;
-                        const uint32_t rightFlankEnd =
+                        const uint32_t regionEnd =
                             std::min(cdc.endPos + flankSize, refSeqLen);
 
                         // Get reference raw sequence.
@@ -2573,22 +2570,37 @@ void Assembler::buildSvMSA(
                             readsRef.getOrientedReadRawSequence(
                                 OrientedReadId(refId, 0));
 
-                        bool refinedCall = false;
-                        for(uint32_t tryK = uint32_t(k) + 4;
-                            tryK <= 30 && !refinedCall; tryK += 4) {
+                        // Reference anchors: (refPos, kmer string).
+                        // Sorted by refPos. Track covered positions.
+                        struct RefAnchor {
+                            uint32_t refPos;
+                            string kmer;
+                            uint32_t kLen;
+                        };
+                        vector<RefAnchor> refAnchors;
 
-                            // Build k-mer → positions for local ref
-                            // (extended region for uniqueness check).
-                            const uint32_t localStart =
-                                leftFlankStart > 300
-                                ? leftFlankStart - 300 : 0;
-                            const uint32_t localEnd =
-                                std::min(rightFlankEnd + 300, refSeqLen);
+                        // Track which reference positions are covered
+                        // by at least one unique anchor.
+                        const uint32_t regionLen = regionEnd - regionStart;
+                        vector<bool> covered(regionLen, false);
 
+                        // Extended region for uniqueness checking.
+                        const uint32_t uniStart =
+                            regionStart > 500
+                            ? regionStart - 500 : 0;
+                        const uint32_t uniEnd =
+                            std::min(regionEnd + 500, refSeqLen);
+
+                        // Progressively fill gaps with larger k.
+                        for(uint32_t tryK = uint32_t(k);
+                            tryK <= 30; tryK += 2) {
+
+                            // Build k-mer → positions for uniqueness
+                            // check across extended region.
                             std::unordered_map<string, vector<uint32_t>>
                                 refKmerPos;
-                            for(uint32_t p = localStart;
-                                p + tryK <= localEnd; ++p) {
+                            for(uint32_t p = uniStart;
+                                p + tryK <= uniEnd; ++p) {
                                 string kmer;
                                 kmer.reserve(tryK);
                                 for(uint32_t j = 0; j < tryK; ++j) {
@@ -2598,115 +2610,301 @@ void Assembler::buildSvMSA(
                                 refKmerPos[kmer].push_back(p);
                             }
 
-                            // Collect unique k-mers from each flank.
-                            struct FlankKmer {
-                                string kmer;
-                                uint32_t refPos;
-                            };
-                            vector<FlankKmer> leftKmers, rightKmers;
+                            // Find unique k-mers in uncovered gaps.
+                            uint32_t newAnchors = 0;
                             for(const auto& [kmer, positions] : refKmerPos) {
                                 if(positions.size() != 1) continue;
                                 const uint32_t pos = positions[0];
-                                if(pos >= leftFlankStart
-                                   && pos + tryK <= leftFlankEnd) {
-                                    leftKmers.push_back({kmer, pos});
-                                } else if(pos >= rightFlankStart
-                                          && pos + tryK <= rightFlankEnd) {
-                                    rightKmers.push_back({kmer, pos});
+                                if(pos < regionStart
+                                   || pos + tryK > regionEnd) continue;
+
+                                // Check if this position is already
+                                // covered by an existing anchor.
+                                const uint32_t localPos =
+                                    pos - regionStart;
+                                if(covered[localPos]) continue;
+
+                                refAnchors.push_back({pos, kmer, tryK});
+                                // Mark covered range.
+                                for(uint32_t j = 0;
+                                    j < tryK && localPos + j < regionLen;
+                                    ++j) {
+                                    covered[localPos + j] = true;
                                 }
+                                ++newAnchors;
                             }
 
-                            cout << "      Adaptive k=" << tryK
-                                 << ": leftKmers=" << leftKmers.size()
-                                 << " rightKmers=" << rightKmers.size()
+                            // Count remaining gaps.
+                            uint32_t gapBases = 0;
+                            for(uint32_t i = 0; i < regionLen; ++i) {
+                                if(!covered[i]) ++gapBases;
+                            }
+
+                            cout << "      k=" << tryK
+                                 << ": +" << newAnchors
+                                 << " anchors, total="
+                                 << refAnchors.size()
+                                 << ", gapBases=" << gapBases
+                                 << "/" << regionLen
                                  << endl;
 
-                            if(leftKmers.size() < 3
-                               || rightKmers.size() < 3) continue;
+                            // Stop if no gaps remain.
+                            if(gapBases == 0) break;
+                        }
 
-                            // For each read, find which flank it matches
-                            // and compute its median diagonal.
-                            vector<int64_t> leftFlankDiags;
-                            vector<int64_t> rightFlankDiags;
+                        // Sort reference anchors by position.
+                        sort(refAnchors.begin(), refAnchors.end(),
+                            [](const RefAnchor& a, const RefAnchor& b) {
+                                return a.refPos < b.refPos;
+                            });
 
-                            for(const auto& rg : readGroups) {
-                                const vector<Base> readSeq =
-                                    readsRef.getOrientedReadRawSequence(
-                                        OrientedReadId(rg.readId, 0));
-                                const uint32_t readLen =
-                                    uint32_t(readSeq.size());
-                                if(readLen < tryK) continue;
+                        cout << "      Total ref anchors: "
+                             << refAnchors.size() << endl;
 
-                                // Build k-mer → positions for read.
-                                std::unordered_map<string, vector<uint32_t>>
-                                    readKmerPos;
+                        if(refAnchors.size() < 5) {
+                            // Not enough anchors to analyze.
+                            if(delSize >= 50 && delSize <= 2000) {
+                                cout << "    >>> DELETION CALL (coverage): "
+                                     << "size=" << delSize << "bp, "
+                                     << "breakpoint=" << bpPos
+                                     << endl;
+                            }
+                            continue; // next covDropCluster
+                        }
+
+                        // For each read, match reference anchors and
+                        // build a per-read anchor list with (refPos,
+                        // readPos) pairs.
+                        struct ReadAnchorResult {
+                            ReadId readId;
+                            vector<pair<uint32_t, uint32_t>> anchors;
+                            // (refPos, readPos)
+                        };
+                        vector<ReadAnchorResult> readResults;
+
+                        for(const auto& rg : readGroups) {
+                            const vector<Base> readSeq =
+                                readsRef.getOrientedReadRawSequence(
+                                    OrientedReadId(rg.readId, 0));
+                            const uint32_t readLen =
+                                uint32_t(readSeq.size());
+
+                            // Build k-mer → positions for this read.
+                            // We need to handle multiple k values, so
+                            // build for each k used in refAnchors.
+                            // Collect all unique k values.
+                            std::set<uint32_t> kValues;
+                            for(const auto& ra : refAnchors) {
+                                kValues.insert(ra.kLen);
+                            }
+
+                            // For each k, build read k-mer index.
+                            std::unordered_map<string, vector<uint32_t>>
+                                readKmerPos;
+                            for(const uint32_t kv : kValues) {
+                                if(readLen < kv) continue;
                                 for(uint32_t p = 0;
-                                    p + tryK <= readLen; ++p) {
+                                    p + kv <= readLen; ++p) {
                                     string kmer;
-                                    kmer.reserve(tryK);
-                                    for(uint32_t j = 0; j < tryK; ++j) {
+                                    kmer.reserve(kv);
+                                    for(uint32_t j = 0; j < kv; ++j) {
                                         kmer.push_back(
                                             readSeq[p + j].character());
                                     }
+                                    // Only add if not already present
+                                    // (avoid duplicates from different k).
                                     readKmerPos[kmer].push_back(p);
-                                }
-
-                                // Match left flank k-mers.
-                                vector<int64_t> lDiags;
-                                for(const auto& fk : leftKmers) {
-                                    auto it = readKmerPos.find(fk.kmer);
-                                    if(it == readKmerPos.end()) continue;
-                                    if(it->second.size() != 1) continue;
-                                    lDiags.push_back(
-                                        int64_t(fk.refPos)
-                                        - int64_t(it->second[0]));
-                                }
-                                if(lDiags.size() >= 3) {
-                                    sort(lDiags.begin(), lDiags.end());
-                                    leftFlankDiags.push_back(
-                                        lDiags[lDiags.size() / 2]);
-                                }
-
-                                // Match right flank k-mers.
-                                vector<int64_t> rDiags;
-                                for(const auto& fk : rightKmers) {
-                                    auto it = readKmerPos.find(fk.kmer);
-                                    if(it == readKmerPos.end()) continue;
-                                    if(it->second.size() != 1) continue;
-                                    rDiags.push_back(
-                                        int64_t(fk.refPos)
-                                        - int64_t(it->second[0]));
-                                }
-                                if(rDiags.size() >= 3) {
-                                    sort(rDiags.begin(), rDiags.end());
-                                    rightFlankDiags.push_back(
-                                        rDiags[rDiags.size() / 2]);
                                 }
                             }
 
-                            cout << "      leftFlankReads="
-                                 << leftFlankDiags.size()
-                                 << " rightFlankReads="
-                                 << rightFlankDiags.size()
-                                 << endl;
+                            // Match reference anchors.
+                            vector<pair<uint32_t, uint32_t>> matches;
+                            for(const auto& ra : refAnchors) {
+                                auto it = readKmerPos.find(ra.kmer);
+                                if(it == readKmerPos.end()) continue;
+                                // Only use if unique in read.
+                                if(it->second.size() != 1) continue;
+                                matches.push_back(
+                                    {ra.refPos, it->second[0]});
+                            }
 
-                            // For a het deletion, each flank should show
-                            // a bimodal diagonal distribution: ref-like
-                            // reads at one diagonal, del-carrying reads
-                            // shifted by ~delSize.
-                            // Analyze the right flank (usually more reads
-                            // since reads pile up after the gap).
+                            if(matches.size() >= 3) {
+                                // Sort by refPos.
+                                sort(matches.begin(), matches.end());
+                                readResults.push_back(
+                                    {rg.readId, std::move(matches)});
+                            }
+                        }
+
+                        cout << "      Reads with anchors: "
+                             << readResults.size() << endl;
+
+                        // Collect per-read median diagonals for
+                        // bimodal analysis (single-flank approach).
+                        vector<int64_t> allMedianDiags;
+                        for(const auto& rr : readResults) {
+                            vector<int64_t> diags;
+                            for(const auto& [rp, rdp] : rr.anchors) {
+                                diags.push_back(
+                                    int64_t(rp) - int64_t(rdp));
+                            }
+                            sort(diags.begin(), diags.end());
+                            allMedianDiags.push_back(
+                                diags[diags.size() / 2]);
+                        }
+                        sort(allMedianDiags.begin(),
+                             allMedianDiags.end());
+
+                        cout << "      Median diags ("
+                             << allMedianDiags.size() << "):";
+                        for(const auto& d : allMedianDiags) {
+                            cout << " " << d;
+                        }
+                        cout << endl;
+
+                        // Analyze per-read diagonal profiles.
+                        // For each read, compute diagonal at each anchor
+                        // and find the max drop (deletion signal).
+                        bool refinedCall = false;
+                        struct DelSignal {
+                            ReadId readId;
+                            int64_t dropSize;
+                            uint32_t dropRefPos;
+                        };
+                        vector<DelSignal> delSignals;
+
+                        for(const auto& rr : readResults) {
+                            // Compute diagonals.
+                            vector<int64_t> diags;
+                            vector<uint32_t> refPositions;
+                            for(const auto& [rp, rdp] : rr.anchors) {
+                                diags.push_back(
+                                    int64_t(rp) - int64_t(rdp));
+                                refPositions.push_back(rp);
+                            }
+
+                            // Find max drop in diagonal (deletion).
+                            int64_t maxDrop = 0;
+                            uint32_t dropPos = 0;
+                            for(size_t i = 1; i < diags.size(); ++i) {
+                                const int64_t drop =
+                                    diags[i-1] - diags[i];
+                                if(drop > maxDrop) {
+                                    maxDrop = drop;
+                                    dropPos = (refPositions[i-1]
+                                               + refPositions[i]) / 2;
+                                }
+                            }
+
+                            if(maxDrop > 30) {
+                                delSignals.push_back(
+                                    {rr.readId, maxDrop, dropPos});
+                            }
+                        }
+
+                        if(delSignals.size() >= 2) {
+                            // Cluster deletion signals by size.
+                            sort(delSignals.begin(), delSignals.end(),
+                                [](const DelSignal& a, const DelSignal& b) {
+                                    return a.dropSize < b.dropSize;
+                                });
+
+                            // Find the most common deletion size
+                            // (within 20% tolerance).
+                            uint32_t bestCount = 0;
+                            int64_t bestSize = 0;
+                            uint32_t bestBp = 0;
+                            for(size_t i = 0;
+                                i < delSignals.size(); ++i) {
+                                uint32_t count = 0;
+                                int64_t sizeSum = 0;
+                                uint32_t bpSum = 0;
+                                for(size_t j = i;
+                                    j < delSignals.size(); ++j) {
+                                    if(delSignals[j].dropSize
+                                       <= delSignals[i].dropSize * 1.3) {
+                                        ++count;
+                                        sizeSum += delSignals[j].dropSize;
+                                        bpSum += delSignals[j].dropRefPos;
+                                    }
+                                }
+                                if(count > bestCount) {
+                                    bestCount = count;
+                                    bestSize = sizeSum / int64_t(count);
+                                    bestBp = bpSum / count;
+                                }
+                            }
+
+                            cout << "      Del signals ("
+                                 << delSignals.size() << "):";
+                            for(const auto& ds : delSignals) {
+                                cout << " r" << ds.readId
+                                     << ":" << ds.dropSize
+                                     << "@" << ds.dropRefPos;
+                            }
+                            cout << endl;
+
+                            // Require the detected size to be at least
+                            // 25% of the coverage-drop region to avoid
+                            // noise from repeat-induced small drops.
+                            if(bestCount >= 2 && bestSize >= 50
+                               && bestSize >= int64_t(delSize) / 4) {
+                                cout << "    >>> DELETION CALL (adaptive): "
+                                     << "size=" << bestSize << "bp, "
+                                     << "breakpoint=" << bestBp << ", "
+                                     << "reads=" << bestCount
+                                     << endl;
+                                refinedCall = true;
+                            }
+                        }
+
+                        // If per-read diagonal drop didn't work (all
+                        // anchors on one side), try per-flank bimodal
+                        // analysis. Separate reads into left-flank and
+                        // right-flank groups based on where their anchors
+                        // are, then look for bimodal diagonal splits
+                        // within each group.
+                        if(!refinedCall && readResults.size() >= 4) {
+                            // Classify reads by which side of the gap
+                            // their anchors are on.
+                            const uint32_t gapCenter =
+                                (cdc.startPos + cdc.endPos) / 2;
+                            vector<int64_t> leftDiags, rightDiags;
+
+                            for(const auto& rr : readResults) {
+                                // Use the median anchor refPos to
+                                // classify left vs right.
+                                vector<uint32_t> rps;
+                                vector<int64_t> ds;
+                                for(const auto& [rp, rdp] : rr.anchors) {
+                                    rps.push_back(rp);
+                                    ds.push_back(
+                                        int64_t(rp) - int64_t(rdp));
+                                }
+                                sort(rps.begin(), rps.end());
+                                sort(ds.begin(), ds.end());
+                                const uint32_t medRefPos =
+                                    rps[rps.size() / 2];
+                                const int64_t medDiag =
+                                    ds[ds.size() / 2];
+
+                                if(medRefPos < gapCenter) {
+                                    leftDiags.push_back(medDiag);
+                                } else {
+                                    rightDiags.push_back(medDiag);
+                                }
+                            }
+
+                            // Analyze each flank for bimodal split.
                             auto analyzeFlank = [](
-                                vector<int64_t>& diags,
-                                const char* label) -> int64_t {
+                                vector<int64_t>& diags) -> int64_t {
                                 if(diags.size() < 4) return 0;
                                 sort(diags.begin(), diags.end());
 
-                                // Find the largest gap between consecutive
-                                // diagonals — this separates the two modes.
                                 int64_t maxGap = 0;
                                 size_t maxGapIdx = 0;
-                                for(size_t i = 1; i < diags.size(); ++i) {
+                                for(size_t i = 1;
+                                    i < diags.size(); ++i) {
                                     const int64_t gap =
                                         diags[i] - diags[i-1];
                                     if(gap > maxGap) {
@@ -2715,16 +2913,8 @@ void Assembler::buildSvMSA(
                                     }
                                 }
 
-                                cout << "      " << label << " diags:";
-                                for(const auto& d : diags) cout << " " << d;
-                                cout << " maxGap=" << maxGap
-                                     << " at idx=" << maxGapIdx
-                                     << endl;
-
-                                // Need a gap > 30bp with reads on both sides.
                                 if(maxGap > 30 && maxGapIdx >= 2
                                    && diags.size() - maxGapIdx >= 2) {
-                                    // Compute median of each mode.
                                     const int64_t lowMed =
                                         diags[maxGapIdx / 2];
                                     const int64_t highMed =
@@ -2737,29 +2927,33 @@ void Assembler::buildSvMSA(
                             };
 
                             const int64_t leftShift =
-                                analyzeFlank(leftFlankDiags, "Left");
+                                analyzeFlank(leftDiags);
                             const int64_t rightShift =
-                                analyzeFlank(rightFlankDiags, "Right");
+                                analyzeFlank(rightDiags);
 
-                            // Use whichever flank gives a clearer signal.
-                            // Both should agree on the deletion size.
+                            cout << "      Flank bimodal: leftReads="
+                                 << leftDiags.size()
+                                 << " rightReads=" << rightDiags.size()
+                                 << " leftShift=" << leftShift
+                                 << " rightShift=" << rightShift
+                                 << endl;
+
                             int64_t bestShift = 0;
-                            if(leftShift > 30 && rightShift > 30) {
-                                // Both flanks agree — use average.
+                            if(leftShift > 50 && rightShift > 50) {
                                 bestShift = (leftShift + rightShift) / 2;
-                            } else if(leftShift > 30) {
+                            } else if(leftShift > 50) {
                                 bestShift = leftShift;
-                            } else if(rightShift > 30) {
+                            } else if(rightShift > 50) {
                                 bestShift = rightShift;
                             }
 
-                            if(bestShift > 30) {
-                                cout << "    >>> DELETION CALL (adaptive k="
-                                     << tryK << "): "
+                            if(bestShift >= 50 && bestShift <= 2000) {
+                                cout << "    >>> DELETION CALL "
+                                     << "(adaptive-bimodal): "
                                      << "size=" << bestShift << "bp, "
-                                     << "breakpoint=" << bpPos << ", "
-                                     << "leftShift=" << leftShift << ", "
-                                     << "rightShift=" << rightShift
+                                     << "breakpoint=" << bpPos
+                                     << ", leftShift=" << leftShift
+                                     << ", rightShift=" << rightShift
                                      << endl;
                                 refinedCall = true;
                             }
