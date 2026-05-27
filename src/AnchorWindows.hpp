@@ -90,9 +90,7 @@ struct AnchorWindow {
     static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
     std::map<std::pair<uint32_t, uint32_t>, std::vector<OrientedReadId>> transitionReads;
 
-    // Backbone read's transition: which windows the backbone connects from/to.
-    uint32_t backbonePreviousWindow = noWindow;
-    uint32_t backboneNextWindow = noWindow;
+
 
     // Read clusters from phasing.
     // Each cluster is a set of reads that phase together.
