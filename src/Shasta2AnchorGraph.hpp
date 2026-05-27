@@ -123,8 +123,16 @@ public:
     void writeGfa(const string& fileName) const;
     void writeBubbleFinderGraph(const string& fileName, bool useForAssemblyOnly = true) const;
 
+    // Write Bandage color CSV: each anchor colored by its window.
+    void writeCsv(const string& fileName) const;
+
     // Save binary data (Shasta2 compatibility).
     void saveAnchorGraph(const string& name = "Shasta2AnchorGraph") const { save(name); }
 
-
+    // Per-anchor window assignment (populated by the anchor-window constructor).
+    // Maps anchorId -> windowId. noWindow means unmapped.
+    // Includes RC mirror windows (windowId >= windowCount).
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    vector<uint32_t> anchorToWindow;
+    uint32_t windowCount = 0;
 };
