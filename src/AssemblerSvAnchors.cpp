@@ -2591,9 +2591,13 @@ void Assembler::buildSvMSA(
                         const uint32_t uniEnd =
                             std::min(regionEnd + 500, refSeqLen);
 
-                        // Progressively fill gaps with larger k.
-                        for(uint32_t tryK = uint32_t(k);
-                            tryK <= 30; tryK += 2) {
+                        // Fill gaps starting from large k (most unique,
+                        // skeleton anchors) down to small k (dense fill).
+                        // Max k=60 since reads are ~150bp.
+                        const uint32_t maxK = 60;
+                        const uint32_t minK = uint32_t(k);
+                        for(uint32_t tryK = maxK;
+                            tryK >= minK; tryK -= 2) {
 
                             // Build k-mer → positions for uniqueness
                             // check across extended region.
