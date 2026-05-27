@@ -246,6 +246,10 @@ public:
     int32_t minimap2MaxGap = 100;   // Max gap for minimap2-sr mode (minimap2 -g100).
     int32_t minimap2MinChainScore = 25; // Min chain score (minimap2 -m25).
 
+    // When > 0, only chain pairs where at least one read has
+    // readId < referenceReadCount. Skips read-vs-read pairs.
+    uint64_t referenceReadCount = 0;
+
     // --- Chaining parameters (hifiasm lchain) ---
     bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
     bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring

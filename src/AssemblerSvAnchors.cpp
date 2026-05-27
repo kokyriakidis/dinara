@@ -432,90 +432,193 @@ void Assembler::buildSvMSA(
         theseus::TheseusMSA aligner(penalties, heuristics, segmentViews, nodeIds, 1);
 
         // -----------------------------------------------------------------
-        // Step 5: Align each chain's read segments into the MSA.
+        // Step 5: Group chains by read, classify SV type, sort, then align.
         // -----------------------------------------------------------------
+        // Group chains by readId so we can classify each read's SV type
+        // from its set of chains (primary + supplementary).
+        //
+        // SV type classification per read:
+        //   - Deletion: read has supplementary chains and the gap between
+        //     chains on the reference is larger than on the query.
+        //   - Insertion: gap on the query is larger than on the reference.
+        //   - Reference-like: only a primary chain (no supplementary).
+        //
+        // Alignment order: deletions first (create shortcut paths in the
+        // graph), then insertions (create longer alternative paths), then
+        // reference-like reads (reinforce the backbone).
+
+        enum class SvType { Deletion = 0, Insertion = 1, ReferenceLike = 2 };
+
+        struct ReadGroup {
+            ReadId readId;
+            SvType svType;
+            vector<size_t> chainIndicesInRef;  // Indices into chainsForRef.
+        };
+
+        // Group chains by readId.
+        unordered_map<uint32_t, vector<size_t>> readToChainIndices;
+        for(size_t ci = 0; ci < chainsForRef.size(); ++ci) {
+            readToChainIndices[uint32_t(chainsForRef[ci].readId)].push_back(ci);
+        }
+
+        vector<ReadGroup> readGroups;
+        readGroups.reserve(readToChainIndices.size());
+
+        for(auto& [rid, indices] : readToChainIndices) {
+            ReadGroup rg;
+            rg.readId = ReadId(rid);
+            rg.chainIndicesInRef = std::move(indices);
+
+            if(rg.chainIndicesInRef.size() <= 1) {
+                // Single chain — reference-like.
+                rg.svType = SvType::ReferenceLike;
+            } else {
+                // Multiple chains — classify by comparing reference vs query gaps.
+                // Sort chains by reference start position.
+                sort(rg.chainIndicesInRef.begin(), rg.chainIndicesInRef.end(),
+                    [&](size_t a, size_t b) {
+                        const auto& alA = alignments[chainsForRef[a].chainIndex];
+                        const auto& alB = alignments[chainsForRef[b].chainIndex];
+                        if(alA.ordinals.empty()) return false;
+                        if(alB.ordinals.empty()) return true;
+                        return refMarkers[alA.ordinals.front()[0]].position
+                             < refMarkers[alB.ordinals.front()[0]].position;
+                    });
+
+                // Compare gaps between consecutive chains.
+                int64_t totalRefGap = 0;
+                int64_t totalQueryGap = 0;
+                for(size_t i = 0; i + 1 < rg.chainIndicesInRef.size(); ++i) {
+                    const auto& alCurr = alignments[chainsForRef[rg.chainIndicesInRef[i]].chainIndex];
+                    const auto& alNext = alignments[chainsForRef[rg.chainIndicesInRef[i + 1]].chainIndex];
+                    if(alCurr.ordinals.empty() || alNext.ordinals.empty()) continue;
+
+                    const auto& ceCurr = chainsForRef[rg.chainIndicesInRef[i]];
+                    const auto& ceNext = chainsForRef[rg.chainIndicesInRef[i + 1]];
+
+                    // Reference gap: from end of current chain to start of next.
+                    uint32_t refEndOrd = alCurr.ordinals.back()[0];
+                    uint32_t refStartOrd = alNext.ordinals.front()[0];
+                    if(refEndOrd < refMarkers.size() && refStartOrd < refMarkers.size()) {
+                        int64_t refEnd = refMarkers[refEndOrd].position + k;
+                        int64_t refStart = refMarkers[refStartOrd].position;
+                        totalRefGap += std::max(int64_t(0), refStart - refEnd);
+                    }
+
+                    // Query gap: from end of current chain to start of next on the read.
+                    const Strand sCurr = ceCurr.isSameStrand ? 0 : 1;
+                    const Strand sNext = ceNext.isSameStrand ? 0 : 1;
+                    const OrientedReadId oidCurr(ceCurr.readId, sCurr);
+                    const OrientedReadId oidNext(ceNext.readId, sNext);
+                    const auto mCurr = markersRef[oidCurr.getValue()];
+                    const auto mNext = markersRef[oidNext.getValue()];
+
+                    uint32_t qEndOrd = alCurr.ordinals.back()[1];
+                    uint32_t qStartOrd = alNext.ordinals.front()[1];
+                    if(qEndOrd < mCurr.size() && qStartOrd < mNext.size()) {
+                        int64_t qEnd = mCurr[qEndOrd].position + k;
+                        int64_t qStart = mNext[qStartOrd].position;
+                        totalQueryGap += std::max(int64_t(0), qStart - qEnd);
+                    }
+                }
+
+                if(totalRefGap > totalQueryGap) {
+                    rg.svType = SvType::Deletion;
+                } else if(totalQueryGap > totalRefGap) {
+                    rg.svType = SvType::Insertion;
+                } else {
+                    rg.svType = SvType::ReferenceLike;
+                }
+            }
+
+            readGroups.push_back(std::move(rg));
+        }
+
+        // Sort: deletions first, then insertions, then reference-like.
+        sort(readGroups.begin(), readGroups.end(),
+            [](const ReadGroup& a, const ReadGroup& b) {
+                return static_cast<int>(a.svType) < static_cast<int>(b.svType);
+            });
+
+        // Now align reads in the sorted order.
         int seqId = 1;  // 0 is the backbone (reference).
         vector<string> seqNames;
         seqNames.push_back(string("ref_") + to_string(uint32_t(refId)));
 
-        for(const auto& ce : chainsForRef) {
-            const auto& al = alignments[ce.chainIndex];
-            const ReadId readId = ce.readId;
-            const bool isSameStrand = ce.isSameStrand;
-
-            // Determine the oriented read ID for the short read.
-            // If same strand, the read is on strand 0. If different strand, strand 1.
-            const Strand readStrand = isSameStrand ? 0 : 1;
-            const OrientedReadId readOid(readId, readStrand);
-            const auto readMarkers = markersRef[readOid.getValue()];
-
-            // Walk the chain's ordinals. Each consecutive pair of ordinals
-            // that map to backbone boundaries defines a segment to align.
-            // ordinals are {refOrdinal, readOrdinal}.
-            const auto& ordinals = al.ordinals;
-
-            // Map each ordinal to its boundary index.
-            vector<pair<uint32_t, uint32_t>> boundaryAndReadOrdinal;
-            for(const auto& ord : ordinals) {
-                auto it = ordinalToBoundary.find(ord[0]);
-                if(it != ordinalToBoundary.end()) {
-                    boundaryAndReadOrdinal.push_back({it->second, ord[1]});
-                }
-            }
-
-            if(boundaryAndReadOrdinal.size() < 2) continue;
-
-            // Sort by boundary index (should already be sorted if chain is collinear).
-            sort(boundaryAndReadOrdinal.begin(), boundaryAndReadOrdinal.end());
-
+        for(const auto& rg : readGroups) {
+            const ReadId readId = rg.readId;
             const auto readNameSpan = readsRef.getReadName(readId);
             const string readName(readNameSpan.data(), readNameSpan.size());
+
+            bool anyAligned = false;
             seqNames.push_back(readName);
 
-            uint32_t alignedSegs = 0;
-            for(size_t j = 0; j + 1 < boundaryAndReadOrdinal.size(); ++j) {
-                const uint32_t bLeft = boundaryAndReadOrdinal[j].first;
-                const uint32_t bRight = boundaryAndReadOrdinal[j + 1].first;
-                const uint32_t readOrdLeft = boundaryAndReadOrdinal[j].second;
-                const uint32_t readOrdRight = boundaryAndReadOrdinal[j + 1].second;
+            // Align all chains for this read.
+            for(size_t ci : rg.chainIndicesInRef) {
+                const auto& ce = chainsForRef[ci];
+                const auto& al = alignments[ce.chainIndex];
 
-                if(bRight <= bLeft) continue;
-                if(readOrdRight <= readOrdLeft) continue;
-                if(readOrdLeft >= readMarkers.size() || readOrdRight >= readMarkers.size()) continue;
+                const Strand readStrand = ce.isSameStrand ? 0 : 1;
+                const OrientedReadId readOid(readId, readStrand);
+                const auto readMarkers = markersRef[readOid.getValue()];
 
-                // Extract read subsequence between the two anchor positions.
-                const uint32_t readPosLeft = readMarkers[readOrdLeft].position + kHalf;
-                const uint32_t readPosRight = readMarkers[readOrdRight].position + kHalf;
-                if(readPosRight <= readPosLeft) continue;
+                const auto& ordinals = al.ordinals;
 
-                string readSeg;
-                readSeg.reserve(readPosRight - readPosLeft);
-                for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
-                    readSeg.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
+                // Map each ordinal to its boundary index.
+                vector<pair<uint32_t, uint32_t>> boundaryAndReadOrdinal;
+                for(const auto& ord : ordinals) {
+                    auto it = ordinalToBoundary.find(ord[0]);
+                    if(it != ordinalToBoundary.end()) {
+                        boundaryAndReadOrdinal.push_back({it->second, ord[1]});
+                    }
                 }
 
-                if(readSeg.empty()) continue;
+                if(boundaryAndReadOrdinal.size() < 2) continue;
 
-                // Determine start and end nodes in the graph.
-                if(bLeft >= nodeIds.size()) continue;
-                int endNode = (bRight < nodeIds.size())
-                    ? static_cast<int>(nodeIds[bRight])
-                    : -1;
+                sort(boundaryAndReadOrdinal.begin(), boundaryAndReadOrdinal.end());
 
-                aligner.align_from(
-                    readSeg,
-                    nodeIds[bLeft],
-                    1,      // weight
-                    true,   // is_ends_free
-                    0,      // start_offset
-                    endNode,
-                    seqId);
+                for(size_t j = 0; j + 1 < boundaryAndReadOrdinal.size(); ++j) {
+                    const uint32_t bLeft = boundaryAndReadOrdinal[j].first;
+                    const uint32_t bRight = boundaryAndReadOrdinal[j + 1].first;
+                    const uint32_t readOrdLeft = boundaryAndReadOrdinal[j].second;
+                    const uint32_t readOrdRight = boundaryAndReadOrdinal[j + 1].second;
 
-                ++alignedSegs;
-                ++totalAlignedSegments;
+                    if(bRight <= bLeft) continue;
+                    if(readOrdRight <= readOrdLeft) continue;
+                    if(readOrdLeft >= readMarkers.size() || readOrdRight >= readMarkers.size()) continue;
+
+                    const uint32_t readPosLeft = readMarkers[readOrdLeft].position + kHalf;
+                    const uint32_t readPosRight = readMarkers[readOrdRight].position + kHalf;
+                    if(readPosRight <= readPosLeft) continue;
+
+                    string readSeg;
+                    readSeg.reserve(readPosRight - readPosLeft);
+                    for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
+                        readSeg.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
+                    }
+
+                    if(readSeg.empty()) continue;
+
+                    if(bLeft >= nodeIds.size()) continue;
+                    int endNode = (bRight < nodeIds.size())
+                        ? static_cast<int>(nodeIds[bRight])
+                        : -1;
+
+                    aligner.align_from(
+                        readSeg,
+                        nodeIds[bLeft],
+                        1,      // weight
+                        true,   // is_ends_free
+                        0,      // start_offset
+                        endNode,
+                        seqId);
+
+                    anyAligned = true;
+                    ++totalAlignedSegments;
+                }
             }
 
-            if(alignedSegs > 0) {
+            if(anyAligned) {
                 ++seqId;
                 ++totalAlignedReads;
             } else {
