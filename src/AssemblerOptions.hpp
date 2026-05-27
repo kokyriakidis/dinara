@@ -243,7 +243,7 @@ public:
     // 1 = minimap2-sr (fixed bandwidth, log gap penalty)
     int chainingMode = 0;
     int32_t minimap2Bw = 100;       // Fixed bandwidth for minimap2-sr mode (minimap2 -r100).
-    int32_t minimap2MaxGap = 5000;  // Max gap for minimap2-sr mode (minimap2 -g100, but we use 5000 for large SVs).
+    int32_t minimap2MaxGap = 100;   // Max gap for minimap2-sr mode (minimap2 -g100).
     int32_t minimap2MinChainScore = 25; // Min chain score (minimap2 -m25).
 
     // --- Chaining parameters (hifiasm lchain) ---

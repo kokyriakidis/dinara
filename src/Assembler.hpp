@@ -2632,7 +2632,7 @@ public:
              // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr.
              int chainingMode = 0;
              int32_t minimap2Bw = 100;
-             int32_t minimap2MaxGap = 5000;
+             int32_t minimap2MaxGap = 100;
              int32_t minimap2MinChainScore = 25;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;

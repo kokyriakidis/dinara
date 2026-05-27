@@ -1370,7 +1370,7 @@ static inline void run_main_dp_loop(
     int64_t* msc, int64_t* msc_i, int64_t* movl, int64_t* plus,
     int chainingMode = 0,
     int32_t minimap2Bw = 100,
-    int32_t minimap2MaxGap = 5000) noexcept
+    int32_t minimap2MaxGap = 100) noexcept
 {
     int64_t max_f, n_skip, st, max_j, end_j, sc, max_ii = -1, ovl;
     int32_t max, tmp;
@@ -1638,7 +1638,7 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
     int64_t mcopy_num, double mcopy_rate, int64_t mcopy_khit_cutoff,
     int chainingMode = 0,
     int32_t minimap2Bw = 100,
-    int32_t minimap2MaxGap = 5000,
+    int32_t minimap2MaxGap = 100,
     int32_t minimap2MinChainScore = 25)
 {
     const int64_t a_n = static_cast<int64_t>(a.size());
