@@ -2383,8 +2383,19 @@ private:
 
                 // Per-partner chaining: build k_mer_hit array, run DP, apply postfilter.
                 // Ref: anchor.cpp:1920 lchain_qgen_mcopy_fast
-                    const HifiasmLchainDpOptions dpOpt =
+                    HifiasmLchainDpOptions dpOpt =
                         getHifiasmLchainDpOptions(lchainIsAccurate, uint32_t(kmerLen));
+
+                    // In minimap2-sr mode, override gap/skip penalties to match
+                    // minimap2's formula: chn_pen_gap = 0.01 * avg_qspan.
+                    // chn_pen_skip is unused in minimap2_comput_sc (skip penalty
+                    // is handled by the n_skip counter in the outer DP loop).
+                    if(chainingMode == 1) {
+                        dpOpt.chnPenGap = 0.01 * static_cast<double>(kmerLen);
+                        dpOpt.chnPenSkip = 0.01 * static_cast<double>(kmerLen);
+                        dpOpt.quickCheck = false;  // Not applicable in minimap2 mode.
+                    }
+
                     const uint8_t span = uint8_t(std::min<uint64_t>(kmerLen, 255ULL));
 
                     const uint32_t readLenA32 = uint32_t(std::min<uint64_t>(
