@@ -3664,6 +3664,48 @@ void dinara::main::svanchors(
         svOpts,
         threadCount);
 
+    // Replace hifiasm-extended qs/qe/ts/te with raw anchor coordinates.
+    // push_ovlp_chain_qgen left-normalizes and right-extends to read
+    // boundaries, which is wrong for short-read SV detection where we
+    // need actual chain boundaries for soft-clip analysis.
+    {
+        auto& als = assembler.alignmentCandidatesAlignmentsData.alignments;
+        const auto& cands = assembler.alignmentCandidates.candidates;
+        const auto& mkrs = *assembler.markers;
+        for(uint64_t i = 0; i < als.size(); ++i) {
+            auto& al = als[i];
+            if(al.ordinals.empty()) continue;
+
+            const auto& cand = cands[i];
+            const bool isSameStrand = cand.isSameStrand;
+
+            // ordinals[j] = {ordinalA, ordinalB}
+            // A = readIds[0] (reference, strand 0)
+            // B = readIds[1] (short read, strand depends on isSameStrand)
+            const OrientedReadId oidA(cand.readIds[0], 0);
+            const Strand strandB = isSameStrand ? 0 : 1;
+            const OrientedReadId oidB(cand.readIds[1], strandB);
+
+            const auto mA = mkrs[oidA.getValue()];
+            const auto mB = mkrs[oidB.getValue()];
+
+            const uint32_t firstOrdA = al.ordinals.front()[0];
+            const uint32_t lastOrdA = al.ordinals.back()[0];
+            const uint32_t firstOrdB = al.ordinals.front()[1];
+            const uint32_t lastOrdB = al.ordinals.back()[1];
+
+            if(firstOrdA < mA.size() && lastOrdA < mA.size()) {
+                al.qs = mA[firstOrdA].position;
+                al.qe = mA[lastOrdA].position + uint32_t(k);
+            }
+            if(firstOrdB < mB.size() && lastOrdB < mB.size()) {
+                al.ts = mB[firstOrdB].position;
+                al.te = mB[lastOrdB].position + uint32_t(k);
+            }
+        }
+        cout << timestamp << "Replaced extended coordinates with raw anchor positions." << endl;
+    }
+
     // ========================================================================
     // Step 6: Classify chains as primary/supplementary/secondary.
     // ========================================================================
