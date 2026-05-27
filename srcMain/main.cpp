@@ -6,6 +6,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "AnchorWindows.hpp"
+#include "InvertedIndexBuilder.hpp"
 #include "AssemblerOptions.hpp"
 #include "buildId.hpp"
 #if DINARA_ENABLE_VARIANT_CLUSTERING
@@ -3610,6 +3611,80 @@ void dinara::main::svanchors(
     assembler.buildInvertedIndex(threadCount);
 
     // ========================================================================
+    // Step 4b: K-mer hit depth along the reference.
+    // ========================================================================
+    // For each marker on the reference (read 0, strand 0), look up its
+    // canonical k-mer in the inverted index hash table and count how many
+    // reads share that k-mer. Build a per-window profile for breakpoint
+    // detection in buildSvMSA.
+    vector<Assembler::RefHitDepthWindow> refHitDepthProfile;
+    {
+        const auto& iiData = assembler.invertedIndexData;
+        const auto refMarkers = (*assembler.markers)[
+            OrientedReadId(ReadId(0), 0).getValue()];
+
+        if(!iiData.hashTable.empty() && refMarkers.size() > 0) {
+            const uint64_t hashMask = iiData.hashTable.size() - 1;
+
+            // Per-marker hit counts.
+            struct HitInfo { uint32_t refPos; uint32_t hitCount; };
+            vector<HitInfo> hitProfile;
+            hitProfile.reserve(refMarkers.size());
+
+            for(uint64_t i = 0; i < refMarkers.size(); ++i) {
+                const uint32_t refPos = uint32_t(refMarkers[i].position);
+                const uint64_t globalIdx = iiData.strand0CanonicalOffsets[0] + i;
+                if(globalIdx >= iiData.strand0CanonicalKmerIds.size()) {
+                    hitProfile.push_back({refPos, 0});
+                    continue;
+                }
+                const KmerId kmer = iiData.strand0CanonicalKmerIds[globalIdx];
+
+                uint64_t slot = hashKmer(kmer) & hashMask;
+                uint32_t hitCount = 0;
+                while(true) {
+                    const auto& entry = iiData.hashTable[slot];
+                    if(entry.empty) break;
+                    if(entry.key == kmer) {
+                        for(uint64_t j = entry.start; j < entry.start + entry.count; ++j) {
+                            if(iiData.compactOccurrences[j].readId != ReadId(0))
+                                ++hitCount;
+                        }
+                        break;
+                    }
+                    slot = (slot + 1) & hashMask;
+                }
+                hitProfile.push_back({refPos, hitCount});
+            }
+
+            // Aggregate into windows.
+            const uint32_t windowSize = 50;
+            const uint32_t refEnd = hitProfile.empty() ? 0 : hitProfile.back().refPos;
+
+            for(uint32_t wStart = 0; wStart <= refEnd; wStart += windowSize) {
+                const uint32_t wEnd = wStart + windowSize;
+                uint32_t sumHits = 0, nMarkers = 0;
+                for(const auto& h : hitProfile) {
+                    if(h.refPos >= wStart && h.refPos < wEnd) {
+                        sumHits += h.hitCount;
+                        ++nMarkers;
+                    }
+                }
+                if(nMarkers > 0) {
+                    refHitDepthProfile.push_back({
+                        wStart + windowSize / 2,
+                        double(sumHits) / double(nMarkers),
+                        nMarkers
+                    });
+                }
+            }
+
+            cout << "K-mer hit depth: " << refHitDepthProfile.size()
+                 << " windows computed." << endl;
+        }
+    }
+
+    // ========================================================================
     // Step 5: DP chaining with multi-chain extraction.
     // ========================================================================
     // Use the same DP chaining as the assembly pipeline, but with parameters
@@ -3716,7 +3791,7 @@ void dinara::main::svanchors(
     // Step 7: Build Theseus MSA using chain anchors as segment boundaries.
     // ========================================================================
     cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
-    assembler.buildSvMSA(referenceReadCount, "sv_msa");
+    assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile);
 
     // ========================================================================
     // Summary.
