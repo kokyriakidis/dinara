@@ -1645,10 +1645,8 @@ void dinara::main::assemble(
         }
     }
 
-    // Write AnchorWindowsClean GFA.
     const uint64_t minInterWindowCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
-    assembler.writeAnchorWindowsCleanGfa(anchorWindows, minInterWindowCoverage);
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;
@@ -1667,6 +1665,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
 
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
 

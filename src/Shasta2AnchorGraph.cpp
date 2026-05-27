@@ -127,9 +127,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // (windowId + windowCount) whose backbone anchors are the RC (anchorId ^ 1)
     // of the original backbone anchors. This lets strand-1 reads discover
     // inter-window transitions through the RC windows.
-    const uint32_t noWindow = std::numeric_limits<uint32_t>::max();
-    const uint32_t windowCount = uint32_t(anchorWindows.size());
-    vector<uint32_t> anchorToWindow(anchorCount, noWindow);
+    windowCount = uint32_t(anchorWindows.size());
+    anchorToWindow.assign(anchorCount, noWindow);
     vector<uint32_t> anchorToBackbonePos(anchorCount, 0);
     for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
