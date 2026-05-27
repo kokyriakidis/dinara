@@ -476,6 +476,8 @@ void Assembler::buildSvMSA(
             ReadId readId;
             SvType svType;
             int64_t svSize;  // |refSpan - readSpan|, larger = bigger SV.
+            uint32_t breakpointRefPos;  // Reference position (bp) of the SV breakpoint.
+            int32_t clusterId;  // SV cluster assignment (-1 = unclustered).
             vector<size_t> chainIndicesInRef;  // Indices into chainsForRef.
         };
 
@@ -493,6 +495,8 @@ void Assembler::buildSvMSA(
             rg.readId = ReadId(rid);
             rg.chainIndicesInRef = std::move(indices);
             rg.svSize = 0;
+            rg.breakpointRefPos = 0;
+            rg.clusterId = -1;
 
             // Check for inversion: chains on both strands.
             const auto& firstCeClassify = chainsForRef[rg.chainIndicesInRef[0]];
@@ -505,9 +509,38 @@ void Assembler::buildSvMSA(
                 else hasOppositeStrand = true;
             }
 
+            // Compute per-chain reference spans for breakpoint detection.
+            // Each chain's ref extent: [minRefPos, maxRefPos].
+            struct ChainRefSpan {
+                uint32_t minRefPos;
+                uint32_t maxRefPos;
+                size_t chainIdxInRef;
+            };
+            vector<ChainRefSpan> chainSpans;
+            for(size_t ci : rg.chainIndicesInRef) {
+                const auto& al = alignments[chainsForRef[ci].chainIndex];
+                uint32_t cMinRef = UINT32_MAX, cMaxRef = 0;
+                for(const auto& ord : al.ordinals) {
+                    if(ord[0] < refMarkers.size()) {
+                        const uint32_t pos = refMarkers[ord[0]].position;
+                        cMinRef = std::min(cMinRef, pos);
+                        cMaxRef = std::max(cMaxRef, pos);
+                    }
+                }
+                if(cMinRef <= cMaxRef) {
+                    chainSpans.push_back({cMinRef, cMaxRef, ci});
+                }
+            }
+            // Sort chains by reference start position.
+            sort(chainSpans.begin(), chainSpans.end(),
+                [](const ChainRefSpan& a, const ChainRefSpan& b) {
+                    return a.minRefPos < b.minRefPos;
+                });
+
             if(hasPrimaryStrand && hasOppositeStrand) {
                 // Inversion: chains on both strands.
                 // svSize = total reference span of the inverted chains.
+                // breakpoint = start of the first inverted chain on the reference.
                 uint32_t invMinRef = UINT32_MAX, invMaxRef = 0;
                 for(size_t ci : rg.chainIndicesInRef) {
                     const Strand s = chainsForRef[ci].isSameStrand ? 0 : 1;
@@ -515,14 +548,15 @@ void Assembler::buildSvMSA(
                     const auto& al = alignments[chainsForRef[ci].chainIndex];
                     for(const auto& ord : al.ordinals) {
                         if(ord[0] < refMarkers.size()) {
-                            invMinRef = std::min(invMinRef, ord[0]);
-                            invMaxRef = std::max(invMaxRef, ord[0]);
+                            const uint32_t pos = refMarkers[ord[0]].position;
+                            invMinRef = std::min(invMinRef, pos);
+                            invMaxRef = std::max(invMaxRef, pos);
                         }
                     }
                 }
-                if(invMinRef < refMarkers.size() && invMaxRef < refMarkers.size() && invMaxRef > invMinRef) {
-                    rg.svSize = int64_t(refMarkers[invMaxRef].position)
-                              - int64_t(refMarkers[invMinRef].position);
+                if(invMinRef != UINT32_MAX && invMaxRef > invMinRef) {
+                    rg.svSize = int64_t(invMaxRef) - int64_t(invMinRef);
+                    rg.breakpointRefPos = invMinRef;
                 }
                 rg.svType = SvType::Inversion;
             } else {
@@ -568,14 +602,109 @@ void Assembler::buildSvMSA(
                 } else {
                     rg.svType = SvType::ReferenceLike;
                 }
+
+                // Breakpoint = midpoint of the largest gap between
+                // consecutive chains on the reference. For single-chain
+                // reads, use the midpoint of the chain's reference span.
+                if(chainSpans.size() >= 2) {
+                    uint32_t maxGap = 0;
+                    uint32_t gapMid = 0;
+                    for(size_t si = 0; si + 1 < chainSpans.size(); ++si) {
+                        const uint32_t gapStart = chainSpans[si].maxRefPos;
+                        const uint32_t gapEnd = chainSpans[si + 1].minRefPos;
+                        if(gapEnd > gapStart) {
+                            const uint32_t gap = gapEnd - gapStart;
+                            if(gap > maxGap) {
+                                maxGap = gap;
+                                gapMid = gapStart + gap / 2;
+                            }
+                        }
+                    }
+                    if(maxGap > 0) {
+                        rg.breakpointRefPos = gapMid;
+                    }
+                } else if(chainSpans.size() == 1) {
+                    rg.breakpointRefPos = (chainSpans[0].minRefPos + chainSpans[0].maxRefPos) / 2;
+                }
             }
 
             readGroups.push_back(std::move(rg));
         }
 
-        // Sort: deletions first (largest first), then insertions (largest
-        // first), then reference-like. Within each SV type, larger SVs
-        // come first so they establish the graph paths before smaller ones.
+        // -----------------------------------------------------------------
+        // Step 5b: Cluster SV-carrying reads by breakpoint position and
+        // SV size, following the hifiasm detectSVSites pattern.
+        //
+        // Within each SV type (Deletion, Insertion, Inversion), reads
+        // whose breakpoints fall within SV_WINDOW bp and whose SV sizes
+        // are within SV_SIZE_RATIO of each other are assigned to the
+        // same cluster. ReferenceLike reads get clusterId = -1.
+        // -----------------------------------------------------------------
+        constexpr uint32_t SV_WINDOW = 50;
+        constexpr double SV_SIZE_RATIO = 0.20;
+        constexpr uint32_t SV_MIN_SUPPORT = 1;  // Minimum reads per cluster.
+
+        // Separate indices by SV type for independent clustering.
+        vector<size_t> svIndices;  // Indices into readGroups for SV reads.
+        for(size_t i = 0; i < readGroups.size(); ++i) {
+            if(readGroups[i].svType != SvType::ReferenceLike) {
+                svIndices.push_back(i);
+            }
+        }
+
+        // Sort SV reads by (svType, breakpointRefPos) for clustering.
+        sort(svIndices.begin(), svIndices.end(),
+            [&readGroups](size_t a, size_t b) {
+                if(readGroups[a].svType != readGroups[b].svType)
+                    return static_cast<int>(readGroups[a].svType)
+                         < static_cast<int>(readGroups[b].svType);
+                return readGroups[a].breakpointRefPos < readGroups[b].breakpointRefPos;
+            });
+
+        int32_t nextClusterId = 0;
+
+        for(size_t ii = 0; ii < svIndices.size(); ) {
+            // Start a new cluster seed from svIndices[ii].
+            const size_t seedIdx = svIndices[ii];
+            const SvType seedType = readGroups[seedIdx].svType;
+            const uint32_t seedPos = readGroups[seedIdx].breakpointRefPos;
+            const int64_t seedSize = readGroups[seedIdx].svSize;
+
+            // Gather all reads within the window that match type and size.
+            vector<size_t> clusterMembers;
+            size_t jj = ii;
+            while(jj < svIndices.size()) {
+                const size_t idx = svIndices[jj];
+                if(readGroups[idx].svType != seedType) break;
+                if(readGroups[idx].breakpointRefPos >= seedPos + SV_WINDOW) break;
+
+                // Size tolerance check.
+                const int64_t sz = readGroups[idx].svSize;
+                const int64_t refSz = (seedSize > 0) ? seedSize : 1;
+                const int64_t diff = std::abs(sz - seedSize);
+                if(diff <= int64_t(std::abs(refSz) * SV_SIZE_RATIO) || seedSize == 0) {
+                    clusterMembers.push_back(idx);
+                }
+                ++jj;
+            }
+
+            if(clusterMembers.size() >= SV_MIN_SUPPORT) {
+                for(size_t idx : clusterMembers) {
+                    readGroups[idx].clusterId = nextClusterId;
+                }
+                ++nextClusterId;
+            }
+
+            // Advance past the window.
+            ii = (jj > ii + 1) ? jj : ii + 1;
+        }
+
+        const int32_t totalClusters = nextClusterId;
+
+        // Sort: deletions first (largest first), then inversions, then
+        // insertions (largest first), then reference-like. Within each
+        // SV type, larger SVs come first so they establish the graph
+        // paths before smaller ones.
         sort(readGroups.begin(), readGroups.end(),
             [](const ReadGroup& a, const ReadGroup& b) {
                 if(a.svType != b.svType)
@@ -592,7 +721,12 @@ void Assembler::buildSvMSA(
         for(const auto& rg : readGroups) {
             const ReadId readId = rg.readId;
             const auto readNameSpan = readsRef.getReadName(readId);
-            const string readName(readNameSpan.data(), readNameSpan.size());
+            string readName(readNameSpan.data(), readNameSpan.size());
+
+            // Tag with cluster ID if assigned.
+            if(rg.clusterId >= 0) {
+                readName += "_C" + to_string(rg.clusterId);
+            }
 
             if(rg.chainIndicesInRef.empty()) continue;
 
@@ -947,6 +1081,58 @@ void Assembler::buildSvMSA(
                 consOut << ">ref" << uint32_t(refId) << "_consensus\n"
                         << consensusSeq << "\n";
             }
+        }
+
+        // -----------------------------------------------------------------
+        // Step 7: Output per-cluster SV summary.
+        // -----------------------------------------------------------------
+        if(totalClusters > 0) {
+            const string clusterFileName = outputPrefix + "_ref"
+                + to_string(uint32_t(refId)) + ".sv_clusters.tsv";
+            ofstream clusterOut(clusterFileName);
+            if(clusterOut) {
+                clusterOut << "cluster_id\tsv_type\tnum_reads\tbreakpoint_pos\t"
+                           << "mean_sv_size\tmin_sv_size\tmax_sv_size\n";
+
+                for(int32_t cid = 0; cid < totalClusters; ++cid) {
+                    uint32_t count = 0;
+                    int64_t sumSize = 0;
+                    int64_t minSize = INT64_MAX;
+                    int64_t maxSize = INT64_MIN;
+                    uint64_t sumPos = 0;
+                    SvType cType = SvType::ReferenceLike;
+
+                    for(const auto& rg : readGroups) {
+                        if(rg.clusterId != cid) continue;
+                        ++count;
+                        sumSize += rg.svSize;
+                        sumPos += rg.breakpointRefPos;
+                        minSize = std::min(minSize, rg.svSize);
+                        maxSize = std::max(maxSize, rg.svSize);
+                        cType = rg.svType;
+                    }
+
+                    if(count == 0) continue;
+
+                    const char* typeStr = "UNKNOWN";
+                    switch(cType) {
+                        case SvType::Deletion:  typeStr = "DEL"; break;
+                        case SvType::Inversion: typeStr = "INV"; break;
+                        case SvType::Insertion: typeStr = "INS"; break;
+                        case SvType::ReferenceLike: typeStr = "REF"; break;
+                    }
+
+                    clusterOut << cid << "\t"
+                               << typeStr << "\t"
+                               << count << "\t"
+                               << (sumPos / count) << "\t"
+                               << (sumSize / int64_t(count)) << "\t"
+                               << minSize << "\t"
+                               << maxSize << "\n";
+                }
+            }
+            cout << "    SV clusters: " << totalClusters
+                 << " (output: " << clusterFileName << ")" << endl;
         }
 
         ++totalMSAs;

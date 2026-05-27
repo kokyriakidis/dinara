@@ -3638,15 +3638,16 @@ void dinara::main::svanchors(
     OverlapCandidatesOptions svOpts = assemblerOptions.overlapCandidatesOptions;
     svOpts.chainingMode = 1;                          // minimap2-sr scoring mode.
     svOpts.minimap2Bw = 100;                          // minimap2 -r100 fixed bandwidth.
-    svOpts.minimap2MaxGap = 100;                      // minimap2 -g100.
+    svOpts.minimap2MaxGap = 5000;                     // Allow large gaps for SV detection.
     svOpts.minimap2MinChainScore = 25;                // minimap2 -m25.
     svOpts.driftRateTolerance = 0.02;                 // Used as bw_rate fallback.
     svOpts.invertedIndexLchainIsAccurate = false;     // HiFi error model.
-    svOpts.invertedIndexMcopyKhitCutoff = 3;          // Short reads have few markers.
+    svOpts.invertedIndexMcopyKhitCutoff = 1;          // Short reads have few markers.
     svOpts.invertedIndexMcopyNum = 20;                // minimap2 -N20.
     svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
     svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
     svOpts.referenceReadCount = 0;                     // Chain all-vs-all (needed for indirect alignment of insertion-internal reads).
+    svOpts.invertedIndexDownsampleHighFrequencyMarkers = false;  // Disable: coverageHet is not computed in svanchors.
 
     const double maxDriftRate = svOpts.driftRateTolerance;
     const uint64_t maxChainLimit = 0;  // No limit on chains per read.
