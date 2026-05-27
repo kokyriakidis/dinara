@@ -560,37 +560,97 @@ void Assembler::buildSvMSA(
                 }
                 rg.svType = SvType::Inversion;
             } else {
-                // No inversion — classify by span comparison on primary strand.
+                // No inversion — classify by comparing gaps between
+                // consecutive chains on the reference vs on the read.
+                //
+                // For each pair of consecutive chains (sorted by ref pos),
+                // compute refGap and readGap. The largest |refGap - readGap|
+                // determines the SV type and size:
+                //   refGap > readGap → Deletion (reference has extra sequence)
+                //   readGap > refGap → Insertion (read has extra sequence)
+                //
+                // This correctly handles insertions where the total refSpan
+                // is large but the gap between chains on the read is small
+                // (the read has inserted sequence between the chains).
+
                 const OrientedReadId classifyOid(rg.readId, primaryStrand);
                 const auto classifyReadMarkers = markersRef[classifyOid.getValue()];
 
-                uint32_t minRefOrd = UINT32_MAX, maxRefOrd = 0;
-                uint32_t minReadOrd = UINT32_MAX, maxReadOrd = 0;
-
+                // Build per-chain spans on both reference and read.
+                struct ChainEndpoints {
+                    uint32_t refMinPos, refMaxPos;
+                    uint32_t readMinPos, readMaxPos;
+                };
+                vector<ChainEndpoints> chainEps;
                 for(size_t ci : rg.chainIndicesInRef) {
+                    const Strand s = chainsForRef[ci].isSameStrand ? 0 : 1;
+                    if(s != primaryStrand) continue;
                     const auto& al = alignments[chainsForRef[ci].chainIndex];
+                    uint32_t rMin = UINT32_MAX, rMax = 0;
+                    uint32_t qMin = UINT32_MAX, qMax = 0;
                     for(const auto& ord : al.ordinals) {
                         if(ord[0] < refMarkers.size()) {
-                            minRefOrd = std::min(minRefOrd, ord[0]);
-                            maxRefOrd = std::max(maxRefOrd, ord[0]);
+                            const uint32_t rp = refMarkers[ord[0]].position;
+                            rMin = std::min(rMin, rp);
+                            rMax = std::max(rMax, rp);
                         }
                         if(ord[1] < classifyReadMarkers.size()) {
-                            minReadOrd = std::min(minReadOrd, ord[1]);
-                            maxReadOrd = std::max(maxReadOrd, ord[1]);
+                            const uint32_t qp = classifyReadMarkers[ord[1]].position;
+                            qMin = std::min(qMin, qp);
+                            qMax = std::max(qMax, qp);
                         }
+                    }
+                    if(rMin <= rMax && qMin <= qMax) {
+                        chainEps.push_back({rMin, rMax, qMin, qMax});
                     }
                 }
 
-                if(minRefOrd < refMarkers.size() && maxRefOrd < refMarkers.size()
-                   && minReadOrd < classifyReadMarkers.size() && maxReadOrd < classifyReadMarkers.size()
-                   && maxRefOrd > minRefOrd && maxReadOrd > minReadOrd) {
+                // Sort by reference start position.
+                sort(chainEps.begin(), chainEps.end(),
+                    [](const ChainEndpoints& a, const ChainEndpoints& b) {
+                        return a.refMinPos < b.refMinPos;
+                    });
 
-                    const int64_t refSpan = int64_t(refMarkers[maxRefOrd].position)
-                                          - int64_t(refMarkers[minRefOrd].position);
-                    const int64_t readSpan = int64_t(classifyReadMarkers[maxReadOrd].position)
-                                           - int64_t(classifyReadMarkers[minReadOrd].position);
+                if(chainEps.size() >= 2) {
+                    // Find the gap with the largest |refGap - readGap|.
+                    int64_t bestDiff = 0;
+                    int64_t bestRefGap = 0;
+                    int64_t bestReadGap = 0;
+                    uint32_t bestBreakpoint = 0;
 
+                    for(size_t si = 0; si + 1 < chainEps.size(); ++si) {
+                        const int64_t refGap = int64_t(chainEps[si + 1].refMinPos)
+                                             - int64_t(chainEps[si].refMaxPos);
+                        const int64_t readGap = int64_t(chainEps[si + 1].readMinPos)
+                                              - int64_t(chainEps[si].readMaxPos);
+                        const int64_t diff = std::abs(refGap - readGap);
+                        if(diff > bestDiff) {
+                            bestDiff = diff;
+                            bestRefGap = refGap;
+                            bestReadGap = readGap;
+                            bestBreakpoint = chainEps[si].refMaxPos
+                                + uint32_t(std::max(int64_t(0), refGap) / 2);
+                        }
+                    }
+
+                    rg.svSize = bestDiff;
+                    rg.breakpointRefPos = bestBreakpoint;
+
+                    if(bestRefGap > bestReadGap) {
+                        rg.svType = SvType::Deletion;
+                    } else if(bestReadGap > bestRefGap) {
+                        rg.svType = SvType::Insertion;
+                    } else {
+                        rg.svType = SvType::ReferenceLike;
+                    }
+                } else if(chainEps.size() == 1) {
+                    // Single chain — compare total span.
+                    const int64_t refSpan = int64_t(chainEps[0].refMaxPos)
+                                          - int64_t(chainEps[0].refMinPos);
+                    const int64_t readSpan = int64_t(chainEps[0].readMaxPos)
+                                           - int64_t(chainEps[0].readMinPos);
                     rg.svSize = std::abs(refSpan - readSpan);
+                    rg.breakpointRefPos = (chainEps[0].refMinPos + chainEps[0].refMaxPos) / 2;
 
                     if(refSpan > readSpan) {
                         rg.svType = SvType::Deletion;
@@ -601,30 +661,6 @@ void Assembler::buildSvMSA(
                     }
                 } else {
                     rg.svType = SvType::ReferenceLike;
-                }
-
-                // Breakpoint = midpoint of the largest gap between
-                // consecutive chains on the reference. For single-chain
-                // reads, use the midpoint of the chain's reference span.
-                if(chainSpans.size() >= 2) {
-                    uint32_t maxGap = 0;
-                    uint32_t gapMid = 0;
-                    for(size_t si = 0; si + 1 < chainSpans.size(); ++si) {
-                        const uint32_t gapStart = chainSpans[si].maxRefPos;
-                        const uint32_t gapEnd = chainSpans[si + 1].minRefPos;
-                        if(gapEnd > gapStart) {
-                            const uint32_t gap = gapEnd - gapStart;
-                            if(gap > maxGap) {
-                                maxGap = gap;
-                                gapMid = gapStart + gap / 2;
-                            }
-                        }
-                    }
-                    if(maxGap > 0) {
-                        rg.breakpointRefPos = gapMid;
-                    }
-                } else if(chainSpans.size() == 1) {
-                    rg.breakpointRefPos = (chainSpans[0].minRefPos + chainSpans[0].maxRefPos) / 2;
                 }
             }
 
@@ -1054,6 +1090,338 @@ void Assembler::buildSvMSA(
             if(indirectAligned > 0) {
                 cout << "    Indirectly aligned " << indirectAligned
                      << " insertion-internal reads via read graph BFS." << endl;
+            }
+
+            // ---------------------------------------------------------
+            // Phase 4: Detect insertions from the read graph.
+            //
+            // For each read with reference chains, record the reference
+            // position range it covers. Then look for read-graph paths
+            // connecting reads anchored on the left side of a gap to
+            // reads anchored on the right side, passing through reads
+            // with no reference chains (insertion-internal reads).
+            //
+            // An insertion is detected when:
+            //   - A left-anchored read L chains to an unanchored read U
+            //   - U (possibly through more unanchored reads) chains to
+            //     a right-anchored read R
+            //   - L and R are close on the reference (small ref gap)
+            //   - The read-graph path L→...→R spans more sequence than
+            //     the reference gap
+            //
+            // Insertion size = total read-graph path span - ref gap.
+            // ---------------------------------------------------------
+            {
+                // For each read, record its reference anchor range (bp).
+                struct RefAnchorRange {
+                    uint32_t minRefPos;
+                    uint32_t maxRefPos;
+                };
+                unordered_map<uint32_t, RefAnchorRange> readRefRange;
+
+                for(const auto& ce : chainsForRef) {
+                    const auto& al = alignments[ce.chainIndex];
+                    auto it = readRefRange.find(uint32_t(ce.readId));
+                    uint32_t rMin = (it != readRefRange.end()) ? it->second.minRefPos : UINT32_MAX;
+                    uint32_t rMax = (it != readRefRange.end()) ? it->second.maxRefPos : 0;
+                    for(const auto& ord : al.ordinals) {
+                        if(ord[0] < refMarkers.size()) {
+                            const uint32_t pos = refMarkers[ord[0]].position;
+                            rMin = std::min(rMin, pos);
+                            rMax = std::max(rMax, pos);
+                        }
+                    }
+                    readRefRange[uint32_t(ce.readId)] = {rMin, rMax};
+                }
+
+                // Identify unanchored reads (in the read graph but no ref chains).
+                unordered_set<uint32_t> unanchoredReads;
+                for(const auto& [rid, edges] : readGraph) {
+                    if(readRefRange.find(rid) == readRefRange.end()) {
+                        unanchoredReads.insert(rid);
+                    }
+                }
+
+                if(!unanchoredReads.empty()) {
+                    // Find connected components of unanchored reads.
+                    unordered_map<uint32_t, int32_t> componentId;
+                    int32_t nextComponent = 0;
+
+                    for(uint32_t seed : unanchoredReads) {
+                        if(componentId.count(seed)) continue;
+
+                        // BFS from this unanchored seed.
+                        queue<uint32_t> q;
+                        q.push(seed);
+                        componentId[seed] = nextComponent;
+                        vector<uint32_t> component;
+
+                        while(!q.empty()) {
+                            uint32_t cur = q.front();
+                            q.pop();
+                            component.push_back(cur);
+
+                            auto gIt = readGraph.find(cur);
+                            if(gIt == readGraph.end()) continue;
+                            for(const auto& edge : gIt->second) {
+                                if(unanchoredReads.count(edge.neighborReadId)
+                                   && !componentId.count(edge.neighborReadId)) {
+                                    componentId[edge.neighborReadId] = nextComponent;
+                                    q.push(edge.neighborReadId);
+                                }
+                            }
+                        }
+
+                        // For this component, find anchored reads that
+                        // connect to it (left and right flanks).
+                        uint32_t leftFlankMaxRef = 0;
+                        uint32_t rightFlankMinRef = UINT32_MAX;
+                        bool hasLeft = false, hasRight = false;
+
+                        // Collect all anchored neighbors of this component.
+                        for(uint32_t uid : component) {
+                            auto gIt = readGraph.find(uid);
+                            if(gIt == readGraph.end()) continue;
+                            for(const auto& edge : gIt->second) {
+                                auto rrIt = readRefRange.find(edge.neighborReadId);
+                                if(rrIt == readRefRange.end()) continue;
+                                // This neighbor is anchored to the reference.
+                                const auto& range = rrIt->second;
+                                const uint32_t midRef = (range.minRefPos + range.maxRefPos) / 2;
+
+                                // Classify as left or right based on
+                                // whether it's before or after the component.
+                                // Use the chain to estimate: if the anchored
+                                // read's ref range ends before the component
+                                // starts (in read coordinates), it's left.
+                                // We approximate by collecting all and then
+                                // splitting at the median.
+                                if(range.maxRefPos > leftFlankMaxRef) {
+                                    leftFlankMaxRef = range.maxRefPos;
+                                }
+                                if(range.minRefPos < rightFlankMinRef) {
+                                    rightFlankMinRef = range.minRefPos;
+                                }
+                            }
+                        }
+
+                        // Collect all anchored neighbors with their ref positions.
+                        vector<pair<uint32_t, uint32_t>> anchoredNeighbors; // {refMidPos, readId}
+                        for(uint32_t uid : component) {
+                            auto gIt = readGraph.find(uid);
+                            if(gIt == readGraph.end()) continue;
+                            for(const auto& edge : gIt->second) {
+                                auto rrIt = readRefRange.find(edge.neighborReadId);
+                                if(rrIt == readRefRange.end()) continue;
+                                const uint32_t mid = (rrIt->second.minRefPos + rrIt->second.maxRefPos) / 2;
+                                anchoredNeighbors.push_back({mid, edge.neighborReadId});
+                            }
+                        }
+
+                        if(anchoredNeighbors.size() < 2) {
+                            ++nextComponent;
+                            continue;
+                        }
+
+                        sort(anchoredNeighbors.begin(), anchoredNeighbors.end());
+                        anchoredNeighbors.erase(
+                            unique(anchoredNeighbors.begin(), anchoredNeighbors.end()),
+                            anchoredNeighbors.end());
+
+                        // Split into left and right flanks.
+                        // Left = anchored reads with smallest ref positions.
+                        // Right = anchored reads with largest ref positions.
+                        const uint32_t leftRefMax = anchoredNeighbors.front().first;
+                        const uint32_t rightRefMin = anchoredNeighbors.back().first;
+
+                        // The ref gap between left and right flanks.
+                        if(rightRefMin <= leftRefMax) {
+                            ++nextComponent;
+                            continue;
+                        }
+                        const int64_t refGap = int64_t(rightRefMin) - int64_t(leftRefMax);
+
+                        // Estimate insertion size from the number of
+                        // unanchored reads and their lengths.
+                        // Each unanchored read contributes roughly
+                        // (readLength - overlap) to the insertion.
+                        // With short reads at ~30x coverage, the number
+                        // of unanchored reads times the non-overlapping
+                        // portion gives the insertion length.
+                        //
+                        // A better estimate: use the read-graph chain
+                        // coordinates to compute the total span.
+                        // For now, use a simple heuristic:
+                        //   insertionSize ≈ sum of read lengths / coverage - refGap
+                        // But we can do better by walking the longest
+                        // path through the component.
+
+                        // Walk the longest chain path through the component.
+                        // For each pair of consecutive reads in the path,
+                        // the chain gives us the overlap. The total path
+                        // length = sum of read lengths - sum of overlaps.
+
+                        // Simple approach: find the longest read-graph path
+                        // from any left-anchored neighbor through unanchored
+                        // reads to any right-anchored neighbor.
+                        // Use BFS from left-anchored reads, tracking the
+                        // cumulative read-coordinate span.
+
+                        // For each edge in the read graph, compute the
+                        // read-coordinate offset: how much of the neighbor
+                        // read extends beyond the current read.
+                        // This gives us the "extension" at each step.
+
+                        // Collect left and right anchored read IDs.
+                        unordered_set<uint32_t> leftAnchored, rightAnchored;
+                        const uint32_t splitPos = (leftRefMax + rightRefMin) / 2;
+                        for(const auto& [pos, rid] : anchoredNeighbors) {
+                            if(pos < splitPos) leftAnchored.insert(rid);
+                            else rightAnchored.insert(rid);
+                        }
+
+                        if(leftAnchored.empty() || rightAnchored.empty()) {
+                            ++nextComponent;
+                            continue;
+                        }
+
+                        // BFS from left-anchored reads through unanchored
+                        // reads, tracking cumulative extension in read coords.
+                        // When we reach a right-anchored read, compute
+                        // insertion size = cumulative extension - refGap.
+
+                        struct BfsState {
+                            uint32_t readId;
+                            int64_t cumulativeExtension; // bp from left anchor
+                        };
+
+                        int64_t bestInsertionSize = 0;
+                        uint32_t bestBreakpoint = leftRefMax;
+                        int bestPathLength = 0;
+
+                        for(uint32_t leftId : leftAnchored) {
+                            queue<BfsState> bfsQ;
+                            unordered_set<uint32_t> visited;
+
+                            // Start from unanchored neighbors of leftId.
+                            auto gIt = readGraph.find(leftId);
+                            if(gIt == readGraph.end()) continue;
+
+                            for(const auto& edge : gIt->second) {
+                                if(!unanchoredReads.count(edge.neighborReadId)) continue;
+
+                                // Compute extension from chain coordinates.
+                                const auto& al = alignments[edge.chainIndex];
+                                if(al.ordinals.empty()) continue;
+
+                                // Get read positions for the neighbor.
+                                const uint32_t neighborOrdIdx = edge.iAmReadA ? 1 : 0;
+                                const uint32_t myOrdIdx = edge.iAmReadA ? 0 : 1;
+
+                                // The extension = neighbor's read length
+                                // beyond the overlap region.
+                                uint32_t overlapMinN = UINT32_MAX, overlapMaxN = 0;
+                                for(const auto& ord : al.ordinals) {
+                                    overlapMinN = std::min(overlapMinN, ord[neighborOrdIdx]);
+                                    overlapMaxN = std::max(overlapMaxN, ord[neighborOrdIdx]);
+                                }
+
+                                // Get neighbor's total marker count.
+                                const auto nMarkers0 = markersRef[
+                                    OrientedReadId(ReadId(edge.neighborReadId), 0).getValue()];
+                                const uint32_t nTotalMarkers = uint32_t(nMarkers0.size());
+                                if(nTotalMarkers == 0) continue;
+
+                                // Extension beyond overlap on the far side.
+                                const int64_t extensionBeyond =
+                                    int64_t(nMarkers0[nTotalMarkers - 1].position)
+                                    - int64_t(nMarkers0[overlapMaxN < nTotalMarkers ? overlapMaxN : nTotalMarkers - 1].position);
+
+                                bfsQ.push({edge.neighborReadId, extensionBeyond});
+                                visited.insert(edge.neighborReadId);
+                            }
+
+                            while(!bfsQ.empty()) {
+                                auto state = bfsQ.front();
+                                bfsQ.pop();
+
+                                // Check if this read connects to a right-anchored read.
+                                auto gIt2 = readGraph.find(state.readId);
+                                if(gIt2 == readGraph.end()) continue;
+
+                                for(const auto& edge : gIt2->second) {
+                                    if(rightAnchored.count(edge.neighborReadId)) {
+                                        // Found a path to the right flank!
+                                        if(state.cumulativeExtension > bestInsertionSize) {
+                                            bestInsertionSize = state.cumulativeExtension;
+                                            bestBreakpoint = leftRefMax;
+                                            bestPathLength = int(visited.size());
+                                        }
+                                    }
+
+                                    if(!unanchoredReads.count(edge.neighborReadId)) continue;
+                                    if(visited.count(edge.neighborReadId)) continue;
+
+                                    const auto& al = alignments[edge.chainIndex];
+                                    if(al.ordinals.empty()) continue;
+
+                                    const uint32_t neighborOrdIdx = edge.iAmReadA ? 1 : 0;
+                                    uint32_t overlapMaxN = 0;
+                                    for(const auto& ord : al.ordinals) {
+                                        overlapMaxN = std::max(overlapMaxN, ord[neighborOrdIdx]);
+                                    }
+
+                                    const auto nMarkers0 = markersRef[
+                                        OrientedReadId(ReadId(edge.neighborReadId), 0).getValue()];
+                                    const uint32_t nTotal = uint32_t(nMarkers0.size());
+                                    if(nTotal == 0) continue;
+
+                                    const int64_t ext =
+                                        int64_t(nMarkers0[nTotal - 1].position)
+                                        - int64_t(nMarkers0[overlapMaxN < nTotal ? overlapMaxN : nTotal - 1].position);
+
+                                    visited.insert(edge.neighborReadId);
+                                    bfsQ.push({edge.neighborReadId,
+                                               state.cumulativeExtension + ext});
+                                }
+                            }
+                        }
+
+                        // If we found a path, create an insertion ReadGroup.
+                        if(bestInsertionSize > 0) {
+                            const int64_t insertionSize = bestInsertionSize;
+                            if(insertionSize > 20) {  // Minimum insertion size.
+                                ReadGroup insRg;
+                                insRg.readId = ReadId(component[0]);
+                                insRg.svType = SvType::Insertion;
+                                insRg.svSize = insertionSize;
+                                insRg.breakpointRefPos = bestBreakpoint;
+                                insRg.clusterId = -1;
+
+                                // Assign to a new cluster.
+                                insRg.clusterId = totalClusters;
+
+                                // Don't add to readGroups (already sorted),
+                                // but add directly to the cluster output.
+                                // We'll print it separately.
+                                cout << "    Insertion detected via read graph: "
+                                     << "size=" << insertionSize << "bp, "
+                                     << "breakpoint=" << bestBreakpoint << ", "
+                                     << "component=" << component.size() << " reads, "
+                                     << "path=" << bestPathLength << " hops."
+                                     << endl;
+                            }
+                        }
+
+                        ++nextComponent;
+                    }
+
+                    if(nextComponent > 0) {
+                        cout << "    Read-graph insertion scan: "
+                             << unanchoredReads.size() << " unanchored reads in "
+                             << nextComponent << " components." << endl;
+                    }
+                }
             }
         }
 
