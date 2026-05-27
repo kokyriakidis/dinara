@@ -5,9 +5,9 @@
 // boost::archive::binary_oarchive of shasta2::AnchorGraph.
 //
 // We build a shasta2::AnchorGraphBaseClass (the boost::adjacency_list
-// with shasta2::AnchorGraphEdge properties), serialize it with the
-// same archive structure that shasta2::AnchorGraph uses, and write
-// the result in the MemoryMapped file format.
+// with shasta2::AnchorGraphEdge properties), wrap it in a struct that
+// mirrors AnchorGraph's serialize() pattern (using base_object<>),
+// and write the result in the MemoryMapped file format.
 
 #include "Shasta2AnchorGraph.hpp"
 
@@ -95,6 +95,19 @@ void writeMmapFile(const string& fileName, const string& data)
     }
 }
 
+
+// Wrapper that mirrors shasta2::AnchorGraph's serialization structure.
+// AnchorGraph::serialize() does: ar & base_object<AnchorGraphBaseClass>(*this)
+// This adds class tracking metadata that a standalone AnchorGraphBaseClass
+// serialization does not include. Without this wrapper, the archive is
+// 5 bytes shorter and shasta2's deserializer reads misaligned data.
+struct AnchorGraphWrapper : public shasta2::AnchorGraphBaseClass {
+    friend class boost::serialization::access;
+    template<class Archive> void serialize(Archive& ar, unsigned int) {
+        ar & boost::serialization::base_object<shasta2::AnchorGraphBaseClass>(*this);
+    }
+};
+
 } // anonymous namespace
 
 
@@ -103,8 +116,12 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
     const auto& dinaraGraph = *this;
     const uint64_t nVertices = boost::num_vertices(dinaraGraph);
 
-    // Build a shasta2::AnchorGraphBaseClass and populate it.
-    shasta2::AnchorGraphBaseClass shastaGraph(nVertices);
+    // Build a wrapper graph with shasta2 types.
+    AnchorGraphWrapper shastaGraph;
+    // Add vertices (AnchorGraphBaseClass uses vecS, so add_vertex is sequential).
+    for(uint64_t i = 0; i < nVertices; i++) {
+        boost::add_vertex(shastaGraph);
+    }
 
     uint64_t edgeCount = 0;
     BGL_FORALL_EDGES(e, dinaraGraph, Shasta2AnchorGraphBaseClass) {
@@ -134,14 +151,7 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
          << nVertices << " vertices, "
          << edgeCount << " edges." << endl;
 
-    // Serialize using the same pattern as shasta2::AnchorGraph::save(ostream&).
-    // shasta2::AnchorGraph::save does: archive << *this
-    // shasta2::AnchorGraph::serialize does: ar & base_object<AnchorGraphBaseClass>(*this)
-    //
-    // For non-polymorphic, non-exported types, boost binary archives
-    // don't encode class names. The archive is purely structural:
-    // the adjacency_list serialization with AnchorGraphEdge properties.
-    // Serializing the base class directly produces identical bytes.
+    // Serialize with the same archive structure as shasta2::AnchorGraph.
     ostringstream oss;
     {
         boost::archive::binary_oarchive archive(oss);
