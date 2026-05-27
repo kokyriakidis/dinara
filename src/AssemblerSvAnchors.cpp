@@ -702,6 +702,15 @@ void Assembler::buildSvMSA(
                              << endl;
                     } else {
                         rg.svType = SvType::ReferenceLike;
+                        if(allAnchors.size() >= 20
+                           && (bestRise > 5 || bestDrop > 5)) {
+                            cout << "    Read " << rg.readId
+                                 << ": REF rise=" << bestRise
+                                 << " drop=" << bestDrop
+                                 << " anchors=" << allAnchors.size()
+                                 << " chains=" << rg.chainIndicesInRef.size()
+                                 << endl;
+                        }
                     }
                 } else {
                     rg.svType = SvType::ReferenceLike;
@@ -2355,6 +2364,117 @@ void Assembler::buildSvMSA(
                                      << "supportingReads=" << cluster.readIds.size()
                                      << endl;
                             }
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Coverage-drop deletion detection.
+                //
+                // For heterozygous deletions, spanning coverage drops
+                // by ~50% in the deleted region. Detect consecutive
+                // windows where coverage is significantly below median.
+                // ---------------------------------------------------------
+                if(medianSpanning > 5) {
+                    const double covDropThreshold = 0.6; // 60% of median
+                    const uint32_t minCovDropWindows = 2;
+
+                    struct CovDropCluster {
+                        uint32_t startWin;
+                        uint32_t endWin;
+                        uint32_t startPos;
+                        uint32_t endPos;
+                        double minRatio;
+                    };
+                    vector<CovDropCluster> covDropClusters;
+
+                    uint32_t clusterStart = UINT32_MAX;
+                    double clusterMinRatio = 1.0;
+                    for(uint32_t w = boundaryWindows;
+                        w + boundaryWindows < nWindows; ++w) {
+                        const double ratio =
+                            double(spanningCount[w]) / double(medianSpanning);
+                        if(ratio < covDropThreshold) {
+                            if(clusterStart == UINT32_MAX) {
+                                clusterStart = w;
+                                clusterMinRatio = ratio;
+                            }
+                            clusterMinRatio =
+                                std::min(clusterMinRatio, ratio);
+                        } else {
+                            if(clusterStart != UINT32_MAX) {
+                                const uint32_t clusterEnd = w - 1;
+                                if(clusterEnd - clusterStart + 1
+                                    >= minCovDropWindows) {
+                                    const uint32_t sp = refStartPos
+                                        + clusterStart * windowSize;
+                                    const uint32_t ep = refStartPos
+                                        + (clusterEnd + 1) * windowSize;
+                                    covDropClusters.push_back(
+                                        {clusterStart, clusterEnd,
+                                         sp, ep, clusterMinRatio});
+                                }
+                                clusterStart = UINT32_MAX;
+                            }
+                        }
+                    }
+                    // Handle cluster at end.
+                    if(clusterStart != UINT32_MAX) {
+                        const uint32_t clusterEnd =
+                            nWindows - boundaryWindows - 1;
+                        if(clusterEnd - clusterStart + 1
+                            >= minCovDropWindows) {
+                            const uint32_t sp = refStartPos
+                                + clusterStart * windowSize;
+                            const uint32_t ep = refStartPos
+                                + (clusterEnd + 1) * windowSize;
+                            covDropClusters.push_back(
+                                {clusterStart, clusterEnd,
+                                 sp, ep, clusterMinRatio});
+                        }
+                    }
+
+                    for(const auto& cdc : covDropClusters) {
+                        const uint32_t delSize = cdc.endPos - cdc.startPos;
+                        // Check flanking coverage is near median.
+                        uint32_t leftFlankCov = 0, rightFlankCov = 0;
+                        uint32_t leftFlankN = 0, rightFlankN = 0;
+                        for(uint32_t w =
+                                (cdc.startWin > 3 ? cdc.startWin - 3 : 0);
+                            w < cdc.startWin; ++w) {
+                            leftFlankCov += spanningCount[w];
+                            ++leftFlankN;
+                        }
+                        for(uint32_t w = cdc.endWin + 1;
+                            w <= cdc.endWin + 3 && w < nWindows; ++w) {
+                            rightFlankCov += spanningCount[w];
+                            ++rightFlankN;
+                        }
+                        const double leftFlank = leftFlankN > 0
+                            ? double(leftFlankCov) / double(leftFlankN) : 0;
+                        const double rightFlank = rightFlankN > 0
+                            ? double(rightFlankCov) / double(rightFlankN) : 0;
+
+                        // Both flanks should be near median (>70%).
+                        if(leftFlank < 0.7 * medianSpanning
+                           || rightFlank < 0.7 * medianSpanning) continue;
+
+                        const uint32_t bpPos =
+                            (cdc.startPos + cdc.endPos) / 2;
+
+                        cout << "    Coverage-drop deletion: pos="
+                             << cdc.startPos << "-" << cdc.endPos
+                             << " size=" << delSize
+                             << " minRatio=" << cdc.minRatio
+                             << " leftFlank=" << leftFlank
+                             << " rightFlank=" << rightFlank
+                             << endl;
+
+                        if(delSize >= 50 && delSize <= 2000) {
+                            cout << "    >>> DELETION CALL (coverage): "
+                                 << "size=" << delSize << "bp, "
+                                 << "breakpoint=" << bpPos
+                                 << endl;
                         }
                     }
                 }
