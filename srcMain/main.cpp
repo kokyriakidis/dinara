@@ -1735,6 +1735,55 @@ void dinara::main::assemble(
     //
     // ========================================================================
 
+    // Verify RC anchor POSITION symmetry.
+    // Check that for each read on an RC anchor, its position equals
+    // readLength - (position of flipped read on canonical anchor).
+    {
+        cout << timestamp << "Verifying RC anchor position symmetry..." << endl;
+        const auto& anchors = *shasta2Anchors;
+        const auto& reads = assembler.getReads();
+        const uint64_t anchorCount = anchors.size();
+        uint64_t mismatchCount = 0;
+        uint64_t checkedCount = 0;
+
+        for(Shasta2AnchorId aid = 0; aid < anchorCount; aid += 2) {
+            const auto canonical = anchors[aid];
+            const auto rc = anchors[aid + 1];
+
+            for(const auto& rcMi : rc) {
+                // Find the flipped read on the canonical anchor.
+                const OrientedReadId flipped = OrientedReadId::fromValue(
+                    rcMi.orientedReadId.getValue() ^ 1);
+                bool found = false;
+                for(const auto& canMi : canonical) {
+                    if(canMi.orientedReadId == flipped) {
+                        found = true;
+                        const uint64_t readLen = reads.getRead(
+                            rcMi.orientedReadId.getReadId()).baseCount;
+                        const uint32_t expectedRcPos = uint32_t(readLen) - canMi.position;
+                        if(rcMi.position != expectedRcPos) {
+                            ++mismatchCount;
+                            if(mismatchCount <= 5) {
+                                cout << "  RC POS MISMATCH anchor " << (aid+1)
+                                     << " read " << rcMi.orientedReadId
+                                     << " rcPos=" << rcMi.position
+                                     << " expected=" << expectedRcPos
+                                     << " (readLen=" << readLen
+                                     << " canonPos=" << canMi.position
+                                     << " diff=" << (int64_t(rcMi.position) - int64_t(expectedRcPos))
+                                     << ")" << endl;
+                            }
+                        }
+                        break;
+                    }
+                }
+                ++checkedCount;
+            }
+        }
+        cout << "RC position symmetry: checked " << checkedCount
+             << " read-anchor pairs, " << mismatchCount << " mismatches." << endl;
+    }
+
     // Dump detailed info for specific edges that shasta2 reports as failing.
     {
         const auto& anchors = *shasta2Anchors;
