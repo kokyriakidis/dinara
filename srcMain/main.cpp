@@ -2784,13 +2784,6 @@ void dinara::main::assemble(
             maxPrimaryCoverage);
     auto& shasta2Anchors = assembler.shasta2Anchors;
 
-    // double kmerDensity = 1.0;
-    // cout << timestamp << "Filtering Shasta2Anchors with Shasta2 hashed k-mer checker..." << endl;
-    // // shasta2Anchors->filterByShasta2HashedKmerChecker(
-    // //     assemblerOptions.kmersOptions.probability);
-    // shasta2Anchors->filterByShasta2HashedKmerChecker(
-    //     kmerDensity);
-
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
     cout << timestamp << "Writing Shasta2 external anchors to "

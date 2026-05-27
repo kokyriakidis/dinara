@@ -77,7 +77,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(uint64_t i=0; i<children.size(); i++) {
             const Shasta2AnchorId anchorIdB = children[i];
             Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, true);
-            DINARA_ASSERT(anchorPair.size() == counts[i]);
+            anchorPair.removeNegativeOffsets(anchors);
             if(anchorPair.orientedReadIds.empty()) {
                 continue;
             }
@@ -164,6 +164,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
+        anchorPair.removeNegativeOffsets(anchors);
         if(anchorPair.orientedReadIds.empty()) {
             return false;
         }
@@ -421,6 +422,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t bestSize = 0;
         for(const auto& [apk, count] : candidates) {
             Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
+            anchorPair.removeNegativeOffsets(anchors);
             if(anchorPair.size() > bestSize) {
                 bestSize = anchorPair.size();
                 bestPair = std::move(anchorPair);
