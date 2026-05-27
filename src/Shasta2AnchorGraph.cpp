@@ -533,7 +533,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //   connections, trim the source backbone past the connection anchor
     //   and the destination backbone before the connection anchor.
     // ========================================================================
-    {
+    if(false) {
         uint64_t trimmedVertexCount = 0;
         uint64_t oneToOneCount = 0;
 
