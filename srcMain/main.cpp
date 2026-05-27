@@ -1735,6 +1735,101 @@ void dinara::main::assemble(
     //
     // ========================================================================
 
+    // Dump detailed info for specific edges that shasta2 reports as failing.
+    {
+        const auto& anchors = *shasta2Anchors;
+        const auto& graph = *shasta2AnchorGraph;
+        const auto& reads = assembler.getReads();
+        const uint32_t kHalfVal = uint32_t(anchors.k / 2);
+
+        auto [ei2, ei2_end] = boost::edges(graph);
+        for(; ei2 != ei2_end; ++ei2) {
+            const auto& dEdge = graph[*ei2];
+            // Check edges 292, 293 (first failing pair in shasta2).
+            if(dEdge.id != 292 && dEdge.id != 293) continue;
+
+            const auto& ap = dEdge.anchorPair;
+            cout << "=== EDGE DEBUG id=" << dEdge.id
+                 << " anchorIdA=" << ap.anchorIdA
+                 << " (parity=" << (uint64_t(ap.anchorIdA) % 2) << ")"
+                 << " anchorIdB=" << ap.anchorIdB
+                 << " (parity=" << (uint64_t(ap.anchorIdB) % 2) << ")"
+                 << " reads=" << ap.orientedReadIds.size() << endl;
+
+            uint64_t printed = 0;
+            for(const OrientedReadId oid : ap.orientedReadIds) {
+                if(printed >= 5) break;
+
+                // Dinara positions on both anchors.
+                uint32_t dPosA = 0, dPosB = 0;
+                bool dFoundA = false, dFoundB = false;
+                for(const auto& mi : anchors[ap.anchorIdA]) {
+                    if(mi.orientedReadId == oid) {
+                        dPosA = mi.position;
+                        dFoundA = true;
+                        break;
+                    }
+                }
+                for(const auto& mi : anchors[ap.anchorIdB]) {
+                    if(mi.orientedReadId == oid) {
+                        dPosB = mi.position;
+                        dFoundB = true;
+                        break;
+                    }
+                }
+
+                // Read length.
+                const uint64_t readLen = reads.getRead(oid.getReadId()).baseCount;
+
+                // What shasta2 would compute for RC anchors.
+                // For canonical (even): shasta2 pos = rawPos + kHalf = dinara pos (same).
+                // For RC (odd): shasta2 pos = readLen - (rawPos_of_flipped + kHalf).
+                //   rawPos_of_flipped = position_of_flipped_on_canonical - kHalf.
+                //   So shasta2 RC pos = readLen - position_of_flipped_on_canonical.
+                uint32_t sPosA = 0, sPosB = 0;
+                bool sFoundA = false, sFoundB = false;
+
+                if(uint64_t(ap.anchorIdA) % 2 == 0) {
+                    sPosA = dPosA; sFoundA = dFoundA;
+                } else {
+                    // Look up flipped read on canonical anchor.
+                    const OrientedReadId flipped = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                    const auto canonA = anchors[uint64_t(ap.anchorIdA) ^ 1ULL];
+                    for(const auto& mi : canonA) {
+                        if(mi.orientedReadId == flipped) {
+                            sPosA = uint32_t(readLen) - mi.position;
+                            sFoundA = true;
+                            break;
+                        }
+                    }
+                }
+                if(uint64_t(ap.anchorIdB) % 2 == 0) {
+                    sPosB = dPosB; sFoundB = dFoundB;
+                } else {
+                    const OrientedReadId flipped = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                    const auto canonB = anchors[uint64_t(ap.anchorIdB) ^ 1ULL];
+                    for(const auto& mi : canonB) {
+                        if(mi.orientedReadId == flipped) {
+                            sPosB = uint32_t(readLen) - mi.position;
+                            sFoundB = true;
+                            break;
+                        }
+                    }
+                }
+
+                cout << "  " << oid << " readLen=" << readLen
+                     << " | dinara: posA=" << dPosA << "(found=" << dFoundA << ")"
+                     << " posB=" << dPosB << "(found=" << dFoundB << ")"
+                     << " offset=" << (int64_t(dPosB) - int64_t(dPosA))
+                     << " | shasta2sim: posA=" << sPosA << "(found=" << sFoundA << ")"
+                     << " posB=" << sPosB << "(found=" << sFoundB << ")"
+                     << " offset=" << (int64_t(sPosB) - int64_t(sPosA))
+                     << endl;
+                ++printed;
+            }
+        }
+    }
+
     // Simulate shasta2's anchor positions and verify edges.
     // Shasta2 loads canonical anchors from external anchors, then creates
     // RC anchors by: rcPosition = readLength - canonicalPosition.
