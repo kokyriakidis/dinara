@@ -1529,6 +1529,7 @@ static inline void zdrop_chain_backtrack(
     int32_t max_drop,       // Z-drop threshold (= bandwidth for minimap2-sr).
     int32_t min_cnt,        // Min anchors per chain (minimap2 -n).
     int32_t min_sc,         // Min chain score (minimap2 -m).
+    int32_t max_chains,     // Max chains to extract (minimap2 -N). 0 = unlimited.
     uint32_t xid,
     int64_t xl, int64_t yl,
     vector<HifiasmOverlapRegion>& res,
@@ -1559,7 +1560,9 @@ static inline void zdrop_chain_backtrack(
     v.reserve(size_t(a_n));
 
     // Process endpoints in descending score order.
+    int32_t n_chains = 0;
     for(int64_t k = int64_t(z.size()) - 1; k >= 0; --k) {
+        if(max_chains > 0 && n_chains >= max_chains) break;
         if(t[z[k].idx] != 0) continue;  // Already claimed.
 
         // Find where to cut this chain (Z-drop).
@@ -1606,6 +1609,7 @@ static inline void zdrop_chain_backtrack(
                     a[v[n_v0 + (chain_len - 1 - j)]].globalIndex);
             }
             res.push_back(region);
+            ++n_chains;
         } else {
             // Reject chain — unmark anchors.
             for(size_t j = n_v0; j < v.size(); ++j) {
@@ -1681,6 +1685,7 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
             minimap2Bw,             // max_drop = bandwidth (minimap2 convention).
             int32_t(mcopy_khit_cutoff > 0 ? mcopy_khit_cutoff : 2),  // min_cnt.
             minimap2MinChainScore,  // min_sc (minimap2 -m25).
+            int32_t(mcopy_num),     // max_chains (minimap2 -N).
             xid, xl, yl,
             res, chainHitIndexFlat);
         return;
