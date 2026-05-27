@@ -515,11 +515,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Trim dangling backbone tails at unambiguous 1-to-1 window connections.
-    // If window A connects to only one next window B, and window B has only
-    // one incoming window A, then the backbone chain of A past the inter-window
-    // edge anchor and the backbone chain of B before the inter-window edge
-    // anchor are dangling tails that should be removed.
+    // ========================================================================
+    // Post-construction graph cleanup rules.
+    // After creating inter-window edges, apply rules to remove artifacts.
+    // More rules can be added below as needed.
+    //
+    // Rule 1: Trim dangling backbone tails at 1-to-1 window connections.
+    //   For each 1-to-1 window connection, find the inter-window edge's
+    //   anchor vertices and remove all intra-window edges beyond that point
+    //   (the tail of the source window past the connection, and the head of
+    //   the destination window before the connection).
+    // ========================================================================
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
