@@ -162,4 +162,72 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
 
     cout << "Wrote shasta2-compatible AnchorGraph to " << fileName
          << " (" << oss.str().size() << " bytes serialized)." << endl;
+
+    // Round-trip verification: deserialize and compare.
+    {
+        const string& serialized = oss.str();
+        std::istringstream iss(serialized);
+        AnchorGraphWrapper roundTrip;
+        {
+            boost::archive::binary_iarchive archive(iss);
+            archive >> roundTrip;
+        }
+
+        const uint64_t rtVertices = boost::num_vertices(roundTrip);
+        const uint64_t rtEdges = boost::num_edges(roundTrip);
+        bool mismatch = false;
+
+        if(rtVertices != nVertices) {
+            cout << "ROUND-TRIP MISMATCH: vertices " << rtVertices << " vs " << nVertices << endl;
+            mismatch = true;
+        }
+        if(rtEdges != edgeCount) {
+            cout << "ROUND-TRIP MISMATCH: edges " << rtEdges << " vs " << edgeCount << endl;
+            mismatch = true;
+        }
+
+        // Compare each edge.
+        uint64_t edgeIdx = 0;
+        uint64_t badEdges = 0;
+        auto [origIt, origEnd] = boost::edges(shastaGraph);
+        auto [rtIt, rtEnd] = boost::edges(roundTrip);
+        for(; origIt != origEnd && rtIt != rtEnd; ++origIt, ++rtIt, ++edgeIdx) {
+            const auto& origPair = shastaGraph[*origIt].anchorPair;
+            const auto& rtPair = roundTrip[*rtIt].anchorPair;
+
+            bool bad = false;
+            if(origPair.anchorIdA != rtPair.anchorIdA ||
+               origPair.anchorIdB != rtPair.anchorIdB) {
+                bad = true;
+            }
+            if(origPair.orientedReadIds.size() != rtPair.orientedReadIds.size()) {
+                bad = true;
+            } else {
+                for(size_t i = 0; i < origPair.orientedReadIds.size(); i++) {
+                    if(origPair.orientedReadIds[i].getValue() != rtPair.orientedReadIds[i].getValue()) {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+            if(bad) {
+                ++badEdges;
+                if(badEdges <= 5) {
+                    cout << "ROUND-TRIP EDGE MISMATCH #" << edgeIdx
+                         << ": orig " << origPair.anchorIdA << "->" << origPair.anchorIdB
+                         << " (" << origPair.orientedReadIds.size() << " reads)"
+                         << " vs rt " << rtPair.anchorIdA << "->" << rtPair.anchorIdB
+                         << " (" << rtPair.orientedReadIds.size() << " reads)" << endl;
+                }
+            }
+        }
+        if(badEdges > 0) {
+            cout << "ROUND-TRIP: " << badEdges << " edges differ!" << endl;
+            mismatch = true;
+        }
+        if(!mismatch) {
+            cout << "Round-trip verification passed: " << rtVertices << " vertices, "
+                 << rtEdges << " edges match." << endl;
+        }
+    }
 }
