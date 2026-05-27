@@ -470,7 +470,7 @@ void Assembler::buildSvMSA(
         // graph), then insertions (create longer alternative paths), then
         // reference-like reads (reinforce the backbone).
 
-        enum class SvType { Deletion = 0, Insertion = 1, ReferenceLike = 2 };
+        enum class SvType { Deletion = 0, Inversion = 1, Insertion = 2, ReferenceLike = 3 };
 
         struct ReadGroup {
             ReadId readId;
@@ -494,55 +494,80 @@ void Assembler::buildSvMSA(
             rg.chainIndicesInRef = std::move(indices);
             rg.svSize = 0;
 
-            // Compute the reference span and read span across all chains
-            // to classify SV type and measure SV size.
-            // First, collect all ordinal pairs across all chains for this read.
+            // Check for inversion: chains on both strands.
             const auto& firstCeClassify = chainsForRef[rg.chainIndicesInRef[0]];
-            const Strand classifyStrand = firstCeClassify.isSameStrand ? 0 : 1;
-            const OrientedReadId classifyOid(rg.readId, classifyStrand);
-            const auto classifyReadMarkers = markersRef[classifyOid.getValue()];
-
-            uint32_t minRefOrd = UINT32_MAX, maxRefOrd = 0;
-            uint32_t minReadOrd = UINT32_MAX, maxReadOrd = 0;
-
+            const Strand primaryStrand = firstCeClassify.isSameStrand ? 0 : 1;
+            bool hasPrimaryStrand = false;
+            bool hasOppositeStrand = false;
             for(size_t ci : rg.chainIndicesInRef) {
-                const auto& ce = chainsForRef[ci];
-                const auto& al = alignments[ce.chainIndex];
-                const Strand thisStrand = ce.isSameStrand ? 0 : 1;
-                if(thisStrand != classifyStrand) continue;
-
-                for(const auto& ord : al.ordinals) {
-                    if(ord[0] < refMarkers.size()) {
-                        minRefOrd = std::min(minRefOrd, ord[0]);
-                        maxRefOrd = std::max(maxRefOrd, ord[0]);
-                    }
-                    if(ord[1] < classifyReadMarkers.size()) {
-                        minReadOrd = std::min(minReadOrd, ord[1]);
-                        maxReadOrd = std::max(maxReadOrd, ord[1]);
-                    }
-                }
+                const Strand s = chainsForRef[ci].isSameStrand ? 0 : 1;
+                if(s == primaryStrand) hasPrimaryStrand = true;
+                else hasOppositeStrand = true;
             }
 
-            if(minRefOrd < refMarkers.size() && maxRefOrd < refMarkers.size()
-               && minReadOrd < classifyReadMarkers.size() && maxReadOrd < classifyReadMarkers.size()
-               && maxRefOrd > minRefOrd && maxReadOrd > minReadOrd) {
+            if(hasPrimaryStrand && hasOppositeStrand) {
+                // Inversion: chains on both strands.
+                // svSize = total reference span of the inverted chains.
+                uint32_t invMinRef = UINT32_MAX, invMaxRef = 0;
+                for(size_t ci : rg.chainIndicesInRef) {
+                    const Strand s = chainsForRef[ci].isSameStrand ? 0 : 1;
+                    if(s == primaryStrand) continue;  // Only measure inverted chains.
+                    const auto& al = alignments[chainsForRef[ci].chainIndex];
+                    for(const auto& ord : al.ordinals) {
+                        if(ord[0] < refMarkers.size()) {
+                            invMinRef = std::min(invMinRef, ord[0]);
+                            invMaxRef = std::max(invMaxRef, ord[0]);
+                        }
+                    }
+                }
+                if(invMinRef < refMarkers.size() && invMaxRef < refMarkers.size() && invMaxRef > invMinRef) {
+                    rg.svSize = int64_t(refMarkers[invMaxRef].position)
+                              - int64_t(refMarkers[invMinRef].position);
+                }
+                rg.svType = SvType::Inversion;
+            } else {
+                // No inversion — classify by span comparison on primary strand.
+                const OrientedReadId classifyOid(rg.readId, primaryStrand);
+                const auto classifyReadMarkers = markersRef[classifyOid.getValue()];
 
-                const int64_t refSpan = int64_t(refMarkers[maxRefOrd].position)
-                                      - int64_t(refMarkers[minRefOrd].position);
-                const int64_t readSpan = int64_t(classifyReadMarkers[maxReadOrd].position)
-                                       - int64_t(classifyReadMarkers[minReadOrd].position);
+                uint32_t minRefOrd = UINT32_MAX, maxRefOrd = 0;
+                uint32_t minReadOrd = UINT32_MAX, maxReadOrd = 0;
 
-                rg.svSize = std::abs(refSpan - readSpan);
+                for(size_t ci : rg.chainIndicesInRef) {
+                    const auto& al = alignments[chainsForRef[ci].chainIndex];
+                    for(const auto& ord : al.ordinals) {
+                        if(ord[0] < refMarkers.size()) {
+                            minRefOrd = std::min(minRefOrd, ord[0]);
+                            maxRefOrd = std::max(maxRefOrd, ord[0]);
+                        }
+                        if(ord[1] < classifyReadMarkers.size()) {
+                            minReadOrd = std::min(minReadOrd, ord[1]);
+                            maxReadOrd = std::max(maxReadOrd, ord[1]);
+                        }
+                    }
+                }
 
-                if(refSpan > readSpan) {
-                    rg.svType = SvType::Deletion;
-                } else if(readSpan > refSpan) {
-                    rg.svType = SvType::Insertion;
+                if(minRefOrd < refMarkers.size() && maxRefOrd < refMarkers.size()
+                   && minReadOrd < classifyReadMarkers.size() && maxReadOrd < classifyReadMarkers.size()
+                   && maxRefOrd > minRefOrd && maxReadOrd > minReadOrd) {
+
+                    const int64_t refSpan = int64_t(refMarkers[maxRefOrd].position)
+                                          - int64_t(refMarkers[minRefOrd].position);
+                    const int64_t readSpan = int64_t(classifyReadMarkers[maxReadOrd].position)
+                                           - int64_t(classifyReadMarkers[minReadOrd].position);
+
+                    rg.svSize = std::abs(refSpan - readSpan);
+
+                    if(refSpan > readSpan) {
+                        rg.svType = SvType::Deletion;
+                    } else if(readSpan > refSpan) {
+                        rg.svType = SvType::Insertion;
+                    } else {
+                        rg.svType = SvType::ReferenceLike;
+                    }
                 } else {
                     rg.svType = SvType::ReferenceLike;
                 }
-            } else {
-                rg.svType = SvType::ReferenceLike;
             }
 
             readGroups.push_back(std::move(rg));
@@ -571,133 +596,132 @@ void Assembler::buildSvMSA(
 
             if(rg.chainIndicesInRef.empty()) continue;
 
-            // Use the strand from the first (primary) chain.
+            // Split chains by strand. Same-strand and opposite-strand
+            // chains have ordinals on different marker arrays and must
+            // be processed separately.
+            // Strand groups: [0] = strand matching primary, [1] = opposite.
             const auto& firstCe = chainsForRef[rg.chainIndicesInRef[0]];
-            const Strand readStrand = firstCe.isSameStrand ? 0 : 1;
-            const OrientedReadId readOid(readId, readStrand);
-            const auto readMarkers = markersRef[readOid.getValue()];
+            const Strand primaryStrand = firstCe.isSameStrand ? 0 : 1;
 
-            // Collect all {boundaryIndex, readOrdinal} pairs across all chains.
-            vector<pair<uint32_t, uint32_t>> allBoundaryAndReadOrdinal;
+            // Collect {boundaryIndex, readOrdinal, strand} per strand group.
+            struct StrandGroup {
+                Strand strand;
+                vector<pair<uint32_t, uint32_t>> boundaryAndReadOrdinal;
+            };
+            StrandGroup strandGroups[2];
+            strandGroups[0].strand = primaryStrand;
+            strandGroups[1].strand = 1 - primaryStrand;
+
             for(size_t ci : rg.chainIndicesInRef) {
                 const auto& ce = chainsForRef[ci];
                 const auto& al = alignments[ce.chainIndex];
-
                 const Strand thisStrand = ce.isSameStrand ? 0 : 1;
-                if(thisStrand != readStrand) continue;
+                int groupIdx = (thisStrand == primaryStrand) ? 0 : 1;
 
                 for(const auto& ord : al.ordinals) {
                     auto it = ordinalToBoundary.find(ord[0]);
                     if(it != ordinalToBoundary.end()) {
-                        allBoundaryAndReadOrdinal.push_back({it->second, ord[1]});
+                        strandGroups[groupIdx].boundaryAndReadOrdinal.push_back(
+                            {it->second, ord[1]});
                     }
                 }
             }
 
-            if(allBoundaryAndReadOrdinal.size() < 2) continue;
-
-            // Sort by boundary index (reference position) and deduplicate.
-            sort(allBoundaryAndReadOrdinal.begin(), allBoundaryAndReadOrdinal.end());
-            allBoundaryAndReadOrdinal.erase(
-                unique(allBoundaryAndReadOrdinal.begin(), allBoundaryAndReadOrdinal.end()),
-                allBoundaryAndReadOrdinal.end());
-
-            const uint32_t bMin = allBoundaryAndReadOrdinal.front().first;
-            const uint32_t bMax = allBoundaryAndReadOrdinal.back().first;
-            if(bMax <= bMin) continue;
-            if(bMin >= nodeIds.size()) continue;
-
-            // -----------------------------------------------------------------
-            // Phase 1: Anchored segments — align each consecutive anchor pair
-            // within each chain. These are high-confidence alignments that
-            // establish the correct graph topology.
-            // -----------------------------------------------------------------
             seqNames.push_back(readName);
             bool anyAligned = false;
 
-            for(size_t j = 0; j + 1 < allBoundaryAndReadOrdinal.size(); ++j) {
-                const uint32_t bLeft = allBoundaryAndReadOrdinal[j].first;
-                const uint32_t bRight = allBoundaryAndReadOrdinal[j + 1].first;
-                const uint32_t readOrdLeft = allBoundaryAndReadOrdinal[j].second;
-                const uint32_t readOrdRight = allBoundaryAndReadOrdinal[j + 1].second;
+            // Process each strand group (primary strand first, then inverted).
+            for(int gi = 0; gi < 2; ++gi) {
+                auto& sg = strandGroups[gi];
+                if(sg.boundaryAndReadOrdinal.size() < 2) continue;
 
-                // Only align within a single chain's collinear region.
-                // Skip gaps between chains (bRight - bLeft > 1 with no
-                // intermediate anchors) — those are the SV breakpoints
-                // that Phase 2 will handle.
-                if(bRight != bLeft + 1) continue;
-                if(readOrdRight <= readOrdLeft) continue;
-                if(readOrdLeft >= readMarkers.size() || readOrdRight >= readMarkers.size()) continue;
+                sort(sg.boundaryAndReadOrdinal.begin(), sg.boundaryAndReadOrdinal.end());
+                sg.boundaryAndReadOrdinal.erase(
+                    unique(sg.boundaryAndReadOrdinal.begin(), sg.boundaryAndReadOrdinal.end()),
+                    sg.boundaryAndReadOrdinal.end());
 
-                const uint32_t readPosLeft = readMarkers[readOrdLeft].position + kHalf;
-                const uint32_t readPosRight = readMarkers[readOrdRight].position + kHalf;
-                if(readPosRight <= readPosLeft) continue;
+                const OrientedReadId sgOid(readId, sg.strand);
+                const auto sgMarkers = markersRef[sgOid.getValue()];
 
-                string readSeg;
-                readSeg.reserve(readPosRight - readPosLeft);
-                for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
-                    readSeg.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
-                }
+                const uint32_t sgBMin = sg.boundaryAndReadOrdinal.front().first;
+                const uint32_t sgBMax = sg.boundaryAndReadOrdinal.back().first;
+                if(sgBMax <= sgBMin) continue;
+                if(sgBMin >= nodeIds.size()) continue;
 
-                if(readSeg.empty()) continue;
-                if(bLeft >= nodeIds.size()) continue;
-                int endNode = (bRight < nodeIds.size())
-                    ? static_cast<int>(nodeIds[bRight])
-                    : -1;
+                // Phase 1: Anchored segments for this strand group.
+                for(size_t j = 0; j + 1 < sg.boundaryAndReadOrdinal.size(); ++j) {
+                    const uint32_t bLeft = sg.boundaryAndReadOrdinal[j].first;
+                    const uint32_t bRight = sg.boundaryAndReadOrdinal[j + 1].first;
+                    const uint32_t readOrdLeft = sg.boundaryAndReadOrdinal[j].second;
+                    const uint32_t readOrdRight = sg.boundaryAndReadOrdinal[j + 1].second;
 
-                aligner.align_from(
-                    readSeg,
-                    nodeIds[bLeft],
-                    1,      // weight
-                    true,   // is_ends_free
-                    0,      // start_offset
-                    endNode,
-                    seqId);
+                    if(bRight != bLeft + 1) continue;
+                    if(readOrdRight <= readOrdLeft) continue;
+                    if(readOrdLeft >= sgMarkers.size() || readOrdRight >= sgMarkers.size()) continue;
 
-                anyAligned = true;
-                ++totalAlignedSegments;
-            }
+                    const uint32_t readPosLeft = sgMarkers[readOrdLeft].position + kHalf;
+                    const uint32_t readPosRight = sgMarkers[readOrdRight].position + kHalf;
+                    if(readPosRight <= readPosLeft) continue;
 
-            // -----------------------------------------------------------------
-            // Phase 2: Full-span alignment — align the complete read sequence
-            // from leftmost to rightmost anchor across the entire backbone
-            // range. The anchored segments from Phase 1 act as guide rails;
-            // this alignment fills in the gaps between chains (the SV
-            // breakpoint regions) and naturally creates shortcut paths
-            // (deletions) or longer alternative paths (insertions).
-            // -----------------------------------------------------------------
-            const uint32_t readOrdMin = allBoundaryAndReadOrdinal.front().second;
-            const uint32_t readOrdMax = allBoundaryAndReadOrdinal.back().second;
-            if(readOrdMax > readOrdMin
-               && readOrdMin < readMarkers.size()
-               && readOrdMax < readMarkers.size()) {
-
-                const uint32_t readPosLeft = readMarkers[readOrdMin].position + kHalf;
-                const uint32_t readPosRight = readMarkers[readOrdMax].position + kHalf;
-
-                if(readPosRight > readPosLeft) {
-                    string readSeq;
-                    readSeq.reserve(readPosRight - readPosLeft);
+                    string readSeg;
+                    readSeg.reserve(readPosRight - readPosLeft);
                     for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
-                        readSeq.push_back(readsRef.getOrientedReadBase(readOid, pos).character());
+                        readSeg.push_back(readsRef.getOrientedReadBase(sgOid, pos).character());
                     }
 
-                    if(!readSeq.empty()) {
-                        int endNode = (bMax < nodeIds.size())
-                            ? static_cast<int>(nodeIds[bMax])
-                            : -1;
+                    if(readSeg.empty()) continue;
+                    if(bLeft >= nodeIds.size()) continue;
+                    int endNode = (bRight < nodeIds.size())
+                        ? static_cast<int>(nodeIds[bRight])
+                        : -1;
 
-                        aligner.align_from(
-                            readSeq,
-                            nodeIds[bMin],
-                            1,      // weight
-                            true,   // is_ends_free
-                            0,      // start_offset
-                            endNode,
-                            seqId);
+                    aligner.align_from(
+                        readSeg,
+                        nodeIds[bLeft],
+                        1,      // weight
+                        true,   // is_ends_free
+                        0,      // start_offset
+                        endNode,
+                        seqId);
 
-                        anyAligned = true;
-                        ++totalAlignedSegments;
+                    anyAligned = true;
+                    ++totalAlignedSegments;
+                }
+
+                // Phase 2: Full-span alignment for this strand group.
+                const uint32_t readOrdMin = sg.boundaryAndReadOrdinal.front().second;
+                const uint32_t readOrdMax = sg.boundaryAndReadOrdinal.back().second;
+                if(readOrdMax > readOrdMin
+                   && readOrdMin < sgMarkers.size()
+                   && readOrdMax < sgMarkers.size()) {
+
+                    const uint32_t readPosLeft = sgMarkers[readOrdMin].position + kHalf;
+                    const uint32_t readPosRight = sgMarkers[readOrdMax].position + kHalf;
+
+                    if(readPosRight > readPosLeft) {
+                        string readSeq;
+                        readSeq.reserve(readPosRight - readPosLeft);
+                        for(uint32_t pos = readPosLeft; pos < readPosRight; ++pos) {
+                            readSeq.push_back(readsRef.getOrientedReadBase(sgOid, pos).character());
+                        }
+
+                        if(!readSeq.empty()) {
+                            int endNode = (sgBMax < nodeIds.size())
+                                ? static_cast<int>(nodeIds[sgBMax])
+                                : -1;
+
+                            aligner.align_from(
+                                readSeq,
+                                nodeIds[sgBMin],
+                                1,      // weight
+                                true,   // is_ends_free
+                                0,      // start_offset
+                                endNode,
+                                seqId);
+
+                            anyAligned = true;
+                            ++totalAlignedSegments;
+                        }
                     }
                 }
             }
