@@ -627,7 +627,6 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            seqNames.push_back(readName);
             bool anyAligned = false;
 
             // Process each strand group (primary strand first, then inverted).
@@ -647,6 +646,8 @@ void Assembler::buildSvMSA(
                 const uint32_t sgBMax = sg.boundaryAndReadOrdinal.back().first;
                 if(sgBMax <= sgBMin) continue;
                 if(sgBMin >= nodeIds.size()) continue;
+
+                const string strandTag = (gi == 0) ? "" : "_INV";
 
                 // Phase 1: Anchored segments for this strand group.
                 for(size_t j = 0; j + 1 < sg.boundaryAndReadOrdinal.size(); ++j) {
@@ -675,6 +676,8 @@ void Assembler::buildSvMSA(
                         ? static_cast<int>(nodeIds[bRight])
                         : -1;
 
+                    seqNames.push_back(readName + "_seg" + to_string(j) + "_P1" + strandTag);
+
                     aligner.align_from(
                         readSeg,
                         nodeIds[bLeft],
@@ -684,6 +687,7 @@ void Assembler::buildSvMSA(
                         endNode,
                         seqId);
 
+                    ++seqId;
                     anyAligned = true;
                     ++totalAlignedSegments;
                 }
@@ -710,6 +714,8 @@ void Assembler::buildSvMSA(
                                 ? static_cast<int>(nodeIds[sgBMax])
                                 : -1;
 
+                            seqNames.push_back(readName + "_span_P2" + strandTag);
+
                             aligner.align_from(
                                 readSeq,
                                 nodeIds[sgBMin],
@@ -719,6 +725,7 @@ void Assembler::buildSvMSA(
                                 endNode,
                                 seqId);
 
+                            ++seqId;
                             anyAligned = true;
                             ++totalAlignedSegments;
                         }
@@ -727,10 +734,7 @@ void Assembler::buildSvMSA(
             }
 
             if(anyAligned) {
-                ++seqId;
                 ++totalAlignedReads;
-            } else {
-                seqNames.pop_back();
             }
         }
 
