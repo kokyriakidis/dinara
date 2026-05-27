@@ -126,6 +126,17 @@ struct AnchorWindow {
     // True if the cluster at the same index contains unclassified reads
     // (reads that don't span any het sites and belong to both haplotypes).
     std::vector<bool> clusterIsUnclassified;
+
+    // Inter-window edges incident to this window.
+    // Populated after inter-window edge creation.
+    struct InterWindowEdge {
+        uint32_t otherWindow;       // The neighbor window (raw ID, may be RC mirror).
+        Shasta2AnchorId anchorIdA;  // Last anchor in source window.
+        Shasta2AnchorId anchorIdB;  // First anchor in destination window.
+        uint64_t readCount;         // Shared read count.
+    };
+    std::vector<InterWindowEdge> outEdges;  // This window is the source.
+    std::vector<InterWindowEdge> inEdges;   // This window is the destination.
 };
 
 } // namespace dinara
