@@ -255,6 +255,7 @@ def installAptPackages():
     "python3-dev", 
     "libsimde-dev",
     "zlib1g-dev",
+    "libcli11-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
 
@@ -674,7 +675,7 @@ def installShasta2():
         os.chdir(temporaryDirectory)
         
         # Clone repo
-        runCommand("git clone https://github.com/kokyriakidis/shasta2.git")
+        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
         
         # Cleanup existing build directory to prevent BuildAbpoa.py failure
         home = os.path.expanduser("~")
@@ -1027,10 +1028,11 @@ def installMinipoa():
                    " -DCMAKE_BUILD_TYPE=Release")
         runCommand("cmake --build " + buildDir + " -j")
 
-        # The binary is placed in the build directory.
+        # The binary may be in build/ or build/bin/ depending on CMake config.
         builtBinary = os.path.join(buildDir, "minipoa")
         if not os.path.exists(builtBinary):
-            # Some CMake setups put it directly in the source tree build dir.
+            builtBinary = os.path.join(buildDir, "bin", "minipoa")
+        if not os.path.exists(builtBinary):
             raise Exception("minipoa binary not found after build. Check build output.")
 
         runCommand("cp " + builtBinary + " " + installBinary)
