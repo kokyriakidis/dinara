@@ -451,6 +451,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
+    // Populate per-window outEdges/inEdges from createdEdges.
+    for(const auto& edgeInfo : createdEdges) {
+        const uint32_t srcW = edgeInfo.windowPair.first;
+        const uint32_t dstW = edgeInfo.windowPair.second;
+        // anchorWindows only has windowCount entries (forward windows).
+        // For RC mirror windows (>= windowCount), skip — they don't have
+        // AnchorWindow entries. The RC edges are already tracked via the
+        // forward window's edges + anchor ^ 1.
+        if(srcW < windowCount) {
+            auto& w = const_cast<AnchorWindow&>(anchorWindows[srcW]);
+            w.outEdges.push_back({dstW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
+        }
+        if(dstW < windowCount) {
+            auto& w = const_cast<AnchorWindow&>(anchorWindows[dstW]);
+            w.inEdges.push_back({srcW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
+        }
+    }
+
     // Per-window connectivity summary using transitionReads.
     {
         const uint32_t noW = AnchorWindow::noWindow;
@@ -513,67 +531,42 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // More rules can be added below as needed.
     //
     // Rule 1: Trim dangling backbone tails at 1-to-1 window connections.
-    //   A window has a 1-to-1 outgoing connection if it has exactly one
-    //   outgoing inter-window edge. Similarly for incoming. At such
+    //   A forward window has a 1-to-1 outgoing connection if it has exactly
+    //   one outgoing inter-window edge. Similarly for incoming. At such
     //   connections, trim the source backbone past the connection anchor
     //   and the destination backbone before the connection anchor.
     // ========================================================================
     {
-        // Count outgoing/incoming inter-window edges per window directly
-        // from createdEdges. Use raw window IDs (including RC mirrors).
-        std::map<uint32_t, std::vector<uint64_t>> windowOutEdges;  // windowId -> edge indices
-        std::map<uint32_t, std::vector<uint64_t>> windowInEdges;
-        for(uint64_t ei = 0; ei < createdEdges.size(); ei++) {
-            windowOutEdges[createdEdges[ei].windowPair.first].push_back(ei);
-            windowInEdges[createdEdges[ei].windowPair.second].push_back(ei);
-        }
-
         uint64_t trimmedVertexCount = 0;
         uint64_t oneToOneCount = 0;
-        for(uint64_t ei = 0; ei < createdEdges.size(); ei++) {
-            const auto& edgeInfo = createdEdges[ei];
-            const uint32_t srcW = edgeInfo.windowPair.first;
-            const uint32_t dstW = edgeInfo.windowPair.second;
 
-            // 1-to-1: source window has exactly 1 outgoing edge,
-            // destination window has exactly 1 incoming edge.
-            const bool srcOneOut = (windowOutEdges[srcW].size() == 1);
-            const bool dstOneIn = (windowInEdges[dstW].size() == 1);
-            if(!srcOneOut || !dstOneIn) continue;
+        for(uint32_t srcW = 0; srcW < windowCount; srcW++) {
+            const auto& srcWindow = anchorWindows[srcW];
+            if(srcWindow.outEdges.size() != 1) continue;
+
+            const auto& edge = srcWindow.outEdges[0];
+            const uint32_t dstW = edge.otherWindow;
+
+            // Destination must also be a forward window with exactly 1 incoming edge.
+            if(dstW >= windowCount) continue;
+            const auto& dstWindow = anchorWindows[dstW];
+            if(dstWindow.inEdges.size() != 1) continue;
 
             ++oneToOneCount;
 
-            // Determine which backbone to use. For forward windows (< windowCount),
-            // use the window directly. For RC mirrors, use the original window
-            // and search for the RC of the connection anchor.
-            const bool srcIsRc = (srcW >= windowCount);
-            const bool dstIsRc = (dstW >= windowCount);
-            const uint32_t srcOrigW = srcIsRc ? (srcW - windowCount) : srcW;
-            const uint32_t dstOrigW = dstIsRc ? (dstW - windowCount) : dstW;
-
-            const auto& srcWindow = anchorWindows[srcOrigW];
-            const auto& dstWindow = anchorWindows[dstOrigW];
             const auto srcJourney = journeys[srcWindow.backboneOrientedReadId];
             const auto dstJourney = journeys[dstWindow.backboneOrientedReadId];
             const auto& srcPositions = srcWindow.filteredBackbonePositions;
             const auto& dstPositions = dstWindow.filteredBackbonePositions;
 
             // Find the connection anchor in the full backbone journey.
-            // For RC mirror windows, search for anchorId ^ 1.
-            const Shasta2AnchorId srcSearch = srcIsRc
-                ? Shasta2AnchorId(uint64_t(edgeInfo.anchorIdA) ^ 1ULL)
-                : edgeInfo.anchorIdA;
-            const Shasta2AnchorId dstSearch = dstIsRc
-                ? Shasta2AnchorId(uint64_t(edgeInfo.anchorIdB) ^ 1ULL)
-                : edgeInfo.anchorIdB;
-
             int64_t srcJourneyPos = -1;
             for(uint32_t pos = srcWindow.backboneBegin; pos < srcWindow.backboneEnd; pos++) {
-                if(srcJourney[pos] == srcSearch) { srcJourneyPos = int64_t(pos); break; }
+                if(srcJourney[pos] == edge.anchorIdA) { srcJourneyPos = int64_t(pos); break; }
             }
             int64_t dstJourneyPos = -1;
             for(uint32_t pos = dstWindow.backboneBegin; pos < dstWindow.backboneEnd; pos++) {
-                if(dstJourney[pos] == dstSearch) { dstJourneyPos = int64_t(pos); break; }
+                if(dstJourney[pos] == edge.anchorIdB) { dstJourneyPos = int64_t(pos); break; }
             }
 
             // Source tail: find the last filtered backbone position <= srcJourneyPos,
@@ -606,9 +599,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 ? uint64_t(dstTrimBefore) : 0;
 
             cout << "  Rule1 trim: W" << srcW << "→W" << dstW
-                 << (srcIsRc || dstIsRc ? " (RC)" : "")
-                 << " anchorA=" << uint64_t(edgeInfo.anchorIdA)
-                 << " anchorB=" << uint64_t(edgeInfo.anchorIdB)
+                 << " anchorA=" << uint64_t(edge.anchorIdA)
+                 << " anchorB=" << uint64_t(edge.anchorIdB)
                  << " srcJPos=" << srcJourneyPos
                  << " dstJPos=" << dstJourneyPos
                  << " srcTrim=" << srcTrimAfter << "/" << srcPositions.size()
