@@ -2584,9 +2584,17 @@ public:
     enum class ChainClassification : uint8_t { Primary = 0, Supplementary = 1, Secondary = 2 };
     vector<ChainClassification> chainClassifications;
 
+    // Per-window k-mer hit depth along the reference.
+    struct RefHitDepthWindow {
+        uint32_t refPos;       // window center position
+        double avgHitDepth;    // average k-mer hit count per marker
+        uint32_t markerCount;  // markers in this window
+    };
+
     void buildSvMSA(
         uint64_t referenceReadCount,
-        const string& outputPrefix);
+        const string& outputPrefix,
+        const vector<RefHitDepthWindow>& refHitDepth = {});
 
     void classifySplitAlignments(
         uint64_t referenceReadCount,

@@ -14,6 +14,7 @@
 #include "Assembler.hpp"
 #include "Alignment.hpp"
 #include "AlignmentCandidates.hpp"
+#include "InvertedIndexBuilder.hpp"
 #include "Reads.hpp"
 #include "performanceLog.hpp"
 #include "timestamp.hpp"
@@ -21,6 +22,9 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace dinara;
@@ -303,7 +307,8 @@ void Assembler::classifySplitAlignments(
 
 void Assembler::buildSvMSA(
     uint64_t referenceReadCount,
-    const string& outputPrefix)
+    const string& outputPrefix,
+    const vector<RefHitDepthWindow>& refHitDepth)
 {
 #ifndef DINARA_HAVE_THESEUS
     throw runtime_error("buildSvMSA requires the theseus library (not available in this build).");
@@ -1193,157 +1198,381 @@ void Assembler::buildSvMSA(
                     }
                 }
 
-                // Classify anchored reads as left-flank or right-flank
-                // based on how much of the read extends beyond its chain.
-                // A read whose chain covers the LEFT portion of the read
-                // (unanchored overhang on the RIGHT) is a left-flank read:
-                // it sits left of the insertion and extends rightward into it.
-                struct FlankRead {
-                    uint32_t readId;
-                    uint32_t refPos;       // chain endpoint on reference
-                    int64_t overhangBp;    // bp extending into insertion
-                };
-                vector<FlankRead> leftFlanks;   // chain ends, read extends right
-                vector<FlankRead> rightFlanks;  // chain starts, read extends left
-
-                // Reference boundary margin: reads whose chain endpoints
-                // are within this distance of the reference start/end are
-                // excluded — their overhangs are due to the extraction
-                // boundary, not an insertion.
+                // -------------------------------------------------------
+                // Reference-centric coverage analysis.
+                //
+                // For each window along the reference, count:
+                //   chainEndCount:   chains whose maxRefPos falls here
+                //   chainStartCount: chains whose minRefPos falls here
+                //   spanningCount:   chains that span through this window
+                //
+                // A breakpoint shows as a spike in chainEndCount (left BP)
+                // or chainStartCount (right BP) with a drop in spanning.
+                // -------------------------------------------------------
                 const uint32_t refEndPos = refMarkers.empty() ? 0
                     : uint32_t(refMarkers[refMarkers.size() - 1].position);
                 const uint32_t refStartPos = refMarkers.empty() ? 0
                     : uint32_t(refMarkers[0].position);
+                const uint32_t refLen = refEndPos - refStartPos;
+                const uint32_t windowSize = 50; // bp per window
+                const uint32_t nWindows = (refLen / windowSize) + 1;
                 const uint32_t boundaryMargin = 300;
+
+                // Boundary windows to exclude (extraction edges).
+                const uint32_t boundaryWindows = boundaryMargin / windowSize;
+
+                vector<uint32_t> chainEndCount(nWindows, 0);
+                vector<uint32_t> chainStartCount(nWindows, 0);
+                vector<uint32_t> spanningCount(nWindows, 0);
+
+                // Also track per-read overhang at each endpoint.
+                struct EndpointInfo {
+                    uint32_t readId;
+                    int64_t overhangBp;
+                };
+                // Map from window index to list of reads ending/starting there.
+                unordered_map<uint32_t, vector<EndpointInfo>> chainEndReads;
+                unordered_map<uint32_t, vector<EndpointInfo>> chainStartReads;
 
                 for(const auto& [rid, info] : readChainInfoMap) {
                     if(info.totalMarkers < 2) continue;
+                    if(info.maxRefPos < refStartPos || info.minRefPos < refStartPos) continue;
+
+                    const uint32_t endWin = (info.maxRefPos - refStartPos) / windowSize;
+                    const uint32_t startWin = (info.minRefPos - refStartPos) / windowSize;
+                    if(endWin >= nWindows || startWin >= nWindows) continue;
+
+                    // Compute overhangs.
                     const auto rdMarkers = markersRef[
                         OrientedReadId(ReadId(rid), 0).getValue()];
                     if(rdMarkers.size() < 2) continue;
 
-                    // Overhang on the right = markers after chain end.
-                    const int64_t rightOvhOrd = int64_t(info.totalMarkers - 1) - int64_t(info.maxReadOrd);
-                    // Overhang on the left = markers before chain start.
-                    const int64_t leftOvhOrd = int64_t(info.minReadOrd);
-
-                    // Convert to bp using marker positions.
                     const uint32_t readLastPos = uint32_t(rdMarkers[rdMarkers.size() - 1].position);
-                    const uint32_t chainEndPos = (info.maxReadOrd < rdMarkers.size())
+                    const uint32_t chainEndOrdPos = (info.maxReadOrd < rdMarkers.size())
                         ? uint32_t(rdMarkers[info.maxReadOrd].position) : readLastPos;
                     const uint32_t readFirstPos = uint32_t(rdMarkers[0].position);
-                    const uint32_t chainStartPos = (info.minReadOrd < rdMarkers.size())
+                    const uint32_t chainStartOrdPos = (info.minReadOrd < rdMarkers.size())
                         ? uint32_t(rdMarkers[info.minReadOrd].position) : readFirstPos;
 
-                    const int64_t rightOvhBp = int64_t(readLastPos) - int64_t(chainEndPos);
-                    const int64_t leftOvhBp = int64_t(chainStartPos) - int64_t(readFirstPos);
+                    const int64_t rightOvhBp = int64_t(readLastPos) - int64_t(chainEndOrdPos);
+                    const int64_t leftOvhBp = int64_t(chainStartOrdPos) - int64_t(readFirstPos);
 
-                    // A read is a left-flank if it has significant right overhang
-                    // (>= 30bp extending beyond its chain into the insertion).
-                    // Its breakpoint on the reference is maxRefPos.
-                    // Exclude reads near reference boundaries.
-                    const int64_t minOverhangBp = 30;
-                    if(rightOvhBp >= minOverhangBp && rightOvhOrd >= 3) {
-                        // Skip if chain end is near the reference end.
-                        if(refEndPos > boundaryMargin && info.maxRefPos < (refEndPos - boundaryMargin)) {
-                            leftFlanks.push_back({rid, info.maxRefPos, rightOvhBp});
+                    // Count chain endpoints.
+                    chainEndCount[endWin]++;
+                    chainStartCount[startWin]++;
+
+                    // Record reads with significant overhang.
+                    const int64_t minOvhBp = 20;
+                    const int64_t rightOvhOrd = int64_t(info.totalMarkers - 1) - int64_t(info.maxReadOrd);
+                    const int64_t leftOvhOrd = int64_t(info.minReadOrd);
+
+                    if(rightOvhBp >= minOvhBp && rightOvhOrd >= 2) {
+                        chainEndReads[endWin].push_back({rid, rightOvhBp});
+                    }
+                    if(leftOvhBp >= minOvhBp && leftOvhOrd >= 2) {
+                        chainStartReads[startWin].push_back({rid, leftOvhBp});
+                    }
+
+                    // Count spanning coverage.
+                    for(uint32_t w = startWin; w <= endWin && w < nWindows; ++w) {
+                        spanningCount[w]++;
+                    }
+                }
+
+                // Compute background chain-end rate.
+                // In a uniform region, chain ends are spread evenly.
+                // At a breakpoint, chain ends cluster.
+                // Use median spanning coverage as baseline.
+                vector<uint32_t> sortedSpanning(spanningCount.begin(), spanningCount.end());
+                sort(sortedSpanning.begin(), sortedSpanning.end());
+                const uint32_t medianSpanning = sortedSpanning[sortedSpanning.size() / 2];
+
+                // Background end rate: total chain ends / number of windows
+                // (excluding boundary windows).
+                uint32_t totalEnds = 0, totalStarts = 0;
+                uint32_t interiorWindows = 0;
+                for(uint32_t w = boundaryWindows; w + boundaryWindows < nWindows; ++w) {
+                    totalEnds += chainEndCount[w];
+                    totalStarts += chainStartCount[w];
+                    ++interiorWindows;
+                }
+                const double bgEndRate = interiorWindows > 0
+                    ? double(totalEnds) / double(interiorWindows) : 1.0;
+                const double bgStartRate = interiorWindows > 0
+                    ? double(totalStarts) / double(interiorWindows) : 1.0;
+
+                // Detect breakpoints: windows where chain-end count is
+                // significantly above background AND there are reads with
+                // significant overhang at that position.
+                //
+                // A left breakpoint has many chain ends with right overhang.
+                // A right breakpoint has many chain starts with left overhang.
+                const double minFoldEnrichment = 3.0;
+                const uint32_t minEndpointReads = 2; // reads with overhang
+
+                struct Breakpoint {
+                    uint32_t windowIdx;
+                    uint32_t refPos;        // center of window
+                    uint32_t endpointCount; // chains ending/starting here
+                    uint32_t spanCount;     // spanning coverage
+                    uint32_t ovhReadCount;  // reads with significant overhang
+                    double foldEnrichment;
+                    vector<EndpointInfo> reads; // reads with overhang
+                };
+                vector<Breakpoint> leftBreakpoints;  // chain ends
+                vector<Breakpoint> rightBreakpoints; // chain starts
+
+                for(uint32_t w = boundaryWindows; w + boundaryWindows < nWindows; ++w) {
+                    const uint32_t refPos = refStartPos + w * windowSize + windowSize / 2;
+
+                    // Left breakpoint: many chain ends with right overhang.
+                    if(chainEndCount[w] > 0) {
+                        const double fold = chainEndCount[w] / std::max(bgEndRate, 0.1);
+                        auto it = chainEndReads.find(w);
+                        const uint32_t ovhCount = (it != chainEndReads.end())
+                            ? uint32_t(it->second.size()) : 0;
+
+                        if(fold >= minFoldEnrichment && ovhCount >= minEndpointReads) {
+                            leftBreakpoints.push_back({
+                                w, refPos, chainEndCount[w], spanningCount[w],
+                                ovhCount, fold,
+                                (it != chainEndReads.end()) ? it->second : vector<EndpointInfo>{}
+                            });
                         }
                     }
-                    if(leftOvhBp >= minOverhangBp && leftOvhOrd >= 3) {
-                        // Skip if chain start is near the reference start.
-                        if(info.minRefPos > (refStartPos + boundaryMargin)) {
-                            rightFlanks.push_back({rid, info.minRefPos, leftOvhBp});
+
+                    // Right breakpoint: many chain starts with left overhang.
+                    if(chainStartCount[w] > 0) {
+                        const double fold = chainStartCount[w] / std::max(bgStartRate, 0.1);
+                        auto it = chainStartReads.find(w);
+                        const uint32_t ovhCount = (it != chainStartReads.end())
+                            ? uint32_t(it->second.size()) : 0;
+
+                        if(fold >= minFoldEnrichment && ovhCount >= minEndpointReads) {
+                            rightBreakpoints.push_back({
+                                w, refPos, chainStartCount[w], spanningCount[w],
+                                ovhCount, fold,
+                                (it != chainStartReads.end()) ? it->second : vector<EndpointInfo>{}
+                            });
                         }
                     }
                 }
 
-                // Sort flanks by reference position.
-                sort(leftFlanks.begin(), leftFlanks.end(),
-                    [](const FlankRead& a, const FlankRead& b) { return a.refPos < b.refPos; });
-                sort(rightFlanks.begin(), rightFlanks.end(),
-                    [](const FlankRead& a, const FlankRead& b) { return a.refPos < b.refPos; });
+                // -------------------------------------------------------
+                // K-mer hit depth along the reference.
+                //
+                // For each reference marker, look up its canonical k-mer
+                // in the inverted index and count how many read occurrences
+                // share that k-mer. Aggregate per window.
+                //
+                // At an insertion breakpoint, the hit depth drops because
+                // reads carrying the insertion have their k-mers split
+                // between the two flanks.
+                // -------------------------------------------------------
+                // Use the pre-computed hit depth profile passed from main.
+                vector<double> windowHitDepth(nWindows, 0.0);
+                vector<uint32_t> windowMarkerCount(nWindows, 0);
 
-                // Cluster left-flank and right-flank reads by reference
-                // position to find breakpoint pairs.
-                // A breakpoint pair is a cluster of left-flanks near position L
-                // and a cluster of right-flanks near position R, with L ≈ R.
-                const uint32_t BP_CLUSTER_WINDOW = 100; // bp
+                for(const auto& hdw : refHitDepth) {
+                    if(hdw.refPos < refStartPos) continue;
+                    const uint32_t win = (hdw.refPos - refStartPos) / windowSize;
+                    if(win >= nWindows) continue;
+                    windowHitDepth[win] = hdw.avgHitDepth;
+                    windowMarkerCount[win] = hdw.markerCount;
+                }
 
-                struct BpCluster {
-                    vector<FlankRead> reads;
-                    uint32_t medianRefPos;
+                // Compute median hit depth for background.
+                vector<double> sortedHitDepth;
+                for(uint32_t w = boundaryWindows; w + boundaryWindows < nWindows; ++w) {
+                    if(windowMarkerCount[w] > 0) {
+                        sortedHitDepth.push_back(windowHitDepth[w]);
+                    }
+                }
+                sort(sortedHitDepth.begin(), sortedHitDepth.end());
+                const double medianHitDepth = sortedHitDepth.empty() ? 0.0
+                    : sortedHitDepth[sortedHitDepth.size() / 2];
+
+                // Detect hit-depth breakpoints: windows where depth drops
+                // below 50% of median AND has at least some markers.
+                const double hitDepthDropThreshold = 0.5;
+                struct HitDepthBreakpoint {
+                    uint32_t windowIdx;
+                    uint32_t refPos;
+                    double hitDepth;
+                    double dropRatio; // hitDepth / medianHitDepth
                 };
+                vector<HitDepthBreakpoint> hitDepthBreakpoints;
 
-                auto clusterFlanks = [&](const vector<FlankRead>& flanks) -> vector<BpCluster> {
-                    vector<BpCluster> clusters;
-                    for(const auto& f : flanks) {
-                        bool added = false;
-                        for(auto& c : clusters) {
-                            if(std::abs(int64_t(f.refPos) - int64_t(c.medianRefPos)) <= BP_CLUSTER_WINDOW) {
-                                c.reads.push_back(f);
-                                // Update median as running average.
-                                uint64_t sum = 0;
-                                for(const auto& r : c.reads) sum += r.refPos;
-                                c.medianRefPos = uint32_t(sum / c.reads.size());
-                                added = true;
-                                break;
-                            }
-                        }
-                        if(!added) {
-                            clusters.push_back({{f}, f.refPos});
+                if(medianHitDepth > 2.0) {
+                    for(uint32_t w = boundaryWindows; w + boundaryWindows < nWindows; ++w) {
+                        if(windowMarkerCount[w] == 0) continue;
+                        const double ratio = windowHitDepth[w] / medianHitDepth;
+                        if(ratio < hitDepthDropThreshold) {
+                            const uint32_t refPos = refStartPos + w * windowSize + windowSize / 2;
+                            hitDepthBreakpoints.push_back({w, refPos, windowHitDepth[w], ratio});
                         }
                     }
-                    return clusters;
-                };
+                }
 
-                auto leftClusters = clusterFlanks(leftFlanks);
-                auto rightClusters = clusterFlanks(rightFlanks);
-
-                cout << "    Breakpoint scan: "
-                     << leftFlanks.size() << " left-flank reads ("
-                     << leftClusters.size() << " clusters), "
-                     << rightFlanks.size() << " right-flank reads ("
-                     << rightClusters.size() << " clusters), "
-                     << unanchoredReads.size() << " unanchored reads."
+                cout << "    Coverage analysis: "
+                     << "medianSpanning=" << medianSpanning
+                     << " bgEndRate=" << bgEndRate
+                     << " bgStartRate=" << bgStartRate
+                     << " leftBPs=" << leftBreakpoints.size()
+                     << " rightBPs=" << rightBreakpoints.size()
+                     << " unanchored=" << unanchoredReads.size()
+                     << " medianHitDepth=" << medianHitDepth
+                     << " hitDepthBPs=" << hitDepthBreakpoints.size()
                      << endl;
 
-                for(size_t ci = 0; ci < leftClusters.size(); ++ci) {
-                    cout << "      Left cluster " << ci
-                         << ": pos=" << leftClusters[ci].medianRefPos
-                         << " reads=" << leftClusters[ci].reads.size()
-                         << endl;
-                }
-                for(size_t ci = 0; ci < rightClusters.size(); ++ci) {
-                    cout << "      Right cluster " << ci
-                         << ": pos=" << rightClusters[ci].medianRefPos
-                         << " reads=" << rightClusters[ci].reads.size()
+                for(const auto& hbp : hitDepthBreakpoints) {
+                    cout << "      HitDepth BP: pos=" << hbp.refPos
+                         << " depth=" << hbp.hitDepth
+                         << " ratio=" << hbp.dropRatio
                          << endl;
                 }
 
-                // For each left-cluster, find the nearest right-cluster
-                // to form a breakpoint pair.
-                for(const auto& lc : leftClusters) {
-                    if(lc.reads.empty()) continue;
-
-                    // Find nearest right-cluster.
-                    const BpCluster* bestRc = nullptr;
-                    int64_t bestDist = INT64_MAX;
-                    for(const auto& rc : rightClusters) {
-                        if(rc.reads.empty()) continue;
-                        const int64_t dist = std::abs(
-                            int64_t(rc.medianRefPos) - int64_t(lc.medianRefPos));
-                        if(dist < bestDist) {
-                            bestDist = dist;
-                            bestRc = &rc;
+                // Merge hit-depth breakpoints into left/right breakpoints.
+                // A hit-depth drop can indicate either a left or right
+                // breakpoint. We check if there are chain-end reads or
+                // chain-start reads near the hit-depth breakpoint.
+                for(const auto& hbp : hitDepthBreakpoints) {
+                    // Check if already covered by an existing breakpoint.
+                    bool coveredLeft = false, coveredRight = false;
+                    for(const auto& lbp : leftBreakpoints) {
+                        if(std::abs(int64_t(lbp.refPos) - int64_t(hbp.refPos)) < int64_t(windowSize * 3)) {
+                            coveredLeft = true;
+                            break;
+                        }
+                    }
+                    for(const auto& rbp : rightBreakpoints) {
+                        if(std::abs(int64_t(rbp.refPos) - int64_t(hbp.refPos)) < int64_t(windowSize * 3)) {
+                            coveredRight = true;
+                            break;
                         }
                     }
 
-                    if(!bestRc || bestDist > 500) continue;
+                    // If not covered, add as both left and right breakpoint
+                    // using any chain-end/start reads in nearby windows.
+                    if(!coveredLeft) {
+                        vector<EndpointInfo> nearbyReads;
+                        for(int32_t dw = -2; dw <= 2; ++dw) {
+                            const int32_t w = int32_t(hbp.windowIdx) + dw;
+                            if(w < 0 || uint32_t(w) >= nWindows) continue;
+                            auto it = chainEndReads.find(uint32_t(w));
+                            if(it != chainEndReads.end()) {
+                                for(const auto& ei : it->second) nearbyReads.push_back(ei);
+                            }
+                        }
+                        if(!nearbyReads.empty()) {
+                            leftBreakpoints.push_back({
+                                hbp.windowIdx, hbp.refPos,
+                                chainEndCount[hbp.windowIdx],
+                                spanningCount[hbp.windowIdx],
+                                uint32_t(nearbyReads.size()),
+                                hbp.dropRatio > 0 ? 1.0 / hbp.dropRatio : 10.0,
+                                std::move(nearbyReads)
+                            });
+                        }
+                    }
+                    if(!coveredRight) {
+                        vector<EndpointInfo> nearbyReads;
+                        for(int32_t dw = -2; dw <= 2; ++dw) {
+                            const int32_t w = int32_t(hbp.windowIdx) + dw;
+                            if(w < 0 || uint32_t(w) >= nWindows) continue;
+                            auto it = chainStartReads.find(uint32_t(w));
+                            if(it != chainStartReads.end()) {
+                                for(const auto& ei : it->second) nearbyReads.push_back(ei);
+                            }
+                        }
+                        if(!nearbyReads.empty()) {
+                            rightBreakpoints.push_back({
+                                hbp.windowIdx, hbp.refPos,
+                                chainStartCount[hbp.windowIdx],
+                                spanningCount[hbp.windowIdx],
+                                uint32_t(nearbyReads.size()),
+                                hbp.dropRatio > 0 ? 1.0 / hbp.dropRatio : 10.0,
+                                std::move(nearbyReads)
+                            });
+                        }
+                    }
+                }
+
+                for(const auto& bp : leftBreakpoints) {
+                    cout << "      Left BP: pos=" << bp.refPos
+                         << " ends=" << bp.endpointCount
+                         << " spanning=" << bp.spanCount
+                         << " ovhReads=" << bp.ovhReadCount
+                         << " fold=" << bp.foldEnrichment;
+                    for(const auto& ei : bp.reads) {
+                        cout << " r" << ei.readId << ":" << ei.overhangBp;
+                    }
+                    cout << endl;
+                }
+                for(const auto& bp : rightBreakpoints) {
+                    cout << "      Right BP: pos=" << bp.refPos
+                         << " starts=" << bp.endpointCount
+                         << " spanning=" << bp.spanCount
+                         << " ovhReads=" << bp.ovhReadCount
+                         << " fold=" << bp.foldEnrichment;
+                    for(const auto& ei : bp.reads) {
+                        cout << " r" << ei.readId << ":" << ei.overhangBp;
+                    }
+                    cout << endl;
+                }
+
+                // For each left breakpoint, find the nearest right breakpoint
+                // to form a breakpoint pair.
+                for(const auto& lbp : leftBreakpoints) {
+                    const Breakpoint* bestRbp = nullptr;
+                    int64_t bestDist = INT64_MAX;
+                    for(const auto& rbp : rightBreakpoints) {
+                        const int64_t dist = std::abs(
+                            int64_t(rbp.refPos) - int64_t(lbp.refPos));
+                        if(dist < bestDist) {
+                            bestDist = dist;
+                            bestRbp = &rbp;
+                        }
+                    }
+
+                    // Allow larger distance if a hit-depth cluster spans
+                    // the gap between left and right BPs (VNTR region).
+                    int64_t maxPairDist = 500;
+                    if(bestRbp && bestDist > 500) {
+                        // Check if the region between the BPs has consistently
+                        // low hit-depth (indicating a marker-depleted VNTR).
+                        const uint32_t gapStartWin = (lbp.refPos - refStartPos) / windowSize;
+                        const uint32_t gapEndWin = (bestRbp->refPos - refStartPos) / windowSize;
+                        uint32_t lowDepthWindows = 0;
+                        uint32_t totalGapWindows = 0;
+                        for(uint32_t w = gapStartWin; w <= gapEndWin && w < nWindows; ++w) {
+                            if(windowMarkerCount[w] == 0) continue;
+                            ++totalGapWindows;
+                            if(medianHitDepth > 0
+                               && windowHitDepth[w] / medianHitDepth < hitDepthDropThreshold) {
+                                ++lowDepthWindows;
+                            }
+                        }
+                        // If >50% of windows in the gap have low hit-depth,
+                        // this is a VNTR — allow the pairing.
+                        if(totalGapWindows > 0
+                           && double(lowDepthWindows) / double(totalGapWindows) > 0.5) {
+                            maxPairDist = bestDist + 1; // Allow this pair.
+                            cout << "    VNTR gap: L=" << lbp.refPos
+                                 << " R=" << bestRbp->refPos
+                                 << " lowDepth=" << lowDepthWindows
+                                 << "/" << totalGapWindows
+                                 << " — extending pair distance"
+                                 << endl;
+                        }
+                    }
+
+                    if(!bestRbp || bestDist > maxPairDist) continue;
 
                     // Collect all left-flank and right-flank read IDs.
                     unordered_set<uint32_t> leftIds, rightIds;
-                    for(const auto& f : lc.reads) leftIds.insert(f.readId);
-                    for(const auto& f : bestRc->reads) rightIds.insert(f.readId);
+                    for(const auto& ei : lbp.reads) leftIds.insert(ei.readId);
+                    for(const auto& ei : bestRbp->reads) rightIds.insert(ei.readId);
 
                     // Direct path search: check if left-flank reads
                     // connect to right-flank reads directly or through
@@ -1356,10 +1585,14 @@ void Assembler::buildSvMSA(
                     //
                     // The insertion size = sum of unique extensions along
                     // the path = left_overhang + intermediate_extensions + right_overhang.
+                    //
+                    // Skip for VNTR gaps: read-to-read chains in repetitive
+                    // regions create false shortcuts, giving wrong sizes.
 
                     int64_t bestPathDist = 0;
                     int bestPathLen = 0;
                     bool foundPath = false;
+                    const bool isVntrGap = (maxPairDist > 500);
 
                     // Helper: get the overlap span (bp) between two reads
                     // from their chain. Returns the overlap extent in the
@@ -1381,7 +1614,8 @@ void Assembler::buildSvMSA(
                              - int64_t(nMkrs[nOvMinOrd].position);
                     };
 
-                    for(const auto& lf : lc.reads) {
+                    if(!isVntrGap)
+                    for(const auto& lf : lbp.reads) {
                         auto gL = readGraph.find(lf.readId);
                         if(gL == readGraph.end()) continue;
 
@@ -1391,10 +1625,9 @@ void Assembler::buildSvMSA(
                             if(ovlp1 < 0) continue;
 
                             // 1-hop: left → right
-                            // Insertion size = L_ovh + R_ovh - overlap
                             if(rightIds.count(n1)) {
                                 int64_t rOvh = 0;
-                                for(const auto& rf : bestRc->reads)
+                                for(const auto& rf : bestRbp->reads)
                                     if(rf.readId == n1) { rOvh = rf.overhangBp; break; }
                                 const int64_t dist = lf.overhangBp + rOvh - ovlp1;
                                 if(dist > bestPathDist && dist > 0) {
@@ -1405,10 +1638,8 @@ void Assembler::buildSvMSA(
                                 continue;
                             }
 
-                            // Only follow unanchored reads for 2+ hops.
                             if(!unanchoredReads.count(n1)) continue;
 
-                            // Get n1's read span for computing its contribution.
                             const auto n1Mkrs = markersRef[
                                 OrientedReadId(ReadId(n1), 0).getValue()];
                             if(n1Mkrs.size() < 2) continue;
@@ -1425,10 +1656,9 @@ void Assembler::buildSvMSA(
                                 if(ovlp2 < 0) continue;
 
                                 // 2-hop: left → n1 → right
-                                // dist = L_ovh + n1_span - ovlp1 - ovlp2 + R_ovh
                                 if(rightIds.count(n2)) {
                                     int64_t rOvh = 0;
-                                    for(const auto& rf : bestRc->reads)
+                                    for(const auto& rf : bestRbp->reads)
                                         if(rf.readId == n2) { rOvh = rf.overhangBp; break; }
                                     const int64_t dist = lf.overhangBp + n1Span
                                         - ovlp1 - ovlp2 + rOvh;
@@ -1460,7 +1690,7 @@ void Assembler::buildSvMSA(
 
                                     // 3-hop: left → n1 → n2 → right
                                     int64_t rOvh = 0;
-                                    for(const auto& rf : bestRc->reads)
+                                    for(const auto& rf : bestRbp->reads)
                                         if(rf.readId == n3) { rOvh = rf.overhangBp; break; }
                                     const int64_t dist = lf.overhangBp + n1Span + n2Span
                                         - ovlp1 - ovlp2 - ovlp3 + rOvh;
@@ -1474,12 +1704,16 @@ void Assembler::buildSvMSA(
                         }
                     }
 
-                    const uint32_t breakpointPos = (lc.medianRefPos + bestRc->medianRefPos) / 2;
+                    const uint32_t breakpointPos = (lbp.refPos + bestRbp->refPos) / 2;
 
-                    cout << "    Breakpoint pair: L=" << lc.medianRefPos
-                         << " (" << lc.reads.size() << " reads)"
-                         << " R=" << bestRc->medianRefPos
-                         << " (" << bestRc->reads.size() << " reads)"
+                    cout << "    Breakpoint pair: L=" << lbp.refPos
+                         << " (ends=" << lbp.endpointCount
+                         << " ovh=" << lbp.ovhReadCount
+                         << " fold=" << lbp.foldEnrichment << ")"
+                         << " R=" << bestRbp->refPos
+                         << " (starts=" << bestRbp->endpointCount
+                         << " ovh=" << bestRbp->ovhReadCount
+                         << " fold=" << bestRbp->foldEnrichment << ")"
                          << " refGap=" << bestDist
                          << " foundPath=" << foundPath
                          << " pathDist=" << bestPathDist
@@ -1487,14 +1721,317 @@ void Assembler::buildSvMSA(
                          << " breakpoint=" << breakpointPos
                          << endl;
 
+                    // If the standard path search failed and this is a VNTR
+                    // gap, estimate insertion size from coverage depth.
+                    //
+                    // In a VNTR, read-to-read chains create shortcuts
+                    // through the repeat structure, so path-based size
+                    // estimation doesn't work. Instead, use the total
+                    // read bases covering the VNTR vs the reference length.
+                    //
+                    // For a diploid het insertion:
+                    //   totalReadBases ≈ coverage × (refLen + insLen) / 2
+                    //                  + coverage × refLen / 2
+                    //                  = coverage × refLen + coverage × insLen / 2
+                    //   insLen ≈ 2 × (totalReadBases / coverage - refLen)
+                    //
+                    // For a hom insertion:
+                    //   insLen ≈ totalReadBases / coverage - refLen
+                    if(!foundPath && maxPairDist > 500) {
+                        // Count total read bases in the VNTR region using
+                        // actual read lengths (not marker-based lengths,
+                        // which are unreliable in repetitive regions).
+                        const uint32_t vntrStart = lbp.refPos;
+                        const uint32_t vntrEnd = bestRbp->refPos;
+                        const int64_t vntrRefLen = int64_t(vntrEnd) - int64_t(vntrStart);
+
+                        // Compute average coverage in flanking regions.
+                        uint32_t flankWindows = 0;
+                        uint32_t flankSpanning = 0;
+                        const uint32_t vntrStartWin = (vntrStart - refStartPos) / windowSize;
+                        const uint32_t vntrEndWin = (vntrEnd - refStartPos) / windowSize;
+                        for(uint32_t w = boundaryWindows; w < vntrStartWin && w < nWindows; ++w) {
+                            flankSpanning += spanningCount[w];
+                            ++flankWindows;
+                        }
+                        for(uint32_t w = vntrEndWin + 1; w + boundaryWindows < nWindows; ++w) {
+                            flankSpanning += spanningCount[w];
+                            ++flankWindows;
+                        }
+                        const double flankCoverage = flankWindows > 0
+                            ? double(flankSpanning) / double(flankWindows) : 1.0;
+
+                        // Count total read bases using actual base counts.
+                        // Include: reads whose chains overlap the VNTR +
+                        // unanchored reads (likely within VNTR).
+                        int64_t totalReadBases = 0;
+                        uint32_t vntrReadCount = 0;
+                        for(const auto& [rid, info] : readChainInfoMap) {
+                            if(info.maxRefPos < vntrStart || info.minRefPos > vntrEnd)
+                                continue;
+                            const int64_t readLen = int64_t(
+                                readsRef.getRead(ReadId(rid)).baseCount);
+                            totalReadBases += readLen;
+                            ++vntrReadCount;
+                        }
+                        for(const uint32_t rid : unanchoredReads) {
+                            const int64_t readLen = int64_t(
+                                readsRef.getRead(ReadId(rid)).baseCount);
+                            totalReadBases += readLen;
+                            ++vntrReadCount;
+                        }
+
+                        // Estimate insertion size.
+                        // Expected bases for reference VNTR at flank coverage:
+                        //   expectedBases = flankCov × vntrRefLen
+                        // Actual bases = totalReadBases
+                        // Excess = totalReadBases - expectedBases
+                        // For het: excess ≈ coverage/2 × insLen
+                        //   insLen ≈ 2 × excess / coverage
+                        // For hom: excess ≈ coverage × insLen
+                        //   insLen ≈ excess / coverage
+                        const double expectedBases = flankCoverage * double(vntrRefLen);
+                        const double excess = double(totalReadBases) - expectedBases;
+                        const int64_t insLenHet = flankCoverage > 0
+                            ? int64_t(2.0 * excess / flankCoverage) : 0;
+                        const int64_t insLenHom = flankCoverage > 0
+                            ? int64_t(excess / flankCoverage) : 0;
+
+                        cout << "    VNTR depth estimate: refLen=" << vntrRefLen
+                             << " reads=" << vntrReadCount
+                             << " bases=" << totalReadBases
+                             << " expected=" << int64_t(expectedBases)
+                             << " hetIns=" << insLenHet
+                             << " homIns=" << insLenHom
+                             << endl;
+
+                        if(insLenHet > 20 && insLenHet < vntrRefLen) {
+                            bestPathDist = insLenHet;
+                            bestPathLen = 0; // coverage-based
+                            foundPath = true;
+                        } else if(insLenHom > 20 && insLenHom < vntrRefLen) {
+                            bestPathDist = insLenHom;
+                            bestPathLen = 0;
+                            foundPath = true;
+                        }
+                    }
+
                     if(foundPath && bestPathDist > 20) {
                         cout << "    >>> INSERTION CALL: "
                              << "size=" << bestPathDist << "bp, "
                              << "breakpoint=" << breakpointPos << ", "
-                             << "leftFlanks=" << lc.reads.size() << ", "
-                             << "rightFlanks=" << bestRc->reads.size() << ", "
+                             << "leftEnds=" << lbp.endpointCount << ", "
+                             << "rightStarts=" << bestRbp->endpointCount << ", "
                              << "hops=" << bestPathLen
                              << endl;
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Hit-depth-only insertion detection.
+                //
+                // For small insertions, reads span across the breakpoint
+                // without their chains breaking. There are no chain-endpoint
+                // breakpoints near the true site. The only signal is a
+                // hit-depth drop: inserted sequence has no reference k-mers,
+                // so reads carrying the insertion contribute fewer hits.
+                //
+                // Approach:
+                // 1. Cluster consecutive hit-depth breakpoints.
+                // 2. For each cluster, find reads whose chains span across
+                //    the drop zone.
+                // 3. For each spanning read, find the largest diagonal shift
+                //    within the drop zone: (readGap - refGap) at consecutive
+                //    chain anchors straddling the zone.
+                // 4. The median diagonal shift estimates insertion size.
+                // ---------------------------------------------------------
+                if(!hitDepthBreakpoints.empty()) {
+                    // Cluster consecutive hit-depth breakpoints (within 2 windows).
+                    struct HitDepthCluster {
+                        uint32_t startPos;
+                        uint32_t endPos;
+                        uint32_t startWin;
+                        uint32_t endWin;
+                        double minRatio;
+                    };
+                    vector<HitDepthCluster> hdClusters;
+
+                    HitDepthCluster cur;
+                    cur.startPos = hitDepthBreakpoints[0].refPos;
+                    cur.endPos = hitDepthBreakpoints[0].refPos;
+                    cur.startWin = hitDepthBreakpoints[0].windowIdx;
+                    cur.endWin = hitDepthBreakpoints[0].windowIdx;
+                    cur.minRatio = hitDepthBreakpoints[0].dropRatio;
+
+                    for(size_t i = 1; i < hitDepthBreakpoints.size(); ++i) {
+                        const auto& hbp = hitDepthBreakpoints[i];
+                        if(hbp.windowIdx <= cur.endWin + 3) {
+                            // Extend cluster.
+                            cur.endPos = hbp.refPos;
+                            cur.endWin = hbp.windowIdx;
+                            cur.minRatio = std::min(cur.minRatio, hbp.dropRatio);
+                        } else {
+                            hdClusters.push_back(cur);
+                            cur.startPos = hbp.refPos;
+                            cur.endPos = hbp.refPos;
+                            cur.startWin = hbp.windowIdx;
+                            cur.endWin = hbp.windowIdx;
+                            cur.minRatio = hbp.dropRatio;
+                        }
+                    }
+                    hdClusters.push_back(cur);
+
+                    for(const auto& cluster : hdClusters) {
+                        // Skip clusters already covered by a chain-endpoint
+                        // breakpoint pair (already handled above).
+                        bool alreadyCovered = false;
+                        for(const auto& lbp : leftBreakpoints) {
+                            for(const auto& rbp : rightBreakpoints) {
+                                const int64_t dist = std::abs(
+                                    int64_t(rbp.refPos) - int64_t(lbp.refPos));
+                                if(dist <= 500
+                                   && lbp.refPos <= cluster.endPos + windowSize * 3
+                                   && rbp.refPos >= cluster.startPos - windowSize * 3) {
+                                    alreadyCovered = true;
+                                    break;
+                                }
+                            }
+                            if(alreadyCovered) break;
+                        }
+                        if(alreadyCovered) continue;
+
+                        // Find the deepest drop point in the cluster.
+                        // Use a narrow zone around it (±1 window) so that
+                        // short reads can span across.
+                        uint32_t deepestPos = cluster.startPos;
+                        double deepestRatio = cluster.minRatio;
+                        for(const auto& hbp : hitDepthBreakpoints) {
+                            if(hbp.refPos >= cluster.startPos
+                               && hbp.refPos <= cluster.endPos
+                               && hbp.dropRatio <= deepestRatio) {
+                                deepestPos = hbp.refPos;
+                                deepestRatio = hbp.dropRatio;
+                            }
+                        }
+
+                        // Narrow zone: just ±1 window around deepest point.
+                        const uint32_t zoneStart = deepestPos > windowSize
+                            ? deepestPos - windowSize : 0;
+                        const uint32_t zoneEnd = deepestPos + windowSize;
+
+                        cout << "    HitDepth cluster: "
+                             << cluster.startPos << "-" << cluster.endPos
+                             << " minRatio=" << cluster.minRatio
+                             << " deepest=" << deepestPos
+                             << " zone=" << zoneStart << "-" << zoneEnd
+                             << endl;
+
+
+
+                        // Find reads whose chains span across the drop zone.
+                        // For each such read, examine chain anchors to find
+                        // the largest diagonal shift within the zone.
+                        //
+                        // diagonal = readPos - refPos
+                        // An insertion causes diagonal to increase.
+                        vector<int64_t> diagShifts;
+
+                        uint32_t nChainsChecked = 0;
+                        uint32_t nChainsSpanning = 0;
+
+                        for(const auto& ce : chainsForRef) {
+                            if(ce.readId == uint32_t(refId)) continue;
+                            const auto& al = alignments[ce.chainIndex];
+                            if(al.ordinals.size() < 4) continue;
+                            ++nChainsChecked;
+
+                            // Check if this chain spans the zone.
+                            // Need anchors on both sides.
+                            bool hasLeft = false, hasRight = false;
+                            for(const auto& ord : al.ordinals) {
+                                if(ord[0] >= refMarkers.size()) continue;
+                                const uint32_t rp = uint32_t(refMarkers[ord[0]].position);
+                                if(rp < zoneStart) hasLeft = true;
+                                if(rp > zoneEnd) hasRight = true;
+                            }
+                            if(!hasLeft || !hasRight) continue;
+                            ++nChainsSpanning;
+
+                            // Get read markers for position lookup.
+                            const Strand strand = ce.isSameStrand ? 0 : 1;
+                            const auto rdMarkers = markersRef[
+                                OrientedReadId(ReadId(ce.readId), strand).getValue()];
+
+                            // Find the largest diagonal shift across the zone.
+                            // Look at consecutive anchor pairs where one is
+                            // before the zone and one is after.
+                            int64_t bestShift = 0;
+                            for(size_t j = 1; j < al.ordinals.size(); ++j) {
+                                const auto& prev = al.ordinals[j - 1];
+                                const auto& curr = al.ordinals[j];
+                                if(prev[0] >= refMarkers.size()
+                                   || curr[0] >= refMarkers.size()) continue;
+                                if(prev[1] >= rdMarkers.size()
+                                   || curr[1] >= rdMarkers.size()) continue;
+
+                                const uint32_t refPosPrev = uint32_t(
+                                    refMarkers[prev[0]].position);
+                                const uint32_t refPosCurr = uint32_t(
+                                    refMarkers[curr[0]].position);
+
+                                // At least one anchor should be near/in the zone.
+                                if(refPosPrev > zoneEnd || refPosCurr < zoneStart)
+                                    continue;
+
+                                const uint32_t rdPosPrev = uint32_t(
+                                    rdMarkers[prev[1]].position);
+                                const uint32_t rdPosCurr = uint32_t(
+                                    rdMarkers[curr[1]].position);
+
+                                const int64_t refGap = int64_t(refPosCurr)
+                                    - int64_t(refPosPrev);
+                                const int64_t readGap = int64_t(rdPosCurr)
+                                    - int64_t(rdPosPrev);
+                                const int64_t shift = readGap - refGap;
+
+                                if(shift > bestShift) {
+                                    bestShift = shift;
+                                }
+                            }
+
+                            if(bestShift > 10) {
+                                diagShifts.push_back(bestShift);
+                            }
+                        }
+
+                        if(diagShifts.empty()) {
+                            cout << "      No spanning chains with diagonal shift (checked="
+                                 << nChainsChecked << " spanning="
+                                 << nChainsSpanning << ")." << endl;
+                            continue;
+                        }
+
+                        sort(diagShifts.begin(), diagShifts.end());
+                        const int64_t medianShift = diagShifts[diagShifts.size() / 2];
+                        const uint32_t breakpointPos =
+                            (cluster.startPos + cluster.endPos) / 2;
+
+                        cout << "      Diagonal shifts: n="
+                             << diagShifts.size()
+                             << " median=" << medianShift
+                             << " min=" << diagShifts.front()
+                             << " max=" << diagShifts.back()
+                             << " breakpoint=" << breakpointPos
+                             << endl;
+
+                        if(diagShifts.size() >= 2 && medianShift > 20) {
+                            cout << "    >>> INSERTION CALL (hit-depth): "
+                                 << "size=" << medianShift << "bp, "
+                                 << "breakpoint=" << breakpointPos << ", "
+                                 << "supportingReads=" << diagShifts.size()
+                                 << ", minRatio=" << cluster.minRatio
+                                 << endl;
+                        }
                     }
                 }
             }
