@@ -1,11 +1,9 @@
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
-#include "MurmurHash2.hpp"
 #include "deduplicate.hpp"
 #include "findMarkerId.hpp"
 #include "MultithreadedObject.tpp"
 #include "Reads.hpp"
-#include "shasta2/ShortBaseSequence.hpp"
 
 #include "Marker.hpp"
 #include "MarkerGraph.hpp"
@@ -41,29 +39,6 @@ namespace {
         {}
     };
 
-    using Shasta2StyleKmer = shasta2::ShortBaseSequence128;
-
-    uint32_t computeShasta2HashThreshold(double markerDensity)
-    {
-        if(markerDensity < 0. || markerDensity > 1.) {
-            throw runtime_error("Invalid marker density " +
-                to_string(markerDensity) + " requested.");
-        }
-
-        const double p = 1. - std::sqrt(1. - markerDensity);
-        const double hashMax = std::numeric_limits<uint32_t>::max();
-        return uint32_t(std::round(double(hashMax) * p));
-    }
-
-    bool isShasta2Marker(const Shasta2StyleKmer& kmer, uint64_t k, uint32_t hashThreshold)
-    {
-        if(MurmurHash2(&kmer, sizeof(Shasta2StyleKmer), 267457831) < hashThreshold) {
-            return true;
-        }
-
-        const Shasta2StyleKmer kmerRc = kmer.reverseComplement(k);
-        return MurmurHash2(&kmerRc, sizeof(Shasta2StyleKmer), 267457831) < hashThreshold;
-    }
 }
 
 string dinara::shasta2AnchorIdToString(Shasta2AnchorId anchorId)
@@ -435,84 +410,6 @@ Kmer Shasta2Anchors::anchorKmer(Shasta2AnchorId anchorId) const
     }
     const Shasta2AnchorMarkerInfo& markerInfo = anchor.front();
     return getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
-}
-
-
-uint64_t Shasta2Anchors::filterByShasta2HashedKmerChecker(double markerDensity)
-{
-    const uint32_t hashThreshold = computeShasta2HashThreshold(markerDensity);
-    const uint64_t anchorCount = size();
-    vector<vector<Shasta2AnchorMarkerInfo> > keptAnchors;
-    keptAnchors.reserve(anchorCount);
-
-    uint64_t removedCount = 0;
-    for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; ++anchorId) {
-        const Shasta2Anchor anchor = (*this)[anchorId];
-        if(anchor.empty()) {
-            ++removedCount;
-            continue;
-        }
-
-        const uint32_t position0 =
-            anchor.front().position - uint32_t(k / 2);
-        Shasta2StyleKmer shasta2Kmer;
-        for(uint64_t i=0; i<k; i++) {
-            shasta2Kmer.set(
-                i,
-                shasta2::Base::fromInteger(
-                    reads.getOrientedReadBase(
-                        anchor.front().orientedReadId,
-                        uint32_t(position0 + i)).value));
-        }
-        if(!isShasta2Marker(shasta2Kmer, k, hashThreshold)) {
-            ++removedCount;
-            continue;
-        }
-
-        keptAnchors.emplace_back(anchor.begin(), anchor.end());
-    }
-
-    cout << "Shasta2 hashed k-mer checker retained " << keptAnchors.size() << " / "
-         << anchorCount << " Shasta2 anchors." << endl;
-    if(removedCount == 0) {
-        return 0;
-    }
-
-    vector<MarkerGraphVertexId> keptAnchorVertexIds;
-    if(!anchorVertexIds.empty()) {
-        keptAnchorVertexIds.reserve(keptAnchors.size());
-        for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; ++anchorId) {
-            const Shasta2Anchor anchor = (*this)[anchorId];
-            if(anchor.empty()) {
-                continue;
-            }
-
-            const uint32_t position0 =
-                anchor.front().position - uint32_t(k / 2);
-            Shasta2StyleKmer shasta2Kmer;
-            for(uint64_t i=0; i<k; i++) {
-                shasta2Kmer.set(
-                    i,
-                    shasta2::Base::fromInteger(
-                        reads.getOrientedReadBase(
-                            anchor.front().orientedReadId,
-                            uint32_t(position0 + i)).value));
-            }
-            if(isShasta2Marker(shasta2Kmer, k, hashThreshold)) {
-                keptAnchorVertexIds.push_back(anchorVertexIds[anchorId]);
-            }
-        }
-    }
-
-    anchorMarkerInfos.clear();
-    for(const auto& anchor : keptAnchors) {
-        anchorMarkerInfos.appendVector(anchor);
-    }
-    if(!anchorVertexIds.empty()) {
-        anchorVertexIds = std::move(keptAnchorVertexIds);
-    }
-
-    return removedCount;
 }
 
 
