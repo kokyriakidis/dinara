@@ -1825,6 +1825,198 @@ void Assembler::buildSvMSA(
                              << "hops=" << bestPathLen
                              << endl;
                     }
+
+                    // -------------------------------------------------
+                    // Deletion detection from diagonal shift.
+                    //
+                    // For a deletion, reads spanning the breakpoint pair
+                    // have chains where the reference gap between
+                    // consecutive anchors exceeds the read gap:
+                    //   delSize = refGap - readGap  (positive for deletion)
+                    //
+                    // Look at all chains spanning the left-right BP zone.
+                    // -------------------------------------------------
+                    if(!foundPath && bestDist >= 50) {
+                        const uint32_t delZoneStart = std::min(lbp.refPos, bestRbp->refPos);
+                        const uint32_t delZoneEnd = std::max(lbp.refPos, bestRbp->refPos);
+
+
+                        vector<int64_t> delShifts;
+
+                        for(const auto& ce : chainsForRef) {
+                            if(ce.readId == uint32_t(refId)) continue;
+                            const auto& al = alignments[ce.chainIndex];
+                            if(al.ordinals.size() < 4) continue;
+
+                            // Check if chain spans the deletion zone.
+                            bool hasLeft = false, hasRight = false;
+                            for(const auto& ord : al.ordinals) {
+                                if(ord[0] >= refMarkers.size()) continue;
+                                const uint32_t rp = uint32_t(refMarkers[ord[0]].position);
+                                if(rp < delZoneStart) hasLeft = true;
+                                if(rp > delZoneEnd) hasRight = true;
+                            }
+                            if(!hasLeft || !hasRight) continue;
+
+                            const Strand strand = ce.isSameStrand ? 0 : 1;
+                            const auto rdMarkers = markersRef[
+                                OrientedReadId(ReadId(ce.readId), strand).getValue()];
+
+                            // Find the largest negative diagonal shift
+                            // (refGap > readGap) near the zone.
+                            int64_t bestDelShift = 0;
+                            for(size_t j = 1; j < al.ordinals.size(); ++j) {
+                                const auto& prev = al.ordinals[j - 1];
+                                const auto& curr = al.ordinals[j];
+                                if(prev[0] >= refMarkers.size()
+                                   || curr[0] >= refMarkers.size()) continue;
+                                if(prev[1] >= rdMarkers.size()
+                                   || curr[1] >= rdMarkers.size()) continue;
+
+                                const uint32_t refPosPrev = uint32_t(
+                                    refMarkers[prev[0]].position);
+                                const uint32_t refPosCurr = uint32_t(
+                                    refMarkers[curr[0]].position);
+
+                                // At least one anchor should be near the zone.
+                                if(refPosPrev > delZoneEnd || refPosCurr < delZoneStart)
+                                    continue;
+
+                                const uint32_t rdPosPrev = uint32_t(
+                                    rdMarkers[prev[1]].position);
+                                const uint32_t rdPosCurr = uint32_t(
+                                    rdMarkers[curr[1]].position);
+
+                                const int64_t refGap = int64_t(refPosCurr)
+                                    - int64_t(refPosPrev);
+                                const int64_t readGap = int64_t(rdPosCurr)
+                                    - int64_t(rdPosPrev);
+                                const int64_t delShift = refGap - readGap;
+
+                                if(delShift > bestDelShift) {
+                                    bestDelShift = delShift;
+                                }
+                            }
+
+                            if(bestDelShift > 20) {
+                                delShifts.push_back(bestDelShift);
+                            }
+                        }
+
+                        if(delShifts.size() >= 2) {
+                            sort(delShifts.begin(), delShifts.end());
+                            const int64_t medianDel = delShifts[delShifts.size() / 2];
+
+                            cout << "    Deletion diagonal: n="
+                                 << delShifts.size()
+                                 << " median=" << medianDel
+                                 << " min=" << delShifts.front()
+                                 << " max=" << delShifts.back()
+                                 << endl;
+
+                            if(medianDel > 30) {
+                                cout << "    >>> DELETION CALL: "
+                                     << "size=" << medianDel << "bp, "
+                                     << "breakpoint=" << breakpointPos << ", "
+                                     << "leftEnds=" << lbp.endpointCount << ", "
+                                     << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     << "supportingReads=" << delShifts.size()
+                                     << endl;
+                            }
+                        }
+                    }
+
+                    // Also check for deletions when there IS no
+                    // reference gap (L and R at same position) but
+                    // spanning coverage drops.
+                    if(!foundPath && bestDist < 50) {
+                        // Look for negative diagonal shifts in chains
+                        // spanning the breakpoint position.
+                        const uint32_t bpPos = breakpointPos;
+                        const uint32_t delZoneStart = bpPos > windowSize * 2
+                            ? bpPos - windowSize * 2 : 0;
+                        const uint32_t delZoneEnd = bpPos + windowSize * 2;
+
+                        vector<int64_t> delShifts;
+
+                        for(const auto& ce : chainsForRef) {
+                            if(ce.readId == uint32_t(refId)) continue;
+                            const auto& al = alignments[ce.chainIndex];
+                            if(al.ordinals.size() < 4) continue;
+
+                            bool hasLeft = false, hasRight = false;
+                            for(const auto& ord : al.ordinals) {
+                                if(ord[0] >= refMarkers.size()) continue;
+                                const uint32_t rp = uint32_t(refMarkers[ord[0]].position);
+                                if(rp < delZoneStart) hasLeft = true;
+                                if(rp > delZoneEnd) hasRight = true;
+                            }
+                            if(!hasLeft || !hasRight) continue;
+
+                            const Strand strand = ce.isSameStrand ? 0 : 1;
+                            const auto rdMarkers = markersRef[
+                                OrientedReadId(ReadId(ce.readId), strand).getValue()];
+
+                            int64_t bestDelShift = 0;
+                            for(size_t j = 1; j < al.ordinals.size(); ++j) {
+                                const auto& prev = al.ordinals[j - 1];
+                                const auto& curr = al.ordinals[j];
+                                if(prev[0] >= refMarkers.size()
+                                   || curr[0] >= refMarkers.size()) continue;
+                                if(prev[1] >= rdMarkers.size()
+                                   || curr[1] >= rdMarkers.size()) continue;
+
+                                const uint32_t refPosPrev = uint32_t(
+                                    refMarkers[prev[0]].position);
+                                const uint32_t refPosCurr = uint32_t(
+                                    refMarkers[curr[0]].position);
+
+                                if(refPosPrev > delZoneEnd
+                                   || refPosCurr < delZoneStart) continue;
+
+                                const uint32_t rdPosPrev = uint32_t(
+                                    rdMarkers[prev[1]].position);
+                                const uint32_t rdPosCurr = uint32_t(
+                                    rdMarkers[curr[1]].position);
+
+                                const int64_t refGap = int64_t(refPosCurr)
+                                    - int64_t(refPosPrev);
+                                const int64_t readGap = int64_t(rdPosCurr)
+                                    - int64_t(rdPosPrev);
+                                const int64_t delShift = refGap - readGap;
+
+                                if(delShift > bestDelShift) {
+                                    bestDelShift = delShift;
+                                }
+                            }
+
+                            if(bestDelShift > 20) {
+                                delShifts.push_back(bestDelShift);
+                            }
+                        }
+
+                        if(delShifts.size() >= 2) {
+                            sort(delShifts.begin(), delShifts.end());
+                            const int64_t medianDel = delShifts[delShifts.size() / 2];
+
+                            cout << "    Deletion diagonal: n="
+                                 << delShifts.size()
+                                 << " median=" << medianDel
+                                 << " min=" << delShifts.front()
+                                 << " max=" << delShifts.back()
+                                 << endl;
+
+                            if(medianDel > 30) {
+                                cout << "    >>> DELETION CALL: "
+                                     << "size=" << medianDel << "bp, "
+                                     << "breakpoint=" << breakpointPos << ", "
+                                     << "leftEnds=" << lbp.endpointCount << ", "
+                                     << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     << "supportingReads=" << delShifts.size()
+                                     << endl;
+                            }
+                        }
+                    }
                 }
 
                 // ---------------------------------------------------------
@@ -2034,37 +2226,143 @@ void Assembler::buildSvMSA(
                         }
                     }
                 }
+
+                // ---------------------------------------------------------
+                // Genome-wide diagonal shift scan for deletions.
+                //
+                // Deletions may not produce chain-endpoint breakpoints
+                // because reads span across the deletion with chains
+                // covering both flanks. The deletion is visible as a
+                // negative diagonal shift: refGap > readGap at consecutive
+                // anchors.
+                //
+                // Scan all chains for large diagonal shifts and cluster
+                // them by reference position.
+                // ---------------------------------------------------------
+                {
+                    struct DiagEvent {
+                        uint32_t refPos;   // midpoint of the anchor pair
+                        int64_t shift;     // refGap - readGap (positive = deletion)
+                        uint32_t readId;
+                    };
+                    vector<DiagEvent> delEvents;
+
+                    for(const auto& ce : chainsForRef) {
+                        if(ce.readId == uint32_t(refId)) continue;
+                        const auto& al = alignments[ce.chainIndex];
+                        if(al.ordinals.size() < 4) continue;
+
+                        const Strand strand = ce.isSameStrand ? 0 : 1;
+                        const auto rdMarkers = markersRef[
+                            OrientedReadId(ReadId(ce.readId), strand).getValue()];
+
+                        for(size_t j = 1; j < al.ordinals.size(); ++j) {
+                            const auto& prev = al.ordinals[j - 1];
+                            const auto& curr = al.ordinals[j];
+                            if(prev[0] >= refMarkers.size()
+                               || curr[0] >= refMarkers.size()) continue;
+                            if(prev[1] >= rdMarkers.size()
+                               || curr[1] >= rdMarkers.size()) continue;
+
+                            const uint32_t refPosPrev = uint32_t(
+                                refMarkers[prev[0]].position);
+                            const uint32_t refPosCurr = uint32_t(
+                                refMarkers[curr[0]].position);
+                            const uint32_t rdPosPrev = uint32_t(
+                                rdMarkers[prev[1]].position);
+                            const uint32_t rdPosCurr = uint32_t(
+                                rdMarkers[curr[1]].position);
+
+                            const int64_t refGap = int64_t(refPosCurr)
+                                - int64_t(refPosPrev);
+                            const int64_t readGap = int64_t(rdPosCurr)
+                                - int64_t(rdPosPrev);
+                            const int64_t delShift = refGap - readGap;
+
+                            // Only consider significant deletions.
+                            if(delShift > 30 && refGap > 50) {
+                                const uint32_t midPos = (refPosPrev + refPosCurr) / 2;
+                                // Skip boundary regions.
+                                if(midPos > refStartPos + boundaryMargin
+                                   && midPos + boundaryMargin < refEndPos) {
+                                    delEvents.push_back({midPos, delShift, ce.readId});
+                                }
+                            }
+                        }
+                    }
+
+                    if(!delEvents.empty()) {
+                        // Sort by reference position.
+                        sort(delEvents.begin(), delEvents.end(),
+                            [](const DiagEvent& a, const DiagEvent& b) {
+                                return a.refPos < b.refPos;
+                            });
+
+                        // Cluster events within 200bp of each other.
+                        struct DelCluster {
+                            uint32_t startPos;
+                            uint32_t endPos;
+                            vector<int64_t> shifts;
+                            unordered_set<uint32_t> readIds;
+                        };
+                        vector<DelCluster> delClusters;
+
+                        DelCluster curCluster;
+                        curCluster.startPos = delEvents[0].refPos;
+                        curCluster.endPos = delEvents[0].refPos;
+                        curCluster.shifts.push_back(delEvents[0].shift);
+                        curCluster.readIds.insert(delEvents[0].readId);
+
+                        for(size_t i = 1; i < delEvents.size(); ++i) {
+                            if(delEvents[i].refPos <= curCluster.endPos + 200) {
+                                curCluster.endPos = delEvents[i].refPos;
+                                curCluster.shifts.push_back(delEvents[i].shift);
+                                curCluster.readIds.insert(delEvents[i].readId);
+                            } else {
+                                delClusters.push_back(std::move(curCluster));
+                                curCluster.startPos = delEvents[i].refPos;
+                                curCluster.endPos = delEvents[i].refPos;
+                                curCluster.shifts.clear();
+                                curCluster.shifts.push_back(delEvents[i].shift);
+                                curCluster.readIds.clear();
+                                curCluster.readIds.insert(delEvents[i].readId);
+                            }
+                        }
+                        delClusters.push_back(std::move(curCluster));
+
+                        for(auto& cluster : delClusters) {
+                            if(cluster.readIds.size() < 2) continue;
+
+                            sort(cluster.shifts.begin(), cluster.shifts.end());
+                            const int64_t medianDel =
+                                cluster.shifts[cluster.shifts.size() / 2];
+                            const uint32_t bpPos =
+                                (cluster.startPos + cluster.endPos) / 2;
+
+                            cout << "    Deletion cluster: pos="
+                                 << cluster.startPos << "-" << cluster.endPos
+                                 << " reads=" << cluster.readIds.size()
+                                 << " events=" << cluster.shifts.size()
+                                 << " median=" << medianDel
+                                 << " min=" << cluster.shifts.front()
+                                 << " max=" << cluster.shifts.back()
+                                 << endl;
+
+                            if(medianDel > 30 && cluster.readIds.size() >= 3) {
+                                cout << "    >>> DELETION CALL: "
+                                     << "size=" << medianDel << "bp, "
+                                     << "breakpoint=" << bpPos << ", "
+                                     << "supportingReads=" << cluster.readIds.size()
+                                     << endl;
+                            }
+                        }
+                    }
+                }
             }
         }
 
         // -----------------------------------------------------------------
-        // Step 6: Output MSA and consensus.
-        // -----------------------------------------------------------------
-        if(seqId <= 1) continue;  // Only backbone, no reads aligned.
-
-        const string msaFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".msa";
-        {
-            ofstream msaOut(msaFileName);
-            if(msaOut) {
-                aligner.print_as_msa(msaOut, seqId, &seqNames);
-            }
-        }
-
-        const string consensusFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".consensus";
-        {
-            ofstream consOut(consensusFileName);
-            if(consOut) {
-                vector<int> consensusWeights;
-                string consensusSeq;
-                string consensusGapped;
-                aligner.majority_voting_consensus(consensusWeights, consensusSeq, consensusGapped);
-                consOut << ">ref" << uint32_t(refId) << "_consensus\n"
-                        << consensusSeq << "\n";
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // Step 7: Output per-cluster SV summary.
+        // Step 6a: Output per-cluster SV summary.
         // -----------------------------------------------------------------
         if(totalClusters > 0) {
             const string clusterFileName = outputPrefix + "_ref"
@@ -2109,10 +2407,41 @@ void Assembler::buildSvMSA(
                                << (sumSize / int64_t(count)) << "\t"
                                << minSize << "\t"
                                << maxSize << "\n";
+
+                    cout << "    >>> " << typeStr << " CLUSTER: "
+                         << "id=" << cid << ", "
+                         << "size=" << (sumSize / int64_t(count)) << "bp, "
+                         << "breakpoint=" << (sumPos / count) << ", "
+                         << "reads=" << count
+                         << endl;
                 }
             }
-            cout << "    SV clusters: " << totalClusters
-                 << " (output: " << clusterFileName << ")" << endl;
+        }
+
+        // -----------------------------------------------------------------
+        // Step 6b: Output MSA and consensus.
+        // -----------------------------------------------------------------
+        if(seqId <= 1) continue;  // Only backbone, no reads aligned.
+
+        const string msaFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".msa";
+        {
+            ofstream msaOut(msaFileName);
+            if(msaOut) {
+                aligner.print_as_msa(msaOut, seqId, &seqNames);
+            }
+        }
+
+        const string consensusFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".consensus";
+        {
+            ofstream consOut(consensusFileName);
+            if(consOut) {
+                vector<int> consensusWeights;
+                string consensusSeq;
+                string consensusGapped;
+                aligner.majority_voting_consensus(consensusWeights, consensusSeq, consensusGapped);
+                consOut << ">ref" << uint32_t(refId) << "_consensus\n"
+                        << consensusSeq << "\n";
+            }
         }
 
         ++totalMSAs;
