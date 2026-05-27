@@ -3653,7 +3653,7 @@ void dinara::main::svanchors(
     svOpts.invertedIndexMcopyNum = 20;                // minimap2 -N20.
     svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
     svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
-    svOpts.referenceReadCount = referenceReadCount;    // Only chain read-vs-reference pairs.
+    svOpts.referenceReadCount = 0;                     // Chain all-vs-all (needed for indirect alignment of insertion-internal reads).
 
     const double maxDriftRate = svOpts.driftRateTolerance;
     const uint64_t maxChainLimit = 0;  // No limit on chains per read.

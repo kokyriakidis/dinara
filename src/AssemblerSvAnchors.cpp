@@ -711,6 +711,191 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
+        // Phase 3: Indirect alignment of insertion-internal reads via
+        // a read graph BFS.
+        //
+        // Build a lightweight read graph from all-vs-all chains:
+        //   Nodes = reads (short reads only, not reference)
+        //   Edges = chains between reads (with shared ordinal pairs)
+        //
+        // For each placed read, build a map: readOrdinal -> boundaryIndex
+        // (from its reference chains). Then BFS outward from placed reads.
+        // When an unplaced read U is reached via a placed/already-placed
+        // read P, map P's ordinals through the P→boundary map to find
+        // U's backbone boundaries. This handles transitive cases: U1→U2→P.
+        // -----------------------------------------------------------------
+        {
+            // Read graph: adjacency list.
+            // Edge = {neighborReadId, chainIndex, iAmReadA}.
+            struct ReadGraphEdge {
+                uint32_t neighborReadId;
+                uint64_t chainIndex;
+                bool iAmReadA;  // true if this node is readIds[0] in the chain.
+            };
+            unordered_map<uint32_t, vector<ReadGraphEdge>> readGraph;
+
+            // Build graph from all read-vs-read chains.
+            for(uint64_t i = 0; i < n; ++i) {
+                const auto& cand = candidates[i];
+                const auto& al = alignments[i];
+                if(al.ordinals.size() < 2) continue;
+
+                // Skip secondaries.
+                if(i < chainClassifications.size()
+                   && chainClassifications[i] == ChainClassification::Secondary) {
+                    continue;
+                }
+
+                const ReadId idA = cand.readIds[0];
+                const ReadId idB = cand.readIds[1];
+
+                // Skip read-vs-reference pairs.
+                if(idA < ReadId(referenceReadCount)) continue;
+
+                readGraph[uint32_t(idA)].push_back({uint32_t(idB), i, true});
+                readGraph[uint32_t(idB)].push_back({uint32_t(idA), i, false});
+            }
+
+            // For each placed read, build ordinal -> boundary map.
+            // Key: (readId, readOrdinal) -> boundaryIndex.
+            // Use a flat map: readId -> (ordinal -> boundary).
+            unordered_map<uint32_t,
+                unordered_map<uint32_t, uint32_t>> readOrdinalToBoundary;
+
+            for(const auto& ce : chainsForRef) {
+                const auto& al = alignments[ce.chainIndex];
+                auto& ordMap = readOrdinalToBoundary[uint32_t(ce.readId)];
+                for(const auto& ord : al.ordinals) {
+                    auto it = ordinalToBoundary.find(ord[0]);
+                    if(it != ordinalToBoundary.end()) {
+                        ordMap[ord[1]] = it->second;
+                    }
+                }
+            }
+
+            // Track placed reads.
+            unordered_set<uint32_t> placedReadIds;
+            for(const auto& rg : readGroups) {
+                placedReadIds.insert(uint32_t(rg.readId));
+            }
+
+            // BFS from placed reads outward.
+            queue<uint32_t> bfsQueue;
+            for(uint32_t rid : placedReadIds) {
+                bfsQueue.push(rid);
+            }
+
+            uint64_t indirectAligned = 0;
+
+            while(!bfsQueue.empty()) {
+                uint32_t currentId = bfsQueue.front();
+                bfsQueue.pop();
+
+                auto graphIt = readGraph.find(currentId);
+                if(graphIt == readGraph.end()) continue;
+
+                // currentId must have an ordinal->boundary map.
+                auto mapIt = readOrdinalToBoundary.find(currentId);
+                if(mapIt == readOrdinalToBoundary.end()) continue;
+                const auto& currentOrdMap = mapIt->second;
+
+                for(const auto& edge : graphIt->second) {
+                    if(placedReadIds.count(edge.neighborReadId)) continue;
+
+                    const auto& al = alignments[edge.chainIndex];
+                    // ordinals: {ordA, ordB}.
+                    // If edge.iAmReadA, currentId is A, neighbor is B.
+                    const uint32_t myOrdIdx = edge.iAmReadA ? 0 : 1;
+                    const uint32_t neighborOrdIdx = edge.iAmReadA ? 1 : 0;
+
+                    // Map through: my ordinal -> boundary -> neighbor ordinal.
+                    vector<pair<uint32_t, uint32_t>> neighborBoundaries;
+                    for(const auto& ord : al.ordinals) {
+                        auto bIt = currentOrdMap.find(ord[myOrdIdx]);
+                        if(bIt != currentOrdMap.end()) {
+                            neighborBoundaries.push_back({bIt->second, ord[neighborOrdIdx]});
+                        }
+                    }
+
+                    if(neighborBoundaries.size() < 2) continue;
+
+                    sort(neighborBoundaries.begin(), neighborBoundaries.end());
+                    neighborBoundaries.erase(
+                        unique(neighborBoundaries.begin(), neighborBoundaries.end()),
+                        neighborBoundaries.end());
+
+                    const uint32_t bMinN = neighborBoundaries.front().first;
+                    const uint32_t bMaxN = neighborBoundaries.back().first;
+                    if(bMaxN <= bMinN) continue;
+                    if(bMinN >= nodeIds.size()) continue;
+
+                    const uint32_t nOrdMin = neighborBoundaries.front().second;
+                    const uint32_t nOrdMax = neighborBoundaries.back().second;
+                    if(nOrdMax <= nOrdMin) continue;
+
+                    // Determine strand from the chain's isSameStrand.
+                    const auto& cand = candidates[edge.chainIndex];
+                    // The neighbor's strand relative to the reference depends
+                    // on the chain of edges. For simplicity, try strand 0 first.
+                    Strand nStrand = 0;
+                    auto nMarkers = markersRef[OrientedReadId(ReadId(edge.neighborReadId), 0).getValue()];
+                    if(nOrdMin >= nMarkers.size() || nOrdMax >= nMarkers.size()) {
+                        nStrand = 1;
+                        nMarkers = markersRef[OrientedReadId(ReadId(edge.neighborReadId), 1).getValue()];
+                        if(nOrdMin >= nMarkers.size() || nOrdMax >= nMarkers.size()) continue;
+                    }
+
+                    const OrientedReadId nOid(ReadId(edge.neighborReadId), nStrand);
+                    const uint32_t nPosLeft = nMarkers[nOrdMin].position + kHalf;
+                    const uint32_t nPosRight = nMarkers[nOrdMax].position + kHalf;
+                    if(nPosRight <= nPosLeft) continue;
+
+                    string nSeq;
+                    nSeq.reserve(nPosRight - nPosLeft);
+                    for(uint32_t pos = nPosLeft; pos < nPosRight; ++pos) {
+                        nSeq.push_back(readsRef.getOrientedReadBase(nOid, pos).character());
+                    }
+                    if(nSeq.empty()) continue;
+
+                    int endNodeN = (bMaxN < nodeIds.size())
+                        ? static_cast<int>(nodeIds[bMaxN])
+                        : -1;
+
+                    const auto nNameSpan = readsRef.getReadName(ReadId(edge.neighborReadId));
+                    seqNames.push_back(string(nNameSpan.data(), nNameSpan.size()));
+
+                    aligner.align_from(
+                        nSeq,
+                        nodeIds[bMinN],
+                        1,      // weight
+                        true,   // is_ends_free
+                        0,      // start_offset
+                        endNodeN,
+                        seqId);
+
+                    ++seqId;
+                    ++indirectAligned;
+                    ++totalAlignedReads;
+                    ++totalAlignedSegments;
+
+                    // Mark as placed and propagate its ordinal->boundary map
+                    // so further BFS steps can use it.
+                    placedReadIds.insert(edge.neighborReadId);
+                    auto& newOrdMap = readOrdinalToBoundary[edge.neighborReadId];
+                    for(const auto& nb : neighborBoundaries) {
+                        newOrdMap[nb.second] = nb.first;
+                    }
+                    bfsQueue.push(edge.neighborReadId);
+                }
+            }
+
+            if(indirectAligned > 0) {
+                cout << "    Indirectly aligned " << indirectAligned
+                     << " insertion-internal reads via read graph BFS." << endl;
+            }
+        }
+
+        // -----------------------------------------------------------------
         // Step 6: Output MSA and consensus.
         // -----------------------------------------------------------------
         if(seqId <= 1) continue;  // Only backbone, no reads aligned.
