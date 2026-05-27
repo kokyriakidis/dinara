@@ -23,6 +23,8 @@
 #include <chrono>
 #include <fstream>
 #include <queue>
+#include <string>
+#include <unordered_map>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2544,7 +2546,227 @@ void Assembler::buildSvMSA(
                         // or insertion call regions.
                         if(overlapsVntr || overlapsInsertion) continue;
 
-                        if(delSize >= 50 && delSize <= 2000) {
+                        // -------------------------------------------------
+                        // Adaptive k-mer refinement for short reads.
+                        //
+                        // Short reads can't span both flanks of the
+                        // coverage-drop region. Instead, collect
+                        // diagonals from reads anchoring on each flank
+                        // separately. For a het deletion, left-flank
+                        // reads and right-flank reads will show two
+                        // diagonal modes: ref-like and del-carrying.
+                        // The difference between modes = deletion size.
+                        // -------------------------------------------------
+                        const uint32_t flankSize = 200;
+                        const uint32_t refSeqLen = uint32_t(
+                            readsRef.getRead(refId).baseCount);
+                        const uint32_t leftFlankStart =
+                            cdc.startPos > flankSize
+                            ? cdc.startPos - flankSize : 0;
+                        const uint32_t leftFlankEnd = cdc.startPos;
+                        const uint32_t rightFlankStart = cdc.endPos;
+                        const uint32_t rightFlankEnd =
+                            std::min(cdc.endPos + flankSize, refSeqLen);
+
+                        // Get reference raw sequence.
+                        const vector<Base> refSeq =
+                            readsRef.getOrientedReadRawSequence(
+                                OrientedReadId(refId, 0));
+
+                        bool refinedCall = false;
+                        for(uint32_t tryK = uint32_t(k) + 4;
+                            tryK <= 30 && !refinedCall; tryK += 4) {
+
+                            // Build k-mer → positions for local ref
+                            // (extended region for uniqueness check).
+                            const uint32_t localStart =
+                                leftFlankStart > 300
+                                ? leftFlankStart - 300 : 0;
+                            const uint32_t localEnd =
+                                std::min(rightFlankEnd + 300, refSeqLen);
+
+                            std::unordered_map<string, vector<uint32_t>>
+                                refKmerPos;
+                            for(uint32_t p = localStart;
+                                p + tryK <= localEnd; ++p) {
+                                string kmer;
+                                kmer.reserve(tryK);
+                                for(uint32_t j = 0; j < tryK; ++j) {
+                                    kmer.push_back(
+                                        refSeq[p + j].character());
+                                }
+                                refKmerPos[kmer].push_back(p);
+                            }
+
+                            // Collect unique k-mers from each flank.
+                            struct FlankKmer {
+                                string kmer;
+                                uint32_t refPos;
+                            };
+                            vector<FlankKmer> leftKmers, rightKmers;
+                            for(const auto& [kmer, positions] : refKmerPos) {
+                                if(positions.size() != 1) continue;
+                                const uint32_t pos = positions[0];
+                                if(pos >= leftFlankStart
+                                   && pos + tryK <= leftFlankEnd) {
+                                    leftKmers.push_back({kmer, pos});
+                                } else if(pos >= rightFlankStart
+                                          && pos + tryK <= rightFlankEnd) {
+                                    rightKmers.push_back({kmer, pos});
+                                }
+                            }
+
+                            cout << "      Adaptive k=" << tryK
+                                 << ": leftKmers=" << leftKmers.size()
+                                 << " rightKmers=" << rightKmers.size()
+                                 << endl;
+
+                            if(leftKmers.size() < 3
+                               || rightKmers.size() < 3) continue;
+
+                            // For each read, find which flank it matches
+                            // and compute its median diagonal.
+                            vector<int64_t> leftFlankDiags;
+                            vector<int64_t> rightFlankDiags;
+
+                            for(const auto& rg : readGroups) {
+                                const vector<Base> readSeq =
+                                    readsRef.getOrientedReadRawSequence(
+                                        OrientedReadId(rg.readId, 0));
+                                const uint32_t readLen =
+                                    uint32_t(readSeq.size());
+                                if(readLen < tryK) continue;
+
+                                // Build k-mer → positions for read.
+                                std::unordered_map<string, vector<uint32_t>>
+                                    readKmerPos;
+                                for(uint32_t p = 0;
+                                    p + tryK <= readLen; ++p) {
+                                    string kmer;
+                                    kmer.reserve(tryK);
+                                    for(uint32_t j = 0; j < tryK; ++j) {
+                                        kmer.push_back(
+                                            readSeq[p + j].character());
+                                    }
+                                    readKmerPos[kmer].push_back(p);
+                                }
+
+                                // Match left flank k-mers.
+                                vector<int64_t> lDiags;
+                                for(const auto& fk : leftKmers) {
+                                    auto it = readKmerPos.find(fk.kmer);
+                                    if(it == readKmerPos.end()) continue;
+                                    if(it->second.size() != 1) continue;
+                                    lDiags.push_back(
+                                        int64_t(fk.refPos)
+                                        - int64_t(it->second[0]));
+                                }
+                                if(lDiags.size() >= 3) {
+                                    sort(lDiags.begin(), lDiags.end());
+                                    leftFlankDiags.push_back(
+                                        lDiags[lDiags.size() / 2]);
+                                }
+
+                                // Match right flank k-mers.
+                                vector<int64_t> rDiags;
+                                for(const auto& fk : rightKmers) {
+                                    auto it = readKmerPos.find(fk.kmer);
+                                    if(it == readKmerPos.end()) continue;
+                                    if(it->second.size() != 1) continue;
+                                    rDiags.push_back(
+                                        int64_t(fk.refPos)
+                                        - int64_t(it->second[0]));
+                                }
+                                if(rDiags.size() >= 3) {
+                                    sort(rDiags.begin(), rDiags.end());
+                                    rightFlankDiags.push_back(
+                                        rDiags[rDiags.size() / 2]);
+                                }
+                            }
+
+                            cout << "      leftFlankReads="
+                                 << leftFlankDiags.size()
+                                 << " rightFlankReads="
+                                 << rightFlankDiags.size()
+                                 << endl;
+
+                            // For a het deletion, each flank should show
+                            // a bimodal diagonal distribution: ref-like
+                            // reads at one diagonal, del-carrying reads
+                            // shifted by ~delSize.
+                            // Analyze the right flank (usually more reads
+                            // since reads pile up after the gap).
+                            auto analyzeFlank = [](
+                                vector<int64_t>& diags,
+                                const char* label) -> int64_t {
+                                if(diags.size() < 4) return 0;
+                                sort(diags.begin(), diags.end());
+
+                                // Find the largest gap between consecutive
+                                // diagonals — this separates the two modes.
+                                int64_t maxGap = 0;
+                                size_t maxGapIdx = 0;
+                                for(size_t i = 1; i < diags.size(); ++i) {
+                                    const int64_t gap =
+                                        diags[i] - diags[i-1];
+                                    if(gap > maxGap) {
+                                        maxGap = gap;
+                                        maxGapIdx = i;
+                                    }
+                                }
+
+                                cout << "      " << label << " diags:";
+                                for(const auto& d : diags) cout << " " << d;
+                                cout << " maxGap=" << maxGap
+                                     << " at idx=" << maxGapIdx
+                                     << endl;
+
+                                // Need a gap > 30bp with reads on both sides.
+                                if(maxGap > 30 && maxGapIdx >= 2
+                                   && diags.size() - maxGapIdx >= 2) {
+                                    // Compute median of each mode.
+                                    const int64_t lowMed =
+                                        diags[maxGapIdx / 2];
+                                    const int64_t highMed =
+                                        diags[maxGapIdx
+                                              + (diags.size() - maxGapIdx)
+                                              / 2];
+                                    return highMed - lowMed;
+                                }
+                                return 0;
+                            };
+
+                            const int64_t leftShift =
+                                analyzeFlank(leftFlankDiags, "Left");
+                            const int64_t rightShift =
+                                analyzeFlank(rightFlankDiags, "Right");
+
+                            // Use whichever flank gives a clearer signal.
+                            // Both should agree on the deletion size.
+                            int64_t bestShift = 0;
+                            if(leftShift > 30 && rightShift > 30) {
+                                // Both flanks agree — use average.
+                                bestShift = (leftShift + rightShift) / 2;
+                            } else if(leftShift > 30) {
+                                bestShift = leftShift;
+                            } else if(rightShift > 30) {
+                                bestShift = rightShift;
+                            }
+
+                            if(bestShift > 30) {
+                                cout << "    >>> DELETION CALL (adaptive k="
+                                     << tryK << "): "
+                                     << "size=" << bestShift << "bp, "
+                                     << "breakpoint=" << bpPos << ", "
+                                     << "leftShift=" << leftShift << ", "
+                                     << "rightShift=" << rightShift
+                                     << endl;
+                                refinedCall = true;
+                            }
+                        }
+
+                        if(!refinedCall && delSize >= 50
+                           && delSize <= 2000) {
                             cout << "    >>> DELETION CALL (coverage): "
                                  << "size=" << delSize << "bp, "
                                  << "breakpoint=" << bpPos
