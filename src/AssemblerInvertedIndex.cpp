@@ -2041,6 +2041,7 @@ static inline void configureInvertedIndexDataForChaining(
     data.minimap2Bw = overlapCandidatesOptions.minimap2Bw;
     data.minimap2MaxGap = overlapCandidatesOptions.minimap2MaxGap;
     data.minimap2MinChainScore = overlapCandidatesOptions.minimap2MinChainScore;
+    data.referenceReadCount = overlapCandidatesOptions.referenceReadCount;
 }
 
 // ============================================================================
@@ -2248,6 +2249,7 @@ private:
         const int32_t minimap2Bw = invertedIndexData.minimap2Bw;
         const int32_t minimap2MaxGap = invertedIndexData.minimap2MaxGap;
         const int32_t minimap2MinChainScore = invertedIndexData.minimap2MinChainScore;
+        const uint64_t referenceReadCount = invertedIndexData.referenceReadCount;
 
         uint64_t startBatch, endBatch;
         while(getNextBatch(startBatch, endBatch)) {
@@ -2444,6 +2446,16 @@ private:
 
                         // Skip mirrored pairs, self-comparisons, and palindromic partners.
                         if(readIdB <= readIdA || reads.getFlags(readIdB).isPalindromic) {
+                            while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) {
+                                ++hitIter;
+                            }
+                            continue;
+                        }
+
+                        // In reference mode, skip read-vs-read pairs (neither is a reference).
+                        if(referenceReadCount > 0
+                           && readIdA >= ReadId(referenceReadCount)
+                           && readIdB >= ReadId(referenceReadCount)) {
                             while(hitIter < scratch.flatHits.size() && scratch.flatHits[hitIter].partnerReadId == readIdB) {
                                 ++hitIter;
                             }

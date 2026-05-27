@@ -2635,6 +2635,9 @@ public:
 	             bool enableMcopyFast = true;
              // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr.
              int chainingMode = 0;
+             // When > 0, only chain pairs where at least one read is a
+             // reference (readId < referenceReadCount). Skips read-vs-read.
+             uint64_t referenceReadCount = 0;
              int32_t minimap2Bw = 100;
              int32_t minimap2MaxGap = 100;
              int32_t minimap2MinChainScore = 25;
