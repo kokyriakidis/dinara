@@ -1735,118 +1735,169 @@ void dinara::main::assemble(
     //
     // ========================================================================
 
-    // Verify edges against shasta2-reconstructed RC anchors.
-    // Shasta2 creates RC anchors by flipping canonical anchors, not using
-    // dinara's RC anchors. Check if any edge's orientedReadIds reference
-    // reads that would be missing from shasta2's reconstructed anchors.
+    // Simulate shasta2's anchor positions and verify edges.
+    // Shasta2 loads canonical anchors from external anchors, then creates
+    // RC anchors by: rcPosition = readLength - canonicalPosition.
+    // Check if edges have positive offsets using shasta2's positions.
     {
-        cout << timestamp << "Verifying edges against shasta2-reconstructed anchors..." << endl;
+        cout << timestamp << "Simulating shasta2 anchor positions and verifying edges..." << endl;
         const auto& anchors = *shasta2Anchors;
         const auto& graph = *shasta2AnchorGraph;
+        const auto& reads = assembler.getReads();
         const uint64_t anchorCount = anchors.size();
+        const uint32_t kHalf = uint32_t(anchors.k / 2);
 
-        // Build shasta2-style anchors: for each canonical anchor (even ID),
-        // the RC anchor (odd ID) should contain the strand-flipped reads
-        // of the canonical anchor. Check if dinara's RC anchor matches.
-        uint64_t mismatchedAnchors = 0;
-        uint64_t totalExtraReads = 0;
-        uint64_t totalMissingReads = 0;
-        for(Shasta2AnchorId aid = 0; aid < anchorCount; aid += 2) {
-            const auto canonical = anchors[aid];
-            const auto rc = anchors[aid + 1];
+        // Build shasta2-style position lookup for each anchor.
+        // For canonical (even) anchors: position = rawPos + kHalf (same as dinara).
+        // For RC (odd) anchors: position = readLength - canonicalPosition,
+        //   where canonicalPosition is the position of the strand-flipped read
+        //   on the canonical (even) anchor.
+        // Key: (anchorId, orientedReadId) -> shasta2 position.
+        // We only build this for anchors that appear in failing edges.
 
-            // Build the set of oriented read IDs that shasta2 would have
-            // on the RC anchor (strand-flipped canonical reads).
-            std::set<uint32_t> shasta2RcReadIds;
-            for(const auto& mi : canonical) {
-                // Flip strand: value ^ 1
-                shasta2RcReadIds.insert(mi.orientedReadId.getValue() ^ 1);
+        // First pass: check all edges using shasta2-style positions.
+        uint64_t failCount = 0;
+        auto [ei, ei_end] = boost::edges(graph);
+        for(; ei != ei_end; ++ei) {
+            const auto& dEdge = graph[*ei];
+            const auto& ap = dEdge.anchorPair;
+            if(ap.orientedReadIds.empty()) continue;
+
+            // For each orientedReadId, compute shasta2-style positions on both anchors.
+            uint64_t forwardCount = 0;
+            uint64_t backwardCount = 0;
+
+            for(const OrientedReadId oid : ap.orientedReadIds) {
+                // Get shasta2 position on anchor A.
+                uint32_t posA = 0;
+                bool foundA = false;
+                if(uint64_t(ap.anchorIdA) % 2 == 0) {
+                    // Canonical: position = rawPos + kHalf = dinara position.
+                    const auto anchorA = anchors[ap.anchorIdA];
+                    for(const auto& mi : anchorA) {
+                        if(mi.orientedReadId == oid) {
+                            posA = mi.position;
+                            foundA = true;
+                            break;
+                        }
+                    }
+                } else {
+                    // RC anchor: shasta2 computes position = readLength - canonical_position.
+                    // The canonical anchor is anchorIdA ^ 1.
+                    // The read on the canonical anchor is oid with flipped strand.
+                    const OrientedReadId flippedOid = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                    const auto canonicalAnchor = anchors[uint64_t(ap.anchorIdA) ^ 1ULL];
+                    for(const auto& mi : canonicalAnchor) {
+                        if(mi.orientedReadId == flippedOid) {
+                            const uint64_t readLen = reads.getRead(flippedOid.getReadId()).baseCount;
+                            posA = uint32_t(readLen) - mi.position;
+                            foundA = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Get shasta2 position on anchor B.
+                uint32_t posB = 0;
+                bool foundB = false;
+                if(uint64_t(ap.anchorIdB) % 2 == 0) {
+                    const auto anchorB = anchors[ap.anchorIdB];
+                    for(const auto& mi : anchorB) {
+                        if(mi.orientedReadId == oid) {
+                            posB = mi.position;
+                            foundB = true;
+                            break;
+                        }
+                    }
+                } else {
+                    const OrientedReadId flippedOid = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                    const auto canonicalAnchor = anchors[uint64_t(ap.anchorIdB) ^ 1ULL];
+                    for(const auto& mi : canonicalAnchor) {
+                        if(mi.orientedReadId == flippedOid) {
+                            const uint64_t readLen = reads.getRead(flippedOid.getReadId()).baseCount;
+                            posB = uint32_t(readLen) - mi.position;
+                            foundB = true;
+                            break;
+                        }
+                    }
+                }
+
+                if(foundA && foundB) {
+                    if(posB >= posA) {
+                        ++forwardCount;
+                    } else {
+                        ++backwardCount;
+                    }
+                }
             }
 
-            // Check dinara's RC anchor reads against shasta2's.
-            std::set<uint32_t> dinaraRcReadIds;
-            for(const auto& mi : rc) {
-                dinaraRcReadIds.insert(mi.orientedReadId.getValue());
-            }
+            if(forwardCount == 0 && backwardCount > 0) {
+                ++failCount;
+                if(failCount <= 5) {
+                    cout << "SHASTA2-SIM FAIL edge " << ap.anchorIdA << " -> " << ap.anchorIdB
+                         << " id=" << dEdge.id
+                         << ": forward=" << forwardCount
+                         << " backward=" << backwardCount
+                         << " total=" << ap.orientedReadIds.size() << endl;
 
-            if(dinaraRcReadIds != shasta2RcReadIds) {
-                ++mismatchedAnchors;
-                uint64_t extra = 0, missing = 0;
-                for(uint32_t rid : dinaraRcReadIds) {
-                    if(!shasta2RcReadIds.count(rid)) ++extra;
-                }
-                for(uint32_t rid : shasta2RcReadIds) {
-                    if(!dinaraRcReadIds.count(rid)) ++missing;
-                }
-                totalExtraReads += extra;
-                totalMissingReads += missing;
-                if(mismatchedAnchors <= 5) {
-                    cout << "  RC anchor " << (aid + 1)
-                         << ": dinara has " << dinaraRcReadIds.size()
-                         << " reads, shasta2 would have " << shasta2RcReadIds.size()
-                         << " (extra=" << extra << " missing=" << missing << ")" << endl;
+                    // Print dinara vs shasta2 positions for first few reads.
+                    uint64_t printed = 0;
+                    for(const OrientedReadId oid : ap.orientedReadIds) {
+                        if(printed >= 3) break;
+
+                        // Dinara positions.
+                        uint32_t dinaraPosA = 0, dinaraPosB = 0;
+                        bool dFoundA = false, dFoundB = false;
+                        for(const auto& mi : anchors[ap.anchorIdA]) {
+                            if(mi.orientedReadId == oid) { dinaraPosA = mi.position; dFoundA = true; break; }
+                        }
+                        for(const auto& mi : anchors[ap.anchorIdB]) {
+                            if(mi.orientedReadId == oid) { dinaraPosB = mi.position; dFoundB = true; break; }
+                        }
+
+                        // Shasta2 positions.
+                        uint32_t shastaPosA = 0, shastaPosB = 0;
+                        bool sFoundA = false, sFoundB = false;
+                        if(uint64_t(ap.anchorIdA) % 2 == 0) {
+                            shastaPosA = dinaraPosA; sFoundA = dFoundA;
+                        } else {
+                            const OrientedReadId flipped = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                            for(const auto& mi : anchors[uint64_t(ap.anchorIdA) ^ 1ULL]) {
+                                if(mi.orientedReadId == flipped) {
+                                    const uint64_t rl = reads.getRead(flipped.getReadId()).baseCount;
+                                    shastaPosA = uint32_t(rl) - mi.position;
+                                    sFoundA = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if(uint64_t(ap.anchorIdB) % 2 == 0) {
+                            shastaPosB = dinaraPosB; sFoundB = dFoundB;
+                        } else {
+                            const OrientedReadId flipped = OrientedReadId::fromValue(oid.getValue() ^ 1);
+                            for(const auto& mi : anchors[uint64_t(ap.anchorIdB) ^ 1ULL]) {
+                                if(mi.orientedReadId == flipped) {
+                                    const uint64_t rl = reads.getRead(flipped.getReadId()).baseCount;
+                                    shastaPosB = uint32_t(rl) - mi.position;
+                                    sFoundB = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        cout << "  " << oid
+                             << " dinara: posA=" << dinaraPosA << " posB=" << dinaraPosB
+                             << " offset=" << (int64_t(dinaraPosB) - int64_t(dinaraPosA))
+                             << " | shasta2: posA=" << shastaPosA << " posB=" << shastaPosB
+                             << " offset=" << (int64_t(shastaPosB) - int64_t(shastaPosA))
+                             << endl;
+                        ++printed;
+                    }
                 }
             }
         }
-        cout << "RC anchor verification: " << mismatchedAnchors
-             << " / " << (anchorCount / 2) << " RC anchors differ from shasta2 reconstruction"
-             << " (totalExtra=" << totalExtraReads
-             << " totalMissing=" << totalMissingReads << ")" << endl;
-
-        // Now check edges between RC anchors: do their orientedReadIds
-        // exist on shasta2's reconstructed RC anchors?
-        if(mismatchedAnchors > 0) {
-            uint64_t problematicEdges = 0;
-            auto [ei, ei_end] = boost::edges(graph);
-            for(; ei != ei_end; ++ei) {
-                const auto& ap = graph[*ei].anchorPair;
-                const bool aIsRc = (uint64_t(ap.anchorIdA) % 2 == 1);
-                const bool bIsRc = (uint64_t(ap.anchorIdB) % 2 == 1);
-                if(!aIsRc && !bIsRc) continue; // Both canonical — no issue.
-
-                // For RC anchors, check if orientedReadIds would exist
-                // on shasta2's reconstructed anchors.
-                uint64_t missingOnA = 0, missingOnB = 0;
-                for(const auto& oid : ap.orientedReadIds) {
-                    if(aIsRc) {
-                        // Check if this read is on shasta2's RC anchor A.
-                        const auto canonical = anchors[uint64_t(ap.anchorIdA) ^ 1ULL];
-                        bool found = false;
-                        const uint32_t flippedVal = oid.getValue() ^ 1;
-                        for(const auto& mi : canonical) {
-                            if(mi.orientedReadId.getValue() == flippedVal) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if(!found) ++missingOnA;
-                    }
-                    if(bIsRc) {
-                        const auto canonical = anchors[uint64_t(ap.anchorIdB) ^ 1ULL];
-                        bool found = false;
-                        const uint32_t flippedVal = oid.getValue() ^ 1;
-                        for(const auto& mi : canonical) {
-                            if(mi.orientedReadId.getValue() == flippedVal) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if(!found) ++missingOnB;
-                    }
-                }
-                if(missingOnA > 0 || missingOnB > 0) {
-                    ++problematicEdges;
-                    if(problematicEdges <= 10) {
-                        cout << "  EDGE " << ap.anchorIdA << " -> " << ap.anchorIdB
-                             << ": " << missingOnA << " reads missing from shasta2 anchor A, "
-                             << missingOnB << " missing from anchor B"
-                             << " (total reads=" << ap.orientedReadIds.size() << ")" << endl;
-                    }
-                }
-            }
-            cout << "RC edge verification: " << problematicEdges
-                 << " edges have reads missing from shasta2-reconstructed anchors." << endl;
-        }
+        cout << "Shasta2 position simulation: " << failCount
+             << " edges would fail in shasta2." << endl;
     }
 
     return;
