@@ -126,8 +126,12 @@ public:
     // Write Bandage color CSV: each anchor colored by its window.
     void writeCsv(const string& fileName) const;
 
-    // Save binary data (Shasta2 compatibility).
+    // Save binary data (dinara's own format).
     void saveAnchorGraph(const string& name = "Shasta2AnchorGraph") const { save(name); }
+
+    // Export in shasta2-compatible MemoryMapped::Vector<char> format.
+    // The output file can be passed to shasta2 via --external-anchor-graph-name.
+    void saveForShasta2(const string& fileName) const;
 
     // Per-anchor window assignment (populated by the anchor-window constructor).
     // Maps anchorId -> windowId. noWindow means unmapped.
