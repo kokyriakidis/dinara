@@ -729,7 +729,7 @@ void Assembler::buildSvMSA(
         // are within SV_SIZE_RATIO of each other are assigned to the
         // same cluster. ReferenceLike reads get clusterId = -1.
         // -----------------------------------------------------------------
-        constexpr uint32_t SV_WINDOW = 50;
+        constexpr uint32_t SV_WINDOW = 100;
         constexpr double SV_SIZE_RATIO = 0.20;
         constexpr uint32_t SV_MIN_SUPPORT = 1;  // Minimum reads per cluster.
 
@@ -1530,6 +1530,15 @@ void Assembler::buildSvMSA(
                     cout << endl;
                 }
 
+                // Collect VNTR gap regions and insertion call regions
+                // for suppressing false coverage-drop deletion calls.
+                struct SvRegion {
+                    uint32_t startPos;
+                    uint32_t endPos;
+                };
+                vector<SvRegion> vntrGaps;
+                vector<SvRegion> insertionCallRegions;
+
                 // For each left breakpoint, find the nearest right breakpoint
                 // to form a breakpoint pair.
                 for(const auto& lbp : leftBreakpoints) {
@@ -1567,6 +1576,7 @@ void Assembler::buildSvMSA(
                         if(totalGapWindows > 0
                            && double(lowDepthWindows) / double(totalGapWindows) > 0.5) {
                             maxPairDist = bestDist + 1; // Allow this pair.
+                            vntrGaps.push_back({lbp.refPos, bestRbp->refPos});
                             cout << "    VNTR gap: L=" << lbp.refPos
                                  << " R=" << bestRbp->refPos
                                  << " lowDepth=" << lowDepthWindows
@@ -1833,6 +1843,12 @@ void Assembler::buildSvMSA(
                              << "rightStarts=" << bestRbp->endpointCount << ", "
                              << "hops=" << bestPathLen
                              << endl;
+                        // Record the insertion region for suppressing
+                        // false coverage-drop deletion calls.
+                        insertionCallRegions.push_back({
+                            std::min(lbp.refPos, bestRbp->refPos),
+                            std::max(lbp.refPos, bestRbp->refPos)
+                        });
                     }
 
                     // -------------------------------------------------
@@ -2459,6 +2475,57 @@ void Assembler::buildSvMSA(
                         if(leftFlank < 0.7 * medianSpanning
                            || rightFlank < 0.7 * medianSpanning) continue;
 
+                        // Check if this region overlaps a detected VNTR gap
+                        // or an insertion call region.
+                        // VNTR gaps cause coverage drops from chaining
+                        // failure in tandem repeats, not real deletions.
+                        // Insertion regions cause coverage drops because
+                        // insertion-carrying reads can't chain through.
+                        bool overlapsVntr = false;
+                        for(const auto& vg : vntrGaps) {
+                            if(cdc.startPos < vg.endPos
+                               && cdc.endPos > vg.startPos) {
+                                overlapsVntr = true;
+                                break;
+                            }
+                        }
+                        // Use margin for insertion overlap since the
+                        // coverage drop extends beyond the BP pair.
+                        const uint32_t insMargin = 200;
+                        bool overlapsInsertion = false;
+                        for(const auto& ir : insertionCallRegions) {
+                            const uint32_t irStart =
+                                ir.startPos > insMargin
+                                ? ir.startPos - insMargin : 0;
+                            const uint32_t irEnd = ir.endPos + insMargin;
+                            if(cdc.startPos < irEnd
+                               && cdc.endPos > irStart) {
+                                overlapsInsertion = true;
+                                break;
+                            }
+                        }
+
+                        // Check if the region is marker-depleted.
+                        // In a real deletion, the reference still has
+                        // markers (k-mers) — reads just don't align there.
+                        // In a VNTR/repeat, the reference itself has
+                        // low hit-depth because k-mers are non-unique.
+                        uint32_t lowHitDepthWins = 0;
+                        uint32_t totalHitDepthWins = 0;
+                        for(uint32_t w = cdc.startWin;
+                            w <= cdc.endWin && w < nWindows; ++w) {
+                            if(windowMarkerCount[w] == 0) continue;
+                            ++totalHitDepthWins;
+                            if(medianHitDepth > 0
+                               && windowHitDepth[w] / medianHitDepth
+                                  < hitDepthDropThreshold) {
+                                ++lowHitDepthWins;
+                            }
+                        }
+                        const bool markerDepleted = totalHitDepthWins > 0
+                            && double(lowHitDepthWins)
+                               / double(totalHitDepthWins) > 0.5;
+
                         const uint32_t bpPos =
                             (cdc.startPos + cdc.endPos) / 2;
 
@@ -2468,7 +2535,14 @@ void Assembler::buildSvMSA(
                              << " minRatio=" << cdc.minRatio
                              << " leftFlank=" << leftFlank
                              << " rightFlank=" << rightFlank
+                             << " vntr=" << overlapsVntr
+                             << " ins=" << overlapsInsertion
+                             << " markerDepleted=" << markerDepleted
                              << endl;
+
+                        // Suppress calls that overlap detected VNTR gaps
+                        // or insertion call regions.
+                        if(overlapsVntr || overlapsInsertion) continue;
 
                         if(delSize >= 50 && delSize <= 2000) {
                             cout << "    >>> DELETION CALL (coverage): "
