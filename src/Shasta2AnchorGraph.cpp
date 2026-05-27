@@ -532,8 +532,39 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //   one outgoing inter-window edge. Similarly for incoming. At such
     //   connections, trim the source backbone past the connection anchor
     //   and the destination backbone before the connection anchor.
+    //   Only intra-window edges are removed — inter-window edges are preserved
+    //   to avoid fragmenting the graph.
     // ========================================================================
-    if(false) {
+    {
+        // Remove only intra-window edges of a vertex (edges where both
+        // endpoints belong to the same window). Preserves inter-window edges.
+        auto clearIntraWindowEdges = [&](uint64_t vid) {
+            if(vid >= anchorCount) return;
+            const uint32_t vWindow = anchorToWindow[vid];
+
+            // Collect edges to remove (can't modify while iterating).
+            std::vector<edge_descriptor> toRemove;
+
+            auto outEdges = boost::out_edges(vid, anchorGraph);
+            for(auto it = outEdges.first; it != outEdges.second; ++it) {
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow) {
+                    toRemove.push_back(*it);
+                }
+            }
+            auto inEdges = boost::in_edges(vid, anchorGraph);
+            for(auto it = inEdges.first; it != inEdges.second; ++it) {
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src < anchorCount && anchorToWindow[src] == vWindow) {
+                    toRemove.push_back(*it);
+                }
+            }
+
+            for(const auto& e : toRemove) {
+                boost::remove_edge(e, anchorGraph);
+            }
+        };
+
         uint64_t trimmedVertexCount = 0;
         uint64_t oneToOneCount = 0;
 
@@ -610,11 +641,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(srcTrimAfter >= 0) {
                 for(uint64_t i = uint64_t(srcTrimAfter) + 1; i < srcPositions.size(); i++) {
                     const Shasta2AnchorId aid = srcJourney[srcPositions[i]];
-                    boost::clear_vertex(uint64_t(aid), anchorGraph);
+                    clearIntraWindowEdges(uint64_t(aid));
                     const uint64_t rcAid = uint64_t(aid) ^ 1ULL;
-                    if(rcAid < anchorCount) {
-                        boost::clear_vertex(rcAid, anchorGraph);
-                    }
+                    clearIntraWindowEdges(rcAid);
                     ++trimmedVertexCount;
                 }
             }
@@ -623,11 +652,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(dstTrimBefore > 0) {
                 for(int64_t i = 0; i < dstTrimBefore; i++) {
                     const Shasta2AnchorId aid = dstJourney[dstPositions[i]];
-                    boost::clear_vertex(uint64_t(aid), anchorGraph);
+                    clearIntraWindowEdges(uint64_t(aid));
                     const uint64_t rcAid = uint64_t(aid) ^ 1ULL;
-                    if(rcAid < anchorCount) {
-                        boost::clear_vertex(rcAid, anchorGraph);
-                    }
+                    clearIntraWindowEdges(rcAid);
                     ++trimmedVertexCount;
                 }
             }
