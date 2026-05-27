@@ -791,6 +791,65 @@ void Assembler::buildSvMSA(
             ii = (jj > ii + 1) ? jj : ii + 1;
         }
 
+        // Merge adjacent clusters of the same type and similar size.
+        // This handles cases where the greedy sweep splits a single
+        // SV event into two clusters because the breakpoint spread
+        // exceeds SV_WINDOW from the first seed.
+        if(nextClusterId >= 2) {
+            // Build per-cluster info.
+            struct ClusterInfo {
+                SvType type;
+                int64_t medianSize;
+                uint32_t minBp, maxBp;
+                int32_t id;
+            };
+            vector<ClusterInfo> clusters(nextClusterId);
+            for(int32_t c = 0; c < nextClusterId; ++c) {
+                vector<int64_t> sizes;
+                uint32_t minBp = UINT32_MAX, maxBp = 0;
+                SvType type = SvType::ReferenceLike;
+                for(auto& rg2 : readGroups) {
+                    if(rg2.clusterId == c) {
+                        sizes.push_back(rg2.svSize);
+                        minBp = std::min(minBp, rg2.breakpointRefPos);
+                        maxBp = std::max(maxBp, rg2.breakpointRefPos);
+                        type = rg2.svType;
+                    }
+                }
+                sort(sizes.begin(), sizes.end());
+                clusters[c] = {type,
+                    sizes.empty() ? 0 : sizes[sizes.size()/2],
+                    minBp, maxBp, c};
+            }
+
+            // Merge clusters that are close and similar.
+            for(int32_t c1 = 0; c1 < nextClusterId; ++c1) {
+                for(int32_t c2 = c1 + 1; c2 < nextClusterId; ++c2) {
+                    if(clusters[c1].type != clusters[c2].type) continue;
+                    // Check breakpoint proximity.
+                    const uint32_t gap =
+                        (clusters[c2].minBp > clusters[c1].maxBp)
+                        ? clusters[c2].minBp - clusters[c1].maxBp : 0;
+                    if(gap > SV_WINDOW) continue;
+                    // Check size similarity.
+                    const int64_t s1 = clusters[c1].medianSize;
+                    const int64_t s2 = clusters[c2].medianSize;
+                    const int64_t ref = std::max(std::abs(s1), int64_t(1));
+                    if(std::abs(s1 - s2) > int64_t(ref * SV_SIZE_RATIO))
+                        continue;
+                    // Merge c2 into c1.
+                    for(auto& rg2 : readGroups) {
+                        if(rg2.clusterId == c2) rg2.clusterId = c1;
+                    }
+                    clusters[c1].minBp = std::min(
+                        clusters[c1].minBp, clusters[c2].minBp);
+                    clusters[c1].maxBp = std::max(
+                        clusters[c1].maxBp, clusters[c2].maxBp);
+                    clusters[c2].id = -1; // Mark as merged.
+                }
+            }
+        }
+
         const int32_t totalClusters = nextClusterId;
 
         // Sort: deletions first (largest first), then inversions, then
@@ -1614,6 +1673,7 @@ void Assembler::buildSvMSA(
                     int64_t bestPathDist = 0;
                     int bestPathLen = 0;
                     bool foundPath = false;
+                    vector<int64_t> allPathDists; // Collect all valid paths.
                     const bool isVntrGap = (maxPairDist > 500);
 
                     // Helper: get the overlap span (bp) between two reads
@@ -1652,10 +1712,13 @@ void Assembler::buildSvMSA(
                                 for(const auto& rf : bestRbp->reads)
                                     if(rf.readId == n1) { rOvh = rf.overhangBp; break; }
                                 const int64_t dist = lf.overhangBp + rOvh - ovlp1;
-                                if(dist > bestPathDist && dist > 0) {
-                                    bestPathDist = dist;
-                                    bestPathLen = 1;
-                                    foundPath = true;
+                                if(dist > 0) {
+                                    allPathDists.push_back(dist);
+                                    if(dist > bestPathDist) {
+                                        bestPathDist = dist;
+                                        bestPathLen = 1;
+                                        foundPath = true;
+                                    }
                                 }
                                 continue;
                             }
@@ -1684,10 +1747,13 @@ void Assembler::buildSvMSA(
                                         if(rf.readId == n2) { rOvh = rf.overhangBp; break; }
                                     const int64_t dist = lf.overhangBp + n1Span
                                         - ovlp1 - ovlp2 + rOvh;
-                                    if(dist > bestPathDist && dist > 0) {
-                                        bestPathDist = dist;
-                                        bestPathLen = 2;
-                                        foundPath = true;
+                                    if(dist > 0) {
+                                        allPathDists.push_back(dist);
+                                        if(dist > bestPathDist) {
+                                            bestPathDist = dist;
+                                            bestPathLen = 2;
+                                            foundPath = true;
+                                        }
                                     }
                                     continue;
                                 }
@@ -1716,10 +1782,13 @@ void Assembler::buildSvMSA(
                                         if(rf.readId == n3) { rOvh = rf.overhangBp; break; }
                                     const int64_t dist = lf.overhangBp + n1Span + n2Span
                                         - ovlp1 - ovlp2 - ovlp3 + rOvh;
-                                    if(dist > bestPathDist && dist > 0) {
-                                        bestPathDist = dist;
-                                        bestPathLen = 3;
-                                        foundPath = true;
+                                    if(dist > 0) {
+                                        allPathDists.push_back(dist);
+                                        if(dist > bestPathDist) {
+                                            bestPathDist = dist;
+                                            bestPathLen = 3;
+                                            foundPath = true;
+                                        }
                                     }
                                 }
                             }
@@ -1727,6 +1796,9 @@ void Assembler::buildSvMSA(
                     }
 
                     const uint32_t breakpointPos = (lbp.refPos + bestRbp->refPos) / 2;
+
+                    // bestPathDist already holds the maximum path
+                    // distance from the search above.
 
                     cout << "    Breakpoint pair: L=" << lbp.refPos
                          << " (ends=" << lbp.endpointCount
@@ -1739,6 +1811,7 @@ void Assembler::buildSvMSA(
                          << " refGap=" << bestDist
                          << " foundPath=" << foundPath
                          << " pathDist=" << bestPathDist
+                         << " paths=" << allPathDists.size()
                          << " hops=" << bestPathLen
                          << " breakpoint=" << breakpointPos
                          << endl;
