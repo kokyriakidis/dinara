@@ -3645,7 +3645,7 @@ void dinara::main::svanchors(
     OverlapCandidatesOptions svOpts = assemblerOptions.overlapCandidatesOptions;
     svOpts.chainingMode = 1;                          // minimap2-sr scoring mode.
     svOpts.minimap2Bw = 100;                          // minimap2 -r100 fixed bandwidth.
-    svOpts.minimap2MaxGap = 5000;                     // Large to allow SV detection.
+    svOpts.minimap2MaxGap = 100;                      // minimap2 -g100.
     svOpts.minimap2MinChainScore = 25;                // minimap2 -m25.
     svOpts.driftRateTolerance = 0.02;                 // Used as bw_rate fallback.
     svOpts.invertedIndexLchainIsAccurate = false;     // HiFi error model.
