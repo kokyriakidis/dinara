@@ -253,8 +253,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    const uint64_t intraEdgeCount = num_edges(anchorGraph) - alternatePathEdgeCount;
-
     // Per-read window transition tracking.
     // Walk each read's journey, collect the sequence of normalized windows,
     // then populate:
@@ -654,8 +652,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    const uint64_t interEdgeCount =
-        num_edges(anchorGraph) - intraEdgeCount - alternatePathEdgeCount;
+    // Recount edge types after trimming (clear_vertex may have removed edges).
+    uint64_t finalIntraCount = 0;
+    uint64_t finalAltPathCount = 0;
+    uint64_t finalInterCount = 0;
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+        if(!anchorGraph[e].useForAssembly) {
+            ++finalAltPathCount;
+        } else {
+            // Check if both endpoints belong to the same window.
+            const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+            const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+            const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+            const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+            if(srcWin != noWindow && srcWin == dstWin) {
+                ++finalIntraCount;
+            } else {
+                ++finalInterCount;
+            }
+        }
+    }
 
     // Count non-isolated vertices (vertices with at least one edge).
     uint64_t nonIsolatedVertexCount = 0;
@@ -668,9 +684,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "The anchor graph has " << nonIsolatedVertexCount
          << " non-isolated vertices (" << num_vertices(*this) << " total), "
          << num_edges(*this) << " edges"
-         << " (" << intraEdgeCount << " intra-window, "
-         << alternatePathEdgeCount << " alternate-path, "
-         << interEdgeCount << " inter-window)." << endl;
+         << " (" << finalIntraCount << " intra-window, "
+         << finalAltPathCount << " alternate-path, "
+         << finalInterCount << " inter-window)." << endl;
 }
 
 
