@@ -3648,9 +3648,9 @@ void dinara::main::svanchors(
     svOpts.minimap2MaxGap = 5000;                     // Large to allow SV detection.
     svOpts.minimap2MinChainScore = 25;                // minimap2 -m25.
     svOpts.driftRateTolerance = 0.02;                 // Used as bw_rate fallback.
-    svOpts.invertedIndexLchainIsAccurate = false;     // HiFi error model (div=0.1).
+    svOpts.invertedIndexLchainIsAccurate = false;     // HiFi error model.
     svOpts.invertedIndexMcopyKhitCutoff = 3;          // Short reads have few markers.
-    svOpts.invertedIndexMcopyNum = 10;                // Generous: capture multiple SV breakpoints.
+    svOpts.invertedIndexMcopyNum = 20;                // minimap2 -N20.
     svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
     svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
 
