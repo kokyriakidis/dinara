@@ -1665,6 +1665,79 @@ void dinara::main::assemble(
 
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
 
+    // ========================================================================
+    // Window transition data usage examples.
+    // After graph construction, each AnchorWindow has per-read transition info.
+    //
+    // --- 1. Per-read: which window does a read come from / go to? ---
+    //
+    //   const AnchorWindow& window = anchorWindows[windowId];
+    //   for(const auto& ri : window.readIntervals) {
+    //       cout << ri.orientedReadId
+    //            << " prev=" << ri.previousWindow   // noWindow if starts here
+    //            << " next=" << ri.nextWindow        // noWindow if ends here
+    //            << endl;
+    //   }
+    //
+    // --- 2. All reads following a specific transition (e.g., from window 3 to window 5): ---
+    //
+    //   const uint32_t noW = AnchorWindow::noWindow;
+    //   auto it = window.transitionReads.find({3, 5});
+    //   if(it != window.transitionReads.end()) {
+    //       for(const auto& oid : it->second) {
+    //           cout << "Read " << oid << " flows 3 -> " << windowId << " -> 5" << endl;
+    //       }
+    //   }
+    //
+    // --- 3. Backbone read's transition: ---
+    //
+    //   cout << "Backbone: " << window.backbonePreviousWindow
+    //        << " -> " << window.windowId
+    //        << " -> " << window.backboneNextWindow << endl;
+    //
+    // --- 4. All transition flows through a window (for detangling): ---
+    //
+    //   for(const auto& [key, reads] : window.transitionReads) {
+    //       cout << "(";
+    //       if(key.first == noW) cout << "-"; else cout << key.first;
+    //       cout << " -> ";
+    //       if(key.second == noW) cout << "-"; else cout << key.second;
+    //       cout << "): " << reads.size() << " reads" << endl;
+    //   }
+    //
+    // --- 5. Per-cluster transitions (after readClusters are populated): ---
+    //
+    //   auto clusterTrans = window.computeClusterTransitions();
+    //   for(uint64_t ci = 0; ci < clusterTrans.size(); ci++) {
+    //       cout << "Cluster " << ci << ":" << endl;
+    //       for(const auto& [key, count] : clusterTrans[ci]) {
+    //           cout << "  (";
+    //           if(key.first == noW) cout << "-"; else cout << key.first;
+    //           cout << " -> ";
+    //           if(key.second == noW) cout << "-"; else cout << key.second;
+    //           cout << "): " << count << " reads" << endl;
+    //       }
+    //   }
+    //
+    // --- 6. Detect detangling candidates (windows with multiple distinct flows): ---
+    //
+    //   for(const auto& window : anchorWindows) {
+    //       // Count distinct (prev, next) pairs ignoring reads that start/end here.
+    //       uint64_t flowCount = 0;
+    //       for(const auto& [key, reads] : window.transitionReads) {
+    //           if(key.first != noW && key.second != noW) {
+    //               ++flowCount;
+    //           }
+    //       }
+    //       if(flowCount > 1) {
+    //           cout << "Window " << window.windowId
+    //                << " is a detangling candidate with "
+    //                << flowCount << " distinct flows." << endl;
+    //       }
+    //   }
+    //
+    // ========================================================================
+
     return;
 
 

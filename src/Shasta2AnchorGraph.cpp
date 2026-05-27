@@ -309,8 +309,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
                 // Always add to transitionReads (even if read isn't in readIntervals,
                 // it still provides transition evidence).
-                const_cast<AnchorWindow&>(anchorWindows[wid])
-                    .transitionReads[{prev, next}].push_back(oid);
+                auto& w = const_cast<AnchorWindow&>(anchorWindows[wid]);
+                w.transitionReads[{prev, next}].push_back(oid);
+
+                // Track backbone read's transition.
+                if(oid == w.backboneOrientedReadId) {
+                    w.backbonePreviousWindow = prev;
+                    w.backboneNextWindow = next;
+                }
             }
         }
     }
@@ -463,7 +469,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
 
             cout << "  Window " << w
-                 << " (" << totalTransitionReads << " reads): incoming=[";
+                 << " (backbone: ";
+            if(window.backbonePreviousWindow == noW) cout << "-"; else cout << window.backbonePreviousWindow;
+            cout << "→" << w << "→";
+            if(window.backboneNextWindow == noW) cout << "-"; else cout << window.backboneNextWindow;
+            cout << ", " << totalTransitionReads << " reads): incoming=[";
             bool first = true;
             for(const auto& [fromW, count] : incomingCounts) {
                 if(!first) cout << ", ";

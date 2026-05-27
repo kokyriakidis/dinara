@@ -90,10 +90,40 @@ struct AnchorWindow {
     static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
     std::map<std::pair<uint32_t, uint32_t>, std::vector<OrientedReadId>> transitionReads;
 
+    // Backbone read's transition: which windows the backbone connects from/to.
+    uint32_t backbonePreviousWindow = noWindow;
+    uint32_t backboneNextWindow = noWindow;
+
     // Read clusters from phasing.
     // Each cluster is a set of reads that phase together.
     // Cluster 0 contains the backbone read.
     std::vector<std::vector<OrientedReadId>> readClusters;
+
+    // Compute per-cluster transition summaries from readClusters and transitionReads.
+    // Returns one map per cluster: (previousWindow, nextWindow) -> read count.
+    // Must be called after both readClusters and transitionReads are populated.
+    std::vector<std::map<std::pair<uint32_t, uint32_t>, uint64_t>>
+    computeClusterTransitions() const {
+        // Build reverse lookup: orientedReadId -> (previousWindow, nextWindow).
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> readTransition;
+        for(const auto& [key, reads] : transitionReads) {
+            for(const auto& oid : reads) {
+                readTransition[oid.getValue()] = key;
+            }
+        }
+
+        std::vector<std::map<std::pair<uint32_t, uint32_t>, uint64_t>> result;
+        result.resize(readClusters.size());
+        for(uint64_t ci = 0; ci < readClusters.size(); ci++) {
+            for(const auto& oid : readClusters[ci]) {
+                auto it = readTransition.find(oid.getValue());
+                if(it != readTransition.end()) {
+                    result[ci][it->second]++;
+                }
+            }
+        }
+        return result;
+    }
 
     // True if the cluster at the same index contains unclassified reads
     // (reads that don't span any het sites and belong to both haplotypes).
