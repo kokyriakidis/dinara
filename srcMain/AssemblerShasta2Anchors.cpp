@@ -897,6 +897,7 @@ namespace dinara {
             shastaOwner,
             *shastaReadsPtr,
             assembler.assemblerInfo->k,
+            shastaMarkers,
             shastaMarkerKmers,
             minAnchorCoverageDinara,
             maxAnchorCoverageDinara,
