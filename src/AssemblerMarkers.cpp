@@ -40,6 +40,8 @@ void Assembler::findMarkers(uint64_t threadCount)
 
 
 
+
+
 // Helper: compute deduplicated canonical closed syncmer markers for a read.
 // The sketcher must be configured with (k_scan, s) where k_scan = k for odd k, or k+1 for even k.
 // If validMarkers is provided, it is filled with (position, kmerId).
@@ -1603,3 +1605,172 @@ void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
         }
     }
 }
+
+
+// =============================================================================
+// Remove markers whose canonical k-mer appears more than once in the reference.
+// A k-mer that is non-unique in the reference cannot serve as an unambiguous
+// anchor for SV detection. This removes such markers from ALL reads (and the
+// reference itself) so they don't pollute the inverted index.
+//
+// The approach:
+//   1. Scan reference reads (strand 0), collect all canonical k-mer IDs.
+//   2. Sort, find duplicates, build a sorted blacklist of non-unique k-mers.
+//   3. Two-pass filter (same pattern as applyKmerCountFilter):
+//      - Pass 1: mark which markers to keep (canonical k-mer not in blacklist).
+//      - Pass 2: rebuild markers and markerKmerIds without blacklisted entries.
+// =============================================================================
+void Assembler::removeNonUniqueReferenceMarkers(
+    uint64_t referenceReadCount,
+    uint64_t threadCount)
+{
+    const auto tBegin = std::chrono::steady_clock::now();
+    performanceLog << timestamp
+        << "Removing non-unique reference k-mers." << endl;
+
+    checkMarkersAreOpen();
+    DINARA_ASSERT(markerKmerIds->isOpen());
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const uint64_t k = assemblerInfo->k;
+    const uint64_t readCount = reads->readCount();
+
+    // =========================================================================
+    // Phase 1: Collect all canonical k-mer IDs from reference reads (strand 0).
+    // =========================================================================
+    vector<KmerId> refKmers;
+    for(uint64_t refId = 0; refId < referenceReadCount; ++refId) {
+        const auto orientedReadId = OrientedReadId(ReadId(refId), 0);
+        const auto kmerIds = (*markerKmerIds)[orientedReadId.getValue()];
+        for(uint64_t i = 0; i < kmerIds.size(); ++i) {
+            refKmers.push_back(kmerIds[i]);
+        }
+    }
+
+    cout << "Reference k-mers (strand 0): " << refKmers.size() << endl;
+
+    // =========================================================================
+    // Phase 2: Sort and find non-unique (duplicate) k-mers.
+    // =========================================================================
+    sort(refKmers.begin(), refKmers.end());
+
+    vector<KmerId> blacklist;
+    for(size_t i = 1; i < refKmers.size(); ++i) {
+        if(refKmers[i] == refKmers[i - 1]) {
+            if(blacklist.empty() || blacklist.back() != refKmers[i]) {
+                blacklist.push_back(refKmers[i]);
+            }
+        }
+    }
+
+    cout << "Non-unique reference k-mers (blacklisted): " << blacklist.size() << endl;
+
+    if(blacklist.empty()) {
+        const auto tEnd = std::chrono::steady_clock::now();
+        const double tTotal = 1.e-9 * double(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin).count());
+        cout << "No non-unique reference k-mers found. Skipping filter ("
+             << tTotal << " s)." << endl;
+        performanceLog << timestamp
+            << "removeNonUniqueReferenceMarkers completed (no-op) in "
+            << tTotal << " s." << endl;
+        return;
+    }
+
+    // blacklist is already sorted (subset of sorted refKmers).
+
+    // =========================================================================
+    // Phase 3: Rebuild markers and markerKmerIds, excluding blacklisted k-mers.
+    // =========================================================================
+    // Swap current markers to "old" for in-place rebuild.
+    const string markersName = markers->getName();
+    const string kmerIdsName = markerKmerIds->getName();
+
+    auto oldMarkers = markers;
+    if(!markersName.empty()) {
+        oldMarkers->rename(markersName + ".old");
+    }
+    markers = make_shared<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>>();
+    markers->createNew(markersName, largeDataPageSize);
+
+    auto oldMarkerKmerIds = markerKmerIds;
+    if(!kmerIdsName.empty()) {
+        oldMarkerKmerIds->rename(kmerIdsName + ".old");
+    }
+    markerKmerIds = make_shared<MemoryMapped::VectorOfVectors<KmerId, uint64_t>>();
+    markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
+
+    uint64_t totalBefore = 0;
+    uint64_t totalAfter = 0;
+
+    for(ReadId readId = 0; ReadId(readId) < ReadId(readCount); ++readId) {
+        const uint64_t readLen = reads->getReadRawSequenceLength(readId);
+
+        // Process strand 0.
+        const auto orientedReadId0 = OrientedReadId(readId, 0);
+        const auto oldM0 = (*oldMarkers)[orientedReadId0.getValue()];
+        const auto oldK0 = (*oldMarkerKmerIds)[orientedReadId0.getValue()];
+        const size_t n = oldM0.size();
+        totalBefore += n;
+
+        // Determine which markers to keep.
+        vector<bool> keep(n);
+        size_t nKeep = 0;
+        for(size_t i = 0; i < n; ++i) {
+            const KmerId kmerId = oldK0[i];
+            // Binary search in blacklist.
+            keep[i] = !std::binary_search(blacklist.begin(), blacklist.end(), kmerId);
+            if(keep[i]) ++nKeep;
+        }
+        totalAfter += nKeep;
+
+        // Write strand 0 markers.
+        markers->appendVector();
+        markerKmerIds->appendVector();
+        for(size_t i = 0; i < n; ++i) {
+            if(keep[i]) {
+                markers->append(oldM0[i]);
+                markerKmerIds->append(oldK0[i]);
+            }
+        }
+
+        // Write strand 1 markers (reverse order, reverse complement positions).
+        const auto oldK1 = (*oldMarkerKmerIds)[OrientedReadId(readId, 1).getValue()];
+        markers->appendVector();
+        markerKmerIds->appendVector();
+        // Strand 1 markers are in reverse order of strand 0.
+        // keep[i] for strand 0 position i corresponds to strand 1 position (n-1-i).
+        for(size_t i = n; i > 0; ) {
+            --i;
+            if(keep[i]) {
+                // Recompute strand 1 position from strand 0 position.
+                const uint32_t pos0 = oldM0[i].position;
+                CompressedMarker cm;
+                cm.position = static_cast<uint32_t>(readLen - k - pos0);
+                markers->append(cm);
+                markerKmerIds->append(oldK1[n - 1 - i]);
+            }
+        }
+    }
+
+    // Remove old data.
+    oldMarkers->remove();
+    oldMarkerKmerIds->remove();
+
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin).count());
+
+    cout << "Marker filtering complete in " << tTotal << " s." << endl;
+    cout << "  Markers before: " << totalBefore << " (per strand)" << endl;
+    cout << "  Markers after:  " << totalAfter << " (per strand)" << endl;
+    cout << "  Removed:        " << (totalBefore - totalAfter) << " markers per strand." << endl;
+
+    performanceLog << timestamp
+        << "removeNonUniqueReferenceMarkers completed in " << tTotal << " s. "
+        << "Removed " << (totalBefore - totalAfter) << " markers." << endl;
+}
+

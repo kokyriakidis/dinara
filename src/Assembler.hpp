@@ -2569,6 +2569,21 @@ public:
     // Prune existing markers based on KmerCounter frequencies.
     void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes = true);
 
+    // Remove markers whose k-mer appears more than once in the reference reads
+    // (read IDs 0..referenceReadCount-1). Non-unique reference k-mers are
+    // ambiguous anchors and cannot be used for read-to-reference alignment.
+    void removeNonUniqueReferenceMarkers(uint64_t referenceReadCount, uint64_t threadCount);
+
+    // Classify multi-chain alignments into primary/supplementary/secondary
+    // based on query coordinate overlap (minimap2 mm_set_parent logic).
+    // Chains covering non-overlapping query regions are supplementary (split-read SV signal).
+    // Chains overlapping an existing primary on the query are secondary.
+    // Writes a TSV with per-chain classification.
+    void classifySplitAlignments(
+        uint64_t referenceReadCount,
+        double maskLevel,           // Max query overlap fraction to be supplementary (minimap2: 0.5).
+        const string& outputFileName);
+
     // Alignment candidates using Inverted Index (modular pipeline).
     // Phase 1-4: Build the inverted index for overlap candidate discovery.
     void buildInvertedIndex(uint64_t threadCount);
@@ -2614,6 +2629,11 @@ public:
 		             bool lchainIsAccurate = true;
 		             bool useEcScoring = true;
 	             bool enableMcopyFast = true;
+             // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr.
+             int chainingMode = 0;
+             int32_t minimap2Bw = 100;
+             int32_t minimap2MaxGap = 5000;
+             int32_t minimap2MinChainScore = 25;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;
              uint32_t mcopyKhitCutoff = 32;
