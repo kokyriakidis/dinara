@@ -1661,14 +1661,12 @@ void dinara::main::assemble(
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
     // Save the pre-transitive-reduction Shasta2 anchor graph.
-    // With paired anchor IDs (2*i = canonical, 2*i+1 = RC), the anchor graph
-    // IDs directly match shasta2's scheme from readExternalAnchors.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
-
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
+
+    // Export in shasta2-native format for --external-anchor-graph-name.
+    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
 
     // ========================================================================
     // Window transition data usage examples.
@@ -2906,7 +2904,7 @@ void dinara::main::assemble(
         *shasta2Journeys,
         *shasta2AnchorGraph,
         shasta2AssemblyGraphOptions);
-    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+    (void)assembler.shasta2AssemblyGraph;
 
 
     return;

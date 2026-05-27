@@ -68,6 +68,8 @@ namespace shasta2 {
     };
 }
 
+
+
 namespace dinara {
 
     // Helper function to perform the actual conversion (multithreaded).
@@ -967,7 +969,7 @@ namespace dinara {
         // Store Anchor Gaps (Ported from Shasta2 Assembler.cpp).
         cout << timestamp << "Storing Anchor Gaps..." << endl;
         {
-            const uint32_t kHalf = uint32_t(shastaAnchors->kHalf);
+            (void)shastaAnchors->kHalf;  // Available if needed for position adjustments.
             // Loop over all ReadIds.
             for(shasta2::ReadId readId=0; readId<shastaReadsPtr->readCount(); readId++) {
                  shasta2::ReadSummary& readSummary = readSummaries[readId];

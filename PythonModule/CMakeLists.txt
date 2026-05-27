@@ -107,6 +107,12 @@ if(NOT SHASTA2_LIB)
     message(FATAL_ERROR "shasta2 library not found. Please install it.")
 endif()
 
+# Allow multiple definitions to resolve duplicate rust_eh_personality
+# from linking both libastarpa_c.a and libpoasta_c.a (each bundles Rust stdlib).
+if(NOT APPLE)
+    set_target_properties(dinaraPythonModule PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
+endif()
+
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule
