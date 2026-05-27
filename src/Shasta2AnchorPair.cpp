@@ -137,12 +137,38 @@ void Shasta2AnchorPair::removeNegativeOffsets(const Shasta2Anchors& anchors)
     getAnchorPositions(anchors, anchorPositions);
     DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
 
+    // Also get journey positions for diagnostic output.
+    vector< pair<uint32_t, uint32_t> > journeyPositions;
+    getPositionsInJourneys(anchors, journeyPositions);
+
     vector<OrientedReadId> newOrientedReadIds;
+    uint64_t removedCount = 0;
     for(uint64_t i=0; i<orientedReadIds.size(); i++) {
         const auto& p = anchorPositions[i];
         if(p.second >= p.first) {
             newOrientedReadIds.push_back(orientedReadIds[i]);
+        } else {
+            if(removedCount == 0) {
+                cout << "Negative base offsets on edge "
+                     << anchorIdA << " -> " << anchorIdB << ":" << endl;
+            }
+            if(removedCount < 5) {
+                cout << "  " << orientedReadIds[i]
+                     << " basePos A=" << p.first << " B=" << p.second
+                     << " (offset " << int64_t(p.second) - int64_t(p.first) << ")"
+                     << " journeyPos A=" << journeyPositions[i].first
+                     << " B=" << journeyPositions[i].second
+                     << " ordinal A=" << anchors[anchorIdA][0].ordinal
+                     << " B=" << anchors[anchorIdB][0].ordinal
+                     << endl;
+            }
+            ++removedCount;
         }
+    }
+    if(removedCount > 0) {
+        cout << "  Removed " << removedCount << " / " << orientedReadIds.size()
+             << " reads with negative base offset from edge "
+             << anchorIdA << " -> " << anchorIdB << endl;
     }
 
     orientedReadIds.swap(newOrientedReadIds);

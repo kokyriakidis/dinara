@@ -239,31 +239,12 @@ void Shasta2Anchors::constructThreadFunctionPass1(uint64_t threadId)
 {
     uint64_t begin, end;
 
-    vector<OrientedReadId> orientedReadIds;
-
     while(getNextBatch(begin, end)) {
         for(uint64_t anchorId=begin; anchorId!=end; anchorId++) {
             const MarkerGraphVertexId vertexId = constructData.selectedVertexIds[anchorId];
             
-            orientedReadIds.clear();
-
-            // This anchor corresponds exactly to the MarkerGraph vertex.
-            // Do not mix in the reverse complement vertex.
-            for(const MarkerId markerId : markerGraph.getVertexMarkerIds(vertexId)) {
-                OrientedReadId orientedReadId;
-                uint32_t ordinal;
-                tie(orientedReadId, ordinal) = findMarkerId(markerId, markers);
-                (void)ordinal;
-                orientedReadIds.push_back(orientedReadId);
-            }
-
-            // Deduplicate orientedReadIds to get unique count.
-            // Shasta2Anchors enforce one marker per oriented readID per anchor.
-            std::sort(orientedReadIds.begin(), orientedReadIds.end());
-            auto last = std::unique(orientedReadIds.begin(), orientedReadIds.end());
-            uint64_t count = std::distance(orientedReadIds.begin(), last);
-            
-            anchorMarkerInfos.incrementCount(anchorId, count);
+            const auto vertexMarkerIds = markerGraph.getVertexMarkerIds(vertexId);
+            anchorMarkerInfos.incrementCount(anchorId, vertexMarkerIds.size());
         }
     }
 }
@@ -294,13 +275,6 @@ void Shasta2Anchors::constructThreadFunctionPass2(uint64_t threadId)
             
             // Sort by OrientedReadId to ensure canonical order for the Anchor.
             std::sort(buffer.begin(), buffer.end());
-
-            // Deduplicate: keep only unique OrientedReadIds.
-            auto last = std::unique(buffer.begin(), buffer.end(),
-                [](const Shasta2AnchorMarkerInfo& a, const Shasta2AnchorMarkerInfo& b){
-                    return a.orientedReadId == b.orientedReadId;
-                });
-            buffer.erase(last, buffer.end());
             
             // Store in reverse because store() fills each vector from end to begin.
             // This preserves ascending OrientedReadId order in final storage.
