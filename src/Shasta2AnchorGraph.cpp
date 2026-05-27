@@ -728,6 +728,57 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << " (" << finalIntraCount << " intra-window, "
          << finalAltPathCount << " alternate-path, "
          << finalInterCount << " inter-window)." << endl;
+
+    // Verify all edges have positive average base offset.
+    {
+        uint64_t backwardEdgeCount = 0;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+            const auto& dEdge = anchorGraph[e];
+            const auto& ap = dEdge.anchorPair;
+            if(ap.orientedReadIds.empty()) continue;
+
+            // Compute per-read base offsets.
+            vector< pair<uint32_t, uint32_t> > anchorPositions;
+            ap.getAnchorPositions(anchors, anchorPositions);
+
+            uint64_t forwardCount = 0;
+            uint64_t backwardCount = 0;
+            for(const auto& p : anchorPositions) {
+                if(p.second >= p.first) {
+                    ++forwardCount;
+                } else {
+                    ++backwardCount;
+                }
+            }
+
+            if(backwardCount > 0) {
+                ++backwardEdgeCount;
+                if(backwardEdgeCount <= 10) {
+                    cout << "BACKWARD EDGE " << ap.anchorIdA << " -> " << ap.anchorIdB
+                         << ": " << forwardCount << " forward, " << backwardCount << " backward"
+                         << " out of " << ap.orientedReadIds.size() << " reads"
+                         << " (offset=" << dEdge.offset << ")" << endl;
+                    // Print details for first few backward reads.
+                    uint64_t printed = 0;
+                    for(uint64_t i = 0; i < anchorPositions.size() && printed < 3; i++) {
+                        const auto& p = anchorPositions[i];
+                        if(p.second < p.first) {
+                            cout << "  " << ap.orientedReadIds[i]
+                                 << " posA=" << p.first << " posB=" << p.second
+                                 << " (offset=" << int64_t(p.second) - int64_t(p.first) << ")"
+                                 << endl;
+                            ++printed;
+                        }
+                    }
+                }
+            }
+        }
+        if(backwardEdgeCount > 0) {
+            cout << "WARNING: " << backwardEdgeCount << " edges have reads with negative base offsets." << endl;
+        } else {
+            cout << "All edges have positive base offsets." << endl;
+        }
+    }
 }
 
 
