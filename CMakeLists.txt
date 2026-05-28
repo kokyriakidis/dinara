@@ -86,9 +86,6 @@ endif()
 if(NOT HTS_LINK_FLAGS)
     set(HTS_LINK_FLAGS "-lhts -lhtscodecs -ldeflate -llzma -lbz2")
 endif()
-if(NOT CURL_LINK_FLAGS)
-    set(CURL_LINK_FLAGS "-lcurl")
-endif()
 
 # Extract -l and -L flags, then filter out libs without a static archive.
 # This is needed because pkg-config --static may list libraries that only
@@ -129,7 +126,13 @@ function(extract_static_link_flags INPUT_STRING OUTPUT_VAR)
 endfunction()
 
 extract_static_link_flags("${HTS_LINK_FLAGS}" HTS_LINK_FLAGS)
-extract_static_link_flags("${CURL_LINK_FLAGS}" CURL_LINK_FLAGS)
+
+# Only link curl if htslib actually depends on it.
+if(HTS_LINK_FLAGS MATCHES "-lcurl")
+    extract_static_link_flags("${CURL_LINK_FLAGS}" CURL_LINK_FLAGS)
+else()
+    set(CURL_LINK_FLAGS "")
+endif()
 
 message(STATUS "HTS link flags: ${HTS_LINK_FLAGS}")
 message(STATUS "CURL link flags: ${CURL_LINK_FLAGS}")
