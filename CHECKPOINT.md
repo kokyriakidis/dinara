@@ -348,6 +348,9 @@ A coverage-drop region is marker-depleted if either all windows have zero refere
 #### VNTR-like coverage-drop suppression
 Large coverage-drop regions (>500bp) with minRatio ≈ 0 and strong edge BPs with low spanning counts (<10) are suppressed as VNTR-like. Prevents false deletion calls from VNTR regions where chains don't span due to repeat structure rather than a real deletion.
 
+#### Hit-depth drop zone span for large insertions
+When a path-based insertion call is small (<200bp) but a further right BP exists with a hit-depth drop zone between L and R, the insertion size is re-estimated from the drop zone span. The contiguous region of low hit-depth (below 50% of median) between the breakpoints approximates the insertion size. Tries all valid candidate right BPs and picks the one with the largest drop span. Fixes INS454 (156bp → 400bp) and INS277 (56bp → 250bp).
+
 ### Key Files (SV Detection)
 
 | File | Purpose |
@@ -376,6 +379,8 @@ Large coverage-drop regions (>500bp) with minRatio ≈ 0 and strong edge BPs wit
 | DEL119a | 119bp | 115bp | flank-gap DEL |
 | DEL119b | 119bp | 115bp | flank-gap DEL |
 | DEL147 | 234bp | 229bp | split-read (2 reads) |
+| INS454 | 454bp | 400bp | hit-depth drop zone span (was 156bp path-based) |
+| INS277 | 277bp | 250bp | hit-depth drop zone span (was 56bp path-based) |
 
 **Undetected (known limitations):**
 
@@ -386,6 +391,7 @@ Large coverage-drop regions (>500bp) with minRatio ≈ 0 and strong edge BPs wit
 | INS65 (65bp) | 1700bp VNTR, BAM-depleted |
 | INS235 (235bp) | VNTR, 16.5x coverage (heavily depleted) |
 | INS61 (61bp) | 2256bp AT-repeat microsatellite |
+| INS108 (108bp) | Small diagonal shifts below detection threshold |
 | DEL379 (379bp) | 98% repetitive 10-mers |
 
 ### Known Limitations
