@@ -1622,11 +1622,13 @@ void Assembler::applyKmerCountFilterThreadFunctionPass2(size_t /* threadId */)
 // =============================================================================
 void Assembler::removeNonUniqueReferenceMarkers(
     uint64_t referenceReadCount,
-    uint64_t threadCount)
+    uint64_t threadCount,
+    uint64_t maxRefKmerFreq)
 {
     const auto tBegin = std::chrono::steady_clock::now();
     performanceLog << timestamp
-        << "Removing non-unique reference k-mers." << endl;
+        << "Removing non-unique reference k-mers (maxFreq="
+        << maxRefKmerFreq << ")." << endl;
 
     checkMarkersAreOpen();
     DINARA_ASSERT(markerKmerIds->isOpen());
@@ -1653,20 +1655,150 @@ void Assembler::removeNonUniqueReferenceMarkers(
     cout << "Reference k-mers (strand 0): " << refKmers.size() << endl;
 
     // =========================================================================
-    // Phase 2: Sort and find non-unique (duplicate) k-mers.
+    // Phase 2: Sort and find k-mers exceeding the frequency threshold.
     // =========================================================================
+    // A k-mer appearing more than maxRefKmerFreq times in the reference
+    // is blacklisted. Default maxRefKmerFreq=1 removes all non-unique
+    // k-mers (original behavior). Higher values retain low-copy repeat
+    // markers, which is useful for SV detection in VNTR regions where
+    // having some markers is better than none.
     sort(refKmers.begin(), refKmers.end());
 
     vector<KmerId> blacklist;
-    for(size_t i = 1; i < refKmers.size(); ++i) {
-        if(refKmers[i] == refKmers[i - 1]) {
-            if(blacklist.empty() || blacklist.back() != refKmers[i]) {
-                blacklist.push_back(refKmers[i]);
+    size_t i = 0;
+    while(i < refKmers.size()) {
+        size_t j = i + 1;
+        while(j < refKmers.size() && refKmers[j] == refKmers[i]) ++j;
+        const uint64_t freq = j - i;
+        if(freq > maxRefKmerFreq) {
+            blacklist.push_back(refKmers[i]);
+        }
+        i = j;
+    }
+
+    cout << "Reference k-mers exceeding maxFreq=" << maxRefKmerFreq
+         << " (blacklisted): " << blacklist.size() << endl;
+
+    // =========================================================================
+    // Phase 2b: Adaptive rescue for marker-depleted windows.
+    // =========================================================================
+    // After blacklisting, some reference windows may have zero remaining
+    // markers (common in VNTRs). For those windows, rescue k-mers with
+    // freq 2..rescueMaxFreq by removing them from the blacklist. This
+    // retains some markers in depleted regions without affecting non-
+    // depleted regions.
+    if(!blacklist.empty() && maxRefKmerFreq == 1) {
+        const uint64_t rescueMaxFreq = 2;
+        const uint32_t windowSize = 50;
+
+        // Compute reference marker positions after blacklisting.
+        // Use reference read 0 (strand 0).
+        const auto refOrientedReadId = OrientedReadId(ReadId(0), 0);
+        const auto refMarkerPositions = (*markers)[refOrientedReadId.getValue()];
+        const auto refKmerIdsSpan = (*markerKmerIds)[refOrientedReadId.getValue()];
+        const uint64_t refLen = reads->getReadRawSequenceLength(ReadId(0));
+        const uint32_t nWindows = uint32_t((refLen + windowSize - 1) / windowSize);
+
+        // Count markers per window after blacklisting.
+        vector<uint32_t> windowMarkerCount(nWindows, 0);
+        for(size_t mi = 0; mi < refMarkerPositions.size(); ++mi) {
+            const KmerId kid = refKmerIdsSpan[mi];
+            if(std::binary_search(blacklist.begin(), blacklist.end(), kid))
+                continue;
+            const uint32_t pos = refMarkerPositions[mi].position;
+            const uint32_t w = pos / windowSize;
+            if(w < nWindows) ++windowMarkerCount[w];
+        }
+
+        // Find depleted windows (zero markers after blacklisting).
+        uint32_t depletedWindows = 0;
+        for(uint32_t w = 0; w < nWindows; ++w) {
+            if(windowMarkerCount[w] == 0) ++depletedWindows;
+        }
+
+        if(depletedWindows > 0) {
+            // Build a set of reference positions in depleted windows.
+            // For each blacklisted k-mer, check if it has an occurrence
+            // in a depleted window. If so, and its freq <= rescueMaxFreq,
+            // rescue it.
+            // Build sorted list of rescue-eligible k-mers
+            // (freq 2..rescueMaxFreq).
+            vector<KmerId> rescueEligible;
+            i = 0;
+            while(i < refKmers.size()) {
+                size_t j2 = i + 1;
+                while(j2 < refKmers.size() && refKmers[j2] == refKmers[i]) ++j2;
+                const uint64_t freq = j2 - i;
+                if(freq > maxRefKmerFreq && freq <= rescueMaxFreq) {
+                    rescueEligible.push_back(refKmers[i]);
+                }
+                i = j2;
+            }
+            sort(rescueEligible.begin(), rescueEligible.end());
+
+            // Mark windows that are part of a contiguous depleted
+            // region (>=5 consecutive depleted windows, i.e. >=250bp).
+            // Shorter depleted stretches are likely low-complexity or
+            // short repeats where rescue causes more harm than good.
+            vector<bool> isVntrDepleted(nWindows, false);
+            {
+                uint32_t runStart = UINT32_MAX;
+                uint32_t runLen = 0;
+                for(uint32_t w = 0; w <= nWindows; ++w) {
+                    if(w < nWindows && windowMarkerCount[w] == 0) {
+                        if(runStart == UINT32_MAX) runStart = w;
+                        ++runLen;
+                    } else {
+                        if(runLen >= 5) {
+                            for(uint32_t rw = runStart;
+                                rw < runStart + runLen; ++rw)
+                                isVntrDepleted[rw] = true;
+                        }
+                        runStart = UINT32_MAX;
+                        runLen = 0;
+                    }
+                }
+            }
+
+            // Check which rescue-eligible k-mers have occurrences
+            // in VNTR-depleted windows.
+            vector<KmerId> rescueSet;
+            for(size_t mi = 0; mi < refMarkerPositions.size(); ++mi) {
+                const KmerId kid = refKmerIdsSpan[mi];
+                if(!std::binary_search(
+                       rescueEligible.begin(),
+                       rescueEligible.end(), kid))
+                    continue;
+                const uint32_t pos = refMarkerPositions[mi].position;
+                const uint32_t w = pos / windowSize;
+                if(w < nWindows && isVntrDepleted[w]) {
+                    rescueSet.push_back(kid);
+                }
+            }
+            sort(rescueSet.begin(), rescueSet.end());
+            rescueSet.erase(
+                unique(rescueSet.begin(), rescueSet.end()),
+                rescueSet.end());
+
+            if(!rescueSet.empty()) {
+                // Remove rescued k-mers from the blacklist.
+                vector<KmerId> newBlacklist;
+                newBlacklist.reserve(blacklist.size());
+                for(const auto& kid : blacklist) {
+                    if(!std::binary_search(
+                           rescueSet.begin(),
+                           rescueSet.end(), kid)) {
+                        newBlacklist.push_back(kid);
+                    }
+                }
+                cout << "  Rescued " << rescueSet.size()
+                     << " k-mers in " << depletedWindows
+                     << " depleted windows (rescueMaxFreq="
+                     << rescueMaxFreq << ")" << endl;
+                blacklist = std::move(newBlacklist);
             }
         }
     }
-
-    cout << "Non-unique reference k-mers (blacklisted): " << blacklist.size() << endl;
 
     if(blacklist.empty()) {
         const auto tEnd = std::chrono::steady_clock::now();

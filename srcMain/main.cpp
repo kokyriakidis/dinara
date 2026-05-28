@@ -3942,10 +3942,13 @@ void dinara::main::svanchors(
     // ========================================================================
     // Step 3b: Remove markers whose k-mer is non-unique in the reference.
     // ========================================================================
-    // A k-mer that appears more than once in the reference cannot serve as
-    // an unambiguous anchor. Remove it from all reads (and the reference).
+    // Remove non-unique reference k-mers (default: freq > 1).
+    // The strict threshold prevents false chains from multi-mapping
+    // k-mers. Marker-depleted VNTR regions are handled downstream
+    // by the SV detection engine.
     cout << timestamp << "Removing non-unique reference k-mers." << endl;
-    assembler.removeNonUniqueReferenceMarkers(referenceReadCount, threadCount);
+    assembler.removeNonUniqueReferenceMarkers(
+        referenceReadCount, threadCount);
 
     // ========================================================================
     // Step 4: Build the inverted index.
