@@ -107,7 +107,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const vector<AnchorWindow>& anchorWindows,
     uint64_t minInterWindowCoverage,
     uint64_t threadCount,
-    const Reads* reads) :
+    const Reads* reads,
+    const std::map<Shasta2AnchorId, vector<Shasta2AnchorId>>* anchorSplitMap) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
@@ -161,6 +162,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // If we have split anchors, map them to the same windows as their originals.
+    if(anchorSplitMap) {
+        for(const auto& [originalId, splitIds] : *anchorSplitMap) {
+            const uint32_t windowId = (uint64_t(originalId) < anchorToWindow.size())
+                ? anchorToWindow[uint64_t(originalId)] : noWindow;
+            for(const Shasta2AnchorId splitId : splitIds) {
+                const uint64_t sid = uint64_t(splitId);
+                if(sid < anchorToWindow.size()) {
+                    anchorToWindow[sid] = windowId;
+                }
+            }
+        }
+    }
+
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
@@ -181,34 +196,78 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Intra-window edges: consecutive filtered backbone anchor pairs,
     // for both the original windows and their RC mirrors.
+    // If anchorSplitMap is provided, split anchors create parallel chains.
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
 
-        // Use filtered backbone positions if available.
+        // Collect the backbone anchor IDs for this window.
+        vector<Shasta2AnchorId> backboneAnchors;
         const auto& positions = window.filteredBackbonePositions;
         if(!positions.empty()) {
-            for(uint64_t i = 0; i + 1 < positions.size(); i++) {
-                const Shasta2AnchorId anchorIdA = backboneJourney[positions[i]];
-                const Shasta2AnchorId anchorIdB = backboneJourney[positions[i + 1]];
-                addEdgeIfValid(anchorIdA, anchorIdB);
+            for(const uint32_t pos : positions) {
+                backboneAnchors.push_back(backboneJourney[pos]);
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                backboneAnchors.push_back(backboneJourney[pos]);
+            }
+        }
+
+        if(backboneAnchors.size() < 2) continue;
+
+        // Check if any backbone anchor in this window was split.
+        bool windowWasSplit = false;
+        uint64_t pathCount = 1;
+        if(anchorSplitMap) {
+            for(const Shasta2AnchorId aid : backboneAnchors) {
+                auto it = anchorSplitMap->find(aid);
+                if(it != anchorSplitMap->end()) {
+                    windowWasSplit = true;
+                    pathCount = it->second.size();
+                    break;
+                }
+            }
+        }
+
+        if(!windowWasSplit) {
+            // No split: create edges using original anchor IDs.
+            for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
+                addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
                 // RC mirror edge.
-                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
-                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
                 if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
                     addEdgeIfValid(rcB, rcA);
                 }
             }
         } else {
-            // Fallback: all consecutive positions.
-            for(uint32_t pos = window.backboneBegin; pos + 1 < window.backboneEnd; pos++) {
-                const Shasta2AnchorId anchorIdA = backboneJourney[pos];
-                const Shasta2AnchorId anchorIdB = backboneJourney[pos + 1];
-                addEdgeIfValid(anchorIdA, anchorIdB);
-                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(anchorIdA) ^ 1ULL);
-                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(anchorIdB) ^ 1ULL);
-                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                    addEdgeIfValid(rcB, rcA);
+            // Split: create parallel chains, one per path.
+            for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+                for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
+                    // Look up the split anchor IDs for this path.
+                    Shasta2AnchorId aidA = backboneAnchors[i];
+                    Shasta2AnchorId aidB = backboneAnchors[i + 1];
+
+                    if(anchorSplitMap) {
+                        auto itA = anchorSplitMap->find(aidA);
+                        if(itA != anchorSplitMap->end() && pathIdx < itA->second.size()) {
+                            aidA = itA->second[pathIdx];
+                        }
+                        auto itB = anchorSplitMap->find(aidB);
+                        if(itB != anchorSplitMap->end() && pathIdx < itB->second.size()) {
+                            aidB = itB->second[pathIdx];
+                        }
+                    }
+
+                    addEdgeIfValid(aidA, aidB);
+
+                    // RC mirror edge.
+                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(aidA) ^ 1ULL);
+                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(aidB) ^ 1ULL);
+                    if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                        addEdgeIfValid(rcB, rcA);
+                    }
                 }
             }
         }
