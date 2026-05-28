@@ -358,7 +358,13 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 After blacklisting non-unique reference k-mers, some reference windows have zero remaining markers (common in VNTRs where all k-mers are repetitive). Phase 2b of `removeNonUniqueReferenceMarkers` identifies contiguous depleted regions (≥5 consecutive 50bp windows with zero markers, i.e. ≥250bp) and rescues k-mers with reference frequency exactly 2 by removing them from the blacklist. Only k-mers that have at least one occurrence in a VNTR-depleted window are rescued. This provides some anchoring in otherwise marker-free VNTR regions while avoiding false chains in non-VNTR regions. The conservative thresholds (freq=2 only, ≥5 consecutive windows) prevent regressions in cases where rescued k-mers would create ambiguous chains.
 
 #### SA-tag size refinement for coverage-drop DEL calls
-When an adaptive-bimodal or flank-gap DEL call is made, the size may be inflated by repeat-unit slippage in the diagonal analysis. If an SA-tag DEL call exists nearby (within 500bp) with ≥2 supporting reads and a compatible size (within 0.3×–1.5× for adaptive-bimodal, 0.3×–2× for flank-gap), the SA-tag size replaces the diagonal-based size. SA-tag uses BAM aligner coordinates which handle repeats better than k-mer chaining. Fixes DEL182 (240bp → 183bp).
+When an adaptive-bimodal or flank-gap DEL call is made, the size may be inflated by repeat-unit slippage in the diagonal analysis. If an SA-tag DEL call exists nearby (within 500bp) with ≥2 supporting reads and a compatible size, the SA-tag size replaces the diagonal-based size. SA-tag uses BAM aligner coordinates which handle repeats better than k-mer chaining. Size range: 0.3×–1.5× for weak SA-tag (2-4 reads), 0.3×–5× for strong SA-tag (≥5 reads). Fixes DEL182 (240bp → 183bp), DEL910 (252bp → 859bp).
+
+#### SA-tag out-of-region filtering
+SA-tag calls with breakpoints outside the local reference region are discarded. These arise when supplementary alignments map to distant genomic locations, producing bogus calls with absolute genomic coordinates instead of local coordinates.
+
+#### Single-cluster promotion
+Per-read DEL/INS clusters with ≥15 reads are promoted to calls even without merging with other clusters. Large SVs (>1000bp) often produce a single cluster where all reads see the same breakpoint.
 
 #### Repetitive region INS call suppression
 In highly repetitive regions (≥5 left BPs AND ≥5 right BPs), path-based insertion calls are suppressed unless both breakpoints have very strong overhang support (≥20 reads each). Many breakpoints on both sides indicate a deeply repetitive region where the read graph has many false connections through rescued k-mers, producing artifact insertion calls. Fixes DEL379 which had three false INS calls (264bp, 168bp, 238bp) from rescued k-mer chains.
@@ -417,22 +423,23 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 |-----|-------|---|---|---|-----|
 | DEL <100bp | 10 | 7 | 2 | 1 | 70% |
 | DEL 100-500bp | 10 | 8 | 1 | 1 | 80% |
-| DEL 500-1000bp | 10 | 5 | 4 | 1 | 50% |
-| DEL >1000bp | 10 | 8 | 2 | 0 | 80% |
+| DEL 500-1000bp | 10 | 5 | 3 | 2 | 50% |
+| DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
 | INS <100bp | 10 | 3 | 6 | 1 | 30% |
 | INS 100-500bp | 10 | 0 | 6 | 4 | 0% |
 | INS 500-1000bp | 10 | 4 | 2 | 4 | 40% |
 | INS >1000bp | 10 | 0 | 5 | 5 | 0% |
-| **TOTAL** | **80** | **35** | **28** | **17** | **44%** |
+| **TOTAL** | **80** | **35** | **26** | **19** | **44%** |
 
-**Correct type (✅+⚠️): 63/80 = 79%**
+**Correct type (✅+⚠️): 61/80 = 76%**
 
 Key observations:
-- **DEL detection is strong**: 28/40 exact (70%), 35/40 correct type (88%)
+- **DEL detection is strong**: 28/40 exact (70%), 33/40 correct type (83%)
 - **INS detection is weak**: 7/40 exact (18%), 28/40 correct type (70%)
 - **INS sizing is the main gap**: path-based sizing undershoots for large INS (>200bp) because read-graph paths can't span beyond read length; overshoots for small INS (<100bp) in VNTRs due to repeat-unit inflation
-- **DEL 500-1000bp** is the weakest DEL bin: SA-tag calls exist but sizes are sometimes wrong due to repeat-unit slippage
+- **DEL 500-1000bp** is the weakest DEL bin: repeat-unit slippage affects both diagonal-shift and SA-tag sizing
 - **INS 100-500bp and INS >1000bp** have 0% exact: these insertions exceed read length, making path-based sizing unreliable
+- **Type confusion**: 10 INS cases are detected as DEL — insertions in tandem repeats create diagonal shifts indistinguishable from deletions with short reads
 
 ### Known Limitations
 
