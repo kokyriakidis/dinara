@@ -80,13 +80,16 @@ public:
     // Construct from anchor windows: each window becomes a chain of its
     // backbone anchors, and inter-window edges are discovered by walking
     // read journeys.
+    // If anchorSplitMap is provided, tangled backbone anchors are replaced
+    // by their split copies, creating parallel chains per path.
     Shasta2AnchorGraph(
         const Shasta2Anchors&,
         const Shasta2Journeys&,
         const vector<AnchorWindow>& anchorWindows,
         uint64_t minInterWindowCoverage,
         uint64_t threadCount,
-        const Reads* reads = nullptr);
+        const Reads* reads = nullptr,
+        const std::map<Shasta2AnchorId, vector<Shasta2AnchorId>>* anchorSplitMap = nullptr);
 
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}

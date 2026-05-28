@@ -25,6 +25,7 @@
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AssemblyGraph.hpp"
+#include "DinaraDetangle.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -1660,7 +1661,37 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    // Save the pre-transitive-reduction Shasta2 anchor graph.
+    // Save the pre-detangling anchor graph.
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa");
+    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
+
+    // Detangle: split backbone anchors of tangled windows.
+    {
+        std::map<Shasta2AnchorId, std::vector<Shasta2AnchorId>> anchorSplitMap;
+        const uint64_t detangledCount = detangleWindows(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            anchorWindows,
+            minInterWindowCoverage,
+            anchorSplitMap);
+
+        if(detangledCount > 0) {
+            cout << timestamp << "Rebuilding anchor graph after detangling..." << endl;
+
+            // Rebuild the anchor graph with the split anchor map.
+            assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+                *shasta2Anchors,
+                *shasta2Journeys,
+                anchorWindows,
+                minInterWindowCoverage,
+                threadCount,
+                &assembler.getReads(),
+                &anchorSplitMap);
+            shasta2AnchorGraph = assembler.shasta2AnchorGraph;
+        }
+    }
+
+    // Save the post-detangling anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
