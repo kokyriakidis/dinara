@@ -2546,19 +2546,43 @@ void Assembler::buildSvMSA(
 
                                 const uint32_t insBpPos =
                                     (lbp.refPos + bestInsRbp->refPos) / 2;
-                                cout << "    >>> INSERTION CALL: "
-                                     << "size=" << bestInsSz << "bp, "
-                                     << "breakpoint=" << insBpPos << ", "
-                                     << "leftEnds=" << lbp.endpointCount << ", "
-                                     << "rightStarts=" << bestInsRbp->endpointCount << ", "
-                                     << "hops=" << bestInsHops
-                                     << " (pathDist=" << bestInsPathDist
-                                     << " refGap=" << bestInsRefGap << ")"
-                                     << endl;
-                                insertionCallRegions.push_back({
-                                    std::min(lbp.refPos, bestInsRbp->refPos),
-                                    std::max(lbp.refPos, bestInsRbp->refPos)
-                                });
+
+                                // In highly repetitive regions (many
+                                // BPs on both sides), path-based INS
+                                // calls are unreliable because the
+                                // read graph has many false connections
+                                // through rescued k-mers. Suppress
+                                // unless both BPs have very strong
+                                // overhang support.
+                                const bool highlyRepetitive =
+                                    leftBreakpoints.size() >= 5
+                                    && rightBreakpoints.size() >= 5;
+                                if(highlyRepetitive
+                                   && (lbp.ovhReadCount < 20
+                                       || bestInsRbp->ovhReadCount < 20)) {
+                                    cout << "    INS suppressed"
+                                         << " (highly repetitive,"
+                                         << " " << leftBreakpoints.size()
+                                         << "L/" << rightBreakpoints.size()
+                                         << "R BPs): size="
+                                         << bestInsSz << "bp"
+                                         << ", breakpoint="
+                                         << insBpPos << endl;
+                                } else {
+                                    cout << "    >>> INSERTION CALL: "
+                                         << "size=" << bestInsSz << "bp, "
+                                         << "breakpoint=" << insBpPos << ", "
+                                         << "leftEnds=" << lbp.endpointCount << ", "
+                                         << "rightStarts=" << bestInsRbp->endpointCount << ", "
+                                         << "hops=" << bestInsHops
+                                         << " (pathDist=" << bestInsPathDist
+                                         << " refGap=" << bestInsRefGap << ")"
+                                         << endl;
+                                    insertionCallRegions.push_back({
+                                        std::min(lbp.refPos, bestInsRbp->refPos),
+                                        std::max(lbp.refPos, bestInsRbp->refPos)
+                                    });
+                                }
                             }
                         }
                     }
@@ -4205,6 +4229,33 @@ void Assembler::buildSvMSA(
                                         {cdc.startPos,
                                          cdc.endPos});
                                 } else {
+                                    // SA-tag refinement for
+                                    // flank-gap DEL calls.
+                                    for(const auto& sc :
+                                        saTagCalls) {
+                                        if(sc.svType == "DEL"
+                                           && sc.readCount >= 2
+                                           && sc.size >= 30
+                                           && sc.size <= 5000
+                                           && abs(int64_t(sc.refPos)
+                                                  - int64_t(bpPos))
+                                              < 500
+                                           && sc.size <= uint32_t(
+                                                  flankShift * 2)
+                                           && sc.size >= uint32_t(
+                                                  flankShift * 0.3)){
+                                            cout << "      SA-tag"
+                                                 << " refine: "
+                                                 << flankShift
+                                                 << "bp -> "
+                                                 << sc.size << "bp"
+                                                 << " (SA reads="
+                                                 << sc.readCount
+                                                 << ")" << endl;
+                                            flankShift = sc.size;
+                                            break;
+                                        }
+                                    }
                                     cout << "    >>> DELETION CALL"
                                          << " (flank-gap): size="
                                          << flankShift << "bp"
@@ -4487,6 +4538,34 @@ void Assembler::buildSvMSA(
                             }
 
                             if(bestShift >= 50 && bestShift <= 2000) {
+                                // Check if an SA-tag DEL call
+                                // nearby can refine the size.
+                                // SA-tag uses aligner coordinates
+                                // which handle repeats better than
+                                // diagonal analysis.
+                                for(const auto& sc : saTagCalls) {
+                                    if(sc.svType == "DEL"
+                                       && sc.readCount >= 2
+                                       && sc.size >= 30
+                                       && sc.size <= 5000
+                                       && abs(int64_t(sc.refPos)
+                                              - int64_t(bpPos))
+                                          < 500
+                                       && sc.size <= uint32_t(
+                                              bestShift * 1.5)
+                                       && sc.size >= uint32_t(
+                                              bestShift * 0.3)) {
+                                        cout << "      SA-tag refine:"
+                                             << " " << bestShift
+                                             << "bp -> "
+                                             << sc.size << "bp"
+                                             << " (SA reads="
+                                             << sc.readCount
+                                             << ")" << endl;
+                                        bestShift = sc.size;
+                                        break;
+                                    }
+                                }
                                 cout << "    >>> DELETION CALL "
                                      << "(adaptive-bimodal): "
                                      << "size=" << bestShift << "bp, "
