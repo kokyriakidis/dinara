@@ -2464,6 +2464,71 @@ void Assembler::buildSvMSA(
                                     }
                                 }
 
+                                // Depth-based fallback: when the path-
+                                // based call is small but a further right
+                                // BP exists with a hit-depth drop zone
+                                // between L and R, estimate insertion
+                                // size from unanchored read bases.
+                                if(bestInsSz < 200) {
+                                    for(const auto& cand : rbpCandidates) {
+                                        if(cand.rbp == bestInsRbp) continue;
+                                        if(cand.dist > uint64_t(maxPairDist)) continue;
+                                        if(cand.rbp->refPos <= bestInsRbp->refPos) continue;
+                                        if(cand.dist < 200) continue;
+
+                                        // Check hit-depth drop between
+                                        // L and this candidate R.
+                                        const uint32_t zs = (lbp.refPos - refStartPos) / windowSize;
+                                        const uint32_t ze = (cand.rbp->refPos - refStartPos) / windowSize;
+                                        uint32_t lowWins = 0, totWins = 0;
+                                        for(uint32_t w = zs; w <= ze && w < nWindows; ++w) {
+                                            if(windowMarkerCount[w] == 0) continue;
+                                            ++totWins;
+                                            if(medianHitDepth > 0
+                                               && windowHitDepth[w] / medianHitDepth < hitDepthDropThreshold)
+                                                ++lowWins;
+                                        }
+                                        if(totWins == 0 || double(lowWins) / double(totWins) < 0.3)
+                                            continue;
+
+                                        // Estimate insertion size from
+                                        // the hit-depth drop zone span.
+                                        // The drop zone is the contiguous
+                                        // region of low hit-depth between
+                                        // L and R. The insertion disrupts
+                                        // k-mer matches over this span.
+                                        uint32_t dropStart = UINT32_MAX;
+                                        uint32_t dropEnd = 0;
+                                        for(uint32_t w = zs; w <= ze && w < nWindows; ++w) {
+                                            if(windowMarkerCount[w] == 0) continue;
+                                            if(medianHitDepth > 0
+                                               && windowHitDepth[w] / medianHitDepth < hitDepthDropThreshold) {
+                                                const uint32_t wp = refStartPos + w * windowSize;
+                                                if(wp < dropStart) dropStart = wp;
+                                                if(wp > dropEnd) dropEnd = wp;
+                                            }
+                                        }
+                                        if(dropStart < dropEnd) {
+                                            const int64_t dropSpan =
+                                                int64_t(dropEnd - dropStart) + int64_t(windowSize);
+                                            if(dropSpan > bestInsSz && dropSpan >= 50) {
+                                                bestInsSz = dropSpan;
+                                                bestInsRbp = cand.rbp;
+                                                bestInsPathDist = dropSpan;
+                                                bestInsHops = 0;
+                                                bestInsRefGap = cand.dist;
+                                                cout << "    HitDepth-span INS estimate:"
+                                                     << " dropZone=" << dropStart
+                                                     << "-" << dropEnd
+                                                     << " span=" << dropSpan
+                                                     << "bp" << endl;
+                                            }
+                                        }
+                                        // Continue to try further candidates
+                                        // for a larger drop span.
+                                    }
+                                }
+
                                 const uint32_t insBpPos =
                                     (lbp.refPos + bestInsRbp->refPos) / 2;
                                 cout << "    >>> INSERTION CALL: "
