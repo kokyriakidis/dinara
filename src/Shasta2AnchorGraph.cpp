@@ -690,6 +690,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(positions.empty()) continue;
             if(window.outEdges.empty() && window.inEdges.empty()) continue;
 
+            // Skip split windows: their inter-window edges connect to split
+            // anchor copies that are not in the backbone journey, so the
+            // bounding span computation would be incorrect.
+            if(anchorSplitMap) {
+                bool windowIsSplit = false;
+                const auto journey = journeys[window.backboneOrientedReadId];
+                for(const uint32_t pos : positions) {
+                    if(anchorSplitMap->count(journey[pos])) {
+                        windowIsSplit = true;
+                        break;
+                    }
+                }
+                if(windowIsSplit) continue;
+            }
+
             const auto journey = journeys[window.backboneOrientedReadId];
 
             // Find bounding journey positions from inter-window edges.
