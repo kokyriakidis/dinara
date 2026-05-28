@@ -2572,7 +2572,13 @@ public:
     // Remove markers whose k-mer appears more than once in the reference reads
     // (read IDs 0..referenceReadCount-1). Non-unique reference k-mers are
     // ambiguous anchors and cannot be used for read-to-reference alignment.
-    void removeNonUniqueReferenceMarkers(uint64_t referenceReadCount, uint64_t threadCount);
+    // Remove reference k-mers that appear more than maxRefKmerFreq
+    // times. Default 1 removes all non-unique k-mers. Higher values
+    // retain low-copy repeat markers for VNTR SV detection.
+    void removeNonUniqueReferenceMarkers(
+        uint64_t referenceReadCount,
+        uint64_t threadCount,
+        uint64_t maxRefKmerFreq = 1);
 
     // Classify multi-chain alignments into primary/supplementary/secondary
     // based on query coordinate overlap (minimap2 mm_set_parent logic).

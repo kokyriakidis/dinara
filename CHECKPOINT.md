@@ -252,7 +252,7 @@ Test cases: `/tmp/sv_cases/` with insertion directories at top level and deletio
 
 1. **Load reference** (read 0) and short reads
 2. **Find minimizer markers** (k=10, w=6)
-3. **Remove non-unique reference k-mers** — blacklist k-mers appearing >1 time in the reference
+3. **Remove non-unique reference k-mers** — blacklist k-mers appearing >1 time in the reference, then rescue freq-2 k-mers in large VNTR-depleted regions (≥5 consecutive depleted 50bp windows)
 4. **Build inverted index** — hash table mapping canonical k-mers to (readId, position) occurrences
 5. **K-mer hit depth profiling** — per-window hit depth along the reference for breakpoint detection
 6. **DP chaining** — minimap2-sr scoring mode (chainingMode=1), bw=100, maxGap=5000, multi-chain extraction
@@ -354,6 +354,9 @@ SA-tag DEL calls are suppressed when the region is marker-depleted (≥10 hit-de
 #### Hit-depth drop zone span for large insertions
 When a path-based insertion call is small (<200bp) but a further right BP exists with a hit-depth drop zone between L and R, the insertion size is re-estimated from the drop zone span. The contiguous region of low hit-depth (below 50% of median) between the breakpoints approximates the insertion size. Tries all valid candidate right BPs and picks the one with the largest drop span. Fixes INS454 (156bp → 400bp) and INS277 (56bp → 250bp).
 
+#### Adaptive marker rescue in VNTR-depleted regions
+After blacklisting non-unique reference k-mers, some reference windows have zero remaining markers (common in VNTRs where all k-mers are repetitive). Phase 2b of `removeNonUniqueReferenceMarkers` identifies contiguous depleted regions (≥5 consecutive 50bp windows with zero markers, i.e. ≥250bp) and rescues k-mers with reference frequency exactly 2 by removing them from the blacklist. Only k-mers that have at least one occurrence in a VNTR-depleted window are rescued. This provides some anchoring in otherwise marker-free VNTR regions while avoiding false chains in non-VNTR regions. The conservative thresholds (freq=2 only, ≥5 consecutive windows) prevent regressions in cases where rescued k-mers would create ambiguous chains.
+
 ### Key Files (SV Detection)
 
 | File | Purpose |
@@ -363,7 +366,7 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 | `src/Assembler.hpp` | `AlignmentCandidatesInvertedIndexData` with chaining parameters |
 | `src/AssemblerInvertedIndex.cpp` | Inverted index build, chaining DP, hit collection |
 | `src/InvertedIndexBuilder.hpp` | Count-then-scatter index construction |
-| `src/AssemblerMarkers.cpp` | `removeNonUniqueReferenceMarkers` — k-mer blacklisting |
+| `src/AssemblerMarkers.cpp` | `removeNonUniqueReferenceMarkers` — k-mer blacklisting + adaptive VNTR rescue |
 | `srcMain/main.cpp` | svanchors pipeline orchestration (line ~3830+) |
 
 ### Test Results (18 cases)
@@ -377,10 +380,10 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 | DEL347 | 347bp | 328bp | split-read (9 reads) + DUST-STR |
 | DEL324 | 324bp | 345bp | diagonal-shift from per-read DEL classifications (was SA-tag only) |
 | DEL160 | 160bp | 160bp | split-read (3 reads) |
-| DEL137 | 137bp | 92bp | flank-gap DEL (was misclassified as INS 212bp) |
-| DEL182 | 182bp | 195bp | adaptive-bimodal |
-| DEL119a | 119bp | 115bp | flank-gap DEL |
-| DEL119b | 119bp | 115bp | flank-gap DEL |
+| DEL137 | 137bp | 96bp | flank-gap DEL (marker rescue improved anchoring) |
+| DEL182 | 182bp | 240bp | adaptive-bimodal (marker rescue improved anchoring) |
+| DEL119a | 119bp | 121bp | adaptive-bimodal (marker rescue resolved VNTR chains) |
+| DEL119b | 119bp | 121bp | adaptive-bimodal (marker rescue resolved VNTR chains) |
 | DEL147 | 234bp | 229bp | split-read (2 reads) |
 | INS454 | 454bp | 400bp | hit-depth drop zone span (was 156bp path-based) |
 | INS277 | 277bp | 250bp | hit-depth drop zone span (was 56bp path-based) |
@@ -389,10 +392,10 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 
 | Case | Root Cause |
 |------|-----------|
-| INS57 (57bp) | VNTR, 10% unique 10-mers at breakpoint |
-| INS62 (62bp) | 1685bp VNTR (75× core motif), BAM-depleted |
-| INS65 (65bp) | 1700bp VNTR, BAM-depleted (false SA-tag DEL suppressed) |
-| INS235 (235bp) | VNTR, 16.5x coverage (false SA-tag DEL suppressed) |
+| INS57 (57bp) | VNTR, detected as INS 342bp (wrong size) |
+| INS62 (62bp) | 1685bp VNTR (75× core motif), VNTR gap detected but no sizing |
+| INS65 (65bp) | 1700bp VNTR, false SA-tag DEL suppressed, no positive call |
+| INS235 (235bp) | VNTR, false SA-tag DEL suppressed, no positive call |
 | INS61 (61bp) | 2256bp AT-repeat microsatellite |
 | INS108 (108bp) | Small diagonal shifts below detection threshold |
 | DEL379 (379bp) | 98% repetitive 10-mers |
