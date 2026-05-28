@@ -16,8 +16,9 @@ Dinara is a genome assembler with two active workstreams:
 3. **Compute anchor windows** — `computeAnchorWindowsClean()` with backbone filtering parameters `minCommonForBackbone` (default 2) and `maxSkipForBackbone` (default 10)
 4. **Phasing / clustering / alternate paths** — per-window het SNP detection, read clustering, alternate path creation
 5. **Build anchor graph** — `Shasta2AnchorGraph` constructor from anchor windows
-6. **Export for shasta2** — external anchors (`Shasta2ExternalAnchors`) and anchor graph (`Shasta2ExternalAnchorGraph`) in shasta2-native binary format
-7. **Early return** — post-graph steps (transitive reduction, assembly graph) are currently disabled via `return;`
+6. **Detangle** — `detangleWindows()` splits backbone anchors of tangled windows, then rebuilds the graph with parallel chains per path
+7. **Export for shasta2** — external anchors (`Shasta2ExternalAnchors`) and anchor graph (`Shasta2ExternalAnchorGraph`) in shasta2-native binary format
+8. **Early return** — post-graph steps (transitive reduction, assembly graph) are currently disabled via `return;`
 
 ### Key Data Structures
 
@@ -96,6 +97,29 @@ After construction, verifies all edges: for each oriented read on an edge, check
 ### 12. Edge Count and Validation
 Recounts edge types (intra/inter/alt-path) after trimming. Warns about edges with no shared reads.
 
+## Detangling (`src/DinaraDetangle.hpp/cpp`)
+
+After the initial anchor graph is built (including Rule 1 and `transitionReads` population), detangling splits backbone anchors of tangled windows so that each path through the window gets its own anchor copies.
+
+### When a Window Is Tangled
+
+A window is a detangling candidate if it has ≥ 2 distinct **through-flows** — `(prev, next)` pairs in `transitionReads` where both `prev ≠ noWindow` and `next ≠ noWindow`, each with ≥ `minInterWindowCoverage` reads.
+
+### Algorithm
+
+1. **Identify candidates**: Scan each window's `transitionReads` for through-flows.
+2. **Partition reads by path**: Each through-flow `(prev, next)` defines a path. Reads are assigned to their path based on their `(prev, next)` pair.
+3. **Split backbone anchors**: For each backbone anchor pair (canonical + RC) in a tangled window, create new anchor copies — one per path — containing only that path's reads. RC subsets are built by matching strand-flipped read IDs.
+4. **Deferred appending**: All new anchors are collected first, then appended to `anchorMarkerInfos` in bulk to avoid invalidating spans during iteration.
+5. **Build split map**: `anchorSplitMap[originalId] = [newId_path0, newId_path1, ...]`.
+6. **Rebuild the graph**: The `Shasta2AnchorGraph` constructor accepts the split map. For windows whose backbone anchors appear in the map, parallel intra-window chains are created — one per path — using the new anchor IDs.
+
+### Current Limitations
+
+- Only handles through-flow reads (both `prev` and `next` are real windows). Reads that start or end at a tangled window are excluded from all split anchor copies.
+- Runs once (no iterative detangling for cascading tangles).
+- Uses `minInterWindowCoverage` as the flow threshold.
+
 ## Shasta2 Export (`src/Shasta2AnchorGraphExport.cpp`)
 
 ### External Anchors
@@ -148,6 +172,7 @@ The `--k` value must match dinara's k-mer length (default 50). The `--min-read-l
 | `src/Shasta2AnchorGraph.cpp` | Anchor-window constructor: edge creation, transitions, Rule 1 |
 | `src/Shasta2AnchorGraphExport.cpp` | `saveForShasta2()` — binary export for shasta2 |
 | `src/Shasta2AnchorGraphGfa.cpp` | `writeGfa()` and `writeCsv()` implementations |
+| `src/DinaraDetangle.hpp/cpp` | `detangleWindows()` — split backbone anchors of tangled windows |
 | `src/Shasta2AnchorPair.hpp/cpp` | `Shasta2AnchorPair` with `removeNegativeOffsets()` |
 | `src/Shasta2Anchors.hpp/cpp` | Anchor construction, `writeExternalAnchors()` |
 | `src/Shasta2Journeys.hpp/cpp` | Journey construction from anchors |
@@ -197,6 +222,7 @@ Key modifications in the fork:
 ## Current State (Anchor Windows)
 
 - Rule 1 (bounding span trimming) is active and working
+- Detangling splits tangled windows by through-flow paths (through-flows only; start/end reads not yet assigned)
 - `removeNegativeOffsets` is called at all 3 edge construction sites
 - Edge verification runs after graph construction (0 backward edges expected)
 - Export to shasta2 format is working with round-trip verification
