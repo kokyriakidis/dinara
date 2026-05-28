@@ -1,0 +1,9 @@
+Category:  tp
+Sample:    SBX-D
+Chrom:     chr2
+Position:  240907825
+SV Type:   DEL
+SV Length: 500bp
+Size Bin:  large_500_1000bp
+Region:    chr2:240905825-240910325
+BAM:       /sc1/groups/sbx/workspace/kyriakik/data/bams/SBX-D.30X.bam

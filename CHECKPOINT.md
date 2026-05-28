@@ -406,6 +406,34 @@ In highly repetitive regions (≥5 left BPs AND ≥5 right BPs), path-based inse
 | INS108 (108bp) | Small diagonal shifts below detection threshold |
 | DEL379 (379bp) | 98% repetitive, DEL 239bp (wrong size), false INS calls suppressed |
 
+### Full SBX-D TP Benchmark (80 cases)
+
+80 TP cases from SBX-D.30X.bam (Roche 2×250bp, GRCh38, ~30× coverage), 10 per size bin.
+Test cases in `test_cases/sbxd_tp/`. Runner: `test_cases/run_sbxd_tp_tests.sh`.
+
+Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >30%. ❌ = wrong type or no call.
+
+| Bin | Total | ✅ | ⚠️ | ❌ | ✅% |
+|-----|-------|---|---|---|-----|
+| DEL <100bp | 10 | 7 | 2 | 1 | 70% |
+| DEL 100-500bp | 10 | 8 | 1 | 1 | 80% |
+| DEL 500-1000bp | 10 | 5 | 4 | 1 | 50% |
+| DEL >1000bp | 10 | 8 | 2 | 0 | 80% |
+| INS <100bp | 10 | 3 | 6 | 1 | 30% |
+| INS 100-500bp | 10 | 0 | 6 | 4 | 0% |
+| INS 500-1000bp | 10 | 4 | 2 | 4 | 40% |
+| INS >1000bp | 10 | 0 | 5 | 5 | 0% |
+| **TOTAL** | **80** | **35** | **28** | **17** | **44%** |
+
+**Correct type (✅+⚠️): 63/80 = 79%**
+
+Key observations:
+- **DEL detection is strong**: 28/40 exact (70%), 35/40 correct type (88%)
+- **INS detection is weak**: 7/40 exact (18%), 28/40 correct type (70%)
+- **INS sizing is the main gap**: path-based sizing undershoots for large INS (>200bp) because read-graph paths can't span beyond read length; overshoots for small INS (<100bp) in VNTRs due to repeat-unit inflation
+- **DEL 500-1000bp** is the weakest DEL bin: SA-tag calls exist but sizes are sometimes wrong due to repeat-unit slippage
+- **INS 100-500bp and INS >1000bp** have 0% exact: these insertions exceed read length, making path-based sizing unreliable
+
 ### Known Limitations
 
 1. **bw=100** prevents single-chain deletion detection >100bp; split-read detection handles larger deletions
