@@ -256,7 +256,6 @@ def installAptPackages():
     "libsimde-dev",
     "zlib1g-dev",
     "libcli11-dev",
-    "libhts-dev",
     "libhtscodecs-dev",
     "libbz2-dev",
     "liblzma-dev",
@@ -623,6 +622,47 @@ def installBasePrerequisites():
     installPybind11()
     installSpoa()
     setupRustToolchain()
+
+def installHtslib():
+    """Build and install htslib from source without curl support.
+
+    Dinara does not use htslib's network features, and statically linking
+    libcurl pulls in a large chain of transitive dependencies (ssh, gnutls,
+    gssapi, brotli, etc.) that are difficult to satisfy with static archives.
+    Building without --enable-libcurl avoids this entirely.
+    """
+    htslibVersion = "1.21"
+    htslibTarball = f"htslib-{htslibVersion}.tar.bz2"
+    htslibUrl = f"https://github.com/samtools/htslib/releases/download/{htslibVersion}/{htslibTarball}"
+    htslibInstallMarker = "/usr/local/lib/libhts.a"
+
+    if os.path.exists(htslibInstallMarker):
+        # Check if existing htslib was built with curl (which we want to avoid).
+        import subprocess
+        nmOut = subprocess.run(["nm", htslibInstallMarker],
+                               capture_output=True, text=True).stdout
+        if "curl_" not in nmOut:
+            print("htslib already installed without curl at " + htslibInstallMarker + ". Skipping.")
+            return
+        print("Existing htslib has curl support. Rebuilding without curl...")
+        return
+
+    print(f"Installing htslib {htslibVersion} (without libcurl)...")
+
+    with tempfile.TemporaryDirectory() as tmpDir:
+        tarballPath = os.path.join(tmpDir, htslibTarball)
+        urllib.request.urlretrieve(htslibUrl, tarballPath)
+        runCommand(f"tar xjf {tarballPath} -C {tmpDir}")
+
+        sourceDir = os.path.join(tmpDir, f"htslib-{htslibVersion}")
+        runCommand(f"cd {sourceDir} && ./configure --prefix=/usr/local "
+                   f"--disable-libcurl --disable-gcs --disable-s3 "
+                   f"--enable-bz2 --enable-lzma --with-libdeflate")
+        runCommand(f"make -C {sourceDir} -j")
+        runCommand(f"sudo make -C {sourceDir} install")
+
+    print("htslib installed to /usr/local (without libcurl).")
+
 
 def installAbpoa():
     print("Installing abPOA (Shared Library)...")
@@ -1071,6 +1111,7 @@ def installMinipoa():
 # Each entry: (name, function, description)
 INSTALL_TARGETS = [
     ("base",             installBasePrerequisites, "apt packages, seqan, pybind11, spoa, Rust toolchain"),
+    ("htslib",           installHtslib,            "htslib (without libcurl, for static linking)"),
     ("astarpa",          installAstarpa,           "astarpa alignment library (Rust)"),
     ("poasta",           installPoasta,            "poasta alignment library (Rust)"),
     ("simd-minimizers",  installSimdMinimizers,    "SIMD minimizers library (Rust)"),
