@@ -366,6 +366,15 @@ SA-tag calls with breakpoints outside the local reference region are discarded. 
 #### Single-cluster promotion
 Per-read DEL/INS clusters with ≥15 reads are promoted to calls even without merging with other clusters. Large SVs (>1000bp) often produce a single cluster where all reads see the same breakpoint.
 
+#### Soft-clip breakpoint evidence
+Reads with soft clips ≥20bp at consistent positions (≥3 reads within 5bp) are clustered into breakpoint evidence. Soft-clip sequences are stored for downstream assembly. Left clips indicate right breakpoints; right clips indicate left breakpoints.
+
+#### CIGAR indel calls
+Large CIGAR I/D operations (≥30bp) from BAM reads are clustered by position (within 20bp) and type. Clusters with ≥3 reads and size ≥50bp are emitted as calls. This directly detects small-medium SVs that are captured within a single read alignment, bypassing the k-mer chaining pipeline entirely.
+
+#### Soft-clip de Bruijn assembly for INS sizing
+At paired soft-clip breakpoints (right-clip and left-clip clusters within 50bp), the clipped sequences are assembled using a greedy de Bruijn graph (k=21). Each side's contig length estimates how far into the insertion the reads extend. The insertion size is estimated from the sum of contig lengths minus overlap. This handles insertions larger than read length where path-based sizing fails.
+
 #### Repetitive region INS call suppression
 In highly repetitive regions (≥5 left BPs AND ≥5 right BPs), path-based insertion calls are suppressed unless both breakpoints have very strong overhang support (≥20 reads each). Many breakpoints on both sides indicate a deeply repetitive region where the read graph has many false connections through rescued k-mers, producing artifact insertion calls. Fixes DEL379 which had three false INS calls (264bp, 168bp, 238bp) from rescued k-mer chains.
 
@@ -421,25 +430,26 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 
 | Bin | Total | ✅ | ⚠️ | ❌ | ✅% |
 |-----|-------|---|---|---|-----|
-| DEL <100bp | 10 | 7 | 2 | 1 | 70% |
-| DEL 100-500bp | 10 | 8 | 1 | 1 | 80% |
-| DEL 500-1000bp | 10 | 5 | 3 | 2 | 50% |
+| DEL <100bp | 10 | 8 | 1 | 1 | 80% |
+| DEL 100-500bp | 10 | 9 | 1 | 0 | 90% |
+| DEL 500-1000bp | 10 | 5 | 4 | 1 | 50% |
 | DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
-| INS <100bp | 10 | 3 | 6 | 1 | 30% |
-| INS 100-500bp | 10 | 0 | 6 | 4 | 0% |
-| INS 500-1000bp | 10 | 4 | 2 | 4 | 40% |
+| INS <100bp | 10 | 7 | 2 | 1 | 70% |
+| INS 100-500bp | 10 | 1 | 6 | 3 | 10% |
+| INS 500-1000bp | 10 | 6 | 2 | 2 | 60% |
 | INS >1000bp | 10 | 0 | 5 | 5 | 0% |
-| **TOTAL** | **80** | **35** | **26** | **19** | **44%** |
+| **TOTAL** | **80** | **44** | **22** | **14** | **55%** |
 
-**Correct type (✅+⚠️): 61/80 = 76%**
+**Correct type (✅+⚠️): 66/80 = 82%**
 
 Key observations:
-- **DEL detection is strong**: 28/40 exact (70%), 33/40 correct type (83%)
-- **INS detection is weak**: 7/40 exact (18%), 28/40 correct type (70%)
-- **INS sizing is the main gap**: path-based sizing undershoots for large INS (>200bp) because read-graph paths can't span beyond read length; overshoots for small INS (<100bp) in VNTRs due to repeat-unit inflation
-- **DEL 500-1000bp** is the weakest DEL bin: repeat-unit slippage affects both diagonal-shift and SA-tag sizing
-- **INS 100-500bp and INS >1000bp** have 0% exact: these insertions exceed read length, making path-based sizing unreliable
-- **Type confusion**: 10 INS cases are detected as DEL — insertions in tandem repeats create diagonal shifts indistinguishable from deletions with short reads
+- **DEL detection is strong**: 30/40 exact (75%), 38/40 correct type (95%)
+- **INS detection improved**: 14/40 exact (35%), 28/40 correct type (70%)
+- **CIGAR indels** directly detect small SVs: INS small improved from 30% → 70% exact
+- **Soft-clip assembly** helps medium-large INS: INS large improved from 40% → 60% exact
+- **INS 100-500bp** remains weak (10% exact): insertions exceed read length and soft-clip assembly can only partially span them
+- **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
+- **Type confusion**: ~8 INS cases still detected as DEL in tandem repeats
 
 ### Known Limitations
 
