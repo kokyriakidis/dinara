@@ -417,11 +417,19 @@ void Assembler::buildSvMSA(
                 bamFileName, refName,
                 regionStart, regionStart + refLength);
             // Convert breakpoint positions from absolute to
-            // relative to the reference subregion.
-            for(auto& sc : saTagCalls) {
-                if(sc.refPos >= regionStart) {
-                    sc.refPos -= regionStart;
+            // relative to the reference subregion. Discard
+            // calls with breakpoints outside the region
+            // (e.g., SA-tag pointing to a distant location).
+            {
+                vector<SaTagSvCall> localCalls;
+                for(auto& sc : saTagCalls) {
+                    if(sc.refPos >= regionStart
+                       && sc.refPos <= regionStart + refLength) {
+                        sc.refPos -= regionStart;
+                        localCalls.push_back(sc);
+                    }
                 }
+                saTagCalls = std::move(localCalls);
             }
             if(!saTagCalls.empty()) {
                 cout << "    SA tag SV evidence ("
@@ -4544,6 +4552,10 @@ void Assembler::buildSvMSA(
                                 // which handle repeats better than
                                 // diagonal analysis.
                                 for(const auto& sc : saTagCalls) {
+                                    // Allow wider size range when
+                                    // SA-tag has strong support.
+                                    const double maxRatio =
+                                        sc.readCount >= 5 ? 5.0 : 1.5;
                                     if(sc.svType == "DEL"
                                        && sc.readCount >= 2
                                        && sc.size >= 30
@@ -4552,7 +4564,7 @@ void Assembler::buildSvMSA(
                                               - int64_t(bpPos))
                                           < 500
                                        && sc.size <= uint32_t(
-                                              bestShift * 1.5)
+                                              bestShift * maxRatio)
                                        && sc.size >= uint32_t(
                                               bestShift * 0.3)) {
                                         cout << "      SA-tag refine:"
@@ -4762,9 +4774,12 @@ void Assembler::buildSvMSA(
                     ++j;
                 }
 
-                // If merged cluster has >= 3 reads from >= 2 original
-                // clusters, emit a call.
-                if(totalReads >= 3 && (j - i) >= 2) {
+                // Emit a call if merged from >= 2 clusters with
+                // >= 3 reads, or if a single cluster has >= 15 reads
+                // (strong standalone evidence, common for large SVs
+                // where all reads see the same breakpoint).
+                if((totalReads >= 3 && (j - i) >= 2)
+                   || totalReads >= 15) {
                     const int64_t mergedSize =
                         weightedSize / int64_t(totalReads);
                     const uint64_t mergedPos =
