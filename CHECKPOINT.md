@@ -300,6 +300,18 @@ For deletion sizing, progressively try k=60 down to k=10 to find skeleton anchor
 #### Split-read deletion detection (commit `e1284fc`)
 Groups chains by read ID. For reads with 2+ same-strand chains, compares median diagonals between consecutive non-overlapping chain pairs. Diagonal differences >50bp and <1000bp with consistent reference gap indicate deletions. Requires ≥2 supporting reads.
 
+#### Breakpoint pairing with fallback candidates
+Breakpoint pairs are formed nearest-first. When the nearest right BP is out of range, remaining candidates are tried in strength-order (fold enrichment × ovhReadCount²). This allows strong distant BPs to be reached when the nearest is invalid.
+
+#### Deletion-like pair suppression of single-breakpoint insertion
+When a strong left-right BP pair exists (both fold ≥ 1.5, both ovhReads ≥ 2, refGap ≥ 100bp) but no path is found, the pattern is more consistent with a deletion than an insertion. The single-breakpoint insertion detector is suppressed so the downstream coverage-drop deletion detector can fire instead. Fixes cases like DEL137 that were previously misclassified as insertions.
+
+#### Hit-depth-only breakpoint generation
+When chain-endpoint breakpoints are missing on one or both sides, breakpoints are generated from hit-depth cluster edges. The left edge of a contiguous hit-depth drop cluster (minRatio < 0.3) becomes a left BP and the right edge becomes a right BP. Overhang reads are collected from reads spanning across or starting just after the drop zone.
+
+#### Alternative-pairing insertion refinement
+After an initial insertion call from the nearest BP pairing, alternative right BPs further away are tried. If a further BP produces a larger valid path distance, the larger insertion call is emitted instead. This handles insertions larger than the read length where the nearest BP captures only a partial insertion.
+
 #### Tandem repeat weighted median cluster selection (commit `e1284fc`)
 In marker-depleted regions (markerDepleted flag), uses weighted median of qualifying deletion clusters (≥100bp) instead of highest-support cluster. Improves sizing accuracy for tandem repeat deletions.
 
@@ -314,6 +326,27 @@ Runs SDUST (symmetric DUST algorithm, `src/Sdust.hpp`) on the reference to find 
 
 #### VNTR depth estimation
 For VNTR gaps where path-based sizing fails, estimates insertion size from total read bases in the VNTR vs expected bases at flanking coverage. Currently limited by BAM extraction depleting VNTR reads (short-read aligners assign low MAPQ in tandem repeats).
+
+#### Breakpoint pairing with fallback candidates
+Breakpoint pairs are formed nearest-first. When the nearest right BP is out of range, remaining candidates are tried in strength-order (fold enrichment × ovhReadCount²). This allows strong distant BPs to be reached when the nearest is invalid.
+
+#### Deletion-like pair suppression of single-breakpoint insertion
+When a strong left-right BP pair exists (both fold ≥ 1.5, both ovhReads ≥ 2, 100bp ≤ refGap ≤ 500bp) near the strongest BP, the single-breakpoint insertion detector is suppressed so the downstream coverage-drop deletion detector can fire instead. Fixes cases like DEL137 that were previously misclassified as insertions.
+
+#### Hit-depth-only breakpoint generation
+When chain-endpoint breakpoints are missing on one or both sides, breakpoints are generated from hit-depth cluster edges. The left edge of a contiguous hit-depth drop cluster (minRatio < 0.3) becomes a left BP and the right edge becomes a right BP. Overhang reads are collected from reads spanning across or starting just after the drop zone.
+
+#### Alternative-pairing insertion refinement
+After an initial insertion call from the nearest BP pairing, alternative right BPs further away are tried. If a further BP produces a larger valid path distance, the larger insertion call is emitted instead. Handles insertions larger than the read length where the nearest BP captures only a partial insertion.
+
+#### Deletion fallback from per-read classifications
+When a breakpoint pair has refGap ≥ 50bp, no path found, and no spanning chains for diagonal-shift detection (deletion larger than read length), falls back to per-read DEL classifications. Reads classified as DEL with breakpoints near the BP pair zone provide the deletion size estimate. Fixes DEL324 which had no primary detection.
+
+#### Marker-depleted region detection
+A coverage-drop region is marker-depleted if either all windows have zero reference markers or >50% of windows with markers have low hit depth. Previously, regions with zero reference markers were not flagged.
+
+#### VNTR-like coverage-drop suppression
+Large coverage-drop regions (>500bp) with minRatio ≈ 0 and strong edge BPs with low spanning counts (<10) are suppressed as VNTR-like. Prevents false deletion calls from VNTR regions where chains don't span due to repeat structure rather than a real deletion.
 
 ### Key Files (SV Detection)
 
@@ -336,12 +369,12 @@ For VNTR gaps where path-based sizing fails, estimates insertion size from total
 | INS148 | 148bp | 149bp | path-based (1 hop) |
 | DEL277 | 277bp | 277bp | split-read (14 reads) |
 | DEL347 | 347bp | 328bp | split-read (9 reads) + DUST-STR |
-| DEL324 | 324bp | 344bp | DEL CLUSTER |
+| DEL324 | 324bp | 345bp | diagonal-shift from per-read DEL classifications (was SA-tag only) |
 | DEL160 | 160bp | 160bp | split-read (3 reads) |
-| DEL137 | 137bp | 136bp | adaptive-bimodal |
+| DEL137 | 137bp | 92bp | flank-gap DEL (was misclassified as INS 212bp) |
 | DEL182 | 182bp | 195bp | adaptive-bimodal |
-| DEL119a | 119bp | 121bp | adaptive-bimodal |
-| DEL119b | 119bp | 121bp | adaptive-bimodal |
+| DEL119a | 119bp | 115bp | flank-gap DEL |
+| DEL119b | 119bp | 115bp | flank-gap DEL |
 | DEL147 | 234bp | 229bp | split-read (2 reads) |
 
 **Undetected (known limitations):**
@@ -420,3 +453,162 @@ With ~4% per-base error rate (typical for Illumina short reads):
 | 50 | 56% | 13% | 2% | 0.8 |
 
 The sweet spot for read-to-reference matching is k=50 (56% unique), but for read-to-read matching it's k=10-20. No single k value works for both.
+
+---
+
+## SV Detection — Latest State (May 2026)
+
+### Latest Commit
+
+`dedca41` on `main` — "Add SA tag parsing, flank-gap analysis, and VNTR-depth deletion detection"
+
+**Changes in this commit (545 insertions, 5 deletions):**
+- Flank-gap analysis for marker-depleted coverage-drop regions
+- VNTR-depth deletion detection (negative depth → DEL call, guarded: ≤30% of VNTR length, ≥50bp)
+- Covdrop-indirect insertion detection
+- SA tag parsing from BAM via htslib (`parseSaTagSvCalls()`)
+- `--bam` CLI option for SA tag input
+- maxK increased from 60 to 62
+- htslib link dependencies added to CMakeLists.txt
+
+### Git Info
+
+- **Commit authorship**: `kokyriakidis <kokyriakidis@gmail.com>` — no Co-authored-by trailer
+- **Branch**: `main`
+
+### Parameters
+
+- k=10, w=6 (minimizer window; w=6 works best, w=10 causes regressions in INS_130bp and DEL_164bp)
+- SDUST: T=20, W=64
+- maxK=62 for adaptive multi-k gap filling
+- minimap2Bw=100, minimap2MaxGap=5000, chainingMode=1
+
+### SV Detection Pipeline Layers (complete, in order)
+
+1. Per-read DP chaining (minimap2-sr scoring) → primary + supplementary chains
+2. Split-read classification → sv_split_reads.tsv
+3. TheseusMSA construction from chain anchors
+4. Per-read diagonal analysis → DEL/INS clusters
+5. Indirect read alignment via read graph BFS
+6. Coverage analysis → breakpoints (chain-endpoint, k-mer hit depth)
+7. Breakpoint pair analysis → path-based INS/DEL calls
+8. Large-insertion detection via relaxed breakpoints
+9. Coverage-drop detection → candidate deletion regions
+10. VNTR gap detection + SDUST-gated STR detection (Strategy 1: spanning, Strategy 2: base-count)
+11. Adaptive multi-k gap filling (k=62 down to k=10)
+12. Pairwise diagonal difference analysis (for non-marker-depleted regions)
+13. Flank-gap analysis (for marker-depleted coverage-drop regions)
+14. VNTR-depth deletion detection (negative depth → DEL call)
+15. Covdrop-indirect insertion detection
+16. Split-read deletion detection
+17. Merged-cluster calls
+18. SA tag parsing from BAM → clustered SV calls
+
+### Test Case Datasets
+
+#### Dataset 1: Original hand-curated cases (38 cases)
+- **Location**: `/tmp/tp_cases/` (10), `/tmp/tp_cases2/` (10), `/tmp/sv_cases/chr*/` (8 INS), `/tmp/sv_cases/DEL_medium_100_500bp/*/` (10 DEL)
+- **Also in repo**: `/workspaces/dinara/test_cases/` (6 FN cases)
+- **Read length**: ~150bp Illumina
+- **Reference**: GRCh38 with `chr` prefix
+- **Results**: 22/38 pass (57%), 16 failing
+- **No BAM files** for most of these (no SA-tag support)
+
+#### Dataset 2: GIAB HG002 TP cases (30 cases)
+- **Location**: `/tmp/giab_cases/` — 30 directories
+- **Read length**: 2x250bp Illumina (GIAB HG002)
+- **Reference**: GRCh37 (no `chr` prefix, chromosomes named "1", "2")
+- **Truth**: GIAB Tier 1 v0.6 SV benchmark
+- **Each dir contains**: `reference.fa`, `reads.fa`, `region.bam`, `region.bam.bai`, `info.txt`
+- **Results**: 15/30 pass (50%), DEL 12/16 pass, INS 3/14 pass
+- **GIAB source data**:
+  - VCF: `/tmp/giab/HG002_SVs_Tier1_v0.6.vcf.gz`
+  - Reference: `/tmp/giab/ref_chr1.fa`, `/tmp/giab/ref_chr2.fa`
+  - BAM: remote `https://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/NIST_Illumina_2x250bps/novoalign_bams/HG002.hs37d5.2x250.bam`
+
+#### Dataset 3: SBX-D Roche cases (129 cases) ← PRIMARY EVALUATION SET
+- **Location**: `/tmp/sbxd_cases/tp/` (80 TP) and `/tmp/sbxd_cases/fn/` (49 FN)
+- **Read length**: ~350-500bp (variable, Roche sequencing)
+- **Reference**: GRCh38 with `chr` prefix
+- **Truth**: T2T Q100 v1.1 stvar benchmark, benchmarked via truvari
+- **Each dir contains**: `reference.fa`, `reads.fa`, `region.bam`, `region.bam.bai`, `info.txt`
+- **Directory structure**: `{tp,fn}/{SV_TYPE}_{SIZE_BIN}/{chrN_POS_TYPELEN}/`
+  - Size bins: `small_lt100bp`, `medium_100_500bp`, `large_500_1000bp`, `xlarge_gt1000bp`
+- **TP breakdown**: 10 per bin × 8 bins (DEL/INS × 4 size categories) = 80
+- **FN breakdown**: 49 total (11 DEL_small, 10 DEL_medium, 3 DEL_xlarge, 12 INS_small, 10 INS_medium, 2 INS_large, 1 INS_xlarge)
+- **Raw results file**: `/tmp/sbxd_all_results2.txt`
+- **Evaluation script**: `/tmp/eval_sbxd2.py` (run: `python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results2.txt`)
+
+### SBX-D Results Summary (129 cases)
+
+|  | PASS | WRONG_SIZE | WRONG_TYPE | NO_CALL | Total | Pass% | Correct-type% |
+|---|---|---|---|---|---|---|---|
+| **TP DEL** | 23 | 12 | 5 | 0 | 40 | 57% | 87% |
+| **TP INS** | 8 | 19 | 9 | 4 | 40 | 20% | 67% |
+| **FN DEL** | 13 | 2 | 5 | 4 | 24 | 54% | 62% |
+| **FN INS** | 3 | 7 | 11 | 4 | 25 | 12% | 40% |
+| **ALL** | **47** | **40** | **30** | **12** | **129** | **36%** | **67%** |
+
+Overall by SV type: DEL 36/64 pass (56%), INS 11/65 pass (16%)
+
+### Remote Machine Access
+
+- **SSH**: `ssh kyriakik@ec-hub.sc1.science.roche.com`
+- **BAM**: `/sc1/groups/sbx/workspace/kyriakik/data/bams/SBX-D.30X.bam` (23GB, GRCh38, ~350-500bp reads)
+- **Reference**: `/sc1/groups/sbx/workspace/kyriakik/data/reference/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna`
+- **Truth VCF**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz`
+- **Benchmark bed**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed`
+- **Truvari results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/test_runs/bench_20260519_155309/SBX-D/truvari/`
+  - `summary.json`: TP=26763, FP=9450, FN=1425, P=0.899, R=0.949, F1=0.923
+  - `tp-base.vcf.gz`, `fn.vcf.gz`, `fp.vcf.gz`
+- **Extracted cases on remote**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/cases/SBX-D/{tp,fn}/`
+- **Assembly contigs**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/test_runs/bench_20260519_155309/SBX-D/final_assemblies.fa`
+- **SBX tools**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/{assemble,contig_aligner,contig-variant-caller}`
+- **Modules**: `SAMtools/1.21-GCC-13.3.0`, `BCFtools/1.21-GCC-13.3.0`, `Micromamba/2.0.7-0`
+- **SLURM**: Use `--qos=3h` (not `1h`)
+
+### How to Run Full SBX-D Evaluation
+
+```bash
+cd /workspaces/dinara
+DINARA=build/Executable/dinara
+
+{
+echo "========== SBX-D TP CASES =========="
+for d in /tmp/sbxd_cases/tp/*/*/; do
+  name=$(basename "$d")
+  svtype=$(grep "SV Type:" "$d/info.txt" | awk '{print $NF}')
+  svsize=$(grep "SV Length:" "$d/info.txt" | sed 's/[^0-9]//g')
+  rm -rf "$d/outdir_eval"
+  calls=$($DINARA --command svanchors --reference "$d/reference.fa" --input "$d/reads.fa" --bam "$d/region.bam" --assemblyDirectory "$d/outdir_eval" --Kmers.k 10 --Kmers.minimizerW 6 2>&1 | grep -E ">>> .* CALL" | tail -5)
+  echo "--- $name (truth: $svtype ${svsize}bp) ---"
+  [ -z "$calls" ] && echo "  (no call)" || echo "$calls"
+done
+echo "========== SBX-D FN CASES =========="
+for d in /tmp/sbxd_cases/fn/*/*/; do
+  name=$(basename "$d")
+  svtype=$(grep "SV Type:" "$d/info.txt" | awk '{print $NF}')
+  svsize=$(grep "SV Length:" "$d/info.txt" | sed 's/[^0-9]//g')
+  rm -rf "$d/outdir_eval"
+  calls=$($DINARA --command svanchors --reference "$d/reference.fa" --input "$d/reads.fa" --bam "$d/region.bam" --assemblyDirectory "$d/outdir_eval" --Kmers.k 10 --Kmers.minimizerW 6 2>&1 | grep -E ">>> .* CALL" | tail -5)
+  echo "--- $name (truth: $svtype ${svsize}bp) ---"
+  [ -z "$calls" ] && echo "  (no call)" || echo "$calls"
+done
+} > /tmp/sbxd_all_results.txt 2>&1
+
+python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
+```
+
+### Known INS Failure Patterns (main area for improvement)
+
+1. **Size overestimation for small INS (50-100bp)**: Path traversal overshoots through repetitive sequence → calls 200-700bp instead of 50-100bp
+2. **Wrong type for medium INS (200-400bp)**: Coverage-drop from insertion misinterpreted as deletion
+3. **Size underestimation for large INS (>500bp)**: Reads can't span full insertion → partial size
+4. **NO_CALL for very large INS (>1000bp)**: No breakpoints detected at all
+5. **chr1:155188986-155189398 cluster**: 6 FN INS cases at same locus all get DEL from SA-tag — complex region
+
+### Known DEL Failure Patterns
+
+1. **Some small DELs (50-90bp) called as INS**: Breakpoint pair with pathDist > refGap looks like insertion (partially fixed by deletion-like pair suppression)
+2. **Large DEL size errors**: SA-tag sometimes gives wrong size for complex regions
+3. **XLarge DELs (>5000bp)**: Often only partial detection or no call
