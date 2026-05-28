@@ -509,14 +509,38 @@ void Assembler::buildSvMSA(
             rg.clusterId = -1;
 
             // Check for inversion: chains on both strands.
+            // Require opposite-strand chains to have a minimum
+            // number of anchors and reference span to avoid
+            // false inversions from palindromic k-mers.
             const auto& firstCeClassify = chainsForRef[rg.chainIndicesInRef[0]];
             const Strand primaryStrand = firstCeClassify.isSameStrand ? 0 : 1;
             bool hasPrimaryStrand = false;
             bool hasOppositeStrand = false;
+            constexpr uint32_t minInvAnchors = 15;
+            constexpr uint32_t minInvSpan = 80;
             for(size_t ci : rg.chainIndicesInRef) {
                 const Strand s = chainsForRef[ci].isSameStrand ? 0 : 1;
-                if(s == primaryStrand) hasPrimaryStrand = true;
-                else hasOppositeStrand = true;
+                if(s == primaryStrand) {
+                    hasPrimaryStrand = true;
+                } else {
+                    // Check anchor count and ref span.
+                    const auto& al = alignments[chainsForRef[ci].chainIndex];
+                    if(al.ordinals.size() >= minInvAnchors) {
+                        uint32_t cMin = UINT32_MAX, cMax = 0;
+                        for(const auto& ord : al.ordinals) {
+                            if(ord[0] < refMarkers.size()) {
+                                const uint32_t pos =
+                                    refMarkers[ord[0]].position;
+                                cMin = std::min(cMin, pos);
+                                cMax = std::max(cMax, pos);
+                            }
+                        }
+                        if(cMax > cMin
+                           && cMax - cMin >= minInvSpan) {
+                            hasOppositeStrand = true;
+                        }
+                    }
+                }
             }
 
             // Compute per-chain reference spans for breakpoint detection.
@@ -714,6 +738,7 @@ void Assembler::buildSvMSA(
                                  << " chains=" << rg.chainIndicesInRef.size()
                                  << endl;
                         }
+
                     }
                 } else {
                     rg.svType = SvType::ReferenceLike;
@@ -1678,22 +1703,40 @@ void Assembler::buildSvMSA(
 
                     // Helper: get the overlap span (bp) between two reads
                     // from their chain. Returns the overlap extent in the
-                    // neighbor's coordinate space.
+                    // neighbor's coordinate space, excluding large gaps
+                    // (which indicate a breakpoint between reference and
+                    // insertion regions).
                     auto getOverlapSpan = [&](const ReadGraphEdge& edge) -> int64_t {
                         const auto& al = alignments[edge.chainIndex];
                         if(al.ordinals.size() < 2) return -1;
                         const uint32_t nIdx = edge.iAmReadA ? 1 : 0;
-                        uint32_t nOvMinOrd = UINT32_MAX, nOvMaxOrd = 0;
+
+                        // Collect neighbor ordinals and sort.
+                        vector<uint32_t> nOrds;
+                        nOrds.reserve(al.ordinals.size());
                         for(const auto& ord : al.ordinals) {
-                            nOvMinOrd = std::min(nOvMinOrd, ord[nIdx]);
-                            nOvMaxOrd = std::max(nOvMaxOrd, ord[nIdx]);
+                            nOrds.push_back(ord[nIdx]);
                         }
+                        sort(nOrds.begin(), nOrds.end());
+
                         const auto nMkrs = markersRef[
                             OrientedReadId(ReadId(edge.neighborReadId), 0).getValue()];
-                        if(nMkrs.size() < 2 || nOvMaxOrd >= nMkrs.size()
-                           || nOvMinOrd >= nMkrs.size()) return -1;
-                        return int64_t(nMkrs[nOvMaxOrd].position)
-                             - int64_t(nMkrs[nOvMinOrd].position);
+                        if(nMkrs.size() < 2) return -1;
+
+                        // Sum marker-to-marker distances, capping each
+                        // gap to exclude breakpoint gaps (where the
+                        // read transitions from reference to insertion).
+                        const int64_t maxGap = int64_t(k) * 3;
+                        int64_t totalSpan = 0;
+                        for(size_t i = 1; i < nOrds.size(); ++i) {
+                            if(nOrds[i] >= nMkrs.size()
+                               || nOrds[i-1] >= nMkrs.size()) continue;
+                            const int64_t gap =
+                                int64_t(nMkrs[nOrds[i]].position)
+                                - int64_t(nMkrs[nOrds[i-1]].position);
+                            totalSpan += std::min(gap, maxGap);
+                        }
+                        return totalSpan;
                     };
 
                     if(!isVntrGap)
@@ -2832,12 +2875,10 @@ void Assembler::buildSvMSA(
                         sort(allMedianDiags.begin(),
                              allMedianDiags.end());
 
-                        cout << "      Median diags ("
-                             << allMedianDiags.size() << "):";
-                        for(const auto& d : allMedianDiags) {
-                            cout << " " << d;
-                        }
-                        cout << endl;
+                        cout << "      Reads with anchors: "
+                             << readResults.size()
+                             << " median diags: "
+                             << allMedianDiags.size() << endl;
 
                         // Analyze per-read diagonal profiles.
                         // For each read, compute diagonal at each anchor
@@ -2935,93 +2976,224 @@ void Assembler::buildSvMSA(
                             }
                         }
 
-                        // If per-read diagonal drop didn't work (all
-                        // anchors on one side), try per-flank bimodal
-                        // analysis. Separate reads into left-flank and
-                        // right-flank groups based on where their anchors
-                        // are, then look for bimodal diagonal splits
-                        // within each group.
+                        // If per-read diagonal drop didn't work,
+                        // try per-anchor pairwise diagonal difference
+                        // analysis. For each reference anchor, collect
+                        // diagonals from all reads that match it. In a
+                        // het deletion, reads from different alleles at
+                        // the same anchor differ by the deletion size.
                         if(!refinedCall && readResults.size() >= 4) {
-                            // Classify reads by which side of the gap
-                            // their anchors are on.
-                            const uint32_t gapCenter =
-                                (cdc.startPos + cdc.endPos) / 2;
-                            vector<int64_t> leftDiags, rightDiags;
-
+                            // Build per-anchor diagonal lists.
+                            // Key: refPos of anchor, Value: list of
+                            // (readDiag) from different reads.
+                            std::unordered_map<uint32_t,
+                                vector<int64_t>> anchorDiags;
                             for(const auto& rr : readResults) {
-                                // Use the median anchor refPos to
-                                // classify left vs right.
-                                vector<uint32_t> rps;
-                                vector<int64_t> ds;
                                 for(const auto& [rp, rdp] : rr.anchors) {
-                                    rps.push_back(rp);
-                                    ds.push_back(
+                                    anchorDiags[rp].push_back(
                                         int64_t(rp) - int64_t(rdp));
-                                }
-                                sort(rps.begin(), rps.end());
-                                sort(ds.begin(), ds.end());
-                                const uint32_t medRefPos =
-                                    rps[rps.size() / 2];
-                                const int64_t medDiag =
-                                    ds[ds.size() / 2];
-
-                                if(medRefPos < gapCenter) {
-                                    leftDiags.push_back(medDiag);
-                                } else {
-                                    rightDiags.push_back(medDiag);
                                 }
                             }
 
-                            // Analyze each flank for bimodal split.
-                            auto analyzeFlank = [](
-                                vector<int64_t>& diags) -> int64_t {
-                                if(diags.size() < 4) return 0;
+                            // Collect all pairwise diagonal differences
+                            // at each anchor. In a het deletion, the
+                            // differences cluster around 0 (same allele)
+                            // and ±D (different alleles).
+                            vector<int64_t> pairDiffs;
+                            for(auto& [pos, diags] : anchorDiags) {
+                                if(diags.size() < 2) continue;
                                 sort(diags.begin(), diags.end());
+                                for(size_t i = 0; i < diags.size(); ++i) {
+                                    for(size_t j = i + 1;
+                                        j < diags.size(); ++j) {
+                                        const int64_t diff =
+                                            diags[j] - diags[i];
+                                        if(diff > 30) {
+                                            pairDiffs.push_back(diff);
+                                        }
+                                    }
+                                }
+                            }
 
-                                int64_t maxGap = 0;
-                                size_t maxGapIdx = 0;
-                                for(size_t i = 1;
-                                    i < diags.size(); ++i) {
-                                    const int64_t gap =
-                                        diags[i] - diags[i-1];
-                                    if(gap > maxGap) {
-                                        maxGap = gap;
-                                        maxGapIdx = i;
+                            int64_t bestShift = 0;
+
+                            if(pairDiffs.size() >= 3) {
+                                sort(pairDiffs.begin(), pairDiffs.end());
+
+                                // Count occurrences of each diff value.
+                                std::unordered_map<int64_t, uint32_t>
+                                    diffCounts;
+                                for(const auto& d : pairDiffs) {
+                                    ++diffCounts[d];
+                                }
+
+                                // Build histogram of diff clusters
+                                // (within 10% tolerance).
+                                struct DiffCluster {
+                                    int64_t meanDiff;
+                                    uint32_t count;
+                                };
+                                vector<DiffCluster> clusters;
+                                vector<int64_t> uniqueDiffs;
+                                for(const auto& [d, c] : diffCounts) {
+                                    uniqueDiffs.push_back(d);
+                                }
+                                sort(uniqueDiffs.begin(),
+                                     uniqueDiffs.end());
+
+                                for(size_t i = 0;
+                                    i < uniqueDiffs.size(); ) {
+                                    int64_t sum = 0;
+                                    uint32_t cnt = 0;
+                                    size_t j = i;
+                                    while(j < uniqueDiffs.size()
+                                          && uniqueDiffs[j]
+                                             <= uniqueDiffs[i] * 1.15) {
+                                        sum += uniqueDiffs[j]
+                                               * diffCounts[uniqueDiffs[j]];
+                                        cnt += diffCounts[uniqueDiffs[j]];
+                                        ++j;
+                                    }
+                                    clusters.push_back(
+                                        {sum / int64_t(cnt), cnt});
+                                    i = j;
+                                }
+
+                                // Sort clusters by count (descending).
+                                sort(clusters.begin(), clusters.end(),
+                                    [](const DiffCluster& a,
+                                       const DiffCluster& b) {
+                                        return a.count > b.count;
+                                    });
+
+                                cout << "      Diff clusters:";
+                                for(size_t i = 0;
+                                    i < std::min(clusters.size(),
+                                                 size_t(8)); ++i) {
+                                    cout << " " << clusters[i].meanDiff
+                                         << "bp(" << clusters[i].count
+                                         << ")";
+                                }
+                                cout << endl;
+
+                                // Find the best cluster.
+                                // Strategy: among clusters with diff
+                                // in [100, delSize], find the most
+                                // supported one. The 100bp minimum
+                                // filters out repeat-unit diffs.
+                                // If tied (within 10%), prefer smaller.
+                                uint32_t bestCount = 0;
+                                for(const auto& cl : clusters) {
+                                    if(cl.meanDiff >= 100
+                                       && cl.meanDiff <= int64_t(delSize)
+                                       && cl.count > bestCount) {
+                                        bestCount = cl.count;
+                                        bestShift = cl.meanDiff;
                                     }
                                 }
 
-                                if(maxGap > 30 && maxGapIdx >= 2
-                                   && diags.size() - maxGapIdx >= 2) {
-                                    const int64_t lowMed =
-                                        diags[maxGapIdx / 2];
-                                    const int64_t highMed =
-                                        diags[maxGapIdx
-                                              + (diags.size() - maxGapIdx)
-                                              / 2];
-                                    return highMed - lowMed;
+                                // Among clusters with similar support
+                                // (within 10% of best), prefer smaller.
+                                if(bestCount > 0) {
+                                    int64_t smallestInRange = bestShift;
+                                    for(const auto& cl : clusters) {
+                                        if(cl.meanDiff >= 100
+                                           && cl.meanDiff <= int64_t(delSize)
+                                           && cl.count >= bestCount * 9 / 10
+                                           && cl.meanDiff < smallestInRange) {
+                                            smallestInRange = cl.meanDiff;
+                                        }
+                                    }
+                                    bestShift = smallestInRange;
+                                    // Update count for the selected cluster.
+                                    for(const auto& cl : clusters) {
+                                        if(cl.meanDiff == bestShift) {
+                                            bestCount = cl.count;
+                                            break;
+                                        }
+                                    }
                                 }
-                                return 0;
-                            };
 
-                            const int64_t leftShift =
-                                analyzeFlank(leftDiags);
-                            const int64_t rightShift =
-                                analyzeFlank(rightDiags);
+                                // If no cluster >= 100bp, try >= 50bp.
+                                if(bestShift == 0) {
+                                    for(const auto& cl : clusters) {
+                                        if(cl.meanDiff >= 50
+                                           && cl.count > bestCount) {
+                                            bestCount = cl.count;
+                                            bestShift = cl.meanDiff;
+                                        }
+                                    }
+                                }
 
-                            cout << "      Flank bimodal: leftReads="
-                                 << leftDiags.size()
-                                 << " rightReads=" << rightDiags.size()
-                                 << " leftShift=" << leftShift
-                                 << " rightShift=" << rightShift
-                                 << endl;
+                                cout << "      Best diff: "
+                                     << bestShift << "bp ("
+                                     << bestCount << " pairs)"
+                                     << endl;
+                            }
 
-                            int64_t bestShift = 0;
-                            if(leftShift > 50 && rightShift > 50) {
-                                bestShift = (leftShift + rightShift) / 2;
-                            } else if(leftShift > 50) {
-                                bestShift = leftShift;
-                            } else if(rightShift > 50) {
-                                bestShift = rightShift;
+                            // Fallback: per-read median diagonal
+                            // flank gap analysis.
+                            if(bestShift == 0) {
+                                const uint32_t gapCenter =
+                                    (cdc.startPos + cdc.endPos) / 2;
+                                vector<int64_t> leftDiags, rightDiags;
+                                for(const auto& rr : readResults) {
+                                    vector<uint32_t> rps;
+                                    vector<int64_t> ds;
+                                    for(const auto& [rp, rdp]
+                                        : rr.anchors) {
+                                        rps.push_back(rp);
+                                        ds.push_back(int64_t(rp)
+                                                     - int64_t(rdp));
+                                    }
+                                    sort(rps.begin(), rps.end());
+                                    sort(ds.begin(), ds.end());
+                                    const uint32_t medRefPos =
+                                        rps[rps.size() / 2];
+                                    const int64_t medDiag =
+                                        ds[ds.size() / 2];
+                                    if(medRefPos < gapCenter) {
+                                        leftDiags.push_back(medDiag);
+                                    } else {
+                                        rightDiags.push_back(medDiag);
+                                    }
+                                }
+
+                                auto analyzeFlankGap = [](
+                                    vector<int64_t>& diags) -> int64_t {
+                                    if(diags.size() < 4) return 0;
+                                    sort(diags.begin(), diags.end());
+                                    int64_t maxGap = 0;
+                                    for(size_t i = 1;
+                                        i < diags.size(); ++i) {
+                                        const int64_t gap =
+                                            diags[i] - diags[i-1];
+                                        if(gap > maxGap)
+                                            maxGap = gap;
+                                    }
+                                    return maxGap;
+                                };
+
+                                const int64_t leftGap =
+                                    analyzeFlankGap(leftDiags);
+                                const int64_t rightGap =
+                                    analyzeFlankGap(rightDiags);
+
+                                cout << "      Flank gaps: left="
+                                     << leftGap << " ("
+                                     << leftDiags.size()
+                                     << " reads) right=" << rightGap
+                                     << " (" << rightDiags.size()
+                                     << " reads)" << endl;
+
+                                if(leftGap > 50 && rightGap > 50) {
+                                    bestShift =
+                                        (leftGap + rightGap) / 2;
+                                } else if(leftGap > 50) {
+                                    bestShift = leftGap;
+                                } else if(rightGap > 50) {
+                                    bestShift = rightGap;
+                                }
                             }
 
                             if(bestShift >= 50 && bestShift <= 2000) {
@@ -3029,8 +3201,6 @@ void Assembler::buildSvMSA(
                                      << "(adaptive-bimodal): "
                                      << "size=" << bestShift << "bp, "
                                      << "breakpoint=" << bpPos
-                                     << ", leftShift=" << leftShift
-                                     << ", rightShift=" << rightShift
                                      << endl;
                                 refinedCall = true;
                             }
