@@ -1138,6 +1138,7 @@ void Assembler::buildSvMSA(
             }
 
             uint64_t indirectAligned = 0;
+            unordered_set<uint32_t> indirectAlignedReads;
 
             while(!bfsQueue.empty()) {
                 uint32_t currentId = bfsQueue.front();
@@ -1225,6 +1226,7 @@ void Assembler::buildSvMSA(
                     ++indirectAligned;
                     ++totalAlignedReads;
                     ++totalAlignedSegments;
+                    indirectAlignedReads.insert(edge.neighborReadId);
 
                     // Mark as placed and propagate its ordinal->boundary map
                     // so further BFS steps can use it.
@@ -1984,19 +1986,75 @@ void Assembler::buildSvMSA(
                     }
 
                     if(foundPath && bestPathDist > 20) {
-                        cout << "    >>> INSERTION CALL: "
-                             << "size=" << bestPathDist << "bp, "
-                             << "breakpoint=" << breakpointPos << ", "
-                             << "leftEnds=" << lbp.endpointCount << ", "
-                             << "rightStarts=" << bestRbp->endpointCount << ", "
-                             << "hops=" << bestPathLen
-                             << endl;
-                        // Record the insertion region for suppressing
-                        // false coverage-drop deletion calls.
-                        insertionCallRegions.push_back({
-                            std::min(lbp.refPos, bestRbp->refPos),
-                            std::max(lbp.refPos, bestRbp->refPos)
-                        });
+                        // Use the maximum path distance (bestPathDist).
+                        // The max represents the longest read-space
+                        // traversal, which best estimates the full
+                        // insertion size.
+                        const int64_t reportedPathDist = bestPathDist;
+
+                        // Determine if this is an insertion or deletion.
+                        //
+                        // For a deletion with refGap > pathDist, the left
+                        // breakpoint should have a strong endpoint signal
+                        // (many chain ends) because reads stop at the
+                        // deletion boundary. Require the left BP to have
+                        // high fold enrichment AND many endpoints.
+                        //
+                        // For an insertion, pathDist directly gives the
+                        // insertion size. When pathDist >> refGap, subtract
+                        // refGap to account for reference traversal in the
+                        // overhangs.
+                        bool isDeletion = false;
+                        if(reportedPathDist < int64_t(bestDist)
+                           && bestDist > 100
+                           && lbp.endpointCount >= 10
+                           && lbp.foldEnrichment >= 3.0) {
+                            isDeletion = true;
+                        }
+
+                        if(isDeletion) {
+                            const int64_t delSz = bestDist - reportedPathDist;
+                            if(delSz > 20) {
+                                cout << "    >>> DELETION CALL (path-based): "
+                                     << "size=" << delSz << "bp, "
+                                     << "breakpoint=" << breakpointPos << ", "
+                                     << "leftEnds=" << lbp.endpointCount << ", "
+                                     << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     << "hops=" << bestPathLen
+                                     << " (pathDist=" << reportedPathDist
+                                     << " refGap=" << bestDist << ")"
+                                     << endl;
+                            }
+                        } else {
+                            // Insertion sizing. The path distance
+                            // includes reference traversal in the
+                            // overhangs when reads span from the chain
+                            // endpoint into the insertion. Subtract
+                            // refGap when it's substantial (> 150bp)
+                            // and pathDist clearly exceeds it. Small
+                            // refGaps (≤ 150bp) are window quantization
+                            // noise and should not be subtracted.
+                            int64_t insSz = reportedPathDist;
+                            if(bestDist > 150
+                               && reportedPathDist > int64_t(bestDist)) {
+                                insSz = reportedPathDist - bestDist;
+                            }
+                            if(insSz > 20) {
+                                cout << "    >>> INSERTION CALL: "
+                                     << "size=" << insSz << "bp, "
+                                     << "breakpoint=" << breakpointPos << ", "
+                                     << "leftEnds=" << lbp.endpointCount << ", "
+                                     << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     << "hops=" << bestPathLen
+                                     << " (pathDist=" << reportedPathDist
+                                     << " refGap=" << bestDist << ")"
+                                     << endl;
+                                insertionCallRegions.push_back({
+                                    std::min(lbp.refPos, bestRbp->refPos),
+                                    std::max(lbp.refPos, bestRbp->refPos)
+                                });
+                            }
+                        }
                     }
 
                     // -------------------------------------------------
@@ -2192,6 +2250,18 @@ void Assembler::buildSvMSA(
                         }
                     }
                 }
+
+                // ---------------------------------------------------------
+                // Single-breakpoint insertion detection.
+                //
+                // When only one strong breakpoint is found (left or right)
+                // with many unanchored reads nearby, estimate insertion
+                // size from the unanchored read count and coverage.
+                // This handles cases where the insertion is larger than
+                // the read length, so only one side of the breakpoint
+                // is detectable.
+                // ---------------------------------------------------------
+
 
                 // ---------------------------------------------------------
                 // Hit-depth-only insertion detection.
@@ -3538,6 +3608,106 @@ void Assembler::buildSvMSA(
                          << "reads=" << count
                          << endl;
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Merge nearby per-read INS/DEL clusters with similar sizes.
+        //
+        // In tandem repeat regions, the same SV appears in multiple
+        // reads at slightly different positions (because the repeat
+        // unit can be inserted at any copy boundary). Merge clusters
+        // of the same type within 500bp with sizes within 20% into
+        // a single call.
+        // -----------------------------------------------------------------
+        {
+            struct ClusterInfo {
+                int64_t size;
+                uint64_t pos;
+                uint32_t reads;
+                SvType type;
+            };
+            vector<ClusterInfo> allClusters;
+
+            for(int32_t cid = 0; cid < totalClusters; ++cid) {
+                uint32_t count = 0;
+                int64_t sumSize = 0;
+                uint64_t sumPos = 0;
+                SvType cType = SvType::ReferenceLike;
+
+                for(const auto& rg : readGroups) {
+                    if(rg.clusterId != cid) continue;
+                    ++count;
+                    sumSize += rg.svSize;
+                    sumPos += rg.breakpointRefPos;
+                    cType = rg.svType;
+                }
+                if(count == 0) continue;
+                allClusters.push_back({
+                    sumSize / int64_t(count),
+                    sumPos / count,
+                    count,
+                    cType
+                });
+            }
+
+            // Sort by type then position.
+            sort(allClusters.begin(), allClusters.end(),
+                [](const ClusterInfo& a, const ClusterInfo& b) {
+                    if(a.type != b.type) return int(a.type) < int(b.type);
+                    return a.pos < b.pos;
+                });
+
+            // Merge nearby clusters of the same type with similar sizes.
+            for(size_t i = 0; i < allClusters.size(); ) {
+                const auto& base = allClusters[i];
+                if(base.type != SvType::Insertion
+                   && base.type != SvType::Deletion) {
+                    ++i;
+                    continue;
+                }
+
+                // Collect mergeable clusters.
+                uint32_t totalReads = base.reads;
+                int64_t weightedSize = base.size * int64_t(base.reads);
+                uint64_t weightedPos = base.pos * uint64_t(base.reads);
+                size_t j = i + 1;
+                while(j < allClusters.size()
+                      && allClusters[j].type == base.type
+                      && allClusters[j].pos <= base.pos + 500
+                      && std::abs(allClusters[j].size - base.size)
+                         <= base.size / 5) {
+                    totalReads += allClusters[j].reads;
+                    weightedSize += allClusters[j].size
+                                    * int64_t(allClusters[j].reads);
+                    weightedPos += allClusters[j].pos
+                                   * uint64_t(allClusters[j].reads);
+                    ++j;
+                }
+
+                // If merged cluster has >= 3 reads from >= 2 original
+                // clusters, emit a call.
+                if(totalReads >= 3 && (j - i) >= 2) {
+                    const int64_t mergedSize =
+                        weightedSize / int64_t(totalReads);
+                    const uint64_t mergedPos =
+                        weightedPos / uint64_t(totalReads);
+                    const char* typeStr =
+                        (base.type == SvType::Insertion) ? "INS" : "DEL";
+
+                    if(mergedSize >= 50) {
+                        cout << "    >>> "
+                             << (base.type == SvType::Insertion
+                                 ? "INSERTION" : "DELETION")
+                             << " CALL (merged-clusters): "
+                             << "size=" << mergedSize << "bp, "
+                             << "breakpoint=" << mergedPos << ", "
+                             << "clusters=" << (j - i) << ", "
+                             << "reads=" << totalReads
+                             << endl;
+                    }
+                }
+                i = j;
             }
         }
 
