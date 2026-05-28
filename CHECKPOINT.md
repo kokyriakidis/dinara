@@ -348,6 +348,9 @@ A coverage-drop region is marker-depleted if either all windows have zero refere
 #### VNTR-like coverage-drop suppression
 Large coverage-drop regions (>500bp) with minRatio ≈ 0 and strong edge BPs with low spanning counts (<10) are suppressed as VNTR-like. Prevents false deletion calls from VNTR regions where chains don't span due to repeat structure rather than a real deletion.
 
+#### SA-tag DEL suppression in VNTR regions
+SA-tag DEL calls are suppressed when the region is marker-depleted (≥10 hit-depth BPs with ≥30 unanchored reads) or when a VNTR gap was detected during breakpoint pairing. In VNTRs, the aligner maps split reads to different repeat copies, producing false DEL calls. Fixes INS235 and INS65 which had false SA-tag DEL calls.
+
 #### Hit-depth drop zone span for large insertions
 When a path-based insertion call is small (<200bp) but a further right BP exists with a hit-depth drop zone between L and R, the insertion size is re-estimated from the drop zone span. The contiguous region of low hit-depth (below 50% of median) between the breakpoints approximates the insertion size. Tries all valid candidate right BPs and picks the one with the largest drop span. Fixes INS454 (156bp → 400bp) and INS277 (56bp → 250bp).
 
@@ -388,8 +391,8 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 |------|-----------|
 | INS57 (57bp) | VNTR, 10% unique 10-mers at breakpoint |
 | INS62 (62bp) | 1685bp VNTR (75× core motif), BAM-depleted |
-| INS65 (65bp) | 1700bp VNTR, BAM-depleted |
-| INS235 (235bp) | VNTR, 16.5x coverage (heavily depleted) |
+| INS65 (65bp) | 1700bp VNTR, BAM-depleted (false SA-tag DEL suppressed) |
+| INS235 (235bp) | VNTR, 16.5x coverage (false SA-tag DEL suppressed) |
 | INS61 (61bp) | 2256bp AT-repeat microsatellite |
 | INS108 (108bp) | Small diagonal shifts below detection threshold |
 | DEL379 (379bp) | 98% repetitive 10-mers |
