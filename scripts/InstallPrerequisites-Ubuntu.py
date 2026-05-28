@@ -260,7 +260,6 @@ def installAptPackages():
     "libhtscodecs-dev",
     "libbz2-dev",
     "liblzma-dev",
-    "libcurl4-openssl-dev",
     "libdeflate-dev",
     "libssl-dev",
     "libnghttp2-dev",
@@ -274,6 +273,14 @@ def installAptPackages():
     "libunistring-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
+
+    # libcurl4-openssl-dev and libcurl4-gnutls-dev conflict with each other.
+    # Install whichever one is compatible with the current system.
+    if os.system("sudo apt-get install --assume-yes libcurl4-openssl-dev") != 0:
+        print("libcurl4-openssl-dev conflicts; trying libcurl4-gnutls-dev...")
+        if os.system("sudo apt-get install --assume-yes libcurl4-gnutls-dev") != 0:
+            print("WARNING: Could not install any libcurl dev package. "
+                  "If one is already installed, this is fine.")
 
 
 
