@@ -54,6 +54,40 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
+# Discover htslib and libcurl transitive dependencies for static linking.
+# pkg-config --static reports all transitive deps, but not all may have
+# static archives (.a) available. We filter to only keep libs that exist.
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(HTS QUIET htslib)
+    pkg_check_modules(CURL QUIET libcurl)
+endif()
+
+# Helper: filter a list of library names, keeping only those whose
+# static archive (lib<name>.a) can be found by the compiler.
+function(filter_available_static_libs INPUT_LIBS OUTPUT_VAR)
+    set(_result "")
+    foreach(_lib ${INPUT_LIBS})
+        find_library(_found_${_lib} NAMES "lib${_lib}.a" PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+        if(_found_${_lib})
+            list(APPEND _result ${_lib})
+        endif()
+        unset(_found_${_lib} CACHE)
+    endforeach()
+    set(${OUTPUT_VAR} ${_result} PARENT_SCOPE)
+endfunction()
+
+if(HTS_STATIC_LIBRARIES)
+    filter_available_static_libs("${HTS_STATIC_LIBRARIES}" HTS_LINK_LIBS)
+else()
+    set(HTS_LINK_LIBS hts htscodecs deflate lzma bz2)
+endif()
+if(CURL_STATIC_LIBRARIES)
+    filter_available_static_libs("${CURL_STATIC_LIBRARIES}" CURL_LINK_LIBS)
+else()
+    set(CURL_LINK_LIBS curl)
+endif()
+
 # Snarl finder (vendored from vg, stripped of protobuf/SnarlManager).
 add_subdirectory(external/snarls)
 
