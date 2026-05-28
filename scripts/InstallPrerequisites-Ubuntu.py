@@ -262,6 +262,16 @@ def installAptPackages():
     "liblzma-dev",
     "libcurl4-openssl-dev",
     "libdeflate-dev",
+    "libssl-dev",
+    "libnghttp2-dev",
+    "libpsl-dev",
+    "libssh-dev",
+    "libbrotli-dev",
+    "libzstd-dev",
+    "librtmp-dev",
+    "libldap-dev",
+    "libidn2-dev",
+    "libunistring-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
 
