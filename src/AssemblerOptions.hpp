@@ -109,6 +109,7 @@ public:
     string overlapsFromPafFile;
     bool saveBinaryData;
     string referenceFileName;  // Reference FASTA for --command svanchors.
+    string bamFileName;        // Optional BAM for SA tag parsing in svanchors.
 };
 
 

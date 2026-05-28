@@ -3783,6 +3783,17 @@ void dinara::main::svanchors(
             assemblerOptions.commandLineOnlyOptions.referenceFileName);
     }
 
+    // Optional BAM file for SA tag parsing.
+    string bamAbsolutePath;
+    if(!assemblerOptions.commandLineOnlyOptions.bamFileName.empty()) {
+        bamAbsolutePath = filesystem::getAbsolutePath(
+            assemblerOptions.commandLineOnlyOptions.bamFileName);
+        if(!std::filesystem::exists(bamAbsolutePath)) {
+            throw runtime_error("BAM file not found: " +
+                assemblerOptions.commandLineOnlyOptions.bamFileName);
+        }
+    }
+
     vector<string> inputFileAbsolutePaths;
     for(const string& inputFileName: assemblerOptions.commandLineOnlyOptions.inputFileNames) {
         if(!std::filesystem::exists(inputFileName)) {
@@ -4091,7 +4102,8 @@ void dinara::main::svanchors(
     // Step 7: Build Theseus MSA using chain anchors as segment boundaries.
     // ========================================================================
     cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
-    assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile);
+    assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile,
+                         bamAbsolutePath);
 
     // ========================================================================
     // Summary.

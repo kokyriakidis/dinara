@@ -2594,7 +2594,21 @@ public:
     void buildSvMSA(
         uint64_t referenceReadCount,
         const string& outputPrefix,
-        const vector<RefHitDepthWindow>& refHitDepth = {});
+        const vector<RefHitDepthWindow>& refHitDepth = {},
+        const string& bamFileName = "");
+
+    // SA tag SV evidence from BAM supplementary alignments.
+    struct SaTagSvCall {
+        string svType;     // "DEL" or "INS"
+        int64_t size;
+        uint32_t refPos;   // breakpoint position in reference
+        uint32_t readCount; // number of supporting reads
+    };
+    vector<SaTagSvCall> parseSaTagSvCalls(
+        const string& bamFileName,
+        const string& refName,
+        uint32_t refStart,
+        uint32_t refEnd) const;
 
     void classifySplitAlignments(
         uint64_t referenceReadCount,
