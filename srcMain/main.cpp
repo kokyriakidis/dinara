@@ -1238,13 +1238,6 @@ void dinara::main::assemble(
 
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
-    cout << timestamp << "Writing Shasta2 external anchors to "
-         << externalAnchorsName << "..." << endl;
-    const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
-    cout << timestamp << "Wrote " << exportedExternalAnchorCount
-         << " external anchors for Shasta2. Use --external-anchors-name "
-         << externalAnchorsName << endl;
 
     // Compute journeys.
     cout << timestamp << "Creating Shasta2Journeys..." << endl;
@@ -1690,6 +1683,15 @@ void dinara::main::assemble(
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
         }
     }
+
+    // Write external anchors after detangling so new split anchors are included.
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
 
     // Save the post-detangling anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");

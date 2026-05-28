@@ -398,14 +398,24 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 
     // With paired anchor IDs (2*i = canonical, 2*i+1 = RC),
     // canonical anchors are at even indices.
+    // We must not skip empty anchors: shasta2 assigns sequential IDs to
+    // external anchors, so skipping would break the identity mapping
+    // between dinara anchor IDs and shasta2 anchor IDs.
     for(Shasta2AnchorId anchorId=0; anchorId<size(); ++anchorId) {
-        const Shasta2Anchor anchor = (*this)[anchorId];
-        if(anchor.empty()) {
-            continue;
-        }
 
         // Skip RC anchors (odd indices) when canonicalOnly is set.
         if(canonicalOnly && (uint64_t(anchorId) % 2 != 0)) {
+            continue;
+        }
+
+        const Shasta2Anchor anchor = (*this)[anchorId];
+        const string anchorName = "anchor-" + shasta2AnchorIdToString(anchorId);
+
+        if(anchor.empty()) {
+            // Export an empty anchor to preserve ID numbering.
+            data.appendVector();
+            names.appendVector(anchorName.begin(), anchorName.end());
+            ++exportedCount;
             continue;
         }
 
@@ -431,7 +441,6 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             readIds.push_back(readId);
         }
 
-        const string anchorName = "anchor-" + shasta2AnchorIdToString(anchorId);
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
