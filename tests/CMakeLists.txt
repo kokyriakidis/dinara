@@ -108,7 +108,7 @@ else()
         spoa png lapack blas gfortran m pthread
         -Wl,--start-group
         ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
-        ${HTS_LINK_LIBS} ${CURL_LINK_LIBS}
+        ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS}
         ZLIB::ZLIB
         -Wl,--end-group
     )
