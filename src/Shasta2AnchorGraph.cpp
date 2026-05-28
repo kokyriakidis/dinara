@@ -493,15 +493,55 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             ++interWindowBelowCoverage;
         } else {
             DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
-            edge_descriptor e;
-            tie(e, ignore) = add_edge(
-                bestPair.anchorIdA,
-                bestPair.anchorIdB,
-                Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
-                anchorGraph);
-            anchorGraph[e].useForAssembly = true;
-            createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
-            ++interWindowCreated;
+
+            // Check if either endpoint was split.
+            const bool aSplit = anchorSplitMap &&
+                anchorSplitMap->count(bestPair.anchorIdA);
+            const bool bSplit = anchorSplitMap &&
+                anchorSplitMap->count(bestPair.anchorIdB);
+
+            if(!aSplit && !bSplit) {
+                // Neither endpoint split: create edge as normal.
+                edge_descriptor e;
+                tie(e, ignore) = add_edge(
+                    bestPair.anchorIdA,
+                    bestPair.anchorIdB,
+                    Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
+                    anchorGraph);
+                anchorGraph[e].useForAssembly = true;
+                createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
+                ++interWindowCreated;
+            } else {
+                // At least one endpoint was split.
+                // For each split copy, create an edge with only the reads
+                // that appear on that copy.
+                const auto& aSplits = aSplit
+                    ? anchorSplitMap->at(bestPair.anchorIdA)
+                    : vector<Shasta2AnchorId>{bestPair.anchorIdA};
+                const auto& bSplits = bSplit
+                    ? anchorSplitMap->at(bestPair.anchorIdB)
+                    : vector<Shasta2AnchorId>{bestPair.anchorIdB};
+
+                for(const Shasta2AnchorId splitA : aSplits) {
+                    for(const Shasta2AnchorId splitB : bSplits) {
+                        Shasta2AnchorPair splitPair(
+                            anchors, splitA, splitB, false);
+                        splitPair.removeNegativeOffsets(anchors);
+                        if(splitPair.size() == 0) continue;
+                        edge_descriptor e;
+                        tie(e, ignore) = add_edge(
+                            splitA, splitB,
+                            Shasta2AnchorGraphEdge(splitPair,
+                                splitPair.getAverageOffset(anchors),
+                                nextEdgeId++),
+                            anchorGraph);
+                        anchorGraph[e].useForAssembly = true;
+                        createdEdges.push_back({windowPair, splitA, splitB,
+                            splitPair.size()});
+                        ++interWindowCreated;
+                    }
+                }
+            }
         }
     }
     cout << "Inter-window edges: " << interWindowCreated << " created, "
