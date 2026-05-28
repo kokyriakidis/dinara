@@ -1984,7 +1984,6 @@ void Assembler::buildSvMSA(
                         const uint32_t delZoneStart = std::min(lbp.refPos, bestRbp->refPos);
                         const uint32_t delZoneEnd = std::max(lbp.refPos, bestRbp->refPos);
 
-
                         vector<int64_t> delShifts;
 
                         for(const auto& ce : chainsForRef) {
@@ -2068,6 +2067,8 @@ void Assembler::buildSvMSA(
                                      << endl;
                             }
                         }
+
+
                     }
 
                     // Also check for deletions when there IS no
@@ -2497,6 +2498,192 @@ void Assembler::buildSvMSA(
                                      << "size=" << medianDel << "bp, "
                                      << "breakpoint=" << bpPos << ", "
                                      << "supportingReads=" << cluster.readIds.size()
+                                     << endl;
+                            }
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Split-read deletion detection.
+                //
+                // For deletions larger than the chaining bandwidth,
+                // no single chain can bridge both sides. Reads
+                // spanning the deletion produce two chains: one on
+                // each flank. The diagonal difference between these
+                // chains estimates the deletion size.
+                //
+                // Group chains by read ID, then for each read with
+                // 2+ chains, compare consecutive chain diagonals.
+                // Cluster the resulting deletion sizes by ref position.
+                // ---------------------------------------------------------
+                {
+                    struct SplitDelEvent {
+                        uint32_t refPos;   // gap midpoint
+                        int64_t delSize;   // diagonal difference
+                        uint32_t readId;
+                    };
+                    vector<SplitDelEvent> splitEvents;
+
+                    // Group chains by read ID.
+                    std::unordered_map<uint32_t,
+                        vector<uint32_t>> readChainIdx;
+                    for(uint32_t ci = 0;
+                        ci < chainsForRef.size(); ++ci) {
+                        const auto& ce = chainsForRef[ci];
+                        if(ce.readId == uint32_t(refId)) continue;
+                        readChainIdx[ce.readId].push_back(ci);
+                    }
+
+                    for(const auto& [rdId, cis] : readChainIdx) {
+                        if(cis.size() < 2) continue;
+
+                        // For each chain, compute median diagonal
+                        // and ref position range.
+                        struct ChainSummary {
+                            int64_t medDiag;
+                            uint32_t minRefPos;
+                            uint32_t maxRefPos;
+                            uint32_t nAnchors;
+                        };
+                        vector<ChainSummary> summaries;
+                        for(const auto ci : cis) {
+                            const auto& ce = chainsForRef[ci];
+                            if(!ce.isSameStrand) continue;
+                            const auto& al =
+                                alignments[ce.chainIndex];
+                            if(al.ordinals.size() < 3) continue;
+                            const Strand strand = 0;
+                            const auto rdMkrs = markersRef[
+                                OrientedReadId(
+                                    ReadId(rdId), strand
+                                ).getValue()];
+
+                            vector<int64_t> diags;
+                            uint32_t minRp = UINT32_MAX;
+                            uint32_t maxRp = 0;
+                            for(const auto& ord : al.ordinals) {
+                                if(ord[0] >= refMarkers.size()
+                                   || ord[1] >= rdMkrs.size())
+                                    continue;
+                                const uint32_t rp = uint32_t(
+                                    refMarkers[ord[0]].position);
+                                const uint32_t qp = uint32_t(
+                                    rdMkrs[ord[1]].position);
+                                diags.push_back(
+                                    int64_t(rp) - int64_t(qp));
+                                minRp = std::min(minRp, rp);
+                                maxRp = std::max(maxRp, rp);
+                            }
+                            if(diags.size() < 3) continue;
+                            sort(diags.begin(), diags.end());
+                            summaries.push_back({
+                                diags[diags.size() / 2],
+                                minRp, maxRp,
+                                uint32_t(diags.size())});
+                        }
+
+                        if(summaries.size() < 2) continue;
+
+                        // Sort by ref position.
+                        sort(summaries.begin(), summaries.end(),
+                            [](const ChainSummary& a,
+                               const ChainSummary& b) {
+                                return a.minRefPos < b.minRefPos;
+                            });
+
+                        // Compare consecutive chain pairs.
+                        for(size_t a = 0;
+                            a + 1 < summaries.size(); ++a) {
+                            const auto& ca = summaries[a];
+                            const auto& cb = summaries[a + 1];
+                            // Chains should be non-overlapping
+                            // in ref space.
+                            if(cb.minRefPos <= ca.maxRefPos)
+                                continue;
+                            // Reference gap between chains.
+                            const int64_t refGap =
+                                int64_t(cb.minRefPos)
+                                - int64_t(ca.maxRefPos);
+                            const int64_t dd =
+                                cb.medDiag - ca.medDiag;
+                            // The ref gap should be comparable
+                            // to the diagonal difference (the
+                            // deletion size). Reject if the gap
+                            // is much larger — indicates chains
+                            // mapping to distant regions.
+                            if(dd > 50 && dd < 1000
+                               && refGap < dd * 2) {
+                                const uint32_t gapMid =
+                                    (ca.maxRefPos + cb.minRefPos) / 2;
+                                splitEvents.push_back(
+                                    {gapMid, dd, rdId});
+                            }
+                        }
+                    }
+
+                    // Cluster split-read deletion events by position.
+                    if(!splitEvents.empty()) {
+                        sort(splitEvents.begin(), splitEvents.end(),
+                            [](const SplitDelEvent& a,
+                               const SplitDelEvent& b) {
+                                return a.refPos < b.refPos;
+                            });
+
+                        struct SplitDelCluster {
+                            uint32_t startPos;
+                            uint32_t endPos;
+                            vector<int64_t> sizes;
+                            std::unordered_set<uint32_t> readIds;
+                        };
+                        vector<SplitDelCluster> splitClusters;
+                        SplitDelCluster cur;
+                        cur.startPos = splitEvents[0].refPos;
+                        cur.endPos = splitEvents[0].refPos;
+                        cur.sizes.push_back(splitEvents[0].delSize);
+                        cur.readIds.insert(splitEvents[0].readId);
+
+                        for(size_t i = 1;
+                            i < splitEvents.size(); ++i) {
+                            if(splitEvents[i].refPos
+                               <= cur.endPos + windowSize * 3) {
+                                cur.endPos =
+                                    splitEvents[i].refPos;
+                                cur.sizes.push_back(
+                                    splitEvents[i].delSize);
+                                cur.readIds.insert(
+                                    splitEvents[i].readId);
+                            } else {
+                                splitClusters.push_back(
+                                    std::move(cur));
+                                cur = SplitDelCluster();
+                                cur.startPos =
+                                    splitEvents[i].refPos;
+                                cur.endPos =
+                                    splitEvents[i].refPos;
+                                cur.sizes.push_back(
+                                    splitEvents[i].delSize);
+                                cur.readIds.insert(
+                                    splitEvents[i].readId);
+                            }
+                        }
+                        splitClusters.push_back(std::move(cur));
+
+                        for(auto& cl : splitClusters) {
+                            if(cl.readIds.size() < 2) continue;
+                            sort(cl.sizes.begin(), cl.sizes.end());
+                            const int64_t medDel =
+                                cl.sizes[cl.sizes.size() / 2];
+                            const uint32_t bpPos =
+                                (cl.startPos + cl.endPos) / 2;
+
+                            if(medDel > 50) {
+                                cout << "    >>> DELETION CALL "
+                                     << "(split-read): "
+                                     << "size=" << medDel
+                                     << "bp, breakpoint=" << bpPos
+                                     << ", splitReads="
+                                     << cl.readIds.size()
                                      << endl;
                             }
                         }
@@ -3077,39 +3264,89 @@ void Assembler::buildSvMSA(
                                 cout << endl;
 
                                 // Find the best cluster.
-                                // Strategy: among clusters with diff
-                                // in [100, delSize], find the most
-                                // supported one. The 100bp minimum
-                                // filters out repeat-unit diffs.
-                                // If tied (within 10%), prefer smaller.
+                                // Strategy depends on whether the
+                                // region is marker-depleted (tandem
+                                // repeat). In tandem repeats, artifact
+                                // clusters appear at non-deletion
+                                // offsets; use weighted median to be
+                                // robust. Otherwise, prefer the
+                                // smallest cluster with support near
+                                // the best.
                                 uint32_t bestCount = 0;
-                                for(const auto& cl : clusters) {
-                                    if(cl.meanDiff >= 100
-                                       && cl.meanDiff <= int64_t(delSize)
-                                       && cl.count > bestCount) {
-                                        bestCount = cl.count;
-                                        bestShift = cl.meanDiff;
-                                    }
-                                }
-
-                                // Among clusters with similar support
-                                // (within 10% of best), prefer smaller.
-                                if(bestCount > 0) {
-                                    int64_t smallestInRange = bestShift;
+                                if(markerDepleted) {
+                                    // Tandem repeat region: use weighted
+                                    // median of qualifying clusters.
+                                    vector<DiffCluster> qualifying;
                                     for(const auto& cl : clusters) {
                                         if(cl.meanDiff >= 100
-                                           && cl.meanDiff <= int64_t(delSize)
-                                           && cl.count >= bestCount * 9 / 10
-                                           && cl.meanDiff < smallestInRange) {
-                                            smallestInRange = cl.meanDiff;
+                                           && cl.meanDiff
+                                              <= int64_t(delSize)) {
+                                            qualifying.push_back(cl);
                                         }
                                     }
-                                    bestShift = smallestInRange;
-                                    // Update count for the selected cluster.
+                                    if(qualifying.size() == 1) {
+                                        bestShift = qualifying[0].meanDiff;
+                                        bestCount = qualifying[0].count;
+                                    } else if(qualifying.size() > 1) {
+                                        sort(qualifying.begin(),
+                                             qualifying.end(),
+                                             [](const DiffCluster& a,
+                                                const DiffCluster& b) {
+                                                 return a.meanDiff
+                                                        < b.meanDiff;
+                                             });
+                                        uint32_t totalCount = 0;
+                                        for(const auto& cl : qualifying) {
+                                            totalCount += cl.count;
+                                        }
+                                        const uint32_t medianIdx =
+                                            totalCount / 2;
+                                        uint32_t cumCount = 0;
+                                        for(const auto& cl : qualifying) {
+                                            cumCount += cl.count;
+                                            if(cumCount >= medianIdx) {
+                                                bestShift = cl.meanDiff;
+                                                bestCount = cl.count;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Non-repeat region: pick highest-
+                                    // support cluster >= 100bp, then
+                                    // prefer smallest within 10% of
+                                    // best support.
                                     for(const auto& cl : clusters) {
-                                        if(cl.meanDiff == bestShift) {
+                                        if(cl.meanDiff >= 100
+                                           && cl.meanDiff
+                                              <= int64_t(delSize)
+                                           && cl.count > bestCount) {
                                             bestCount = cl.count;
-                                            break;
+                                            bestShift = cl.meanDiff;
+                                        }
+                                    }
+                                    if(bestCount > 0) {
+                                        int64_t smallestInRange =
+                                            bestShift;
+                                        for(const auto& cl : clusters) {
+                                            if(cl.meanDiff >= 100
+                                               && cl.meanDiff
+                                                  <= int64_t(delSize)
+                                               && cl.count
+                                                  >= bestCount * 9 / 10
+                                               && cl.meanDiff
+                                                  < smallestInRange) {
+                                                smallestInRange =
+                                                    cl.meanDiff;
+                                            }
+                                        }
+                                        bestShift = smallestInRange;
+                                        // Update count for selected.
+                                        for(const auto& cl : clusters) {
+                                            if(cl.meanDiff == bestShift) {
+                                                bestCount = cl.count;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
