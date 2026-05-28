@@ -341,3 +341,56 @@ For VNTR gaps where path-based sizing fails, estimates insertion size from total
 - **Relaxed k-mer blacklist** (maxRefKmerCount=50): chains still don't form in VNTRs because k-mers match too many positions; signal-to-noise ratio is too low for the chaining DP
 - **Inverted index frequency filters**: downsampling is already disabled for svanchors; the bottleneck is in the chaining DP, not candidate generation
 - **VNTR depth estimation from read bases**: fails because BAM extraction depletes VNTR reads (mappers assign low MAPQ)
+
+### VNTR Alignment Strategy Investigation
+
+Extensive investigation into alternative alignment strategies for detecting SVs in tandem repeat regions. All failing cases are VNTR insertions (INS57, INS62, INS65, INS235, INS61) or a highly repetitive deletion (DEL379).
+
+#### Repeat Structure Characterization
+
+| Case | Period | Autocorr | VNTR Length | k=50 Unique |
+|------|--------|----------|-------------|-------------|
+| INS57 | 57bp | 0.93 | 1950bp | 56% |
+| INS62 | 21bp | 0.65 | 1685bp | 54% |
+| INS65 | 62bp | 0.98 | 1136bp | 0% (k=80) |
+| INS235 | 60bp | 0.96 | 400bp | 8% (k=100) |
+| INS61 | 70bp | 0.97 | 218bp | 54% |
+| DEL379 | 39bp | 0.67 | 1298bp | 24% |
+
+#### Approaches Tested
+
+1. **k=50 read-to-reference chaining**: 94-96% of reads are chainable with k=50 unique k-mers (vs 7% with k=10). However, the chains don't produce clean SV signals because inserted repeat copies have k-mers that match existing reference positions.
+
+2. **k=50 split-read detection**: Diagonal clustering with k=50 unique k-mers produces 155 split reads for INS57, but the diagonal difference distribution is nearly uniform (no peak at the true 57bp insertion size). Only 3 reads show differences near 57bp. The repeat structure creates false diagonal clusters that dominate the signal.
+
+3. **Reference position gap analysis**: Sorting unique k-mer matches by reference position reveals gaps of ~51bp (close to the 57bp repeat period). However, this gap is a property of the reference's unique k-mer distribution, not the insertion. Both alleles show the same gap pattern.
+
+4. **Read-gap vs reference-gap comparison**: For each read, comparing read-space gaps to reference-space gaps between consecutive unique k-mer matches. The LIS chain absorbs the insertion signal because inserted k-mers match at shifted reference positions.
+
+5. **k=50 read-to-read overlap graph**: True overlaps show 47-196 shared k=50 k-mers vs 7 for non-overlapping reads (20:1 ratio). However, with ~4% sequencing error rate, the expected shared k=50 k-mers between two overlapping reads is only 0.8 (because (1-0.04)^100 ≈ 0.016). The overlap graph has zero paths from left-flank to right-flank reads.
+
+6. **Repeat copy counting**: Per-read repeat unit counts show 0.065 copies/read difference between alleles — too weak to detect with 292 reads.
+
+7. **Full pipeline with k=50**: Running dinara with k=50 produces worse results than k=10 for non-VNTR cases (INS268: 355bp vs 278bp true 268bp) and noisy results for VNTR cases (INS57: 432bp vs true 57bp).
+
+#### Root Cause Analysis
+
+The fundamental limitation is that **VNTR insertions add copies of existing repeat units**. The inserted sequence's k-mers match the reference at positions of existing copies, regardless of k. This makes the insertion invisible to any k-mer-based alignment approach.
+
+The only viable approaches for VNTR insertion detection with short reads require:
+- **Paired-end insert size analysis** (not available in current pipeline)
+- **Local assembly** with error-tolerant overlap detection (k ≤ 20 for read-to-read matching, but k=20 gives only 19% unique k-mers in the VNTR)
+- **Long reads** that can span the entire VNTR
+
+#### Error Rate vs k Trade-off
+
+With ~4% per-base error rate (typical for Illumina short reads):
+
+| k | VNTR Unique | Read-to-Ref Match Rate | Read-to-Read Match Rate | Shared k-mers (100bp overlap) |
+|---|-------------|----------------------|------------------------|-------------------------------|
+| 10 | 7% | 66% | 44% | 22 |
+| 20 | 19% | 44% | 19% | 16 |
+| 30 | 32% | 29% | 8% | 6 |
+| 50 | 56% | 13% | 2% | 0.8 |
+
+The sweet spot for read-to-reference matching is k=50 (56% unique), but for read-to-read matching it's k=10-20. No single k value works for both.
