@@ -114,6 +114,12 @@ else()
     )
 endif()
 
+# Match the main executable's static link flags.
+if(NOT APPLE)
+    set_target_properties(test_integration PROPERTIES
+        LINK_FLAGS "-static -Wl,--allow-multiple-definition")
+endif()
+
 # Ensure the test binary uses the same curated Dinara dependency builds at runtime.
 set_target_properties(test_integration PROPERTIES
     BUILD_RPATH "${DINARA_BUILD_DIR}/lib"
