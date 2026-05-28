@@ -54,39 +54,85 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
-# Discover htslib and libcurl transitive dependencies for static linking.
-# pkg-config --static reports all transitive deps, but not all may have
-# static archives (.a) available. We filter to only keep libs that exist.
+# Discover htslib and libcurl link flags for static linking.
+# We run pkg-config --libs --static to get the full transitive dependency
+# list and pass the raw flags to the linker.
 find_package(PkgConfig)
+set(HTS_LINK_FLAGS "")
+set(CURL_LINK_FLAGS "")
 if(PKG_CONFIG_FOUND)
-    pkg_check_modules(HTS QUIET htslib)
-    pkg_check_modules(CURL QUIET libcurl)
+    execute_process(
+        COMMAND ${PKG_CONFIG_EXECUTABLE} --libs --static htslib
+        OUTPUT_VARIABLE HTS_LINK_FLAGS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _hts_result)
+    if(NOT _hts_result EQUAL 0)
+        set(HTS_LINK_FLAGS "")
+    endif()
+
+    execute_process(
+        COMMAND ${PKG_CONFIG_EXECUTABLE} --libs --static libcurl
+        OUTPUT_VARIABLE CURL_LINK_FLAGS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _curl_result)
+    if(NOT _curl_result EQUAL 0)
+        set(CURL_LINK_FLAGS "")
+    endif()
 endif()
 
-# Helper: filter a list of library names, keeping only those whose
-# static archive (lib<name>.a) can be found by the compiler.
-function(filter_available_static_libs INPUT_LIBS OUTPUT_VAR)
+# Fallback if pkg-config is unavailable or failed.
+if(NOT HTS_LINK_FLAGS)
+    set(HTS_LINK_FLAGS "-lhts -lhtscodecs -ldeflate -llzma -lbz2")
+endif()
+if(NOT CURL_LINK_FLAGS)
+    set(CURL_LINK_FLAGS "-lcurl")
+endif()
+
+# Extract -l and -L flags, then filter out libs without a static archive.
+# This is needed because pkg-config --static may list libraries that only
+# ship as shared (.so) on the system, which breaks -static linking.
+function(extract_static_link_flags INPUT_STRING OUTPUT_VAR)
+    separate_arguments(_tokens UNIX_COMMAND "${INPUT_STRING}")
+    set(_lib_dirs "")
     set(_result "")
-    foreach(_lib ${INPUT_LIBS})
-        find_library(_found_${_lib} NAMES "lib${_lib}.a" PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
-        if(_found_${_lib})
-            list(APPEND _result ${_lib})
+    # First pass: collect -L paths.
+    foreach(_tok ${_tokens})
+        if(_tok MATCHES "^-L(.+)")
+            list(APPEND _lib_dirs "${CMAKE_MATCH_1}")
+            list(APPEND _result ${_tok})
         endif()
-        unset(_found_${_lib} CACHE)
+    endforeach()
+    # Standard search paths.
+    list(APPEND _lib_dirs "/usr/lib" "/usr/lib/x86_64-linux-gnu" "/usr/local/lib"
+                          "/usr/lib/aarch64-linux-gnu")
+    # Second pass: keep -l flags only if lib<name>.a exists somewhere.
+    foreach(_tok ${_tokens})
+        if(_tok MATCHES "^-l(.+)")
+            set(_name "${CMAKE_MATCH_1}")
+            set(_found FALSE)
+            foreach(_dir ${_lib_dirs})
+                if(EXISTS "${_dir}/lib${_name}.a")
+                    set(_found TRUE)
+                    break()
+                endif()
+            endforeach()
+            if(_found)
+                list(APPEND _result ${_tok})
+            else()
+                message(STATUS "  Skipping -l${_name} (no static archive found)")
+            endif()
+        endif()
     endforeach()
     set(${OUTPUT_VAR} ${_result} PARENT_SCOPE)
 endfunction()
 
-if(HTS_STATIC_LIBRARIES)
-    filter_available_static_libs("${HTS_STATIC_LIBRARIES}" HTS_LINK_LIBS)
-else()
-    set(HTS_LINK_LIBS hts htscodecs deflate lzma bz2)
-endif()
-if(CURL_STATIC_LIBRARIES)
-    filter_available_static_libs("${CURL_STATIC_LIBRARIES}" CURL_LINK_LIBS)
-else()
-    set(CURL_LINK_LIBS curl)
-endif()
+extract_static_link_flags("${HTS_LINK_FLAGS}" HTS_LINK_FLAGS)
+extract_static_link_flags("${CURL_LINK_FLAGS}" CURL_LINK_FLAGS)
+
+message(STATUS "HTS link flags: ${HTS_LINK_FLAGS}")
+message(STATUS "CURL link flags: ${CURL_LINK_FLAGS}")
 
 # Snarl finder (vendored from vg, stripped of protobuf/SnarlManager).
 add_subdirectory(external/snarls)
