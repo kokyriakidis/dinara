@@ -2616,6 +2616,36 @@ public:
         uint32_t refStart,
         uint32_t refEnd) const;
 
+    // Soft-clip breakpoint: a cluster of reads with soft clips
+    // at the same position, indicating a breakpoint.
+    struct SoftClipBreakpoint {
+        uint32_t refPos;       // breakpoint position (local coords)
+        uint32_t readCount;    // number of reads with soft clip here
+        bool isLeftClip;       // true = left soft clip (read starts here)
+        uint32_t avgClipLen;   // average soft-clip length
+        vector<string> clipSeqs; // soft-clipped sequences (for assembly)
+    };
+
+    // CIGAR indel call: a large I/D from CIGAR operations.
+    struct CigarIndelCall {
+        string svType;     // "DEL" or "INS"
+        int64_t size;
+        uint32_t refPos;   // position in local coords
+        uint32_t readCount;
+        string insSeq;     // inserted sequence (for INS only)
+    };
+
+    // Parse soft-clip breakpoints and CIGAR indels from BAM.
+    // Returns soft-clip breakpoints and CIGAR indel calls in
+    // a single BAM pass for efficiency.
+    void parseBamEvidence(
+        const string& bamFileName,
+        const string& refName,
+        uint32_t refStart,
+        uint32_t refEnd,
+        vector<SoftClipBreakpoint>& softClipBPs,
+        vector<CigarIndelCall>& cigarIndels) const;
+
     void classifySplitAlignments(
         uint64_t referenceReadCount,
         double maskLevel,           // Max query overlap fraction to be supplementary (minimap2: 0.5).

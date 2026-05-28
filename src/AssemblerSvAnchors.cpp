@@ -38,6 +38,91 @@ using namespace dinara;
 using namespace std;
 
 
+// Simple de Bruijn graph assembly of soft-clip sequences.
+// Returns the length of the longest assembled contig.
+// Uses a greedy extension approach: start from the most
+// frequent k-mer and extend in both directions.
+static uint32_t assembleClipSequences(
+    const vector<string>& seqs,
+    uint32_t k = 21)
+{
+    if(seqs.empty() || k < 11) return 0;
+
+    // Build k-mer count map.
+    unordered_map<string, uint32_t> kmerCount;
+    for(const auto& seq : seqs) {
+        if(seq.size() < k) continue;
+        for(size_t i = 0; i + k <= seq.size(); ++i) {
+            ++kmerCount[seq.substr(i, k)];
+        }
+    }
+
+    if(kmerCount.empty()) return 0;
+
+    // Find the most frequent k-mer as seed.
+    string seed;
+    uint32_t maxCount = 0;
+    for(const auto& kv : kmerCount) {
+        if(kv.second > maxCount) {
+            maxCount = kv.second;
+            seed = kv.first;
+        }
+    }
+
+    if(maxCount < 2) return 0;
+
+    // Greedy extension: extend right, then left.
+    string contig = seed;
+    unordered_set<string> used;
+    used.insert(seed);
+
+    // Extend right.
+    while(true) {
+        const string suffix = contig.substr(
+            contig.size() - (k - 1));
+        string bestNext;
+        uint32_t bestCount = 0;
+        for(char c : {'A', 'C', 'G', 'T'}) {
+            string candidate = suffix + c;
+            auto it = kmerCount.find(candidate);
+            if(it != kmerCount.end()
+               && it->second > bestCount
+               && used.find(candidate) == used.end()) {
+                bestCount = it->second;
+                bestNext = candidate;
+            }
+        }
+        if(bestCount < 2) break;
+        used.insert(bestNext);
+        contig += bestNext.back();
+        if(contig.size() > 5000) break;
+    }
+
+    // Extend left.
+    while(true) {
+        const string prefix = contig.substr(0, k - 1);
+        string bestPrev;
+        uint32_t bestCount = 0;
+        for(char c : {'A', 'C', 'G', 'T'}) {
+            string candidate = string(1, c) + prefix;
+            auto it = kmerCount.find(candidate);
+            if(it != kmerCount.end()
+               && it->second > bestCount
+               && used.find(candidate) == used.end()) {
+                bestCount = it->second;
+                bestPrev = candidate;
+            }
+        }
+        if(bestCount < 2) break;
+        used.insert(bestPrev);
+        contig = bestPrev.front() + contig;
+        if(contig.size() > 5000) break;
+    }
+
+    return uint32_t(contig.size());
+}
+
+
 void Assembler::classifySplitAlignments(
     uint64_t referenceReadCount,
     double maskLevel,
@@ -441,6 +526,129 @@ void Assembler::buildSvMSA(
                          << " at pos=" << sc.refPos
                          << " reads=" << sc.readCount
                          << endl;
+                }
+            }
+            // Parse soft-clip breakpoints and CIGAR indels.
+            vector<SoftClipBreakpoint> softClipBPs;
+            vector<CigarIndelCall> cigarIndels;
+            parseBamEvidence(
+                bamFileName, refName,
+                regionStart, regionStart + refLength,
+                softClipBPs, cigarIndels);
+
+            if(!softClipBPs.empty()) {
+                cout << "    Soft-clip breakpoints ("
+                     << softClipBPs.size() << " clusters):"
+                     << endl;
+                for(const auto& sc : softClipBPs) {
+                    cout << "      "
+                         << (sc.isLeftClip ? "L" : "R")
+                         << " pos=" << sc.refPos
+                         << " reads=" << sc.readCount
+                         << " avgClipLen=" << sc.avgClipLen
+                         << endl;
+                }
+            }
+
+            if(!cigarIndels.empty()) {
+                cout << "    CIGAR indels ("
+                     << cigarIndels.size() << " clusters):"
+                     << endl;
+                for(const auto& ci : cigarIndels) {
+                    cout << "      " << ci.svType
+                         << " " << ci.size << "bp"
+                         << " at pos=" << ci.refPos
+                         << " reads=" << ci.readCount;
+                    if(!ci.insSeq.empty())
+                        cout << " seq=" << ci.insSeq.size()
+                             << "bp";
+                    cout << endl;
+                }
+            }
+
+            // Emit CIGAR indel calls when they have strong
+            // support (>=3 reads) and size >=50bp.
+            for(const auto& ci : cigarIndels) {
+                if(ci.readCount >= 3 && ci.size >= 50) {
+                    cout << "    >>> "
+                         << (ci.svType == "DEL"
+                             ? "DELETION" : "INSERTION")
+                         << " CALL (CIGAR): size="
+                         << ci.size << "bp"
+                         << ", breakpoint=" << ci.refPos
+                         << ", reads=" << ci.readCount
+                         << endl;
+                }
+            }
+
+            // Paired soft-clip INS sizing with de Bruijn assembly.
+            // Right-clip reads end at the left breakpoint; their
+            // clipped bases extend into the insertion. Left-clip
+            // reads start at the right breakpoint; their clipped
+            // bases extend into the insertion from the other side.
+            // Assemble each side to get contig lengths, then
+            // estimate insertion size from the sum minus overlap.
+            for(const auto& rClip : softClipBPs) {
+                if(rClip.isLeftClip) continue;
+                if(rClip.readCount < 3) continue;
+                for(const auto& lClip : softClipBPs) {
+                    if(!lClip.isLeftClip) continue;
+                    if(lClip.readCount < 3) continue;
+                    const int64_t gap = int64_t(lClip.refPos)
+                                      - int64_t(rClip.refPos);
+                    if(gap < -10 || gap > 50) continue;
+
+                    // Assemble each side's clip sequences.
+                    const uint32_t rContigLen =
+                        assembleClipSequences(rClip.clipSeqs);
+                    const uint32_t lContigLen =
+                        assembleClipSequences(lClip.clipSeqs);
+
+                    // Estimate insertion size.
+                    // If both sides assembled, the insertion is
+                    // at least as long as the longer contig.
+                    // If the contigs overlap (insertion < read
+                    // length), the true size is captured by the
+                    // overlap. For larger insertions, sum the
+                    // contig lengths minus estimated overlap.
+                    int64_t insSize;
+                    if(rContigLen > 0 && lContigLen > 0) {
+                        // Use assembled contig lengths.
+                        // Subtract k-1 overlap estimate.
+                        insSize = int64_t(rContigLen)
+                                + int64_t(lContigLen) - 20;
+                        // But at least the max of the two.
+                        insSize = std::max(insSize,
+                            int64_t(std::max(
+                                rContigLen, lContigLen)));
+                    } else if(rContigLen > 0 || lContigLen > 0) {
+                        // One side assembled.
+                        insSize = int64_t(std::max(
+                            rContigLen, lContigLen));
+                    } else {
+                        // Fallback to average clip lengths.
+                        insSize = int64_t(rClip.avgClipLen)
+                                + int64_t(lClip.avgClipLen)
+                                - std::max(int64_t(0), gap);
+                    }
+
+                    if(insSize >= 50 && insSize <= 10000) {
+                        const uint32_t bpPos =
+                            (rClip.refPos + lClip.refPos) / 2;
+                        cout << "    >>> INSERTION CALL"
+                             << " (soft-clip assembly): size="
+                             << insSize << "bp"
+                             << ", breakpoint=" << bpPos
+                             << ", Rclip=" << rClip.readCount
+                             << "reads"
+                             << " contig=" << rContigLen
+                             << "bp"
+                             << ", Lclip=" << lClip.readCount
+                             << "reads"
+                             << " contig=" << lContigLen
+                             << "bp"
+                             << endl;
+                    }
                 }
             }
         }
@@ -5479,6 +5687,278 @@ vector<Assembler::SaTagSvCall> Assembler::parseSaTagSvCalls(
     }
 
     return result;
+}
+
+
+// Parse soft-clip breakpoints and CIGAR indels from BAM reads
+// in a single pass. Soft clips indicate breakpoint positions;
+// CIGAR I/D operations indicate small-medium SVs directly.
+void Assembler::parseBamEvidence(
+    const string& bamFileName,
+    const string& refName,
+    uint32_t refStart,
+    uint32_t refEnd,
+    vector<SoftClipBreakpoint>& softClipBPs,
+    vector<CigarIndelCall>& cigarIndels) const
+{
+    softClipBPs.clear();
+    cigarIndels.clear();
+    if(bamFileName.empty()) return;
+
+    htsFile* fp = hts_open(bamFileName.c_str(), "r");
+    if(!fp) return;
+    sam_hdr_t* hdr = sam_hdr_read(fp);
+    if(!hdr) { hts_close(fp); return; }
+    hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
+    if(!idx) { sam_hdr_destroy(hdr); hts_close(fp); return; }
+
+    int tid = sam_hdr_name2tid(hdr, refName.c_str());
+    if(tid < 0) {
+        string altName;
+        if(refName.size() > 3 && refName.substr(0, 3) == "chr")
+            altName = refName.substr(3);
+        else
+            altName = "chr" + refName;
+        tid = sam_hdr_name2tid(hdr, altName.c_str());
+    }
+    if(tid < 0) {
+        hts_idx_destroy(idx);
+        sam_hdr_destroy(hdr);
+        hts_close(fp);
+        return;
+    }
+
+    hts_itr_t* iter = sam_itr_queryi(
+        idx, tid, int(refStart), int(refEnd));
+    if(!iter) {
+        hts_idx_destroy(idx);
+        sam_hdr_destroy(hdr);
+        hts_close(fp);
+        return;
+    }
+
+    const uint32_t minClipLen = 20;
+    const int64_t minIndelSize = 30;
+
+    // Raw observations before clustering.
+    struct ClipObs {
+        uint32_t refPos;   // absolute position
+        bool isLeftClip;
+        string clipSeq;
+    };
+    vector<ClipObs> clipObs;
+
+    struct IndelObs {
+        bool isDel;
+        int64_t size;
+        uint32_t refPos;   // absolute position
+        string insSeq;
+    };
+    vector<IndelObs> indelObs;
+
+    bam1_t* aln = bam_init1();
+    while(sam_itr_next(fp, iter, aln) >= 0) {
+        if(aln->core.flag &
+           (BAM_FSUPPLEMENTARY | BAM_FSECONDARY | BAM_FUNMAP))
+            continue;
+
+        const int32_t pos = aln->core.pos;
+        const uint32_t* cigar = bam_get_cigar(aln);
+        const int nCigar = aln->core.n_cigar;
+        const uint8_t* seq = bam_get_seq(aln);
+        const int32_t seqLen = aln->core.l_qseq;
+
+        if(nCigar == 0) continue;
+
+        // Check left soft clip (first CIGAR op).
+        {
+            const int op = bam_cigar_op(cigar[0]);
+            const int len = bam_cigar_oplen(cigar[0]);
+            if(op == BAM_CSOFT_CLIP
+               && uint32_t(len) >= minClipLen) {
+                // Left clip: breakpoint is at alignment start.
+                string clipSeq;
+                clipSeq.reserve(len);
+                for(int i = 0; i < len; ++i) {
+                    static const char base[] = "=ACMGRSVTWYHKDBN";
+                    clipSeq += base[bam_seqi(seq, i)];
+                }
+                clipObs.push_back({
+                    uint32_t(pos), true, std::move(clipSeq)
+                });
+            }
+        }
+
+        // Check right soft clip (last CIGAR op).
+        {
+            const int op = bam_cigar_op(cigar[nCigar - 1]);
+            const int len = bam_cigar_oplen(cigar[nCigar - 1]);
+            if(op == BAM_CSOFT_CLIP
+               && uint32_t(len) >= minClipLen) {
+                // Right clip: breakpoint is at alignment end.
+                // Compute alignment end position.
+                int64_t refPos = pos;
+                for(int ci = 0; ci < nCigar - 1; ++ci) {
+                    const int o = bam_cigar_op(cigar[ci]);
+                    const int l = bam_cigar_oplen(cigar[ci]);
+                    if(o == BAM_CMATCH || o == BAM_CDEL
+                       || o == BAM_CREF_SKIP || o == BAM_CEQUAL
+                       || o == BAM_CDIFF)
+                        refPos += l;
+                }
+                string clipSeq;
+                const int clipStart = seqLen - len;
+                clipSeq.reserve(len);
+                for(int i = clipStart; i < seqLen; ++i) {
+                    static const char base[] = "=ACMGRSVTWYHKDBN";
+                    clipSeq += base[bam_seqi(seq, i)];
+                }
+                clipObs.push_back({
+                    uint32_t(refPos), false, std::move(clipSeq)
+                });
+            }
+        }
+
+        // Check CIGAR for large I/D operations.
+        {
+            int64_t refPos = pos;
+            int32_t queryPos = 0;
+            // Skip leading soft clip in query position.
+            if(nCigar > 0
+               && bam_cigar_op(cigar[0]) == BAM_CSOFT_CLIP) {
+                queryPos = bam_cigar_oplen(cigar[0]);
+            }
+            for(int ci = 0; ci < nCigar; ++ci) {
+                const int op = bam_cigar_op(cigar[ci]);
+                const int len = bam_cigar_oplen(cigar[ci]);
+
+                if(op == BAM_CDEL && len >= minIndelSize) {
+                    indelObs.push_back({
+                        true, int64_t(len),
+                        uint32_t(refPos), ""
+                    });
+                } else if(op == BAM_CINS && len >= minIndelSize) {
+                    string insSeq;
+                    insSeq.reserve(len);
+                    for(int i = queryPos;
+                        i < queryPos + len && i < seqLen; ++i) {
+                        static const char base[] =
+                            "=ACMGRSVTWYHKDBN";
+                        insSeq += base[bam_seqi(seq, i)];
+                    }
+                    indelObs.push_back({
+                        false, int64_t(len),
+                        uint32_t(refPos), std::move(insSeq)
+                    });
+                }
+
+                // Advance positions.
+                if(op == BAM_CMATCH || op == BAM_CEQUAL
+                   || op == BAM_CDIFF) {
+                    refPos += len;
+                    queryPos += len;
+                } else if(op == BAM_CDEL
+                          || op == BAM_CREF_SKIP) {
+                    refPos += len;
+                } else if(op == BAM_CINS
+                          || op == BAM_CSOFT_CLIP) {
+                    queryPos += len;
+                }
+            }
+        }
+    }
+
+    bam_destroy1(aln);
+    hts_itr_destroy(iter);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    hts_close(fp);
+
+    // Cluster soft-clip observations by position (within 5bp).
+    sort(clipObs.begin(), clipObs.end(),
+         [](const ClipObs& a, const ClipObs& b) {
+             if(a.isLeftClip != b.isLeftClip)
+                 return a.isLeftClip > b.isLeftClip;
+             return a.refPos < b.refPos;
+         });
+
+    {
+        size_t i = 0;
+        while(i < clipObs.size()) {
+            const bool isLeft = clipObs[i].isLeftClip;
+            const uint32_t clusterStart = clipObs[i].refPos;
+            uint64_t sumPos = 0;
+            uint64_t sumClipLen = 0;
+            vector<string> seqs;
+            size_t j = i;
+            while(j < clipObs.size()
+                  && clipObs[j].isLeftClip == isLeft
+                  && clipObs[j].refPos <= clusterStart + 5) {
+                sumPos += clipObs[j].refPos;
+                sumClipLen += clipObs[j].clipSeq.size();
+                seqs.push_back(std::move(clipObs[j].clipSeq));
+                ++j;
+            }
+            const uint32_t count = uint32_t(j - i);
+            if(count >= 3) {
+                uint32_t localPos = uint32_t(sumPos / count);
+                if(localPos >= refStart)
+                    localPos -= refStart;
+                softClipBPs.push_back({
+                    localPos,
+                    count,
+                    isLeft,
+                    uint32_t(sumClipLen / count),
+                    std::move(seqs)
+                });
+            }
+            i = j;
+        }
+    }
+
+    // Cluster CIGAR indel observations by type and position
+    // (within 20bp).
+    sort(indelObs.begin(), indelObs.end(),
+         [](const IndelObs& a, const IndelObs& b) {
+             if(a.isDel != b.isDel) return a.isDel > b.isDel;
+             return a.refPos < b.refPos;
+         });
+
+    {
+        size_t i = 0;
+        while(i < indelObs.size()) {
+            const bool isDel = indelObs[i].isDel;
+            const uint32_t clusterStart = indelObs[i].refPos;
+            int64_t sumSize = 0;
+            uint64_t sumPos = 0;
+            string bestInsSeq;
+            size_t j = i;
+            while(j < indelObs.size()
+                  && indelObs[j].isDel == isDel
+                  && indelObs[j].refPos <= clusterStart + 20) {
+                sumSize += indelObs[j].size;
+                sumPos += indelObs[j].refPos;
+                if(indelObs[j].insSeq.size()
+                   > bestInsSeq.size())
+                    bestInsSeq = indelObs[j].insSeq;
+                ++j;
+            }
+            const uint32_t count = uint32_t(j - i);
+            if(count >= 2) {
+                uint32_t localPos = uint32_t(sumPos / count);
+                if(localPos >= refStart)
+                    localPos -= refStart;
+                cigarIndels.push_back({
+                    isDel ? "DEL" : "INS",
+                    sumSize / int64_t(count),
+                    localPos,
+                    count,
+                    std::move(bestInsSeq)
+                });
+            }
+            i = j;
+        }
+    }
 }
 
 
