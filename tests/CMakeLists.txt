@@ -109,7 +109,7 @@ else()
         -Wl,--start-group
         ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
         ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS}
-        ZLIB::ZLIB
+        z
         -Wl,--end-group
     )
 endif()
