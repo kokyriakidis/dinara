@@ -16,6 +16,7 @@
 #include "AlignmentCandidates.hpp"
 #include "InvertedIndexBuilder.hpp"
 #include "Reads.hpp"
+#include "Sdust.hpp"
 #include "performanceLog.hpp"
 #include "timestamp.hpp"
 
@@ -3508,6 +3509,199 @@ void Assembler::buildSvMSA(
                          << "breakpoint=" << (sumPos / count) << ", "
                          << "reads=" << count
                          << endl;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // DUST-gated STR/microsatellite SV detection.
+        //
+        // For large low-complexity regions (detected by SDUST), standard
+        // chaining fails because k-mers are non-unique. Instead, find
+        // reads whose chains anchor on both flanks of the DUST interval,
+        // then compare the read-space gap to the reference-space gap.
+        // The difference estimates the insertion or deletion size.
+        // -----------------------------------------------------------------
+        {
+            // Get reference sequence.
+            const vector<Base> dustRefSeq =
+                readsRef.getOrientedReadRawSequence(
+                    OrientedReadId(refId, 0));
+
+            // Run SDUST on the full reference.
+            vector<pair<uint32_t,uint32_t>> dustIntervals;
+            sdust(dustRefSeq, 0, uint32_t(dustRefSeq.size()),
+                  20, 64, dustIntervals);
+
+            // Process large DUST intervals (>= 200bp).
+            for(const auto& [dustStart, dustEnd] : dustIntervals) {
+                const uint32_t dustLen = dustEnd - dustStart;
+                if(dustLen < 200) continue;
+
+                // Find reads with chains anchoring on both flanks.
+                // Left flank: anchors in [dustStart-300, dustStart)
+                // Right flank: anchors in (dustEnd, dustEnd+300]
+                const uint32_t flankSize = 300;
+                const uint32_t leftFlankStart =
+                    dustStart > flankSize
+                    ? dustStart - flankSize : 0;
+                const uint32_t rightFlankEnd =
+                    std::min(dustEnd + flankSize,
+                             uint32_t(dustRefSeq.size()));
+
+                struct FlankingRead {
+                    uint32_t readId;
+                    uint32_t lastLeftRefPos;   // last anchor in left flank
+                    uint32_t firstRightRefPos; // first anchor in right flank
+                    uint32_t lastLeftReadPos;  // corresponding read pos
+                    uint32_t firstRightReadPos;
+                };
+                vector<FlankingRead> flankingReads;
+
+                // Group chains by read ID.
+                std::unordered_map<uint32_t,
+                    vector<uint32_t>> readChainMap;
+                for(uint32_t ci = 0;
+                    ci < chainsForRef.size(); ++ci) {
+                    const auto& ce = chainsForRef[ci];
+                    if(ce.readId == uint32_t(refId)) continue;
+                    readChainMap[ce.readId].push_back(ci);
+                }
+
+                for(const auto& [rdId, cis] : readChainMap) {
+                    uint32_t bestLeftRef = 0, bestLeftRead = 0;
+                    uint32_t bestRightRef = UINT32_MAX;
+                    uint32_t bestRightRead = 0;
+                    bool hasLeft = false, hasRight = false;
+
+                    for(const auto ci : cis) {
+                        const auto& ce = chainsForRef[ci];
+                        if(!ce.isSameStrand) continue;
+                        const auto& al =
+                            alignments[ce.chainIndex];
+                        const Strand strand = 0;
+                        const auto rdMkrs = markersRef[
+                            OrientedReadId(
+                                ReadId(rdId), strand
+                            ).getValue()];
+
+                        for(const auto& ord : al.ordinals) {
+                            if(ord[0] >= refMarkers.size()
+                               || ord[1] >= rdMkrs.size())
+                                continue;
+                            const uint32_t rp = uint32_t(
+                                refMarkers[ord[0]].position);
+                            const uint32_t qp = uint32_t(
+                                rdMkrs[ord[1]].position);
+
+                            // Left flank: closest to dustStart.
+                            if(rp >= leftFlankStart
+                               && rp < dustStart
+                               && rp > bestLeftRef) {
+                                bestLeftRef = rp;
+                                bestLeftRead = qp;
+                                hasLeft = true;
+                            }
+                            // Right flank: closest to dustEnd.
+                            if(rp > dustEnd
+                               && rp <= rightFlankEnd
+                               && rp < bestRightRef) {
+                                bestRightRef = rp;
+                                bestRightRead = qp;
+                                hasRight = true;
+                            }
+                        }
+                    }
+
+                    if(hasLeft && hasRight
+                       && bestRightRead > bestLeftRead) {
+                        flankingReads.push_back({
+                            rdId,
+                            bestLeftRef, bestRightRef,
+                            bestLeftRead, bestRightRead});
+                    }
+                }
+
+                if(flankingReads.size() < 2) continue;
+
+                // For each flanking read, compute:
+                //   refGap = rightRefPos - leftRefPos
+                //   readGap = rightReadPos - leftReadPos
+                //   sizeDiff = readGap - refGap
+                //   positive sizeDiff = insertion
+                //   negative sizeDiff = deletion
+                vector<int64_t> sizeDiffs;
+                for(const auto& fr : flankingReads) {
+                    const int64_t refGap =
+                        int64_t(fr.firstRightRefPos)
+                        - int64_t(fr.lastLeftRefPos);
+                    const int64_t readGap =
+                        int64_t(fr.firstRightReadPos)
+                        - int64_t(fr.lastLeftReadPos);
+                    sizeDiffs.push_back(readGap - refGap);
+                }
+
+                sort(sizeDiffs.begin(), sizeDiffs.end());
+                const int64_t medianDiff =
+                    sizeDiffs[sizeDiffs.size() / 2];
+
+                // Detect repeat motif period in the DUST region.
+                uint32_t motifPeriod = 0;
+                {
+                    const uint32_t checkLen =
+                        std::min(dustLen, uint32_t(200));
+                    for(uint32_t p = 1; p <= 6; ++p) {
+                        uint32_t matches = 0;
+                        uint32_t total = 0;
+                        for(uint32_t i = dustStart;
+                            i + p < dustStart + checkLen; ++i) {
+                            ++total;
+                            if(dustRefSeq[i].value
+                               == dustRefSeq[i + p].value)
+                                ++matches;
+                        }
+                        if(total > 0
+                           && matches * 100 / total >= 70) {
+                            motifPeriod = p;
+                            break;
+                        }
+                    }
+                }
+
+                cout << "    DUST-STR region: "
+                     << dustStart << "-" << dustEnd
+                     << " (" << dustLen << "bp)"
+                     << " motifPeriod=" << motifPeriod
+                     << " flankingReads="
+                     << flankingReads.size()
+                     << " medianDiff=" << medianDiff
+                     << endl;
+
+                if(std::abs(medianDiff) >= 10
+                   && flankingReads.size() >= 2) {
+                    if(medianDiff > 0) {
+                        cout << "    >>> INSERTION CALL "
+                             << "(DUST-STR): size="
+                             << medianDiff << "bp"
+                             << ", breakpoint="
+                             << (dustStart + dustEnd) / 2
+                             << ", flankingReads="
+                             << flankingReads.size()
+                             << ", motifPeriod="
+                             << motifPeriod
+                             << endl;
+                    } else {
+                        cout << "    >>> DELETION CALL "
+                             << "(DUST-STR): size="
+                             << -medianDiff << "bp"
+                             << ", breakpoint="
+                             << (dustStart + dustEnd) / 2
+                             << ", flankingReads="
+                             << flankingReads.size()
+                             << ", motifPeriod="
+                             << motifPeriod
+                             << endl;
+                    }
                 }
             }
         }
