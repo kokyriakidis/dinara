@@ -1,8 +1,11 @@
-# Dinara Anchor Window Pipeline — Checkpoint
+# Dinara — Checkpoint
 
 ## Overview
 
-Dinara is a genome assembler. The current work focuses on building an **anchor graph from anchor windows** that is compatible with shasta2. Each window represents a contiguous region on a backbone read's journey, and the anchor graph connects these windows via inter-window edges discovered from read journeys.
+Dinara is a genome assembler with two active workstreams:
+
+1. **Anchor window pipeline** — builds an anchor graph compatible with shasta2 from long reads
+2. **SV detection from short reads** — the `--command svanchors` subcommand maps short reads to a reference and detects structural variants
 
 ## Architecture
 
@@ -191,7 +194,7 @@ Key modifications in the fork:
 - **`transitionReads`-based 1-to-1 check** — stray reads added extra neighbors, causing zero 1-to-1 matches. Replaced with direct `outEdges`/`inEdges` counting, then generalized to bounding span approach.
 - **`filterByShasta2HashedKmerChecker`** — removed entirely; was filtering anchors by shasta2's hashed k-mer checker but caused issues and was unnecessary.
 
-## Current State
+## Current State (Anchor Windows)
 
 - Rule 1 (bounding span trimming) is active and working
 - `removeNegativeOffsets` is called at all 3 edge construction sites
@@ -199,3 +202,142 @@ Key modifications in the fork:
 - Export to shasta2 format is working with round-trip verification
 - Shasta2 assembly completes successfully with dinara's exported anchors and graph
 - Post-graph steps (transitive reduction, assembly graph, etc.) are disabled via `return;` in main.cpp
+
+---
+
+## SV Detection Pipeline (`--command svanchors`)
+
+### Overview
+
+Detects structural variants (insertions and deletions) from short reads aligned to a local reference. The pipeline uses k-mer-based chaining (hifiasm-derived DP) with minimap2-sr scoring to align reads, then applies multiple detection layers.
+
+### Running
+
+```bash
+dinara --command svanchors \
+  --reference reference.fa --input reads.fa \
+  --assemblyDirectory outdir \
+  --Reads.minReadLength 50 --Kmers.k 10 --Kmers.minimizerW 6
+```
+
+Test cases: `/tmp/sv_cases/` with insertion directories at top level and deletion directories under `DEL_medium_100_500bp/`.
+
+### Pipeline Steps (in `srcMain/main.cpp`, svanchors section)
+
+1. **Load reference** (read 0) and short reads
+2. **Find minimizer markers** (k=10, w=6)
+3. **Remove non-unique reference k-mers** — blacklist k-mers appearing >1 time in the reference
+4. **Build inverted index** — hash table mapping canonical k-mers to (readId, position) occurrences
+5. **K-mer hit depth profiling** — per-window hit depth along the reference for breakpoint detection
+6. **DP chaining** — minimap2-sr scoring mode (chainingMode=1), bw=100, maxGap=5000, multi-chain extraction
+7. **Replace extended coordinates** — use raw anchor positions instead of hifiasm-extended qs/qe/ts/te
+8. **Classify chains** — primary/supplementary/secondary based on query overlap (minimap2 mm_set_parent)
+9. **Build read graph** — connect reads sharing chains for path-based insertion sizing
+10. **Build SV MSA** (`buildSvMSA` in `src/AssemblerSvAnchors.cpp`) — the main detection engine
+
+### Chaining Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| chainingMode | 1 | minimap2-sr scoring |
+| minimap2Bw | 100 | Fixed bandwidth; limits single-chain deletion detection to ~100bp |
+| minimap2MaxGap | 5000 | Large gaps for SV detection |
+| minimap2MinChainScore | 25 | minimap2 -m25 |
+| mcopyNum | 20 | minimap2 -N20 (max secondary chains) |
+| mcopyRate | 0.50 | minimap2 -p.5 (secondary ratio) |
+| downsampleHighFrequencyMarkers | false | Disabled; coverageHet not computed in svanchors |
+| referenceReadCount | 0 | Chain all-vs-all (needed for read graph) |
+
+### Detection Layers (in `buildSvMSA`)
+
+#### Per-read diagonal analysis
+For each read's chain anchors, compute diagonal (refPos - readPos). A large rise/drop in diagonal indicates a deletion/insertion.
+
+#### Coverage-drop breakpoint detection
+Per-50bp-window analysis of chain endpoints and spanning counts. Left breakpoints (chain ends spike) and right breakpoints (chain starts spike) are paired.
+
+#### K-mer hit depth profiling
+Windows where hit depth drops below 50% of median indicate marker-depleted regions (VNTRs, repeats). Used for VNTR gap detection and marker-density gating.
+
+#### VNTR gap detection
+When left/right breakpoints are >500bp apart and >50% of intervening windows have low hit depth, the gap is classified as a VNTR. Path-based sizing is skipped for VNTRs.
+
+#### Marker-density gating (commit `b2677da`)
+Even when breakpoints are close (<500bp), if >60% of windows in a ±300bp radius have zero reference markers, the region is treated as VNTR-like and path-based sizing is skipped. Prevents false insertion calls from read-to-read chain shortcuts in repetitive regions.
+
+#### Path-based insertion sizing
+For non-VNTR breakpoint pairs, search the read graph for paths from left-flank reads to right-flank reads (1-3 hops). Insertion size = left overhang + intermediate extensions + right overhang - overlap spans. Gap-capped overlap prevents breakpoint-spanning gaps from inflating the overlap estimate.
+
+#### Adaptive multi-k gap filling
+For deletion sizing, progressively try k=60 down to k=10 to find skeleton anchors in marker-depleted regions. Larger k provides more specific anchors; smaller k fills gaps.
+
+#### Split-read deletion detection (commit `e1284fc`)
+Groups chains by read ID. For reads with 2+ same-strand chains, compares median diagonals between consecutive non-overlapping chain pairs. Diagonal differences >50bp and <1000bp with consistent reference gap indicate deletions. Requires ≥2 supporting reads.
+
+#### Tandem repeat weighted median cluster selection (commit `e1284fc`)
+In marker-depleted regions (markerDepleted flag), uses weighted median of qualifying deletion clusters (≥100bp) instead of highest-support cluster. Improves sizing accuracy for tandem repeat deletions.
+
+#### Per-anchor pairwise diagonal difference analysis (commit `69e589e`)
+For each consecutive anchor pair in a chain, computes the diagonal difference. Collects all pairwise differences and clusters them for deletion sizing.
+
+#### Inversion filter (commit `69e589e`)
+Requires ≥15 anchors and ≥80bp span for inversion calls. Prevents small spurious inversion clusters.
+
+#### DUST-gated STR detection (commit `4f3b22f`)
+Runs SDUST (symmetric DUST algorithm, `src/Sdust.hpp`) on the reference to find low-complexity intervals ≥200bp. For each, finds reads with chain anchors on both flanks and compares read-space gap to reference-space gap. The difference gives insertion/deletion size.
+
+#### VNTR depth estimation
+For VNTR gaps where path-based sizing fails, estimates insertion size from total read bases in the VNTR vs expected bases at flanking coverage. Currently limited by BAM extraction depleting VNTR reads (short-read aligners assign low MAPQ in tandem repeats).
+
+### Key Files (SV Detection)
+
+| File | Purpose |
+|---|---|
+| `src/AssemblerSvAnchors.cpp` | `buildSvMSA` — main SV detection engine |
+| `src/Sdust.hpp` | Standalone SDUST low-complexity filter (Heng Li's algorithm) |
+| `src/Assembler.hpp` | `AlignmentCandidatesInvertedIndexData` with chaining parameters |
+| `src/AssemblerInvertedIndex.cpp` | Inverted index build, chaining DP, hit collection |
+| `src/InvertedIndexBuilder.hpp` | Count-then-scatter index construction |
+| `src/AssemblerMarkers.cpp` | `removeNonUniqueReferenceMarkers` — k-mer blacklisting |
+| `srcMain/main.cpp` | svanchors pipeline orchestration (line ~3830+) |
+
+### Test Results (18 cases)
+
+| Case | True Size | Detected | Method |
+|------|-----------|----------|--------|
+| INS268 | 268bp | 278bp | path-based (1 hop) |
+| INS254 | 254bp | 263bp | path-based (2 hops) |
+| INS148 | 148bp | 149bp | path-based (1 hop) |
+| DEL277 | 277bp | 277bp | split-read (14 reads) |
+| DEL347 | 347bp | 328bp | split-read (9 reads) + DUST-STR |
+| DEL324 | 324bp | 344bp | DEL CLUSTER |
+| DEL160 | 160bp | 160bp | split-read (3 reads) |
+| DEL137 | 137bp | 136bp | adaptive-bimodal |
+| DEL182 | 182bp | 195bp | adaptive-bimodal |
+| DEL119a | 119bp | 121bp | adaptive-bimodal |
+| DEL119b | 119bp | 121bp | adaptive-bimodal |
+| DEL147 | 234bp | 229bp | split-read (2 reads) |
+
+**Undetected (known limitations):**
+
+| Case | Root Cause |
+|------|-----------|
+| INS57 (57bp) | VNTR, 10% unique 10-mers at breakpoint |
+| INS62 (62bp) | 1685bp VNTR (75× core motif), BAM-depleted |
+| INS65 (65bp) | 1700bp VNTR, BAM-depleted |
+| INS235 (235bp) | VNTR, 16.5x coverage (heavily depleted) |
+| INS61 (61bp) | 2256bp AT-repeat microsatellite |
+| DEL379 (379bp) | 98% repetitive 10-mers |
+
+### Known Limitations
+
+1. **bw=100** prevents single-chain deletion detection >100bp; split-read detection handles larger deletions
+2. **VNTR insertions** are fundamentally limited: short reads can't span VNTRs, k-mers are non-unique, BAM extraction depletes VNTR reads
+3. **Microsatellite insertions** (e.g., AT-repeats): reads are too short to span from unique flanking sequence past the breakpoint
+4. **Highly repetitive regions** (>90% non-unique 10-mers): no reliable anchoring possible with k=10
+
+### Investigated but Not Viable
+
+- **Relaxed k-mer blacklist** (maxRefKmerCount=50): chains still don't form in VNTRs because k-mers match too many positions; signal-to-noise ratio is too low for the chaining DP
+- **Inverted index frequency filters**: downsampling is already disabled for svanchors; the bottleneck is in the chaining DP, not candidate generation
+- **VNTR depth estimation from read bases**: fails because BAM extraction depletes VNTR reads (mappers assign low MAPQ)
