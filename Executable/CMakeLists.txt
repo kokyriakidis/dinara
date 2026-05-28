@@ -130,7 +130,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} hts htscodecs deflate lzma bz2 curl z m)
     else(X86_64)
         target_link_libraries(
             dinaraExecutable

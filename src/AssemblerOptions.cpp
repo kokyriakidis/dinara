@@ -277,6 +277,12 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         "Reference FASTA for the target subregion. "
         "Required for --command svanchors. "
         "The reference is loaded as read 0; short reads from --input follow.")
+
+        ("bam",
+        value<string>(&commandLineOnlyOptions.bamFileName),
+        "Optional BAM file with aligned short reads for --command svanchors. "
+        "SA tags from supplementary alignments are parsed to extract "
+        "split-read SV evidence.")
         ;
 
 }

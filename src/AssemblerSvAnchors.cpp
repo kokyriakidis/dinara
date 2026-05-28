@@ -20,6 +20,9 @@
 #include "performanceLog.hpp"
 #include "timestamp.hpp"
 
+#include <htslib/sam.h>
+#include <htslib/hts.h>
+
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -312,7 +315,8 @@ void Assembler::classifySplitAlignments(
 void Assembler::buildSvMSA(
     uint64_t referenceReadCount,
     const string& outputPrefix,
-    const vector<RefHitDepthWindow>& refHitDepth)
+    const vector<RefHitDepthWindow>& refHitDepth,
+    const string& bamFileName)
 {
 #ifndef DINARA_HAVE_THESEUS
     throw runtime_error("buildSvMSA requires the theseus library (not available in this build).");
@@ -385,6 +389,53 @@ void Assembler::buildSvMSA(
         const OrientedReadId refOid(refId, 0);
         const auto refMarkers = markersRef[refOid.getValue()];
         const uint32_t refLength = uint32_t(readsRef.getRead(refId).baseCount);
+
+        // Parse SA tag SV evidence from BAM if provided.
+        vector<SaTagSvCall> saTagCalls;
+        if(!bamFileName.empty()) {
+            // Extract chromosome name and region offset from the
+            // reference read name. The name may be "chr1:100-200".
+            const auto refNameSpan =
+                readsRef.getReadName(refId);
+            string fullRefName(
+                refNameSpan.begin(), refNameSpan.end());
+            string refName = fullRefName;
+            uint32_t regionStart = 0;
+            const auto colonPos = fullRefName.find(':');
+            if(colonPos != string::npos) {
+                refName = fullRefName.substr(0, colonPos);
+                const auto dashPos =
+                    fullRefName.find('-', colonPos);
+                if(dashPos != string::npos) {
+                    regionStart = uint32_t(
+                        stoul(fullRefName.substr(
+                            colonPos + 1,
+                            dashPos - colonPos - 1)));
+                }
+            }
+            saTagCalls = parseSaTagSvCalls(
+                bamFileName, refName,
+                regionStart, regionStart + refLength);
+            // Convert breakpoint positions from absolute to
+            // relative to the reference subregion.
+            for(auto& sc : saTagCalls) {
+                if(sc.refPos >= regionStart) {
+                    sc.refPos -= regionStart;
+                }
+            }
+            if(!saTagCalls.empty()) {
+                cout << "    SA tag SV evidence ("
+                     << saTagCalls.size() << " clusters):"
+                     << endl;
+                for(const auto& sc : saTagCalls) {
+                    cout << "      " << sc.svType
+                         << " " << sc.size << "bp"
+                         << " at pos=" << sc.refPos
+                         << " reads=" << sc.readCount
+                         << endl;
+                }
+            }
+        }
 
         // Collect all unique reference marker ordinals across all chains.
         vector<uint32_t> allRefOrdinals;
@@ -1983,6 +2034,45 @@ void Assembler::buildSvMSA(
                             bestPathLen = 0;
                             foundPath = true;
                         }
+                        // Negative values indicate a deletion in the
+                        // VNTR: the sample has fewer repeat copies than
+                        // the reference. Use homDel estimate (more
+                        // conservative) when it's large enough.
+                        // Guard: the deletion must be at most 30% of
+                        // the VNTR length and at least 50bp. Larger
+                        // ratios are likely noise from coverage
+                        // estimation in long VNTRs.
+                        else if(insLenHom < -50
+                                && std::abs(insLenHom) < vntrRefLen
+                                && double(std::abs(insLenHom))
+                                   / double(vntrRefLen) <= 0.30) {
+                            const int64_t delSize = std::abs(insLenHom);
+                            cout << "    >>> DELETION CALL"
+                                 << " (VNTR-depth): size="
+                                 << delSize << "bp"
+                                 << ", breakpoint="
+                                 << breakpointPos
+                                 << ", refLen=" << vntrRefLen
+                                 << ", flankCov="
+                                 << flankCoverage
+                                 << endl;
+                        } else if(insLenHet < -50
+                                  && std::abs(insLenHet)
+                                     < vntrRefLen
+                                  && double(std::abs(insLenHet))
+                                     / double(vntrRefLen) <= 0.30) {
+                            const int64_t delSize =
+                                std::abs(insLenHet);
+                            cout << "    >>> DELETION CALL"
+                                 << " (VNTR-depth): size="
+                                 << delSize << "bp"
+                                 << ", breakpoint="
+                                 << breakpointPos
+                                 << ", refLen=" << vntrRefLen
+                                 << ", flankCov="
+                                 << flankCoverage
+                                 << endl;
+                        }
                     }
 
                     if(foundPath && bestPathDist > 20) {
@@ -3170,7 +3260,7 @@ void Assembler::buildSvMSA(
                         // Fill gaps starting from large k (most unique,
                         // skeleton anchors) down to small k (dense fill).
                         // Max k=60 since reads are ~150bp.
-                        const uint32_t maxK = 60;
+                        const uint32_t maxK = 62;
                         const uint32_t minK = uint32_t(k);
                         for(uint32_t tryK = maxK;
                             tryK >= minK; tryK -= 2) {
@@ -3432,6 +3522,154 @@ void Assembler::buildSvMSA(
                                      << "breakpoint=" << bestBp << ", "
                                      << "reads=" << bestCount
                                      << endl;
+                                refinedCall = true;
+                            }
+                        }
+
+                        // For marker-depleted regions, try flank gap
+                        // analysis first. In repeats, pairwise diffs
+                        // produce artifact clusters at repeat-period
+                        // multiples. The flank gap directly measures
+                        // the bimodal split in per-read diagonals on
+                        // each side of the gap, which is more robust.
+                        if(!refinedCall && markerDepleted
+                           && readResults.size() >= 6) {
+                            const uint32_t gapCenter =
+                                (cdc.startPos + cdc.endPos) / 2;
+                            vector<int64_t> leftDiags, rightDiags;
+                            for(const auto& rr : readResults) {
+                                vector<uint32_t> rps;
+                                vector<int64_t> ds;
+                                for(const auto& [rp, rdp]
+                                    : rr.anchors) {
+                                    rps.push_back(rp);
+                                    ds.push_back(int64_t(rp)
+                                                 - int64_t(rdp));
+                                }
+                                sort(rps.begin(), rps.end());
+                                sort(ds.begin(), ds.end());
+                                const uint32_t medRefPos =
+                                    rps[rps.size() / 2];
+                                const int64_t medDiag =
+                                    ds[ds.size() / 2];
+                                if(medRefPos < gapCenter) {
+                                    leftDiags.push_back(medDiag);
+                                } else {
+                                    rightDiags.push_back(medDiag);
+                                }
+                            }
+
+                            auto analyzeFlankGapEarly = [](
+                                vector<int64_t>& diags) -> int64_t {
+                                if(diags.size() < 4) return 0;
+                                sort(diags.begin(), diags.end());
+                                int64_t maxGap = 0;
+                                for(size_t i = 1;
+                                    i < diags.size(); ++i) {
+                                    const int64_t gap =
+                                        diags[i] - diags[i-1];
+                                    if(gap > maxGap)
+                                        maxGap = gap;
+                                }
+                                return maxGap;
+                            };
+
+                            const int64_t leftGap =
+                                analyzeFlankGapEarly(leftDiags);
+                            const int64_t rightGap =
+                                analyzeFlankGapEarly(rightDiags);
+
+                            // Compute median diagonal for each
+                            // flank to determine shift direction.
+                            // DEL: right median > left median
+                            //   (reads after deletion shift up)
+                            // INS: right median < left median
+                            //   (reads after insertion shift down)
+                            int64_t leftMedian = 0, rightMedian = 0;
+                            if(!leftDiags.empty()) {
+                                sort(leftDiags.begin(),
+                                     leftDiags.end());
+                                leftMedian = leftDiags[
+                                    leftDiags.size() / 2];
+                            }
+                            if(!rightDiags.empty()) {
+                                sort(rightDiags.begin(),
+                                     rightDiags.end());
+                                rightMedian = rightDiags[
+                                    rightDiags.size() / 2];
+                            }
+                            const int64_t medianShift =
+                                rightMedian - leftMedian;
+
+                            cout << "      Flank gaps (early): left="
+                                 << leftGap << " ("
+                                 << leftDiags.size()
+                                 << " reads) right=" << rightGap
+                                 << " (" << rightDiags.size()
+                                 << " reads)"
+                                 << " medianShift="
+                                 << medianShift
+                                 << endl;
+
+                            int64_t flankShift = 0;
+                            if(leftGap > 30 && rightGap > 30) {
+                                flankShift =
+                                    (leftGap + rightGap) / 2;
+                            } else if(leftGap > 30) {
+                                flankShift = leftGap;
+                            } else if(rightGap > 30) {
+                                flankShift = rightGap;
+                            }
+
+                            if(flankShift >= 40
+                               && flankShift <= int64_t(delSize)) {
+                                // Distinguish INS from DEL:
+                                // In a deletion, chain-start BPs
+                                // appear at the right edge of the
+                                // coverage drop (reads from the
+                                // non-deleted allele start there).
+                                // In an insertion, no chain-start
+                                // BPs appear because insertion-
+                                // carrying reads simply don't chain.
+                                bool hasRightStartBP = false;
+                                for(const auto& rbp :
+                                    rightBreakpoints) {
+                                    if(rbp.refPos >= cdc.endPos - 100
+                                       && rbp.refPos
+                                          <= cdc.endPos + 200
+                                       && rbp.endpointCount >= 5) {
+                                        hasRightStartBP = true;
+                                        break;
+                                    }
+                                }
+                                const bool likelyInsertion =
+                                    markerDepleted
+                                    && !hasRightStartBP
+                                    && indirectAlignedReads.size()
+                                       >= 10
+                                    && insertionCallRegions.empty();
+
+                                if(likelyInsertion) {
+                                    cout << "    >>> INSERTION CALL"
+                                         << " (flank-gap): size="
+                                         << flankShift << "bp"
+                                         << ", breakpoint="
+                                         << bpPos
+                                         << ", indirectReads="
+                                         << indirectAlignedReads
+                                            .size()
+                                         << endl;
+                                    insertionCallRegions.push_back(
+                                        {cdc.startPos,
+                                         cdc.endPos});
+                                } else {
+                                    cout << "    >>> DELETION CALL"
+                                         << " (flank-gap): size="
+                                         << flankShift << "bp"
+                                         << ", breakpoint="
+                                         << bpPos
+                                         << endl;
+                                }
                                 refinedCall = true;
                             }
                         }
@@ -3712,6 +3950,50 @@ void Assembler::buildSvMSA(
                                      << "size=" << bestShift << "bp, "
                                      << "breakpoint=" << bpPos
                                      << endl;
+                                refinedCall = true;
+                            }
+                        }
+
+                        // Marker-depleted insertion detection.
+                        //
+                        // When the adaptive analysis found no deletion
+                        // signal in a marker-depleted region AND there
+                        // are many indirect/unanchored reads, the
+                        // coverage drop is likely from an insertion:
+                        // reads carrying the inserted sequence can't
+                        // chain to the reference.
+                        if(!refinedCall && markerDepleted
+                           && indirectAlignedReads.size() >= 10
+                           && insertionCallRegions.empty()) {
+                            uint64_t indirectBases = 0;
+                            for(const uint32_t rid :
+                                indirectAlignedReads) {
+                                indirectBases +=
+                                    readsRef.getRead(
+                                        ReadId(rid)).baseCount;
+                            }
+                            const int64_t estInsSize =
+                                (medianSpanning > 0)
+                                ? int64_t(double(indirectBases)
+                                          / double(medianSpanning))
+                                : 0;
+
+                            if(estInsSize >= 50
+                               && estInsSize <= 2000
+                               && indirectAlignedReads.size()
+                                  >= uint32_t(medianSpanning) / 3) {
+                                cout << "    >>> INSERTION CALL"
+                                     << " (covdrop-indirect):"
+                                     << " size=" << estInsSize
+                                     << "bp, breakpoint="
+                                     << bpPos
+                                     << ", indirectReads="
+                                     << indirectAlignedReads
+                                        .size()
+                                     << ", markerDepleted=1"
+                                     << endl;
+                                insertionCallRegions.push_back({
+                                    cdc.startPos, cdc.endPos});
                                 refinedCall = true;
                             }
                         }
@@ -4275,6 +4557,27 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
+        // SA tag evidence integration.
+        //
+        // When a BAM file is provided, SA tag split-read calls serve
+        // as independent evidence. Emit SA-based calls that have
+        // sufficient read support (>= 2 reads).
+        // -----------------------------------------------------------------
+        if(!saTagCalls.empty()) {
+            for(const auto& sc : saTagCalls) {
+                if(sc.readCount >= 2 && sc.size >= 30
+                   && sc.size <= 5000) {
+                    cout << "    >>> " << sc.svType
+                         << " CALL (SA-tag): size="
+                         << sc.size << "bp"
+                         << ", breakpoint=" << sc.refPos
+                         << ", reads=" << sc.readCount
+                         << endl;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // Step 6b: Output MSA and consensus.
         // -----------------------------------------------------------------
         if(seqId <= 1) continue;  // Only backbone, no reads aligned.
@@ -4320,3 +4623,207 @@ void Assembler::buildSvMSA(
         << totalMSAs << " MSAs, " << totalAlignedReads << " reads." << endl;
 #endif // DINARA_HAVE_THESEUS
 }
+
+
+// Parse SA tags from a BAM file to extract split-read SV evidence.
+vector<Assembler::SaTagSvCall> Assembler::parseSaTagSvCalls(
+    const string& bamFileName,
+    const string& refName,
+    uint32_t refStart,
+    uint32_t refEnd) const
+{
+    vector<SaTagSvCall> result;
+    if(bamFileName.empty()) return result;
+
+    htsFile* fp = hts_open(bamFileName.c_str(), "r");
+    if(!fp) {
+        cerr << "Warning: could not open BAM file: "
+             << bamFileName << endl;
+        return result;
+    }
+
+    sam_hdr_t* hdr = sam_hdr_read(fp);
+    if(!hdr) {
+        hts_close(fp);
+        return result;
+    }
+
+    hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
+    if(!idx) {
+        sam_hdr_destroy(hdr);
+        hts_close(fp);
+        cerr << "Warning: could not load BAM index for "
+             << bamFileName << endl;
+        return result;
+    }
+
+    // Try the reference name as-is, then with/without "chr" prefix.
+    int tid = sam_hdr_name2tid(hdr, refName.c_str());
+    if(tid < 0) {
+        string altName;
+        if(refName.size() > 3
+           && refName.substr(0, 3) == "chr") {
+            altName = refName.substr(3);
+        } else {
+            altName = "chr" + refName;
+        }
+        tid = sam_hdr_name2tid(hdr, altName.c_str());
+    }
+    if(tid < 0) {
+        hts_idx_destroy(idx);
+        sam_hdr_destroy(hdr);
+        hts_close(fp);
+        return result;
+    }
+
+    // Get the chromosome name as it appears in the BAM header.
+    const string bamChrName = sam_hdr_tid2name(hdr, tid);
+
+    hts_itr_t* iter = sam_itr_queryi(
+        idx, tid, int(refStart), int(refEnd));
+    if(!iter) {
+        hts_idx_destroy(idx);
+        sam_hdr_destroy(hdr);
+        hts_close(fp);
+        return result;
+    }
+
+    struct SaObs {
+        bool isDel;
+        int64_t size;
+        uint32_t bpPos;
+    };
+    vector<SaObs> observations;
+
+    bam1_t* aln = bam_init1();
+    while(sam_itr_next(fp, iter, aln) >= 0) {
+        if(aln->core.flag &
+           (BAM_FSUPPLEMENTARY | BAM_FSECONDARY | BAM_FUNMAP))
+            continue;
+
+        uint8_t* saTag = bam_aux_get(aln, "SA");
+        if(!saTag) continue;
+        const char* saStr = bam_aux2Z(saTag);
+        if(!saStr) continue;
+
+        const int32_t pPos = aln->core.pos;
+        const uint32_t* pCigar = bam_get_cigar(aln);
+        const int pNCigar = aln->core.n_cigar;
+
+        int64_t pRefSpan = 0;
+        for(int ci = 0; ci < pNCigar; ++ci) {
+            const int op = bam_cigar_op(pCigar[ci]);
+            const int len = bam_cigar_oplen(pCigar[ci]);
+            if(op == BAM_CMATCH || op == BAM_CDEL
+               || op == BAM_CREF_SKIP || op == BAM_CEQUAL
+               || op == BAM_CDIFF) {
+                pRefSpan += len;
+            }
+        }
+        const int64_t pEnd = pPos + pRefSpan;
+
+        // Parse SA tag entries.
+        string saString(saStr);
+        size_t sStart = 0;
+        while(sStart < saString.size()) {
+            size_t sEnd = saString.find(';', sStart);
+            if(sEnd == string::npos) sEnd = saString.size();
+            string entry = saString.substr(
+                sStart, sEnd - sStart);
+            sStart = sEnd + 1;
+            if(entry.empty()) continue;
+
+            vector<string> fields;
+            size_t fStart = 0;
+            while(fStart < entry.size()) {
+                size_t fEnd = entry.find(',', fStart);
+                if(fEnd == string::npos) fEnd = entry.size();
+                fields.push_back(
+                    entry.substr(fStart, fEnd - fStart));
+                fStart = fEnd + 1;
+            }
+            if(fields.size() < 4) continue;
+
+            if(fields[0] != bamChrName) continue;
+
+            const int64_t saPos = stoll(fields[1]) - 1;
+            const string& saCigar = fields[3];
+
+            int64_t sRefSpan = 0;
+            int64_t num = 0;
+            for(char c : saCigar) {
+                if(c >= '0' && c <= '9') {
+                    num = num * 10 + (c - '0');
+                } else {
+                    if(c == 'M' || c == 'D' || c == 'N'
+                       || c == '=' || c == 'X') {
+                        sRefSpan += num;
+                    }
+                    num = 0;
+                }
+            }
+
+            int64_t refGap;
+            uint32_t bpPos;
+            if(pPos <= saPos) {
+                refGap = saPos - pEnd;
+                bpPos = uint32_t(pEnd);
+            } else {
+                refGap = pPos - (saPos + sRefSpan);
+                bpPos = uint32_t(saPos + sRefSpan);
+            }
+
+            if(refGap >= 30) {
+                observations.push_back(
+                    {true, refGap, bpPos});
+            } else if(refGap <= -30) {
+                observations.push_back(
+                    {false, -refGap, bpPos});
+            }
+        }
+    }
+
+    bam_destroy1(aln);
+    hts_itr_destroy(iter);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    hts_close(fp);
+
+    // Cluster observations by type and breakpoint (within 50bp).
+    sort(observations.begin(), observations.end(),
+         [](const SaObs& a, const SaObs& b) {
+             if(a.isDel != b.isDel) return a.isDel > b.isDel;
+             return a.bpPos < b.bpPos;
+         });
+
+    size_t i = 0;
+    while(i < observations.size()) {
+        const bool isDel = observations[i].isDel;
+        uint32_t clusterStart = observations[i].bpPos;
+        int64_t sumSize = 0;
+        uint32_t sumPos = 0;
+        uint32_t count = 0;
+        size_t j = i;
+        while(j < observations.size()
+              && observations[j].isDel == isDel
+              && observations[j].bpPos <= clusterStart + 50) {
+            sumSize += observations[j].size;
+            sumPos += observations[j].bpPos;
+            ++count;
+            ++j;
+        }
+        if(count >= 2) {
+            result.push_back({
+                isDel ? "DEL" : "INS",
+                sumSize / int64_t(count),
+                sumPos / count,
+                count
+            });
+        }
+        i = j;
+    }
+
+    return result;
+}
+
+
