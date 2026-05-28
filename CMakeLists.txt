@@ -127,9 +127,45 @@ endfunction()
 
 extract_static_link_flags("${HTS_LINK_FLAGS}" HTS_LINK_FLAGS)
 
-# Only link curl if htslib actually depends on it.
-if(HTS_LINK_FLAGS MATCHES "-lcurl")
-    extract_static_link_flags("${CURL_LINK_FLAGS}" CURL_LINK_FLAGS)
+# htslib is often built with curl, lzma, and bz2 support even when its
+# pkg-config doesn't report them. Probe libhts.a for these symbols and
+# add the libraries if needed.
+function(hts_needs_symbol LIB_NAME SYMBOL_PREFIX RESULT_VAR)
+    set(${RESULT_VAR} FALSE PARENT_SCOPE)
+    # Find libhts.a
+    find_library(_hts_a NAMES libhts.a PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+    if(_hts_a)
+        execute_process(
+            COMMAND nm ${_hts_a}
+            OUTPUT_VARIABLE _nm_out ERROR_QUIET)
+        if(_nm_out MATCHES " U ${SYMBOL_PREFIX}")
+            set(${RESULT_VAR} TRUE PARENT_SCOPE)
+        endif()
+    endif()
+    unset(_hts_a CACHE)
+endfunction()
+
+hts_needs_symbol("curl" "curl_" _hts_needs_curl)
+hts_needs_symbol("lzma" "lzma_" _hts_needs_lzma)
+hts_needs_symbol("bz2" "BZ2_" _hts_needs_bz2)
+
+if(_hts_needs_lzma AND NOT "-llzma" IN_LIST HTS_LINK_FLAGS)
+    list(APPEND HTS_LINK_FLAGS -llzma)
+    message(STATUS "  Adding -llzma (needed by libhts.a)")
+endif()
+if(_hts_needs_bz2 AND NOT "-lbz2" IN_LIST HTS_LINK_FLAGS)
+    list(APPEND HTS_LINK_FLAGS -lbz2)
+    message(STATUS "  Adding -lbz2 (needed by libhts.a)")
+endif()
+
+# Expand curl and its transitive deps if htslib needs it.
+if(_hts_needs_curl)
+    if(CURL_LINK_FLAGS)
+        extract_static_link_flags("${CURL_LINK_FLAGS}" CURL_LINK_FLAGS)
+    else()
+        set(CURL_LINK_FLAGS -lcurl)
+    endif()
+    message(STATUS "  Adding curl (needed by libhts.a)")
 else()
     set(CURL_LINK_FLAGS "")
 endif()
