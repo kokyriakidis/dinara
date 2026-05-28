@@ -256,6 +256,12 @@ def installAptPackages():
     "libsimde-dev",
     "zlib1g-dev",
     "libcli11-dev",
+    "libhts-dev",
+    "libhtscodecs-dev",
+    "libbz2-dev",
+    "liblzma-dev",
+    "libcurl4-openssl-dev",
+    "libdeflate-dev",
     ]
     runCommand("sudo apt-get install --assume-yes " + " ".join(packages))
 
