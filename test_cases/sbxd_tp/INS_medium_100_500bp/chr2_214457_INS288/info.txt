@@ -1,0 +1,9 @@
+Category:  tp
+Sample:    SBX-D
+Chrom:     chr2
+Position:  214457
+SV Type:   INS
+SV Length: 288bp
+Size Bin:  medium_100_500bp
+Region:    chr2:212457-216745
+BAM:       /sc1/groups/sbx/workspace/kyriakik/data/bams/SBX-D.30X.bam
