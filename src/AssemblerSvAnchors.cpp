@@ -1700,7 +1700,35 @@ void Assembler::buildSvMSA(
                     int bestPathLen = 0;
                     bool foundPath = false;
                     vector<int64_t> allPathDists; // Collect all valid paths.
-                    const bool isVntrGap = (maxPairDist > 500);
+
+                    // Detect marker-depleted regions around the breakpoint.
+                    // Even when the left/right BPs are close (refGap < 500),
+                    // the surrounding region may be a VNTR where read-to-read
+                    // chains create false shortcuts. Check for windows with
+                    // zero markers (fully depleted) in a ±300bp window.
+                    // Only flag as VNTR if >60% of windows are fully depleted
+                    // (not just low depth — low depth can be caused by the
+                    // insertion itself in non-repetitive regions).
+                    bool isVntrGap = (maxPairDist > 500);
+                    if(!isVntrGap) {
+                        const uint32_t bpMid = (lbp.refPos + bestRbp->refPos) / 2;
+                        const uint32_t checkRadius = 300;
+                        const uint32_t checkStart = (bpMid > refStartPos + checkRadius)
+                            ? (bpMid - refStartPos - checkRadius) / windowSize : 0;
+                        const uint32_t checkEnd = std::min(
+                            (bpMid - refStartPos + checkRadius) / windowSize, nWindows - 1);
+                        uint32_t emptyWins = 0, totalWins = 0;
+                        for(uint32_t w = checkStart; w <= checkEnd; ++w) {
+                            ++totalWins;
+                            if(windowMarkerCount[w] == 0) {
+                                ++emptyWins;
+                            }
+                        }
+                        if(totalWins > 0
+                           && double(emptyWins) / double(totalWins) > 0.6) {
+                            isVntrGap = true;
+                        }
+                    }
 
                     // Helper: get the overlap span (bp) between two reads
                     // from their chain. Returns the overlap extent in the
