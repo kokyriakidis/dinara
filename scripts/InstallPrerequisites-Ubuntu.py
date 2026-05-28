@@ -645,9 +645,9 @@ def installHtslib():
             print("htslib already installed without curl at " + htslibInstallMarker + ". Skipping.")
             return
         print("Existing htslib has curl support. Rebuilding without curl...")
-        return
 
-    print(f"Installing htslib {htslibVersion} (without libcurl)...")
+    else:
+        print(f"Installing htslib {htslibVersion} (without libcurl)...")
 
     with tempfile.TemporaryDirectory() as tmpDir:
         tarballPath = os.path.join(tmpDir, htslibTarball)
