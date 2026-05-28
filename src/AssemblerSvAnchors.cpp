@@ -1648,6 +1648,162 @@ void Assembler::buildSvMSA(
                     }
                 }
 
+                // Generate breakpoints from hit-depth cluster edges
+                // when chain-endpoint breakpoints are missing on one
+                // or both sides. For insertions where chains don't
+                // break (the DP bridges the insertion), the only
+                // signal is a contiguous hit-depth drop. The left
+                // edge of the drop cluster is a left BP and the right
+                // edge is a right BP. Use reads spanning across the
+                // drop zone as overhang reads.
+                if(!hitDepthBreakpoints.empty()
+                   && (leftBreakpoints.empty()
+                       || rightBreakpoints.empty())) {
+                    // Cluster consecutive hit-depth BPs (within 2 windows).
+                    struct HdCluster {
+                        uint32_t startWin;
+                        uint32_t endWin;
+                        uint32_t startPos;
+                        uint32_t endPos;
+                        double minRatio;
+                    };
+                    vector<HdCluster> hdClusters;
+                    HdCluster curHd;
+                    curHd.startWin = hitDepthBreakpoints[0].windowIdx;
+                    curHd.endWin = hitDepthBreakpoints[0].windowIdx;
+                    curHd.startPos = hitDepthBreakpoints[0].refPos;
+                    curHd.endPos = hitDepthBreakpoints[0].refPos;
+                    curHd.minRatio = hitDepthBreakpoints[0].dropRatio;
+
+                    for(size_t i = 1; i < hitDepthBreakpoints.size(); ++i) {
+                        if(hitDepthBreakpoints[i].windowIdx
+                           <= curHd.endWin + 2) {
+                            curHd.endWin = hitDepthBreakpoints[i].windowIdx;
+                            curHd.endPos = hitDepthBreakpoints[i].refPos;
+                            curHd.minRatio = std::min(
+                                curHd.minRatio,
+                                hitDepthBreakpoints[i].dropRatio);
+                        } else {
+                            hdClusters.push_back(curHd);
+                            curHd.startWin = hitDepthBreakpoints[i].windowIdx;
+                            curHd.endWin = hitDepthBreakpoints[i].windowIdx;
+                            curHd.startPos = hitDepthBreakpoints[i].refPos;
+                            curHd.endPos = hitDepthBreakpoints[i].refPos;
+                            curHd.minRatio = hitDepthBreakpoints[i].dropRatio;
+                        }
+                    }
+                    hdClusters.push_back(curHd);
+
+                    // For each cluster with strong depth drop, generate
+                    // left BP at the start and right BP at the end.
+                    for(const auto& hdc : hdClusters) {
+                        if(hdc.minRatio > 0.3) continue; // Weak drop.
+                        const uint32_t clusterSpan =
+                            hdc.endPos - hdc.startPos + windowSize;
+                        if(clusterSpan < windowSize) continue;
+
+                        // Collect reads spanning across the cluster
+                        // as overhang reads for both BPs.
+                        vector<EndpointInfo> leftOvhReads;
+                        vector<EndpointInfo> rightOvhReads;
+                        for(const auto& [rid, info] : readChainInfoMap) {
+                            if(info.totalMarkers < 2) continue;
+                            // Read must span past the cluster edge.
+                            if(info.maxRefPos > hdc.startPos + windowSize
+                               && info.minRefPos < hdc.startPos) {
+                                const auto rdMkrs = markersRef[
+                                    OrientedReadId(ReadId(rid), 0).getValue()];
+                                if(rdMkrs.size() < 2) continue;
+                                const int64_t ovh = int64_t(
+                                    rdMkrs[rdMkrs.size()-1].position)
+                                    - int64_t(rdMkrs[info.maxReadOrd].position);
+                                if(ovh >= 20) {
+                                    leftOvhReads.push_back(
+                                        {rid, ovh});
+                                }
+                            }
+                            if(info.minRefPos < hdc.endPos - windowSize
+                               && info.maxRefPos > hdc.endPos) {
+                                const auto rdMkrs = markersRef[
+                                    OrientedReadId(ReadId(rid), 0).getValue()];
+                                if(rdMkrs.size() < 2) continue;
+                                const int64_t ovh = int64_t(
+                                    rdMkrs[info.minReadOrd].position)
+                                    - int64_t(rdMkrs[0].position);
+                                if(ovh >= 20) {
+                                    rightOvhReads.push_back(
+                                        {rid, ovh});
+                                }
+                            }
+                        }
+
+                        if(!leftOvhReads.empty()
+                           && leftBreakpoints.empty()) {
+                            const double fold = hdc.minRatio > 0
+                                ? 1.0 / hdc.minRatio : 10.0;
+                            leftBreakpoints.push_back({
+                                hdc.startWin, hdc.startPos,
+                                uint32_t(leftOvhReads.size()),
+                                spanningCount[hdc.startWin],
+                                uint32_t(leftOvhReads.size()),
+                                fold,
+                                leftOvhReads
+                            });
+                            cout << "      HitDepth-generated Left BP:"
+                                 << " pos=" << hdc.startPos
+                                 << " ovhReads="
+                                 << leftOvhReads.size()
+                                 << " fold=" << fold
+                                 << endl;
+                        }
+                        // If no spanning reads found for right BP,
+                        // look for reads whose chains start just
+                        // after the drop zone with left overhang
+                        // (indicating they extend back into the
+                        // insertion from the right flank).
+                        if(rightOvhReads.empty()) {
+                            for(const auto& [rid, info] : readChainInfoMap) {
+                                if(info.totalMarkers < 2) continue;
+                                // Read starts near the right edge
+                                // of the drop zone.
+                                if(info.minRefPos >= hdc.endPos - windowSize
+                                   && info.minRefPos <= hdc.endPos + windowSize * 3) {
+                                    const auto rdMkrs = markersRef[
+                                        OrientedReadId(ReadId(rid), 0).getValue()];
+                                    if(rdMkrs.size() < 2) continue;
+                                    const int64_t ovh = int64_t(
+                                        rdMkrs[info.minReadOrd].position)
+                                        - int64_t(rdMkrs[0].position);
+                                    if(ovh >= 20) {
+                                        rightOvhReads.push_back(
+                                            {rid, ovh});
+                                    }
+                                }
+                            }
+                        }
+
+                        if(!rightOvhReads.empty()
+                           && rightBreakpoints.empty()) {
+                            const double fold = hdc.minRatio > 0
+                                ? 1.0 / hdc.minRatio : 10.0;
+                            rightBreakpoints.push_back({
+                                hdc.endWin, hdc.endPos,
+                                uint32_t(rightOvhReads.size()),
+                                spanningCount[hdc.endWin],
+                                uint32_t(rightOvhReads.size()),
+                                fold,
+                                rightOvhReads
+                            });
+                            cout << "      HitDepth-generated Right BP:"
+                                 << " pos=" << hdc.endPos
+                                 << " ovhReads="
+                                 << rightOvhReads.size()
+                                 << " fold=" << fold
+                                 << endl;
+                        }
+                    }
+                }
+
                 for(const auto& bp : leftBreakpoints) {
                     cout << "      Left BP: pos=" << bp.refPos
                          << " ends=" << bp.endpointCount
@@ -1680,19 +1836,42 @@ void Assembler::buildSvMSA(
                 vector<SvRegion> vntrGaps;
                 vector<SvRegion> insertionCallRegions;
 
-                // For each left breakpoint, find the nearest right breakpoint
-                // to form a breakpoint pair.
+                // For each left breakpoint, find the best right breakpoint
+                // to form a breakpoint pair. Start with the nearest BP
+                // (preserves original behavior for cases where proximity
+                // is the right signal). Build a ranked candidate list
+                // so that if the nearest fails to produce a path, we
+                // can fall through to stronger alternatives.
                 for(const auto& lbp : leftBreakpoints) {
-                    const Breakpoint* bestRbp = nullptr;
-                    int64_t bestDist = INT64_MAX;
+                    // Build candidate list sorted by distance (nearest first).
+                    struct RbpCandidate {
+                        const Breakpoint* rbp;
+                        int64_t dist;
+                        double score;
+                    };
+                    vector<RbpCandidate> rbpCandidates;
                     for(const auto& rbp : rightBreakpoints) {
                         const int64_t dist = std::abs(
                             int64_t(rbp.refPos) - int64_t(lbp.refPos));
-                        if(dist < bestDist) {
-                            bestDist = dist;
-                            bestRbp = &rbp;
-                        }
+                        // Score for fallback ranking: strength / distance.
+                        const double strength =
+                            rbp.foldEnrichment
+                            * double(std::max(rbp.ovhReadCount, 1u))
+                            * double(std::max(rbp.ovhReadCount, 1u));
+                        const double score =
+                            strength / (1.0 + double(dist) / 100.0);
+                        rbpCandidates.push_back({&rbp, dist, score});
                     }
+                    // Sort by distance ascending (nearest first).
+                    sort(rbpCandidates.begin(), rbpCandidates.end(),
+                        [](const RbpCandidate& a, const RbpCandidate& b) {
+                            return a.dist < b.dist;
+                        });
+
+                    const Breakpoint* bestRbp = rbpCandidates.empty()
+                        ? nullptr : rbpCandidates[0].rbp;
+                    int64_t bestDist = rbpCandidates.empty()
+                        ? INT64_MAX : rbpCandidates[0].dist;
 
                     // Allow larger distance if a hit-depth cluster spans
                     // the gap between left and right BPs (VNTR region).
@@ -1727,7 +1906,47 @@ void Assembler::buildSvMSA(
                         }
                     }
 
-                    if(!bestRbp || bestDist > maxPairDist) continue;
+                    if(!bestRbp || bestDist > maxPairDist) {
+                        // If the nearest candidate is out of range,
+                        // try remaining candidates by score (strongest first).
+                        // Sort remaining candidates by score descending.
+                        sort(rbpCandidates.begin(), rbpCandidates.end(),
+                            [](const RbpCandidate& a, const RbpCandidate& b) {
+                                return a.score > b.score;
+                            });
+                        bool foundCandidate = false;
+                        for(size_t ci = 0; ci < rbpCandidates.size(); ++ci) {
+                            if(rbpCandidates[ci].rbp == bestRbp) continue;
+                            int64_t candMaxDist = 500;
+                            const auto* candRbp = rbpCandidates[ci].rbp;
+                            const int64_t candDist = rbpCandidates[ci].dist;
+                            // Check VNTR for this candidate.
+                            if(candDist > 500) {
+                                const uint32_t gs = (lbp.refPos - refStartPos) / windowSize;
+                                const uint32_t ge = (candRbp->refPos - refStartPos) / windowSize;
+                                uint32_t ldw = 0, tgw = 0;
+                                for(uint32_t w = gs; w <= ge && w < nWindows; ++w) {
+                                    if(windowMarkerCount[w] == 0) continue;
+                                    ++tgw;
+                                    if(medianHitDepth > 0
+                                       && windowHitDepth[w] / medianHitDepth < hitDepthDropThreshold)
+                                        ++ldw;
+                                }
+                                if(tgw > 0 && double(ldw)/double(tgw) > 0.5) {
+                                    candMaxDist = candDist + 1;
+                                    vntrGaps.push_back({lbp.refPos, candRbp->refPos});
+                                }
+                            }
+                            if(candDist <= candMaxDist) {
+                                bestRbp = candRbp;
+                                bestDist = candDist;
+                                maxPairDist = candMaxDist;
+                                foundCandidate = true;
+                                break;
+                            }
+                        }
+                        if(!foundCandidate) continue;
+                    }
 
                     // Collect all left-flank and right-flank read IDs.
                     unordered_set<uint32_t> leftIds, rightIds;
@@ -2130,18 +2349,135 @@ void Assembler::buildSvMSA(
                                 insSz = reportedPathDist - bestDist;
                             }
                             if(insSz > 20) {
+                                // Before emitting, check if a further
+                                // right BP produces a larger insertion.
+                                // This handles cases where the nearest
+                                // BP captures only a partial insertion
+                                // (insertion larger than read length).
+                                int64_t bestInsSz = insSz;
+                                const Breakpoint* bestInsRbp = bestRbp;
+                                int64_t bestInsPathDist = reportedPathDist;
+                                int bestInsHops = bestPathLen;
+                                int64_t bestInsRefGap = bestDist;
+
+                                for(const auto& cand : rbpCandidates) {
+                                    if(cand.rbp == bestRbp) continue;
+                                    if(cand.dist > uint64_t(maxPairDist)) continue;
+                                    if(cand.rbp->refPos <= bestRbp->refPos) continue;
+
+                                    // Try path search with this candidate.
+                                    unordered_set<uint32_t> altRightIds;
+                                    for(const auto& ei : cand.rbp->reads)
+                                        altRightIds.insert(ei.readId);
+
+                                    int64_t altBestPathDist = 0;
+                                    int altBestPathLen = 0;
+                                    bool altFoundPath = false;
+
+                                    if(!isVntrGap)
+                                    for(const auto& lf : lbp.reads) {
+                                        auto gL2 = readGraph.find(lf.readId);
+                                        if(gL2 == readGraph.end()) continue;
+                                        for(const auto& e1 : gL2->second) {
+                                            const uint32_t n1 = e1.neighborReadId;
+                                            const int64_t ovlp1 = getOverlapSpan(e1);
+                                            if(ovlp1 < 0) continue;
+                                            if(altRightIds.count(n1)) {
+                                                int64_t rOvh = 0;
+                                                for(const auto& rf : cand.rbp->reads)
+                                                    if(rf.readId == n1) { rOvh = rf.overhangBp; break; }
+                                                const int64_t d = lf.overhangBp + rOvh - ovlp1;
+                                                if(d > altBestPathDist) {
+                                                    altBestPathDist = d;
+                                                    altBestPathLen = 1;
+                                                    altFoundPath = true;
+                                                }
+                                                continue;
+                                            }
+                                            if(!unanchoredReads.count(n1)) continue;
+                                            const auto n1M = markersRef[
+                                                OrientedReadId(ReadId(n1), 0).getValue()];
+                                            if(n1M.size() < 2) continue;
+                                            const int64_t n1S = int64_t(n1M[n1M.size()-1].position)
+                                                               - int64_t(n1M[0].position);
+                                            auto gN1 = readGraph.find(n1);
+                                            if(gN1 == readGraph.end()) continue;
+                                            for(const auto& e2 : gN1->second) {
+                                                const uint32_t n2 = e2.neighborReadId;
+                                                if(n2 == lf.readId) continue;
+                                                const int64_t ovlp2 = getOverlapSpan(e2);
+                                                if(ovlp2 < 0) continue;
+                                                if(altRightIds.count(n2)) {
+                                                    int64_t rOvh = 0;
+                                                    for(const auto& rf : cand.rbp->reads)
+                                                        if(rf.readId == n2) { rOvh = rf.overhangBp; break; }
+                                                    const int64_t d = lf.overhangBp + n1S - ovlp1 - ovlp2 + rOvh;
+                                                    if(d > altBestPathDist) {
+                                                        altBestPathDist = d;
+                                                        altBestPathLen = 2;
+                                                        altFoundPath = true;
+                                                    }
+                                                    continue;
+                                                }
+                                                if(!unanchoredReads.count(n2)) continue;
+                                                const auto n2M = markersRef[
+                                                    OrientedReadId(ReadId(n2), 0).getValue()];
+                                                if(n2M.size() < 2) continue;
+                                                const int64_t n2S = int64_t(n2M[n2M.size()-1].position)
+                                                                   - int64_t(n2M[0].position);
+                                                auto gN2 = readGraph.find(n2);
+                                                if(gN2 == readGraph.end()) continue;
+                                                for(const auto& e3 : gN2->second) {
+                                                    const uint32_t n3 = e3.neighborReadId;
+                                                    if(n3 == n1 || n3 == lf.readId) continue;
+                                                    if(!altRightIds.count(n3)) continue;
+                                                    const int64_t ovlp3 = getOverlapSpan(e3);
+                                                    if(ovlp3 < 0) continue;
+                                                    int64_t rOvh = 0;
+                                                    for(const auto& rf : cand.rbp->reads)
+                                                        if(rf.readId == n3) { rOvh = rf.overhangBp; break; }
+                                                    const int64_t d = lf.overhangBp + n1S + n2S
+                                                        - ovlp1 - ovlp2 - ovlp3 + rOvh;
+                                                    if(d > altBestPathDist) {
+                                                        altBestPathDist = d;
+                                                        altBestPathLen = 3;
+                                                        altFoundPath = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if(altFoundPath) {
+                                        int64_t altInsSz = altBestPathDist;
+                                        if(cand.dist > 150
+                                           && altBestPathDist > int64_t(cand.dist)) {
+                                            altInsSz = altBestPathDist - cand.dist;
+                                        }
+                                        if(altInsSz > bestInsSz) {
+                                            bestInsSz = altInsSz;
+                                            bestInsRbp = cand.rbp;
+                                            bestInsPathDist = altBestPathDist;
+                                            bestInsHops = altBestPathLen;
+                                            bestInsRefGap = cand.dist;
+                                        }
+                                    }
+                                }
+
+                                const uint32_t insBpPos =
+                                    (lbp.refPos + bestInsRbp->refPos) / 2;
                                 cout << "    >>> INSERTION CALL: "
-                                     << "size=" << insSz << "bp, "
-                                     << "breakpoint=" << breakpointPos << ", "
+                                     << "size=" << bestInsSz << "bp, "
+                                     << "breakpoint=" << insBpPos << ", "
                                      << "leftEnds=" << lbp.endpointCount << ", "
-                                     << "rightStarts=" << bestRbp->endpointCount << ", "
-                                     << "hops=" << bestPathLen
-                                     << " (pathDist=" << reportedPathDist
-                                     << " refGap=" << bestDist << ")"
+                                     << "rightStarts=" << bestInsRbp->endpointCount << ", "
+                                     << "hops=" << bestInsHops
+                                     << " (pathDist=" << bestInsPathDist
+                                     << " refGap=" << bestInsRefGap << ")"
                                      << endl;
                                 insertionCallRegions.push_back({
-                                    std::min(lbp.refPos, bestRbp->refPos),
-                                    std::max(lbp.refPos, bestRbp->refPos)
+                                    std::min(lbp.refPos, bestInsRbp->refPos),
+                                    std::max(lbp.refPos, bestInsRbp->refPos)
                                 });
                             }
                         }
@@ -2163,10 +2499,14 @@ void Assembler::buildSvMSA(
 
                         vector<int64_t> delShifts;
 
+                        uint32_t nChainsChecked = 0;
+                        uint32_t nChainsSpanning = 0;
+
                         for(const auto& ce : chainsForRef) {
                             if(ce.readId == uint32_t(refId)) continue;
                             const auto& al = alignments[ce.chainIndex];
-                            if(al.ordinals.size() < 4) continue;
+                            if(al.ordinals.size() < 2) continue;
+                            ++nChainsChecked;
 
                             // Check if chain spans the deletion zone.
                             bool hasLeft = false, hasRight = false;
@@ -2177,6 +2517,7 @@ void Assembler::buildSvMSA(
                                 if(rp > delZoneEnd) hasRight = true;
                             }
                             if(!hasLeft || !hasRight) continue;
+                            ++nChainsSpanning;
 
                             const Strand strand = ce.isSameStrand ? 0 : 1;
                             const auto rdMarkers = markersRef[
@@ -2220,6 +2561,26 @@ void Assembler::buildSvMSA(
 
                             if(bestDelShift > 20) {
                                 delShifts.push_back(bestDelShift);
+                            }
+                        }
+
+                        // Fallback: if no spanning chains found, use
+                        // per-read DEL classifications whose breakpoints
+                        // fall near the BP pair zone. These come from
+                        // the initial per-read diagonal analysis.
+                        if(delShifts.empty()) {
+                            const uint32_t zoneMargin = windowSize * 4;
+                            const uint32_t zoneL = delZoneStart > zoneMargin
+                                ? delZoneStart - zoneMargin : 0;
+                            const uint32_t zoneR = delZoneEnd + zoneMargin;
+
+                            for(const auto& rg : readGroups) {
+                                if(rg.svType != SvType::Deletion) continue;
+                                if(rg.svSize < 30) continue;
+                                if(rg.breakpointRefPos >= zoneL
+                                   && rg.breakpointRefPos <= zoneR) {
+                                    delShifts.push_back(rg.svSize);
+                                }
                             }
                         }
 
@@ -2350,9 +2711,57 @@ void Assembler::buildSvMSA(
                 // This handles cases where the insertion is larger than
                 // the read length, so only one side of the breakpoint
                 // is detectable.
+                //
+                // Suppress when a strong left-right BP pair exists with
+                // a large refGap and no path — that pattern indicates a
+                // deletion, not an insertion. The coverage-drop deletion
+                // detector downstream will handle it.
                 // ---------------------------------------------------------
+                // Find the strongest left BP by ovhReadCount
+                // (most supported). This is where the single-
+                // breakpoint insertion would be called.
+                const Breakpoint* strongestLBP = nullptr;
+                uint32_t strongestLBPOvh = 0;
+                for(const auto& lbp2 : leftBreakpoints) {
+                    if(lbp2.ovhReadCount > strongestLBPOvh) {
+                        strongestLBPOvh = lbp2.ovhReadCount;
+                        strongestLBP = &lbp2;
+                    }
+                }
+                // Only suppress single-BP insertion if a deletion-
+                // like pair exists near the strongest BP. Pairs far
+                // from the insertion region shouldn't suppress it.
+                bool hasDeletionLikePair = false;
+                for(const auto& lbp2 : leftBreakpoints) {
+                    for(const auto& rbp2 : rightBreakpoints) {
+                        const int64_t pairDist = std::abs(
+                            int64_t(rbp2.refPos) - int64_t(lbp2.refPos));
+                        if(pairDist >= 100
+                           && pairDist <= 500
+                           && lbp2.foldEnrichment >= 1.5
+                           && rbp2.foldEnrichment >= 1.5
+                           && lbp2.ovhReadCount >= 2
+                           && rbp2.ovhReadCount >= 2) {
+                            // Check proximity to strongest BP.
+                            if(strongestLBP != nullptr) {
+                                const int64_t distToStrong =
+                                    std::min(
+                                        std::abs(int64_t(lbp2.refPos)
+                                            - int64_t(strongestLBP->refPos)),
+                                        std::abs(int64_t(rbp2.refPos)
+                                            - int64_t(strongestLBP->refPos)));
+                                if(distToStrong > 500) continue;
+                            }
+                            hasDeletionLikePair = true;
+                            break;
+                        }
+                    }
+                    if(hasDeletionLikePair) break;
+                }
+
                 if(insertionCallRegions.empty()
-                   && indirectAlignedReads.size() >= 10) {
+                   && indirectAlignedReads.size() >= 10
+                   && !hasDeletionLikePair) {
                     // Collect relaxed breakpoints: fold >= 1.5
                     // (weaker than the standard fold >= 3.0).
                     struct RelaxedBP {
@@ -3191,9 +3600,15 @@ void Assembler::buildSvMSA(
                                 ++lowHitDepthWins;
                             }
                         }
-                        const bool markerDepleted = totalHitDepthWins > 0
-                            && double(lowHitDepthWins)
-                               / double(totalHitDepthWins) > 0.5;
+                        // A region is marker-depleted if either:
+                        // (a) all windows have zero reference markers
+                        //     (totalHitDepthWins == 0), or
+                        // (b) >50% of windows with markers have low
+                        //     hit depth.
+                        const bool markerDepleted =
+                            totalHitDepthWins == 0
+                            || (double(lowHitDepthWins)
+                                / double(totalHitDepthWins) > 0.5);
 
                         const uint32_t bpPos =
                             (cdc.startPos + cdc.endPos) / 2;
@@ -3212,6 +3627,53 @@ void Assembler::buildSvMSA(
                         // Suppress calls that overlap detected VNTR gaps
                         // or insertion call regions.
                         if(overlapsVntr || overlapsInsertion) continue;
+
+                        // Suppress large coverage-drop regions (>500bp)
+                        // with minRatio=0 that have strong breakpoints
+                        // at both edges AND very low spanning count
+                        // inside the region. This pattern indicates a
+                        // VNTR where chains don't span, not a real
+                        // deletion. Real deletions have significant
+                        // spanning chains in the flanking windows.
+                        if(delSize > 500 && cdc.minRatio < 0.01) {
+                            bool hasEdgeLeftBP = false;
+                            bool hasEdgeRightBP = false;
+                            uint32_t edgeLBPSpanning = 0;
+                            uint32_t edgeRBPSpanning = 0;
+                            for(const auto& lbp2 : leftBreakpoints) {
+                                if(lbp2.refPos >= cdc.startPos - 200
+                                   && lbp2.refPos <= cdc.startPos + 200
+                                   && lbp2.foldEnrichment >= 2.0
+                                   && lbp2.ovhReadCount >= 5) {
+                                    hasEdgeLeftBP = true;
+                                    edgeLBPSpanning = lbp2.spanCount;
+                                    break;
+                                }
+                            }
+                            for(const auto& rbp2 : rightBreakpoints) {
+                                if(rbp2.refPos >= cdc.endPos - 200
+                                   && rbp2.refPos <= cdc.endPos + 200
+                                   && rbp2.foldEnrichment >= 2.0
+                                   && rbp2.ovhReadCount >= 5) {
+                                    hasEdgeRightBP = true;
+                                    edgeRBPSpanning = rbp2.spanCount;
+                                    break;
+                                }
+                            }
+                            // Only suppress if spanning counts at
+                            // both edges are low (<10). Real deletions
+                            // have significant spanning at the edges
+                            // because reads still chain across the
+                            // flanking regions.
+                            if(hasEdgeLeftBP && hasEdgeRightBP
+                               && edgeLBPSpanning < 10
+                               && edgeRBPSpanning < 10) {
+                                cout << "    Suppressed: large VNTR-like "
+                                     << "coverage-drop with edge BPs"
+                                     << endl;
+                                continue;
+                            }
+                        }
 
                         // -------------------------------------------------
                         // Adaptive multi-k anchor filling.
