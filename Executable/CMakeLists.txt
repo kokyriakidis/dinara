@@ -138,7 +138,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
     endif(X86_64)
 endif()
   
