@@ -465,6 +465,10 @@ void Assembler::buildSvMSA(
         const uint32_t nSegments = nBoundaries - 1;
 
         // -----------------------------------------------------------------
+        // Flag set during per-segment processing to suppress
+        // SA-tag DEL calls in marker-depleted VNTR regions.
+        bool suppressSaTagDel = false;
+
         // Step 3: Extract backbone segments from the reference.
         // -----------------------------------------------------------------
         // Each segment spans from the midpoint of marker at ordinal[i]
@@ -1564,6 +1568,16 @@ void Assembler::buildSvMSA(
                     }
                 }
 
+                // Flag marker-depleted VNTR regions for SA-tag
+                // DEL suppression. Triggers when many hit-depth
+                // BPs exist with many unanchored reads. VNTR gaps
+                // detected during breakpoint pairing also set this
+                // flag (see vntrGaps.push_back below).
+                if(unanchoredReads.size() >= 30
+                   && hitDepthBreakpoints.size() >= 10) {
+                    suppressSaTagDel = true;
+                }
+
                 cout << "    Coverage analysis: "
                      << "medianSpanning=" << medianSpanning
                      << " bgEndRate=" << bgEndRate
@@ -1897,6 +1911,7 @@ void Assembler::buildSvMSA(
                            && double(lowDepthWindows) / double(totalGapWindows) > 0.5) {
                             maxPairDist = bestDist + 1; // Allow this pair.
                             vntrGaps.push_back({lbp.refPos, bestRbp->refPos});
+                            suppressSaTagDel = true;
                             cout << "    VNTR gap: L=" << lbp.refPos
                                  << " R=" << bestRbp->refPos
                                  << " lowDepth=" << lowDepthWindows
@@ -5089,11 +5104,30 @@ void Assembler::buildSvMSA(
         // When a BAM file is provided, SA tag split-read calls serve
         // as independent evidence. Emit SA-based calls that have
         // sufficient read support (>= 2 reads).
+        //
+        // Suppress SA-tag DEL calls when the region has a high
+        // fraction of hit-depth BPs (indicating marker depletion)
+        // and many supplementary alignments. In VNTRs, the aligner
+        // maps split reads to different repeat copies, producing
+        // false DEL calls.
         // -----------------------------------------------------------------
         if(!saTagCalls.empty()) {
             for(const auto& sc : saTagCalls) {
                 if(sc.readCount >= 2 && sc.size >= 30
                    && sc.size <= 5000) {
+                    // Suppress DEL calls in marker-depleted
+                    // VNTR regions where the aligner maps
+                    // split reads to different repeat copies.
+                    if(sc.svType == "DEL"
+                       && suppressSaTagDel) {
+                        cout << "    SA-tag DEL suppressed"
+                             << " (marker-depleted VNTR):"
+                             << " size=" << sc.size << "bp"
+                             << ", breakpoint=" << sc.refPos
+                             << ", reads=" << sc.readCount
+                             << endl;
+                        continue;
+                    }
                     cout << "    >>> " << sc.svType
                          << " CALL (SA-tag): size="
                          << sc.size << "bp"
