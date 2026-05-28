@@ -357,6 +357,12 @@ When a path-based insertion call is small (<200bp) but a further right BP exists
 #### Adaptive marker rescue in VNTR-depleted regions
 After blacklisting non-unique reference k-mers, some reference windows have zero remaining markers (common in VNTRs where all k-mers are repetitive). Phase 2b of `removeNonUniqueReferenceMarkers` identifies contiguous depleted regions (≥5 consecutive 50bp windows with zero markers, i.e. ≥250bp) and rescues k-mers with reference frequency exactly 2 by removing them from the blacklist. Only k-mers that have at least one occurrence in a VNTR-depleted window are rescued. This provides some anchoring in otherwise marker-free VNTR regions while avoiding false chains in non-VNTR regions. The conservative thresholds (freq=2 only, ≥5 consecutive windows) prevent regressions in cases where rescued k-mers would create ambiguous chains.
 
+#### SA-tag size refinement for coverage-drop DEL calls
+When an adaptive-bimodal or flank-gap DEL call is made, the size may be inflated by repeat-unit slippage in the diagonal analysis. If an SA-tag DEL call exists nearby (within 500bp) with ≥2 supporting reads and a compatible size (within 0.3×–1.5× for adaptive-bimodal, 0.3×–2× for flank-gap), the SA-tag size replaces the diagonal-based size. SA-tag uses BAM aligner coordinates which handle repeats better than k-mer chaining. Fixes DEL182 (240bp → 183bp).
+
+#### Repetitive region INS call suppression
+In highly repetitive regions (≥5 left BPs AND ≥5 right BPs), path-based insertion calls are suppressed unless both breakpoints have very strong overhang support (≥20 reads each). Many breakpoints on both sides indicate a deeply repetitive region where the read graph has many false connections through rescued k-mers, producing artifact insertion calls. Fixes DEL379 which had three false INS calls (264bp, 168bp, 238bp) from rescued k-mer chains.
+
 ### Key Files (SV Detection)
 
 | File | Purpose |
@@ -381,7 +387,7 @@ After blacklisting non-unique reference k-mers, some reference windows have zero
 | DEL324 | 324bp | 345bp | diagonal-shift from per-read DEL classifications (was SA-tag only) |
 | DEL160 | 160bp | 160bp | split-read (3 reads) |
 | DEL137 | 137bp | 96bp | flank-gap DEL (marker rescue improved anchoring) |
-| DEL182 | 182bp | 240bp | adaptive-bimodal (marker rescue improved anchoring) |
+| DEL182 | 182bp | 183bp | adaptive-bimodal + SA-tag refinement |
 | DEL119a | 119bp | 121bp | adaptive-bimodal (marker rescue resolved VNTR chains) |
 | DEL119b | 119bp | 121bp | adaptive-bimodal (marker rescue resolved VNTR chains) |
 | DEL147 | 234bp | 229bp | split-read (2 reads) |
@@ -392,13 +398,13 @@ After blacklisting non-unique reference k-mers, some reference windows have zero
 
 | Case | Root Cause |
 |------|-----------|
-| INS57 (57bp) | VNTR, detected as INS 342bp (wrong size) |
+| INS57 (57bp) | VNTR, detected as INS 342bp (wrong size, repeat-unit inflation) |
 | INS62 (62bp) | 1685bp VNTR (75× core motif), VNTR gap detected but no sizing |
 | INS65 (65bp) | 1700bp VNTR, false SA-tag DEL suppressed, no positive call |
 | INS235 (235bp) | VNTR, false SA-tag DEL suppressed, no positive call |
 | INS61 (61bp) | 2256bp AT-repeat microsatellite |
 | INS108 (108bp) | Small diagonal shifts below detection threshold |
-| DEL379 (379bp) | 98% repetitive 10-mers |
+| DEL379 (379bp) | 98% repetitive, DEL 239bp (wrong size), false INS calls suppressed |
 
 ### Known Limitations
 
