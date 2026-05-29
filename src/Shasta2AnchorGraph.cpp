@@ -653,14 +653,34 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         uint64_t danglingRemovedCount = 0;
 
-        // List windows with low inter-window edge counts.
+        // List windows with low inter-window edge counts, including neighbors.
         for(uint32_t w = 0; w < windowCount; w++) {
             const uint64_t wIn = inCount.count(w) ? inCount[w] : 0;
             const uint64_t wOut = outCount.count(w) ? outCount[w] : 0;
             if(wIn + wOut > 0 && wIn + wOut <= 4) {
+                // Find which windows the edges connect to.
+                std::set<uint32_t> inFrom, outTo;
+                BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                    const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                    const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                    if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                    const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+                    const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
+                    if(srcWin == noWindow || dstWin == noWindow) continue;
+                    if(srcWin == dstWin) continue;
+                    if(dstWin == w) inFrom.insert(srcWin);
+                    if(srcWin == w) outTo.insert(dstWin);
+                }
                 cout << "  Window " << w << " inter-window edges: in=" << wIn
                      << " out=" << wOut << " (backbone="
-                     << anchorWindows[w].filteredBackbonePositions.size() << ")" << endl;
+                     << anchorWindows[w].filteredBackbonePositions.size() << ")";
+                cout << " from=[";
+                bool first = true;
+                for(uint32_t n : inFrom) { if(!first) cout << ","; cout << n; first = false; }
+                cout << "] to=[";
+                first = true;
+                for(uint32_t n : outTo) { if(!first) cout << ","; cout << n; first = false; }
+                cout << "]" << endl;
             }
         }
 
