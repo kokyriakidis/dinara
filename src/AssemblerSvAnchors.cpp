@@ -3245,6 +3245,32 @@ void Assembler::buildSvMSA(
                                  << indirectAlignedReads
                                     .size()
                                  << endl;
+                            // Het-corrected estimate: for het
+                            // insertions, indirectBases/coverage
+                            // gives ~half the true size because
+                            // only one allele contributes indirect
+                            // reads while coverage counts both.
+                            // Emit a 2x estimate when the ratio
+                            // of internal reads to coverage
+                            // suggests het (< 2.0).
+                            const double irCovRatio =
+                                double(indirectAlignedReads
+                                       .size())
+                                / double(medianSpanning);
+                            if(irCovRatio < 2.0
+                               && estSize >= 100) {
+                                const int64_t hetSize =
+                                    estSize * 2;
+                                cout << "    >>> INSERTION CALL"
+                                     << " (large-ins-het):"
+                                     << " size="
+                                     << hetSize << "bp"
+                                     << ", breakpoint="
+                                     << bpPos
+                                     << ", irCovRatio="
+                                     << irCovRatio
+                                     << endl;
+                            }
                             insertionCallRegions.push_back({
                                 std::min(bestStrong->pos,
                                          bestPartner->pos),
@@ -3294,6 +3320,26 @@ void Assembler::buildSvMSA(
                                      << indirectAlignedReads
                                         .size()
                                      << endl;
+                                // Het-corrected estimate.
+                                const double irCovRatio2 =
+                                    double(indirectAlignedReads
+                                           .size())
+                                    / double(medianSpanning);
+                                if(irCovRatio2 < 2.0
+                                   && estSize >= 100) {
+                                    const int64_t hetSize2 =
+                                        estSize * 2;
+                                    cout << "    >>> INSERTION"
+                                         << " CALL"
+                                         << " (large-ins-het):"
+                                         << " size="
+                                         << hetSize2 << "bp"
+                                         << ", breakpoint="
+                                         << bestStrong->pos
+                                         << ", irCovRatio="
+                                         << irCovRatio2
+                                         << endl;
+                                }
                                 insertionCallRegions.push_back({
                                     bestStrong->pos > 200
                                     ? bestStrong->pos - 200
