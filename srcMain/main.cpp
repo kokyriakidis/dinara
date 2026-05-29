@@ -1660,7 +1660,7 @@ void dinara::main::assemble(
 
     // Detangle Case 1: create bypass edges and remove flow reads from backbone.
     // COMMENTED OUT pending validation on larger datasets.
-#if 0
+#if 1
     std::vector<DetangleBypassEdge> bypassEdges;
     {
         const uint64_t detangledCount = detangleWindows(
