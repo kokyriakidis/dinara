@@ -452,24 +452,26 @@ Key observations:
 - **INS 500-1000bp at 70%**: no-covdrop-flip detects INS509 (split-read DEL with no coverage-drop → INS)
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads; flank-gap-alt provides ⚠️ for INS2399
 
-### Q100 DEL <100bp Benchmark (94 cases)
+### Q100 DEL 5011-Case Benchmark
 
-94 unique DEL 50-99bp cases from HG002 GRCh38 v5.0q stvar truthset (first 100, all chr1).
-BAM: HG002.GRCh38.2x250.bam (GIAB NIST Illumina 2x250bp).
-Cases in `/tmp/truthset/cases_del_lt100bp/`. Runner: `/tmp/truthset/run_del_lt100bp.sh`.
+5011 DEL cases (≥50bp) from HG002 GRCh38 v5.0q stvar truthset, extracted from SBX-D.30X.bam.
+Cases in `/tmp/truthset/del_5000/`. Runner: `/tmp/truthset/run_del5000.sh`.
 
-| Metric | Count | % |
-|---|---|---|
-| ✅ | 73 | 77% |
-| ⚠️ | 14 | 14% |
-| ❌ | 7 | 7% |
-| Correct type (✅+⚠️) | 87 | 92% |
+| Bin | Total | ✅ | ⚠️ | ❌ | ✅% |
+|---|---|---|---|---|---|
+| DEL <100bp | 1833 | 1556 | 230 | 47 | 84% |
+| DEL 100-500bp | 1842 | 1505 | 293 | 44 | 81% |
+| DEL 500-1000bp | 508 | 396 | 105 | 7 | 77% |
+| DEL >1000bp | 828 | 764 | 44 | 20 | 92% |
+| **TOTAL** | **5011** | **4221** | **672** | **118** | **84%** |
 
-Best call source distribution (✅ cases): CIGAR 25, diagonal 21, cluster 12, adaptive-bimodal 8, flank-gap 4, path-based 2, SDUST-STR 1.
+**Correct type (✅+⚠️): 4893/5011 = 97%**
 
-Remaining ⚠️ root causes: tandem repeat copy-number ambiguity (adaptive-bimodal weighted median overshoots, cluster sees one repeat unit), flank-gap undersizing in tandem repeats.
+Best call sources (✅): CIGAR 1705, cluster 770, diagonal 597, SA-tag 394, adaptive-bimodal 253, flank-gap 178, split-read 131, SDUST-STR 56, path-based 42, SDUST-VNTR 30, VNTR-depth 25, coverage 16, merged-clusters 14, SA-DEL-flip 5, no-covdrop-flip 5.
 
-Remaining ❌ root causes: het deletions where path-based INS fires first and masks DEL signal (2), complex/inverted regions with only INV clusters (2), tandem repeat locus misclassified as large INS (2), marker-depleted with no DEL evidence (1).
+Remaining ❌ (118 cases): INS-only calls in tandem repeats (66), no calls at all (52 — zero spanning coverage, homozygous deletions, unmappable regions).
+
+Remaining ⚠️ (672 cases): tandem repeat copy-number ambiguity across all sources (CIGAR sees partial repeat units, SA-tag/adaptive-bimodal overshoot by 1-2 repeat units, flank-gap measures one repeat unit shift).
 
 ### Known Limitations
 
