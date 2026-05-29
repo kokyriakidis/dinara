@@ -404,9 +404,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Identify parallel windows: windows where the set of incoming neighbor
+    // windows is identical to the set of outgoing neighbor windows.
+    // These represent parallel connections (e.g., haplotype bubbles) and
+    // should not have inter-window edges added.
+    std::set<uint32_t> parallelWindows;
+    {
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            std::set<uint32_t> inNeighbors, outNeighbors;
+            for(const auto& [key, reads] : window.transitionReads) {
+                if(key.first != noW) inNeighbors.insert(key.first);
+                if(key.second != noW) outNeighbors.insert(key.second);
+            }
+            if(inNeighbors.size() == 2 && inNeighbors == outNeighbors) {
+                parallelWindows.insert(w);
+            }
+        }
+        if(!parallelWindows.empty()) {
+            cout << "Parallel windows (same in/out neighbors, edges skipped):";
+            for(const uint32_t w : parallelWindows) {
+                cout << " " << w;
+            }
+            cout << endl;
+        }
+    }
+
     // For each window pair, pick the candidate with the most shared reads.
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowBelowCoverage = 0;
+    uint64_t interWindowParallel = 0;
     uint64_t interWindowCreated = 0;
     // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, readCount).
     struct InterWindowEdgeInfo {
@@ -417,6 +445,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
     std::vector<InterWindowEdgeInfo> createdEdges;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        // Skip edges involving parallel windows.
+        const uint32_t normSrc = (windowPair.first >= windowCount)
+            ? (windowPair.first - windowCount) : windowPair.first;
+        const uint32_t normDst = (windowPair.second >= windowCount)
+            ? (windowPair.second - windowCount) : windowPair.second;
+        if(parallelWindows.count(normSrc) || parallelWindows.count(normDst)) {
+            ++interWindowParallel;
+            continue;
+        }
+
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
         for(const auto& [apk, count] : candidates) {
@@ -446,6 +484,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
     cout << "Inter-window edges: " << interWindowCreated << " created, "
+         << interWindowParallel << " rejected (parallel window), "
          << interWindowZeroPairs << " rejected (zero forward-flow reads), "
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
@@ -696,27 +735,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
-    //
-    // When two windows A and B are connected by an internal inter-window
-    // edge (both endpoints are mid-backbone), check whether the connection
-    // is real or spurious using a tangle matrix approach similar to
-    // shasta2's Shasta2TangleMatrix1.
-    //
-    // For each window, collect reads from all backbone anchors before the
-    // connection point ("entrance" side) and all anchors after it ("exit"
-    // side). Each read's contribution is weighted by the number of anchors
-    // (steps) it appears on in each side, following shasta2's per-read
-    // matrix approach.
-    //
-    // Build a 2x2 matrix:
-    //   A-entrance → A-exit (diagonal: A continues on its own)
-    //   B-entrance → B-exit (diagonal: B continues on its own)
-    //   A-entrance → B-exit (off-diagonal: cross from A to B)
-    //   B-entrance → A-exit (off-diagonal: cross from B to A)
-    //
-    // If both diagonal entries are stronger than both off-diagonal
-    // entries, the internal connection is false and the edge is removed.
+    // COMMENTED OUT pending validation on larger datasets.
     // ========================================================================
+#if 0
     {
         // Build boundary anchor set.
         std::set<Shasta2AnchorId> boundaryAnchors;
@@ -935,6 +956,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << " false internal inter-window edges." << endl;
         }
     }
+#endif
 
     // Validate: check that every edge has shared oriented reads.
     {
