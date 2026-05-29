@@ -590,21 +590,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Trim backbone outside the bounding inter-window connection span.
     auto trimBackbones = [&]() {
-        auto clearIntraWindowEdges = [&](uint64_t vid) {
+        // Disable all edges of a trimmed anchor (intra-window and inter-window).
+        auto clearAllEdges = [&](uint64_t vid) {
             if(vid >= anchorCount) return;
-            const uint32_t vWindow = anchorToWindow[vid];
             auto oe = boost::out_edges(vid, anchorGraph);
             for(auto it = oe.first; it != oe.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
+                if(anchorGraph[*it].useForAssembly)
                     disableEdge(*it);
             }
             auto ie = boost::in_edges(vid, anchorGraph);
             for(auto it = ie.first; it != ie.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                if(src < anchorCount && anchorToWindow[src] == vWindow)
+                if(anchorGraph[*it].useForAssembly)
                     disableEdge(*it);
             }
         };
@@ -671,14 +667,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
-                clearIntraWindowEdges(uint64_t(aid) ^ 1ULL);
+                clearAllEdges(uint64_t(aid));
+                clearAllEdges(uint64_t(aid) ^ 1ULL);
                 ++trimmedVertexCount;
             }
             for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
-                clearIntraWindowEdges(uint64_t(aid) ^ 1ULL);
+                clearAllEdges(uint64_t(aid));
+                clearAllEdges(uint64_t(aid) ^ 1ULL);
                 ++trimmedVertexCount;
             }
         }

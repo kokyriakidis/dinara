@@ -74,30 +74,30 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
         windowNeighbors[dstWin].insert(srcWin);
     }
 
-    // Greedy graph coloring: assign each window the smallest color index
-    // not used by any neighbor.
+    // Use a fixed palette of 20 colors. Assign each window the color
+    // index that is least used among its neighbors, breaking ties by
+    // picking the lowest index. This maximizes local contrast.
+    const uint32_t numColors = 20;
     std::map<uint32_t, uint32_t> windowColorIndex;
     for(uint32_t w = 0; w < windowCount; w++) {
-        if(!windowNeighbors.count(w) && windowNeighbors.empty()) continue;
-        std::set<uint32_t> usedColors;
+        // Count how many neighbors use each color.
+        std::vector<uint32_t> neighborColorCount(numColors, 0);
         if(windowNeighbors.count(w)) {
             for(const uint32_t nb : windowNeighbors[w]) {
                 if(windowColorIndex.count(nb)) {
-                    usedColors.insert(windowColorIndex[nb]);
+                    neighborColorCount[windowColorIndex[nb]]++;
                 }
             }
         }
-        uint32_t color = 0;
-        while(usedColors.count(color)) ++color;
-        windowColorIndex[w] = color;
+        // Pick the color with the lowest neighbor count.
+        uint32_t bestColor = 0;
+        for(uint32_t c = 1; c < numColors; c++) {
+            if(neighborColorCount[c] < neighborColorCount[bestColor]) {
+                bestColor = c;
+            }
+        }
+        windowColorIndex[w] = bestColor;
     }
-
-    // Find the number of colors used.
-    uint32_t numColors = 0;
-    for(const auto& [w, c] : windowColorIndex) {
-        if(c >= numColors) numColors = c + 1;
-    }
-    if(numColors == 0) numColors = 1;
 
     // HSL-to-RGB helper.
     auto hslToRgb = [](double h, double s, double l,
