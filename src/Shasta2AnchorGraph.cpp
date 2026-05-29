@@ -632,7 +632,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(positions.empty()) continue;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            int64_t startBound = -1, endBound = -1;
+            int64_t minBound = -1, maxBound = -1;
             bool hasInterWindowEdges = false;
 
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
@@ -644,22 +644,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
                 if(srcWin == noWindow || dstWin == noWindow) continue;
                 if(srcWin == dstWin) continue;
+
+                // Find position of whichever endpoint belongs to this window.
+                int64_t pos = -1;
                 if(dstWin == w) {
-                    hasInterWindowEdges = true;
-                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
-                    if(pos >= 0 && (startBound < 0 || pos < startBound)) startBound = pos;
+                    pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
+                } else if(srcWin == w) {
+                    pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
                 }
-                if(srcWin == w) {
+                if(pos >= 0) {
                     hasInterWindowEdges = true;
-                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
-                    if(pos >= 0 && (endBound < 0 || pos > endBound)) endBound = pos;
+                    if(minBound < 0 || pos < minBound) minBound = pos;
+                    if(maxBound < 0 || pos > maxBound) maxBound = pos;
                 }
             }
 
             if(!hasInterWindowEdges) continue;
-            if(startBound < 0) startBound = int64_t(positions.front());
-            if(endBound < 0) endBound = int64_t(positions.back());
-            if(startBound > endBound) continue;
+            const int64_t startBound = minBound;
+            const int64_t endBound = maxBound;
+            if(startBound < 0 || endBound < 0 || startBound > endBound) continue;
 
             int64_t keepFirst = -1;
             for(uint64_t i = 0; i < positions.size(); i++) {
