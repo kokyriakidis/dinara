@@ -725,9 +725,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             cout << "Dangling window cleanup (" << label << "): removed "
                  << danglingRemovedCount << " inter-window edges." << endl;
         }
+        return danglingRemovedCount;
     };
 
-    removeDanglingWindows("post-filter");
+    // Wrapper that runs dangling cleanup iteratively until stable.
+    auto removeDanglingWindowsIterative = [&](const string& label) {
+        uint64_t totalRemoved = 0;
+        uint64_t iteration = 0;
+        while(true) {
+            const string iterLabel = label + " pass " + to_string(++iteration);
+            const uint64_t removed = removeDanglingWindows(iterLabel);
+            if(removed == 0) break;
+            totalRemoved += removed;
+        }
+    };
+
+    removeDanglingWindowsIterative("post-filter");
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
@@ -1237,7 +1250,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 #endif
 
-    removeDanglingWindows("post-detangle");
+    removeDanglingWindowsIterative("post-detangle");
 
     // Validate: check that every edge has shared oriented reads.
     {
