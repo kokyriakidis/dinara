@@ -265,31 +265,41 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             // has a split copy (splitId != originalId), then create edges
             // between consecutive ones. This skips backbone anchors where
             // the path has no reads.
+            // We also build the RC chain from the RC entries in anchorSplitMap
+            // (split copy IDs don't satisfy id^1 pairing, so we can't compute
+            // RC IDs arithmetically).
             for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                // Collect this path's actual anchor chain.
+                // Collect this path's forward and RC anchor chains.
                 vector<Shasta2AnchorId> pathChain;
+                vector<Shasta2AnchorId> rcPathChain;
                 for(const Shasta2AnchorId origAid : backboneAnchors) {
+                    // Forward chain.
                     auto it = anchorSplitMap->find(origAid);
                     if(it != anchorSplitMap->end() && pathIdx < it->second.size()) {
                         const Shasta2AnchorId splitId = it->second[pathIdx];
-                        // Only include if this path has a real split copy
-                        // (not pointing back to the original).
                         if(splitId != origAid) {
                             pathChain.push_back(splitId);
                         }
                     }
+                    // RC chain: look up the RC of the original anchor.
+                    const Shasta2AnchorId rcOrigAid = Shasta2AnchorId(uint64_t(origAid) ^ 1ULL);
+                    auto rcIt = anchorSplitMap->find(rcOrigAid);
+                    if(rcIt != anchorSplitMap->end() && pathIdx < rcIt->second.size()) {
+                        const Shasta2AnchorId rcSplitId = rcIt->second[pathIdx];
+                        if(rcSplitId != rcOrigAid) {
+                            rcPathChain.push_back(rcSplitId);
+                        }
+                    }
                 }
 
-                // Create edges between consecutive anchors in this path's chain.
+                // Forward chain edges.
                 for(uint64_t i = 0; i + 1 < pathChain.size(); i++) {
                     addEdgeForSplitChain(pathChain[i], pathChain[i + 1]);
+                }
 
-                    // RC mirror edge.
-                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(pathChain[i]) ^ 1ULL);
-                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(pathChain[i + 1]) ^ 1ULL);
-                    if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                        addEdgeForSplitChain(rcB, rcA);
-                    }
+                // RC chain edges (reversed direction).
+                for(uint64_t i = 0; i + 1 < rcPathChain.size(); i++) {
+                    addEdgeForSplitChain(rcPathChain[i + 1], rcPathChain[i]);
                 }
             }
         }
