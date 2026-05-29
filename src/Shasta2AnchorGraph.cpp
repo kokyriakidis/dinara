@@ -556,6 +556,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t b = normalize(dstW);
             if(a == b) continue;
             directConnections.insert({a, b});
+            directConnections.insert({b, a});
             incomingNeighbors[b].insert(a);
             outgoingNeighbors[a].insert(b);
         }
