@@ -822,8 +822,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // provided removal won't make any neighbor dangling.
     // Defined as a lambda so it can be called after each filter pass.
     auto removeDanglingWindows = [&](const string& label) {
-        // Work with raw (un-normalized) window IDs so forward and RC
-        // windows are treated independently.
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Build per-edge window pair info once, then maintain inCount/outCount
+        // as edges are disabled.
         struct InterWindowEdge {
             edge_descriptor e;
             uint32_t srcWin;
@@ -837,8 +841,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcWin = anchorToWindow[srcVal];
-            const uint32_t dstWin = anchorToWindow[dstVal];
+            const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+            const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
             if(srcWin == noWindow || dstWin == noWindow) continue;
             if(srcWin == dstWin) continue;
             interWindowEdges.push_back({e, srcWin, dstWin});
@@ -846,19 +850,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             inCount[dstWin]++;
         }
 
-        // Collect all raw window IDs that have inter-window edges.
-        std::set<uint32_t> allWindows;
-        for(const auto& [w, _] : inCount) if(_ > 0) allWindows.insert(w);
-        for(const auto& [w, _] : outCount) if(_ > 0) allWindows.insert(w);
-
         uint64_t danglingRemovedCount = 0;
         uint64_t danglingWindowCount = 0;
 
-        // Iterate until no more dangling windows are found.
+        // Iterate until no more dangling windows are found in this pass.
         bool changed = true;
         while(changed) {
             changed = false;
-            for(const uint32_t w : allWindows) {
+            for(uint32_t w = 0; w < windowCount; w++) {
                 const bool hasIn = (inCount.count(w) && inCount[w] > 0);
                 const bool hasOut = (outCount.count(w) && outCount[w] > 0);
                 if(hasIn == hasOut) continue;
@@ -884,6 +883,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     const auto& iwe = interWindowEdges[idx];
                     const uint32_t n = (iwe.srcWin == w) ? iwe.dstWin : iwe.srcWin;
 
+                    // Compute how many edges neighbor n would lose.
                     uint64_t nInLoss = 0, nOutLoss = 0;
                     for(const size_t idx2 : edgeIndices) {
                         const auto& iwe2 = interWindowEdges[idx2];
@@ -1298,15 +1298,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Diagnostic: dump per-window inter-window connectivity after all cleanup.
     {
-        // Use raw (un-normalized) window IDs to match GFA output.
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+        // For each window, track which other windows it connects to.
         std::map<uint32_t, std::set<uint32_t>> outNeighbors, inNeighbors;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcWin = anchorToWindow[srcVal];
-            const uint32_t dstWin = anchorToWindow[dstVal];
+            const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+            const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
             if(srcWin == noWindow || dstWin == noWindow) continue;
             if(srcWin == dstWin) continue;
             outNeighbors[srcWin].insert(dstWin);
