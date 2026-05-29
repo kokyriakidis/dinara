@@ -693,6 +693,149 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << trimmedVertexCount << " vertices trimmed." << endl;
     }
 
+    // ========================================================================
+    // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
+    //
+    // When two windows A and B are connected by an internal inter-window
+    // edge (both endpoints are mid-backbone, not at the first/last
+    // position), check whether the connection is real or spurious by
+    // examining the reads on the anchors just before and after the
+    // connection point in both windows.
+    //
+    // Build a 2x2 matrix of common reads:
+    //   A-before → A-after (diagonal: A continues on its own)
+    //   B-before → B-after (diagonal: B continues on its own)
+    //   A-before → B-after (off-diagonal: cross from A to B)
+    //   B-before → A-after (off-diagonal: cross from B to A)
+    //
+    // If both diagonal entries are stronger than both off-diagonal
+    // entries, the internal connection is false and the edge is removed.
+    // ========================================================================
+    {
+        // Build boundary anchor set.
+        std::set<Shasta2AnchorId> boundaryAnchors;
+        for(const AnchorWindow& window : anchorWindows) {
+            const auto backboneJourney = journeys[window.backboneOrientedReadId];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const Shasta2AnchorId firstAnchor = backboneJourney[positions.front()];
+            const Shasta2AnchorId lastAnchor = backboneJourney[positions.back()];
+            boundaryAnchors.insert(firstAnchor);
+            boundaryAnchors.insert(lastAnchor);
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(firstAnchor) ^ 1ULL));
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(lastAnchor) ^ 1ULL));
+        }
+
+        // Build anchor → (windowIndex, backbone position index) map
+        // for quick lookup of an anchor's position in its window.
+        std::map<Shasta2AnchorId, std::pair<uint32_t, uint64_t>> anchorPosition;
+        for(uint32_t wIdx = 0; wIdx < anchorWindows.size(); wIdx++) {
+            const auto& window = anchorWindows[wIdx];
+            const auto backboneJourney = journeys[window.backboneOrientedReadId];
+            const auto& positions = window.filteredBackbonePositions;
+            for(uint64_t i = 0; i < positions.size(); i++) {
+                const Shasta2AnchorId aid = backboneJourney[positions[i]];
+                anchorPosition[aid] = {wIdx, i};
+            }
+        }
+
+        // Helper: get reads on an anchor as a set.
+        auto getReads = [&](Shasta2AnchorId aid) -> std::set<uint32_t> {
+            std::set<uint32_t> reads;
+            const auto span = anchors[aid];
+            for(const auto& mi : span) {
+                reads.insert(mi.orientedReadId.getValue());
+            }
+            return reads;
+        };
+
+        // Helper: count common reads between two sets.
+        auto countCommon = [](const std::set<uint32_t>& a,
+                              const std::set<uint32_t>& b) -> uint64_t {
+            uint64_t count = 0;
+            for(const uint32_t r : a) {
+                if(b.count(r)) ++count;
+            }
+            return count;
+        };
+
+        // Find internal inter-window edges and check the 2x2 matrix.
+        uint64_t case2RemovedCount = 0;
+        bool changed = true;
+        while(changed) {
+            changed = false;
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const Shasta2AnchorId srcAid = Shasta2AnchorId(uint64_t(source(e, anchorGraph)));
+                const Shasta2AnchorId dstAid = Shasta2AnchorId(uint64_t(target(e, anchorGraph)));
+
+                const uint64_t srcVal = uint64_t(srcAid);
+                const uint64_t dstVal = uint64_t(dstAid);
+                const uint32_t srcWin = (srcVal < anchorCount) ? anchorToWindow[srcVal] : noWindow;
+                const uint32_t dstWin = (dstVal < anchorCount) ? anchorToWindow[dstVal] : noWindow;
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+
+                // Both endpoints must be internal.
+                if(boundaryAnchors.count(srcAid)) continue;
+                if(boundaryAnchors.count(dstAid)) continue;
+
+                // Find backbone positions of both endpoints.
+                auto srcIt = anchorPosition.find(srcAid);
+                auto dstIt = anchorPosition.find(dstAid);
+                if(srcIt == anchorPosition.end() || dstIt == anchorPosition.end()) continue;
+
+                const uint32_t srcWIdx = srcIt->second.first;
+                const uint64_t srcPosIdx = srcIt->second.second;
+                const uint32_t dstWIdx = dstIt->second.first;
+                const uint64_t dstPosIdx = dstIt->second.second;
+
+                const auto& srcWindow = anchorWindows[srcWIdx];
+                const auto& dstWindow = anchorWindows[dstWIdx];
+                const auto& srcPositions = srcWindow.filteredBackbonePositions;
+                const auto& dstPositions = dstWindow.filteredBackbonePositions;
+                const auto srcJourney = journeys[srcWindow.backboneOrientedReadId];
+                const auto dstJourney = journeys[dstWindow.backboneOrientedReadId];
+
+                // Need at least one anchor before and after in both windows.
+                if(srcPosIdx == 0 || srcPosIdx + 1 >= srcPositions.size()) continue;
+                if(dstPosIdx == 0 || dstPosIdx + 1 >= dstPositions.size()) continue;
+
+                // Get the anchors before and after the connection point.
+                const Shasta2AnchorId aBefore = srcJourney[srcPositions[srcPosIdx - 1]];
+                const Shasta2AnchorId aAfter  = srcJourney[srcPositions[srcPosIdx + 1]];
+                const Shasta2AnchorId bBefore = dstJourney[dstPositions[dstPosIdx - 1]];
+                const Shasta2AnchorId bAfter  = dstJourney[dstPositions[dstPosIdx + 1]];
+
+                // Get read sets.
+                const auto aBeforeReads = getReads(aBefore);
+                const auto aAfterReads  = getReads(aAfter);
+                const auto bBeforeReads = getReads(bBefore);
+                const auto bAfterReads  = getReads(bAfter);
+
+                // 2x2 tangle matrix.
+                const uint64_t diagAA = countCommon(aBeforeReads, aAfterReads);
+                const uint64_t diagBB = countCommon(bBeforeReads, bAfterReads);
+                const uint64_t offAB  = countCommon(aBeforeReads, bAfterReads);
+                const uint64_t offBA  = countCommon(bBeforeReads, aAfterReads);
+
+                // The connection is false if both diagonal entries are
+                // stronger than both off-diagonal entries.
+                if(diagAA > offAB && diagAA > offBA &&
+                   diagBB > offAB && diagBB > offBA) {
+                    boost::remove_edge(e, anchorGraph);
+                    ++case2RemovedCount;
+                    changed = true;
+                    break; // Iterator invalidated, restart.
+                }
+            }
+        }
+
+        if(case2RemovedCount > 0) {
+            cout << "Detangle Case 2: removed " << case2RemovedCount
+                 << " false internal inter-window edges." << endl;
+        }
+    }
+
     // Validate: check that every edge has shared oriented reads.
     {
         uint64_t emptyEdgeCount = 0;
