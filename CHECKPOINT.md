@@ -431,25 +431,25 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 | Bin | Total | ✅ | ⚠️ | ❌ | ✅% |
 |-----|-------|---|---|---|-----|
 | DEL <100bp | 10 | 9 | 1 | 0 | 90% |
-| DEL 100-500bp | 10 | 8 | 2 | 0 | 80% |
+| DEL 100-500bp | 10 | 9 | 1 | 0 | 90% |
 | DEL 500-1000bp | 10 | 7 | 3 | 0 | 70% |
-| DEL >1000bp | 10 | 6 | 2 | 2 | 60% |
-| INS <100bp | 10 | 7 | 2 | 1 | 70% |
-| INS 100-500bp | 10 | 1 | 6 | 3 | 10% |
-| INS 500-1000bp | 10 | 5 | 3 | 2 | 50% |
-| INS >1000bp | 10 | 0 | 5 | 5 | 0% |
-| **TOTAL** | **80** | **43** | **24** | **13** | **54%** |
+| DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
+| INS <100bp | 10 | 8 | 2 | 0 | 80% |
+| INS 100-500bp | 10 | 1 | 9 | 0 | 10% |
+| INS 500-1000bp | 10 | 6 | 2 | 2 | 60% |
+| INS >1000bp | 10 | 0 | 8 | 2 | 0% |
+| **TOTAL** | **80** | **48** | **27** | **5** | **60%** |
 
-**Correct type (✅+⚠️): 67/80 = 84%**
+**Correct type (✅+⚠️): 75/80 = 94%**
 
 Key observations:
 - **DEL <100bp at 90%**: compound CIGAR merging (35D+55D→90D) and CIGAR-corroborated k-mer clusters fix tandem repeat and STR cases
-- **DEL 100-500bp at 80%**: size-gated CIGAR clustering separates mixed-size deletion clusters (e.g. 57D vs 114D)
-- **DEL 500-1000bp at 70%**: SA-tag VNTR suppression relaxed for strong calls (≥10 reads); coverage-drop corroborated k-mer clusters for marker-depleted regions
-- **INS detection limited**: 13/40 exact (33%), 27/40 correct type (68%)
+- **DEL 100-500bp at 90%**: size-gated CIGAR clustering separates mixed-size deletion clusters (e.g. 57D vs 114D)
+- **DEL 500-1000bp at 70%**: SA-tag VNTR suppression relaxed for strong calls (≥10 reads); coverage-drop corroborated k-mer clusters for marker-depleted regions; remaining 3 ⚠️ are tandem repeat copy-number ambiguities (DEL662, DEL605, DEL500)
+- **DEL >1000bp at 80%**: 1 ❌ (DEL1432 — no call), 1 ⚠️ (DEL6191 — partial detection)
+- **INS detection limited**: 15/40 exact (38%), 35/40 correct type (88%)
 - **INS 100-500bp** remains weak (10% exact): insertions exceed read length and soft-clip assembly can only partially span them
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
-- **Type confusion**: ~8 INS cases still detected as DEL in tandem repeats
 
 ### Known Limitations
 
@@ -457,6 +457,21 @@ Key observations:
 2. **VNTR insertions** are fundamentally limited: short reads can't span VNTRs, k-mers are non-unique, BAM extraction depletes VNTR reads
 3. **Microsatellite insertions** (e.g., AT-repeats): reads are too short to span from unique flanking sequence past the breakpoint
 4. **Highly repetitive regions** (>90% non-unique 10-mers): no reliable anchoring possible with k=10
+
+### DEL 500-1000bp Remaining ⚠️ Cases
+
+Three cases remain ⚠️ due to tandem repeat copy-number ambiguity:
+
+- **DEL662**: Coverage-drop 1300bp (marker-depleted), SA-tag 396bp (10 reads). SA-tag undersizes by ~5 repeat units (unit≈53bp). Coverage-drop oversizes. A false BP-pair insertion call at the deletion boundary was suppressing the coverage-drop — fixed by skipping small insertions (<1/3 of coverage-drop size) in the `overlapsInsertion` check. SA-tag refinement now works via widened proximity (coverage-drop region boundaries instead of fixed 500bp) and widened size ratio for marker-depleted regions.
+
+- **DEL605**: medianSpanning=0, no SA-tag (supplementary alignments fall outside extracted region), no coverage-drop detected (requires medianSpanning>5). Only evidence is scattered CIGAR DELs (33-83bp) and HitDepth BPs. Fundamentally limited by lack of spanning reads and SA-tag evidence.
+
+- **DEL500**: Coverage-drop 1650bp, SA-tag 675bp (13 reads, 35% over truth). Adaptive-bimodal picks 121bp (one repeat unit artifact). SA-tag refinement now works via widened proximity and ratio, emitting 675bp. Still ⚠️ because 675/500=1.35 exceeds 30% threshold by 5%.
+
+Code changes (not yet committed):
+1. `overlapsInsertion` skip for small insertions relative to coverage-drop size
+2. SA-tag proximity uses coverage-drop region boundaries (±300bp) instead of fixed 500bp from center
+3. SA-tag size ratio widened to `delSize/bestShift` for strong SA-tag support (≥5 reads) in both flank-gap and adaptive-bimodal paths
 
 ### Investigated but Not Viable
 
