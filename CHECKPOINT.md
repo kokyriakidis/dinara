@@ -432,19 +432,20 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 |-----|-------|---|---|---|-----|
 | DEL <100bp | 10 | 9 | 1 | 0 | 90% |
 | DEL 100-500bp | 10 | 8 | 2 | 0 | 80% |
-| DEL 500-1000bp | 10 | 5 | 4 | 1 | 50% |
+| DEL 500-1000bp | 10 | 7 | 3 | 0 | 70% |
 | DEL >1000bp | 10 | 6 | 2 | 2 | 60% |
 | INS <100bp | 10 | 7 | 2 | 1 | 70% |
 | INS 100-500bp | 10 | 1 | 6 | 3 | 10% |
 | INS 500-1000bp | 10 | 5 | 3 | 2 | 50% |
 | INS >1000bp | 10 | 0 | 5 | 5 | 0% |
-| **TOTAL** | **80** | **41** | **25** | **14** | **51%** |
+| **TOTAL** | **80** | **43** | **24** | **13** | **54%** |
 
-**Correct type (✅+⚠️): 66/80 = 82%**
+**Correct type (✅+⚠️): 67/80 = 84%**
 
 Key observations:
 - **DEL <100bp at 90%**: compound CIGAR merging (35D+55D→90D) and CIGAR-corroborated k-mer clusters fix tandem repeat and STR cases
 - **DEL 100-500bp at 80%**: size-gated CIGAR clustering separates mixed-size deletion clusters (e.g. 57D vs 114D)
+- **DEL 500-1000bp at 70%**: SA-tag VNTR suppression relaxed for strong calls (≥10 reads); coverage-drop corroborated k-mer clusters for marker-depleted regions
 - **INS detection limited**: 13/40 exact (33%), 27/40 correct type (68%)
 - **INS 100-500bp** remains weak (10% exact): insertions exceed read length and soft-clip assembly can only partially span them
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
