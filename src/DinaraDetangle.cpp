@@ -1,6 +1,11 @@
 // Detangling: split backbone anchors of tangled windows so that
 // each path through the window gets its own anchor copies containing
 // only that path's reads.
+//
+// A flow is defined by the reads common between a previous window and
+// a next window. These reads traverse the current window's backbone.
+// For each backbone anchor, a split copy is created containing the
+// subset of flow reads present in that anchor.
 
 #include "DinaraDetangle.hpp"
 #include "timestamp.hpp"
@@ -36,7 +41,9 @@ uint64_t dinara::detangleWindows(
     // spans into anchorMarkerInfos during iteration.
     vector<vector<Shasta2AnchorMarkerInfo>> newAnchors;
 
-    // Deferred split map entries: originalId -> indices into newAnchors per path.
+    // Deferred split: originalId -> index into newAnchors per path.
+    // invalidIndex means the flow has no reads at this anchor.
+    static constexpr uint64_t invalidIndex = uint64_t(-1);
     struct DeferredSplit {
         Shasta2AnchorId originalId;
         vector<uint64_t> newAnchorIndices;
@@ -45,47 +52,73 @@ uint64_t dinara::detangleWindows(
 
     for(const AnchorWindow& window : anchorWindows) {
 
-        // Collect through-flows: (prev, next) pairs where both are real windows,
-        // with sufficient read support.
-        using Flow = pair<pair<uint32_t, uint32_t>, vector<OrientedReadId>>;
-        vector<Flow> throughFlows;
+        // Build flows from transitionReads: each (prev, next) pair where
+        // both are real windows defines a flow. Merge directional pairs
+        // (A->B) and (B->A) since they represent the same genomic path.
+        using FlowKey = pair<uint32_t, uint32_t>;
+        struct MergedFlow {
+            vector<FlowKey> flowKeys;
+            set<uint32_t> readSet; // OrientedReadId values.
+        };
+        map<FlowKey, uint64_t> canonicalToIdx;
+        vector<MergedFlow> mergedFlows;
+
         for(const auto& [key, reads] : window.transitionReads) {
-            if(key.first != noW && key.second != noW &&
-               reads.size() >= minFlowCoverage) {
-                throughFlows.push_back({key, reads});
+            if(key.first == noW || key.second == noW) continue;
+            FlowKey canonical = {std::min(key.first, key.second),
+                                 std::max(key.first, key.second)};
+            auto it = canonicalToIdx.find(canonical);
+            if(it == canonicalToIdx.end()) {
+                canonicalToIdx[canonical] = mergedFlows.size();
+                MergedFlow mf;
+                mf.flowKeys.push_back(key);
+                for(const OrientedReadId& oid : reads) {
+                    mf.readSet.insert(oid.getValue());
+                }
+                mergedFlows.push_back(std::move(mf));
+            } else {
+                auto& mf = mergedFlows[it->second];
+                mf.flowKeys.push_back(key);
+                for(const OrientedReadId& oid : reads) {
+                    mf.readSet.insert(oid.getValue());
+                }
             }
         }
 
-        if(throughFlows.size() < 2) {
+        // Filter by minimum coverage.
+        vector<MergedFlow> flows;
+        for(auto& mf : mergedFlows) {
+            if(mf.readSet.size() >= minFlowCoverage) {
+                flows.push_back(std::move(mf));
+            }
+        }
+
+        if(flows.size() < 2) {
             continue;
         }
 
-        ++detangledCount;
-        const uint64_t pathCount = throughFlows.size();
+        const uint64_t pathCount = flows.size();
 
         cout << "  Window " << window.windowId
              << " backbone=" << window.backboneOrientedReadId
-             << ": " << pathCount << " through-flows:";
-        for(const auto& [key, reads] : throughFlows) {
-            cout << " (" << key.first << "->" << key.second
-                 << ")=" << reads.size();
+             << ": " << pathCount << " flows:";
+        for(const auto& f : flows) {
+            cout << " {";
+            for(uint64_t k = 0; k < f.flowKeys.size(); k++) {
+                if(k > 0) cout << "+";
+                cout << f.flowKeys[k].first << "->" << f.flowKeys[k].second;
+            }
+            cout << "}=" << f.readSet.size();
         }
         cout << endl;
 
-        // Build per-path read sets.
-        vector<set<uint32_t>> pathReadSets(pathCount);
-        for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-            for(const OrientedReadId& oid : throughFlows[pathIdx].second) {
-                pathReadSets[pathIdx].insert(oid.getValue());
-            }
-        }
-
-        // Get backbone anchor IDs from the backbone read's journey.
+        // Get backbone info.
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
         const auto& positions = window.filteredBackbonePositions;
         if(positions.empty()) continue;
 
+        ++detangledCount;
         set<Shasta2AnchorId> alreadySplit;
 
         for(const uint32_t pos : positions) {
@@ -96,7 +129,7 @@ uint64_t dinara::detangleWindows(
             if(alreadySplit.count(canonicalId)) continue;
             alreadySplit.insert(canonicalId);
 
-            // Copy anchor data to local vectors before any appending.
+            // Copy anchor data before any appending.
             const auto canonicalSpan = anchors[canonicalId];
             const auto rcSpan = anchors[rcId];
             vector<Shasta2AnchorMarkerInfo> canonicalData(canonicalSpan.begin(), canonicalSpan.end());
@@ -106,30 +139,40 @@ uint64_t dinara::detangleWindows(
             DeferredSplit rcSplit{rcId, {}};
 
             for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                const set<uint32_t>& pathReads = pathReadSets[pathIdx];
+                const set<uint32_t>& flowReads = flows[pathIdx].readSet;
 
-                // Canonical subset: reads in this path.
+                // Canonical: keep reads that are in the flow's read set.
                 vector<Shasta2AnchorMarkerInfo> canonicalSubset;
                 for(const auto& mi : canonicalData) {
-                    if(pathReads.count(mi.orientedReadId.getValue())) {
+                    if(flowReads.count(mi.orientedReadId.getValue())) {
                         canonicalSubset.push_back(mi);
                     }
                 }
 
-                // RC subset: RC anchor has strand-flipped reads.
+                // RC: the flow reads are stored as forward-strand values,
+                // but RC anchor reads are strand-flipped.
                 vector<Shasta2AnchorMarkerInfo> rcSubset;
                 for(const auto& mi : rcData) {
                     const uint32_t flippedValue = mi.orientedReadId.getValue() ^ 1;
-                    if(pathReads.count(flippedValue)) {
+                    if(flowReads.count(flippedValue)) {
                         rcSubset.push_back(mi);
                     }
                 }
 
-                canonicalSplit.newAnchorIndices.push_back(newAnchors.size());
-                newAnchors.push_back(std::move(canonicalSubset));
+                // Only create a new anchor if this flow has reads here.
+                if(!canonicalSubset.empty()) {
+                    canonicalSplit.newAnchorIndices.push_back(newAnchors.size());
+                    newAnchors.push_back(std::move(canonicalSubset));
+                } else {
+                    canonicalSplit.newAnchorIndices.push_back(invalidIndex);
+                }
 
-                rcSplit.newAnchorIndices.push_back(newAnchors.size());
-                newAnchors.push_back(std::move(rcSubset));
+                if(!rcSubset.empty()) {
+                    rcSplit.newAnchorIndices.push_back(newAnchors.size());
+                    newAnchors.push_back(std::move(rcSubset));
+                } else {
+                    rcSplit.newAnchorIndices.push_back(invalidIndex);
+                }
             }
 
             deferredSplits.push_back(std::move(canonicalSplit));
@@ -146,11 +189,15 @@ uint64_t dinara::detangleWindows(
         anchors.anchorMarkerInfos.appendVector(anchorData);
     }
 
-    // Build the split map with actual anchor IDs.
+    // Build the split map. invalidIndex entries get the original anchor ID.
     for(const auto& ds : deferredSplits) {
         vector<Shasta2AnchorId> splitIds;
         for(const uint64_t idx : ds.newAnchorIndices) {
-            splitIds.push_back(Shasta2AnchorId(uint64_t(firstNewId) + idx));
+            if(idx == invalidIndex) {
+                splitIds.push_back(ds.originalId);
+            } else {
+                splitIds.push_back(Shasta2AnchorId(uint64_t(firstNewId) + idx));
+            }
         }
         anchorSplitMap[ds.originalId] = splitIds;
     }
