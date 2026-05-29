@@ -629,6 +629,110 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 #endif
 
+    // ========================================================================
+    // Remove dangling windows: windows with inter-window edges on only
+    // one side (only incoming or only outgoing). Only remove if doing so
+    // won't make any neighbor dangling.
+    // ========================================================================
+    {
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        // Count inter-window incoming/outgoing edges per normalized window.
+        auto countInterWindowEdges = [&]() {
+            std::map<uint32_t, uint64_t> inCount, outCount;
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+                const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+                outCount[srcWin]++;
+                inCount[dstWin]++;
+            }
+            return std::make_pair(inCount, outCount);
+        };
+
+        uint64_t danglingRemovedCount = 0;
+        auto [inCount, outCount] = countInterWindowEdges();
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const bool hasIn = (inCount.count(w) && inCount[w] > 0);
+            const bool hasOut = (outCount.count(w) && outCount[w] > 0);
+
+            // Skip if not dangling (has both or has neither).
+            if(hasIn == hasOut) continue;
+
+            // Collect W's inter-window edges and neighbors.
+            struct NeighborEdge {
+                edge_descriptor e;
+                uint32_t neighborWin;
+                bool isIncoming;  // true = neighbor→W, false = W→neighbor
+            };
+            std::vector<NeighborEdge> neighborEdges;
+
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+                const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+
+                if(dstWin == w) {
+                    neighborEdges.push_back({e, srcWin, true});
+                }
+                if(srcWin == w) {
+                    neighborEdges.push_back({e, dstWin, false});
+                }
+            }
+
+            // Check if removing W's edges would make any neighbor dangling.
+            bool safeToRemove = true;
+            for(const auto& ne : neighborEdges) {
+                const uint32_t n = ne.neighborWin;
+                uint64_t nInFromW = 0, nOutToW = 0;
+                for(const auto& ne2 : neighborEdges) {
+                    if(ne2.neighborWin == n) {
+                        if(ne2.isIncoming) nOutToW++;
+                        else nInFromW++;
+                    }
+                }
+                const uint64_t nInAfter = (inCount.count(n) ? inCount[n] : 0) - nInFromW;
+                const uint64_t nOutAfter = (outCount.count(n) ? outCount[n] : 0) - nOutToW;
+
+                if((nInAfter > 0) != (nOutAfter > 0)) {
+                    safeToRemove = false;
+                    break;
+                }
+            }
+
+            if(!safeToRemove) continue;
+
+            // Remove W's inter-window edges.
+            std::vector<edge_descriptor> edgesToRemove;
+            for(const auto& ne : neighborEdges) {
+                edgesToRemove.push_back(ne.e);
+            }
+            std::sort(edgesToRemove.begin(), edgesToRemove.end());
+            edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
+                                edgesToRemove.end());
+            for(const auto& e : edgesToRemove) {
+                boost::remove_edge(e, anchorGraph);
+                ++danglingRemovedCount;
+            }
+        }
+
+        if(danglingRemovedCount > 0) {
+            cout << "Dangling window cleanup: removed " << danglingRemovedCount
+                 << " inter-window edges." << endl;
+        }
+    }
+
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
         const uint32_t srcW = edgeInfo.windowPair.first;
