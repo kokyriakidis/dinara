@@ -194,6 +194,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return true;
     };
 
+    // Variant for split chain edges: skip removeNegativeOffsets.
+    // Flow reads traverse the backbone in order, so negative offsets
+    // are alignment artifacts, not real inversions.
+    auto addEdgeForSplitChain = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
+        Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
+        if(anchorPair.orientedReadIds.empty()) {
+            return false;
+        }
+        edge_descriptor e;
+        tie(e, ignore) = add_edge(
+            anchorPair.anchorIdA,
+            anchorPair.anchorIdB,
+            Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+            anchorGraph);
+        anchorGraph[e].useForAssembly = true;
+        return true;
+    };
+
     // Intra-window edges: consecutive filtered backbone anchor pairs,
     // for both the original windows and their RC mirrors.
     // If anchorSplitMap is provided, split anchors create parallel chains.
@@ -264,13 +282,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
                 // Create edges between consecutive anchors in this path's chain.
                 for(uint64_t i = 0; i + 1 < pathChain.size(); i++) {
-                    addEdgeIfValid(pathChain[i], pathChain[i + 1]);
+                    addEdgeForSplitChain(pathChain[i], pathChain[i + 1]);
 
                     // RC mirror edge.
                     const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(pathChain[i]) ^ 1ULL);
                     const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(pathChain[i + 1]) ^ 1ULL);
                     if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                        addEdgeIfValid(rcB, rcA);
+                        addEdgeForSplitChain(rcB, rcA);
                     }
                 }
             }

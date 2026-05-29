@@ -1740,6 +1740,19 @@ void dinara::main::assemble(
             }
         }
 
+        // Check for chain breaks: split copies with degree 1 that should
+        // have degree 2 (connected on both sides).
+        uint64_t degree1Count = 0;
+        for(const auto& [originalId2, splitIds2] : anchorSplitMap) {
+            for(const Shasta2AnchorId splitId : splitIds2) {
+                if(splitId == originalId2) continue;
+                uint64_t deg = boost::degree(splitId, ag);
+                if(deg == 1) ++degree1Count;
+            }
+        }
+        cout << "  Split copies with degree 1 (potential chain endpoints/breaks): "
+             << degree1Count << endl;
+
         cout << "  Per-window isolated split copies:" << endl;
         for(const auto& [wid, stats] : windowStats) {
             if(stats.second > 0) {
