@@ -653,6 +653,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         uint64_t danglingRemovedCount = 0;
 
+        // List windows with low inter-window edge counts.
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const uint64_t wIn = inCount.count(w) ? inCount[w] : 0;
+            const uint64_t wOut = outCount.count(w) ? outCount[w] : 0;
+            if(wIn + wOut > 0 && wIn + wOut <= 4) {
+                cout << "  Window " << w << " inter-window edges: in=" << wIn
+                     << " out=" << wOut << " (backbone="
+                     << anchorWindows[w].filteredBackbonePositions.size() << ")" << endl;
+            }
+        }
+
         for(uint32_t w = 0; w < windowCount; w++) {
             const bool hasIn = (inCount.count(w) && inCount[w] > 0);
             const bool hasOut = (outCount.count(w) && outCount[w] > 0);
