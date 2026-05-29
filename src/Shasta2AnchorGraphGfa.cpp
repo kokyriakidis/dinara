@@ -53,7 +53,9 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
 
     if(windowCount == 0 || anchorToWindow.empty()) return;
 
-    // Assign a color per forward window using HSL, same as AnchorWindowsClean.csv.
+    // Assign a color per forward window using golden-ratio hue spacing
+    // with varied saturation and lightness for better visual distinction.
+    const double goldenRatio = 0.618033988749895;
     BGL_FORALL_VERTICES(v, *this, Shasta2AnchorGraph) {
         if(in_degree(v, *this) == 0 && out_degree(v, *this) == 0) continue;
         if(uint64_t(v) >= anchorToWindow.size()) continue;
@@ -64,9 +66,11 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
         // Normalize RC mirror windows to forward window for color.
         const uint32_t fwdWid = (wid >= windowCount) ? (wid - windowCount) : wid;
 
-        const double hue = (360.0 * fwdWid) / windowCount;
-        const double s = 0.7;
-        const double l = 0.5;
+        // Golden-ratio hue spacing gives better separation than linear.
+        const double hue = std::fmod(fwdWid * goldenRatio * 360.0, 360.0);
+        // Vary saturation and lightness based on window index for more variety.
+        const double s = 0.55 + 0.35 * ((fwdWid % 3) / 2.0);       // 0.55, 0.725, 0.9
+        const double l = 0.40 + 0.15 * (((fwdWid / 3) % 3) / 2.0); // 0.40, 0.475, 0.55
         const double c = (1.0 - std::abs(2.0 * l - 1.0)) * s;
         const double x = c * (1.0 - std::abs(std::fmod(hue / 60.0, 2.0) - 1.0));
         const double m = l - c / 2.0;
