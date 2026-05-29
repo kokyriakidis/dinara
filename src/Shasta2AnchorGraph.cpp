@@ -543,6 +543,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // If window B has prev=A and next=C, and there's already a direct
     // A→C inter-window edge, then B is a shortcut and the A→B and B→C
     // edges are redundant.
+    // COMMENTED OUT — causes breaks on larger datasets.
+#if 0
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
@@ -622,6 +624,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << " redundant inter-window edges." << endl;
         }
     }
+#endif
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
