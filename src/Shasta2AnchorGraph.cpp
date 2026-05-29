@@ -456,6 +456,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // edges are redundant — the path already goes through W's backbone.
     // Check that the landing anchor (from A→W) precedes the leaving
     // anchor (from W→A) on W's backbone to confirm reachability.
+    // COMMENTED OUT pending validation on larger datasets.
+#if 0
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
@@ -538,6 +540,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
     }
+#endif
 
     // Remove redundant shortcut edges.
     // If window B has prev=A and next=C, and there's already a direct
