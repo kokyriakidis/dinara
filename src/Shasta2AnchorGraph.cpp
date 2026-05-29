@@ -825,46 +825,96 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         auto normalize = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
+        // RC mirror of a raw window ID.
+        auto rcMirror = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
 
-        // Build per-edge window pair info once, then maintain inCount/outCount
-        // as edges are disabled.
+        // Build per-edge info using raw window IDs.
         struct InterWindowEdge {
             edge_descriptor e;
-            uint32_t srcWin;
-            uint32_t dstWin;
+            uint32_t srcWin;  // raw
+            uint32_t dstWin;  // raw
         };
         std::vector<InterWindowEdge> interWindowEdges;
-        std::map<uint32_t, uint64_t> inCount, outCount;
+        // Raw counts for dangling detection.
+        std::map<uint32_t, uint64_t> rawInCount, rawOutCount;
+        // Normalized counts for safety check.
+        std::map<uint32_t, uint64_t> normInCount, normOutCount;
 
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
-            const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
-            if(srcWin == noWindow || dstWin == noWindow) continue;
-            if(srcWin == dstWin) continue;
-            interWindowEdges.push_back({e, srcWin, dstWin});
-            outCount[srcWin]++;
-            inCount[dstWin]++;
+            const uint32_t srcWinRaw = anchorToWindow[srcVal];
+            const uint32_t dstWinRaw = anchorToWindow[dstVal];
+            if(srcWinRaw == noWindow || dstWinRaw == noWindow) continue;
+            if(srcWinRaw == dstWinRaw) continue;
+            const uint32_t srcNorm = normalize(srcWinRaw);
+            const uint32_t dstNorm = normalize(dstWinRaw);
+            if(srcNorm == dstNorm) continue;  // skip fwd<->RC of same window
+            interWindowEdges.push_back({e, srcWinRaw, dstWinRaw});
+            rawOutCount[srcWinRaw]++;
+            rawInCount[dstWinRaw]++;
+            normOutCount[srcNorm]++;
+            normInCount[dstNorm]++;
         }
+
+        // Collect all raw window IDs.
+        std::set<uint32_t> allRawWindows;
+        for(const auto& [w, c] : rawInCount) if(c > 0) allRawWindows.insert(w);
+        for(const auto& [w, c] : rawOutCount) if(c > 0) allRawWindows.insert(w);
 
         uint64_t danglingRemovedCount = 0;
         uint64_t danglingWindowCount = 0;
 
-        // Iterate until no more dangling windows are found in this pass.
+        // Disable an edge and its RC mirror, updating all counts.
+        auto disableEdgeWithMirror = [&](edge_descriptor e) {
+            if(!anchorGraph[e].useForAssembly) return;
+            anchorGraph[e].useForAssembly = false;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal < anchorCount && dstVal < anchorCount) {
+                const uint32_t sw = anchorToWindow[srcVal];
+                const uint32_t dw = anchorToWindow[dstVal];
+                if(sw != noWindow && dw != noWindow && sw != dw) {
+                    rawOutCount[sw]--;
+                    rawInCount[dw]--;
+                    normOutCount[normalize(sw)]--;
+                    normInCount[normalize(dw)]--;
+                }
+            }
+            ++danglingRemovedCount;
+
+            // Find and disable RC mirror: (dst^1) -> (src^1).
+            const uint64_t rcSrc = dstVal ^ 1ULL;
+            const uint64_t rcDst = srcVal ^ 1ULL;
+            if(rcSrc < anchorCount && rcDst < anchorCount) {
+                auto [eit, exists] = boost::edge(rcSrc, rcDst, anchorGraph);
+                if(exists && anchorGraph[eit].useForAssembly) {
+                    anchorGraph[eit].useForAssembly = false;
+                    const uint32_t msw = anchorToWindow[rcSrc];
+                    const uint32_t mdw = anchorToWindow[rcDst];
+                    if(msw != noWindow && mdw != noWindow && msw != mdw) {
+                        rawOutCount[msw]--;
+                        rawInCount[mdw]--;
+                        normOutCount[normalize(msw)]--;
+                        normInCount[normalize(mdw)]--;
+                    }
+                    ++danglingRemovedCount;
+                }
+            }
+        };
+
         bool changed = true;
         while(changed) {
             changed = false;
-            for(uint32_t w = 0; w < windowCount; w++) {
-                const bool hasIn = (inCount.count(w) && inCount[w] > 0);
-                const bool hasOut = (outCount.count(w) && outCount[w] > 0);
+            for(const uint32_t w : allRawWindows) {
+                const bool hasIn = (rawInCount.count(w) && rawInCount[w] > 0);
+                const bool hasOut = (rawOutCount.count(w) && rawOutCount[w] > 0);
                 if(hasIn == hasOut) continue;
                 ++danglingWindowCount;
-                cout << "  Dangling window " << w
-                     << " in=" << (inCount.count(w) ? inCount[w] : 0)
-                     << " out=" << (outCount.count(w) ? outCount[w] : 0) << endl;
 
                 // Collect this window's active inter-window edges.
                 std::vector<size_t> edgeIndices;
@@ -876,51 +926,45 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
 
-                // Check if removing W's edges would make any neighbor
-                // fully isolated (no inter-window edges at all).
+                // Safety: don't isolate any normalized neighbor.
                 bool safeToRemove = true;
                 for(const size_t idx : edgeIndices) {
                     const auto& iwe = interWindowEdges[idx];
-                    const uint32_t n = (iwe.srcWin == w) ? iwe.dstWin : iwe.srcWin;
+                    const uint32_t nRaw = (iwe.srcWin == w) ? iwe.dstWin : iwe.srcWin;
+                    const uint32_t nNorm = normalize(nRaw);
+                    const uint32_t nMirror = rcMirror(nRaw);
 
-                    // Compute how many edges neighbor n would lose.
-                    uint64_t nInLoss = 0, nOutLoss = 0;
+                    // Count how many raw edges the neighbor + its mirror would lose.
+                    uint64_t nRawInLoss = 0, nRawOutLoss = 0;
+                    uint64_t mRawInLoss = 0, mRawOutLoss = 0;
                     for(const size_t idx2 : edgeIndices) {
                         const auto& iwe2 = interWindowEdges[idx2];
-                        if(iwe2.dstWin == n) nInLoss++;
-                        if(iwe2.srcWin == n) nOutLoss++;
+                        if(iwe2.dstWin == nRaw) nRawInLoss++;
+                        if(iwe2.srcWin == nRaw) nRawOutLoss++;
+                        // Mirror edges will also be disabled.
+                        if(iwe2.dstWin == nMirror) mRawInLoss++;
+                        if(iwe2.srcWin == nMirror) mRawOutLoss++;
                     }
 
-                    const uint64_t nInBefore = inCount.count(n) ? inCount[n] : 0;
-                    const uint64_t nOutBefore = outCount.count(n) ? outCount[n] : 0;
-                    const uint64_t nInAfter = nInBefore - nInLoss;
-                    const uint64_t nOutAfter = nOutBefore - nOutLoss;
+                    // Check normalized totals.
+                    const uint64_t totalInLoss = nRawInLoss + mRawInLoss;
+                    const uint64_t totalOutLoss = nRawOutLoss + mRawOutLoss;
+                    const uint64_t nInBefore = normInCount.count(nNorm) ? normInCount[nNorm] : 0;
+                    const uint64_t nOutBefore = normOutCount.count(nNorm) ? normOutCount[nNorm] : 0;
+                    const uint64_t nInAfter = (nInBefore >= totalInLoss) ? nInBefore - totalInLoss : 0;
+                    const uint64_t nOutAfter = (nOutBefore >= totalOutLoss) ? nOutBefore - totalOutLoss : 0;
 
-                    const bool wouldBeIsolated = (nInAfter == 0) && (nOutAfter == 0);
-                    if(wouldBeIsolated) {
-                        cout << "    Blocked by neighbor " << n
-                             << " (would become isolated: in " << nInBefore << "->" << nInAfter
-                             << " out " << nOutBefore << "->" << nOutAfter << ")" << endl;
+                    if(nInAfter == 0 && nOutAfter == 0) {
                         safeToRemove = false;
                         break;
                     }
                 }
 
-                if(!safeToRemove) {
-                    cout << "    Window " << w << " NOT removed (unsafe)." << endl;
-                    continue;
-                }
+                if(!safeToRemove) continue;
 
-                // Disable edges and update counts immediately.
-                cout << "    Window " << w << " removed (" << edgeIndices.size() << " edges)." << endl;
                 for(const size_t idx : edgeIndices) {
                     const auto& iwe = interWindowEdges[idx];
-                    if(anchorGraph[iwe.e].useForAssembly) {
-                        anchorGraph[iwe.e].useForAssembly = false;
-                        outCount[iwe.srcWin]--;
-                        inCount[iwe.dstWin]--;
-                        ++danglingRemovedCount;
-                    }
+                    disableEdgeWithMirror(iwe.e);
                 }
                 changed = true;
             }
