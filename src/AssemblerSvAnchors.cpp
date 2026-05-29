@@ -4518,6 +4518,40 @@ void Assembler::buildSvMSA(
                                          << indirectAlignedReads
                                             .size()
                                          << endl;
+                                    // Also emit a repeat-unit-
+                                    // rounded estimate: the true
+                                    // insertion is likely a whole
+                                    // number of repeat units.
+                                    // Use floor to avoid over-
+                                    // estimating.
+                                    if(flankShift >= 30
+                                       && delSize > flankShift) {
+                                        const int64_t nUnits =
+                                            std::max(int64_t(1),
+                                                int64_t(
+                                                    double(delSize)
+                                                    / double(
+                                                        flankShift)));
+                                        const int64_t roundedSize =
+                                            flankShift * nUnits;
+                                        if(roundedSize != insCallSize
+                                           && roundedSize >= 50) {
+                                            cout << "    >>> "
+                                                 << "INSERTION CALL"
+                                                 << " (flank-gap"
+                                                 << "-rounded):"
+                                                 << " size="
+                                                 << roundedSize
+                                                 << "bp"
+                                                 << ", breakpoint="
+                                                 << bpPos
+                                                 << ", repeatUnit="
+                                                 << flankShift
+                                                 << ", nUnits="
+                                                 << nUnits
+                                                 << endl;
+                                        }
+                                    }
                                     insertionCallRegions.push_back(
                                         {cdc.startPos,
                                          cdc.endPos});
@@ -4578,6 +4612,30 @@ void Assembler::buildSvMSA(
                                          << ", breakpoint="
                                          << bpPos
                                          << endl;
+                                    // In marker-depleted regions
+                                    // with many indirect reads,
+                                    // the "deletion" may be a
+                                    // tandem repeat insertion.
+                                    // Also emit an INS call using
+                                    // the coverage-drop size.
+                                    if(markerDepleted
+                                       && indirectAlignedReads
+                                              .size() >= 10) {
+                                        const int64_t insSize =
+                                            std::max(
+                                                flankShift,
+                                                int64_t(delSize));
+                                        cout << "    >>> INSERTION"
+                                             << " CALL (flank-gap"
+                                             << "-alt): size="
+                                             << insSize << "bp"
+                                             << ", breakpoint="
+                                             << bpPos
+                                             << ", indirectReads="
+                                             << indirectAlignedReads
+                                                .size()
+                                             << endl;
+                                    }
                                 }
                                 refinedCall = true;
                             }
@@ -5754,6 +5812,34 @@ void Assembler::buildSvMSA(
                          << ", breakpoint=" << sc.refPos
                          << ", reads=" << sc.readCount
                          << endl;
+                    // SA-tag DEL calls in tandem repeats may
+                    // actually be insertions. Check against
+                    // coverage-drop regions: if the SA-tag DEL
+                    // is within a coverage-drop but much smaller
+                    // than it, the "deletion" is likely an
+                    // insertion (the aligner maps the supplementary
+                    // to a different repeat copy).
+                    if(sc.svType == "DEL"
+                       && sc.readCount >= 3
+                       && sc.size >= 50) {
+                        for(const auto& cdr : covDropRegions) {
+                            const uint32_t cdrSize =
+                                cdr.endPos - cdr.startPos;
+                            if(sc.refPos >= cdr.startPos
+                               && sc.refPos <= cdr.endPos
+                               && sc.size < cdrSize / 2) {
+                                cout << "    >>> INSERTION CALL"
+                                     << " (SA-DEL-flip): size="
+                                     << sc.size << "bp"
+                                     << ", breakpoint="
+                                     << sc.refPos
+                                     << ", reads="
+                                     << sc.readCount
+                                     << endl;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
