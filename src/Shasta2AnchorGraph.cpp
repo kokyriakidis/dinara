@@ -490,8 +490,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         if(!anchorGraph[e].useForAssembly) continue;
                         const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                         const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                        const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
-                        const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
+                        if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                        const uint32_t srcRaw = anchorToWindow[srcVal];
+                        const uint32_t dstRaw = anchorToWindow[dstVal];
+                        if(srcRaw == noWindow || dstRaw == noWindow) continue;
+                        const uint32_t srcWin = normalize(srcRaw);
+                        const uint32_t dstWin = normalize(dstRaw);
                         if(srcWin == dstWin) continue;
                         if(srcWin == neighborW && dstWin == w)
                             incomingEdges.push_back({e, Shasta2AnchorId(dstVal)});
@@ -526,14 +530,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
 
     // Shortcut filter: remove edges for small bypass windows.
+    // Shortcut filter (structural): for each window w, find pairs of
+    // (incoming neighbor A, outgoing neighbor C) where A and C are both
+    // bigger than w and directly connected. Remove only the edges between
+    // w and those specific neighbors involved in bypassed pairs.
     auto runShortcutFilter = [&]() {
-#if 1
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
+        // Build direct connections and per-window neighbor sets from active edges.
         std::set<std::pair<uint32_t, uint32_t>> directConnections;
+        std::map<uint32_t, std::set<uint32_t>> incomingNeighbors;  // w -> set of windows with edges into w
+        std::map<uint32_t, std::set<uint32_t>> outgoingNeighbors;  // w -> set of windows w has edges to
+
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -546,44 +556,52 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t b = normalize(dstW);
             if(a == b) continue;
             directConnections.insert({a, b});
-            directConnections.insert({b, a});
+            incomingNeighbors[b].insert(a);
+            outgoingNeighbors[a].insert(b);
         }
 
         uint64_t shortcutRemovedCount = 0;
-        for(uint32_t b = 0; b < windowCount; b++) {
-            const auto& window = anchorWindows[b];
-            const uint64_t bSize = window.readIntervals.size();
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const uint64_t wSpan = window.baseSpan;
 
-            std::set<std::pair<uint32_t, uint32_t>> bypassedPairs;
-            for(const auto& [key, reads] : window.transitionReads) {
-                const uint32_t A = key.first;
-                const uint32_t C = key.second;
-                if(A == noW || C == noW) continue;
-                if(A == C) continue;
-                if(!directConnections.count({A, C})) continue;
-                if(A < windowCount && C < windowCount &&
-                   anchorWindows[A].readIntervals.size() > bSize &&
-                   anchorWindows[C].readIntervals.size() > bSize) {
-                    bypassedPairs.insert({A, C});
+            const auto inIt = incomingNeighbors.find(w);
+            const auto outIt = outgoingNeighbors.find(w);
+            if(inIt == incomingNeighbors.end() || outIt == outgoingNeighbors.end())
+                continue;
+
+            // Find bypassed pairs: (A incoming, C outgoing) where
+            // A and C are both bigger (by base span) and directly connected.
+            std::set<uint32_t> neighborsToRemove;
+            for(const uint32_t A : inIt->second) {
+                if(A >= windowCount) continue;
+                if(anchorWindows[A].baseSpan <= wSpan) continue;
+                for(const uint32_t C : outIt->second) {
+                    if(C >= windowCount) continue;
+                    if(A == C) continue;
+                    if(anchorWindows[C].baseSpan <= wSpan) continue;
+                    if(directConnections.count({A, C})) {
+                        neighborsToRemove.insert(A);
+                        neighborsToRemove.insert(C);
+                    }
                 }
             }
-            if(bypassedPairs.empty()) continue;
+            if(neighborsToRemove.empty()) continue;
 
-            std::set<uint32_t> neighborsToRemove;
-            for(const auto& [A, C] : bypassedPairs) {
-                neighborsToRemove.insert(A);
-                neighborsToRemove.insert(C);
-            }
-
+            // Disable edges between w and the bypassed neighbors.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                 const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
-                const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[srcVal];
+                const uint32_t dstRaw = anchorToWindow[dstVal];
+                if(srcRaw == noWindow || dstRaw == noWindow) continue;
+                const uint32_t srcWin = normalize(srcRaw);
+                const uint32_t dstWin = normalize(dstRaw);
                 if(srcWin == dstWin) continue;
-                if((srcWin == b && neighborsToRemove.count(dstWin)) ||
-                   (dstWin == b && neighborsToRemove.count(srcWin))) {
+                if((srcWin == w && neighborsToRemove.count(dstWin)) ||
+                   (dstWin == w && neighborsToRemove.count(srcWin))) {
                     disableEdge(e);
                     ++shortcutRemovedCount;
                 }
@@ -593,7 +611,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             cout << "Shortcut filter: removed " << shortcutRemovedCount
                  << " redundant inter-window edges." << endl;
         }
-#endif
     };
 
     // Trim backbone outside the bounding inter-window connection span.
@@ -1105,19 +1122,86 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
+    // Remove windows that have no active inter-window edges.
+    // Their backbone is left floating after other filters removed
+    // all their inter-window connections.
+    auto removeIsolatedWindows = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Find which normalized windows still have active inter-window edges.
+        std::set<uint32_t> connectedWindows;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcRaw = anchorToWindow[srcVal];
+            const uint32_t dstRaw = anchorToWindow[dstVal];
+            if(srcRaw == noWindow || dstRaw == noWindow) continue;
+            const uint32_t srcNorm = normalize(srcRaw);
+            const uint32_t dstNorm = normalize(dstRaw);
+            if(srcNorm != dstNorm) {
+                connectedWindows.insert(srcNorm);
+                connectedWindows.insert(dstNorm);
+            }
+        }
+
+        uint64_t removedCount = 0;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            if(connectedWindows.count(w)) continue;
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            bool hadActive = false;
+            for(const uint32_t pos : positions) {
+                // Disable all edges of both forward and RC anchors.
+                const uint64_t fwdAid = uint64_t(journey[pos]);
+                const uint64_t rcAid = fwdAid ^ 1ULL;
+                for(const uint64_t aid : {fwdAid, rcAid}) {
+                    if(aid >= anchorCount) continue;
+                    auto oe = boost::out_edges(aid, anchorGraph);
+                    for(auto it = oe.first; it != oe.second; ++it) {
+                        if(anchorGraph[*it].useForAssembly) {
+                            disableEdge(*it);
+                            hadActive = true;
+                        }
+                    }
+                    auto ie = boost::in_edges(aid, anchorGraph);
+                    for(auto it = ie.first; it != ie.second; ++it) {
+                        if(anchorGraph[*it].useForAssembly) {
+                            disableEdge(*it);
+                            hadActive = true;
+                        }
+                    }
+                }
+            }
+            if(hadActive) ++removedCount;
+        }
+
+        if(removedCount > 0) {
+            cout << "Isolated window removal: removed " << removedCount
+                 << " windows with no inter-window edges." << endl;
+        }
+    };
+
     // ========================================================================
     // Filter pipeline:
-    //   1. Trim backbones
+    //   1. Shortcut filter (remove bypass edges for small windows)
     //   2. Parallel filter (A→A flows)
-    //   3. Shortcut filter (small bypass windows)
-    //   4. Small window removal (≤ 2 anchors)
-    //   5. Dangling cleanup
+    //   3. Remove isolated windows (no inter-window edges remaining)
+    //   4. Trim backbones (trim ends without inter-window edges)
+    //   5. Small window removal (≤ 2 anchors)
+    //   6. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
-    trimBackbones();
-
-    runParallelFilter();
     runShortcutFilter();
+    runParallelFilter();
+    removeIsolatedWindows();
+    trimBackbones();
     removeSmallWindows(2);
     removeDanglingWindowsIterative("post-filter");
 
@@ -1279,38 +1363,50 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const auto journey = journeys[window.backboneOrientedReadId];
             const auto& positions = window.filteredBackbonePositions;
 
+            // Check if an anchor or its RC mirror has any active inter-window edge.
+            // Uses normalized window IDs to avoid false positives between
+            // forward and RC anchors of the same window.
+            auto normalizeWalk = [&](uint32_t ww) -> uint32_t {
+                return (ww >= windowCount) ? (ww - windowCount) : ww;
+            };
+            auto walkAnchorHasInterWindow = [&](uint64_t a) -> bool {
+                if(a >= anchorCount) return false;
+                const uint32_t aWin = anchorToWindow[a];
+                if(aWin == noWindow) return false;
+                const uint32_t aNorm = normalizeWalk(aWin);
+                BGL_FORALL_OUTEDGES(a, outE, anchorGraph, Shasta2AnchorGraph) {
+                    if(!anchorGraph[outE].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(target(outE, anchorGraph));
+                    if(tgt < anchorCount) {
+                        const uint32_t tgtWin = anchorToWindow[tgt];
+                        if(tgtWin != noWindow && normalizeWalk(tgtWin) != aNorm)
+                            return true;
+                    }
+                }
+                BGL_FORALL_INEDGES(a, inE, anchorGraph, Shasta2AnchorGraph) {
+                    if(!anchorGraph[inE].useForAssembly) continue;
+                    const uint64_t src = uint64_t(source(inE, anchorGraph));
+                    if(src < anchorCount) {
+                        const uint32_t srcWin = anchorToWindow[src];
+                        if(srcWin != noWindow && normalizeWalk(srcWin) != aNorm)
+                            return true;
+                    }
+                }
+                return false;
+            };
+            auto walkHasInterWindow = [&](uint64_t a) -> bool {
+                if(walkAnchorHasInterWindow(a)) return true;
+                const uint64_t rcA = a ^ 1ULL;
+                if(rcA < anchorCount && walkAnchorHasInterWindow(rcA)) return true;
+                return false;
+            };
+
             if(walkForward) {
                 for(uint64_t i = startPosIdx; i < positions.size(); i++) {
                     const Shasta2AnchorId aid = journey[positions[i]];
-                    const uint64_t aidVal = uint64_t(aid);
 
-                    // Stop if this anchor has inter-window edges
-                    // (i.e., it connects to a different window).
                     if(i != startPosIdx) {
-                        bool hasInterWindowEdge = false;
-                        BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
-                            if(!anchorGraph[outE].useForAssembly) continue;
-                            const uint64_t tgt = uint64_t(target(outE, anchorGraph));
-                            const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
-                            const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
-                            if(tgtWin != noWindow && tgtWin != aidWin) {
-                                hasInterWindowEdge = true;
-                                break;
-                            }
-                        }
-                        if(!hasInterWindowEdge) {
-                            BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
-                                if(!anchorGraph[inE].useForAssembly) continue;
-                                const uint64_t src = uint64_t(source(inE, anchorGraph));
-                                const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
-                                const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
-                                if(srcWin2 != noWindow && srcWin2 != aidWin) {
-                                    hasInterWindowEdge = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if(hasInterWindowEdge) break;
+                        if(walkHasInterWindow(uint64_t(aid))) break;
                     }
 
                     const auto span = anchors[aid];
@@ -1322,33 +1418,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 // Walk backward.
                 for(int64_t i = int64_t(startPosIdx); i >= 0; i--) {
                     const Shasta2AnchorId aid = journey[positions[uint64_t(i)]];
-                    const uint64_t aidVal = uint64_t(aid);
 
                     if(uint64_t(i) != startPosIdx) {
-                        bool hasInterWindowEdge = false;
-                        BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
-                            if(!anchorGraph[outE].useForAssembly) continue;
-                            const uint64_t tgt = uint64_t(target(outE, anchorGraph));
-                            const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
-                            const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
-                            if(tgtWin != noWindow && tgtWin != aidWin) {
-                                hasInterWindowEdge = true;
-                                break;
-                            }
-                        }
-                        if(!hasInterWindowEdge) {
-                            BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
-                                if(!anchorGraph[inE].useForAssembly) continue;
-                                const uint64_t src = uint64_t(source(inE, anchorGraph));
-                                const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
-                                const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
-                                if(srcWin2 != noWindow && srcWin2 != aidWin) {
-                                    hasInterWindowEdge = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if(hasInterWindowEdge) break;
+                        if(walkHasInterWindow(uint64_t(aid))) break;
                     }
 
                     const auto span = anchors[aid];

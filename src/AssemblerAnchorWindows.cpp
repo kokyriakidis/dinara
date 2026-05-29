@@ -185,6 +185,8 @@ void Assembler::computeAnchorWindows(
         window.backboneOrientedReadId = backboneOid;
         window.backboneBegin = seedBegin;
         window.backboneEnd = seedEnd;
+        window.baseSpan = intervalBaseSpan(backboneOid,
+            (*shasta2Journeys)[backboneOid], seedBegin, seedEnd);
         window.readIntervals.push_back(AnchorWindowReadInterval{
             backboneOid,
             seedBegin,
