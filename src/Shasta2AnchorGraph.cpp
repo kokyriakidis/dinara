@@ -729,35 +729,56 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             windowInterEdgeCounts[dstWin].first++;  // incoming to dstWin
         }
 
-        // Collect candidate edges, then process one at a time,
-        // re-checking connectivity after each removal.
+        // Collect all candidate internal inter-window edges with their
+        // coverage (number of shared reads), then sort by coverage
+        // ascending — remove weakest first.
+        struct Case2Candidate {
+            Shasta2AnchorId srcAnchor;
+            Shasta2AnchorId dstAnchor;
+            uint32_t srcWin;
+            uint32_t dstWin;
+            uint64_t coverage;
+        };
+        vector<Case2Candidate> case2Candidates;
+
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+            const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+            const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+            const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue;
+
+            if(boundaryAnchors.count(Shasta2AnchorId(srcAnchor))) continue;
+            if(boundaryAnchors.count(Shasta2AnchorId(dstAnchor))) continue;
+
+            case2Candidates.push_back({
+                Shasta2AnchorId(srcAnchor), Shasta2AnchorId(dstAnchor),
+                srcWin, dstWin,
+                anchorGraph[e].anchorPair.orientedReadIds.size()});
+        }
+
+        // Sort by coverage ascending — weakest edges removed first.
+        std::sort(case2Candidates.begin(), case2Candidates.end(),
+            [](const Case2Candidate& a, const Case2Candidate& b) {
+                return a.coverage < b.coverage;
+            });
+
         uint64_t case2RemovedCount = 0;
-        bool changed = true;
-        while(changed) {
-            changed = false;
-            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
-                const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
-                const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
-                const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
-                if(srcWin == noWindow || dstWin == noWindow) continue;
-                if(srcWin == dstWin) continue;
+        for(const auto& cand : case2Candidates) {
+            // Re-check connectivity: both windows must retain at least
+            // one incoming and one outgoing inter-window edge.
+            if(windowInterEdgeCounts[cand.srcWin].second <= 1) continue;
+            if(windowInterEdgeCounts[cand.dstWin].first <= 1) continue;
 
-                // Both endpoints must be internal (not boundary).
-                if(boundaryAnchors.count(Shasta2AnchorId(srcAnchor))) continue;
-                if(boundaryAnchors.count(Shasta2AnchorId(dstAnchor))) continue;
+            // Find and remove the edge.
+            auto [e, exists] = boost::edge(cand.srcAnchor, cand.dstAnchor, anchorGraph);
+            if(!exists) continue;
 
-                // Only remove if both windows retain connectivity.
-                if(windowInterEdgeCounts[srcWin].second > 1 &&
-                   windowInterEdgeCounts[dstWin].first > 1) {
-                    windowInterEdgeCounts[srcWin].second--;
-                    windowInterEdgeCounts[dstWin].first--;
-                    boost::remove_edge(e, anchorGraph);
-                    ++case2RemovedCount;
-                    changed = true;
-                    break; // Iterator invalidated, restart.
-                }
-            }
+            windowInterEdgeCounts[cand.srcWin].second--;
+            windowInterEdgeCounts[cand.dstWin].first--;
+            boost::remove_edge(e, anchorGraph);
+            ++case2RemovedCount;
         }
 
         if(case2RemovedCount > 0) {
