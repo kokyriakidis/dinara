@@ -473,6 +473,31 @@ Remaining ❌ (118 cases): INS-only calls in tandem repeats (66), no calls at al
 
 Remaining ⚠️ (672 cases): tandem repeat copy-number ambiguity across all sources (CIGAR sees partial repeat units, SA-tag/adaptive-bimodal overshoot by 1-2 repeat units, flank-gap measures one repeat unit shift).
 
+### Q100 DEL 10,160-Case Exhaustive Benchmark
+
+Full 10,160 DEL cases (≥50bp) from HG002 GRCh38 v5.0q stvar truthset.
+Cases in `/tmp/truthset/del_5000/` (5011), `/tmp/truthset/del_new_2000/` (1939), `/tmp/truthset/del_remaining/` (3210).
+Runner: `/tmp/truthset/run_full_v7.sh`. Per-case output: `/tmp/truthset/v7_per_case/`.
+
+| Metric | Count | % |
+|---|---|---|
+| ✅ (ratio ≥ 0.7) | 8,883 | 87% |
+| ⚠️ (correct type, wrong size) | 1,187 | 12% |
+| ❌ (wrong type or no call) | 88 | 1% |
+| **Total scored** | **10,158** | |
+
+**⚠️ by best-call source (1,187 total):**
+- CIGAR: 369, cluster: 230, bp-pair: 121, SA-tag: 107, adaptive-bimodal: 86
+- flank-gap: 72, path-mirror: 54, diagonal: 47, SDUST-STR: 33, split-read: 25
+- SDUST-VNTR: 17, VNTR-depth: 10, coverage: 7, merged-clusters: 5, SA-DEL-flip: 2, no-covdrop-flip: 2
+
+**bp-pair/path-mirror ⚠️ analysis (175 cases):**
+- All sizes quantized to 50bp multiples (window center distance)
+- ~40 in tandem repeats (inherent copy-number ambiguity)
+- ~135 in non-TR regions (potentially fixable)
+- 58/60 close cases (ratio 0.6-0.7) have breakpoints in wrong windows
+- Multiple refinement approaches tried and failed (see Known DEL Failure Patterns #4)
+
 ### Known Limitations
 
 1. **bw=100** prevents single-chain deletion detection >100bp; split-read detection handles larger deletions
@@ -712,3 +737,8 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 1. **Some small DELs (50-90bp) called as INS**: Breakpoint pair with pathDist > refGap looks like insertion (partially fixed by deletion-like pair suppression)
 2. **Large DEL size errors**: SA-tag sometimes gives wrong size for complex regions
 3. **XLarge DELs (>5000bp)**: Often only partial detection or no call
+4. **bp-pair/path-mirror 50bp quantization**: All bp-pair and path-mirror sizes are multiples of 50bp (window center distance). 175 ⚠️ cases are bp-pair/path-mirror. Of these, ~135 are non-TR. Analysis shows 58/60 close cases (ratio 0.6-0.7) have breakpoints in the **wrong windows**, not just quantization noise. Root causes:
+   - **Small DELs (<100bp)**: Chain absorbs deletion within bw=100. No diagonal shifts detected. Per-read analysis shows max drops of ~18bp for 56bp deletions. The chainer treats the deletion as normal gap.
+   - **Larger DELs (100-500bp)**: Breakpoints placed in wrong windows. Called size ≠ nearest 50bp multiple to truth.
+   - **Approaches tried and failed**: (a) Raw chain endpoint positions — overestimates by variable amount. (b) K-mer diagonal sizing — unreliable, net -5 on full benchmark. (c) Shared-read diagonal differences — chain endpoints have near-zero diagonal shift because chainer absorbs deletion. (d) astarpa2 global alignment — prefers many small edits over one big DEL in repeats.
+   - **Fundamental blocker**: bp-pair fires when <2 spanning reads have diagonal shifts. Without spanning reads, no direct measurement of deletion size exists. The window-center distance is the only available estimate.
