@@ -534,9 +534,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
         std::set<std::pair<uint32_t, uint32_t>> directConnections;
-        for(const auto& edgeInfo : createdEdges) {
-            const uint32_t a = normalize(edgeInfo.windowPair.first);
-            const uint32_t b = normalize(edgeInfo.windowPair.second);
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcW = anchorToWindow[srcVal];
+            const uint32_t dstW = anchorToWindow[dstVal];
+            if(srcW == noWindow || dstW == noWindow) continue;
+            const uint32_t a = normalize(srcW);
+            const uint32_t b = normalize(dstW);
+            if(a == b) continue;
             directConnections.insert({a, b});
             directConnections.insert({b, a});
         }
@@ -945,19 +953,165 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
+    // Remove small windows: windows with few backbone anchors (≤ maxSmallWindow)
+    // that are not needed for connectivity. Uses the same neighbor safety check
+    // as dangling removal — only remove if every neighbor has other connections
+    // on the same side from a non-dangling window.
+    auto removeSmallWindows = [&](uint64_t maxSmallWindow) {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Build normalized in/out counts from active inter-window edges.
+        std::map<uint32_t, uint64_t> normInCount, normOutCount;
+        // Collect inter-window edges for neighbor lookup.
+        struct InterWindowEdge {
+            edge_descriptor e;
+            uint32_t srcNorm;
+            uint32_t dstNorm;
+        };
+        std::vector<InterWindowEdge> interWindowEdges;
+
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcW = anchorToWindow[srcVal];
+            const uint32_t dstW = anchorToWindow[dstVal];
+            if(srcW == noWindow || dstW == noWindow) continue;
+            const uint32_t srcNorm = normalize(srcW);
+            const uint32_t dstNorm = normalize(dstW);
+            if(srcNorm == dstNorm) continue;
+            interWindowEdges.push_back({e, srcNorm, dstNorm});
+            normOutCount[srcNorm]++;
+            normInCount[dstNorm]++;
+        }
+
+        uint64_t removedCount = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.size() > maxSmallWindow) continue;
+
+            // Check if this window has any active inter-window edges.
+            bool hasActiveEdges = false;
+            for(const auto& iwe : interWindowEdges) {
+                if(!anchorGraph[iwe.e].useForAssembly) continue;
+                if(iwe.srcNorm == w || iwe.dstNorm == w) {
+                    hasActiveEdges = true;
+                    break;
+                }
+            }
+            if(!hasActiveEdges) continue;
+
+            // Safety: for each neighbor, check that it has other connections
+            // on the same side from a non-dangling window.
+            bool safeToRemove = true;
+            std::set<uint32_t> checkedNeighbors;
+
+            for(const auto& iwe : interWindowEdges) {
+                if(!anchorGraph[iwe.e].useForAssembly) continue;
+                uint32_t nNorm;
+                bool wIsSource;
+                if(iwe.srcNorm == w) {
+                    nNorm = iwe.dstNorm;
+                    wIsSource = true;
+                } else if(iwe.dstNorm == w) {
+                    nNorm = iwe.srcNorm;
+                    wIsSource = false;
+                } else {
+                    continue;
+                }
+
+                if(!checkedNeighbors.insert(nNorm).second) continue;
+
+                // Find other windows on the same side of N (excluding w).
+                // At least one must be non-dangling.
+                bool hasNonDanglingOther = false;
+                for(const auto& iwe2 : interWindowEdges) {
+                    if(!anchorGraph[iwe2.e].useForAssembly) continue;
+                    uint32_t otherNorm;
+                    if(wIsSource) {
+                        // w -> N: same side = N's incoming.
+                        if(iwe2.dstNorm != nNorm) continue;
+                        if(iwe2.srcNorm == w) continue;
+                        otherNorm = iwe2.srcNorm;
+                    } else {
+                        // N -> w: same side = N's outgoing.
+                        if(iwe2.srcNorm != nNorm) continue;
+                        if(iwe2.dstNorm == w) continue;
+                        otherNorm = iwe2.dstNorm;
+                    }
+
+                    const uint64_t oIn = normInCount.count(otherNorm) ? normInCount[otherNorm] : 0;
+                    const uint64_t oOut = normOutCount.count(otherNorm) ? normOutCount[otherNorm] : 0;
+                    if(oIn > 0 && oOut > 0) {
+                        hasNonDanglingOther = true;
+                        break;
+                    }
+                }
+
+                if(!hasNonDanglingOther) {
+                    safeToRemove = false;
+                    break;
+                }
+            }
+
+            if(!safeToRemove) continue;
+
+            // Disable all inter-window edges of this window.
+            for(const auto& iwe : interWindowEdges) {
+                if(!anchorGraph[iwe.e].useForAssembly) continue;
+                if(iwe.srcNorm == w || iwe.dstNorm == w) {
+                    // Update counts before disabling.
+                    normOutCount[iwe.srcNorm]--;
+                    normInCount[iwe.dstNorm]--;
+                    disableEdge(iwe.e);
+                }
+            }
+
+            // Disable all backbone edges.
+            const auto journey = journeys[window.backboneOrientedReadId];
+            for(const uint32_t pos : positions) {
+                const uint64_t aid = uint64_t(journey[pos]);
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly)
+                        disableEdge(*it);
+                }
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly)
+                        disableEdge(*it);
+                }
+            }
+
+            ++removedCount;
+        }
+
+        if(removedCount > 0) {
+            cout << "Small window removal (maxSize=" << maxSmallWindow
+                 << "): removed " << removedCount << " windows." << endl;
+        }
+    };
+
     // ========================================================================
     // Filter pipeline:
     //   1. Trim backbones
     //   2. Parallel filter (A→A flows)
     //   3. Shortcut filter (small bypass windows)
-    //   4. Dangling cleanup
+    //   4. Small window removal (≤ 2 anchors)
+    //   5. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
     trimBackbones();
 
-    //runParallelFilter();
-    //runShortcutFilter();
-    removeDanglingWindowsIterative("post-trim");
+    runParallelFilter();
+    runShortcutFilter();
+    removeSmallWindows(2);
+    removeDanglingWindowsIterative("post-filter");
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
