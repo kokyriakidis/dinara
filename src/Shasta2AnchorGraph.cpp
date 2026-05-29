@@ -668,13 +668,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearAllEdges(uint64_t(aid));
-                clearAllEdges(uint64_t(aid) ^ 1ULL);
                 ++trimmedVertexCount;
             }
             for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearAllEdges(uint64_t(aid));
-                clearAllEdges(uint64_t(aid) ^ 1ULL);
                 ++trimmedVertexCount;
             }
         }
@@ -874,12 +872,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //   4. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
-    // Run trimBackbones iteratively: trimming window A may disable inter-window
-    // edges that shrink window B's bounding span, enabling further trimming.
-    for(uint64_t pass = 1; ; ++pass) {
-        const uint64_t trimmed = trimBackbones();
-        if(trimmed == 0) break;
-    }
+    trimBackbones();
     //runParallelFilter();
     //runShortcutFilter();
     //removeDanglingWindowsIterative("post-filter");
