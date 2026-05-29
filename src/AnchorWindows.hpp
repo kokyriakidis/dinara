@@ -48,6 +48,14 @@ struct AnchorWindow {
     // backbone anchor on the backbone read). Set during window construction.
     uint64_t baseSpan = 0;
 
+    // Endpoint windows: the windows that the backbone read transitions
+    // to/from. These are the "real" connections. All other inter-window
+    // connections are internal (from non-backbone reads).
+    // Set after transitionReads are populated.
+    // noWindow means the backbone starts/ends here.
+    uint32_t backbonePreviousWindow = AnchorWindowReadInterval::noWindow;
+    uint32_t backboneNextWindow = AnchorWindowReadInterval::noWindow;
+
     // Filtered backbone positions: the longest subsequence of journey
     // positions in [backboneBegin, backboneEnd) where every consecutive
     // pair has sufficient common read support. Intra-window edges should
