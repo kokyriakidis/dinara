@@ -4756,7 +4756,7 @@ void Assembler::buildSvMSA(
                                     // median of qualifying clusters.
                                     vector<DiffCluster> qualifying;
                                     for(const auto& cl : clusters) {
-                                        if(cl.meanDiff >= 100
+                                        if(cl.meanDiff >= 50
                                            && cl.meanDiff
                                               <= int64_t(delSize)) {
                                             qualifying.push_back(cl);
@@ -4791,11 +4791,9 @@ void Assembler::buildSvMSA(
                                     }
                                 } else {
                                     // Non-repeat region: pick highest-
-                                    // support cluster >= 100bp, then
-                                    // prefer smallest within 10% of
-                                    // best support.
+                                    // support cluster >= 50bp.
                                     for(const auto& cl : clusters) {
-                                        if(cl.meanDiff >= 100
+                                        if(cl.meanDiff >= 50
                                            && cl.meanDiff
                                               <= int64_t(delSize)
                                            && cl.count > bestCount) {
@@ -4804,21 +4802,6 @@ void Assembler::buildSvMSA(
                                         }
                                     }
                                     if(bestCount > 0) {
-                                        int64_t smallestInRange =
-                                            bestShift;
-                                        for(const auto& cl : clusters) {
-                                            if(cl.meanDiff >= 100
-                                               && cl.meanDiff
-                                                  <= int64_t(delSize)
-                                               && cl.count
-                                                  >= bestCount * 9 / 10
-                                               && cl.meanDiff
-                                                  < smallestInRange) {
-                                                smallestInRange =
-                                                    cl.meanDiff;
-                                            }
-                                        }
-                                        bestShift = smallestInRange;
                                         // Update count for selected.
                                         for(const auto& cl : clusters) {
                                             if(cl.meanDiff == bestShift) {
