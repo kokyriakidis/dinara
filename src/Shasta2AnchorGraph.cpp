@@ -588,8 +588,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 #endif
     };
 
-    // Rule 1: Trim backbone outside the bounding inter-window connection span.
-    auto runRule1 = [&]() {
+    // Trim backbone outside the bounding inter-window connection span.
+    auto trimBackbones = [&]() {
         auto clearIntraWindowEdges = [&](uint64_t vid) {
             if(vid >= anchorCount) return;
             const uint32_t vWindow = anchorToWindow[vid];
@@ -689,7 +689,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        cout << "Rule 1: " << trimmedWindowCount << " windows trimmed, "
+        cout << "Trim backbones: " << trimmedWindowCount << " windows trimmed, "
              << trimmedVertexCount << " vertices trimmed." << endl;
     };
 
@@ -877,13 +877,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // ========================================================================
     // Filter pipeline:
-    //   1. Rule 1 (trim backbones)
+    //   1. Trim backbones
     //   2. Parallel filter (A→A flows)
     //   3. Shortcut filter (small bypass windows)
     //   4. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
-    runRule1();
+    trimBackbones();
     //runParallelFilter();
     //runShortcutFilter();
     //removeDanglingWindowsIterative("post-filter");
