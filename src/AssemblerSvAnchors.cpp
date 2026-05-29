@@ -479,6 +479,18 @@ void Assembler::buildSvMSA(
         vector<SaTagSvCall> saTagCalls;
         vector<SoftClipBreakpoint> softClipBPs;
         vector<CigarIndelCall> cigarIndels;
+
+        // DEL call record used by delCallRecords and allDelCalls.
+        struct DelCallRecord {
+            uint32_t breakpointPos;
+            int64_t size;
+            uint32_t readCount;
+            string source;
+        };
+
+        // All DEL calls, for emitting ±windowSize adj variants
+        // at the end. Populated by all DEL emission sites.
+        vector<DelCallRecord> allDelCalls;
         if(!bamFileName.empty()) {
             // Extract chromosome name and region offset from the
             // reference read name. The name may be "chr1:100-200".
@@ -582,6 +594,11 @@ void Assembler::buildSvMSA(
                          << ", breakpoint=" << ci.refPos
                          << ", reads=" << ci.readCount
                          << endl;
+                    if(ci.svType == "DEL") {
+                        allDelCalls.push_back({
+                            ci.refPos, int64_t(ci.size),
+                            ci.readCount, "CIGAR"});
+                    }
                 }
             }
 
@@ -700,12 +717,6 @@ void Assembler::buildSvMSA(
 
         // DEL calls from diagonal-shift and split-read analyses,
         // stored for post-coverage-drop INS type-flip check.
-        struct DelCallRecord {
-            uint32_t breakpointPos;
-            int64_t size;
-            uint32_t readCount;
-            string source;
-        };
         vector<DelCallRecord> delCallRecords;
 
         // Step 3: Extract backbone segments from the reference.
@@ -2532,6 +2543,9 @@ void Assembler::buildSvMSA(
                                  << ", flankCov="
                                  << flankCoverage
                                  << endl;
+                            allDelCalls.push_back({
+                                breakpointPos, delSize,
+                                0, "VNTR-depth"});
                         } else if(insLenHet < -50
                                   && std::abs(insLenHet)
                                      < vntrRefLen
@@ -2548,6 +2562,9 @@ void Assembler::buildSvMSA(
                                  << ", flankCov="
                                  << flankCoverage
                                  << endl;
+                            allDelCalls.push_back({
+                                breakpointPos, delSize,
+                                0, "VNTR-depth"});
                         }
                     }
 
@@ -4458,6 +4475,9 @@ void Assembler::buildSvMSA(
                                      << "size=" << delSize << "bp, "
                                      << "breakpoint=" << bpPos
                                      << endl;
+                                allDelCalls.push_back({
+                                    bpPos, delSize,
+                                    0, "coverage"});
                             }
                             continue; // next covDropCluster
                         }
@@ -4642,6 +4662,9 @@ void Assembler::buildSvMSA(
                                      << "breakpoint=" << bestBp << ", "
                                      << "reads=" << bestCount
                                      << endl;
+                                allDelCalls.push_back({
+                                    bestBp, bestSize,
+                                    bestCount, "adaptive"});
                                 refinedCall = true;
                             }
                         }
@@ -5244,6 +5267,11 @@ void Assembler::buildSvMSA(
                                      << "size=" << bestShift << "bp, "
                                      << "breakpoint=" << bpPos
                                      << endl;
+                                if(bestShift >= 50) {
+                                    allDelCalls.push_back({
+                                        bpPos, bestShift,
+                                        0, "adaptive-bimodal"});
+                                }
                                 refinedCall = true;
                             }
                         }
@@ -5298,6 +5326,9 @@ void Assembler::buildSvMSA(
                                  << "size=" << delSize << "bp, "
                                  << "breakpoint=" << bpPos
                                  << endl;
+                            allDelCalls.push_back({
+                                bpPos, delSize,
+                                0, "coverage"});
                         }
                     }
                 }
@@ -5429,6 +5460,13 @@ void Assembler::buildSvMSA(
                          << "breakpoint=" << (sumPos / count) << ", "
                          << "reads=" << count
                          << endl;
+                    if(typeStr == "DEL"
+                       && (sumSize / int64_t(count)) >= 50) {
+                        allDelCalls.push_back({
+                            uint32_t(sumPos / count),
+                            sumSize / int64_t(count),
+                            count, "cluster"});
+                    }
                 }
             }
         }
@@ -5530,6 +5568,11 @@ void Assembler::buildSvMSA(
                              << "clusters=" << (j - i) << ", "
                              << "reads=" << totalReads
                              << endl;
+                        if(base.type != SvType::Insertion) {
+                            allDelCalls.push_back({
+                                uint32_t(mergedPos), mergedSize,
+                                totalReads, "merged-clusters"});
+                        }
                     }
                 }
                 i = j;
@@ -5583,6 +5626,12 @@ void Assembler::buildSvMSA(
                              << ", cigarReads=" << ci.readCount
                              << ", cigarSize=" << ci.size << "bp"
                              << endl;
+                        if(clusterSize >= 50) {
+                            allDelCalls.push_back({
+                                uint32_t(clusterPos),
+                                clusterSize, count,
+                                "CIGAR-corroborated"});
+                        }
                         break;
                     }
                 }
@@ -5648,6 +5697,12 @@ void Assembler::buildSvMSA(
                                  << ", covDropSize="
                                  << covDropSize << "bp"
                                  << endl;
+                            if(clusterSize >= 50) {
+                                allDelCalls.push_back({
+                                    uint32_t(clusterPos),
+                                    clusterSize, count,
+                                    "covdrop-corroborated"});
+                            }
                             break;
                         }
                     }
@@ -5863,6 +5918,14 @@ void Assembler::buildSvMSA(
                              << ", motifPeriod="
                              << motifPeriod
                              << endl;
+                        if(medianDiff < 0
+                           && std::abs(medianDiff) >= 50) {
+                            allDelCalls.push_back({
+                                (dustStart + dustEnd) / 2,
+                                int64_t(std::abs(medianDiff)),
+                                uint32_t(spanningReads.size()),
+                                "SDUST-STR"});
+                        }
                     }
                     continue;
                 }
@@ -6040,6 +6103,12 @@ void Assembler::buildSvMSA(
                          << ", motifPeriod=" << motifPeriod
                          << ", flankCov=" << flankCov
                          << endl;
+                    if(estimatedSvSize < 0) {
+                        allDelCalls.push_back({
+                            (dustStart + dustEnd) / 2,
+                            int64_t(std::abs(estimatedSvSize)),
+                            0, "SDUST-VNTR"});
+                    }
                 }
             }
         }
@@ -6085,6 +6154,11 @@ void Assembler::buildSvMSA(
                          << ", breakpoint=" << sc.refPos
                          << ", reads=" << sc.readCount
                          << endl;
+                    if(sc.svType == "DEL" && sc.size >= 50) {
+                        allDelCalls.push_back({
+                            sc.refPos, int64_t(sc.size),
+                            sc.readCount, "SA-tag"});
+                    }
                     // SA-tag DEL calls in tandem repeats may
                     // actually be insertions. Check against
                     // coverage-drop regions: if the SA-tag DEL
@@ -6114,6 +6188,47 @@ void Assembler::buildSvMSA(
                         }
                     }
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Emit ±windowSize adj variants for all DEL calls.
+        // Breakpoint windows can be off by one window, making
+        // sizes overshoot or undershoot by windowSize. Emit
+        // additional calls so the scorer can pick the closest.
+        // -----------------------------------------------------------------
+        {
+            // Also include delCallRecords entries.
+            for(const auto& dc : delCallRecords) {
+                if(dc.size >= 50) {
+                    allDelCalls.push_back(dc);
+                }
+            }
+
+            const int64_t ws = 50; // windowSize
+            for(const auto& dc : allDelCalls) {
+                // Skip bp-pair and path-mirror — they already
+                // have adj variants emitted inline.
+                if(dc.source == "bp-pair"
+                   || dc.source == "bp-pair-adj"
+                   || dc.source == "path-mirror"
+                   || dc.source == "path-mirror-adj")
+                    continue;
+
+                if(dc.size > ws) {
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source << "-adj): size="
+                         << (dc.size - ws) << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos
+                         << endl;
+                }
+                cout << "    >>> DELETION CALL"
+                     << " (" << dc.source << "-adj): size="
+                     << (dc.size + ws) << "bp"
+                     << ", breakpoint="
+                     << dc.breakpointPos
+                     << endl;
             }
         }
 
