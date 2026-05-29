@@ -1622,6 +1622,7 @@ void Assembler::buildSvMSA(
                 struct EndpointInfo {
                     uint32_t readId;
                     int64_t overhangBp;
+                    uint32_t actualRefPos; // precise chain endpoint position
                 };
                 // Map from window index to list of reads ending/starting there.
                 unordered_map<uint32_t, vector<EndpointInfo>> chainEndReads;
@@ -1660,10 +1661,12 @@ void Assembler::buildSvMSA(
                     const int64_t leftOvhOrd = int64_t(info.minReadOrd);
 
                     if(rightOvhBp >= minOvhBp && rightOvhOrd >= 2) {
-                        chainEndReads[endWin].push_back({rid, rightOvhBp});
+                        chainEndReads[endWin].push_back(
+                            {rid, rightOvhBp, info.maxRefPos});
                     }
                     if(leftOvhBp >= minOvhBp && leftOvhOrd >= 2) {
-                        chainStartReads[startWin].push_back({rid, leftOvhBp});
+                        chainStartReads[startWin].push_back(
+                            {rid, leftOvhBp, info.minRefPos});
                     }
 
                     // Count spanning coverage.
@@ -2832,16 +2835,50 @@ void Assembler::buildSvMSA(
                                     // size (distance between BPs
                                     // on the reference).
                                     if(bestInsRefGap >= 40) {
+                                        // Refine using soft-clip BPs.
+                                        int64_t pmSize = bestInsRefGap;
+                                        if(!softClipBPs.empty()) {
+                                            const int64_t sr =
+                                                int64_t(windowSize);
+                                            int64_t dL = INT64_MAX;
+                                            uint32_t pL = lbp.refPos;
+                                            for(const auto& sc : softClipBPs) {
+                                                if(sc.isLeftClip) continue;
+                                                if(sc.readCount < 2) continue;
+                                                const int64_t d = std::abs(
+                                                    int64_t(sc.refPos)
+                                                    - int64_t(lbp.refPos));
+                                                if(d < dL) { dL = d; pL = sc.refPos; }
+                                            }
+                                            int64_t dR = INT64_MAX;
+                                            uint32_t pR = bestInsRbp->refPos;
+                                            for(const auto& sc : softClipBPs) {
+                                                if(!sc.isLeftClip) continue;
+                                                if(sc.readCount < 2) continue;
+                                                const int64_t d = std::abs(
+                                                    int64_t(sc.refPos)
+                                                    - int64_t(bestInsRbp->refPos));
+                                                if(d < dR) { dR = d; pR = sc.refPos; }
+                                            }
+                                            if(dL <= sr && dR <= sr
+                                               && pR > pL) {
+                                                const int64_t scD =
+                                                    int64_t(pR) - int64_t(pL);
+                                                if(scD >= 40) {
+                                                    pmSize = scD;
+                                                }
+                                            }
+                                        }
                                         cout << "    >>> DELETION CALL"
                                              << " (path-mirror):"
                                              << " size="
-                                             << bestInsRefGap
+                                             << pmSize
                                              << "bp, breakpoint="
                                              << insBpPos
                                              << endl;
                                         delCallRecords.push_back({
                                             insBpPos,
-                                            bestInsRefGap,
+                                            pmSize,
                                             uint32_t(
                                                 lbp.endpointCount
                                                 + bestInsRbp
@@ -3016,15 +3053,51 @@ void Assembler::buildSvMSA(
                                + lbp.ovhReadCount) >= 3
                            && (lbp.foldEnrichment >= 2.5
                                || bestRbp->foldEnrichment >= 2.5)) {
+                            // Refine size using soft-clip BPs.
+                            // bestDist is quantized to 50bp;
+                            // soft-clip positions are base-precise.
+                            int64_t bpPairSize = bestDist;
+                            if(!softClipBPs.empty()) {
+                                const int64_t sr =
+                                    int64_t(windowSize);
+                                int64_t dL = INT64_MAX;
+                                uint32_t pL = lbp.refPos;
+                                for(const auto& sc : softClipBPs) {
+                                    if(sc.isLeftClip) continue;
+                                    if(sc.readCount < 2) continue;
+                                    const int64_t d = std::abs(
+                                        int64_t(sc.refPos)
+                                        - int64_t(lbp.refPos));
+                                    if(d < dL) { dL = d; pL = sc.refPos; }
+                                }
+                                int64_t dR = INT64_MAX;
+                                uint32_t pR = bestRbp->refPos;
+                                for(const auto& sc : softClipBPs) {
+                                    if(!sc.isLeftClip) continue;
+                                    if(sc.readCount < 2) continue;
+                                    const int64_t d = std::abs(
+                                        int64_t(sc.refPos)
+                                        - int64_t(bestRbp->refPos));
+                                    if(d < dR) { dR = d; pR = sc.refPos; }
+                                }
+                                if(dL <= sr && dR <= sr
+                                   && pR > pL) {
+                                    const int64_t scD =
+                                        int64_t(pR) - int64_t(pL);
+                                    if(scD >= 40) {
+                                        bpPairSize = scD;
+                                    }
+                                }
+                            }
                             cout << "    >>> DELETION CALL"
                                  << " (bp-pair): size="
-                                 << bestDist << "bp"
+                                 << bpPairSize << "bp"
                                  << ", breakpoint="
                                  << breakpointPos
                                  << endl;
                             delCallRecords.push_back({
                                 breakpointPos,
-                                bestDist,
+                                bpPairSize,
                                 uint32_t(
                                     lbp.endpointCount
                                     + bestRbp->endpointCount),
