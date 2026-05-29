@@ -197,6 +197,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Intra-window edges: consecutive filtered backbone anchor pairs,
     // for both the original windows and their RC mirrors.
     // If anchorSplitMap is provided, split anchors create parallel chains.
+    uint64_t splitChainFailCount = 0;
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
@@ -274,17 +275,60 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
 
+                if(pathChain.size() <= 1 && !pathChain.empty()) {
+                    if(splitChainFailCount < 10) {
+                        cout << "  SPLIT CHAIN LEN=1 fwd path=" << pathIdx
+                             << " anchor=" << pathChain[0]
+                             << "(size=" << anchors[pathChain[0]].size() << ")" << endl;
+                    }
+                }
+                if(rcPathChain.size() <= 1 && !rcPathChain.empty()) {
+                    if(splitChainFailCount < 10) {
+                        cout << "  SPLIT CHAIN LEN=1 rc path=" << pathIdx
+                             << " anchor=" << rcPathChain[0]
+                             << "(size=" << anchors[rcPathChain[0]].size() << ")" << endl;
+                    }
+                }
+
                 // Forward chain edges.
                 for(uint64_t i = 0; i + 1 < pathChain.size(); i++) {
-                    addEdgeIfValid(pathChain[i], pathChain[i + 1]);
+                    if(!addEdgeIfValid(pathChain[i], pathChain[i + 1])) {
+                        if(splitChainFailCount < 10) {
+                            Shasta2AnchorPair dbgPair(anchors, pathChain[i], pathChain[i + 1], false);
+                            cout << "  SPLIT CHAIN FAIL fwd path=" << pathIdx
+                                 << " A=" << pathChain[i] << "(size=" << anchors[pathChain[i]].size() << ")"
+                                 << " B=" << pathChain[i+1] << "(size=" << anchors[pathChain[i+1]].size() << ")"
+                                 << " common=" << dbgPair.orientedReadIds.size()
+                                 << " afterNegFilter=";
+                            dbgPair.removeNegativeOffsets(anchors);
+                            cout << dbgPair.orientedReadIds.size() << endl;
+                        }
+                        ++splitChainFailCount;
+                    }
                 }
 
                 // RC chain edges (reversed direction).
                 for(uint64_t i = 0; i + 1 < rcPathChain.size(); i++) {
-                    addEdgeIfValid(rcPathChain[i + 1], rcPathChain[i]);
+                    if(!addEdgeIfValid(rcPathChain[i + 1], rcPathChain[i])) {
+                        if(splitChainFailCount < 10) {
+                            Shasta2AnchorPair dbgPair(anchors, rcPathChain[i+1], rcPathChain[i], false);
+                            cout << "  SPLIT CHAIN FAIL rc path=" << pathIdx
+                                 << " A=" << rcPathChain[i+1] << "(size=" << anchors[rcPathChain[i+1]].size() << ")"
+                                 << " B=" << rcPathChain[i] << "(size=" << anchors[rcPathChain[i]].size() << ")"
+                                 << " common=" << dbgPair.orientedReadIds.size()
+                                 << " afterNegFilter=";
+                            dbgPair.removeNegativeOffsets(anchors);
+                            cout << dbgPair.orientedReadIds.size() << endl;
+                        }
+                        ++splitChainFailCount;
+                    }
                 }
             }
         }
+    }
+
+    if(splitChainFailCount > 0) {
+        cout << "Split chain edge failures: " << splitChainFailCount << " total" << endl;
     }
 
     // Alternate path edges: for each het window, add a chain
