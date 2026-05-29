@@ -695,15 +695,40 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // with edges on only one side (only incoming or only outgoing),
     // provided removal won't make any neighbor dangling.
     // Defined as a lambda so it can be called after each filter pass.
+    // Remove dangling windows: windows with inter-window edges on only
+    // one side (only incoming or only outgoing). A dangling window is
+    // removed only if every neighbor has OTHER connections on the SAME
+    // side where the dangling window connects, and at least one of those
+    // other connections is from a non-dangling window (has both in and out).
+    //
+    // Test cases:
+    //  1. Simple noise tip: W_tip -> N <- W_prev(non-dangling), N -> W_next.
+    //     N has other incoming from W_prev (non-dangling) -> remove W_tip.
+    //  2. Telomere (sole source): W_telo -> N -> W_next.
+    //     N has no other incoming -> preserve W_telo.
+    //  3. Two dangling tips on same neighbor: W_tip1 -> N <- W_tip2, N -> W_next.
+    //     Other source into N is W_tip2 (dangling) -> not non-dangling -> preserve both.
+    //  4. Dangling + non-dangling on same neighbor: W_tip -> N <- W_prev(non-dangling).
+    //     W_prev is non-dangling -> remove W_tip.
+    //  5. Dangling tip with multiple neighbors: W_tip -> N1, W_tip -> N2.
+    //     Both N1 and N2 must pass the safety check. If either fails -> preserve.
+    //  6. Incoming-only dangling: ... -> W_prev -> N -> W_tip.
+    //     Same side = N's outgoing. If N only outputs to W_tip -> preserve (telomere end).
+    //     If N also outputs to W_next (non-dangling) -> remove W_tip.
+    //  7. Chain of dangling windows: W1 -> N <- W2 -> M <- W3 (all dangling).
+    //     Each tip's neighbor's other sources are also dangling -> preserve all.
+    //  8. RC mirror symmetry: forward and RC raw windows are always dangling
+    //     in complementary directions. Processing either one via disableEdge
+    //     correctly removes both sides.
+    //  9. Cascading removal: after removing W_tip, neighbor N may lose edges,
+    //     making other windows dangling. The while(changed) loop re-checks.
+    //     Count maps are updated by disableAndUpdateCounts before re-check.
+    // 10. Empty edgeIndices: if a window appears dangling by raw counts but
+    //     has no active edges (stale counts from backbone cleanup), skip it.
     auto removeDanglingWindows = [&](const string& label) {
         auto normalize = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
-        // RC mirror of a raw window ID.
-        auto rcMirror = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
-        };
-
         // Build per-edge info using raw window IDs.
         struct InterWindowEdge {
             edge_descriptor e;
@@ -754,14 +779,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(sv < anchorCount && dv < anchorCount) {
                     const uint32_t sw = anchorToWindow[sv];
                     const uint32_t dw = anchorToWindow[dv];
-                    if(sw != noWindow && dw != noWindow && sw != dw) {
+                    if(sw != noWindow && dw != noWindow &&
+                       sw != dw && normalize(sw) != normalize(dw)) {
                         rawOutCount[sw]--;
                         rawInCount[dw]--;
                         normOutCount[normalize(sw)]--;
                         normInCount[normalize(dw)]--;
+                        ++danglingRemovedCount;
                     }
                 }
-                ++danglingRemovedCount;
             };
 
             // Find RC mirror before disabling (disableEdge will disable both).
@@ -803,45 +829,63 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
 
-                // Safety: don't isolate any normalized neighbor.
+                if(edgeIndices.empty()) continue;
+
+                // Safety: only remove if every neighbor has OTHER connections
+                // on the SAME side where w connects, and at least one of
+                // those other connections is from a non-dangling window.
+                // This preserves telomeres and avoids removing a tip whose
+                // only "backup" is another dangling window.
+                const uint32_t wNorm = normalize(w);
                 bool safeToRemove = true;
+
+                // Collect unique normalized neighbors to avoid redundant checks.
+                std::set<uint32_t> checkedNeighbors;
+
                 for(const size_t idx : edgeIndices) {
                     const auto& iwe = interWindowEdges[idx];
+                    if(!anchorGraph[iwe.e].useForAssembly) continue;
                     const uint32_t nRaw = (iwe.srcWin == w) ? iwe.dstWin : iwe.srcWin;
                     const uint32_t nNorm = normalize(nRaw);
-                    const uint32_t nMirror = rcMirror(nRaw);
 
-                    // Count how many raw edges the neighbor + its mirror would lose.
-                    uint64_t nRawInLoss = 0, nRawOutLoss = 0;
-                    uint64_t mRawInLoss = 0, mRawOutLoss = 0;
-                    for(const size_t idx2 : edgeIndices) {
-                        const auto& iwe2 = interWindowEdges[idx2];
-                        if(iwe2.dstWin == nRaw) nRawInLoss++;
-                        if(iwe2.srcWin == nRaw) nRawOutLoss++;
-                        // Mirror edges will also be disabled.
-                        if(iwe2.dstWin == nMirror) mRawInLoss++;
-                        if(iwe2.srcWin == nMirror) mRawOutLoss++;
-                    }
+                    if(!checkedNeighbors.insert(nNorm).second) continue;
 
-                    // Check normalized totals.
-                    const uint64_t totalInLoss = nRawInLoss + mRawInLoss;
-                    const uint64_t totalOutLoss = nRawOutLoss + mRawOutLoss;
-                    const uint64_t nInBefore = normInCount.count(nNorm) ? normInCount[nNorm] : 0;
-                    const uint64_t nOutBefore = normOutCount.count(nNorm) ? normOutCount[nNorm] : 0;
-                    const uint64_t nInAfter = (nInBefore >= totalInLoss) ? nInBefore - totalInLoss : 0;
-                    const uint64_t nOutAfter = (nOutBefore >= totalOutLoss) ? nOutBefore - totalOutLoss : 0;
+                    const bool wIsSource = (iwe.srcWin == w);
 
-                    if(nInAfter == 0 && nOutAfter == 0) {
-                        // Allow removal if the neighbor (raw) is itself dangling
-                        // (it will be removed too in this or a subsequent iteration).
-                        const uint64_t nRawIn = rawInCount.count(nRaw) ? rawInCount[nRaw] : 0;
-                        const uint64_t nRawOut = rawOutCount.count(nRaw) ? rawOutCount[nRaw] : 0;
-                        const bool neighborRawDangling =
-                            (nRawIn > 0) != (nRawOut > 0);
-                        if(!neighborRawDangling) {
-                            safeToRemove = false;
+                    // Find other windows on the same side of N (excluding w).
+                    // At least one must be non-dangling (has edges on both sides).
+                    bool hasNonDanglingOther = false;
+                    for(const auto& iwe2 : interWindowEdges) {
+                        if(!anchorGraph[iwe2.e].useForAssembly) continue;
+                        const uint32_t src2Norm = normalize(iwe2.srcWin);
+                        const uint32_t dst2Norm = normalize(iwe2.dstWin);
+
+                        uint32_t otherNorm;
+                        if(wIsSource) {
+                            // w -> N: same side = N's incoming. Find other sources.
+                            if(dst2Norm != nNorm) continue;
+                            if(src2Norm == wNorm) continue; // back to w
+                            otherNorm = src2Norm;
+                        } else {
+                            // N -> w: same side = N's outgoing. Find other destinations.
+                            if(src2Norm != nNorm) continue;
+                            if(dst2Norm == wNorm) continue; // back to w
+                            otherNorm = dst2Norm;
+                        }
+
+                        // Check that this other window is not dangling
+                        // (has edges on both sides).
+                        const uint64_t oIn = normInCount.count(otherNorm) ? normInCount[otherNorm] : 0;
+                        const uint64_t oOut = normOutCount.count(otherNorm) ? normOutCount[otherNorm] : 0;
+                        if(oIn > 0 && oOut > 0) {
+                            hasNonDanglingOther = true;
                             break;
                         }
+                    }
+
+                    if(!hasNonDanglingOther) {
+                        safeToRemove = false;
+                        break;
                     }
                 }
 
@@ -851,6 +895,34 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     const auto& iwe = interWindowEdges[idx];
                     disableAndUpdateCounts(iwe.e);
                 }
+
+                // Also disable all edges (including intra-window) of
+                // every anchor in this window, so the backbone doesn't
+                // remain as a disconnected chain in the output.
+                // Use normalized window to find the forward backbone,
+                // then handle both forward and RC anchors.
+                const uint32_t normW = normalize(w);
+                if(normW < anchorWindows.size()) {
+                    const auto& dangleWindow = anchorWindows[normW];
+                    const auto& danglePositions = dangleWindow.filteredBackbonePositions;
+                    const auto dangleJourney = journeys[dangleWindow.backboneOrientedReadId];
+                    for(const uint32_t pos : danglePositions) {
+                        const uint64_t aid = uint64_t(dangleJourney[pos]);
+                        // Disable all edges of forward anchor.
+                        auto oe = boost::out_edges(aid, anchorGraph);
+                        for(auto it = oe.first; it != oe.second; ++it) {
+                            if(anchorGraph[*it].useForAssembly)
+                                disableEdge(*it);
+                        }
+                        auto ie = boost::in_edges(aid, anchorGraph);
+                        for(auto it = ie.first; it != ie.second; ++it) {
+                            if(anchorGraph[*it].useForAssembly)
+                                disableEdge(*it);
+                        }
+                        // RC anchor edges are handled by disableEdge.
+                    }
+                }
+
                 changed = true;
             }
         }
@@ -885,7 +957,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     //runParallelFilter();
     //runShortcutFilter();
-    //removeDanglingWindowsIterative("post-filter");
+    removeDanglingWindowsIterative("post-trim");
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
