@@ -689,40 +689,131 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "Rule 1: " << trimmedWindowCount << " windows trimmed, "
              << trimmedVertexCount << " vertices trimmed." << endl;
 
-        // Remove orphaned inter-window edges.
-        auto normalizeW2 = [&](uint32_t w2) -> uint32_t {
-            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
-        };
-        // Count active edges per vertex.
-        auto activeEdgeCount = [&](uint64_t vid) -> uint64_t {
-            uint64_t count = 0;
-            auto oe = boost::out_edges(vid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it)
-                if(anchorGraph[*it].useForAssembly) ++count;
-            auto ie = boost::in_edges(vid, anchorGraph);
-            for(auto it = ie.first; it != ie.second; ++it)
-                if(anchorGraph[*it].useForAssembly) ++count;
-            return count;
-        };
+        // Remove disconnected backbone fragments within each window.
+        // After trimming, a window's backbone may have disconnected fragments
+        // (anchors connected to each other but not to the main chain).
+        // Find the largest connected component per window and disable all
+        // edges (intra- and inter-window) for anchors not in it.
+        uint64_t fragmentEdgeCount = 0;
+        uint64_t fragmentVertexCount = 0;
 
-        uint64_t orphanedEdgeCount = 0;
-        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-            if(!anchorGraph[e].useForAssembly) continue;
-            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcWin = normalizeW2(anchorToWindow[srcVal]);
-            const uint32_t dstWin = normalizeW2(anchorToWindow[dstVal]);
-            if(srcWin == noWindow || dstWin == noWindow) continue;
-            if(srcWin == dstWin) continue;
-            if(activeEdgeCount(srcVal) <= 1 || activeEdgeCount(dstVal) <= 1) {
-                anchorGraph[e].useForAssembly = false;
-                ++orphanedEdgeCount;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            // Collect anchors in this window that still have active edges.
+            std::vector<uint64_t> windowAnchors;
+            for(const uint32_t pos : positions) {
+                const uint64_t aid = uint64_t(journey[pos]);
+                // Check if this anchor has any active edge.
+                bool hasActive = false;
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+                }
+                if(!hasActive) {
+                    auto ie = boost::in_edges(aid, anchorGraph);
+                    for(auto it = ie.first; it != ie.second; ++it) {
+                        if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+                    }
+                }
+                if(hasActive) windowAnchors.push_back(aid);
+            }
+
+            if(windowAnchors.size() <= 1) continue;
+
+            // Build adjacency for active intra-window edges.
+            std::set<uint64_t> anchorSet(windowAnchors.begin(), windowAnchors.end());
+            std::map<uint64_t, std::vector<uint64_t>> adj;
+            for(const uint64_t aid : windowAnchors) {
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                    if(anchorSet.count(tgt)) adj[aid].push_back(tgt);
+                }
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                    if(anchorSet.count(src)) adj[aid].push_back(src);
+                }
+            }
+
+            // BFS to find connected components.
+            std::map<uint64_t, uint64_t> componentId;
+            uint64_t numComponents = 0;
+            for(const uint64_t aid : windowAnchors) {
+                if(componentId.count(aid)) continue;
+                const uint64_t cid = numComponents++;
+                std::queue<uint64_t> q;
+                q.push(aid);
+                componentId[aid] = cid;
+                while(!q.empty()) {
+                    const uint64_t cur = q.front(); q.pop();
+                    for(const uint64_t nb : adj[cur]) {
+                        if(!componentId.count(nb)) {
+                            componentId[nb] = cid;
+                            q.push(nb);
+                        }
+                    }
+                }
+            }
+
+            if(numComponents <= 1) continue;
+
+            // Find the largest component.
+            std::vector<uint64_t> componentSize(numComponents, 0);
+            for(const auto& [aid, cid] : componentId) componentSize[cid]++;
+            const uint64_t mainComponent = uint64_t(
+                std::max_element(componentSize.begin(), componentSize.end())
+                - componentSize.begin());
+
+            // Disable all edges for anchors not in the main component.
+            for(const auto& [aid, cid] : componentId) {
+                if(cid == mainComponent) continue;
+                ++fragmentVertexCount;
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) {
+                        anchorGraph[*it].useForAssembly = false;
+                        ++fragmentEdgeCount;
+                    }
+                }
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) {
+                        anchorGraph[*it].useForAssembly = false;
+                        ++fragmentEdgeCount;
+                    }
+                }
+                // Also disable RC mirror edges.
+                const uint64_t rcAid = aid ^ 1ULL;
+                if(rcAid < anchorCount) {
+                    auto oe2 = boost::out_edges(rcAid, anchorGraph);
+                    for(auto it = oe2.first; it != oe2.second; ++it) {
+                        if(anchorGraph[*it].useForAssembly) {
+                            anchorGraph[*it].useForAssembly = false;
+                            ++fragmentEdgeCount;
+                        }
+                    }
+                    auto ie2 = boost::in_edges(rcAid, anchorGraph);
+                    for(auto it = ie2.first; it != ie2.second; ++it) {
+                        if(anchorGraph[*it].useForAssembly) {
+                            anchorGraph[*it].useForAssembly = false;
+                            ++fragmentEdgeCount;
+                        }
+                    }
+                }
             }
         }
-        if(orphanedEdgeCount > 0) {
-            cout << "Rule 1: removed " << orphanedEdgeCount
-                 << " orphaned inter-window edges." << endl;
+
+        if(fragmentEdgeCount > 0) {
+            cout << "Rule 1: removed " << fragmentVertexCount
+                 << " fragment vertices and " << fragmentEdgeCount
+                 << " edges from disconnected backbone fragments." << endl;
         }
     };
 
