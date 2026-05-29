@@ -618,7 +618,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         };
 
         // Check if an anchor has any active inter-window edge.
-        auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
+        auto anchorHasInterWindowEdge = [&](uint64_t aid) -> bool {
             if(aid >= anchorCount) return false;
             const uint32_t aidWin = anchorToWindow[aid];
             if(aidWin == noWindow) return false;
@@ -643,6 +643,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         return true;
                 }
             }
+            return false;
+        };
+
+        // Check both forward anchor and its RC mirror.
+        auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
+            if(anchorHasInterWindowEdge(aid)) return true;
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount && anchorHasInterWindowEdge(rcAid)) return true;
             return false;
         };
 
