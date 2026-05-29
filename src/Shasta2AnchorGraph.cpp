@@ -590,22 +590,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Trim backbone outside the bounding inter-window connection span.
     auto trimBackbones = [&]() {
-        // Disable intra-window edges of a trimmed anchor.
-        auto clearIntraWindowEdges = [&](uint64_t vid) {
-            if(vid >= anchorCount) return;
-            const uint32_t vWindow = anchorToWindow[vid];
-            auto oe = boost::out_edges(vid, anchorGraph);
+        // Disable all active edges of an anchor and its RC mirror.
+        auto disableAllEdges = [&](uint64_t aid) {
+            if(aid >= anchorCount) return;
+            auto oe = boost::out_edges(aid, anchorGraph);
             for(auto it = oe.first; it != oe.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
+                if(anchorGraph[*it].useForAssembly)
                     disableEdge(*it);
             }
-            auto ie = boost::in_edges(vid, anchorGraph);
+            auto ie = boost::in_edges(aid, anchorGraph);
             for(auto it = ie.first; it != ie.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                if(src < anchorCount && anchorToWindow[src] == vWindow)
+                if(anchorGraph[*it].useForAssembly)
                     disableEdge(*it);
             }
         };
@@ -614,7 +609,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if a backbone anchor has any active inter-window edge.
+        // Check if an anchor has any active inter-window edge.
         auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
             if(aid >= anchorCount) return false;
             const uint32_t aidWin = anchorToWindow[aid];
@@ -652,18 +647,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(positions.size() <= 1) continue;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            // Walk from the head inward: trim anchors until we hit one
-            // with an inter-window edge.
+            // Head trim: walk from position 0 inward, trim anchors
+            // with no inter-window edge. Stop at the first anchor
+            // that connects to another window.
             uint64_t headTrim = 0;
             for(uint64_t i = 0; i < positions.size(); i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
                 if(hasInterWindowEdge(aid)) break;
                 ++headTrim;
             }
-            // Don't trim everything — keep at least 1 anchor.
             if(headTrim >= positions.size()) headTrim = 0;
 
-            // Walk from the tail inward.
+            // Tail trim: walk from last position inward, trim anchors
+            // with no inter-window edge. Stop at the first anchor
+            // that connects to another window.
             uint64_t tailTrim = 0;
             for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
                 const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
@@ -676,13 +673,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             ++trimmedWindowCount;
 
             for(uint64_t i = 0; i < headTrim; i++) {
-                const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
+                const uint64_t aid = uint64_t(journey[positions[i]]);
+                disableAllEdges(aid);
+                disableAllEdges(aid ^ 1ULL);
                 ++trimmedVertexCount;
             }
             for(uint64_t i = positions.size() - tailTrim; i < positions.size(); i++) {
-                const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
+                const uint64_t aid = uint64_t(journey[positions[i]]);
+                disableAllEdges(aid);
+                disableAllEdges(aid ^ 1ULL);
                 ++trimmedVertexCount;
             }
         }
@@ -883,67 +882,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
     trimBackbones();
-
-    // Remove isolated backbone anchors: anchors that have inter-window edges
-    // but no intra-window edges (disconnected from their window's backbone).
-    {
-        uint64_t isolatedCount = 0;
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& window = anchorWindows[w];
-            const auto& positions = window.filteredBackbonePositions;
-            if(positions.empty()) continue;
-            const auto journey = journeys[window.backboneOrientedReadId];
-
-            for(const uint32_t pos : positions) {
-                const uint64_t aid = uint64_t(journey[pos]);
-                // Check if this anchor has any active intra-window edge.
-                bool hasIntraWindow = false;
-                auto oe = boost::out_edges(aid, anchorGraph);
-                for(auto it = oe.first; it != oe.second; ++it) {
-                    if(!anchorGraph[*it].useForAssembly) continue;
-                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                    if(tgt < anchorCount && anchorToWindow[tgt] == anchorToWindow[aid]) {
-                        hasIntraWindow = true;
-                        break;
-                    }
-                }
-                if(!hasIntraWindow) {
-                    auto ie = boost::in_edges(aid, anchorGraph);
-                    for(auto it = ie.first; it != ie.second; ++it) {
-                        if(!anchorGraph[*it].useForAssembly) continue;
-                        const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                        if(src < anchorCount && anchorToWindow[src] == anchorToWindow[aid]) {
-                            hasIntraWindow = true;
-                            break;
-                        }
-                    }
-                }
-                if(hasIntraWindow) continue;
-
-                // This anchor has no intra-window edges. Disable all its edges.
-                bool hadActive = false;
-                auto oe2 = boost::out_edges(aid, anchorGraph);
-                for(auto it = oe2.first; it != oe2.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) {
-                        disableEdge(*it);
-                        hadActive = true;
-                    }
-                }
-                auto ie2 = boost::in_edges(aid, anchorGraph);
-                for(auto it = ie2.first; it != ie2.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) {
-                        disableEdge(*it);
-                        hadActive = true;
-                    }
-                }
-                if(hadActive) ++isolatedCount;
-            }
-        }
-        if(isolatedCount > 0) {
-            cout << "Removed " << isolatedCount
-                 << " isolated backbone anchors (no intra-window edges)." << endl;
-        }
-    }
 
     //runParallelFilter();
     //runShortcutFilter();

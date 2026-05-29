@@ -57,9 +57,16 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
         return (w >= windowCount) ? (w - windowCount) : w;
     };
 
+    // Collect vertices that have at least one active edge.
+    std::set<vertex_descriptor> activeVertices;
+    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
+        if(!(*this)[e].useForAssembly) continue;
+        activeVertices.insert(source(e, *this));
+        activeVertices.insert(target(e, *this));
+    }
+
     // One unique color per window. Distribute hue evenly across windowCount.
-    BGL_FORALL_VERTICES(v, *this, Shasta2AnchorGraph) {
-        if(in_degree(v, *this) == 0 && out_degree(v, *this) == 0) continue;
+    for(const auto v : activeVertices) {
         if(uint64_t(v) >= anchorToWindow.size()) continue;
 
         const uint32_t wid = anchorToWindow[uint64_t(v)];
