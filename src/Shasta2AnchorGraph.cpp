@@ -993,9 +993,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
     runRule1();
-    runParallelFilter();
-    runShortcutFilter();
-    removeDanglingWindowsIterative("post-filter");
+    //runParallelFilter();
+    //runShortcutFilter();
+    //removeDanglingWindowsIterative("post-filter");
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
@@ -1090,7 +1090,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
     // COMMENTED OUT pending validation on larger datasets.
     // ========================================================================
-#if 1
+#if 0  // DISABLED for incremental filter testing
     // ========================================================================
     //
     // When two windows A and B are connected by an internal inter-window
@@ -1334,7 +1334,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 #endif
 
-    removeDanglingWindowsIterative("post-detangle");
+    //removeDanglingWindowsIterative("post-detangle");
 
     // Diagnostic: dump per-window inter-window connectivity after all cleanup.
     // Check both normalized and raw window IDs, and count noWindow edges.
