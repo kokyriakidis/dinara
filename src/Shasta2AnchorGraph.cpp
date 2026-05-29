@@ -735,7 +735,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
+        // Build per-edge window pair info once, then maintain inCount/outCount
+        // as edges are disabled.
+        struct InterWindowEdge {
+            edge_descriptor e;
+            uint32_t srcWin;
+            uint32_t dstWin;
+        };
+        std::vector<InterWindowEdge> interWindowEdges;
         std::map<uint32_t, uint64_t> inCount, outCount;
+
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -745,6 +754,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
             if(srcWin == noWindow || dstWin == noWindow) continue;
             if(srcWin == dstWin) continue;
+            interWindowEdges.push_back({e, srcWin, dstWin});
             outCount[srcWin]++;
             inCount[dstWin]++;
         }
@@ -752,77 +762,76 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t danglingRemovedCount = 0;
         uint64_t danglingWindowCount = 0;
 
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const bool hasIn = (inCount.count(w) && inCount[w] > 0);
-            const bool hasOut = (outCount.count(w) && outCount[w] > 0);
-            if(hasIn == hasOut) continue;
-            ++danglingWindowCount;
-            cout << "  Dangling window " << w
-                 << " in=" << (inCount.count(w) ? inCount[w] : 0)
-                 << " out=" << (outCount.count(w) ? outCount[w] : 0) << endl;
+        // Iterate until no more dangling windows are found in this pass.
+        bool changed = true;
+        while(changed) {
+            changed = false;
+            for(uint32_t w = 0; w < windowCount; w++) {
+                const bool hasIn = (inCount.count(w) && inCount[w] > 0);
+                const bool hasOut = (outCount.count(w) && outCount[w] > 0);
+                if(hasIn == hasOut) continue;
+                ++danglingWindowCount;
+                cout << "  Dangling window " << w
+                     << " in=" << (inCount.count(w) ? inCount[w] : 0)
+                     << " out=" << (outCount.count(w) ? outCount[w] : 0) << endl;
 
-            struct NeighborEdge {
-                edge_descriptor e;
-                uint32_t neighborWin;
-                bool isIncoming;
-            };
-            std::vector<NeighborEdge> neighborEdges;
-
-            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                if(!anchorGraph[e].useForAssembly) continue;
-                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
-                const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
-                if(srcWin == noWindow || dstWin == noWindow) continue;
-                if(srcWin == dstWin) continue;
-
-                if(dstWin == w) neighborEdges.push_back({e, srcWin, true});
-                if(srcWin == w) neighborEdges.push_back({e, dstWin, false});
-            }
-
-            // Check if removing W's edges would make any neighbor
-            // *become* dangling (transition from two-sided to one-sided).
-            bool safeToRemove = true;
-            for(const auto& ne : neighborEdges) {
-                const uint32_t n = ne.neighborWin;
-                uint64_t nInFromW = 0, nOutToW = 0;
-                for(const auto& ne2 : neighborEdges) {
-                    if(ne2.neighborWin == n) {
-                        if(ne2.isIncoming) nOutToW++;
-                        else nInFromW++;
+                // Collect this window's active inter-window edges.
+                std::vector<size_t> edgeIndices;
+                for(size_t i = 0; i < interWindowEdges.size(); i++) {
+                    const auto& iwe = interWindowEdges[i];
+                    if(!anchorGraph[iwe.e].useForAssembly) continue;
+                    if(iwe.srcWin == w || iwe.dstWin == w) {
+                        edgeIndices.push_back(i);
                     }
                 }
-                const uint64_t nInBefore = inCount.count(n) ? inCount[n] : 0;
-                const uint64_t nOutBefore = outCount.count(n) ? outCount[n] : 0;
-                const uint64_t nInAfter = nInBefore - nInFromW;
-                const uint64_t nOutAfter = nOutBefore - nOutToW;
 
-                // Only block removal if neighbor would become fully isolated
-                // (no inter-window edges at all). One-sided neighbors will be
-                // cleaned up by subsequent iterations.
-                const bool wouldBeIsolated = (nInAfter == 0) && (nOutAfter == 0);
-                if(wouldBeIsolated) {
-                    cout << "    Blocked by neighbor " << n
-                         << " (would become isolated: in " << nInBefore << "->" << nInAfter
-                         << " out " << nOutBefore << "->" << nOutAfter << ")" << endl;
-                    safeToRemove = false;
-                    break;
+                // Check if removing W's edges would make any neighbor
+                // fully isolated (no inter-window edges at all).
+                bool safeToRemove = true;
+                for(const size_t idx : edgeIndices) {
+                    const auto& iwe = interWindowEdges[idx];
+                    const uint32_t n = (iwe.srcWin == w) ? iwe.dstWin : iwe.srcWin;
+
+                    // Compute how many edges neighbor n would lose.
+                    uint64_t nInLoss = 0, nOutLoss = 0;
+                    for(const size_t idx2 : edgeIndices) {
+                        const auto& iwe2 = interWindowEdges[idx2];
+                        if(iwe2.dstWin == n) nInLoss++;
+                        if(iwe2.srcWin == n) nOutLoss++;
+                    }
+
+                    const uint64_t nInBefore = inCount.count(n) ? inCount[n] : 0;
+                    const uint64_t nOutBefore = outCount.count(n) ? outCount[n] : 0;
+                    const uint64_t nInAfter = nInBefore - nInLoss;
+                    const uint64_t nOutAfter = nOutBefore - nOutLoss;
+
+                    const bool wouldBeIsolated = (nInAfter == 0) && (nOutAfter == 0);
+                    if(wouldBeIsolated) {
+                        cout << "    Blocked by neighbor " << n
+                             << " (would become isolated: in " << nInBefore << "->" << nInAfter
+                             << " out " << nOutBefore << "->" << nOutAfter << ")" << endl;
+                        safeToRemove = false;
+                        break;
+                    }
                 }
-            }
 
-            if(!safeToRemove) {
-                cout << "    Window " << w << " NOT removed (unsafe)." << endl;
-                continue;
-            }
-
-            cout << "    Window " << w << " removed (" << neighborEdges.size() << " edges)." << endl;
-            for(const auto& ne : neighborEdges) {
-                if(anchorGraph[ne.e].useForAssembly) {
-                    anchorGraph[ne.e].useForAssembly = false;
-                    ++danglingRemovedCount;
+                if(!safeToRemove) {
+                    cout << "    Window " << w << " NOT removed (unsafe)." << endl;
+                    continue;
                 }
+
+                // Disable edges and update counts immediately.
+                cout << "    Window " << w << " removed (" << edgeIndices.size() << " edges)." << endl;
+                for(const size_t idx : edgeIndices) {
+                    const auto& iwe = interWindowEdges[idx];
+                    if(anchorGraph[iwe.e].useForAssembly) {
+                        anchorGraph[iwe.e].useForAssembly = false;
+                        outCount[iwe.srcWin]--;
+                        inCount[iwe.dstWin]--;
+                        ++danglingRemovedCount;
+                    }
+                }
+                changed = true;
             }
         }
 
