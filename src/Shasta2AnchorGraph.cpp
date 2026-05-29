@@ -274,27 +274,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
 
-                // Forward chain edges: try to connect consecutive anchors.
-                // If consecutive A,B have no common reads, skip B and try
-                // connecting A to the next anchor C, etc. This bridges over
-                // gaps caused by low-coverage split copies.
-                if(pathChain.size() >= 2) {
-                    uint64_t last = 0;
-                    for(uint64_t i = 1; i < pathChain.size(); i++) {
-                        if(addEdgeIfValid(pathChain[last], pathChain[i])) {
-                            last = i;
-                        }
-                    }
+                // Forward chain edges.
+                for(uint64_t i = 0; i + 1 < pathChain.size(); i++) {
+                    addEdgeIfValid(pathChain[i], pathChain[i + 1]);
                 }
 
                 // RC chain edges (reversed direction: last → ... → first).
-                if(rcPathChain.size() >= 2) {
-                    uint64_t last = rcPathChain.size() - 1;
-                    for(int64_t i = int64_t(rcPathChain.size()) - 2; i >= 0; i--) {
-                        if(addEdgeIfValid(rcPathChain[last], rcPathChain[i])) {
-                            last = uint64_t(i);
-                        }
-                    }
+                for(uint64_t i = 0; i + 1 < rcPathChain.size(); i++) {
+                    addEdgeIfValid(rcPathChain[i + 1], rcPathChain[i]);
                 }
             }
         }
