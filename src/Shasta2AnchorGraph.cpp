@@ -750,11 +750,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         uint64_t danglingRemovedCount = 0;
+        uint64_t danglingWindowCount = 0;
 
         for(uint32_t w = 0; w < windowCount; w++) {
             const bool hasIn = (inCount.count(w) && inCount[w] > 0);
             const bool hasOut = (outCount.count(w) && outCount[w] > 0);
             if(hasIn == hasOut) continue;
+            ++danglingWindowCount;
+            cout << "  Dangling window " << w
+                 << " in=" << (inCount.count(w) ? inCount[w] : 0)
+                 << " out=" << (outCount.count(w) ? outCount[w] : 0) << endl;
 
             struct NeighborEdge {
                 edge_descriptor e;
@@ -799,13 +804,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 // cleaned up by subsequent iterations.
                 const bool wouldBeIsolated = (nInAfter == 0) && (nOutAfter == 0);
                 if(wouldBeIsolated) {
+                    cout << "    Blocked by neighbor " << n
+                         << " (would become isolated: in " << nInBefore << "->" << nInAfter
+                         << " out " << nOutBefore << "->" << nOutAfter << ")" << endl;
                     safeToRemove = false;
                     break;
                 }
             }
 
-            if(!safeToRemove) continue;
+            if(!safeToRemove) {
+                cout << "    Window " << w << " NOT removed (unsafe)." << endl;
+                continue;
+            }
 
+            cout << "    Window " << w << " removed (" << neighborEdges.size() << " edges)." << endl;
             for(const auto& ne : neighborEdges) {
                 if(anchorGraph[ne.e].useForAssembly) {
                     anchorGraph[ne.e].useForAssembly = false;
@@ -814,10 +826,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        if(danglingRemovedCount > 0) {
-            cout << "Dangling window cleanup (" << label << "): removed "
-                 << danglingRemovedCount << " inter-window edges." << endl;
-        }
+        cout << "Dangling window cleanup (" << label << "): found "
+             << danglingWindowCount << " dangling windows, removed "
+             << danglingRemovedCount << " inter-window edges." << endl;
         return danglingRemovedCount;
     };
 
