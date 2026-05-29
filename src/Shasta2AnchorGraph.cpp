@@ -667,25 +667,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(int64_t(positions[i]) <= endBound) { keepLast = i; break; }
             }
             if(keepFirst < 0 || keepLast < 0 || keepFirst > keepLast) continue;
-            uint64_t headTrim = uint64_t(keepFirst);
-            uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
-
-            // Cap trimming: don't trim more than maxTrim anchors from each end.
-            // This prevents gutting backbones that only have inter-window edges
-            // at one end.
-            const uint64_t maxTrim = 5;
-            headTrim = std::min(headTrim, maxTrim);
-            tailTrim = std::min(tailTrim, maxTrim);
-
+            const uint64_t headTrim = uint64_t(keepFirst);
+            const uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
             if(headTrim == 0 && tailTrim == 0) continue;
             ++trimmedWindowCount;
 
-            for(uint64_t i = 0; i < headTrim; i++) {
+            for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
             }
-            for(uint64_t i = positions.size() - tailTrim; i < positions.size(); i++) {
+            for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
