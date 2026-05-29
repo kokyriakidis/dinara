@@ -1659,8 +1659,8 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
     // Detangle: split backbone anchors of tangled windows.
+    std::map<Shasta2AnchorId, std::vector<Shasta2AnchorId>> anchorSplitMap;
     {
-        std::map<Shasta2AnchorId, std::vector<Shasta2AnchorId>> anchorSplitMap;
         const uint64_t detangledCount = detangleWindows(
             *shasta2Anchors,
             *shasta2Journeys,
@@ -1682,6 +1682,74 @@ void dinara::main::assemble(
                 &anchorSplitMap);
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
         }
+    }
+
+    // Diagnostic: report isolated split anchors after detangling.
+    if(!anchorSplitMap.empty()) {
+        const auto& ag = *shasta2AnchorGraph;
+        uint64_t totalSplitCopies = 0;
+        uint64_t isolatedSplitCopies = 0;
+        uint64_t totalOriginals = 0;
+        uint64_t isolatedOriginals = 0;
+        for(const auto& [originalId, splitIds] : anchorSplitMap) {
+            ++totalOriginals;
+            if(boost::degree(originalId, ag) == 0) {
+                ++isolatedOriginals;
+            }
+            for(const Shasta2AnchorId splitId : splitIds) {
+                if(splitId == originalId) continue; // Not a real split copy.
+                ++totalSplitCopies;
+                if(boost::degree(splitId, ag) == 0) {
+                    ++isolatedSplitCopies;
+                }
+            }
+        }
+        cout << "Detangle diagnostics:" << endl;
+        cout << "  Original anchors in splitMap: " << totalOriginals
+             << ", isolated: " << isolatedOriginals << endl;
+        cout << "  Split copies created: " << totalSplitCopies
+             << ", isolated: " << isolatedSplitCopies << endl;
+        cout << "  Non-isolated split copies: "
+             << (totalSplitCopies - isolatedSplitCopies) << endl;
+
+        // Per-window breakdown for windows with isolated split copies.
+        std::map<uint32_t, std::pair<uint64_t, uint64_t>> windowStats; // windowId -> (total, isolated)
+        for(const auto& [originalId, splitIds] : anchorSplitMap) {
+            // Find which window this anchor belongs to.
+            // Check both originalId and its canonical/RC partner (originalId ^ 1)
+            // since RC anchor IDs won't appear in forward backbone journeys.
+            const Shasta2AnchorId partnerId = Shasta2AnchorId(uint64_t(originalId) ^ 1ULL);
+            uint32_t wid = AnchorWindow::noWindow;
+            for(uint32_t w = 0; w < anchorWindows.size(); w++) {
+                const auto& window = anchorWindows[w];
+                const auto journey = shasta2Journeys->operator[](window.backboneOrientedReadId);
+                for(const uint32_t pos : window.filteredBackbonePositions) {
+                    if(journey[pos] == originalId || journey[pos] == partnerId) {
+                        wid = w;
+                        break;
+                    }
+                }
+                if(wid != AnchorWindow::noWindow) break;
+            }
+            for(const Shasta2AnchorId splitId : splitIds) {
+                if(splitId == originalId) continue; // Not a real split copy.
+                windowStats[wid].first++;
+                if(boost::degree(splitId, ag) == 0) {
+                    windowStats[wid].second++;
+                }
+            }
+        }
+
+        cout << "  Per-window isolated split copies:" << endl;
+        for(const auto& [wid, stats] : windowStats) {
+            if(stats.second > 0) {
+                cout << "    Window " << wid << ": "
+                     << stats.second << "/" << stats.first
+                     << " isolated" << endl;
+            }
+        }
+
+
     }
 
     // Write external anchors after detangling so new split anchors are included.
