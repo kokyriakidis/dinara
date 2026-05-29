@@ -693,6 +693,79 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << trimmedVertexCount << " vertices trimmed." << endl;
     }
 
+    // ========================================================================
+    // Detangle Case 2: Remove inter-window edges where both endpoints
+    // are internal backbone anchors, but only if removing the edge
+    // leaves both windows still connected (each window retains at least
+    // one incoming and one outgoing inter-window edge).
+    // ========================================================================
+    {
+        // Build boundary anchor set: first and last in each window's backbone.
+        std::set<Shasta2AnchorId> boundaryAnchors;
+        for(const AnchorWindow& window : anchorWindows) {
+            const auto backboneJourney = journeys[window.backboneOrientedReadId];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+
+            const Shasta2AnchorId firstAnchor = backboneJourney[positions.front()];
+            const Shasta2AnchorId lastAnchor = backboneJourney[positions.back()];
+            boundaryAnchors.insert(firstAnchor);
+            boundaryAnchors.insert(lastAnchor);
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(firstAnchor) ^ 1ULL));
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(lastAnchor) ^ 1ULL));
+        }
+
+        // Count inter-window in/out edges per window.
+        // Key: windowId. Value: {inCount, outCount}.
+        std::map<uint32_t, std::pair<uint64_t, uint64_t>> windowInterEdgeCounts;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+            const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+            const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+            const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue;
+            windowInterEdgeCounts[srcWin].second++; // outgoing from srcWin
+            windowInterEdgeCounts[dstWin].first++;  // incoming to dstWin
+        }
+
+        // Collect candidate edges, then process one at a time,
+        // re-checking connectivity after each removal.
+        uint64_t case2RemovedCount = 0;
+        bool changed = true;
+        while(changed) {
+            changed = false;
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+                const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+                const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+                const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+
+                // Both endpoints must be internal (not boundary).
+                if(boundaryAnchors.count(Shasta2AnchorId(srcAnchor))) continue;
+                if(boundaryAnchors.count(Shasta2AnchorId(dstAnchor))) continue;
+
+                // Only remove if both windows retain connectivity.
+                if(windowInterEdgeCounts[srcWin].second > 1 &&
+                   windowInterEdgeCounts[dstWin].first > 1) {
+                    windowInterEdgeCounts[srcWin].second--;
+                    windowInterEdgeCounts[dstWin].first--;
+                    boost::remove_edge(e, anchorGraph);
+                    ++case2RemovedCount;
+                    changed = true;
+                    break; // Iterator invalidated, restart.
+                }
+            }
+        }
+
+        if(case2RemovedCount > 0) {
+            cout << "Detangle Case 2: removed " << case2RemovedCount
+                 << " internal inter-window edges." << endl;
+        }
+    }
+
     // Validate: check that every edge has shared oriented reads.
     {
         uint64_t emptyEdgeCount = 0;
