@@ -434,21 +434,22 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 | DEL 100-500bp | 10 | 9 | 1 | 0 | 90% |
 | DEL 500-1000bp | 10 | 7 | 3 | 0 | 70% |
 | DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
-| INS <100bp | 10 | 8 | 2 | 0 | 80% |
-| INS 100-500bp | 10 | 1 | 9 | 0 | 10% |
-| INS 500-1000bp | 10 | 6 | 2 | 2 | 60% |
+| INS <100bp | 10 | 9 | 1 | 0 | 90% |
+| INS 100-500bp | 10 | 5 | 5 | 0 | 50% |
+| INS 500-1000bp | 10 | 7 | 2 | 1 | 70% |
 | INS >1000bp | 10 | 0 | 8 | 2 | 0% |
-| **TOTAL** | **80** | **48** | **27** | **5** | **60%** |
+| **TOTAL** | **80** | **54** | **22** | **4** | **67%** |
 
-**Correct type (✅+⚠️): 75/80 = 94%**
+**Correct type (✅+⚠️): 76/80 = 95%**
 
 Key observations:
 - **DEL <100bp at 90%**: compound CIGAR merging (35D+55D→90D) and CIGAR-corroborated k-mer clusters fix tandem repeat and STR cases
 - **DEL 100-500bp at 90%**: size-gated CIGAR clustering separates mixed-size deletion clusters (e.g. 57D vs 114D)
 - **DEL 500-1000bp at 70%**: SA-tag VNTR suppression relaxed for strong calls (≥10 reads); coverage-drop corroborated k-mer clusters for marker-depleted regions; remaining 3 ⚠️ are tandem repeat copy-number ambiguities (DEL662, DEL605, DEL500)
 - **DEL >1000bp at 80%**: 1 ❌ (DEL1432 — no call), 1 ⚠️ (DEL6191 — partial detection)
-- **INS detection limited**: 15/40 exact (38%), 35/40 correct type (88%)
-- **INS 100-500bp** remains weak (10% exact): insertions exceed read length and soft-clip assembly can only partially span them
+- **INS <100bp at 90%**: no-covdrop-flip detects INS58 (diagonal-shift DEL with no coverage-drop support → INS)
+- **INS 100-500bp at 50%**: reversed-BP INS (INS330), no-covdrop-flip (INS313), flank-gap covDrop sizing (INS310), CIGAR-covdrop corroboration (INS266)
+- **INS 500-1000bp at 70%**: no-covdrop-flip detects INS509 (split-read DEL with no coverage-drop → INS)
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
 
 ### Known Limitations

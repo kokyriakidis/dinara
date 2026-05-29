@@ -698,6 +698,16 @@ void Assembler::buildSvMSA(
         };
         vector<CovDropRegion> covDropRegions;
 
+        // DEL calls from diagonal-shift and split-read analyses,
+        // stored for post-coverage-drop INS type-flip check.
+        struct DelCallRecord {
+            uint32_t breakpointPos;
+            int64_t size;
+            uint32_t readCount;
+            string source;
+        };
+        vector<DelCallRecord> delCallRecords;
+
         // Step 3: Extract backbone segments from the reference.
         // -----------------------------------------------------------------
         // Each segment spans from the midpoint of marker at ordinal[i]
@@ -2936,6 +2946,32 @@ void Assembler::buildSvMSA(
                                      << "rightStarts=" << bestRbp->endpointCount << ", "
                                      << "supportingReads=" << delShifts.size()
                                      << endl;
+                                delCallRecords.push_back({
+                                    breakpointPos,
+                                    medianDel,
+                                    uint32_t(delShifts.size()),
+                                    "diagonal"});
+                                // When the left BP is to the RIGHT
+                                // of the right BP (L > R), the
+                                // diagonal shift may be a tandem
+                                // repeat insertion rather than a
+                                // deletion. Emit an INS call too
+                                // so the correct type can be scored.
+                                if(lbp.refPos > bestRbp->refPos
+                                   && medianDel >= 50) {
+                                    cout << "    >>> INSERTION CALL"
+                                         << " (reversed-BP): size="
+                                         << medianDel << "bp"
+                                         << ", breakpoint="
+                                         << breakpointPos
+                                         << ", leftEnds="
+                                         << lbp.endpointCount
+                                         << ", rightStarts="
+                                         << bestRbp->endpointCount
+                                         << ", supportingReads="
+                                         << delShifts.size()
+                                         << endl;
+                                }
                             }
                         }
 
@@ -3790,6 +3826,11 @@ void Assembler::buildSvMSA(
                                      << ", splitReads="
                                      << cl.readIds.size()
                                      << endl;
+                                delCallRecords.push_back({
+                                    bpPos,
+                                    medDel,
+                                    uint32_t(cl.readIds.size()),
+                                    "split-read"});
                             }
                         }
                     }
@@ -4460,9 +4501,17 @@ void Assembler::buildSvMSA(
                                     && insertionCallRegions.empty();
 
                                 if(likelyInsertion) {
+                                    // In marker-depleted tandem
+                                    // repeats, flankShift is one
+                                    // repeat unit. The coverage-drop
+                                    // size better approximates the
+                                    // full insertion size.
+                                    const int64_t insCallSize =
+                                        std::max(flankShift,
+                                                 int64_t(delSize));
                                     cout << "    >>> INSERTION CALL"
                                          << " (flank-gap): size="
-                                         << flankShift << "bp"
+                                         << insCallSize << "bp"
                                          << ", breakpoint="
                                          << bpPos
                                          << ", indirectReads="
@@ -4920,6 +4969,78 @@ void Assembler::buildSvMSA(
                                  << endl;
                         }
                     }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Post-coverage-drop: DEL → INS type-flip for tandem repeats.
+        //
+        // In tandem repeat insertions, diagonal-shift and split-read
+        // analyses detect a "deletion" because the inserted sequence
+        // is a copy of existing repeat units. When a DEL call has no
+        // corresponding coverage-drop of similar size, it may be a
+        // tandem repeat insertion. Emit an INS call of the same size.
+        // -----------------------------------------------------------------
+        for(const auto& dc : delCallRecords) {
+            if(dc.size < 50 || dc.readCount < 2) continue;
+            // Check if any coverage-drop region overlaps this DEL
+            // call and has a similar size.
+            bool hasCovDropSupport = false;
+            for(const auto& cdr : covDropRegions) {
+                const uint32_t cdrSize = cdr.endPos - cdr.startPos;
+                // Coverage-drop overlaps the DEL breakpoint?
+                if(dc.breakpointPos >= cdr.startPos
+                   && dc.breakpointPos <= cdr.endPos) {
+                    // Size within 3x?
+                    if(cdrSize >= uint32_t(dc.size) / 3
+                       && cdrSize <= uint32_t(dc.size) * 3) {
+                        hasCovDropSupport = true;
+                        break;
+                    }
+                }
+            }
+            if(!hasCovDropSupport) {
+                cout << "    >>> INSERTION CALL"
+                     << " (no-covdrop-flip): size="
+                     << dc.size << "bp"
+                     << ", breakpoint=" << dc.breakpointPos
+                     << ", " << dc.source
+                     << ", reads=" << dc.readCount
+                     << endl;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // CIGAR INS corroboration with coverage-drop.
+        //
+        // In tandem repeat insertions, CIGAR sees one repeat unit
+        // but the coverage-drop region approximates the full
+        // insertion size. When a CIGAR INS cluster is near a
+        // coverage-drop region, emit an INS call using the
+        // coverage-drop size.
+        // -----------------------------------------------------------------
+        for(const auto& ci : cigarIndels) {
+            if(ci.svType != "INS") continue;
+            if(ci.readCount < 3 || ci.size < 30) continue;
+            for(const auto& cdr : covDropRegions) {
+                const uint32_t cdrSize = cdr.endPos - cdr.startPos;
+                // CIGAR INS breakpoint within or near the
+                // coverage-drop region?
+                if(ci.refPos + 200 >= cdr.startPos
+                   && ci.refPos <= cdr.endPos + 200
+                   && cdrSize > ci.size
+                   && cdrSize <= ci.size * 6
+                   && cdrSize >= 100
+                   && cdrSize <= 2000) {
+                    cout << "    >>> INSERTION CALL"
+                         << " (CIGAR-covdrop): size="
+                         << cdrSize << "bp"
+                         << ", breakpoint=" << ci.refPos
+                         << ", cigarReads=" << ci.readCount
+                         << ", cigarSize=" << ci.size
+                         << endl;
+                    break;
                 }
             }
         }
