@@ -678,6 +678,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == w) neighborEdges.push_back({e, dstWin, false});
             }
 
+            cout << "  Dangling window " << w
+                 << " (in=" << (inCount.count(w) ? inCount[w] : 0)
+                 << ", out=" << (outCount.count(w) ? outCount[w] : 0)
+                 << ", " << neighborEdges.size() << " neighbor edges):";
+            for(const auto& ne : neighborEdges) {
+                cout << " " << (ne.isIncoming ? "from" : "to") << "=" << ne.neighborWin;
+            }
+            cout << endl;
+
             // Check if removing W's edges would make any neighbor
             // *become* dangling (transition from having both incoming
             // and outgoing to having only one side).
@@ -701,6 +710,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const bool wasTwoSided = (nInBefore > 0) && (nOutBefore > 0);
                 const bool wouldBeOneSided = (nInAfter > 0) != (nOutAfter > 0);
                 if(wasTwoSided && wouldBeOneSided) {
+                    cout << "    Blocked by neighbor " << n
+                         << " (in: " << nInBefore << "->" << nInAfter
+                         << ", out: " << nOutBefore << "->" << nOutAfter << ")" << endl;
                     safeToRemove = false;
                     break;
                 }
