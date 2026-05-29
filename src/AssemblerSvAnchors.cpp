@@ -689,6 +689,15 @@ void Assembler::buildSvMSA(
         // SA-tag DEL calls in marker-depleted VNTR regions.
         bool suppressSaTagDel = false;
 
+        // Coverage-drop regions detected during per-segment
+        // processing, used later for k-mer cluster corroboration.
+        struct CovDropRegion {
+            uint32_t startPos;
+            uint32_t endPos;
+            bool markerDepleted;
+        };
+        vector<CovDropRegion> covDropRegions;
+
         // Step 3: Extract backbone segments from the reference.
         // -----------------------------------------------------------------
         // Each segment spans from the midpoint of marker at ordinal[i]
@@ -3948,6 +3957,12 @@ void Assembler::buildSvMSA(
                              << " markerDepleted=" << markerDepleted
                              << endl;
 
+                        // Record for later k-mer cluster
+                        // corroboration.
+                        covDropRegions.push_back({
+                            cdc.startPos, cdc.endPos,
+                            markerDepleted});
+
                         // Suppress calls that overlap detected VNTR gaps
                         // or insertion call regions.
                         if(overlapsVntr || overlapsInsertion) continue;
@@ -5069,6 +5084,72 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
+        // Coverage-drop corroborated k-mer cluster emission.
+        //
+        // In marker-depleted regions, k-mer chains may classify
+        // only 1-2 reads as DEL. When a k-mer DEL cluster falls
+        // within a detected coverage-drop region, the coverage
+        // drop confirms a deletion exists and the k-mer cluster
+        // provides the size estimate.
+        // -----------------------------------------------------------------
+        if(!covDropRegions.empty()) {
+            for(int32_t cid = 0; cid < totalClusters; ++cid) {
+                uint32_t count = 0;
+                int64_t sumSize = 0;
+                uint64_t sumPos = 0;
+                SvType cType = SvType::ReferenceLike;
+
+                for(const auto& rg : readGroups) {
+                    if(rg.clusterId != cid) continue;
+                    ++count;
+                    sumSize += rg.svSize;
+                    sumPos += rg.breakpointRefPos;
+                    cType = rg.svType;
+                }
+                if(count == 0 || count > 2) continue;
+                if(cType != SvType::Deletion) continue;
+                const int64_t clusterSize =
+                    sumSize / int64_t(count);
+                if(clusterSize < 100) continue;
+                const uint64_t clusterPos = sumPos / count;
+
+                // Check if this cluster falls within a
+                // coverage-drop region.
+                for(const auto& cdr : covDropRegions) {
+                    if(!cdr.markerDepleted) continue;
+                    // Allow 200bp margin — k-mer breakpoints
+                    // may be slightly outside the coverage-drop
+                    // boundaries due to windowing.
+                    const uint32_t margin = 200;
+                    if(clusterPos + margin >= cdr.startPos
+                       && clusterPos <= cdr.endPos + margin) {
+                        const uint32_t covDropSize =
+                            cdr.endPos - cdr.startPos;
+                        // Accept if k-mer size is within
+                        // 2x of coverage-drop size (the
+                        // coverage-drop region is often
+                        // wider than the actual deletion).
+                        if(clusterSize <= int64_t(covDropSize)
+                           && clusterSize * 2
+                              >= int64_t(covDropSize)) {
+                            cout << "    >>> DELETION CALL"
+                                 << " (covdrop-corroborated):"
+                                 << " size="
+                                 << clusterSize << "bp"
+                                 << ", breakpoint="
+                                 << clusterPos
+                                 << ", kmerReads=" << count
+                                 << ", covDropSize="
+                                 << covDropSize << "bp"
+                                 << endl;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // SDUST-gated low-complexity SV detection.
         //
         // For low-complexity regions (detected by SDUST), standard
@@ -5477,8 +5558,13 @@ void Assembler::buildSvMSA(
                     // Suppress DEL calls in marker-depleted
                     // VNTR regions where the aligner maps
                     // split reads to different repeat copies.
+                    // Exception: allow calls with very strong
+                    // support (>=10 reads) — a real deletion
+                    // in a VNTR region will have many
+                    // consistent split reads.
                     if(sc.svType == "DEL"
-                       && suppressSaTagDel) {
+                       && suppressSaTagDel
+                       && sc.readCount < 10) {
                         cout << "    SA-tag DEL suppressed"
                              << " (marker-depleted VNTR):"
                              << " size=" << sc.size << "bp"
