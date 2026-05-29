@@ -110,9 +110,10 @@ uint64_t dinara::detangleWindows(
         // Collect all flow reads for removal from backbone.
         set<uint32_t> allFlowReads;
 
+        // For each flow, find the connection anchors and create bypass edges.
+        // The flow reads are the common reads between the prev window's exit
+        // anchor and the next window's entry anchor.
         for(const auto& flow : mergedFlows) {
-            // For each directional key (prev->next), find the connection
-            // anchors and create a bypass edge.
             for(const auto& fk : flow.flowKeys) {
                 const uint32_t prevW = fk.first;
                 const uint32_t nextW = fk.second;
@@ -142,6 +143,24 @@ uint64_t dinara::detangleWindows(
                 }
 
                 if(foundPrev && foundNext) {
+                    // Compute common reads between the two connection anchors.
+                    set<uint32_t> prevReads, nextReads;
+                    const auto prevSpan = anchors[prevExitAnchor];
+                    for(const auto& mi : prevSpan) {
+                        prevReads.insert(mi.orientedReadId.getValue());
+                    }
+                    const auto nextSpan = anchors[nextEntryAnchor];
+                    for(const auto& mi : nextSpan) {
+                        nextReads.insert(mi.orientedReadId.getValue());
+                    }
+                    uint64_t commonCount = 0;
+                    for(const uint32_t r : prevReads) {
+                        if(nextReads.count(r)) {
+                            allFlowReads.insert(r);
+                            ++commonCount;
+                        }
+                    }
+
                     // Forward bypass edge.
                     bypassEdges.push_back({prevExitAnchor, nextEntryAnchor});
 
@@ -153,13 +172,8 @@ uint64_t dinara::detangleWindows(
                     cout << "    Bypass: " << prevExitAnchor << " -> "
                          << nextEntryAnchor << " (+ RC " << rcB << " -> " << rcA << ")"
                          << " (prev=" << prevW << " next=" << nextW
-                         << " reads=" << flow.readSet.size() << ")" << endl;
+                         << " commonReads=" << commonCount << ")" << endl;
                 }
-            }
-
-            // Accumulate flow reads.
-            for(const uint32_t r : flow.readSet) {
-                allFlowReads.insert(r);
             }
         }
 
