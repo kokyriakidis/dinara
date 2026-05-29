@@ -2821,6 +2821,33 @@ void Assembler::buildSvMSA(
                                         std::min(lbp.refPos, bestInsRbp->refPos),
                                         std::max(lbp.refPos, bestInsRbp->refPos)
                                     });
+                                    // In tandem repeats, the path
+                                    // traverses repeat units from
+                                    // the non-deleted allele, so
+                                    // pathDist reflects insertion
+                                    // while the truth may be a
+                                    // deletion. When refGap > 0,
+                                    // also emit a DEL call: refGap
+                                    // approximates the deletion
+                                    // size (distance between BPs
+                                    // on the reference).
+                                    if(bestInsRefGap >= 40) {
+                                        cout << "    >>> DELETION CALL"
+                                             << " (path-mirror):"
+                                             << " size="
+                                             << bestInsRefGap
+                                             << "bp, breakpoint="
+                                             << insBpPos
+                                             << endl;
+                                        delCallRecords.push_back({
+                                            insBpPos,
+                                            bestInsRefGap,
+                                            uint32_t(
+                                                lbp.endpointCount
+                                                + bestInsRbp
+                                                  ->endpointCount),
+                                            "path-mirror"});
+                                    }
                                 }
                             }
                         }
@@ -4059,14 +4086,19 @@ void Assembler::buildSvMSA(
                             cdc.startPos, cdc.endPos,
                             markerDepleted});
 
-                        // Suppress calls that overlap detected VNTR gaps.
-                        // For insertion overlaps in marker-depleted
-                        // regions, still run the analysis: tandem
-                        // repeat evidence is ambiguous between DEL
-                        // and INS, so emit both.
-                        if(overlapsVntr) continue;
-                        if(overlapsInsertion && !markerDepleted)
-                            continue;
+                        // Suppress calls that overlap detected VNTR
+                        // gaps or prior insertion calls, UNLESS the
+                        // region is marker-depleted. In marker-
+                        // depleted tandem repeats, the evidence is
+                        // ambiguous between DEL and INS, so let the
+                        // flank-gap analysis run and emit both.
+                        if(overlapsVntr && !markerDepleted) continue;
+                        // For insertion overlaps: still run the
+                        // analysis. In tandem repeats, the same
+                        // evidence can manifest as both INS and
+                        // DEL. The diagonal-shift or flank-gap
+                        // analysis may find the correct DEL size
+                        // even when a large-ins call was emitted.
 
                         // Suppress large coverage-drop regions (>500bp)
                         // with minRatio=0 that have strong breakpoints
@@ -4563,7 +4595,7 @@ void Assembler::buildSvMSA(
                                     // INS. Emit both and let
                                     // downstream pick the correct
                                     // type.
-                                    if(flankShift >= 50) {
+                                    if(flankShift >= 40) {
                                         cout << "    >>> DELETION CALL"
                                              << " (flank-gap): size="
                                              << flankShift << "bp"
