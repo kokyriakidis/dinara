@@ -450,6 +450,95 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
+    // Remove redundant parallel inter-window edges.
+    // For each window W, if the same neighbor A appears in both W's
+    // incoming and outgoing transitions, the A→W and W→A inter-window
+    // edges are redundant — the path already goes through W's backbone.
+    // Check that the landing anchor (from A→W) precedes the leaving
+    // anchor (from W→A) on W's backbone to confirm reachability.
+    {
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+
+        // For each window, find neighbors that form parallel connections:
+        // reads enter from A and exit back to A (flow A→A through W).
+        // This is distinct from chain connections where reads flow A→B.
+        std::map<uint32_t, std::set<uint32_t>> parallelNeighbors;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            for(const auto& [key, reads] : window.transitionReads) {
+                // key.first = incoming neighbor, key.second = outgoing neighbor.
+                // A parallel connection has the same window on both sides.
+                if(key.first != noW && key.first == key.second) {
+                    parallelNeighbors[w].insert(key.first);
+                }
+            }
+        }
+
+        if(!parallelNeighbors.empty()) {
+            uint64_t parallelRemovedCount = 0;
+
+            for(const auto& [w, neighbors] : parallelNeighbors) {
+                for(const uint32_t neighborW : neighbors) {
+                    // Find incoming edges from neighborW to W and
+                    // outgoing edges from W to neighborW.
+                    struct EdgeInfo {
+                        edge_descriptor e;
+                        Shasta2AnchorId anchorInW;  // the anchor on W's side
+                    };
+                    std::vector<EdgeInfo> incomingEdges;
+                    std::vector<EdgeInfo> outgoingEdges;
+
+                    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                        const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                        const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                        const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
+                        const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
+                        if(srcWin == dstWin) continue;
+
+                        // Edge from neighborW → W (incoming to W).
+                        if(srcWin == neighborW && dstWin == w) {
+                            incomingEdges.push_back({e, Shasta2AnchorId(dstVal)});
+                        }
+                        // Edge from W → neighborW (outgoing from W).
+                        if(srcWin == w && dstWin == neighborW) {
+                            outgoingEdges.push_back({e, Shasta2AnchorId(srcVal)});
+                        }
+                    }
+
+                    // For each (incoming, outgoing) pair, check backbone reachability.
+                    std::vector<edge_descriptor> edgesToRemove;
+                    for(const auto& in : incomingEdges) {
+                        const uint32_t landingPos = anchorToBackbonePos[uint64_t(in.anchorInW)];
+                        for(const auto& out : outgoingEdges) {
+                            const uint32_t leavingPos = anchorToBackbonePos[uint64_t(out.anchorInW)];
+                            if(landingPos <= leavingPos) {
+                                edgesToRemove.push_back(in.e);
+                                edgesToRemove.push_back(out.e);
+                            }
+                        }
+                    }
+
+                    // Deduplicate and remove.
+                    std::sort(edgesToRemove.begin(), edgesToRemove.end());
+                    edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
+                                        edgesToRemove.end());
+                    for(const auto& e : edgesToRemove) {
+                        boost::remove_edge(e, anchorGraph);
+                        ++parallelRemovedCount;
+                    }
+                }
+            }
+
+            if(parallelRemovedCount > 0) {
+                cout << "Parallel connections: removed " << parallelRemovedCount
+                     << " redundant inter-window edges." << endl;
+            }
+        }
+    }
+
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
         const uint32_t srcW = edgeInfo.windowPair.first;
@@ -696,6 +785,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
+    // COMMENTED OUT pending validation on larger datasets.
+    // ========================================================================
+#if 0
+    // ========================================================================
     //
     // When two windows A and B are connected by an internal inter-window
     // edge (both endpoints are mid-backbone), check whether the connection
@@ -935,6 +1028,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << " false internal inter-window edges." << endl;
         }
     }
+#endif
 
     // Validate: check that every edge has shared oriented reads.
     {
