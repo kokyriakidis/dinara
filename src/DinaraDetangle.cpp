@@ -41,9 +41,14 @@ uint64_t dinara::detangleWindows(
     uint64_t detangledCount = 0;
     bypassEdges.clear();
 
-    // Track which anchors need flow reads removed, and which reads to remove.
-    // Key: anchor ID. Value: set of OrientedReadId values to remove.
-    map<Shasta2AnchorId, set<uint32_t>> readsToRemove;
+    // Copy all anchor data to a mutable vector so we can modify in place.
+    // Each window's read removal is immediately visible to subsequent windows.
+    const uint64_t anchorCount = anchors.anchorMarkerInfos.size();
+    vector<vector<Shasta2AnchorMarkerInfo>> mutableAnchors(anchorCount);
+    for(uint64_t i = 0; i < anchorCount; i++) {
+        const auto span = anchors.anchorMarkerInfos[i];
+        mutableAnchors[i].assign(span.begin(), span.end());
+    }
 
     for(const AnchorWindow& window : anchorWindows) {
 
@@ -143,14 +148,13 @@ uint64_t dinara::detangleWindows(
                 }
 
                 if(foundPrev && foundNext) {
-                    // Compute common reads between the two connection anchors.
+                    // Compute common reads between the two connection anchors
+                    // using the mutable copy (reflects prior windows' removals).
                     set<uint32_t> prevReads, nextReads;
-                    const auto prevSpan = anchors[prevExitAnchor];
-                    for(const auto& mi : prevSpan) {
+                    for(const auto& mi : mutableAnchors[uint64_t(prevExitAnchor)]) {
                         prevReads.insert(mi.orientedReadId.getValue());
                     }
-                    const auto nextSpan = anchors[nextEntryAnchor];
-                    for(const auto& mi : nextSpan) {
+                    for(const auto& mi : mutableAnchors[uint64_t(nextEntryAnchor)]) {
                         nextReads.insert(mi.orientedReadId.getValue());
                     }
                     uint64_t commonCount = 0;
@@ -177,7 +181,7 @@ uint64_t dinara::detangleWindows(
             }
         }
 
-        // Mark flow reads for removal from each backbone anchor.
+        // Remove flow reads from each backbone anchor immediately.
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
         const auto& positions = window.filteredBackbonePositions;
@@ -191,49 +195,34 @@ uint64_t dinara::detangleWindows(
             if(processedAnchors.count(canonicalId)) continue;
             processedAnchors.insert(canonicalId);
 
-            // For canonical anchor: remove reads whose OrientedReadId value
-            // is in allFlowReads.
-            for(const uint32_t r : allFlowReads) {
-                readsToRemove[canonicalId].insert(r);
-            }
+            // Remove flow reads from canonical anchor in place.
+            auto& canonicalData = mutableAnchors[uint64_t(canonicalId)];
+            canonicalData.erase(
+                std::remove_if(canonicalData.begin(), canonicalData.end(),
+                    [&](const Shasta2AnchorMarkerInfo& mi) {
+                        return allFlowReads.count(mi.orientedReadId.getValue());
+                    }),
+                canonicalData.end());
 
-            // For RC anchor: flow reads are stored as forward-strand values,
-            // but RC anchor reads are strand-flipped.
-            for(const uint32_t r : allFlowReads) {
-                readsToRemove[rcId].insert(r ^ 1);
-            }
+            // Remove flow reads from RC anchor in place.
+            // Flow reads are forward-strand values; RC anchor reads are flipped.
+            auto& rcData = mutableAnchors[uint64_t(rcId)];
+            rcData.erase(
+                std::remove_if(rcData.begin(), rcData.end(),
+                    [&](const Shasta2AnchorMarkerInfo& mi) {
+                        return allFlowReads.count(mi.orientedReadId.getValue() ^ 1);
+                    }),
+                rcData.end());
         }
 
-        cout << "    Marked " << allFlowReads.size() << " flow reads for removal from "
+        cout << "    Removed " << allFlowReads.size() << " flow reads from "
              << processedAnchors.size() << " backbone anchor pairs." << endl;
     }
 
-    // Rebuild anchorMarkerInfos: copy all anchors, removing flow reads
-    // from backbone anchors of detangled windows.
-    if(!readsToRemove.empty()) {
-        const uint64_t anchorCount = anchors.anchorMarkerInfos.size();
-        vector<vector<Shasta2AnchorMarkerInfo>> allAnchors(anchorCount);
-
-        for(uint64_t i = 0; i < anchorCount; i++) {
-            const auto span = anchors.anchorMarkerInfos[i];
-            auto it = readsToRemove.find(Shasta2AnchorId(i));
-            if(it != readsToRemove.end()) {
-                const auto& toRemove = it->second;
-                for(const auto& mi : span) {
-                    if(!toRemove.count(mi.orientedReadId.getValue())) {
-                        allAnchors[i].push_back(mi);
-                    }
-                }
-            } else {
-                allAnchors[i].assign(span.begin(), span.end());
-            }
-        }
-
-        // Rebuild the VectorOfVectors.
-        anchors.anchorMarkerInfos.clear();
-        for(const auto& anchorData : allAnchors) {
-            anchors.anchorMarkerInfos.appendVector(anchorData);
-        }
+    // Rebuild anchorMarkerInfos from the modified mutable copy.
+    anchors.anchorMarkerInfos.clear();
+    for(const auto& anchorData : mutableAnchors) {
+        anchors.anchorMarkerInfos.appendVector(anchorData);
     }
 
     cout << timestamp << "Detangling: " << detangledCount
