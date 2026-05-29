@@ -44,6 +44,10 @@ struct AnchorWindow {
     uint32_t backboneBegin = 0; // Inclusive journey position on backbone.
     uint32_t backboneEnd = 0;   // Exclusive journey position on backbone.
 
+    // Base span of the backbone (distance in bases from first to last
+    // backbone anchor on the backbone read). Set during window construction.
+    uint64_t baseSpan = 0;
+
     // Filtered backbone positions: the longest subsequence of journey
     // positions in [backboneBegin, backboneEnd) where every consecutive
     // pair has sufficient common read support. Intra-window edges should
