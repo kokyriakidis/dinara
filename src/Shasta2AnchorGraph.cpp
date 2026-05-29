@@ -1189,18 +1189,132 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
+    // Cross-edge filter: remove edges of windows that bridge unrelated
+    // parts of the graph. For each window W with incoming from A and
+    // outgoing to C, check if A's outgoing neighbors and C's incoming
+    // neighbors share any common windows (excluding W). If no overlap
+    // for ALL (A, C) pairs, W is a spurious bridge and its edges are removed.
+    auto runCrossEdgeFilter = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Build per-window neighbor sets from active edges.
+        std::map<uint32_t, std::set<uint32_t>> inNeighbors;  // w <- sources
+        std::map<uint32_t, std::set<uint32_t>> outNeighbors;  // w -> destinations
+
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcRaw = anchorToWindow[srcVal];
+            const uint32_t dstRaw = anchorToWindow[dstVal];
+            if(srcRaw == noWindow || dstRaw == noWindow) continue;
+            const uint32_t s = normalize(srcRaw);
+            const uint32_t d = normalize(dstRaw);
+            if(s == d) continue;
+            outNeighbors[s].insert(d);
+            inNeighbors[d].insert(s);
+        }
+
+        uint64_t crossEdgeRemovedCount = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto inIt = inNeighbors.find(w);
+            const auto outIt = outNeighbors.find(w);
+            if(inIt == inNeighbors.end() || outIt == outNeighbors.end())
+                continue;
+
+            // Check every (A incoming, C outgoing) pair.
+            // If ALL pairs have no neighbor overlap, W is a spurious bridge.
+            // Only consider pairs where both A and C are internal windows
+            // (have edges on both sides).
+            const uint64_t wSpan = anchorWindows[w].baseSpan;
+            bool allDisjoint = true;
+            bool hasValidPair = false;
+            for(const uint32_t A : inIt->second) {
+                if(A >= windowCount) continue;
+                const auto aOutIt = outNeighbors.find(A);
+                const auto aInIt = inNeighbors.find(A);
+                // A must have both incoming and outgoing (internal window).
+                if(aOutIt == outNeighbors.end() || aInIt == inNeighbors.end())
+                    continue;
+                // A must be larger than W.
+                if(anchorWindows[A].baseSpan <= wSpan) continue;
+
+                for(const uint32_t C : outIt->second) {
+                    if(C >= windowCount) continue;
+                    if(A == C) continue;
+                    const auto cInIt = inNeighbors.find(C);
+                    const auto cOutIt = outNeighbors.find(C);
+                    // C must have both incoming and outgoing (internal window).
+                    if(cInIt == inNeighbors.end() || cOutIt == outNeighbors.end())
+                        continue;
+                    // C must be larger than W.
+                    if(anchorWindows[C].baseSpan <= wSpan) continue;
+
+                    hasValidPair = true;
+
+                    // Check if A's outgoing neighbors and C's incoming
+                    // neighbors share any window (excluding W).
+                    bool hasOverlap = false;
+                    for(const uint32_t aOut : aOutIt->second) {
+                        if(aOut == w) continue;
+                        if(cInIt->second.count(aOut)) {
+                            hasOverlap = true;
+                            break;
+                        }
+                    }
+                    if(hasOverlap) {
+                        allDisjoint = false;
+                        break;
+                    }
+                }
+                if(!allDisjoint) break;
+            }
+
+            if(!allDisjoint || !hasValidPair) continue;
+
+            // W bridges unrelated regions. Disable all its inter-window edges.
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[srcVal];
+                const uint32_t dstRaw = anchorToWindow[dstVal];
+                if(srcRaw == noWindow || dstRaw == noWindow) continue;
+                const uint32_t s = normalize(srcRaw);
+                const uint32_t d = normalize(dstRaw);
+                if(s == d) continue;
+                if(s == w || d == w) {
+                    disableEdge(e);
+                    ++crossEdgeRemovedCount;
+                }
+            }
+        }
+
+        if(crossEdgeRemovedCount > 0) {
+            cout << "Cross-edge filter: removed " << crossEdgeRemovedCount
+                 << " spurious bridge edges." << endl;
+        }
+    };
+
     // ========================================================================
     // Filter pipeline:
     //   1. Shortcut filter (remove bypass edges for small windows)
     //   2. Parallel filter (A→A flows)
-    //   3. Remove isolated windows (no inter-window edges remaining)
-    //   4. Trim backbones (trim ends without inter-window edges)
-    //   5. Small window removal (≤ 2 anchors)
-    //   6. Dangling cleanup
+    //   3. Cross-edge filter (remove spurious bridges between unrelated regions)
+    //   4. Remove isolated windows (no inter-window edges remaining)
+    //   5. Trim backbones (trim ends without inter-window edges)
+    //   6. Small window removal (≤ 2 anchors)
+    //   7. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
     runShortcutFilter();
     runParallelFilter();
+    runCrossEdgeFilter();
     removeIsolatedWindows();
     trimBackbones();
     removeSmallWindows(2);
