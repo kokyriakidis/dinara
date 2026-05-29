@@ -314,6 +314,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Populate backbonePreviousWindow / backboneNextWindow for each window.
+    for(uint32_t wid = 0; wid < windowCount; wid++) {
+        auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
+        const uint32_t bbOid = window.backboneOrientedReadId.getValue();
+        for(const auto& ri : window.readIntervals) {
+            if(ri.orientedReadId.getValue() == bbOid) {
+                window.backbonePreviousWindow = ri.previousWindow;
+                window.backboneNextWindow = ri.nextWindow;
+                break;
+            }
+        }
+    }
+
     // Inter-window edges: walk each read's journey and collect candidate
     // anchor pairs (lastAnchorInWindowA, firstAnchorInWindowB) for each
     // ordered window pair. Pick the candidate with the highest shared
@@ -529,67 +542,52 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 #endif
     };
 
-    // Shortcut filter: remove edges for small bypass windows.
-    // Shortcut filter (structural): for each window w, find pairs of
-    // (incoming neighbor A, outgoing neighbor C) where A and C are both
-    // bigger than w and directly connected. Remove only the edges between
-    // w and those specific neighbors involved in bypassed pairs.
+    // Shortcut filter: a window is a shortcut window if its backbone
+    // read transitions between two windows (backbonePreviousWindow and
+    // backboneNextWindow) that are connected to each other.
+    // The window is redundant — it shortcuts a path that already exists.
     auto runShortcutFilter = [&]() {
-        auto normalize = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : w;
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Build direct connections and per-window neighbor sets from active edges.
-        std::set<std::pair<uint32_t, uint32_t>> directConnections;
-        std::map<uint32_t, std::set<uint32_t>> incomingNeighbors;  // w -> set of windows with edges into w
-        std::map<uint32_t, std::set<uint32_t>> outgoingNeighbors;  // w -> set of windows w has edges to
-
+        // Build per-window neighbor sets from active edges.
+        std::map<uint32_t, std::set<uint32_t>> neighbors;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcW = anchorToWindow[srcVal];
-            const uint32_t dstW = anchorToWindow[dstVal];
-            if(srcW == noWindow || dstW == noWindow) continue;
-            const uint32_t a = normalize(srcW);
-            const uint32_t b = normalize(dstW);
-            if(a == b) continue;
-            directConnections.insert({a, b});
-            directConnections.insert({b, a});
-            incomingNeighbors[b].insert(a);
-            outgoingNeighbors[a].insert(b);
+            const uint32_t srcRaw = anchorToWindow[srcVal];
+            const uint32_t dstRaw = anchorToWindow[dstVal];
+            if(srcRaw == noWindow || dstRaw == noWindow) continue;
+            const uint32_t s = normalize(srcRaw);
+            const uint32_t d = normalize(dstRaw);
+            if(s == d) continue;
+            neighbors[s].insert(d);
+            neighbors[d].insert(s);
         }
 
         uint64_t shortcutRemovedCount = 0;
+
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
-            const uint64_t wSpan = window.baseSpan;
+            const uint32_t prevW = window.backbonePreviousWindow;
+            const uint32_t nextW = window.backboneNextWindow;
 
-            const auto inIt = incomingNeighbors.find(w);
-            const auto outIt = outgoingNeighbors.find(w);
-            if(inIt == incomingNeighbors.end() || outIt == outgoingNeighbors.end())
+            // Both endpoints must exist and be different.
+            if(prevW == noWindow || nextW == noWindow) continue;
+            if(prevW == nextW) continue;
+
+            // Check if prevW and nextW are connected to each other.
+            const auto prevIt = neighbors.find(prevW);
+            if(prevIt == neighbors.end() || !prevIt->second.count(nextW)) {
+                // They are not connected — not a shortcut window.
                 continue;
-
-            // Find bypassed pairs: (A incoming, C outgoing) where
-            // A and C are both bigger (by base span) and directly connected.
-            std::set<uint32_t> neighborsToRemove;
-            for(const uint32_t A : inIt->second) {
-                if(A >= windowCount) continue;
-                if(anchorWindows[A].baseSpan <= wSpan) continue;
-                for(const uint32_t C : outIt->second) {
-                    if(C >= windowCount) continue;
-                    if(A == C) continue;
-                    if(anchorWindows[C].baseSpan <= wSpan) continue;
-                    if(directConnections.count({A, C})) {
-                        neighborsToRemove.insert(A);
-                        neighborsToRemove.insert(C);
-                    }
-                }
             }
-            if(neighborsToRemove.empty()) continue;
 
-            // Disable edges between w and the bypassed neighbors.
+            // prevW and nextW are connected. This is a shortcut window.
+            // Disable all its inter-window edges.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -598,19 +596,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint32_t srcRaw = anchorToWindow[srcVal];
                 const uint32_t dstRaw = anchorToWindow[dstVal];
                 if(srcRaw == noWindow || dstRaw == noWindow) continue;
-                const uint32_t srcWin = normalize(srcRaw);
-                const uint32_t dstWin = normalize(dstRaw);
-                if(srcWin == dstWin) continue;
-                if((srcWin == w && neighborsToRemove.count(dstWin)) ||
-                   (dstWin == w && neighborsToRemove.count(srcWin))) {
+                const uint32_t s = normalize(srcRaw);
+                const uint32_t d = normalize(dstRaw);
+                if(s == d) continue;
+                if(s == w || d == w) {
                     disableEdge(e);
                     ++shortcutRemovedCount;
                 }
             }
         }
+
         if(shortcutRemovedCount > 0) {
             cout << "Shortcut filter: removed " << shortcutRemovedCount
-                 << " redundant inter-window edges." << endl;
+                 << " redundant shortcut edges." << endl;
         }
     };
 
@@ -1189,20 +1187,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // Cross-edge filter: remove edges of windows that bridge unrelated
-    // parts of the graph. For each window W with incoming from A and
-    // outgoing to C, check if A's outgoing neighbors and C's incoming
-    // neighbors share any common windows (excluding W). If no overlap
-    // for ALL (A, C) pairs, W is a spurious bridge and its edges are removed.
-    auto runCrossEdgeFilter = [&]() {
+    // Cross-window filter: a window is a cross-window if its backbone
+    // read transitions between two windows (backbonePreviousWindow and
+    // backboneNextWindow) that are not connected to each other.
+    // This means the backbone read bridges unrelated regions.
+    auto runCrossWindowFilter = [&]() {
         auto normalize = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
         // Build per-window neighbor sets from active edges.
-        std::map<uint32_t, std::set<uint32_t>> inNeighbors;  // w <- sources
-        std::map<uint32_t, std::set<uint32_t>> outNeighbors;  // w -> destinations
-
+        std::map<uint32_t, std::set<uint32_t>> neighbors;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -1214,69 +1209,30 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t s = normalize(srcRaw);
             const uint32_t d = normalize(dstRaw);
             if(s == d) continue;
-            outNeighbors[s].insert(d);
-            inNeighbors[d].insert(s);
+            neighbors[s].insert(d);
+            neighbors[d].insert(s);
         }
 
-        uint64_t crossEdgeRemovedCount = 0;
+        uint64_t crossWindowRemovedCount = 0;
 
         for(uint32_t w = 0; w < windowCount; w++) {
-            const auto inIt = inNeighbors.find(w);
-            const auto outIt = outNeighbors.find(w);
-            if(inIt == inNeighbors.end() || outIt == outNeighbors.end())
+            const auto& window = anchorWindows[w];
+            const uint32_t prevW = window.backbonePreviousWindow;
+            const uint32_t nextW = window.backboneNextWindow;
+
+            // Both endpoints must exist and be different.
+            if(prevW == noWindow || nextW == noWindow) continue;
+            if(prevW == nextW) continue;
+
+            // Check if prevW and nextW are connected to each other.
+            const auto prevIt = neighbors.find(prevW);
+            if(prevIt != neighbors.end() && prevIt->second.count(nextW)) {
+                // They are connected — not a cross-window.
                 continue;
-
-            // Check every (A incoming, C outgoing) pair.
-            // If ALL pairs have no neighbor overlap, W is a spurious bridge.
-            // Only consider pairs where both A and C are internal windows
-            // (have edges on both sides).
-            const uint64_t wSpan = anchorWindows[w].baseSpan;
-            bool allDisjoint = true;
-            bool hasValidPair = false;
-            for(const uint32_t A : inIt->second) {
-                if(A >= windowCount) continue;
-                const auto aOutIt = outNeighbors.find(A);
-                const auto aInIt = inNeighbors.find(A);
-                // A must have both incoming and outgoing (internal window).
-                if(aOutIt == outNeighbors.end() || aInIt == inNeighbors.end())
-                    continue;
-                // A must be larger than W.
-                if(anchorWindows[A].baseSpan <= wSpan) continue;
-
-                for(const uint32_t C : outIt->second) {
-                    if(C >= windowCount) continue;
-                    if(A == C) continue;
-                    const auto cInIt = inNeighbors.find(C);
-                    const auto cOutIt = outNeighbors.find(C);
-                    // C must have both incoming and outgoing (internal window).
-                    if(cInIt == inNeighbors.end() || cOutIt == outNeighbors.end())
-                        continue;
-                    // C must be larger than W.
-                    if(anchorWindows[C].baseSpan <= wSpan) continue;
-
-                    hasValidPair = true;
-
-                    // Check if A's outgoing neighbors and C's incoming
-                    // neighbors share any window (excluding W).
-                    bool hasOverlap = false;
-                    for(const uint32_t aOut : aOutIt->second) {
-                        if(aOut == w) continue;
-                        if(cInIt->second.count(aOut)) {
-                            hasOverlap = true;
-                            break;
-                        }
-                    }
-                    if(hasOverlap) {
-                        allDisjoint = false;
-                        break;
-                    }
-                }
-                if(!allDisjoint) break;
             }
 
-            if(!allDisjoint || !hasValidPair) continue;
-
-            // W bridges unrelated regions. Disable all its inter-window edges.
+            // prevW and nextW are not connected. This is a cross-window.
+            // Disable all its inter-window edges.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -1290,22 +1246,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(s == d) continue;
                 if(s == w || d == w) {
                     disableEdge(e);
-                    ++crossEdgeRemovedCount;
+                    ++crossWindowRemovedCount;
                 }
             }
         }
 
-        if(crossEdgeRemovedCount > 0) {
-            cout << "Cross-edge filter: removed " << crossEdgeRemovedCount
+        if(crossWindowRemovedCount > 0) {
+            cout << "Cross-window filter: removed " << crossWindowRemovedCount
                  << " spurious bridge edges." << endl;
         }
     };
 
     // ========================================================================
     // Filter pipeline:
-    //   1. Shortcut filter (remove bypass edges for small windows)
+    //   1. Shortcut filter (remove windows that shortcut connected neighbors)
     //   2. Parallel filter (A→A flows)
-    //   3. Cross-edge filter (remove spurious bridges between unrelated regions)
+    //   3. Cross-window filter (remove spurious bridges between unrelated regions)
     //   4. Remove isolated windows (no inter-window edges remaining)
     //   5. Trim backbones (trim ends without inter-window edges)
     //   6. Small window removal (≤ 2 anchors)
@@ -1314,7 +1270,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // ========================================================================
     runShortcutFilter();
     runParallelFilter();
-    runCrossEdgeFilter();
+    runCrossWindowFilter();
     removeIsolatedWindows();
     trimBackbones();
     removeSmallWindows(2);
