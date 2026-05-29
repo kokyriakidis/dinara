@@ -609,16 +609,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         };
 
-        auto findJourneyPos = [&](
-            const auto& journey, const AnchorWindow& window,
-            Shasta2AnchorId anchor) -> int64_t
-        {
-            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-                if(journey[pos] == anchor) return int64_t(pos);
-            }
-            return -1;
-        };
-
         auto normalizeW = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
@@ -632,7 +622,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(positions.empty()) continue;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            int64_t minBound = -1, maxBound = -1;
+            // Find the bounding span: min and max backbone positions of
+            // anchors in this window that have inter-window edges.
+            // Use anchorToBackbonePos which works for both forward and RC anchors.
+            int64_t startBound = -1, endBound = -1;
             bool hasInterWindowEdges = false;
 
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
@@ -645,28 +638,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == noWindow || dstWin == noWindow) continue;
                 if(srcWin == dstWin) continue;
 
-                // Find position of whichever endpoint belongs to this window.
-                // If the anchor is in the RC mirror, use its forward counterpart.
+                // Get the backbone position of whichever endpoint belongs to this window.
                 int64_t pos = -1;
                 if(dstWin == w) {
-                    const uint32_t rawDstWin = anchorToWindow[dstVal];
-                    const uint64_t fwdAnchor = (rawDstWin >= windowCount) ? (dstVal ^ 1ULL) : dstVal;
-                    pos = findJourneyPos(journey, window, Shasta2AnchorId(fwdAnchor));
+                    pos = int64_t(anchorToBackbonePos[dstVal]);
                 } else if(srcWin == w) {
-                    const uint32_t rawSrcWin = anchorToWindow[srcVal];
-                    const uint64_t fwdAnchor = (rawSrcWin >= windowCount) ? (srcVal ^ 1ULL) : srcVal;
-                    pos = findJourneyPos(journey, window, Shasta2AnchorId(fwdAnchor));
+                    pos = int64_t(anchorToBackbonePos[srcVal]);
                 }
                 if(pos >= 0) {
                     hasInterWindowEdges = true;
-                    if(minBound < 0 || pos < minBound) minBound = pos;
-                    if(maxBound < 0 || pos > maxBound) maxBound = pos;
+                    if(startBound < 0 || pos < startBound) startBound = pos;
+                    if(endBound < 0 || pos > endBound) endBound = pos;
                 }
             }
 
             if(!hasInterWindowEdges) continue;
-            const int64_t startBound = minBound;
-            const int64_t endBound = maxBound;
             if(startBound < 0 || endBound < 0 || startBound > endBound) continue;
 
             int64_t keepFirst = -1;
