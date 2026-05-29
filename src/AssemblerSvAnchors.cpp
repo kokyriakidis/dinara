@@ -2884,6 +2884,51 @@ void Assembler::buildSvMSA(
                                                 + bestInsRbp
                                                   ->endpointCount),
                                             "path-mirror"});
+
+                                        // Adjacent-window variants.
+                                        if(pmSize
+                                           > int64_t(windowSize)) {
+                                            const int64_t adjPm =
+                                                pmSize
+                                                - int64_t(windowSize);
+                                            cout << "    >>> DELETION"
+                                                 << " CALL"
+                                                 << " (path-mirror-adj"
+                                                 << "): size="
+                                                 << adjPm
+                                                 << "bp, breakpoint="
+                                                 << insBpPos
+                                                 << endl;
+                                            delCallRecords.push_back({
+                                                insBpPos,
+                                                adjPm,
+                                                uint32_t(
+                                                    lbp.endpointCount
+                                                    + bestInsRbp
+                                                      ->endpointCount),
+                                                "path-mirror-adj"});
+                                        }
+                                        {
+                                            const int64_t adjPmUp =
+                                                pmSize
+                                                + int64_t(windowSize);
+                                            cout << "    >>> DELETION"
+                                                 << " CALL"
+                                                 << " (path-mirror-adj"
+                                                 << "): size="
+                                                 << adjPmUp
+                                                 << "bp, breakpoint="
+                                                 << insBpPos
+                                                 << endl;
+                                            delCallRecords.push_back({
+                                                insBpPos,
+                                                adjPmUp,
+                                                uint32_t(
+                                                    lbp.endpointCount
+                                                    + bestInsRbp
+                                                      ->endpointCount),
+                                                "path-mirror-adj"});
+                                        }
                                     }
                                 }
                             }
@@ -3102,6 +3147,46 @@ void Assembler::buildSvMSA(
                                     lbp.endpointCount
                                     + bestRbp->endpointCount),
                                 "bp-pair"});
+
+                            // Emit adjacent-window variants.
+                            // BP windows can be off by one window
+                            // in either direction. Emit calls at
+                            // bestDist ± windowSize so the scorer
+                            // can pick whichever is closest.
+                            if(bpPairSize > int64_t(windowSize)) {
+                                const int64_t adjSize =
+                                    bpPairSize - int64_t(windowSize);
+                                cout << "    >>> DELETION CALL"
+                                     << " (bp-pair-adj): size="
+                                     << adjSize << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << endl;
+                                delCallRecords.push_back({
+                                    breakpointPos,
+                                    adjSize,
+                                    uint32_t(
+                                        lbp.endpointCount
+                                        + bestRbp->endpointCount),
+                                    "bp-pair-adj"});
+                            }
+                            {
+                                const int64_t adjSizeUp =
+                                    bpPairSize + int64_t(windowSize);
+                                cout << "    >>> DELETION CALL"
+                                     << " (bp-pair-adj): size="
+                                     << adjSizeUp << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << endl;
+                                delCallRecords.push_back({
+                                    breakpointPos,
+                                    adjSizeUp,
+                                    uint32_t(
+                                        lbp.endpointCount
+                                        + bestRbp->endpointCount),
+                                    "bp-pair-adj"});
+                            }
                         }
 
                     }
