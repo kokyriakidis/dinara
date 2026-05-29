@@ -19,9 +19,16 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName) const
     }
     gfa << "H\tVN:Z:1.0\n";
 
-    // Write non-isolated vertices only.
-    BGL_FORALL_VERTICES(v, *this, Shasta2AnchorGraph) {
-        if(in_degree(v, *this) == 0 && out_degree(v, *this) == 0) continue;
+    // Collect vertices that have at least one active edge.
+    std::set<vertex_descriptor> activeVertices;
+    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
+        if(!(*this)[e].useForAssembly) continue;
+        activeVertices.insert(source(e, *this));
+        activeVertices.insert(target(e, *this));
+    }
+
+    // Write active vertices only.
+    for(const auto v : activeVertices) {
         gfa << "S\t" << v << "\t*\tLN:i:1\n";
     }
 

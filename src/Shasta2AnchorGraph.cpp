@@ -484,6 +484,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     std::vector<EdgeInfo> outgoingEdges;
 
                     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                        if(!anchorGraph[e].useForAssembly) continue;
                         const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                         const uint64_t dstVal = uint64_t(target(e, anchorGraph));
                         const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
@@ -495,23 +496,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                             outgoingEdges.push_back({e, Shasta2AnchorId(srcVal)});
                     }
 
-                    std::vector<edge_descriptor> edgesToRemove;
                     for(const auto& in : incomingEdges) {
                         const uint32_t landingPos = anchorToBackbonePos[uint64_t(in.anchorInW)];
                         for(const auto& out : outgoingEdges) {
                             const uint32_t leavingPos = anchorToBackbonePos[uint64_t(out.anchorInW)];
                             if(landingPos <= leavingPos) {
-                                edgesToRemove.push_back(in.e);
-                                edgesToRemove.push_back(out.e);
+                                if(anchorGraph[in.e].useForAssembly) {
+                                    anchorGraph[in.e].useForAssembly = false;
+                                    ++parallelRemovedCount;
+                                }
+                                if(anchorGraph[out.e].useForAssembly) {
+                                    anchorGraph[out.e].useForAssembly = false;
+                                    ++parallelRemovedCount;
+                                }
                             }
                         }
-                    }
-                    std::sort(edgesToRemove.begin(), edgesToRemove.end());
-                    edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
-                                        edgesToRemove.end());
-                    for(const auto& e : edgesToRemove) {
-                        boost::remove_edge(e, anchorGraph);
-                        ++parallelRemovedCount;
                     }
                 }
             }
@@ -565,22 +564,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 neighborsToRemove.insert(C);
             }
 
-            std::vector<edge_descriptor> edgesToRemove;
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                 const uint64_t dstVal = uint64_t(target(e, anchorGraph));
                 const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
                 const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
                 if(srcWin == dstWin) continue;
-                if(srcWin == b && neighborsToRemove.count(dstWin)) edgesToRemove.push_back(e);
-                if(dstWin == b && neighborsToRemove.count(srcWin)) edgesToRemove.push_back(e);
-            }
-            std::sort(edgesToRemove.begin(), edgesToRemove.end());
-            edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
-                                edgesToRemove.end());
-            for(const auto& e : edgesToRemove) {
-                boost::remove_edge(e, anchorGraph);
-                ++shortcutRemovedCount;
+                if((srcWin == b && neighborsToRemove.count(dstWin)) ||
+                   (dstWin == b && neighborsToRemove.count(srcWin))) {
+                    anchorGraph[e].useForAssembly = false;
+                    ++shortcutRemovedCount;
+                }
             }
         }
         if(shortcutRemovedCount > 0) {
@@ -595,20 +590,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         auto clearIntraWindowEdges = [&](uint64_t vid) {
             if(vid >= anchorCount) return;
             const uint32_t vWindow = anchorToWindow[vid];
-            std::vector<edge_descriptor> toRemove;
             auto oe = boost::out_edges(vid, anchorGraph);
             for(auto it = oe.first; it != oe.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
                 const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                 if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
-                    toRemove.push_back(*it);
+                    anchorGraph[*it].useForAssembly = false;
             }
             auto ie = boost::in_edges(vid, anchorGraph);
             for(auto it = ie.first; it != ie.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
                 const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
                 if(src < anchorCount && anchorToWindow[src] == vWindow)
-                    toRemove.push_back(*it);
+                    anchorGraph[*it].useForAssembly = false;
             }
-            for(const auto& e : toRemove) boost::remove_edge(e, anchorGraph);
         };
 
         auto findJourneyPos = [&](
@@ -638,6 +633,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             bool hasInterWindowEdges = false;
 
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                 const uint64_t dstVal = uint64_t(target(e, anchorGraph));
                 if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
@@ -697,9 +693,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         auto normalizeW2 = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
+        // Count active edges per vertex.
+        auto activeEdgeCount = [&](uint64_t vid) -> uint64_t {
+            uint64_t count = 0;
+            auto oe = boost::out_edges(vid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it)
+                if(anchorGraph[*it].useForAssembly) ++count;
+            auto ie = boost::in_edges(vid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it)
+                if(anchorGraph[*it].useForAssembly) ++count;
+            return count;
+        };
+
         uint64_t orphanedEdgeCount = 0;
-        std::vector<edge_descriptor> orphanedEdges;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
@@ -707,16 +715,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t dstWin = normalizeW2(anchorToWindow[dstVal]);
             if(srcWin == noWindow || dstWin == noWindow) continue;
             if(srcWin == dstWin) continue;
-            const auto srcV = vertex(srcVal, anchorGraph);
-            const auto dstV = vertex(dstVal, anchorGraph);
-            if(out_degree(srcV, anchorGraph) + in_degree(srcV, anchorGraph) <= 1 ||
-               out_degree(dstV, anchorGraph) + in_degree(dstV, anchorGraph) <= 1) {
-                orphanedEdges.push_back(e);
+            if(activeEdgeCount(srcVal) <= 1 || activeEdgeCount(dstVal) <= 1) {
+                anchorGraph[e].useForAssembly = false;
+                ++orphanedEdgeCount;
             }
-        }
-        for(const auto& e : orphanedEdges) {
-            boost::remove_edge(e, anchorGraph);
-            ++orphanedEdgeCount;
         }
         if(orphanedEdgeCount > 0) {
             cout << "Rule 1: removed " << orphanedEdgeCount
@@ -735,6 +737,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         std::map<uint32_t, uint64_t> inCount, outCount;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
             if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
@@ -747,37 +750,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         uint64_t danglingRemovedCount = 0;
-
-        // List windows with low inter-window edge counts, including neighbors.
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const uint64_t wIn = inCount.count(w) ? inCount[w] : 0;
-            const uint64_t wOut = outCount.count(w) ? outCount[w] : 0;
-            if(wIn + wOut > 0 && wIn + wOut <= 4) {
-                // Find which windows the edges connect to.
-                std::set<uint32_t> inFrom, outTo;
-                BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                    const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                    const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                    if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                    const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
-                    const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
-                    if(srcWin == noWindow || dstWin == noWindow) continue;
-                    if(srcWin == dstWin) continue;
-                    if(dstWin == w) inFrom.insert(srcWin);
-                    if(srcWin == w) outTo.insert(dstWin);
-                }
-                cout << "  Window " << w << " inter-window edges: in=" << wIn
-                     << " out=" << wOut << " (backbone="
-                     << anchorWindows[w].filteredBackbonePositions.size() << ")";
-                cout << " from=[";
-                bool first = true;
-                for(uint32_t n : inFrom) { if(!first) cout << ","; cout << n; first = false; }
-                cout << "] to=[";
-                first = true;
-                for(uint32_t n : outTo) { if(!first) cout << ","; cout << n; first = false; }
-                cout << "]" << endl;
-            }
-        }
 
         for(uint32_t w = 0; w < windowCount; w++) {
             const bool hasIn = (inCount.count(w) && inCount[w] > 0);
@@ -792,6 +764,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             std::vector<NeighborEdge> neighborEdges;
 
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
                 const uint64_t dstVal = uint64_t(target(e, anchorGraph));
                 if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
@@ -804,18 +777,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == w) neighborEdges.push_back({e, dstWin, false});
             }
 
-            cout << "  Dangling window " << w
-                 << " (in=" << (inCount.count(w) ? inCount[w] : 0)
-                 << ", out=" << (outCount.count(w) ? outCount[w] : 0)
-                 << ", " << neighborEdges.size() << " neighbor edges):";
-            for(const auto& ne : neighborEdges) {
-                cout << " " << (ne.isIncoming ? "from" : "to") << "=" << ne.neighborWin;
-            }
-            cout << endl;
-
             // Check if removing W's edges would make any neighbor
-            // *become* dangling (transition from having both incoming
-            // and outgoing to having only one side).
+            // *become* dangling (transition from two-sided to one-sided).
             bool safeToRemove = true;
             for(const auto& ne : neighborEdges) {
                 const uint32_t n = ne.neighborWin;
@@ -831,14 +794,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint64_t nInAfter = nInBefore - nInFromW;
                 const uint64_t nOutAfter = nOutBefore - nOutToW;
 
-                // Was the neighbor two-sided before but would become
-                // one-sided after?
                 const bool wasTwoSided = (nInBefore > 0) && (nOutBefore > 0);
                 const bool wouldBeOneSided = (nInAfter > 0) != (nOutAfter > 0);
                 if(wasTwoSided && wouldBeOneSided) {
-                    cout << "    Blocked by neighbor " << n
-                         << " (in: " << nInBefore << "->" << nInAfter
-                         << ", out: " << nOutBefore << "->" << nOutAfter << ")" << endl;
                     safeToRemove = false;
                     break;
                 }
@@ -846,16 +804,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             if(!safeToRemove) continue;
 
-            std::vector<edge_descriptor> edgesToRemove;
             for(const auto& ne : neighborEdges) {
-                edgesToRemove.push_back(ne.e);
-            }
-            std::sort(edgesToRemove.begin(), edgesToRemove.end());
-            edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
-                                edgesToRemove.end());
-            for(const auto& e : edgesToRemove) {
-                boost::remove_edge(e, anchorGraph);
-                ++danglingRemovedCount;
+                if(anchorGraph[ne.e].useForAssembly) {
+                    anchorGraph[ne.e].useForAssembly = false;
+                    ++danglingRemovedCount;
+                }
             }
         }
 
@@ -1059,6 +1012,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     if(i != startPosIdx) {
                         bool hasInterWindowEdge = false;
                         BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
+                            if(!anchorGraph[outE].useForAssembly) continue;
                             const uint64_t tgt = uint64_t(target(outE, anchorGraph));
                             const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
                             const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
@@ -1069,6 +1023,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         }
                         if(!hasInterWindowEdge) {
                             BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
+                                if(!anchorGraph[inE].useForAssembly) continue;
                                 const uint64_t src = uint64_t(source(inE, anchorGraph));
                                 const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
                                 const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
@@ -1095,6 +1050,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     if(uint64_t(i) != startPosIdx) {
                         bool hasInterWindowEdge = false;
                         BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
+                            if(!anchorGraph[outE].useForAssembly) continue;
                             const uint64_t tgt = uint64_t(target(outE, anchorGraph));
                             const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
                             const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
@@ -1105,6 +1061,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         }
                         if(!hasInterWindowEdge) {
                             BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
+                                if(!anchorGraph[inE].useForAssembly) continue;
                                 const uint64_t src = uint64_t(source(inE, anchorGraph));
                                 const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
                                 const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
@@ -1142,10 +1099,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         // Find internal inter-window edges and check the 2x2 matrix.
         uint64_t case2RemovedCount = 0;
-        bool changed = true;
-        while(changed) {
-            changed = false;
+        {
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
                 const Shasta2AnchorId srcAid = Shasta2AnchorId(uint64_t(source(e, anchorGraph)));
                 const Shasta2AnchorId dstAid = Shasta2AnchorId(uint64_t(target(e, anchorGraph)));
 
@@ -1211,10 +1167,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         best.connectivityMatrix[1][1];
 
                     if(isDiagonal) {
-                        boost::remove_edge(e, anchorGraph);
+                        anchorGraph[e].useForAssembly = false;
                         ++case2RemovedCount;
-                        changed = true;
-                        break; // Iterator invalidated, restart.
                     }
                 }
             }
