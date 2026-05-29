@@ -794,9 +794,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint64_t nInAfter = nInBefore - nInFromW;
                 const uint64_t nOutAfter = nOutBefore - nOutToW;
 
-                const bool wasTwoSided = (nInBefore > 0) && (nOutBefore > 0);
-                const bool wouldBeOneSided = (nInAfter > 0) != (nOutAfter > 0);
-                if(wasTwoSided && wouldBeOneSided) {
+                // Only block removal if neighbor would become fully isolated
+                // (no inter-window edges at all). One-sided neighbors will be
+                // cleaned up by subsequent iterations.
+                const bool wouldBeIsolated = (nInAfter == 0) && (nOutAfter == 0);
+                if(wouldBeIsolated) {
                     safeToRemove = false;
                     break;
                 }
