@@ -943,8 +943,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     const uint64_t nOutAfter = (nOutBefore >= totalOutLoss) ? nOutBefore - totalOutLoss : 0;
 
                     if(nInAfter == 0 && nOutAfter == 0) {
-                        safeToRemove = false;
-                        break;
+                        // Allow removal if the neighbor (raw) is itself dangling
+                        // (it will be removed too in this or a subsequent iteration).
+                        const uint64_t nRawIn = rawInCount.count(nRaw) ? rawInCount[nRaw] : 0;
+                        const uint64_t nRawOut = rawOutCount.count(nRaw) ? rawOutCount[nRaw] : 0;
+                        const bool neighborRawDangling =
+                            (nRawIn > 0) != (nRawOut > 0);
+                        if(!neighborRawDangling) {
+                            safeToRemove = false;
+                            break;
+                        }
                     }
                 }
 
