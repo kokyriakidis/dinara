@@ -477,6 +477,8 @@ void Assembler::buildSvMSA(
 
         // Parse SA tag SV evidence from BAM if provided.
         vector<SaTagSvCall> saTagCalls;
+        vector<SoftClipBreakpoint> softClipBPs;
+        vector<CigarIndelCall> cigarIndels;
         if(!bamFileName.empty()) {
             // Extract chromosome name and region offset from the
             // reference read name. The name may be "chr1:100-200".
@@ -529,8 +531,6 @@ void Assembler::buildSvMSA(
                 }
             }
             // Parse soft-clip breakpoints and CIGAR indels.
-            vector<SoftClipBreakpoint> softClipBPs;
-            vector<CigarIndelCall> cigarIndels;
             parseBamEvidence(
                 bamFileName, refName,
                 regionStart, regionStart + refLength,
@@ -566,10 +566,14 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            // Emit CIGAR indel calls when they have strong
-            // support (>=3 reads) and size >=50bp.
+            // Emit CIGAR indel calls with sufficient support.
+            // DEL: >=2 reads (CIGAR D ops are high-confidence).
+            // INS: >=3 reads (insertions need more support to
+            // avoid false positives from alignment artifacts).
             for(const auto& ci : cigarIndels) {
-                if(ci.readCount >= 3 && ci.size >= 50) {
+                const uint32_t minReads =
+                    (ci.svType == "DEL") ? 2 : 3;
+                if(ci.readCount >= minReads && ci.size >= 50) {
                     cout << "    >>> "
                          << (ci.svType == "DEL"
                              ? "DELETION" : "INSERTION")
@@ -5012,6 +5016,59 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
+        // CIGAR-corroborated k-mer cluster emission.
+        //
+        // In STR regions, k-mer chains may classify only 1-2 reads
+        // as DEL (too few for merged-cluster emission), while CIGAR
+        // net-deletion evidence independently confirms a deletion
+        // at a nearby position. When a k-mer DEL cluster (1-2 reads,
+        // size >= 50bp) has a CIGAR DEL cluster within 200bp, emit
+        // the k-mer cluster's size (which better reflects the true
+        // deletion through repeat-unit counting).
+        // -----------------------------------------------------------------
+        if(!cigarIndels.empty()) {
+            for(int32_t cid = 0; cid < totalClusters; ++cid) {
+                uint32_t count = 0;
+                int64_t sumSize = 0;
+                uint64_t sumPos = 0;
+                SvType cType = SvType::ReferenceLike;
+
+                for(const auto& rg : readGroups) {
+                    if(rg.clusterId != cid) continue;
+                    ++count;
+                    sumSize += rg.svSize;
+                    sumPos += rg.breakpointRefPos;
+                    cType = rg.svType;
+                }
+                if(count == 0 || count > 2) continue;
+                if(cType != SvType::Deletion) continue;
+                const int64_t clusterSize =
+                    sumSize / int64_t(count);
+                if(clusterSize < 50) continue;
+                const uint64_t clusterPos = sumPos / count;
+
+                // Check for a nearby CIGAR DEL cluster.
+                for(const auto& ci : cigarIndels) {
+                    if(ci.svType != "DEL") continue;
+                    if(ci.readCount < 3) continue;
+                    const int64_t posDiff =
+                        int64_t(ci.refPos) - int64_t(clusterPos);
+                    if(std::abs(posDiff) <= 200) {
+                        cout << "    >>> DELETION CALL"
+                             << " (CIGAR-corroborated): "
+                             << "size=" << clusterSize << "bp"
+                             << ", breakpoint=" << clusterPos
+                             << ", kmerReads=" << count
+                             << ", cigarReads=" << ci.readCount
+                             << ", cigarSize=" << ci.size << "bp"
+                             << endl;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // SDUST-gated low-complexity SV detection.
         //
         // For low-complexity regions (detected by SDUST), standard
@@ -5820,7 +5877,17 @@ void Assembler::parseBamEvidence(
         }
 
         // Check CIGAR for large I/D operations.
+        // Collect per-read D operations first, then merge nearby
+        // ones into compound deletions (handles tandem repeat
+        // regions where the aligner splits one deletion into
+        // multiple D ops separated by short matches).
         {
+            struct DelOp {
+                uint32_t refPos;
+                int64_t  size;
+            };
+            vector<DelOp> readDels;
+
             int64_t refPos = pos;
             int32_t queryPos = 0;
             // Skip leading soft clip in query position.
@@ -5828,16 +5895,36 @@ void Assembler::parseBamEvidence(
                && bam_cigar_op(cigar[0]) == BAM_CSOFT_CLIP) {
                 queryPos = bam_cigar_oplen(cigar[0]);
             }
+
+            // Also track net indel effect for this read
+            // (sum of all D minus sum of all I, regardless
+            // of individual op size).
+            int64_t totalDel = 0;
+            int64_t totalIns = 0;
+            // Track position of the largest D op (even if
+            // below minIndelSize) for net-CIGAR breakpoint.
+            uint32_t largestDelPos = uint32_t(pos);
+            int64_t largestDelSize = 0;
+
             for(int ci = 0; ci < nCigar; ++ci) {
                 const int op = bam_cigar_op(cigar[ci]);
                 const int len = bam_cigar_oplen(cigar[ci]);
 
                 if(op == BAM_CDEL && len >= minIndelSize) {
-                    indelObs.push_back({
-                        true, int64_t(len),
-                        uint32_t(refPos), ""
+                    readDels.push_back({
+                        uint32_t(refPos), int64_t(len)
                     });
-                } else if(op == BAM_CINS && len >= minIndelSize) {
+                }
+                if(op == BAM_CDEL) {
+                    totalDel += len;
+                    if(int64_t(len) > largestDelSize) {
+                        largestDelSize = int64_t(len);
+                        largestDelPos = uint32_t(refPos);
+                    }
+                }
+                if(op == BAM_CINS) totalIns += len;
+
+                if(op == BAM_CINS && len >= minIndelSize) {
                     string insSeq;
                     insSeq.reserve(len);
                     for(int i = queryPos;
@@ -5864,6 +5951,54 @@ void Assembler::parseBamEvidence(
                           || op == BAM_CSOFT_CLIP) {
                     queryPos += len;
                 }
+            }
+
+            // Merge nearby D operations within this read.
+            // If two D ops are within 100bp on the reference,
+            // combine them into a single compound deletion.
+            // This handles tandem repeats where e.g. 35D + 55D
+            // should be reported as a single 90D.
+            if(readDels.size() >= 2) {
+                size_t wi = 0;
+                for(size_t ri = 1; ri < readDels.size(); ++ri) {
+                    const uint32_t gap =
+                        readDels[ri].refPos
+                        - readDels[wi].refPos
+                        - uint32_t(readDels[wi].size);
+                    if(gap <= 100) {
+                        // Merge: sum deleted bases (not
+                        // reference span) so the size
+                        // matches truth-set conventions.
+                        readDels[wi].size += readDels[ri].size;
+                    } else {
+                        ++wi;
+                        readDels[wi] = readDels[ri];
+                    }
+                }
+                readDels.resize(wi + 1);
+            }
+
+            // Emit individual (possibly merged) D observations.
+            for(const auto& d : readDels) {
+                indelObs.push_back({
+                    true, d.size, d.refPos, ""
+                });
+            }
+
+            // Net-CIGAR deletion: if the read's total CIGAR
+            // deletions exceed insertions by >= 30bp, record
+            // a net-deletion observation. This catches STR
+            // regions where the aligner fragments the deletion
+            // into many small D ops below minIndelSize.
+            const int64_t netDel = totalDel - totalIns;
+            if(netDel >= minIndelSize
+               && readDels.empty()) {
+                // Use position of the largest D operation as
+                // breakpoint (not alignment start), so reads
+                // seeing the same deletion cluster together.
+                indelObs.push_back({
+                    true, netDel, largestDelPos, ""
+                });
             }
         }
     }
@@ -5916,47 +6051,83 @@ void Assembler::parseBamEvidence(
         }
     }
 
-    // Cluster CIGAR indel observations by type and position
-    // (within 20bp).
+    // Cluster CIGAR indel observations by type, position
+    // (within 20bp), and size (within 50% of cluster median).
+    // Size gating prevents averaging different-sized deletions
+    // in tandem repeat regions (e.g. 35D and 90D at the same
+    // locus should form separate clusters).
     sort(indelObs.begin(), indelObs.end(),
          [](const IndelObs& a, const IndelObs& b) {
              if(a.isDel != b.isDel) return a.isDel > b.isDel;
-             return a.refPos < b.refPos;
+             if(a.refPos != b.refPos) return a.refPos < b.refPos;
+             return a.size < b.size;
          });
 
     {
+        // First pass: group by position (within 20bp).
+        // Second pass: split each position group by size.
         size_t i = 0;
         while(i < indelObs.size()) {
             const bool isDel = indelObs[i].isDel;
             const uint32_t clusterStart = indelObs[i].refPos;
-            int64_t sumSize = 0;
-            uint64_t sumPos = 0;
-            string bestInsSeq;
-            size_t j = i;
-            while(j < indelObs.size()
-                  && indelObs[j].isDel == isDel
-                  && indelObs[j].refPos <= clusterStart + 20) {
-                sumSize += indelObs[j].size;
-                sumPos += indelObs[j].refPos;
-                if(indelObs[j].insSeq.size()
-                   > bestInsSeq.size())
-                    bestInsSeq = indelObs[j].insSeq;
-                ++j;
+
+            // Find extent of position cluster.
+            size_t posEnd = i;
+            while(posEnd < indelObs.size()
+                  && indelObs[posEnd].isDel == isDel
+                  && indelObs[posEnd].refPos <= clusterStart + 20) {
+                ++posEnd;
             }
-            const uint32_t count = uint32_t(j - i);
-            if(count >= 2) {
-                uint32_t localPos = uint32_t(sumPos / count);
-                if(localPos >= refStart)
-                    localPos -= refStart;
-                cigarIndels.push_back({
-                    isDel ? "DEL" : "INS",
-                    sumSize / int64_t(count),
-                    localPos,
-                    count,
-                    std::move(bestInsSeq)
-                });
+
+            // Sort this position group by size.
+            sort(indelObs.begin() + int64_t(i),
+                 indelObs.begin() + int64_t(posEnd),
+                 [](const IndelObs& a, const IndelObs& b) {
+                     return a.size < b.size;
+                 });
+
+            // Sub-cluster by size: observations join the
+            // cluster if within 50% of the running mean.
+            size_t si = i;
+            while(si < posEnd) {
+                int64_t sumSize = indelObs[si].size;
+                uint64_t sumPos = indelObs[si].refPos;
+                string bestInsSeq = indelObs[si].insSeq;
+                size_t sj = si + 1;
+                while(sj < posEnd) {
+                    const int64_t meanSize =
+                        sumSize / int64_t(sj - si);
+                    // Allow joining if within 50% of mean.
+                    if(indelObs[sj].size
+                       <= meanSize * 3 / 2) {
+                        sumSize += indelObs[sj].size;
+                        sumPos += indelObs[sj].refPos;
+                        if(indelObs[sj].insSeq.size()
+                           > bestInsSeq.size())
+                            bestInsSeq = indelObs[sj].insSeq;
+                        ++sj;
+                    } else {
+                        break;
+                    }
+                }
+                const uint32_t count = uint32_t(sj - si);
+                if(count >= 2) {
+                    uint32_t localPos =
+                        uint32_t(sumPos / count);
+                    if(localPos >= refStart)
+                        localPos -= refStart;
+                    cigarIndels.push_back({
+                        isDel ? "DEL" : "INS",
+                        sumSize / int64_t(count),
+                        localPos,
+                        count,
+                        std::move(bestInsSeq)
+                    });
+                }
+                si = sj;
             }
-            i = j;
+
+            i = posEnd;
         }
     }
 }

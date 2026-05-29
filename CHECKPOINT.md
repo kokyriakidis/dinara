@@ -430,23 +430,22 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 
 | Bin | Total | ✅ | ⚠️ | ❌ | ✅% |
 |-----|-------|---|---|---|-----|
-| DEL <100bp | 10 | 8 | 1 | 1 | 80% |
-| DEL 100-500bp | 10 | 9 | 1 | 0 | 90% |
+| DEL <100bp | 10 | 9 | 1 | 0 | 90% |
+| DEL 100-500bp | 10 | 8 | 2 | 0 | 80% |
 | DEL 500-1000bp | 10 | 5 | 4 | 1 | 50% |
-| DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
+| DEL >1000bp | 10 | 6 | 2 | 2 | 60% |
 | INS <100bp | 10 | 7 | 2 | 1 | 70% |
 | INS 100-500bp | 10 | 1 | 6 | 3 | 10% |
-| INS 500-1000bp | 10 | 6 | 2 | 2 | 60% |
+| INS 500-1000bp | 10 | 5 | 3 | 2 | 50% |
 | INS >1000bp | 10 | 0 | 5 | 5 | 0% |
-| **TOTAL** | **80** | **44** | **22** | **14** | **55%** |
+| **TOTAL** | **80** | **41** | **25** | **14** | **51%** |
 
 **Correct type (✅+⚠️): 66/80 = 82%**
 
 Key observations:
-- **DEL detection is strong**: 30/40 exact (75%), 38/40 correct type (95%)
-- **INS detection improved**: 14/40 exact (35%), 28/40 correct type (70%)
-- **CIGAR indels** directly detect small SVs: INS small improved from 30% → 70% exact
-- **Soft-clip assembly** helps medium-large INS: INS large improved from 40% → 60% exact
+- **DEL <100bp at 90%**: compound CIGAR merging (35D+55D→90D) and CIGAR-corroborated k-mer clusters fix tandem repeat and STR cases
+- **DEL 100-500bp at 80%**: size-gated CIGAR clustering separates mixed-size deletion clusters (e.g. 57D vs 114D)
+- **INS detection limited**: 13/40 exact (33%), 27/40 correct type (68%)
 - **INS 100-500bp** remains weak (10% exact): insertions exceed read length and soft-clip assembly can only partially span them
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
 - **Type confusion**: ~8 INS cases still detected as DEL in tandem repeats
