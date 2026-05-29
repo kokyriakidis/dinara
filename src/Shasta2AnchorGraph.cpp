@@ -693,6 +693,63 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << trimmedVertexCount << " vertices trimmed." << endl;
     }
 
+    // ========================================================================
+    // Detangle Case 2: Remove inter-window edges where both endpoints
+    // are internal backbone anchors (not at the start or end of their
+    // window's backbone). Such edges are false connections caused by
+    // read sharing between parallel windows.
+    // ========================================================================
+    {
+        // Build a set of boundary anchors: the first and last anchor
+        // in each window's filtered backbone.
+        std::set<Shasta2AnchorId> boundaryAnchors;
+        for(const AnchorWindow& window : anchorWindows) {
+            const auto backboneJourney = journeys[window.backboneOrientedReadId];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+
+            // First and last backbone anchors (and their RC).
+            const Shasta2AnchorId firstAnchor = backboneJourney[positions.front()];
+            const Shasta2AnchorId lastAnchor = backboneJourney[positions.back()];
+            boundaryAnchors.insert(firstAnchor);
+            boundaryAnchors.insert(lastAnchor);
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(firstAnchor) ^ 1ULL));
+            boundaryAnchors.insert(Shasta2AnchorId(uint64_t(lastAnchor) ^ 1ULL));
+        }
+
+        // Remove inter-window edges where both endpoints are internal.
+        uint64_t case2RemovedCount = 0;
+        vector<edge_descriptor> edgesToRemove;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+            const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+
+            // Only consider inter-window edges.
+            const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+            const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue; // Intra-window edge.
+
+            // Check if both endpoints are internal (not boundary).
+            const bool srcBoundary = boundaryAnchors.count(Shasta2AnchorId(srcAnchor));
+            const bool dstBoundary = boundaryAnchors.count(Shasta2AnchorId(dstAnchor));
+
+            if(!srcBoundary && !dstBoundary) {
+                edgesToRemove.push_back(e);
+            }
+        }
+
+        for(const auto& e : edgesToRemove) {
+            boost::remove_edge(e, anchorGraph);
+            ++case2RemovedCount;
+        }
+
+        if(case2RemovedCount > 0) {
+            cout << "Detangle Case 2: removed " << case2RemovedCount
+                 << " inter-window edges with both endpoints internal." << endl;
+        }
+    }
+
     // Validate: check that every edge has shared oriented reads.
     {
         uint64_t emptyEdgeCount = 0;
