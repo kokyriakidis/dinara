@@ -452,6 +452,25 @@ Key observations:
 - **INS 500-1000bp at 70%**: no-covdrop-flip detects INS509 (split-read DEL with no coverage-drop → INS)
 - **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads; flank-gap-alt provides ⚠️ for INS2399
 
+### Q100 DEL <100bp Benchmark (94 cases)
+
+94 unique DEL 50-99bp cases from HG002 GRCh38 v5.0q stvar truthset (first 100, all chr1).
+BAM: HG002.GRCh38.2x250.bam (GIAB NIST Illumina 2x250bp).
+Cases in `/tmp/truthset/cases_del_lt100bp/`. Runner: `/tmp/truthset/run_del_lt100bp.sh`.
+
+| Metric | Count | % |
+|---|---|---|
+| ✅ | 73 | 77% |
+| ⚠️ | 14 | 14% |
+| ❌ | 7 | 7% |
+| Correct type (✅+⚠️) | 87 | 92% |
+
+Best call source distribution (✅ cases): CIGAR 25, diagonal 21, cluster 12, adaptive-bimodal 8, flank-gap 4, path-based 2, SDUST-STR 1.
+
+Remaining ⚠️ root causes: tandem repeat copy-number ambiguity (adaptive-bimodal weighted median overshoots, cluster sees one repeat unit), flank-gap undersizing in tandem repeats.
+
+Remaining ❌ root causes: het deletions where path-based INS fires first and masks DEL signal (2), complex/inverted regions with only INV clusters (2), tandem repeat locus misclassified as large INS (2), marker-depleted with no DEL evidence (1).
+
 ### Known Limitations
 
 1. **bw=100** prevents single-chain deletion detection >100bp; split-read detection handles larger deletions
