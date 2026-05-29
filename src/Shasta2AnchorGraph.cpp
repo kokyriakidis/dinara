@@ -697,16 +697,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
     //
     // When two windows A and B are connected by an internal inter-window
-    // edge (both endpoints are mid-backbone, not at the first/last
-    // position), check whether the connection is real or spurious by
-    // examining the reads on the anchors just before and after the
-    // connection point in both windows.
+    // edge (both endpoints are mid-backbone), check whether the connection
+    // is real or spurious using a tangle matrix approach similar to
+    // shasta2's Shasta2TangleMatrix1.
     //
-    // Build a 2x2 matrix of common reads:
-    //   A-before → A-after (diagonal: A continues on its own)
-    //   B-before → B-after (diagonal: B continues on its own)
-    //   A-before → B-after (off-diagonal: cross from A to B)
-    //   B-before → A-after (off-diagonal: cross from B to A)
+    // For each window, collect reads from all backbone anchors before the
+    // connection point ("entrance" side) and all anchors after it ("exit"
+    // side). Each read's contribution is weighted by the number of anchors
+    // (steps) it appears on in each side, following shasta2's per-read
+    // matrix approach.
+    //
+    // Build a 2x2 matrix:
+    //   A-entrance → A-exit (diagonal: A continues on its own)
+    //   B-entrance → B-exit (diagonal: B continues on its own)
+    //   A-entrance → B-exit (off-diagonal: cross from A to B)
+    //   B-entrance → A-exit (off-diagonal: cross from B to A)
     //
     // If both diagonal entries are stronger than both off-diagonal
     // entries, the internal connection is false and the edge is removed.
@@ -726,8 +731,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             boundaryAnchors.insert(Shasta2AnchorId(uint64_t(lastAnchor) ^ 1ULL));
         }
 
-        // Build anchor → (windowIndex, backbone position index) map
-        // for quick lookup of an anchor's position in its window.
+        // Build anchor → (windowIndex, backbone position index) map.
         std::map<Shasta2AnchorId, std::pair<uint32_t, uint64_t>> anchorPosition;
         for(uint32_t wIdx = 0; wIdx < anchorWindows.size(); wIdx++) {
             const auto& window = anchorWindows[wIdx];
@@ -739,24 +743,110 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        // Helper: get reads on an anchor as a set.
-        auto getReads = [&](Shasta2AnchorId aid) -> std::set<uint32_t> {
-            std::set<uint32_t> reads;
-            const auto span = anchors[aid];
-            for(const auto& mi : span) {
-                reads.insert(mi.orientedReadId.getValue());
+        // Collect reads from consecutive linear backbone anchors,
+        // counting how many anchors (steps) each read appears on.
+        // Walks from startPosIdx in the given direction (forward or
+        // backward) and stops when it hits an anchor that has inter-window
+        // edges (degree disturbance) or reaches the window boundary.
+        // Returns a map: readId -> stepCount.
+        auto collectLinearReadsWithSteps = [&](
+            const AnchorWindow& window,
+            uint64_t startPosIdx,
+            bool walkForward) -> std::map<uint32_t, uint64_t>
+        {
+            std::map<uint32_t, uint64_t> readSteps;
+            const auto journey = journeys[window.backboneOrientedReadId];
+            const auto& positions = window.filteredBackbonePositions;
+
+            if(walkForward) {
+                for(uint64_t i = startPosIdx; i < positions.size(); i++) {
+                    const Shasta2AnchorId aid = journey[positions[i]];
+                    const uint64_t aidVal = uint64_t(aid);
+
+                    // Stop if this anchor has inter-window edges
+                    // (i.e., it connects to a different window).
+                    if(i != startPosIdx) {
+                        bool hasInterWindowEdge = false;
+                        BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
+                            const uint64_t tgt = uint64_t(target(outE, anchorGraph));
+                            const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
+                            const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
+                            if(tgtWin != noWindow && tgtWin != aidWin) {
+                                hasInterWindowEdge = true;
+                                break;
+                            }
+                        }
+                        if(!hasInterWindowEdge) {
+                            BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
+                                const uint64_t src = uint64_t(source(inE, anchorGraph));
+                                const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
+                                const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
+                                if(srcWin2 != noWindow && srcWin2 != aidWin) {
+                                    hasInterWindowEdge = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if(hasInterWindowEdge) break;
+                    }
+
+                    const auto span = anchors[aid];
+                    for(const auto& mi : span) {
+                        readSteps[mi.orientedReadId.getValue()]++;
+                    }
+                }
+            } else {
+                // Walk backward.
+                for(int64_t i = int64_t(startPosIdx); i >= 0; i--) {
+                    const Shasta2AnchorId aid = journey[positions[uint64_t(i)]];
+                    const uint64_t aidVal = uint64_t(aid);
+
+                    if(uint64_t(i) != startPosIdx) {
+                        bool hasInterWindowEdge = false;
+                        BGL_FORALL_OUTEDGES(aid, outE, anchorGraph, Shasta2AnchorGraph) {
+                            const uint64_t tgt = uint64_t(target(outE, anchorGraph));
+                            const uint32_t tgtWin = (tgt < anchorCount) ? anchorToWindow[tgt] : noWindow;
+                            const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
+                            if(tgtWin != noWindow && tgtWin != aidWin) {
+                                hasInterWindowEdge = true;
+                                break;
+                            }
+                        }
+                        if(!hasInterWindowEdge) {
+                            BGL_FORALL_INEDGES(aid, inE, anchorGraph, Shasta2AnchorGraph) {
+                                const uint64_t src = uint64_t(source(inE, anchorGraph));
+                                const uint32_t srcWin2 = (src < anchorCount) ? anchorToWindow[src] : noWindow;
+                                const uint32_t aidWin = (aidVal < anchorCount) ? anchorToWindow[aidVal] : noWindow;
+                                if(srcWin2 != noWindow && srcWin2 != aidWin) {
+                                    hasInterWindowEdge = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if(hasInterWindowEdge) break;
+                    }
+
+                    const auto span = anchors[aid];
+                    for(const auto& mi : span) {
+                        readSteps[mi.orientedReadId.getValue()]++;
+                    }
+                }
             }
-            return reads;
+            return readSteps;
         };
 
-        // Helper: count common reads between two sets.
-        auto countCommon = [](const std::set<uint32_t>& a,
-                              const std::set<uint32_t>& b) -> uint64_t {
-            uint64_t count = 0;
-            for(const uint32_t r : a) {
-                if(b.count(r)) ++count;
+        // Compute tangle matrix entry: sum of min(stepsInEntrance, stepsInExit)
+        // for each read that appears in both, following shasta2's approach.
+        auto tangleEntry = [](const std::map<uint32_t, uint64_t>& entrance,
+                              const std::map<uint32_t, uint64_t>& exit) -> uint64_t {
+            uint64_t total = 0;
+            for(const auto& [readId, entranceSteps] : entrance) {
+                auto it = exit.find(readId);
+                if(it != exit.end()) {
+                    total += std::min(entranceSteps, it->second);
+                }
             }
-            return count;
+            return total;
         };
 
         // Find internal inter-window edges and check the 2x2 matrix.
@@ -793,33 +883,31 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const auto& dstWindow = anchorWindows[dstWIdx];
                 const auto& srcPositions = srcWindow.filteredBackbonePositions;
                 const auto& dstPositions = dstWindow.filteredBackbonePositions;
-                const auto srcJourney = journeys[srcWindow.backboneOrientedReadId];
-                const auto dstJourney = journeys[dstWindow.backboneOrientedReadId];
 
                 // Need at least one anchor before and after in both windows.
                 if(srcPosIdx == 0 || srcPosIdx + 1 >= srcPositions.size()) continue;
                 if(dstPosIdx == 0 || dstPosIdx + 1 >= dstPositions.size()) continue;
 
-                // Get the anchors before and after the connection point.
-                const Shasta2AnchorId aBefore = srcJourney[srcPositions[srcPosIdx - 1]];
-                const Shasta2AnchorId aAfter  = srcJourney[srcPositions[srcPosIdx + 1]];
-                const Shasta2AnchorId bBefore = dstJourney[dstPositions[dstPosIdx - 1]];
-                const Shasta2AnchorId bAfter  = dstJourney[dstPositions[dstPosIdx + 1]];
+                // Collect reads with step counts from consecutive linear
+                // backbone anchors before and after the connection point.
+                // Walk stops at anchors with inter-window edges.
+                // A-entrance: walk backward from srcPosIdx-1.
+                // A-exit:     walk forward from srcPosIdx+1.
+                // B-entrance: walk backward from dstPosIdx-1.
+                // B-exit:     walk forward from dstPosIdx+1.
+                const auto aEntrance = collectLinearReadsWithSteps(srcWindow, srcPosIdx - 1, false);
+                const auto aExit     = collectLinearReadsWithSteps(srcWindow, srcPosIdx + 1, true);
+                const auto bEntrance = collectLinearReadsWithSteps(dstWindow, dstPosIdx - 1, false);
+                const auto bExit     = collectLinearReadsWithSteps(dstWindow, dstPosIdx + 1, true);
 
-                // Get read sets.
-                const auto aBeforeReads = getReads(aBefore);
-                const auto aAfterReads  = getReads(aAfter);
-                const auto bBeforeReads = getReads(bBefore);
-                const auto bAfterReads  = getReads(bAfter);
-
-                // 2x2 tangle matrix.
-                const uint64_t diagAA = countCommon(aBeforeReads, aAfterReads);
-                const uint64_t diagBB = countCommon(bBeforeReads, bAfterReads);
-                const uint64_t offAB  = countCommon(aBeforeReads, bAfterReads);
-                const uint64_t offBA  = countCommon(bBeforeReads, aAfterReads);
+                // 2x2 tangle matrix with step-weighted entries.
+                const uint64_t diagAA = tangleEntry(aEntrance, aExit);
+                const uint64_t diagBB = tangleEntry(bEntrance, bExit);
+                const uint64_t offAB  = tangleEntry(aEntrance, bExit);
+                const uint64_t offBA  = tangleEntry(bEntrance, aExit);
 
                 // The connection is false if both diagonal entries are
-                // stronger than both off-diagonal entries.
+                // strictly stronger than both off-diagonal entries.
                 if(diagAA > offAB && diagAA > offBA &&
                    diagBB > offAB && diagBB > offBA) {
                     boost::remove_edge(e, anchorGraph);
