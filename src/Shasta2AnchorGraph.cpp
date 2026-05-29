@@ -883,33 +883,50 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t trimmedVertexCount = 0;
         uint64_t trimmedWindowCount = 0;
 
+        auto normalizeW = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
             const auto& positions = window.filteredBackbonePositions;
             if(positions.empty()) continue;
-            if(window.outEdges.empty() && window.inEdges.empty()) continue;
 
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            // Find bounding journey positions from inter-window edges.
-            // Start bound: min of incoming connection positions.
-            // End bound: max of outgoing connection positions.
+            // Find bounding journey positions from actual inter-window
+            // edges in the graph (scanning the graph directly so this
+            // reflects any prior edge removals by filters).
             int64_t startBound = -1;  // earliest incoming
             int64_t endBound = -1;    // latest outgoing
+            bool hasInterWindowEdges = false;
 
-            for(const auto& ie : window.inEdges) {
-                const int64_t pos = findJourneyPos(journey, window, ie.anchorIdB);
-                if(pos >= 0) {
-                    if(startBound < 0 || pos < startBound) startBound = pos;
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
+                const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+
+                if(dstWin == w) {
+                    hasInterWindowEdges = true;
+                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
+                    if(pos >= 0) {
+                        if(startBound < 0 || pos < startBound) startBound = pos;
+                    }
+                }
+                if(srcWin == w) {
+                    hasInterWindowEdges = true;
+                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
+                    if(pos >= 0) {
+                        if(endBound < 0 || pos > endBound) endBound = pos;
+                    }
                 }
             }
 
-            for(const auto& oe : window.outEdges) {
-                const int64_t pos = findJourneyPos(journey, window, oe.anchorIdA);
-                if(pos >= 0) {
-                    if(endBound < 0 || pos > endBound) endBound = pos;
-                }
-            }
+            if(!hasInterWindowEdges) continue;
 
             // If no incoming edges, start at backbone start (no head trimming).
             if(startBound < 0) startBound = int64_t(positions.front());
