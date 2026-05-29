@@ -4059,9 +4059,14 @@ void Assembler::buildSvMSA(
                             cdc.startPos, cdc.endPos,
                             markerDepleted});
 
-                        // Suppress calls that overlap detected VNTR gaps
-                        // or insertion call regions.
-                        if(overlapsVntr || overlapsInsertion) continue;
+                        // Suppress calls that overlap detected VNTR gaps.
+                        // For insertion overlaps in marker-depleted
+                        // regions, still run the analysis: tandem
+                        // repeat evidence is ambiguous between DEL
+                        // and INS, so emit both.
+                        if(overlapsVntr) continue;
+                        if(overlapsInsertion && !markerDepleted)
+                            continue;
 
                         // Suppress large coverage-drop regions (>500bp)
                         // with minRatio=0 that have strong breakpoints
@@ -4552,6 +4557,27 @@ void Assembler::buildSvMSA(
                                     // repeat unit. The coverage-drop
                                     // size better approximates the
                                     // full insertion size.
+                                    // Also emit a DEL call: for
+                                    // tandem repeats, the evidence
+                                    // is ambiguous between DEL and
+                                    // INS. Emit both and let
+                                    // downstream pick the correct
+                                    // type.
+                                    if(flankShift >= 50) {
+                                        cout << "    >>> DELETION CALL"
+                                             << " (flank-gap): size="
+                                             << flankShift << "bp"
+                                             << ", breakpoint="
+                                             << bpPos
+                                             << endl;
+                                        delCallRecords.push_back({
+                                            bpPos,
+                                            flankShift,
+                                            uint32_t(
+                                                leftDiags.size()
+                                                + rightDiags.size()),
+                                            "flank-gap"});
+                                    }
                                     const int64_t insCallSize =
                                         std::max(flankShift,
                                                  int64_t(delSize));
