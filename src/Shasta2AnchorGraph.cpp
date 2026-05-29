@@ -590,17 +590,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Trim backbone outside the bounding inter-window connection span.
     auto trimBackbones = [&]() {
-        // Disable all edges of a trimmed anchor (intra-window and inter-window).
-        auto clearAllEdges = [&](uint64_t vid) {
+        // Disable intra-window edges of a trimmed anchor.
+        // Inter-window edges are left intact — they'll be cleaned up
+        // by the isolated anchor cleanup that follows.
+        auto clearIntraWindowEdges = [&](uint64_t vid) {
             if(vid >= anchorCount) return;
+            const uint32_t vWindow = anchorToWindow[vid];
             auto oe = boost::out_edges(vid, anchorGraph);
             for(auto it = oe.first; it != oe.second; ++it) {
-                if(anchorGraph[*it].useForAssembly)
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
                     disableEdge(*it);
             }
             auto ie = boost::in_edges(vid, anchorGraph);
             for(auto it = ie.first; it != ie.second; ++it) {
-                if(anchorGraph[*it].useForAssembly)
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src < anchorCount && anchorToWindow[src] == vWindow)
                     disableEdge(*it);
             }
         };
@@ -660,24 +667,27 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(int64_t(positions[i]) <= endBound) { keepLast = i; break; }
             }
             if(keepFirst < 0 || keepLast < 0 || keepFirst > keepLast) continue;
-            const uint64_t headTrim = uint64_t(keepFirst);
-            const uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
+            uint64_t headTrim = uint64_t(keepFirst);
+            uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
+
+            // Cap trimming: don't trim more than maxTrim anchors from each end.
+            // This prevents gutting backbones that only have inter-window edges
+            // at one end.
+            const uint64_t maxTrim = 5;
+            headTrim = std::min(headTrim, maxTrim);
+            tailTrim = std::min(tailTrim, maxTrim);
+
             if(headTrim == 0 && tailTrim == 0) continue;
             ++trimmedWindowCount;
-            cout << "  Window " << w << ": backbone [" << positions.front()
-                 << ".." << positions.back() << "], bounds [" << startBound
-                 << ".." << endBound << "], keep [" << keepFirst << ".."
-                 << keepLast << "], headTrim=" << headTrim
-                 << " tailTrim=" << tailTrim << endl;
 
-            for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
+            for(uint64_t i = 0; i < headTrim; i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
-                clearAllEdges(uint64_t(aid));
+                clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
             }
-            for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
+            for(uint64_t i = positions.size() - tailTrim; i < positions.size(); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
-                clearAllEdges(uint64_t(aid));
+                clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
             }
         }
