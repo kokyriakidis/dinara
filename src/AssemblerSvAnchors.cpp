@@ -20,6 +20,7 @@
 #include "performanceLog.hpp"
 #include "timestamp.hpp"
 
+#include <astarpa/astarpa.h>
 #include <htslib/sam.h>
 #include <htslib/hts.h>
 
@@ -2835,55 +2836,129 @@ void Assembler::buildSvMSA(
                                     // size (distance between BPs
                                     // on the reference).
                                     if(bestInsRefGap >= 40) {
-                                        // Refine using soft-clip BPs.
+                                        // K-mer diagonal sizing.
                                         int64_t pmSize = bestInsRefGap;
-                                        if(!softClipBPs.empty()) {
-                                            const int64_t sr =
-                                                int64_t(windowSize);
-                                            int64_t dL = INT64_MAX;
-                                            uint32_t pL = lbp.refPos;
-                                            for(const auto& sc : softClipBPs) {
-                                                if(sc.isLeftClip) continue;
-                                                if(sc.readCount < 2) continue;
-                                                const int64_t d = std::abs(
-                                                    int64_t(sc.refPos)
-                                                    - int64_t(lbp.refPos));
-                                                if(d < dL) { dL = d; pL = sc.refPos; }
-                                            }
-                                            int64_t dR = INT64_MAX;
-                                            uint32_t pR = bestInsRbp->refPos;
-                                            for(const auto& sc : softClipBPs) {
-                                                if(!sc.isLeftClip) continue;
-                                                if(sc.readCount < 2) continue;
-                                                const int64_t d = std::abs(
-                                                    int64_t(sc.refPos)
-                                                    - int64_t(bestInsRbp->refPos));
-                                                if(d < dR) { dR = d; pR = sc.refPos; }
-                                            }
-                                            if(dL <= sr && dR <= sr
-                                               && pR > pL) {
-                                                const int64_t scD =
-                                                    int64_t(pR) - int64_t(pL);
-                                                if(scD >= 40) {
-                                                    pmSize = scD;
+                                        const uint32_t pmRefLen =
+                                            uint32_t(readsRef.getRead(
+                                                refId).baseCount);
+                                        vector<int64_t> pmProjSizes;
+                                        for(const auto& ep : lbp.reads) {
+                                            const auto it =
+                                                readChainInfoMap.find(
+                                                    ep.readId);
+                                            if(it == readChainInfoMap.end())
+                                                continue;
+                                            const auto& rci = it->second;
+                                            const auto rdM = markersRef[
+                                                OrientedReadId(
+                                                    ReadId(ep.readId), 0)
+                                                .getValue()];
+                                            if(rdM.size() < 2) continue;
+                                            const int64_t cDiag =
+                                                int64_t(ep.actualRefPos)
+                                                - int64_t(rdM[rci.maxReadOrd]
+                                                    .position);
+                                            const uint32_t rbc = uint32_t(
+                                                readsRef.getRead(
+                                                    ReadId(ep.readId))
+                                                .baseCount);
+                                            const OrientedReadId rdOid(
+                                                ReadId(ep.readId), 0);
+                                            const uint32_t ovhS =
+                                                (rci.maxReadOrd < rdM.size())
+                                                ? uint32_t(rdM[rci.maxReadOrd]
+                                                    .position) + k
+                                                : rbc;
+                                            if(ovhS + k > rbc) continue;
+                                            string ovhSeq;
+                                            ovhSeq.reserve(rbc - ovhS);
+                                            for(uint32_t p = ovhS; p < rbc; ++p)
+                                                ovhSeq.push_back(readsRef
+                                                    .getOrientedReadBase(
+                                                        rdOid, p).character());
+                                            if(ovhSeq.size() < k) continue;
+                                            const uint32_t rss =
+                                                ep.actualRefPos + k;
+                                            const uint32_t rse = std::min(
+                                                rss + uint32_t(bestInsRefGap)
+                                                + uint32_t(ovhSeq.size())
+                                                + 100, pmRefLen);
+                                            if(rss >= rse) continue;
+                                            string refReg;
+                                            refReg.reserve(rse - rss);
+                                            for(uint32_t p = rss; p < rse; ++p)
+                                                refReg.push_back(readsRef
+                                                    .getOrientedReadBase(
+                                                        refOid, p).character());
+                                            unordered_map<string, vector<uint32_t>>
+                                                rKm;
+                                            for(uint32_t i = 0;
+                                                i + k <= refReg.size(); ++i)
+                                                rKm[refReg.substr(i, k)]
+                                                    .push_back(rss + i);
+                                            vector<int64_t> oDiags;
+                                            for(uint32_t i = 0;
+                                                i + k <= ovhSeq.size(); ++i) {
+                                                const auto jt =
+                                                    rKm.find(ovhSeq.substr(i, k));
+                                                if(jt == rKm.end()) continue;
+                                                const uint32_t rp = ovhS + i;
+                                                for(const uint32_t rfp : jt->second) {
+                                                    const int64_t sh =
+                                                        (int64_t(rfp) - int64_t(rp))
+                                                        - cDiag;
+                                                    if(sh >= 30 && sh <= 1000)
+                                                        oDiags.push_back(sh);
                                                 }
                                             }
+                                            if(oDiags.size() >= 3) {
+                                                sort(oDiags.begin(), oDiags.end());
+                                                pmProjSizes.push_back(
+                                                    oDiags[oDiags.size() / 2]);
+                                            }
                                         }
-                                        cout << "    >>> DELETION CALL"
-                                             << " (path-mirror):"
-                                             << " size="
-                                             << pmSize
-                                             << "bp, breakpoint="
-                                             << insBpPos
-                                             << endl;
-                                        delCallRecords.push_back({
-                                            insBpPos,
-                                            pmSize,
-                                            uint32_t(
-                                                lbp.endpointCount
-                                                + bestInsRbp
-                                                  ->endpointCount),
-                                            "path-mirror"});
+                                        if(pmProjSizes.size() >= 2) {
+                                            sort(pmProjSizes.begin(),
+                                                 pmProjSizes.end());
+                                            const int64_t pmMed =
+                                                pmProjSizes[
+                                                    pmProjSizes.size() / 2];
+                                            const int64_t pmQ1 =
+                                                pmProjSizes[
+                                                    pmProjSizes.size() / 4];
+                                            const int64_t pmQ3 =
+                                                pmProjSizes[
+                                                    3 * pmProjSizes.size()
+                                                    / 4];
+                                            const int64_t pmIqr =
+                                                pmQ3 - pmQ1;
+                                            if(pmMed > 0
+                                               && pmIqr <= pmMed / 5
+                                               && std::abs(pmMed - bestInsRefGap)
+                                                  <= int64_t(windowSize)) {
+                                                pmSize = pmMed;
+                                            }
+                                        }
+                                        if(pmSize >= 40) {
+                                            cout << "    >>> DELETION CALL"
+                                                 << " (path-mirror):"
+                                                 << " size=" << pmSize
+                                                 << "bp, breakpoint="
+                                                 << insBpPos
+                                                 << " (projAlign="
+                                                 << pmProjSizes.size()
+                                                 << " window="
+                                                 << bestInsRefGap << ")"
+                                                 << endl;
+                                            delCallRecords.push_back({
+                                                insBpPos,
+                                                pmSize,
+                                                uint32_t(
+                                                    lbp.endpointCount
+                                                    + bestInsRbp
+                                                      ->endpointCount),
+                                                "path-mirror"});
+                                        }
                                     }
                                 }
                             }
@@ -3041,11 +3116,10 @@ void Assembler::buildSvMSA(
 
                         // Fallback: when diagonal-shift finds no
                         // supporting chains but the BP pair is
-                        // strong, emit a DEL call using refGap as
-                        // the size estimate. In tandem repeats,
-                        // chains often can't span the deletion
-                        // zone, but the BP pair endpoints still
-                        // mark the deletion boundaries.
+                        // strong, emit a DEL call. Use projected
+                        // alignment (astarpa2) to get precise
+                        // sizing from overhang reads, falling back
+                        // to window distance if alignment fails.
                         if(delShifts.size() < 2
                            && bestDist >= 40
                            && bestDist <= 500
@@ -3053,55 +3127,178 @@ void Assembler::buildSvMSA(
                                + lbp.ovhReadCount) >= 3
                            && (lbp.foldEnrichment >= 2.5
                                || bestRbp->foldEnrichment >= 2.5)) {
-                            // Refine size using soft-clip BPs.
-                            // bestDist is quantized to 50bp;
-                            // soft-clip positions are base-precise.
                             int64_t bpPairSize = bestDist;
-                            if(!softClipBPs.empty()) {
-                                const int64_t sr =
-                                    int64_t(windowSize);
-                                int64_t dL = INT64_MAX;
-                                uint32_t pL = lbp.refPos;
-                                for(const auto& sc : softClipBPs) {
-                                    if(sc.isLeftClip) continue;
-                                    if(sc.readCount < 2) continue;
-                                    const int64_t d = std::abs(
-                                        int64_t(sc.refPos)
-                                        - int64_t(lbp.refPos));
-                                    if(d < dL) { dL = d; pL = sc.refPos; }
-                                }
-                                int64_t dR = INT64_MAX;
-                                uint32_t pR = bestRbp->refPos;
-                                for(const auto& sc : softClipBPs) {
-                                    if(!sc.isLeftClip) continue;
-                                    if(sc.readCount < 2) continue;
-                                    const int64_t d = std::abs(
-                                        int64_t(sc.refPos)
-                                        - int64_t(bestRbp->refPos));
-                                    if(d < dR) { dR = d; pR = sc.refPos; }
-                                }
-                                if(dL <= sr && dR <= sr
-                                   && pR > pL) {
-                                    const int64_t scD =
-                                        int64_t(pR) - int64_t(pL);
-                                    if(scD >= 40) {
-                                        bpPairSize = scD;
+
+                            // K-mer diagonal sizing: find k-mer
+                            // matches between the read overhang
+                            // and the reference past the right BP.
+                            // The diagonal shift between chained
+                            // anchors and overhang anchors equals
+                            // the deletion size.
+                            const uint32_t refLen = uint32_t(
+                                readsRef.getRead(refId).baseCount);
+                            vector<int64_t> projDelSizes;
+                            for(const auto& ep : lbp.reads) {
+                                const auto it =
+                                    readChainInfoMap.find(ep.readId);
+                                if(it == readChainInfoMap.end())
+                                    continue;
+                                const auto& rci = it->second;
+                                const auto rdM = markersRef[
+                                    OrientedReadId(
+                                        ReadId(ep.readId), 0)
+                                    .getValue()];
+                                if(rdM.size() < 2) continue;
+
+                                // Chain diagonal at the endpoint.
+                                const int64_t chainDiag =
+                                    int64_t(ep.actualRefPos)
+                                    - int64_t(rdM[rci.maxReadOrd]
+                                        .position);
+
+                                // Read overhang: markers past the
+                                // chain endpoint.
+                                const uint32_t rdBaseCount =
+                                    uint32_t(readsRef.getRead(
+                                        ReadId(ep.readId))
+                                        .baseCount);
+                                const OrientedReadId rdOid(
+                                    ReadId(ep.readId), 0);
+
+                                // Extract overhang k-mers and match
+                                // against reference.
+                                const uint32_t ovhStart =
+                                    (rci.maxReadOrd < rdM.size())
+                                    ? uint32_t(rdM[rci.maxReadOrd]
+                                        .position) + k
+                                    : rdBaseCount;
+                                if(ovhStart + k > rdBaseCount)
+                                    continue;
+
+                                // Build overhang k-mer set.
+                                string ovhSeq;
+                                ovhSeq.reserve(
+                                    rdBaseCount - ovhStart);
+                                for(uint32_t p = ovhStart;
+                                    p < rdBaseCount; ++p)
+                                    ovhSeq.push_back(
+                                        readsRef
+                                        .getOrientedReadBase(
+                                            rdOid, p)
+                                        .character());
+                                if(ovhSeq.size() < k) continue;
+
+                                // Reference region past the left BP.
+                                const uint32_t refSearchStart =
+                                    ep.actualRefPos + k;
+                                const uint32_t refSearchEnd =
+                                    std::min(
+                                        refSearchStart
+                                        + uint32_t(bestDist)
+                                        + uint32_t(ovhSeq.size())
+                                        + 100,
+                                        refLen);
+                                if(refSearchStart >= refSearchEnd)
+                                    continue;
+                                string refRegion;
+                                refRegion.reserve(
+                                    refSearchEnd - refSearchStart);
+                                for(uint32_t p = refSearchStart;
+                                    p < refSearchEnd; ++p)
+                                    refRegion.push_back(
+                                        readsRef
+                                        .getOrientedReadBase(
+                                            refOid, p)
+                                        .character());
+
+                                // Find matching k-mers and compute
+                                // diagonal shifts.
+                                unordered_map<string, vector<uint32_t>>
+                                    refKmers;
+                                for(uint32_t i = 0;
+                                    i + k <= refRegion.size(); ++i)
+                                    refKmers[refRegion.substr(i, k)]
+                                        .push_back(
+                                            refSearchStart + i);
+
+                                vector<int64_t> ovhDiags;
+                                for(uint32_t i = 0;
+                                    i + k <= ovhSeq.size(); ++i) {
+                                    const string kmer =
+                                        ovhSeq.substr(i, k);
+                                    const auto jt =
+                                        refKmers.find(kmer);
+                                    if(jt == refKmers.end())
+                                        continue;
+                                    const uint32_t readPos =
+                                        ovhStart + i;
+                                    for(const uint32_t refPos
+                                        : jt->second) {
+                                        const int64_t diag =
+                                            int64_t(refPos)
+                                            - int64_t(readPos);
+                                        const int64_t shift =
+                                            diag - chainDiag;
+                                        if(shift >= 30
+                                           && shift <= 1000)
+                                            ovhDiags.push_back(
+                                                shift);
                                     }
                                 }
+
+                                if(ovhDiags.size() >= 3) {
+                                    sort(ovhDiags.begin(),
+                                         ovhDiags.end());
+                                    projDelSizes.push_back(
+                                        ovhDiags[
+                                            ovhDiags.size() / 2]);
+                                }
                             }
-                            cout << "    >>> DELETION CALL"
-                                 << " (bp-pair): size="
-                                 << bpPairSize << "bp"
-                                 << ", breakpoint="
-                                 << breakpointPos
-                                 << endl;
-                            delCallRecords.push_back({
-                                breakpointPos,
-                                bpPairSize,
-                                uint32_t(
-                                    lbp.endpointCount
-                                    + bestRbp->endpointCount),
-                                "bp-pair"});
+
+                            if(projDelSizes.size() >= 2) {
+                                sort(projDelSizes.begin(),
+                                     projDelSizes.end());
+                                const int64_t median =
+                                    projDelSizes[
+                                        projDelSizes.size() / 2];
+                                // Require read consensus: IQR must
+                                // be <= 20% of median to avoid
+                                // tandem repeat ambiguity.
+                                const int64_t q1 =
+                                    projDelSizes[
+                                        projDelSizes.size() / 4];
+                                const int64_t q3 =
+                                    projDelSizes[
+                                        3 * projDelSizes.size()
+                                        / 4];
+                                const int64_t iqr = q3 - q1;
+                                if(median > 0
+                                   && iqr <= median / 5
+                                   && std::abs(median - bestDist)
+                                      <= int64_t(windowSize)) {
+                                    bpPairSize = median;
+                                }
+                            }
+
+                            if(bpPairSize >= 40) {
+                                cout << "    >>> DELETION CALL"
+                                     << " (bp-pair): size="
+                                     << bpPairSize << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << " (projAlign="
+                                     << projDelSizes.size()
+                                     << " window="
+                                     << bestDist << ")"
+                                     << endl;
+                                delCallRecords.push_back({
+                                    breakpointPos,
+                                    bpPairSize,
+                                    uint32_t(
+                                        lbp.endpointCount
+                                        + bestRbp->endpointCount),
+                                    "bp-pair"});
+                            }
                         }
 
                     }
