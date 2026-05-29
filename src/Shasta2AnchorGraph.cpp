@@ -539,6 +539,90 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Remove redundant shortcut edges.
+    // If window B has prev=A and next=C, and there's already a direct
+    // A→C inter-window edge, then B is a shortcut and the A→B and B→C
+    // edges are redundant.
+    {
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+
+        // Build set of directly connected normalized window pairs.
+        std::set<std::pair<uint32_t, uint32_t>> directConnections;
+        for(const auto& edgeInfo : createdEdges) {
+            const uint32_t a = normalize(edgeInfo.windowPair.first);
+            const uint32_t b = normalize(edgeInfo.windowPair.second);
+            directConnections.insert({a, b});
+            directConnections.insert({b, a});
+        }
+
+        // For each window B, check if any (prev=A, next=C) transition
+        // has a direct A→C connection where both A and C are larger
+        // than B (more reads).
+        uint64_t shortcutRemovedCount = 0;
+        for(uint32_t b = 0; b < windowCount; b++) {
+            const auto& window = anchorWindows[b];
+            const uint64_t bSize = window.readIntervals.size();
+
+            // Collect (A, C) pairs from transitions through B.
+            std::set<std::pair<uint32_t, uint32_t>> bypassedPairs;
+            for(const auto& [key, reads] : window.transitionReads) {
+                const uint32_t A = key.first;
+                const uint32_t C = key.second;
+                if(A == noW || C == noW) continue;
+                if(A == C) continue;  // parallel, handled above
+                if(!directConnections.count({A, C})) continue;
+                // Only skip B if both A and C are larger windows.
+                if(A < windowCount && C < windowCount &&
+                   anchorWindows[A].readIntervals.size() > bSize &&
+                   anchorWindows[C].readIntervals.size() > bSize) {
+                    bypassedPairs.insert({A, C});
+                }
+            }
+
+            if(bypassedPairs.empty()) continue;
+
+            // Remove inter-window edges between B and the bypassed neighbors.
+            std::set<uint32_t> neighborsToRemove;
+            for(const auto& [A, C] : bypassedPairs) {
+                neighborsToRemove.insert(A);
+                neighborsToRemove.insert(C);
+            }
+
+            std::vector<edge_descriptor> edgesToRemove;
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
+                const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
+                if(srcWin == dstWin) continue;
+
+                // Edge from neighbor → B or B → neighbor.
+                if(srcWin == b && neighborsToRemove.count(dstWin)) {
+                    edgesToRemove.push_back(e);
+                }
+                if(dstWin == b && neighborsToRemove.count(srcWin)) {
+                    edgesToRemove.push_back(e);
+                }
+            }
+
+            std::sort(edgesToRemove.begin(), edgesToRemove.end());
+            edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
+                                edgesToRemove.end());
+            for(const auto& e : edgesToRemove) {
+                boost::remove_edge(e, anchorGraph);
+                ++shortcutRemovedCount;
+            }
+        }
+
+        if(shortcutRemovedCount > 0) {
+            cout << "Shortcut filter: removed " << shortcutRemovedCount
+                 << " redundant inter-window edges." << endl;
+        }
+    }
+
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
         const uint32_t srcW = edgeInfo.windowPair.first;
