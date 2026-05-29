@@ -28,7 +28,7 @@ for bin in DEL_small_lt100bp DEL_medium_100_500bp DEL_large_500_1000bp DEL_xlarg
         true_size=$(grep "SV Length" "$dir/info.txt" | awk '{print $3}')
         echo ""
         echo "--- $name (true: $true_type $true_size) ---"
-        outdir=$(mktemp -d)
+        outdir=$(mktemp -u -d)
         "$DINARA" --command svanchors \
             --reference "$dir/reference.fa" \
             --input "$dir/reads.fa" \

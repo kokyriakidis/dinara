@@ -3905,6 +3905,15 @@ void Assembler::buildSvMSA(
                         const uint32_t insMargin = 200;
                         bool overlapsInsertion = false;
                         for(const auto& ir : insertionCallRegions) {
+                            const uint32_t irSize =
+                                ir.endPos > ir.startPos
+                                ? ir.endPos - ir.startPos : 0;
+                            // Don't let small insertion calls
+                            // suppress large coverage-drop regions.
+                            // A small insertion at the edge of a
+                            // deletion is likely a false positive
+                            // from the BP-pair analysis.
+                            if(irSize < delSize / 3) continue;
                             const uint32_t irStart =
                                 ir.startPos > insMargin
                                 ? ir.startPos - insMargin : 0;
@@ -4466,17 +4475,40 @@ void Assembler::buildSvMSA(
                                 } else {
                                     // SA-tag refinement for
                                     // flank-gap DEL calls.
+                                    // Use coverage-drop region
+                                    // boundaries for proximity.
+                                    const uint32_t fgSaMargin = 300;
+                                    const uint32_t fgSaStart =
+                                        cdc.startPos > fgSaMargin
+                                        ? cdc.startPos - fgSaMargin
+                                        : 0;
+                                    const uint32_t fgSaEnd =
+                                        cdc.endPos + fgSaMargin;
                                     for(const auto& sc :
                                         saTagCalls) {
+                                        // In marker-depleted regions,
+                                        // flank-gap sees one repeat
+                                        // unit but SA-tag sees the
+                                        // full deletion. Allow wider
+                                        // size ratio with strong
+                                        // SA-tag support.
+                                        const double fgMaxR =
+                                            (markerDepleted
+                                             && sc.readCount >= 5)
+                                            ? double(delSize)
+                                              / double(
+                                                  std::max(
+                                                      flankShift,
+                                                      int64_t(1)))
+                                            : 2.0;
                                         if(sc.svType == "DEL"
                                            && sc.readCount >= 2
                                            && sc.size >= 30
                                            && sc.size <= 5000
-                                           && abs(int64_t(sc.refPos)
-                                                  - int64_t(bpPos))
-                                              < 500
+                                           && sc.refPos >= fgSaStart
+                                           && sc.refPos <= fgSaEnd
                                            && sc.size <= uint32_t(
-                                                  flankShift * 2)
+                                                  flankShift * fgMaxR)
                                            && sc.size >= uint32_t(
                                                   flankShift * 0.3)){
                                             cout << "      SA-tag"
@@ -4778,18 +4810,40 @@ void Assembler::buildSvMSA(
                                 // SA-tag uses aligner coordinates
                                 // which handle repeats better than
                                 // diagonal analysis.
+                                //
+                                // Use coverage-drop region boundaries
+                                // for proximity (with margin) rather
+                                // than fixed distance from center —
+                                // large coverage-drop regions can have
+                                // SA-tag breakpoints far from center
+                                // but still within the region.
+                                const uint32_t saProxMargin = 300;
+                                const uint32_t saProxStart =
+                                    cdc.startPos > saProxMargin
+                                    ? cdc.startPos - saProxMargin : 0;
+                                const uint32_t saProxEnd =
+                                    cdc.endPos + saProxMargin;
                                 for(const auto& sc : saTagCalls) {
                                     // Allow wider size range when
                                     // SA-tag has strong support.
+                                    // In repeat regions, the bimodal
+                                    // analysis picks one repeat unit
+                                    // but the SA-tag sees the full
+                                    // deletion — allow up to the
+                                    // coverage-drop size.
                                     const double maxRatio =
-                                        sc.readCount >= 5 ? 5.0 : 1.5;
+                                        sc.readCount >= 5
+                                        ? double(delSize)
+                                          / double(std::max(
+                                                bestShift,
+                                                int64_t(1)))
+                                        : 1.5;
                                     if(sc.svType == "DEL"
                                        && sc.readCount >= 2
                                        && sc.size >= 30
                                        && sc.size <= 5000
-                                       && abs(int64_t(sc.refPos)
-                                              - int64_t(bpPos))
-                                          < 500
+                                       && sc.refPos >= saProxStart
+                                       && sc.refPos <= saProxEnd
                                        && sc.size <= uint32_t(
                                               bestShift * maxRatio)
                                        && sc.size >= uint32_t(
