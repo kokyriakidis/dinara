@@ -457,7 +457,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Check that the landing anchor (from A→W) precedes the leaving
     // anchor (from W→A) on W's backbone to confirm reachability.
     // COMMENTED OUT pending validation on larger datasets.
-#if 0
+#if 1
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
@@ -547,7 +547,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // A→C inter-window edge, then B is a shortcut and the A→B and B→C
     // edges are redundant.
     // COMMENTED OUT — causes breaks on larger datasets.
-#if 0
+#if 1
     {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
@@ -877,7 +877,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
     // COMMENTED OUT pending validation on larger datasets.
     // ========================================================================
-#if 0
+#if 1
     // ========================================================================
     //
     // When two windows A and B are connected by an internal inter-window
