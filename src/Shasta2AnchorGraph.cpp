@@ -470,76 +470,107 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Use the member function disableEdge() for all edge disabling.
     // (Defined at the end of this file.)
 
-    // Parallel filter: remove inter-window edges for A→A flows.
-    auto runParallelFilter = [&]() {
-#if 1
-        auto normalize = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : w;
+    // Recompute backbonePreviousWindow / backboneNextWindow for each window
+    // based on current active edges. Must be called after any filter that
+    // changes edge state before filters that use these fields.
+    auto recomputeBackboneEndpoints = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
-        std::map<uint32_t, std::set<uint32_t>> parallelNeighbors;
+        // Check if an anchor has any active edge.
+        auto anchorHasActiveEdge = [&](uint64_t aid) -> bool {
+            if(aid >= anchorCount) return false;
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(anchorGraph[*it].useForAssembly) return true;
+            }
+            auto ie = boost::in_edges(aid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                if(anchorGraph[*it].useForAssembly) return true;
+            }
+            return false;
+        };
+
+        for(uint32_t wid = 0; wid < windowCount; wid++) {
+            auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            // Walk the backbone read's full journey and build the sequence
+            // of distinct normalized windows, considering only anchors
+            // that still have active edges.
+            std::vector<uint32_t> windowSequence;
+            for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                const uint64_t aid = uint64_t(journey[pos]);
+                if(aid >= anchorCount) continue;
+                const uint32_t rawW = anchorToWindow[aid];
+                if(rawW == noWindow) continue;
+                if(!anchorHasActiveEdge(aid)) continue;
+                const uint32_t normW = normalize(rawW);
+                if(windowSequence.empty() || windowSequence.back() != normW) {
+                    windowSequence.push_back(normW);
+                }
+            }
+
+            // Find wid in the sequence and extract prev/next.
+            window.backbonePreviousWindow = AnchorWindowReadInterval::noWindow;
+            window.backboneNextWindow = AnchorWindowReadInterval::noWindow;
+            for(uint64_t i = 0; i < windowSequence.size(); i++) {
+                if(windowSequence[i] == wid) {
+                    if(i > 0) {
+                        window.backbonePreviousWindow = windowSequence[i - 1];
+                    }
+                    if(i + 1 < windowSequence.size()) {
+                        window.backboneNextWindow = windowSequence[i + 1];
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    // Parallel filter: a window has a parallel flow if its backbone
+    // read comes from and returns to the same window (prevW == nextW).
+    // Remove only the edges between w and that neighbor.
+    auto runParallelFilter = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        uint64_t parallelRemovedCount = 0;
+
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
-            for(const auto& [key, reads] : window.transitionReads) {
-                if(key.first != noW && key.first == key.second) {
-                    parallelNeighbors[w].insert(key.first);
+            const uint32_t prevW = window.backbonePreviousWindow;
+            const uint32_t nextW = window.backboneNextWindow;
+
+            // Parallel flow: backbone comes from and returns to the same window.
+            if(prevW == noWindow || nextW == noWindow) continue;
+            if(prevW != nextW) continue;
+
+            // Remove edges between w and prevW (== nextW).
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[srcVal];
+                const uint32_t dstRaw = anchorToWindow[dstVal];
+                if(srcRaw == noWindow || dstRaw == noWindow) continue;
+                const uint32_t s = normalize(srcRaw);
+                const uint32_t d = normalize(dstRaw);
+                if(s == d) continue;
+                if((s == w && d == prevW) || (d == w && s == prevW)) {
+                    disableEdge(e);
+                    ++parallelRemovedCount;
                 }
             }
         }
 
-        if(!parallelNeighbors.empty()) {
-            uint64_t parallelRemovedCount = 0;
-            for(const auto& [w, neighbors] : parallelNeighbors) {
-                for(const uint32_t neighborW : neighbors) {
-                    struct EdgeInfo {
-                        edge_descriptor e;
-                        Shasta2AnchorId anchorInW;
-                    };
-                    std::vector<EdgeInfo> incomingEdges;
-                    std::vector<EdgeInfo> outgoingEdges;
-
-                    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                        if(!anchorGraph[e].useForAssembly) continue;
-                        const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                        const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                        if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                        const uint32_t srcRaw = anchorToWindow[srcVal];
-                        const uint32_t dstRaw = anchorToWindow[dstVal];
-                        if(srcRaw == noWindow || dstRaw == noWindow) continue;
-                        const uint32_t srcWin = normalize(srcRaw);
-                        const uint32_t dstWin = normalize(dstRaw);
-                        if(srcWin == dstWin) continue;
-                        if(srcWin == neighborW && dstWin == w)
-                            incomingEdges.push_back({e, Shasta2AnchorId(dstVal)});
-                        if(srcWin == w && dstWin == neighborW)
-                            outgoingEdges.push_back({e, Shasta2AnchorId(srcVal)});
-                    }
-
-                    for(const auto& in : incomingEdges) {
-                        const uint32_t landingPos = anchorToBackbonePos[uint64_t(in.anchorInW)];
-                        for(const auto& out : outgoingEdges) {
-                            const uint32_t leavingPos = anchorToBackbonePos[uint64_t(out.anchorInW)];
-                            if(landingPos <= leavingPos) {
-                                if(anchorGraph[in.e].useForAssembly) {
-                                    disableEdge(in.e);
-                                    ++parallelRemovedCount;
-                                }
-                                if(anchorGraph[out.e].useForAssembly) {
-                                    disableEdge(out.e);
-                                    ++parallelRemovedCount;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if(parallelRemovedCount > 0) {
-                cout << "Parallel connections: removed " << parallelRemovedCount
-                     << " redundant inter-window edges." << endl;
-            }
+        if(parallelRemovedCount > 0) {
+            cout << "Parallel filter: removed " << parallelRemovedCount
+                 << " parallel flow edges." << endl;
         }
-#endif
     };
 
     // Shortcut filter: a window is a shortcut window if its backbone
@@ -587,7 +618,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
 
             // prevW and nextW are connected. This is a shortcut window.
-            // Disable all its inter-window edges.
+            // Disable only edges between w and prevW/nextW.
+            // Edges between w and other windows are preserved.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -599,7 +631,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint32_t s = normalize(srcRaw);
                 const uint32_t d = normalize(dstRaw);
                 if(s == d) continue;
-                if(s == w || d == w) {
+                // Only remove edges between w and prevW or nextW.
+                if((s == w && (d == prevW || d == nextW)) ||
+                   (d == w && (s == prevW || s == nextW))) {
                     disableEdge(e);
                     ++shortcutRemovedCount;
                 }
@@ -1258,22 +1292,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
 
     // ========================================================================
-    // Filter pipeline:
-    //   1. Shortcut filter (remove windows that shortcut connected neighbors)
-    //   2. Parallel filter (A→A flows)
-    //   3. Cross-window filter (remove spurious bridges between unrelated regions)
-    //   4. Remove isolated windows (no inter-window edges remaining)
-    //   5. Trim backbones (trim ends without inter-window edges)
-    //   6. Small window removal (≤ 2 anchors)
-    //   7. Dangling cleanup
-    // Case 2 and final dangling cleanup run after bypass edges below.
+    // Filter pipeline: trimBackbones runs after each filter to clean up
+    // backbone ends exposed by edge removal. recomputeBackboneEndpoints
+    // runs before filters that use backbonePreviousWindow/backboneNextWindow.
     // ========================================================================
+    trimBackbones();
+    recomputeBackboneEndpoints();
     runShortcutFilter();
+    trimBackbones();
+    recomputeBackboneEndpoints();
     runParallelFilter();
+    trimBackbones();
+    recomputeBackboneEndpoints();
     runCrossWindowFilter();
+    trimBackbones();
     removeIsolatedWindows();
     trimBackbones();
     removeSmallWindows(2);
+    trimBackbones();
     removeDanglingWindowsIterative("post-filter");
 
     // Populate per-window outEdges/inEdges from createdEdges.
