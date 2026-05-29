@@ -27,6 +27,8 @@ Dinara is a genome assembler with two active workstreams:
 Central data structure for a window. Key fields:
 
 - `windowId`, `backboneOrientedReadId`, `backboneBegin`, `backboneEnd` — identity and span
+- `baseSpan` — base distance from first to last backbone anchor on the backbone read
+- `backbonePreviousWindow` / `backboneNextWindow` — normalized window IDs the backbone read transitions to/from. Recomputed after each filter step via `recomputeBackboneEndpoints()`. `noWindow` if the backbone starts/ends here.
 - `filteredBackbonePositions` — DP-filtered backbone positions where consecutive pairs have ≥ `minCommonForBackbone` common reads. Intra-window edges use these positions.
 - `readIntervals` — all reads overlapping this window, with `previousWindow`/`nextWindow` tracking
 - `alternatePaths` — parallel chains between backbone anchors at het sites
@@ -84,12 +86,53 @@ Populates from `createdEdges`, only for forward windows (< windowCount).
 ### 9. Per-window Connectivity Diagnostic
 Prints per-window incoming/outgoing counts and transition flows.
 
-### 10. Rule 1: Trim Backbone Outside Bounding Inter-window Span
-For each forward window with inter-window edges:
-- **Start bound:** min journey position of all incoming connection anchors (`anchorIdB`). If no incoming edges, defaults to backbone start (no head trimming).
-- **End bound:** max journey position of all outgoing connection anchors (`anchorIdA`). If no outgoing edges, defaults to backbone end (no tail trimming).
-- Trims backbone vertices outside `[start, end]` by removing only **intra-window** edges (edges where both endpoints belong to the same window). Inter-window edges are preserved.
-- RC mirror vertices are also trimmed.
+### 10. Inter-window Edge Filter Pipeline
+
+All edge disabling goes through `disableEdge()`, which sets `useForAssembly=false` on the edge and its RC mirror (`dst^1 → src^1`). Edges remain in the graph but are excluded from assembly and GFA/CSV output.
+
+The pipeline runs `trimBackbones()` and `recomputeBackboneEndpoints()` between each filter so every filter sees a clean graph with accurate backbone endpoint data.
+
+```
+trimBackbones()
+recomputeBackboneEndpoints()
+runShortcutFilter()
+trimBackbones()
+recomputeBackboneEndpoints()
+runParallelFilter()
+trimBackbones()
+recomputeBackboneEndpoints()
+runCrossWindowFilter()
+trimBackbones()
+removeIsolatedWindows()
+trimBackbones()
+removeSmallWindows(2)
+trimBackbones()
+removeDanglingWindowsIterative("post-filter")
+```
+
+#### `trimBackbones()`
+Symmetric head/tail trim. Walks from both ends of each window's backbone, stops at the first anchor with an active inter-window edge (checking both forward and RC mirror). Disables all edges of trimmed anchors and their RC mirrors.
+
+#### `recomputeBackboneEndpoints()`
+For each window, walks the backbone read's full journey, builds a window sequence from anchors that still have active edges, and updates `backbonePreviousWindow`/`backboneNextWindow`. Must run before any filter that uses these fields.
+
+#### `runShortcutFilter()`
+A window is a **shortcut** if `prevW ≠ nextW`, both are not `noWindow`, and `prevW` and `nextW` are directly connected (have an anchor-level edge between them). The window is a redundant bypass. Removes only edges between `w↔prevW` and `w↔nextW`; edges to other windows are preserved.
+
+#### `runParallelFilter()`
+A window has a **parallel flow** if `prevW == nextW` (and not `noWindow`). The backbone comes from and returns to the same window (A→w→A pattern). Removes edges between `w` and `prevW`.
+
+#### `runCrossWindowFilter()`
+A window is a **cross-window** if `prevW ≠ nextW`, both are not `noWindow`, and `prevW` and `nextW` are NOT connected. The backbone bridges unrelated regions. Removes all inter-window edges of `w`, making it isolated for cleanup by `removeIsolatedWindows()`.
+
+#### `removeIsolatedWindows()`
+Finds windows with no remaining active inter-window edges and disables all their backbone edges (forward + RC).
+
+#### `removeSmallWindows(maxSize)`
+Removes windows with ≤ `maxSize` backbone anchors. Safety check: neighbor must have other connections so removal doesn't disconnect the graph.
+
+#### `removeDanglingWindowsIterative(label)`
+Iteratively removes windows with edges on only one side. Safety check: neighbor must have other connections on the same side from a non-dangling window.
 
 ### 11. Edge Verification
 After construction, verifies all edges: for each oriented read on an edge, checks that its base position on anchor A < position on anchor B (forward offset). Reports backward, onlyA, onlyB, and neither counts.
@@ -221,7 +264,9 @@ Key modifications in the fork:
 
 ## Current State (Anchor Windows)
 
-- Rule 1 (bounding span trimming) is active and working
+- Inter-window edge filter pipeline is active: shortcut, parallel, cross-window filters using backbone endpoints, with trimBackbones and recomputeBackboneEndpoints between each step
+- All edge disabling uses `disableEdge()` member function for RC mirror symmetry
+- Bypass edges and Case 2 detangle are disabled (`#if 0`)
 - Detangling splits tangled windows by through-flow paths (through-flows only; start/end reads not yet assigned)
 - `removeNegativeOffsets` is called at all 3 edge construction sites
 - Edge verification runs after graph construction (0 backward edges expected)
