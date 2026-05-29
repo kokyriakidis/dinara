@@ -2,6 +2,7 @@
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2AnchorPair.hpp"
+#include "GTest.hpp"
 #include "orderPairs.hpp"
 #include "performanceLog.hpp"
 #include "ReadId.hpp"
@@ -900,20 +901,31 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const auto bEntrance = collectLinearReadsWithSteps(dstWindow, dstPosIdx - 1, false);
                 const auto bExit     = collectLinearReadsWithSteps(dstWindow, dstPosIdx + 1, true);
 
-                // 2x2 tangle matrix with step-weighted entries.
-                const uint64_t diagAA = tangleEntry(aEntrance, aExit);
-                const uint64_t diagBB = tangleEntry(bEntrance, bExit);
-                const uint64_t offAB  = tangleEntry(aEntrance, bExit);
-                const uint64_t offBA  = tangleEntry(bEntrance, aExit);
+                // Build 2x2 tangle matrix with step-weighted entries.
+                const uint64_t m00 = tangleEntry(aEntrance, aExit);  // A→A
+                const uint64_t m01 = tangleEntry(aEntrance, bExit);  // A→B
+                const uint64_t m10 = tangleEntry(bEntrance, aExit);  // B→A
+                const uint64_t m11 = tangleEntry(bEntrance, bExit);  // B→B
 
-                // The connection is false if both diagonal entries are
-                // strictly stronger than both off-diagonal entries.
-                if(diagAA > offAB && diagAA > offBA &&
-                   diagBB > offAB && diagBB > offBA) {
-                    boost::remove_edge(e, anchorGraph);
-                    ++case2RemovedCount;
-                    changed = true;
-                    break; // Iterator invalidated, restart.
+                vector<vector<uint64_t>> tangleMatrix = {{m00, m01}, {m10, m11}};
+                GTest gtest(tangleMatrix, 0.1, false, false);
+
+                if(gtest.success && !gtest.hypotheses.empty()) {
+                    const auto& best = gtest.hypotheses[0];
+                    // The connection is false if the best hypothesis
+                    // is diagonal: A→A and B→B only, no cross-connections.
+                    const bool isDiagonal =
+                        best.connectivityMatrix[0][0] &&
+                        !best.connectivityMatrix[0][1] &&
+                        !best.connectivityMatrix[1][0] &&
+                        best.connectivityMatrix[1][1];
+
+                    if(isDiagonal) {
+                        boost::remove_edge(e, anchorGraph);
+                        ++case2RemovedCount;
+                        changed = true;
+                        break; // Iterator invalidated, restart.
+                    }
                 }
             }
         }
