@@ -3002,6 +3002,34 @@ void Assembler::buildSvMSA(
                             }
                         }
 
+                        // Fallback: when diagonal-shift finds no
+                        // supporting chains but the BP pair is
+                        // strong, emit a DEL call using refGap as
+                        // the size estimate. In tandem repeats,
+                        // chains often can't span the deletion
+                        // zone, but the BP pair endpoints still
+                        // mark the deletion boundaries.
+                        if(delShifts.size() < 2
+                           && bestDist >= 40
+                           && bestDist <= 500
+                           && (lbp.endpointCount
+                               + lbp.ovhReadCount) >= 3
+                           && (lbp.foldEnrichment >= 2.5
+                               || bestRbp->foldEnrichment >= 2.5)) {
+                            cout << "    >>> DELETION CALL"
+                                 << " (bp-pair): size="
+                                 << bestDist << "bp"
+                                 << ", breakpoint="
+                                 << breakpointPos
+                                 << endl;
+                            delCallRecords.push_back({
+                                breakpointPos,
+                                bestDist,
+                                uint32_t(
+                                    lbp.endpointCount
+                                    + bestRbp->endpointCount),
+                                "bp-pair"});
+                        }
 
                     }
 
