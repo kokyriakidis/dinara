@@ -106,6 +106,9 @@ public:
     uint64_t cutWeakStalksLeadingToBranch(
         const Shasta2Anchors& anchors,
         uint64_t maxTipReadCount);
+    // Disable an edge and its RC mirror (dst^1 -> src^1).
+    void disableEdge(edge_descriptor e);
+
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
 public:

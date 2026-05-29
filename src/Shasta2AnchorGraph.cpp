@@ -454,6 +454,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Filter lambdas (defined here, called in order below).
     // ========================================================================
 
+    // Use the member function disableEdge() for all edge disabling.
+    // (Defined at the end of this file.)
+
     // Parallel filter: remove inter-window edges for A→A flows.
     auto runParallelFilter = [&]() {
 #if 1
@@ -502,11 +505,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                             const uint32_t leavingPos = anchorToBackbonePos[uint64_t(out.anchorInW)];
                             if(landingPos <= leavingPos) {
                                 if(anchorGraph[in.e].useForAssembly) {
-                                    anchorGraph[in.e].useForAssembly = false;
+                                    disableEdge(in.e);
                                     ++parallelRemovedCount;
                                 }
                                 if(anchorGraph[out.e].useForAssembly) {
-                                    anchorGraph[out.e].useForAssembly = false;
+                                    disableEdge(out.e);
                                     ++parallelRemovedCount;
                                 }
                             }
@@ -573,7 +576,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == dstWin) continue;
                 if((srcWin == b && neighborsToRemove.count(dstWin)) ||
                    (dstWin == b && neighborsToRemove.count(srcWin))) {
-                    anchorGraph[e].useForAssembly = false;
+                    disableEdge(e);
                     ++shortcutRemovedCount;
                 }
             }
@@ -595,14 +598,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(!anchorGraph[*it].useForAssembly) continue;
                 const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                 if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
-                    anchorGraph[*it].useForAssembly = false;
+                    disableEdge(*it);
             }
             auto ie = boost::in_edges(vid, anchorGraph);
             for(auto it = ie.first; it != ie.second; ++it) {
                 if(!anchorGraph[*it].useForAssembly) continue;
                 const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
                 if(src < anchorCount && anchorToWindow[src] == vWindow)
-                    anchorGraph[*it].useForAssembly = false;
+                    disableEdge(*it);
             }
         };
 
@@ -778,33 +781,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 auto oe = boost::out_edges(aid, anchorGraph);
                 for(auto it = oe.first; it != oe.second; ++it) {
                     if(anchorGraph[*it].useForAssembly) {
-                        anchorGraph[*it].useForAssembly = false;
+                        disableEdge(*it);
                         ++fragmentEdgeCount;
                     }
                 }
                 auto ie = boost::in_edges(aid, anchorGraph);
                 for(auto it = ie.first; it != ie.second; ++it) {
                     if(anchorGraph[*it].useForAssembly) {
-                        anchorGraph[*it].useForAssembly = false;
+                        disableEdge(*it);
                         ++fragmentEdgeCount;
-                    }
-                }
-                // Also disable RC mirror edges.
-                const uint64_t rcAid = aid ^ 1ULL;
-                if(rcAid < anchorCount) {
-                    auto oe2 = boost::out_edges(rcAid, anchorGraph);
-                    for(auto it = oe2.first; it != oe2.second; ++it) {
-                        if(anchorGraph[*it].useForAssembly) {
-                            anchorGraph[*it].useForAssembly = false;
-                            ++fragmentEdgeCount;
-                        }
-                    }
-                    auto ie2 = boost::in_edges(rcAid, anchorGraph);
-                    for(auto it = ie2.first; it != ie2.second; ++it) {
-                        if(anchorGraph[*it].useForAssembly) {
-                            anchorGraph[*it].useForAssembly = false;
-                            ++fragmentEdgeCount;
-                        }
                     }
                 }
             }
@@ -869,42 +854,45 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t danglingRemovedCount = 0;
         uint64_t danglingWindowCount = 0;
 
-        // Disable an edge and its RC mirror, updating all counts.
-        auto disableEdgeWithMirror = [&](edge_descriptor e) {
+        // Disable an edge + RC mirror and update local count maps.
+        auto disableAndUpdateCounts = [&](edge_descriptor e) {
             if(!anchorGraph[e].useForAssembly) return;
-            anchorGraph[e].useForAssembly = false;
+
+            // Decrement counts for this edge and its RC mirror before disabling.
+            auto decrementCounts = [&](edge_descriptor ed) {
+                const uint64_t sv = uint64_t(source(ed, anchorGraph));
+                const uint64_t dv = uint64_t(target(ed, anchorGraph));
+                if(sv < anchorCount && dv < anchorCount) {
+                    const uint32_t sw = anchorToWindow[sv];
+                    const uint32_t dw = anchorToWindow[dv];
+                    if(sw != noWindow && dw != noWindow && sw != dw) {
+                        rawOutCount[sw]--;
+                        rawInCount[dw]--;
+                        normOutCount[normalize(sw)]--;
+                        normInCount[normalize(dw)]--;
+                    }
+                }
+                ++danglingRemovedCount;
+            };
+
+            // Find RC mirror before disabling (disableEdge will disable both).
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
             const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-            if(srcVal < anchorCount && dstVal < anchorCount) {
-                const uint32_t sw = anchorToWindow[srcVal];
-                const uint32_t dw = anchorToWindow[dstVal];
-                if(sw != noWindow && dw != noWindow && sw != dw) {
-                    rawOutCount[sw]--;
-                    rawInCount[dw]--;
-                    normOutCount[normalize(sw)]--;
-                    normInCount[normalize(dw)]--;
-                }
-            }
-            ++danglingRemovedCount;
-
-            // Find and disable RC mirror: (dst^1) -> (src^1).
             const uint64_t rcSrc = dstVal ^ 1ULL;
             const uint64_t rcDst = srcVal ^ 1ULL;
+            edge_descriptor mirrorE;
+            bool hasMirror = false;
             if(rcSrc < anchorCount && rcDst < anchorCount) {
                 auto [eit, exists] = boost::edge(rcSrc, rcDst, anchorGraph);
                 if(exists && anchorGraph[eit].useForAssembly) {
-                    anchorGraph[eit].useForAssembly = false;
-                    const uint32_t msw = anchorToWindow[rcSrc];
-                    const uint32_t mdw = anchorToWindow[rcDst];
-                    if(msw != noWindow && mdw != noWindow && msw != mdw) {
-                        rawOutCount[msw]--;
-                        rawInCount[mdw]--;
-                        normOutCount[normalize(msw)]--;
-                        normInCount[normalize(mdw)]--;
-                    }
-                    ++danglingRemovedCount;
+                    hasMirror = true;
+                    mirrorE = eit;
                 }
             }
+
+            decrementCounts(e);
+            if(hasMirror) decrementCounts(mirrorE);
+            disableEdge(e);  // disables both edge and RC mirror
         };
 
         bool changed = true;
@@ -964,7 +952,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
                 for(const size_t idx : edgeIndices) {
                     const auto& iwe = interWindowEdges[idx];
-                    disableEdgeWithMirror(iwe.e);
+                    disableAndUpdateCounts(iwe.e);
                 }
                 changed = true;
             }
@@ -1324,7 +1312,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         best.connectivityMatrix[1][1];
 
                     if(isDiagonal) {
-                        anchorGraph[e].useForAssembly = false;
+                        disableEdge(e);
                         ++case2RemovedCount;
                     }
                 }
@@ -1657,7 +1645,7 @@ void Shasta2AnchorGraph::transitiveReduction(
 
         // Turn off the useForAssembly flag for edges removed at this iteration over coverage.
         for(const edge_descriptor e: edgesToRemove) {
-            anchorGraph[e].useForAssembly = false;
+            disableEdge(e);
         }
         cout << "Edge coverage " << edgeCoverage <<
             ": processed " << edgesToProcess.size() <<
@@ -1880,7 +1868,7 @@ uint64_t Shasta2AnchorGraph::cutWeakStalksLeadingToBranch(
     uint64_t cutCount = 0;
     for(const edge_descriptor e: candidateEdgesToCut) {
         if(graph[e].useForAssembly) {
-            graph[e].useForAssembly = false;
+            disableEdge(e);
             ++cutCount;
         }
     }
@@ -1975,5 +1963,24 @@ bool Shasta2AnchorGraph::transitiveReductionCanRemove(
 }
 
 
+
+void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    if(!anchorGraph[e].useForAssembly) return;
+    anchorGraph[e].useForAssembly = false;
+
+    const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+    const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+    const uint64_t rcSrc = dstVal ^ 1ULL;
+    const uint64_t rcDst = srcVal ^ 1ULL;
+    if(rcSrc < anchorCount && rcDst < anchorCount) {
+        auto [eit, exists] = boost::edge(rcSrc, rcDst, anchorGraph);
+        if(exists) {
+            anchorGraph[eit].useForAssembly = false;
+        }
+    }
+}
 
 
