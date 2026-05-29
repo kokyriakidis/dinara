@@ -85,24 +85,16 @@ uint64_t dinara::detangleWindows(
             }
         }
 
-        // Filter by minimum coverage.
-        vector<MergedFlow> flows;
-        for(auto& mf : mergedFlows) {
-            if(mf.readSet.size() >= minFlowCoverage) {
-                flows.push_back(std::move(mf));
-            }
-        }
-
-        if(flows.size() < 2) {
+        if(mergedFlows.size() < 2) {
             continue;
         }
 
-        const uint64_t pathCount = flows.size();
+        const uint64_t pathCount = mergedFlows.size();
 
         cout << "  Window " << window.windowId
              << " backbone=" << window.backboneOrientedReadId
              << ": " << pathCount << " flows:";
-        for(const auto& f : flows) {
+        for(const auto& f : mergedFlows) {
             cout << " {";
             for(uint64_t k = 0; k < f.flowKeys.size(); k++) {
                 if(k > 0) cout << "+";
@@ -139,7 +131,7 @@ uint64_t dinara::detangleWindows(
             DeferredSplit rcSplit{rcId, {}};
 
             for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                const set<uint32_t>& flowReads = flows[pathIdx].readSet;
+                const set<uint32_t>& flowReads = mergedFlows[pathIdx].readSet;
 
                 // Canonical: keep reads that are in the flow's read set.
                 vector<Shasta2AnchorMarkerInfo> canonicalSubset;
