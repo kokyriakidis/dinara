@@ -3,6 +3,7 @@
 // Shasta2AnchorGraph.hpp
 
 #include "AnchorWindows.hpp"
+#include "DinaraDetangle.hpp"
 #include "Reads.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
@@ -80,8 +81,8 @@ public:
     // Construct from anchor windows: each window becomes a chain of its
     // backbone anchors, and inter-window edges are discovered by walking
     // read journeys.
-    // If anchorSplitMap is provided, tangled backbone anchors are replaced
-    // by their split copies, creating parallel chains per path.
+    // If bypassEdges is provided, additional edges are created to bypass
+    // detangled windows.
     Shasta2AnchorGraph(
         const Shasta2Anchors&,
         const Shasta2Journeys&,
@@ -89,7 +90,7 @@ public:
         uint64_t minInterWindowCoverage,
         uint64_t threadCount,
         const Reads* reads = nullptr,
-        const std::map<Shasta2AnchorId, vector<Shasta2AnchorId>>* anchorSplitMap = nullptr);
+        const vector<DetangleBypassEdge>* bypassEdges = nullptr);
 
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}

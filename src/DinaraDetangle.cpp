@@ -1,17 +1,21 @@
-// Detangling: split backbone anchors of tangled windows so that
-// each path through the window gets its own anchor copies containing
-// only that path's reads.
+// Detangling: for each tangled window, identify flows (prev->current->next
+// triplets), create bypass edges connecting prev directly to next, and
+// remove flow reads from the current window's backbone anchors.
 //
-// A flow is defined by the reads common between a previous window and
-// a next window. These reads traverse the current window's backbone.
-// For each backbone anchor, a split copy is created containing the
-// subset of flow reads present in that anchor.
+// Algorithm:
+// 1. Find all triplets (W_prev -> X -> W_next) from transitionReads
+// 2. Merge directional pairs (A->B) and (B->A) into single flows
+// 3. Sort flows by common read count (descending)
+// 4. For each flow: create a bypass edge from prev's exit anchor to
+//    next's entry anchor, record the common reads
+// 5. Remove all flow reads from every backbone anchor of window X
 
 #include "DinaraDetangle.hpp"
 #include "timestamp.hpp"
 
 #include <algorithm>
 #include <iostream>
+#include <map>
 #include <set>
 
 using namespace dinara;
@@ -29,26 +33,17 @@ uint64_t dinara::detangleWindows(
     const Shasta2Journeys& journeys,
     const vector<AnchorWindow>& anchorWindows,
     uint64_t minFlowCoverage,
-    map<Shasta2AnchorId, vector<Shasta2AnchorId>>& anchorSplitMap)
+    vector<DetangleBypassEdge>& bypassEdges)
 {
     cout << timestamp << "Detangling begins." << endl;
 
     const uint32_t noW = AnchorWindow::noWindow;
     uint64_t detangledCount = 0;
-    anchorSplitMap.clear();
+    bypassEdges.clear();
 
-    // Collect all new anchors to append at the end, to avoid invalidating
-    // spans into anchorMarkerInfos during iteration.
-    vector<vector<Shasta2AnchorMarkerInfo>> newAnchors;
-
-    // Deferred split: originalId -> index into newAnchors per path.
-    // invalidIndex means the flow has no reads at this anchor.
-    static constexpr uint64_t invalidIndex = uint64_t(-1);
-    struct DeferredSplit {
-        Shasta2AnchorId originalId;
-        vector<uint64_t> newAnchorIndices;
-    };
-    vector<DeferredSplit> deferredSplits;
+    // Track which anchors need flow reads removed, and which reads to remove.
+    // Key: anchor ID. Value: set of OrientedReadId values to remove.
+    map<Shasta2AnchorId, set<uint32_t>> readsToRemove;
 
     for(const AnchorWindow& window : anchorWindows) {
 
@@ -89,6 +84,12 @@ uint64_t dinara::detangleWindows(
             continue;
         }
 
+        // Sort flows by read count (descending) — process largest first.
+        std::sort(mergedFlows.begin(), mergedFlows.end(),
+            [](const MergedFlow& a, const MergedFlow& b) {
+                return a.readSet.size() > b.readSet.size();
+            });
+
         const uint64_t pathCount = mergedFlows.size();
 
         cout << "  Window " << window.windowId
@@ -104,196 +105,126 @@ uint64_t dinara::detangleWindows(
         }
         cout << endl;
 
-        // Get backbone info.
-        const OrientedReadId backboneOid = window.backboneOrientedReadId;
-        const auto backboneJourney = journeys[backboneOid];
-        const auto& positions = window.filteredBackbonePositions;
-        if(positions.empty()) continue;
-
         ++detangledCount;
 
-        // Collect unique backbone anchor pairs (canonical, RC) in order.
-        struct BackboneAnchorPair {
-            Shasta2AnchorId canonicalId;
-            Shasta2AnchorId rcId;
-        };
-        vector<BackboneAnchorPair> backbonePairs;
-        set<Shasta2AnchorId> seen;
-        for(const uint32_t pos : positions) {
-            const Shasta2AnchorId anchorId = backboneJourney[pos];
-            const Shasta2AnchorId canonicalId = anchorId & ~Shasta2AnchorId(1);
-            if(seen.count(canonicalId)) continue;
-            seen.insert(canonicalId);
-            backbonePairs.push_back({canonicalId, canonicalId | Shasta2AnchorId(1)});
-        }
+        // Collect all flow reads for removal from backbone.
+        set<uint32_t> allFlowReads;
 
-        const uint64_t nPositions = backbonePairs.size();
+        for(const auto& flow : mergedFlows) {
+            // For each directional key (prev->next), find the connection
+            // anchors and create a bypass edge.
+            for(const auto& fk : flow.flowKeys) {
+                const uint32_t prevW = fk.first;
+                const uint32_t nextW = fk.second;
 
-        // Phase 1: For each flow and each backbone position, compute the
-        // read subsets (canonical and RC). Store as sets of OrientedReadId
-        // values for connectivity checking.
-        // readSubsets[pathIdx][posIdx] = set of canonical-strand read values.
-        vector<vector<set<uint32_t>>> readSubsets(pathCount, vector<set<uint32_t>>(nPositions));
-
-        for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-            const set<uint32_t>& flowReads = mergedFlows[pathIdx].readSet;
-            for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
-                const auto canonicalSpan = anchors[backbonePairs[posIdx].canonicalId];
-                for(const auto& mi : canonicalSpan) {
-                    if(flowReads.count(mi.orientedReadId.getValue())) {
-                        readSubsets[pathIdx][posIdx].insert(mi.orientedReadId.getValue());
-                    }
-                }
-            }
-        }
-
-        // Phase 2: For each flow, thin the chain to keep only positions
-        // where consecutive pairs share reads. Use greedy bridging:
-        // walk forward, skip positions that don't share reads with the
-        // last kept position.
-        // keep[pathIdx][posIdx] = true if this position is kept.
-        vector<vector<bool>> keep(pathCount, vector<bool>(nPositions, false));
-
-        for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-            // Find positions where this flow has reads.
-            vector<uint64_t> flowPositions;
-            for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
-                if(!readSubsets[pathIdx][posIdx].empty()) {
-                    flowPositions.push_back(posIdx);
-                }
-            }
-            if(flowPositions.size() < 2) continue;
-
-            // Greedy bridging: keep positions that share reads with predecessor.
-            vector<uint64_t> kept;
-            kept.push_back(flowPositions[0]);
-            for(uint64_t i = 1; i < flowPositions.size(); i++) {
-                const uint64_t prevPos = kept.back();
-                const uint64_t curPos = flowPositions[i];
-                // Check if they share reads.
-                const auto& prevReads = readSubsets[pathIdx][prevPos];
-                const auto& curReads = readSubsets[pathIdx][curPos];
-                bool sharesReads = false;
-                for(const uint32_t r : prevReads) {
-                    if(curReads.count(r)) {
-                        sharesReads = true;
+                // Find the incoming edge from prevW: anchorIdA is the last
+                // anchor in prevW (the exit point of prevW).
+                Shasta2AnchorId prevExitAnchor = Shasta2AnchorId(0);
+                bool foundPrev = false;
+                for(const auto& ie : window.inEdges) {
+                    if(ie.otherWindow == prevW) {
+                        prevExitAnchor = ie.anchorIdA;
+                        foundPrev = true;
                         break;
                     }
                 }
-                if(sharesReads) {
-                    kept.push_back(curPos);
-                }
-                // If not, skip curPos (it will not be split).
-            }
-            // Only keep if chain has at least 2 positions.
-            if(kept.size() >= 2) {
-                for(const uint64_t posIdx : kept) {
-                    keep[pathIdx][posIdx] = true;
-                }
-            }
-        }
 
-        // Phase 3: Create split copies only for kept positions.
-        uint64_t splitPairCount = 0;
-        for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
-            // Check if any flow keeps this position.
-            bool anyKept = false;
-            for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                if(keep[pathIdx][posIdx]) {
-                    anyKept = true;
-                    break;
-                }
-            }
-            if(!anyKept) continue;
-
-            const Shasta2AnchorId canonicalId = backbonePairs[posIdx].canonicalId;
-            const Shasta2AnchorId rcId = backbonePairs[posIdx].rcId;
-
-            // Copy anchor data.
-            const auto canonicalSpan = anchors[canonicalId];
-            const auto rcSpan = anchors[rcId];
-            vector<Shasta2AnchorMarkerInfo> canonicalData(canonicalSpan.begin(), canonicalSpan.end());
-            vector<Shasta2AnchorMarkerInfo> rcData(rcSpan.begin(), rcSpan.end());
-
-            DeferredSplit canonicalSplit{canonicalId, {}};
-            DeferredSplit rcSplit{rcId, {}};
-
-            for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                if(!keep[pathIdx][posIdx]) {
-                    // This flow doesn't keep this position — use original.
-                    canonicalSplit.newAnchorIndices.push_back(invalidIndex);
-                    rcSplit.newAnchorIndices.push_back(invalidIndex);
-                    continue;
-                }
-
-                const set<uint32_t>& flowReads = mergedFlows[pathIdx].readSet;
-
-                // Canonical subset.
-                vector<Shasta2AnchorMarkerInfo> canonicalSubset;
-                for(const auto& mi : canonicalData) {
-                    if(flowReads.count(mi.orientedReadId.getValue())) {
-                        canonicalSubset.push_back(mi);
+                // Find the outgoing edge to nextW: anchorIdB is the first
+                // anchor in nextW (the entry point of nextW).
+                Shasta2AnchorId nextEntryAnchor = Shasta2AnchorId(0);
+                bool foundNext = false;
+                for(const auto& oe : window.outEdges) {
+                    if(oe.otherWindow == nextW) {
+                        nextEntryAnchor = oe.anchorIdB;
+                        foundNext = true;
+                        break;
                     }
                 }
 
-                // RC subset.
-                vector<Shasta2AnchorMarkerInfo> rcSubset;
-                for(const auto& mi : rcData) {
-                    const uint32_t flippedValue = mi.orientedReadId.getValue() ^ 1;
-                    if(flowReads.count(flippedValue)) {
-                        rcSubset.push_back(mi);
-                    }
-                }
+                if(foundPrev && foundNext) {
+                    // Forward bypass edge.
+                    bypassEdges.push_back({prevExitAnchor, nextEntryAnchor});
 
-                if(!canonicalSubset.empty()) {
-                    canonicalSplit.newAnchorIndices.push_back(newAnchors.size());
-                    newAnchors.push_back(std::move(canonicalSubset));
-                } else {
-                    canonicalSplit.newAnchorIndices.push_back(invalidIndex);
-                }
+                    // RC bypass edge: B' -> A' (reversed direction).
+                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(prevExitAnchor) ^ 1ULL);
+                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(nextEntryAnchor) ^ 1ULL);
+                    bypassEdges.push_back({rcB, rcA});
 
-                if(!rcSubset.empty()) {
-                    rcSplit.newAnchorIndices.push_back(newAnchors.size());
-                    newAnchors.push_back(std::move(rcSubset));
-                } else {
-                    rcSplit.newAnchorIndices.push_back(invalidIndex);
+                    cout << "    Bypass: " << prevExitAnchor << " -> "
+                         << nextEntryAnchor << " (+ RC " << rcB << " -> " << rcA << ")"
+                         << " (prev=" << prevW << " next=" << nextW
+                         << " reads=" << flow.readSet.size() << ")" << endl;
                 }
             }
 
-            deferredSplits.push_back(std::move(canonicalSplit));
-            deferredSplits.push_back(std::move(rcSplit));
-            ++splitPairCount;
+            // Accumulate flow reads.
+            for(const uint32_t r : flow.readSet) {
+                allFlowReads.insert(r);
+            }
         }
 
-        cout << "    Split " << splitPairCount << " anchor pairs into "
-             << pathCount << " paths each." << endl;
+        // Mark flow reads for removal from each backbone anchor.
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+        const auto& positions = window.filteredBackbonePositions;
+
+        set<Shasta2AnchorId> processedAnchors;
+        for(const uint32_t pos : positions) {
+            const Shasta2AnchorId anchorId = backboneJourney[pos];
+            const Shasta2AnchorId canonicalId = anchorId & ~Shasta2AnchorId(1);
+            const Shasta2AnchorId rcId = canonicalId | Shasta2AnchorId(1);
+
+            if(processedAnchors.count(canonicalId)) continue;
+            processedAnchors.insert(canonicalId);
+
+            // For canonical anchor: remove reads whose OrientedReadId value
+            // is in allFlowReads.
+            for(const uint32_t r : allFlowReads) {
+                readsToRemove[canonicalId].insert(r);
+            }
+
+            // For RC anchor: flow reads are stored as forward-strand values,
+            // but RC anchor reads are strand-flipped.
+            for(const uint32_t r : allFlowReads) {
+                readsToRemove[rcId].insert(r ^ 1);
+            }
+        }
+
+        cout << "    Marked " << allFlowReads.size() << " flow reads for removal from "
+             << processedAnchors.size() << " backbone anchor pairs." << endl;
     }
 
-    // Append all new anchors at once. Original anchors are kept intact —
-    // they serve as inter-window connection points with their full read sets.
-    // Split copies contain flow-specific subsets for the parallel chains.
-    const Shasta2AnchorId firstNewId = Shasta2AnchorId(anchors.anchorMarkerInfos.size());
-    for(const auto& anchorData : newAnchors) {
-        anchors.anchorMarkerInfos.appendVector(anchorData);
-    }
+    // Rebuild anchorMarkerInfos: copy all anchors, removing flow reads
+    // from backbone anchors of detangled windows.
+    if(!readsToRemove.empty()) {
+        const uint64_t anchorCount = anchors.anchorMarkerInfos.size();
+        vector<vector<Shasta2AnchorMarkerInfo>> allAnchors(anchorCount);
 
-    // Build the split map. invalidIndex entries get the original anchor ID.
-    for(const auto& ds : deferredSplits) {
-        vector<Shasta2AnchorId> splitIds;
-        for(const uint64_t idx : ds.newAnchorIndices) {
-            if(idx == invalidIndex) {
-                splitIds.push_back(ds.originalId);
+        for(uint64_t i = 0; i < anchorCount; i++) {
+            const auto span = anchors.anchorMarkerInfos[i];
+            auto it = readsToRemove.find(Shasta2AnchorId(i));
+            if(it != readsToRemove.end()) {
+                const auto& toRemove = it->second;
+                for(const auto& mi : span) {
+                    if(!toRemove.count(mi.orientedReadId.getValue())) {
+                        allAnchors[i].push_back(mi);
+                    }
+                }
             } else {
-                splitIds.push_back(Shasta2AnchorId(uint64_t(firstNewId) + idx));
+                allAnchors[i].assign(span.begin(), span.end());
             }
         }
-        anchorSplitMap[ds.originalId] = splitIds;
+
+        // Rebuild the VectorOfVectors.
+        anchors.anchorMarkerInfos.clear();
+        for(const auto& anchorData : allAnchors) {
+            anchors.anchorMarkerInfos.appendVector(anchorData);
+        }
     }
 
     cout << timestamp << "Detangling: " << detangledCount
          << " windows detangled, "
-         << newAnchors.size() << " new anchors created, "
-         << anchors.anchorMarkerInfos.size() << " total anchors." << endl;
+         << bypassEdges.size() << " bypass edges created." << endl;
 
     return detangledCount;
 }
