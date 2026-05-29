@@ -591,8 +591,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Trim backbone outside the bounding inter-window connection span.
     auto trimBackbones = [&]() {
         // Disable intra-window edges of a trimmed anchor.
-        // Inter-window edges are left intact — they'll be cleaned up
-        // by the isolated anchor cleanup that follows.
         auto clearIntraWindowEdges = [&](uint64_t vid) {
             if(vid >= anchorCount) return;
             const uint32_t vWindow = anchorToWindow[vid];
@@ -616,68 +614,73 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
+        // Check if a backbone anchor has any active inter-window edge.
+        auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
+            if(aid >= anchorCount) return false;
+            const uint32_t aidWin = anchorToWindow[aid];
+            if(aidWin == noWindow) return false;
+            const uint32_t aidNorm = normalizeW(aidWin);
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt < anchorCount) {
+                    const uint32_t tgtWin = anchorToWindow[tgt];
+                    if(tgtWin != noWindow && normalizeW(tgtWin) != aidNorm)
+                        return true;
+                }
+            }
+            auto ie = boost::in_edges(aid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src < anchorCount) {
+                    const uint32_t srcWin = anchorToWindow[src];
+                    if(srcWin != noWindow && normalizeW(srcWin) != aidNorm)
+                        return true;
+                }
+            }
+            return false;
+        };
+
         uint64_t trimmedVertexCount = 0;
         uint64_t trimmedWindowCount = 0;
 
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
             const auto& positions = window.filteredBackbonePositions;
-            if(positions.empty()) continue;
+            if(positions.size() <= 1) continue;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            // Find the bounding span: min and max backbone positions of
-            // anchors in this window that have inter-window edges.
-            // Use anchorToBackbonePos which works for both forward and RC anchors.
-            int64_t startBound = -1, endBound = -1;
-            bool hasInterWindowEdges = false;
-
-            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                if(!anchorGraph[e].useForAssembly) continue;
-                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
-                const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
-                if(srcWin == noWindow || dstWin == noWindow) continue;
-                if(srcWin == dstWin) continue;
-
-                // Get the backbone position of whichever endpoint belongs to this window.
-                int64_t pos = -1;
-                if(dstWin == w) {
-                    pos = int64_t(anchorToBackbonePos[dstVal]);
-                } else if(srcWin == w) {
-                    pos = int64_t(anchorToBackbonePos[srcVal]);
-                }
-                if(pos >= 0) {
-                    hasInterWindowEdges = true;
-                    if(startBound < 0 || pos < startBound) startBound = pos;
-                    if(endBound < 0 || pos > endBound) endBound = pos;
-                }
-            }
-
-            if(!hasInterWindowEdges) continue;
-            if(startBound < 0 || endBound < 0 || startBound > endBound) continue;
-
-            int64_t keepFirst = -1;
+            // Walk from the head inward: trim anchors until we hit one
+            // with an inter-window edge.
+            uint64_t headTrim = 0;
             for(uint64_t i = 0; i < positions.size(); i++) {
-                if(int64_t(positions[i]) >= startBound) { keepFirst = int64_t(i); break; }
+                const uint64_t aid = uint64_t(journey[positions[i]]);
+                if(hasInterWindowEdge(aid)) break;
+                ++headTrim;
             }
-            int64_t keepLast = -1;
-            for(int64_t i = int64_t(positions.size()) - 1; i >= 0; i--) {
-                if(int64_t(positions[i]) <= endBound) { keepLast = i; break; }
+            // Don't trim everything — keep at least 1 anchor.
+            if(headTrim >= positions.size()) headTrim = 0;
+
+            // Walk from the tail inward.
+            uint64_t tailTrim = 0;
+            for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
+                const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
+                if(hasInterWindowEdge(aid)) break;
+                ++tailTrim;
             }
-            if(keepFirst < 0 || keepLast < 0 || keepFirst > keepLast) continue;
-            const uint64_t headTrim = uint64_t(keepFirst);
-            const uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
+            if(headTrim + tailTrim >= positions.size()) tailTrim = 0;
+
             if(headTrim == 0 && tailTrim == 0) continue;
             ++trimmedWindowCount;
 
-            for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
+            for(uint64_t i = 0; i < headTrim; i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
             }
-            for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
+            for(uint64_t i = positions.size() - tailTrim; i < positions.size(); i++) {
                 const Shasta2AnchorId aid = journey[positions[i]];
                 clearIntraWindowEdges(uint64_t(aid));
                 ++trimmedVertexCount;
