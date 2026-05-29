@@ -681,6 +681,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         cout << "Trim backbones: " << trimmedWindowCount << " windows trimmed, "
              << trimmedVertexCount << " vertices trimmed." << endl;
+        return trimmedVertexCount;
     };
 
     // Dangling window cleanup: remove inter-window edges for windows
@@ -873,7 +874,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //   4. Dangling cleanup
     // Case 2 and final dangling cleanup run after bypass edges below.
     // ========================================================================
-    trimBackbones();
+    // Run trimBackbones iteratively: trimming window A may disable inter-window
+    // edges that shrink window B's bounding span, enabling further trimming.
+    for(uint64_t pass = 1; ; ++pass) {
+        const uint64_t trimmed = trimBackbones();
+        if(trimmed == 0) break;
+    }
     //runParallelFilter();
     //runShortcutFilter();
     //removeDanglingWindowsIterative("post-filter");
