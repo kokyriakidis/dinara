@@ -1205,6 +1205,51 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     removeDanglingWindowsIterative("post-detangle");
 
+    // Diagnostic: dump per-window inter-window connectivity after all cleanup.
+    {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+        // For each window, track which other windows it connects to.
+        std::map<uint32_t, std::set<uint32_t>> outNeighbors, inNeighbors;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcWin = normalize(anchorToWindow[srcVal]);
+            const uint32_t dstWin = normalize(anchorToWindow[dstVal]);
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue;
+            outNeighbors[srcWin].insert(dstWin);
+            inNeighbors[dstWin].insert(srcWin);
+        }
+        // Print windows that are one-sided (dangling survivors).
+        cout << "Post-cleanup dangling check:" << endl;
+        std::set<uint32_t> allWindows;
+        for(const auto& [w, _] : outNeighbors) allWindows.insert(w);
+        for(const auto& [w, _] : inNeighbors) allWindows.insert(w);
+        uint64_t survivingDangling = 0;
+        for(const uint32_t w : allWindows) {
+            const bool hasIn = inNeighbors.count(w) && !inNeighbors[w].empty();
+            const bool hasOut = outNeighbors.count(w) && !outNeighbors[w].empty();
+            if(hasIn != hasOut) {
+                ++survivingDangling;
+                cout << "  DANGLING window " << w
+                     << " in={";
+                if(hasIn) for(const auto n : inNeighbors[w]) cout << n << " ";
+                cout << "} out={";
+                if(hasOut) for(const auto n : outNeighbors[w]) cout << n << " ";
+                cout << "}" << endl;
+            }
+        }
+        if(survivingDangling == 0) {
+            cout << "  No dangling windows remain." << endl;
+        } else {
+            cout << "  " << survivingDangling << " dangling windows survive." << endl;
+        }
+    }
+
     // Validate: check that every edge has shared oriented reads.
     {
         uint64_t emptyEdgeCount = 0;
