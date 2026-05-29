@@ -435,12 +435,12 @@ Scoring: ✅ = correct type, size within 30%. ⚠️ = correct type, size off >3
 | DEL 500-1000bp | 10 | 7 | 3 | 0 | 70% |
 | DEL >1000bp | 10 | 8 | 1 | 1 | 80% |
 | INS <100bp | 10 | 9 | 1 | 0 | 90% |
-| INS 100-500bp | 10 | 5 | 5 | 0 | 50% |
+| INS 100-500bp | 10 | 7 | 3 | 0 | 70% |
 | INS 500-1000bp | 10 | 7 | 2 | 1 | 70% |
-| INS >1000bp | 10 | 0 | 8 | 2 | 0% |
-| **TOTAL** | **80** | **54** | **22** | **4** | **67%** |
+| INS >1000bp | 10 | 0 | 9 | 1 | 0% |
+| **TOTAL** | **80** | **56** | **21** | **3** | **70%** |
 
-**Correct type (✅+⚠️): 76/80 = 95%**
+**Correct type (✅+⚠️): 77/80 = 96%**
 
 Key observations:
 - **DEL <100bp at 90%**: compound CIGAR merging (35D+55D→90D) and CIGAR-corroborated k-mer clusters fix tandem repeat and STR cases
@@ -448,9 +448,9 @@ Key observations:
 - **DEL 500-1000bp at 70%**: SA-tag VNTR suppression relaxed for strong calls (≥10 reads); coverage-drop corroborated k-mer clusters for marker-depleted regions; remaining 3 ⚠️ are tandem repeat copy-number ambiguities (DEL662, DEL605, DEL500)
 - **DEL >1000bp at 80%**: 1 ❌ (DEL1432 — no call), 1 ⚠️ (DEL6191 — partial detection)
 - **INS <100bp at 90%**: no-covdrop-flip detects INS58 (diagonal-shift DEL with no coverage-drop support → INS)
-- **INS 100-500bp at 50%**: reversed-BP INS (INS330), no-covdrop-flip (INS313), flank-gap covDrop sizing (INS310), CIGAR-covdrop corroboration (INS266)
+- **INS 100-500bp at 70%**: reversed-BP INS (INS330), no-covdrop-flip (INS313), flank-gap covDrop sizing (INS310), CIGAR-covdrop corroboration (INS266), SA-DEL-flip (INS306), flank-gap-rounded (INS252)
 - **INS 500-1000bp at 70%**: no-covdrop-flip detects INS509 (split-read DEL with no coverage-drop → INS)
-- **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads
+- **INS >1000bp** has 0% exact: assembly contigs max out at ~600bp with 250bp reads; flank-gap-alt provides ⚠️ for INS2399
 
 ### Known Limitations
 
