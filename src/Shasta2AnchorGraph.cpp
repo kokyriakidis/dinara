@@ -678,6 +678,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == w) neighborEdges.push_back({e, dstWin, false});
             }
 
+            // Check if removing W's edges would make any neighbor
+            // *become* dangling (transition from having both incoming
+            // and outgoing to having only one side).
             bool safeToRemove = true;
             for(const auto& ne : neighborEdges) {
                 const uint32_t n = ne.neighborWin;
@@ -688,10 +691,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         else nInFromW++;
                     }
                 }
-                const uint64_t nInAfter = (inCount.count(n) ? inCount[n] : 0) - nInFromW;
-                const uint64_t nOutAfter = (outCount.count(n) ? outCount[n] : 0) - nOutToW;
+                const uint64_t nInBefore = inCount.count(n) ? inCount[n] : 0;
+                const uint64_t nOutBefore = outCount.count(n) ? outCount[n] : 0;
+                const uint64_t nInAfter = nInBefore - nInFromW;
+                const uint64_t nOutAfter = nOutBefore - nOutToW;
 
-                if((nInAfter > 0) != (nOutAfter > 0)) {
+                // Was the neighbor two-sided before but would become
+                // one-sided after?
+                const bool wasTwoSided = (nInBefore > 0) && (nOutBefore > 0);
+                const bool wouldBeOneSided = (nInAfter > 0) != (nOutAfter > 0);
+                if(wasTwoSided && wouldBeOneSided) {
                     safeToRemove = false;
                     break;
                 }
