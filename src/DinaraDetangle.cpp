@@ -269,7 +269,9 @@ uint64_t dinara::detangleWindows(
              << pathCount << " paths each." << endl;
     }
 
-    // Append all new anchors at once.
+    // Append all new anchors at once. Original anchors are kept intact —
+    // they serve as inter-window connection points with their full read sets.
+    // Split copies contain flow-specific subsets for the parallel chains.
     const Shasta2AnchorId firstNewId = Shasta2AnchorId(anchors.anchorMarkerInfos.size());
     for(const auto& anchorData : newAnchors) {
         anchors.anchorMarkerInfos.appendVector(anchorData);
