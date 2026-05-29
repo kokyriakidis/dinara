@@ -450,29 +450,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Remove redundant parallel inter-window edges.
-    // For each window W, if the same neighbor A appears in both W's
-    // incoming and outgoing transitions, the A→W and W→A inter-window
-    // edges are redundant — the path already goes through W's backbone.
-    // Check that the landing anchor (from A→W) precedes the leaving
-    // anchor (from W→A) on W's backbone to confirm reachability.
-    // COMMENTED OUT pending validation on larger datasets.
+    // ========================================================================
+    // Filter lambdas (defined here, called in order below).
+    // ========================================================================
+
+    // Parallel filter: remove inter-window edges for A→A flows.
+    auto runParallelFilter = [&]() {
 #if 1
-    {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
         const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
-        // For each window, find neighbors that form parallel connections:
-        // reads enter from A and exit back to A (flow A→A through W).
-        // This is distinct from chain connections where reads flow A→B.
         std::map<uint32_t, std::set<uint32_t>> parallelNeighbors;
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
             for(const auto& [key, reads] : window.transitionReads) {
-                // key.first = incoming neighbor, key.second = outgoing neighbor.
-                // A parallel connection has the same window on both sides.
                 if(key.first != noW && key.first == key.second) {
                     parallelNeighbors[w].insert(key.first);
                 }
@@ -481,14 +474,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         if(!parallelNeighbors.empty()) {
             uint64_t parallelRemovedCount = 0;
-
             for(const auto& [w, neighbors] : parallelNeighbors) {
                 for(const uint32_t neighborW : neighbors) {
-                    // Find incoming edges from neighborW to W and
-                    // outgoing edges from W to neighborW.
                     struct EdgeInfo {
                         edge_descriptor e;
-                        Shasta2AnchorId anchorInW;  // the anchor on W's side
+                        Shasta2AnchorId anchorInW;
                     };
                     std::vector<EdgeInfo> incomingEdges;
                     std::vector<EdgeInfo> outgoingEdges;
@@ -499,18 +489,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                         const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
                         const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
                         if(srcWin == dstWin) continue;
-
-                        // Edge from neighborW → W (incoming to W).
-                        if(srcWin == neighborW && dstWin == w) {
+                        if(srcWin == neighborW && dstWin == w)
                             incomingEdges.push_back({e, Shasta2AnchorId(dstVal)});
-                        }
-                        // Edge from W → neighborW (outgoing from W).
-                        if(srcWin == w && dstWin == neighborW) {
+                        if(srcWin == w && dstWin == neighborW)
                             outgoingEdges.push_back({e, Shasta2AnchorId(srcVal)});
-                        }
                     }
 
-                    // For each (incoming, outgoing) pair, check backbone reachability.
                     std::vector<edge_descriptor> edgesToRemove;
                     for(const auto& in : incomingEdges) {
                         const uint32_t landingPos = anchorToBackbonePos[uint64_t(in.anchorInW)];
@@ -522,8 +506,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                             }
                         }
                     }
-
-                    // Deduplicate and remove.
                     std::sort(edgesToRemove.begin(), edgesToRemove.end());
                     edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
                                         edgesToRemove.end());
@@ -533,28 +515,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     }
                 }
             }
-
             if(parallelRemovedCount > 0) {
                 cout << "Parallel connections: removed " << parallelRemovedCount
                      << " redundant inter-window edges." << endl;
             }
         }
-    }
 #endif
+    };
 
-    // Remove redundant shortcut edges.
-    // If window B has prev=A and next=C, and there's already a direct
-    // A→C inter-window edge, then B is a shortcut and the A→B and B→C
-    // edges are redundant.
-    // COMMENTED OUT — causes breaks on larger datasets.
+    // Shortcut filter: remove edges for small bypass windows.
+    auto runShortcutFilter = [&]() {
 #if 1
-    {
         auto normalize = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
         const uint32_t noW = AnchorWindowReadInterval::noWindow;
 
-        // Build set of directly connected normalized window pairs.
         std::set<std::pair<uint32_t, uint32_t>> directConnections;
         for(const auto& edgeInfo : createdEdges) {
             const uint32_t a = normalize(edgeInfo.windowPair.first);
@@ -563,33 +539,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             directConnections.insert({b, a});
         }
 
-        // For each window B, check if any (prev=A, next=C) transition
-        // has a direct A→C connection where both A and C are larger
-        // than B (more reads).
         uint64_t shortcutRemovedCount = 0;
         for(uint32_t b = 0; b < windowCount; b++) {
             const auto& window = anchorWindows[b];
             const uint64_t bSize = window.readIntervals.size();
 
-            // Collect (A, C) pairs from transitions through B.
             std::set<std::pair<uint32_t, uint32_t>> bypassedPairs;
             for(const auto& [key, reads] : window.transitionReads) {
                 const uint32_t A = key.first;
                 const uint32_t C = key.second;
                 if(A == noW || C == noW) continue;
-                if(A == C) continue;  // parallel, handled above
+                if(A == C) continue;
                 if(!directConnections.count({A, C})) continue;
-                // Only skip B if both A and C are larger windows.
                 if(A < windowCount && C < windowCount &&
                    anchorWindows[A].readIntervals.size() > bSize &&
                    anchorWindows[C].readIntervals.size() > bSize) {
                     bypassedPairs.insert({A, C});
                 }
             }
-
             if(bypassedPairs.empty()) continue;
 
-            // Remove inter-window edges between B and the bypassed neighbors.
             std::set<uint32_t> neighborsToRemove;
             for(const auto& [A, C] : bypassedPairs) {
                 neighborsToRemove.insert(A);
@@ -603,16 +572,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const uint32_t srcWin = (srcVal < anchorCount) ? normalize(anchorToWindow[srcVal]) : noWindow;
                 const uint32_t dstWin = (dstVal < anchorCount) ? normalize(anchorToWindow[dstVal]) : noWindow;
                 if(srcWin == dstWin) continue;
-
-                // Edge from neighbor → B or B → neighbor.
-                if(srcWin == b && neighborsToRemove.count(dstWin)) {
-                    edgesToRemove.push_back(e);
-                }
-                if(dstWin == b && neighborsToRemove.count(srcWin)) {
-                    edgesToRemove.push_back(e);
-                }
+                if(srcWin == b && neighborsToRemove.count(dstWin)) edgesToRemove.push_back(e);
+                if(dstWin == b && neighborsToRemove.count(srcWin)) edgesToRemove.push_back(e);
             }
-
             std::sort(edgesToRemove.begin(), edgesToRemove.end());
             edgesToRemove.erase(std::unique(edgesToRemove.begin(), edgesToRemove.end()),
                                 edgesToRemove.end());
@@ -621,13 +583,146 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 ++shortcutRemovedCount;
             }
         }
-
         if(shortcutRemovedCount > 0) {
             cout << "Shortcut filter: removed " << shortcutRemovedCount
                  << " redundant inter-window edges." << endl;
         }
-    }
 #endif
+    };
+
+    // Rule 1: Trim backbone outside the bounding inter-window connection span.
+    auto runRule1 = [&]() {
+        auto clearIntraWindowEdges = [&](uint64_t vid) {
+            if(vid >= anchorCount) return;
+            const uint32_t vWindow = anchorToWindow[vid];
+            std::vector<edge_descriptor> toRemove;
+            auto oe = boost::out_edges(vid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow)
+                    toRemove.push_back(*it);
+            }
+            auto ie = boost::in_edges(vid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src < anchorCount && anchorToWindow[src] == vWindow)
+                    toRemove.push_back(*it);
+            }
+            for(const auto& e : toRemove) boost::remove_edge(e, anchorGraph);
+        };
+
+        auto findJourneyPos = [&](
+            const auto& journey, const AnchorWindow& window,
+            Shasta2AnchorId anchor) -> int64_t
+        {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                if(journey[pos] == anchor) return int64_t(pos);
+            }
+            return -1;
+        };
+
+        auto normalizeW = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        uint64_t trimmedVertexCount = 0;
+        uint64_t trimmedWindowCount = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            int64_t startBound = -1, endBound = -1;
+            bool hasInterWindowEdges = false;
+
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
+                const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
+                if(srcWin == noWindow || dstWin == noWindow) continue;
+                if(srcWin == dstWin) continue;
+                if(dstWin == w) {
+                    hasInterWindowEdges = true;
+                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
+                    if(pos >= 0 && (startBound < 0 || pos < startBound)) startBound = pos;
+                }
+                if(srcWin == w) {
+                    hasInterWindowEdges = true;
+                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
+                    if(pos >= 0 && (endBound < 0 || pos > endBound)) endBound = pos;
+                }
+            }
+
+            if(!hasInterWindowEdges) continue;
+            if(startBound < 0) startBound = int64_t(positions.front());
+            if(endBound < 0) endBound = int64_t(positions.back());
+            if(startBound > endBound) continue;
+
+            int64_t keepFirst = -1;
+            for(uint64_t i = 0; i < positions.size(); i++) {
+                if(int64_t(positions[i]) >= startBound) { keepFirst = int64_t(i); break; }
+            }
+            int64_t keepLast = -1;
+            for(int64_t i = int64_t(positions.size()) - 1; i >= 0; i--) {
+                if(int64_t(positions[i]) <= endBound) { keepLast = i; break; }
+            }
+            if(keepFirst < 0 || keepLast < 0 || keepFirst > keepLast) continue;
+            const uint64_t headTrim = uint64_t(keepFirst);
+            const uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
+            if(headTrim == 0 && tailTrim == 0) continue;
+            ++trimmedWindowCount;
+
+            for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
+                const Shasta2AnchorId aid = journey[positions[i]];
+                clearIntraWindowEdges(uint64_t(aid));
+                clearIntraWindowEdges(uint64_t(aid) ^ 1ULL);
+                ++trimmedVertexCount;
+            }
+            for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
+                const Shasta2AnchorId aid = journey[positions[i]];
+                clearIntraWindowEdges(uint64_t(aid));
+                clearIntraWindowEdges(uint64_t(aid) ^ 1ULL);
+                ++trimmedVertexCount;
+            }
+        }
+
+        cout << "Rule 1: " << trimmedWindowCount << " windows trimmed, "
+             << trimmedVertexCount << " vertices trimmed." << endl;
+
+        // Remove orphaned inter-window edges.
+        auto normalizeW2 = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+        uint64_t orphanedEdgeCount = 0;
+        std::vector<edge_descriptor> orphanedEdges;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcWin = normalizeW2(anchorToWindow[srcVal]);
+            const uint32_t dstWin = normalizeW2(anchorToWindow[dstVal]);
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue;
+            const auto srcV = vertex(srcVal, anchorGraph);
+            const auto dstV = vertex(dstVal, anchorGraph);
+            if(out_degree(srcV, anchorGraph) + in_degree(srcV, anchorGraph) <= 1 ||
+               out_degree(dstV, anchorGraph) + in_degree(dstV, anchorGraph) <= 1) {
+                orphanedEdges.push_back(e);
+            }
+        }
+        for(const auto& e : orphanedEdges) {
+            boost::remove_edge(e, anchorGraph);
+            ++orphanedEdgeCount;
+        }
+        if(orphanedEdgeCount > 0) {
+            cout << "Rule 1: removed " << orphanedEdgeCount
+                 << " orphaned inter-window edges." << endl;
+        }
+    };
 
     // Dangling window cleanup: remove inter-window edges for windows
     // with edges on only one side (only incoming or only outgoing),
@@ -783,6 +878,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
+    // ========================================================================
+    // Filter pipeline:
+    //   1. Rule 1 (trim backbones + remove orphaned edges)
+    //   2. Parallel filter (A→A flows)
+    //   3. Shortcut filter (small bypass windows)
+    //   4. Dangling cleanup
+    // Case 2 and final dangling cleanup run after bypass edges below.
+    // ========================================================================
+    runRule1();
+    runParallelFilter();
+    runShortcutFilter();
     removeDanglingWindowsIterative("post-filter");
 
     // Populate per-window outEdges/inEdges from createdEdges.
@@ -873,210 +979,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
-
-    // ========================================================================
-    // Post-construction graph cleanup rules.
-    // After creating inter-window edges, apply rules to remove artifacts.
-    // More rules can be added below as needed.
-    //
-    // Rule 1: Trim backbone outside the bounding inter-window connection span.
-    //   For each forward window, find the journey positions of all inter-window
-    //   connection anchors (outgoing anchorIdA, incoming anchorIdB). The useful
-    //   backbone span is bounded by:
-    //     - Start: min of all incoming connection positions (or backbone start
-    //       if no incoming edges)
-    //     - End: max of all outgoing connection positions (or backbone end
-    //       if no outgoing edges)
-    //   Trim backbone vertices outside [start, end].
-    //   Only intra-window edges are removed to avoid fragmenting the graph.
-    // ========================================================================
-    {
-        // Remove only intra-window edges of a vertex (edges where both
-        // endpoints belong to the same window). Preserves inter-window edges.
-        auto clearIntraWindowEdges = [&](uint64_t vid) {
-            if(vid >= anchorCount) return;
-            const uint32_t vWindow = anchorToWindow[vid];
-
-            std::vector<edge_descriptor> toRemove;
-
-            auto oe = boost::out_edges(vid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it) {
-                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                if(tgt < anchorCount && anchorToWindow[tgt] == vWindow) {
-                    toRemove.push_back(*it);
-                }
-            }
-            auto ie = boost::in_edges(vid, anchorGraph);
-            for(auto it = ie.first; it != ie.second; ++it) {
-                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                if(src < anchorCount && anchorToWindow[src] == vWindow) {
-                    toRemove.push_back(*it);
-                }
-            }
-
-            for(const auto& e : toRemove) {
-                boost::remove_edge(e, anchorGraph);
-            }
-        };
-
-        // Helper: find the journey position of an anchor in a window's
-        // backbone journey span [backboneBegin, backboneEnd).
-        auto findJourneyPos = [&](
-            const auto& journey,
-            const AnchorWindow& window,
-            Shasta2AnchorId anchor) -> int64_t
-        {
-            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-                if(journey[pos] == anchor) return int64_t(pos);
-            }
-            return -1;
-        };
-
-        uint64_t trimmedVertexCount = 0;
-        uint64_t trimmedWindowCount = 0;
-
-        auto normalizeW = [&](uint32_t w2) -> uint32_t {
-            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
-        };
-
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& window = anchorWindows[w];
-            const auto& positions = window.filteredBackbonePositions;
-            if(positions.empty()) continue;
-
-            const auto journey = journeys[window.backboneOrientedReadId];
-
-            // Find bounding journey positions from actual inter-window
-            // edges in the graph (scanning the graph directly so this
-            // reflects any prior edge removals by filters).
-            int64_t startBound = -1;  // earliest incoming
-            int64_t endBound = -1;    // latest outgoing
-            bool hasInterWindowEdges = false;
-
-            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
-                const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
-                if(srcWin == noWindow || dstWin == noWindow) continue;
-                if(srcWin == dstWin) continue;
-
-                if(dstWin == w) {
-                    hasInterWindowEdges = true;
-                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
-                    if(pos >= 0) {
-                        if(startBound < 0 || pos < startBound) startBound = pos;
-                    }
-                }
-                if(srcWin == w) {
-                    hasInterWindowEdges = true;
-                    const int64_t pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
-                    if(pos >= 0) {
-                        if(endBound < 0 || pos > endBound) endBound = pos;
-                    }
-                }
-            }
-
-            if(!hasInterWindowEdges) continue;
-
-            // If no incoming edges, start at backbone start (no head trimming).
-            if(startBound < 0) startBound = int64_t(positions.front());
-            // If no outgoing edges, end at backbone end (no tail trimming).
-            if(endBound < 0) endBound = int64_t(positions.back());
-
-            // Sanity: if start > end, skip (shouldn't happen in well-formed graph).
-            if(startBound > endBound) continue;
-
-            // Find the first filtered position >= startBound (trim before it).
-            int64_t keepFirst = -1;
-            for(uint64_t i = 0; i < positions.size(); i++) {
-                if(int64_t(positions[i]) >= startBound) {
-                    keepFirst = int64_t(i);
-                    break;
-                }
-            }
-
-            // Find the last filtered position <= endBound (trim after it).
-            int64_t keepLast = -1;
-            for(int64_t i = int64_t(positions.size()) - 1; i >= 0; i--) {
-                if(int64_t(positions[i]) <= endBound) {
-                    keepLast = i;
-                    break;
-                }
-            }
-
-            if(keepFirst < 0 || keepLast < 0 || keepFirst > keepLast) continue;
-
-            const uint64_t headTrim = uint64_t(keepFirst);
-            const uint64_t tailTrim = positions.size() - 1 - uint64_t(keepLast);
-
-            if(headTrim == 0 && tailTrim == 0) continue;
-
-            ++trimmedWindowCount;
-
-            cout << "  Rule1 W" << w
-                 << " in=" << window.inEdges.size()
-                 << " out=" << window.outEdges.size()
-                 << " span=[" << startBound << "," << endBound << "]"
-                 << " keep=[" << keepFirst << "," << keepLast << "]/" << positions.size()
-                 << " head=" << headTrim << " tail=" << tailTrim
-                 << endl;
-
-            // Trim head (before keepFirst).
-            for(uint64_t i = 0; i < uint64_t(keepFirst); i++) {
-                const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
-                const uint64_t rcAid = uint64_t(aid) ^ 1ULL;
-                clearIntraWindowEdges(rcAid);
-                ++trimmedVertexCount;
-            }
-
-            // Trim tail (after keepLast).
-            for(uint64_t i = uint64_t(keepLast) + 1; i < positions.size(); i++) {
-                const Shasta2AnchorId aid = journey[positions[i]];
-                clearIntraWindowEdges(uint64_t(aid));
-                const uint64_t rcAid = uint64_t(aid) ^ 1ULL;
-                clearIntraWindowEdges(rcAid);
-                ++trimmedVertexCount;
-            }
-        }
-
-        cout << "Rule 1: " << trimmedWindowCount << " windows trimmed, "
-             << trimmedVertexCount << " vertices trimmed." << endl;
-
-        // Remove inter-window edges whose endpoints were isolated by trimming.
-        // An endpoint is isolated if it has no remaining intra-window edges.
-        uint64_t orphanedEdgeCount = 0;
-        std::vector<edge_descriptor> orphanedEdges;
-        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-            const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
-            const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
-            if(srcWin == noWindow || dstWin == noWindow) continue;
-            if(srcWin == dstWin) continue;  // intra-window
-
-            // Check if either endpoint is isolated (degree 1 = only this edge).
-            const auto srcV = vertex(srcVal, anchorGraph);
-            const auto dstV = vertex(dstVal, anchorGraph);
-            if(out_degree(srcV, anchorGraph) + in_degree(srcV, anchorGraph) <= 1 ||
-               out_degree(dstV, anchorGraph) + in_degree(dstV, anchorGraph) <= 1) {
-                orphanedEdges.push_back(e);
-            }
-        }
-        for(const auto& e : orphanedEdges) {
-            boost::remove_edge(e, anchorGraph);
-            ++orphanedEdgeCount;
-        }
-        if(orphanedEdgeCount > 0) {
-            cout << "Rule 1: removed " << orphanedEdgeCount
-                 << " orphaned inter-window edges." << endl;
-        }
-    }
-
-    removeDanglingWindowsIterative("post-rule1");
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
