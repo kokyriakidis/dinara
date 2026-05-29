@@ -111,17 +111,105 @@ uint64_t dinara::detangleWindows(
         if(positions.empty()) continue;
 
         ++detangledCount;
-        set<Shasta2AnchorId> alreadySplit;
 
+        // Collect unique backbone anchor pairs (canonical, RC) in order.
+        struct BackboneAnchorPair {
+            Shasta2AnchorId canonicalId;
+            Shasta2AnchorId rcId;
+        };
+        vector<BackboneAnchorPair> backbonePairs;
+        set<Shasta2AnchorId> seen;
         for(const uint32_t pos : positions) {
             const Shasta2AnchorId anchorId = backboneJourney[pos];
             const Shasta2AnchorId canonicalId = anchorId & ~Shasta2AnchorId(1);
-            const Shasta2AnchorId rcId = canonicalId | Shasta2AnchorId(1);
+            if(seen.count(canonicalId)) continue;
+            seen.insert(canonicalId);
+            backbonePairs.push_back({canonicalId, canonicalId | Shasta2AnchorId(1)});
+        }
 
-            if(alreadySplit.count(canonicalId)) continue;
-            alreadySplit.insert(canonicalId);
+        const uint64_t nPositions = backbonePairs.size();
 
-            // Copy anchor data before any appending.
+        // Phase 1: For each flow and each backbone position, compute the
+        // read subsets (canonical and RC). Store as sets of OrientedReadId
+        // values for connectivity checking.
+        // readSubsets[pathIdx][posIdx] = set of canonical-strand read values.
+        vector<vector<set<uint32_t>>> readSubsets(pathCount, vector<set<uint32_t>>(nPositions));
+
+        for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+            const set<uint32_t>& flowReads = mergedFlows[pathIdx].readSet;
+            for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
+                const auto canonicalSpan = anchors[backbonePairs[posIdx].canonicalId];
+                for(const auto& mi : canonicalSpan) {
+                    if(flowReads.count(mi.orientedReadId.getValue())) {
+                        readSubsets[pathIdx][posIdx].insert(mi.orientedReadId.getValue());
+                    }
+                }
+            }
+        }
+
+        // Phase 2: For each flow, thin the chain to keep only positions
+        // where consecutive pairs share reads. Use greedy bridging:
+        // walk forward, skip positions that don't share reads with the
+        // last kept position.
+        // keep[pathIdx][posIdx] = true if this position is kept.
+        vector<vector<bool>> keep(pathCount, vector<bool>(nPositions, false));
+
+        for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+            // Find positions where this flow has reads.
+            vector<uint64_t> flowPositions;
+            for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
+                if(!readSubsets[pathIdx][posIdx].empty()) {
+                    flowPositions.push_back(posIdx);
+                }
+            }
+            if(flowPositions.size() < 2) continue;
+
+            // Greedy bridging: keep positions that share reads with predecessor.
+            vector<uint64_t> kept;
+            kept.push_back(flowPositions[0]);
+            for(uint64_t i = 1; i < flowPositions.size(); i++) {
+                const uint64_t prevPos = kept.back();
+                const uint64_t curPos = flowPositions[i];
+                // Check if they share reads.
+                const auto& prevReads = readSubsets[pathIdx][prevPos];
+                const auto& curReads = readSubsets[pathIdx][curPos];
+                bool sharesReads = false;
+                for(const uint32_t r : prevReads) {
+                    if(curReads.count(r)) {
+                        sharesReads = true;
+                        break;
+                    }
+                }
+                if(sharesReads) {
+                    kept.push_back(curPos);
+                }
+                // If not, skip curPos (it will not be split).
+            }
+            // Only keep if chain has at least 2 positions.
+            if(kept.size() >= 2) {
+                for(const uint64_t posIdx : kept) {
+                    keep[pathIdx][posIdx] = true;
+                }
+            }
+        }
+
+        // Phase 3: Create split copies only for kept positions.
+        uint64_t splitPairCount = 0;
+        for(uint64_t posIdx = 0; posIdx < nPositions; posIdx++) {
+            // Check if any flow keeps this position.
+            bool anyKept = false;
+            for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+                if(keep[pathIdx][posIdx]) {
+                    anyKept = true;
+                    break;
+                }
+            }
+            if(!anyKept) continue;
+
+            const Shasta2AnchorId canonicalId = backbonePairs[posIdx].canonicalId;
+            const Shasta2AnchorId rcId = backbonePairs[posIdx].rcId;
+
+            // Copy anchor data.
             const auto canonicalSpan = anchors[canonicalId];
             const auto rcSpan = anchors[rcId];
             vector<Shasta2AnchorMarkerInfo> canonicalData(canonicalSpan.begin(), canonicalSpan.end());
@@ -131,9 +219,16 @@ uint64_t dinara::detangleWindows(
             DeferredSplit rcSplit{rcId, {}};
 
             for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
+                if(!keep[pathIdx][posIdx]) {
+                    // This flow doesn't keep this position — use original.
+                    canonicalSplit.newAnchorIndices.push_back(invalidIndex);
+                    rcSplit.newAnchorIndices.push_back(invalidIndex);
+                    continue;
+                }
+
                 const set<uint32_t>& flowReads = mergedFlows[pathIdx].readSet;
 
-                // Canonical: keep reads that are in the flow's read set.
+                // Canonical subset.
                 vector<Shasta2AnchorMarkerInfo> canonicalSubset;
                 for(const auto& mi : canonicalData) {
                     if(flowReads.count(mi.orientedReadId.getValue())) {
@@ -141,8 +236,7 @@ uint64_t dinara::detangleWindows(
                     }
                 }
 
-                // RC: the flow reads are stored as forward-strand values,
-                // but RC anchor reads are strand-flipped.
+                // RC subset.
                 vector<Shasta2AnchorMarkerInfo> rcSubset;
                 for(const auto& mi : rcData) {
                     const uint32_t flippedValue = mi.orientedReadId.getValue() ^ 1;
@@ -151,7 +245,6 @@ uint64_t dinara::detangleWindows(
                     }
                 }
 
-                // Only create a new anchor if this flow has reads here.
                 if(!canonicalSubset.empty()) {
                     canonicalSplit.newAnchorIndices.push_back(newAnchors.size());
                     newAnchors.push_back(std::move(canonicalSubset));
@@ -169,9 +262,10 @@ uint64_t dinara::detangleWindows(
 
             deferredSplits.push_back(std::move(canonicalSplit));
             deferredSplits.push_back(std::move(rcSplit));
+            ++splitPairCount;
         }
 
-        cout << "    Split " << alreadySplit.size() << " anchor pairs into "
+        cout << "    Split " << splitPairCount << " anchor pairs into "
              << pathCount << " paths each." << endl;
     }
 
