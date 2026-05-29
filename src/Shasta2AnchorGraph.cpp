@@ -646,11 +646,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(srcWin == dstWin) continue;
 
                 // Find position of whichever endpoint belongs to this window.
+                // If the anchor is in the RC mirror, use its forward counterpart.
                 int64_t pos = -1;
                 if(dstWin == w) {
-                    pos = findJourneyPos(journey, window, Shasta2AnchorId(dstVal));
+                    const uint32_t rawDstWin = anchorToWindow[dstVal];
+                    const uint64_t fwdAnchor = (rawDstWin >= windowCount) ? (dstVal ^ 1ULL) : dstVal;
+                    pos = findJourneyPos(journey, window, Shasta2AnchorId(fwdAnchor));
                 } else if(srcWin == w) {
-                    pos = findJourneyPos(journey, window, Shasta2AnchorId(srcVal));
+                    const uint32_t rawSrcWin = anchorToWindow[srcVal];
+                    const uint64_t fwdAnchor = (rawSrcWin >= windowCount) ? (srcVal ^ 1ULL) : srcVal;
+                    pos = findJourneyPos(journey, window, Shasta2AnchorId(fwdAnchor));
                 }
                 if(pos >= 0) {
                     hasInterWindowEdges = true;
