@@ -1044,7 +1044,39 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         cout << "Rule 1: " << trimmedWindowCount << " windows trimmed, "
              << trimmedVertexCount << " vertices trimmed." << endl;
+
+        // Remove inter-window edges whose endpoints were isolated by trimming.
+        // An endpoint is isolated if it has no remaining intra-window edges.
+        uint64_t orphanedEdgeCount = 0;
+        std::vector<edge_descriptor> orphanedEdges;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcWin = normalizeW(anchorToWindow[srcVal]);
+            const uint32_t dstWin = normalizeW(anchorToWindow[dstVal]);
+            if(srcWin == noWindow || dstWin == noWindow) continue;
+            if(srcWin == dstWin) continue;  // intra-window
+
+            // Check if either endpoint is isolated (degree 1 = only this edge).
+            const auto srcV = vertex(srcVal, anchorGraph);
+            const auto dstV = vertex(dstVal, anchorGraph);
+            if(out_degree(srcV, anchorGraph) + in_degree(srcV, anchorGraph) <= 1 ||
+               out_degree(dstV, anchorGraph) + in_degree(dstV, anchorGraph) <= 1) {
+                orphanedEdges.push_back(e);
+            }
+        }
+        for(const auto& e : orphanedEdges) {
+            boost::remove_edge(e, anchorGraph);
+            ++orphanedEdgeCount;
+        }
+        if(orphanedEdgeCount > 0) {
+            cout << "Rule 1: removed " << orphanedEdgeCount
+                 << " orphaned inter-window edges." << endl;
+        }
     }
+
+    removeDanglingWindowsIterative("post-rule1");
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
