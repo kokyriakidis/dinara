@@ -108,7 +108,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     uint64_t minInterWindowCoverage,
     uint64_t threadCount,
     const Reads* reads,
-    const std::map<Shasta2AnchorId, vector<Shasta2AnchorId>>* anchorSplitMap) :
+    const vector<DetangleBypassEdge>* bypassEdges) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
@@ -162,20 +162,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // If we have split anchors, map them to the same windows as their originals.
-    if(anchorSplitMap) {
-        for(const auto& [originalId, splitIds] : *anchorSplitMap) {
-            const uint32_t windowId = (uint64_t(originalId) < anchorToWindow.size())
-                ? anchorToWindow[uint64_t(originalId)] : noWindow;
-            for(const Shasta2AnchorId splitId : splitIds) {
-                const uint64_t sid = uint64_t(splitId);
-                if(sid < anchorToWindow.size()) {
-                    anchorToWindow[sid] = windowId;
-                }
-            }
-        }
-    }
-
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
@@ -196,7 +182,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Intra-window edges: consecutive filtered backbone anchor pairs,
     // for both the original windows and their RC mirrors.
-    // If anchorSplitMap is provided, split anchors create parallel chains.
     for(const AnchorWindow& window : anchorWindows) {
         const OrientedReadId backboneOid = window.backboneOrientedReadId;
         const auto backboneJourney = journeys[backboneOid];
@@ -216,73 +201,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         if(backboneAnchors.size() < 2) continue;
 
-        // Check if any backbone anchor in this window was split.
-        bool windowWasSplit = false;
-        uint64_t pathCount = 1;
-        if(anchorSplitMap) {
-            for(const Shasta2AnchorId aid : backboneAnchors) {
-                auto it = anchorSplitMap->find(aid);
-                if(it != anchorSplitMap->end()) {
-                    windowWasSplit = true;
-                    pathCount = it->second.size();
-                    break;
-                }
-            }
-        }
-
-        if(!windowWasSplit) {
-            // No split: create edges using original anchor IDs.
-            for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
-                addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
-                // RC mirror edge.
-                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
-                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
-                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                    addEdgeIfValid(rcB, rcA);
-                }
-            }
-        } else {
-            // Split: create parallel chains, one per path.
-            // For each path, collect the backbone anchors where this path
-            // has a split copy (splitId != originalId), then create edges
-            // between consecutive ones. This skips backbone anchors where
-            // the path has no reads.
-            // We also build the RC chain from the RC entries in anchorSplitMap
-            // (split copy IDs don't satisfy id^1 pairing, so we can't compute
-            // RC IDs arithmetically).
-            for(uint64_t pathIdx = 0; pathIdx < pathCount; pathIdx++) {
-                // Collect this path's forward and RC anchor chains.
-                vector<Shasta2AnchorId> pathChain;
-                vector<Shasta2AnchorId> rcPathChain;
-                for(const Shasta2AnchorId origAid : backboneAnchors) {
-                    // Forward chain.
-                    auto it = anchorSplitMap->find(origAid);
-                    if(it != anchorSplitMap->end() && pathIdx < it->second.size()) {
-                        const Shasta2AnchorId splitId = it->second[pathIdx];
-                        if(splitId != origAid) {
-                            pathChain.push_back(splitId);
-                        }
-                    }
-                    // RC chain: look up the RC of the original anchor.
-                    const Shasta2AnchorId rcOrigAid = Shasta2AnchorId(uint64_t(origAid) ^ 1ULL);
-                    auto rcIt = anchorSplitMap->find(rcOrigAid);
-                    if(rcIt != anchorSplitMap->end() && pathIdx < rcIt->second.size()) {
-                        const Shasta2AnchorId rcSplitId = rcIt->second[pathIdx];
-                        if(rcSplitId != rcOrigAid) {
-                            rcPathChain.push_back(rcSplitId);
-                        }
-                    }
-                }
-
-                // Forward chain edges.
-                for(uint64_t i = 0; i + 1 < pathChain.size(); i++) {
-                    addEdgeIfValid(pathChain[i], pathChain[i + 1]);
-                }
-
-                // RC chain edges (reversed direction: last → ... → first).
-                for(uint64_t i = 0; i + 1 < rcPathChain.size(); i++) {
-                    addEdgeIfValid(rcPathChain[i + 1], rcPathChain[i]);
-                }
+        for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
+            addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
+            // RC mirror edge.
+            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
+            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
+            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                addEdgeIfValid(rcB, rcA);
             }
         }
     }
@@ -508,54 +433,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         } else {
             DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
 
-            // Check if either endpoint was split.
-            const bool aSplit = anchorSplitMap &&
-                anchorSplitMap->count(bestPair.anchorIdA);
-            const bool bSplit = anchorSplitMap &&
-                anchorSplitMap->count(bestPair.anchorIdB);
-
-            if(!aSplit && !bSplit) {
-                // Neither endpoint split: create edge as normal.
-                edge_descriptor e;
-                tie(e, ignore) = add_edge(
-                    bestPair.anchorIdA,
-                    bestPair.anchorIdB,
-                    Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
-                    anchorGraph);
-                anchorGraph[e].useForAssembly = true;
-                createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
-                ++interWindowCreated;
-            } else {
-                // At least one endpoint was split.
-                // For each split copy, create an edge with only the reads
-                // that appear on that copy.
-                const auto& aSplits = aSplit
-                    ? anchorSplitMap->at(bestPair.anchorIdA)
-                    : vector<Shasta2AnchorId>{bestPair.anchorIdA};
-                const auto& bSplits = bSplit
-                    ? anchorSplitMap->at(bestPair.anchorIdB)
-                    : vector<Shasta2AnchorId>{bestPair.anchorIdB};
-
-                for(const Shasta2AnchorId splitA : aSplits) {
-                    for(const Shasta2AnchorId splitB : bSplits) {
-                        Shasta2AnchorPair splitPair(
-                            anchors, splitA, splitB, false);
-                        splitPair.removeNegativeOffsets(anchors);
-                        if(splitPair.size() == 0) continue;
-                        edge_descriptor e;
-                        tie(e, ignore) = add_edge(
-                            splitA, splitB,
-                            Shasta2AnchorGraphEdge(splitPair,
-                                splitPair.getAverageOffset(anchors),
-                                nextEdgeId++),
-                            anchorGraph);
-                        anchorGraph[e].useForAssembly = true;
-                        createdEdges.push_back({windowPair, splitA, splitB,
-                            splitPair.size()});
-                        ++interWindowCreated;
-                    }
-                }
-            }
+            edge_descriptor e;
+            tie(e, ignore) = add_edge(
+                bestPair.anchorIdA,
+                bestPair.anchorIdB,
+                Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[e].useForAssembly = true;
+            createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
+            ++interWindowCreated;
         }
     }
     cout << "Inter-window edges: " << interWindowCreated << " created, "
@@ -637,6 +523,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Bypass edges from detangling: direct connections that skip over
+    // tangled windows whose backbone reads have been removed.
+    uint64_t bypassEdgeCount = 0;
+    if(bypassEdges) {
+        for(const auto& be : *bypassEdges) {
+            if(addEdgeIfValid(be.anchorIdA, be.anchorIdB)) {
+                ++bypassEdgeCount;
+            }
+        }
+        if(bypassEdgeCount > 0) {
+            cout << "Bypass edges: " << bypassEdgeCount << " created from "
+                 << bypassEdges->size() << " candidates." << endl;
+        }
+    }
+
     // ========================================================================
     // Post-construction graph cleanup rules.
     // After creating inter-window edges, apply rules to remove artifacts.
@@ -703,21 +604,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const auto& positions = window.filteredBackbonePositions;
             if(positions.empty()) continue;
             if(window.outEdges.empty() && window.inEdges.empty()) continue;
-
-            // Skip split windows: their inter-window edges connect to split
-            // anchor copies that are not in the backbone journey, so the
-            // bounding span computation would be incorrect.
-            if(anchorSplitMap) {
-                bool windowIsSplit = false;
-                const auto journey = journeys[window.backboneOrientedReadId];
-                for(const uint32_t pos : positions) {
-                    if(anchorSplitMap->count(journey[pos])) {
-                        windowIsSplit = true;
-                        break;
-                    }
-                }
-                if(windowIsSplit) continue;
-            }
 
             const auto journey = journeys[window.backboneOrientedReadId];
 
