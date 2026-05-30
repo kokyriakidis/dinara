@@ -1966,7 +1966,7 @@ void Assembler::buildSvMSA(
                 vector<Breakpoint> rightBreakpoints; // chain starts
 
                 for(uint32_t w = boundaryWindows; w + boundaryWindows < nWindows; ++w) {
-                    const uint32_t refPos = refStartPos + w * windowSize + windowSize / 2;
+                    const uint32_t windowCenter = refStartPos + w * windowSize + windowSize / 2;
 
                     // Left breakpoint: many chain ends with right overhang.
                     if(chainEndCount[w] > 0) {
@@ -1976,6 +1976,22 @@ void Assembler::buildSvMSA(
                             ? uint32_t(it->second.size()) : 0;
 
                         if(fold >= minFoldEnrichment && ovhCount >= minEndpointReads) {
+                            // Use median of actual read endpoint
+                            // positions for sub-window precision.
+                            uint32_t refPos = windowCenter;
+                            if(it != chainEndReads.end()
+                               && !it->second.empty()) {
+                                vector<uint32_t> actPos;
+                                for(const auto& ep :
+                                    it->second) {
+                                    actPos.push_back(
+                                        ep.actualRefPos);
+                                }
+                                sort(actPos.begin(),
+                                     actPos.end());
+                                refPos = actPos[
+                                    actPos.size() / 2];
+                            }
                             leftBreakpoints.push_back({
                                 w, refPos, chainEndCount[w], spanningCount[w],
                                 ovhCount, fold,
@@ -1992,6 +2008,20 @@ void Assembler::buildSvMSA(
                             ? uint32_t(it->second.size()) : 0;
 
                         if(fold >= minFoldEnrichment && ovhCount >= minEndpointReads) {
+                            uint32_t refPos = windowCenter;
+                            if(it != chainStartReads.end()
+                               && !it->second.empty()) {
+                                vector<uint32_t> actPos;
+                                for(const auto& ep :
+                                    it->second) {
+                                    actPos.push_back(
+                                        ep.actualRefPos);
+                                }
+                                sort(actPos.begin(),
+                                     actPos.end());
+                                refPos = actPos[
+                                    actPos.size() / 2];
+                            }
                             rightBreakpoints.push_back({
                                 w, refPos, chainStartCount[w], spanningCount[w],
                                 ovhCount, fold,
