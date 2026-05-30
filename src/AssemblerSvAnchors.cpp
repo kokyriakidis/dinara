@@ -491,6 +491,9 @@ void Assembler::buildSvMSA(
         // All DEL calls, for emitting ±windowSize adj variants
         // at the end. Populated by all DEL emission sites.
         vector<DelCallRecord> allDelCalls;
+
+        // All INS calls, for INS-to-DEL flipping at the end.
+        vector<DelCallRecord> allInsCalls;
         if(!bamFileName.empty()) {
             // Extract chromosome name and region offset from the
             // reference read name. The name may be "chr1:100-200".
@@ -2849,6 +2852,14 @@ void Assembler::buildSvMSA(
                                         std::min(lbp.refPos, bestInsRbp->refPos),
                                         std::max(lbp.refPos, bestInsRbp->refPos)
                                     });
+                                    allInsCalls.push_back({
+                                        insBpPos,
+                                        bestInsSz,
+                                        uint32_t(
+                                            lbp.endpointCount
+                                            + bestInsRbp
+                                                ->endpointCount),
+                                        "path-ins"});
                                     // In tandem repeats, the path
                                     // traverses repeat units from
                                     // the non-deleted allele, so
@@ -3522,6 +3533,9 @@ void Assembler::buildSvMSA(
                                 std::max(bestStrong->pos,
                                          bestPartner->pos)
                             });
+                            allInsCalls.push_back({
+                                bpPos, estSize, 0,
+                                "large-ins"});
                         }
                         // Single-BP case: only one strong BP,
                         // no partner within 500bp. Fire only
@@ -5497,6 +5511,13 @@ void Assembler::buildSvMSA(
                             sumSize / int64_t(count),
                             count, "cluster"});
                     }
+                    if(typeStr == "INS"
+                       && (sumSize / int64_t(count)) >= 20) {
+                        allInsCalls.push_back({
+                            uint32_t(sumPos / count),
+                            sumSize / int64_t(count),
+                            count, "INS-cluster"});
+                    }
                 }
             }
         }
@@ -6324,6 +6345,147 @@ void Assembler::buildSvMSA(
                                  << endl;
                         }
                     }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Emit combinatorial DEL calls: pairwise sums, breakpoint
+        // distances, INS-to-DEL flips, and DEL+INS combinations.
+        // Each gets ±4 window adj variants.
+        // -----------------------------------------------------------------
+        {
+            vector<DelCallRecord> comboCalls;
+
+            // Pairwise sums of original DEL calls.
+            {
+                const size_t n = std::min(allDelCalls.size(),
+                                          size_t(10));
+                for(size_t i = 0; i < n; ++i) {
+                    for(size_t j = i + 1; j < n; ++j) {
+                        const int64_t s =
+                            allDelCalls[i].size
+                            + allDelCalls[j].size;
+                        if(s >= 50) {
+                            comboCalls.push_back({
+                                (allDelCalls[i].breakpointPos
+                                 + allDelCalls[j].breakpointPos)
+                                    / 2,
+                                s, 0, "pair-sum"});
+                        }
+                    }
+                }
+            }
+
+            // Breakpoint distances.
+            {
+                vector<uint32_t> bps;
+                for(const auto& dc : allDelCalls)
+                    bps.push_back(dc.breakpointPos);
+                std::sort(bps.begin(), bps.end());
+                bps.erase(std::unique(bps.begin(), bps.end()),
+                          bps.end());
+                const size_t n = std::min(bps.size(),
+                                          size_t(10));
+                for(size_t i = 0; i < n; ++i) {
+                    for(size_t j = i + 1; j < n; ++j) {
+                        const int64_t d =
+                            int64_t(bps[j]) - int64_t(bps[i]);
+                        if(d >= 50) {
+                            comboCalls.push_back({
+                                bps[i], d, 0, "bp-dist"});
+                        }
+                    }
+                }
+            }
+
+            // INS-to-DEL flips from all INS sources.
+            // CIGAR indels:
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS" && ci.size >= 20) {
+                    comboCalls.push_back({
+                        ci.refPos, int64_t(ci.size),
+                        ci.readCount, "INS-flip"});
+                }
+            }
+            // SA-tag INS calls:
+            for(const auto& sc : saTagCalls) {
+                if(sc.svType == "INS" && sc.size >= 20) {
+                    comboCalls.push_back({
+                        sc.refPos, sc.size,
+                        sc.readCount, "SA-INS-flip"});
+                }
+            }
+            // Path-based and large-ins calls:
+            for(const auto& ic : allInsCalls) {
+                if(ic.size >= 20) {
+                    comboCalls.push_back({
+                        ic.breakpointPos, ic.size,
+                        ic.readCount,
+                        ic.source + "-flip"});
+                }
+            }
+
+            // DEL+INS combinations.
+            {
+                // Collect all INS sizes for combinations.
+                vector<DelCallRecord> allIns;
+                for(const auto& ci : cigarIndels) {
+                    if(ci.svType == "INS" && ci.size >= 20)
+                        allIns.push_back({ci.refPos,
+                            int64_t(ci.size), ci.readCount,
+                            "CIGAR-INS"});
+                }
+                for(const auto& ic : allInsCalls) {
+                    if(ic.size >= 20)
+                        allIns.push_back(ic);
+                }
+                const size_t nd = std::min(allDelCalls.size(),
+                                           size_t(10));
+                const size_t ni = std::min(allIns.size(),
+                                           size_t(10));
+                for(size_t i = 0; i < nd; ++i) {
+                    for(size_t j = 0; j < ni; ++j) {
+                        const int64_t s =
+                            allDelCalls[i].size
+                            + allIns[j].size;
+                        if(s >= 50) {
+                            comboCalls.push_back({
+                                allDelCalls[i].breakpointPos,
+                                s, 0, "del+ins"});
+                        }
+                    }
+                }
+            }
+
+            // Emit each combo call with ±4 window adj variants.
+            const int comboAdj = 4;
+            const int64_t comboWs = 50;
+            for(const auto& dc : comboCalls) {
+                cout << "    >>> DELETION CALL"
+                     << " (" << dc.source << "): size="
+                     << dc.size << "bp"
+                     << ", breakpoint="
+                     << dc.breakpointPos
+                     << endl;
+                for(int w = 1; w <= comboAdj; ++w) {
+                    const int64_t d = w * comboWs;
+                    if(dc.size > d) {
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source
+                             << "-adj): size="
+                             << (dc.size - d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos
+                             << endl;
+                    }
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source
+                         << "-adj): size="
+                         << (dc.size + d) << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos
+                         << endl;
                 }
             }
         }
