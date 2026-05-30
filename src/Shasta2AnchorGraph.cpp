@@ -506,6 +506,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Store endpoint anchors for GFA tagging.
+    endpointAnchors = reservedAnchors;
+
     // Early trim: disable backbone anchors beyond the endpoint anchors.
     // For each window, find the backbone positions of the endpoint anchors
     // (from pass 1). Disable all intra-window edges on anchors before the
