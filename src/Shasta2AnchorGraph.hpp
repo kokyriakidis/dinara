@@ -154,4 +154,8 @@ public:
     // Stored as (min, max) for direction-independent lookup.
     // A pair (A, B) means some backbone read transitions between A and B.
     std::set<std::pair<uint32_t, uint32_t>> endpointWindowPairs;
+
+    // Anchors used by endpoint edges (and their RC mirrors).
+    // An anchor in this set is at an endpoint position of its window.
+    std::set<uint64_t> endpointAnchors;
 };

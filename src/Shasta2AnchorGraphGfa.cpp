@@ -51,15 +51,13 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             << dst << "\t+\t0M"
             << "\tRC:i:" << edge.coverage();
 
-        // Classify edge from each side's perspective.
-        // Uses the endpointWindowPairs set built during construction,
-        // which records which window pairs have a backbone read
-        // transitioning between them.
+        // Classify each side of the edge independently.
         // Each link gets two tags:
-        //   pw:Z: — source anchor's window perspective
-        //   nw:Z: — target anchor's window perspective
-        // Values: "Endpoint" (backbone transition), "intra" (same
-        //         window), "internal" (no backbone transition).
+        //   pw:Z: — source anchor classification
+        //   nw:Z: — target anchor classification
+        // Values: "Endpoint" (this anchor was used by an endpoint edge),
+        //         "intra" (same window), "internal" (inter-window but
+        //         not an endpoint anchor).
         if(windowCount > 0 &&
            uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
             const uint32_t srcW = anchorToWindow[uint64_t(src)];
@@ -72,13 +70,11 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
                 if(srcNorm == dstNorm) {
                     gfa << "\tpw:Z:intra\tnw:Z:intra";
                 } else {
-                    // Check if this window pair has a backbone transition
-                    // in either direction.
-                    bool isEndpoint = endpointWindowPairs.count(
-                        {std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)});
-                    const char* tag = isEndpoint ? "Endpoint" : "internal";
-
-                    gfa << "\tpw:Z:" << tag << "\tnw:Z:" << tag;
+                    const char* srcTag = endpointAnchors.count(uint64_t(src))
+                        ? "Endpoint" : "internal";
+                    const char* dstTag = endpointAnchors.count(uint64_t(dst))
+                        ? "Endpoint" : "internal";
+                    gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
                 }
             }
         }
