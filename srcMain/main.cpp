@@ -1655,7 +1655,7 @@ void dinara::main::assemble(
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
     // Save the pre-detangling anchor graph.
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
     // Detangle Case 1: create bypass edges and remove flow reads from backbone.
@@ -1697,7 +1697,7 @@ void dinara::main::assemble(
          << externalAnchorsName << endl;
 
     // Save the post-detangling anchor graph.
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
 
