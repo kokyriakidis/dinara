@@ -508,74 +508,103 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Build per-window backbone position boundaries from endpoint edges.
-    // headBound: position of the endpoint anchor connecting to backbonePreviousWindow.
-    // tailBound: position of the endpoint anchor connecting to backboneNextWindow.
-    // Internal edges must land strictly between these (when present).
-    // If only one side has an endpoint, the other side is unconstrained.
-    struct WindowBounds {
-        uint32_t headBound = 0;
-        uint32_t tailBound = 0;
-        bool hasHead = false;
-        bool hasTail = false;
-    };
-    std::vector<WindowBounds> windowBounds(windowCount);
-    for(const auto& edgeInfo : createdEdges) {
-        const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
-        const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+    // Early trim: disable backbone anchors beyond the endpoint anchors.
+    // For each window, find the backbone positions of the endpoint anchors
+    // (from pass 1). Disable all intra-window edges on anchors before the
+    // head endpoint or after the tail endpoint, and add those anchors to
+    // reservedAnchors so pass 2 can't use them.
+    {
+        // Per-window endpoint positions on the backbone.
+        struct EndpointPos {
+            uint32_t headPos = 0;           // position of head endpoint anchor
+            uint32_t tailPos = UINT32_MAX;  // position of tail endpoint anchor
+            bool hasHead = false;
+            bool hasTail = false;
+        };
+        std::vector<EndpointPos> endpointPos(windowCount);
 
-        if(srcNorm < windowCount) {
-            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdA)];
-            const auto& w = anchorWindows[srcNorm];
-            if(w.backboneNextWindow == dstNorm) {
-                if(!windowBounds[srcNorm].hasTail || pos < windowBounds[srcNorm].tailBound) {
-                    windowBounds[srcNorm].tailBound = pos;
+        for(const auto& edgeInfo : createdEdges) {
+            const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
+            const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+
+            if(srcNorm < windowCount) {
+                const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdA)];
+                const auto& w = anchorWindows[srcNorm];
+                if(w.backboneNextWindow == dstNorm) {
+                    if(!endpointPos[srcNorm].hasTail || pos < endpointPos[srcNorm].tailPos) {
+                        endpointPos[srcNorm].tailPos = pos;
+                    }
+                    endpointPos[srcNorm].hasTail = true;
                 }
-                windowBounds[srcNorm].hasTail = true;
+                if(w.backbonePreviousWindow == dstNorm) {
+                    if(!endpointPos[srcNorm].hasHead || pos > endpointPos[srcNorm].headPos) {
+                        endpointPos[srcNorm].headPos = pos;
+                    }
+                    endpointPos[srcNorm].hasHead = true;
+                }
             }
-            if(w.backbonePreviousWindow == dstNorm) {
-                if(!windowBounds[srcNorm].hasHead || pos > windowBounds[srcNorm].headBound) {
-                    windowBounds[srcNorm].headBound = pos;
+
+            if(dstNorm < windowCount) {
+                const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdB)];
+                const auto& w = anchorWindows[dstNorm];
+                if(w.backbonePreviousWindow == srcNorm) {
+                    if(!endpointPos[dstNorm].hasHead || pos > endpointPos[dstNorm].headPos) {
+                        endpointPos[dstNorm].headPos = pos;
+                    }
+                    endpointPos[dstNorm].hasHead = true;
                 }
-                windowBounds[srcNorm].hasHead = true;
+                if(w.backboneNextWindow == srcNorm) {
+                    if(!endpointPos[dstNorm].hasTail || pos < endpointPos[dstNorm].tailPos) {
+                        endpointPos[dstNorm].tailPos = pos;
+                    }
+                    endpointPos[dstNorm].hasTail = true;
+                }
             }
         }
 
-        if(dstNorm < windowCount) {
-            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdB)];
-            const auto& w = anchorWindows[dstNorm];
-            if(w.backbonePreviousWindow == srcNorm) {
-                if(!windowBounds[dstNorm].hasHead || pos > windowBounds[dstNorm].headBound) {
-                    windowBounds[dstNorm].headBound = pos;
+        uint64_t earlyTrimCount = 0;
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& ep = endpointPos[w];
+            if(!ep.hasHead && !ep.hasTail) continue;
+
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            for(const uint32_t pos : positions) {
+                bool outsideBounds = false;
+                if(ep.hasHead && pos < ep.headPos) outsideBounds = true;
+                if(ep.hasTail && pos > ep.tailPos) outsideBounds = true;
+
+                if(outsideBounds) {
+                    const uint64_t aid = uint64_t(journey[pos]);
+                    // Disable all edges on this anchor and its RC mirror.
+                    auto disableAll = [&](uint64_t a) {
+                        if(a >= anchorCount) return;
+                        auto oe = boost::out_edges(a, anchorGraph);
+                        for(auto it = oe.first; it != oe.second; ++it) {
+                            if(anchorGraph[*it].useForAssembly)
+                                disableEdge(*it);
+                        }
+                        auto ie = boost::in_edges(a, anchorGraph);
+                        for(auto it = ie.first; it != ie.second; ++it) {
+                            if(anchorGraph[*it].useForAssembly)
+                                disableEdge(*it);
+                        }
+                    };
+                    disableAll(aid);
+                    disableAll(aid ^ 1ULL);
+                    reservedAnchors.insert(aid);
+                    reservedAnchors.insert(aid ^ 1ULL);
+                    ++earlyTrimCount;
                 }
-                windowBounds[dstNorm].hasHead = true;
-            }
-            if(w.backboneNextWindow == srcNorm) {
-                if(!windowBounds[dstNorm].hasTail || pos < windowBounds[dstNorm].tailBound) {
-                    windowBounds[dstNorm].tailBound = pos;
-                }
-                windowBounds[dstNorm].hasTail = true;
             }
         }
+        cout << "Early trim after endpoint edges: " << earlyTrimCount
+             << " backbone anchors disabled." << endl;
     }
 
-    // Check if an anchor is inside its window's endpoint boundaries.
-    // Only the side that has an endpoint is constrained.
-    auto isInsideBounds = [&](uint64_t anchorId) -> bool {
-        if(anchorId >= anchorCount) return false;
-        const uint32_t wRaw = anchorToWindow[anchorId];
-        if(wRaw == noWindow) return false;
-        const uint32_t wNorm = normalize(wRaw);
-        if(wNorm >= windowCount) return false;
-        const auto& bounds = windowBounds[wNorm];
-        const uint32_t pos = anchorToBackbonePos[anchorId];
-        if(bounds.hasHead && pos <= bounds.headBound) return false;
-        if(bounds.hasTail && pos >= bounds.tailBound) return false;
-        return true;
-    };
-
-    // Pass 2: Create remaining (non-endpoint) edges, skipping reserved
-    // anchors and candidates outside endpoint boundaries.
+    // Pass 2: Create remaining (non-endpoint) edges, skipping reserved anchors.
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
@@ -589,10 +618,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             hadCandidates = true;
             if(reservedAnchors.count(uint64_t(apk.anchorIdA)) ||
                reservedAnchors.count(uint64_t(apk.anchorIdB))) {
-                continue;
-            }
-            if(!isInsideBounds(uint64_t(apk.anchorIdA)) ||
-               !isInsideBounds(uint64_t(apk.anchorIdB))) {
                 continue;
             }
             Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
