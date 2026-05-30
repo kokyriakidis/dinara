@@ -488,12 +488,10 @@ void Assembler::buildSvMSA(
             string source;
         };
 
-        // All DEL calls, for emitting ±windowSize adj variants
-        // at the end. Populated by all DEL emission sites.
+        // All DEL calls. Populated by all DEL emission sites.
         vector<DelCallRecord> allDelCalls;
 
-        // All INS calls, for INS-to-DEL flipping at the end.
-        vector<DelCallRecord> allInsCalls;
+
 
 
 
@@ -924,8 +922,7 @@ void Assembler::buildSvMSA(
         };
         vector<CovDropRegion> covDropRegions;
 
-        // DEL calls from diagonal-shift and split-read analyses,
-        // stored for post-coverage-drop INS type-flip check.
+        // DEL calls from diagonal-shift and split-read analyses.
         vector<DelCallRecord> delCallRecords;
 
         // Step 3: Extract backbone segments from the reference.
@@ -1280,14 +1277,7 @@ void Assembler::buildSvMSA(
                     rg.breakpointRefPos, rg.svSize,
                     1, "per-read-DEL"});
             }
-            if(rg.svType == SvType::Insertion && rg.svSize >= 20) {
-                allDelCalls.push_back({
-                    rg.breakpointRefPos, rg.svSize,
-                    1, "per-read-INS-flip"});
-                allInsCalls.push_back({
-                    rg.breakpointRefPos, rg.svSize,
-                    1, "per-read-INS"});
-            }
+
         }
 
         // -----------------------------------------------------------------
@@ -3208,14 +3198,7 @@ void Assembler::buildSvMSA(
                                         std::min(lbp.refPos, bestInsRbp->refPos),
                                         std::max(lbp.refPos, bestInsRbp->refPos)
                                     });
-                                    allInsCalls.push_back({
-                                        insBpPos,
-                                        bestInsSz,
-                                        uint32_t(
-                                            lbp.endpointCount
-                                            + bestInsRbp
-                                                ->endpointCount),
-                                        "path-ins"});
+
                                     // In tandem repeats, the path
                                     // traverses repeat units from
                                     // the non-deleted allele, so
@@ -3807,9 +3790,7 @@ void Assembler::buildSvMSA(
                                 std::max(bestStrong->pos,
                                          bestPartner->pos)
                             });
-                            allInsCalls.push_back({
-                                bpPos, estSize, 0,
-                                "large-ins"});
+
                         }
                         // Single-BP case: only one strong BP,
                         // no partner within 500bp. Fire only
@@ -5676,44 +5657,6 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
-        // Post-coverage-drop: DEL → INS type-flip for tandem repeats.
-        //
-        // In tandem repeat insertions, diagonal-shift and split-read
-        // analyses detect a "deletion" because the inserted sequence
-        // is a copy of existing repeat units. When a DEL call has no
-        // corresponding coverage-drop of similar size, it may be a
-        // tandem repeat insertion. Emit an INS call of the same size.
-        // -----------------------------------------------------------------
-        for(const auto& dc : delCallRecords) {
-            if(dc.size < 50 || dc.readCount < 2) continue;
-            // Check if any coverage-drop region overlaps this DEL
-            // call and has a similar size.
-            bool hasCovDropSupport = false;
-            for(const auto& cdr : covDropRegions) {
-                const uint32_t cdrSize = cdr.endPos - cdr.startPos;
-                // Coverage-drop overlaps the DEL breakpoint?
-                if(dc.breakpointPos >= cdr.startPos
-                   && dc.breakpointPos <= cdr.endPos) {
-                    // Size within 3x?
-                    if(cdrSize >= uint32_t(dc.size) / 3
-                       && cdrSize <= uint32_t(dc.size) * 3) {
-                        hasCovDropSupport = true;
-                        break;
-                    }
-                }
-            }
-            if(!hasCovDropSupport) {
-                cout << "    >>> INSERTION CALL"
-                     << " (no-covdrop-flip): size="
-                     << dc.size << "bp"
-                     << ", breakpoint=" << dc.breakpointPos
-                     << ", " << dc.source
-                     << ", reads=" << dc.readCount
-                     << endl;
-            }
-        }
-
-        // -----------------------------------------------------------------
         // CIGAR INS corroboration with coverage-drop.
         //
         // In tandem repeat insertions, CIGAR sees one repeat unit
@@ -5807,13 +5750,7 @@ void Assembler::buildSvMSA(
                             sumSize / int64_t(count),
                             count, "cluster"});
                     }
-                    if(typeStr == "INS"
-                       && (sumSize / int64_t(count)) >= 20) {
-                        allInsCalls.push_back({
-                            uint32_t(sumPos / count),
-                            sumSize / int64_t(count),
-                            count, "INS-cluster"});
-                    }
+
                     if(typeStr == "INV"
                        && (sumSize / int64_t(count)) >= 20) {
                         allDelCalls.push_back({
@@ -6513,34 +6450,7 @@ void Assembler::buildSvMSA(
                             sc.refPos, int64_t(sc.size),
                             sc.readCount, "SA-tag"});
                     }
-                    // SA-tag DEL calls in tandem repeats may
-                    // actually be insertions. Check against
-                    // coverage-drop regions: if the SA-tag DEL
-                    // is within a coverage-drop but much smaller
-                    // than it, the "deletion" is likely an
-                    // insertion (the aligner maps the supplementary
-                    // to a different repeat copy).
-                    if(sc.svType == "DEL"
-                       && sc.readCount >= 3
-                       && sc.size >= 50) {
-                        for(const auto& cdr : covDropRegions) {
-                            const uint32_t cdrSize =
-                                cdr.endPos - cdr.startPos;
-                            if(sc.refPos >= cdr.startPos
-                               && sc.refPos <= cdr.endPos
-                               && sc.size < cdrSize / 2) {
-                                cout << "    >>> INSERTION CALL"
-                                     << " (SA-DEL-flip): size="
-                                     << sc.size << "bp"
-                                     << ", breakpoint="
-                                     << sc.refPos
-                                     << ", reads="
-                                     << sc.readCount
-                                     << endl;
-                                break;
-                            }
-                        }
-                    }
+
                 }
             }
         }
