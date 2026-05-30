@@ -94,11 +94,17 @@ The pipeline runs `trimBackbones()` between each filter and `recomputeBackboneEn
 
 ```
 trimBackbones()
-runSingleEdgeFilter()           // Case 2
+recomputeBackboneEndpoints()
+removeDeadEndSpurs()            // Remove single-neighbor internal spurs
 trimBackbones()
-runBypassDetourFilter()         // Case 1
+recomputeBackboneEndpoints()
+runSingleEdgeFilter()           // Case 2: remove single-point connections
 trimBackbones()
-runBubblePopFilter()            // Case 3
+recomputeBackboneEndpoints()
+runBypassDetourFilter()         // Case 1: bypass detours through other windows
+trimBackbones()
+recomputeBackboneEndpoints()
+runBubblePopFilter()            // Case 3: pop bubbles returning to same window
 trimBackbones()
 recomputeBackboneEndpoints()
 runShortcutFilter()
@@ -147,7 +153,7 @@ After:  a0 → a1             a3 → a4  (linearized)
 ```
 
 #### `trimBackbones()`
-Symmetric head/tail trim. Walks from both ends of each window's backbone, stops at the first anchor with an active inter-window edge (checking both forward and RC mirror). Disables all edges of trimmed anchors and their RC mirrors.
+Directional head/tail trim respecting backbone orientation. Head trim: walks from position 0 inward, trims anchors before the first one that receives an **incoming** inter-window edge (checked on both forward anchor and RC mirror). Tail trim: walks from the last position inward, trims anchors after the last one that sends an **outgoing** inter-window edge. If no incoming inter-window edge exists on any anchor, head trim is skipped (resets to 0). Same for tail with outgoing. Disables all edges of trimmed anchors and their RC mirrors.
 
 #### `recomputeBackboneEndpoints()`
 For each window, walks the backbone read's full journey, builds a window sequence from anchors that still have active edges, and updates `backbonePreviousWindow`/`backboneNextWindow`. Must run before any filter that uses these fields.
