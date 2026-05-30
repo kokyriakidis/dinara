@@ -491,6 +491,55 @@ void Assembler::buildSvMSA(
         // All DEL calls. Populated by all DEL emission sites.
         vector<DelCallRecord> allDelCalls;
 
+        // DEL calls from diagonal-shift and split-read analyses.
+        vector<DelCallRecord> delCallRecords;
+
+        // Lambda: merge delCallRecords into allDelCalls,
+        // deduplicate near-identical calls, and emit.
+        auto emitDelCalls = [&]() {
+            for(const auto& dc : delCallRecords) {
+                if(dc.size >= 50) {
+                    allDelCalls.push_back(dc);
+                }
+            }
+
+            // Sort by read count descending so the most-supported
+            // call for each event survives deduplication.
+            sort(allDelCalls.begin(), allDelCalls.end(),
+                [](const DelCallRecord& a, const DelCallRecord& b) {
+                    return a.readCount > b.readCount;
+                });
+
+            // Deduplicate: suppress a call if a previously-emitted
+            // call has breakpoint within 100bp AND size ratio >= 0.9.
+            vector<DelCallRecord> emitted;
+            for(const auto& dc : allDelCalls) {
+                bool isDup = false;
+                for(const auto& prev : emitted) {
+                    const int64_t bpDist = int64_t(dc.breakpointPos)
+                        - int64_t(prev.breakpointPos);
+                    if(std::abs(bpDist) > 100) continue;
+                    const double ratio =
+                        double(std::min(dc.size, prev.size))
+                        / double(std::max(dc.size, prev.size));
+                    if(ratio >= 0.9) {
+                        isDup = true;
+                        break;
+                    }
+                }
+                if(!isDup) {
+                    emitted.push_back(dc);
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source
+                         << "): size=" << dc.size << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos
+                         << ", reads=" << dc.readCount
+                         << endl;
+                }
+            }
+        };
+
 
 
 
@@ -633,13 +682,13 @@ void Assembler::buildSvMSA(
                     const uint32_t bpPos =
                         (cl.startPos + cl.endPos) / 2;
                     if(medDel >= 20) {
-                        cout << "    >>> DELETION CALL "
-                             << "(early-split): "
-                             << "size=" << medDel
-                             << "bp, breakpoint=" << bpPos
-                             << ", splitReads="
-                             << cl.readIds.size()
-                             << endl;
+                        // cout << "    >>> DELETION CALL "
+                             // << "(early-split): "
+                             // << "size=" << medDel
+                             // << "bp, breakpoint=" << bpPos
+                             // << ", splitReads="
+                             // << cl.readIds.size()
+                             // << endl;
                         allDelCalls.push_back({
                             bpPos, medDel,
                             uint32_t(cl.readIds.size()),
@@ -750,14 +799,14 @@ void Assembler::buildSvMSA(
                 const uint32_t minReads =
                     (ci.svType == "DEL") ? 2 : 3;
                 if(ci.readCount >= minReads && ci.size >= 30) {
-                    cout << "    >>> "
-                         << (ci.svType == "DEL"
-                             ? "DELETION" : "INSERTION")
-                         << " CALL (CIGAR): size="
-                         << ci.size << "bp"
-                         << ", breakpoint=" << ci.refPos
-                         << ", reads=" << ci.readCount
-                         << endl;
+                    // cout << "    >>> "
+                         // << (ci.svType == "DEL"
+                             // ? "DELETION" : "INSERTION")
+                         // << " CALL (CIGAR): size="
+                         // << ci.size << "bp"
+                         // << ", breakpoint=" << ci.refPos
+                         // << ", reads=" << ci.readCount
+                         // << endl;
                     if(ci.svType == "DEL") {
                         allDelCalls.push_back({
                             ci.refPos, int64_t(ci.size),
@@ -785,12 +834,12 @@ void Assembler::buildSvMSA(
                     uint32_t(assemblerInfo->k), 62);
                 for(const auto& mk : mkCalls) {
                     if(mk.size >= 30 && mk.readCount >= 2) {
-                        cout << "    >>> DELETION CALL"
-                             << " (multi-k): size="
-                             << mk.size << "bp"
-                             << ", breakpoint=" << mk.breakpointPos
-                             << ", reads=" << mk.readCount
-                             << endl;
+                        // cout << "    >>> DELETION CALL"
+                             // << " (multi-k): size="
+                             // << mk.size << "bp"
+                             // << ", breakpoint=" << mk.breakpointPos
+                             // << ", reads=" << mk.readCount
+                             // << endl;
                         allDelCalls.push_back({
                             mk.breakpointPos,
                             mk.size,
@@ -854,19 +903,19 @@ void Assembler::buildSvMSA(
                     if(insSize >= 50 && insSize <= 10000) {
                         const uint32_t bpPos =
                             (rClip.refPos + lClip.refPos) / 2;
-                        cout << "    >>> INSERTION CALL"
-                             << " (soft-clip assembly): size="
-                             << insSize << "bp"
-                             << ", breakpoint=" << bpPos
-                             << ", Rclip=" << rClip.readCount
-                             << "reads"
-                             << " contig=" << rContigLen
-                             << "bp"
-                             << ", Lclip=" << lClip.readCount
-                             << "reads"
-                             << " contig=" << lContigLen
-                             << "bp"
-                             << endl;
+                        // cout << "    >>> INSERTION CALL"
+                             // << " (soft-clip assembly): size="
+                             // << insSize << "bp"
+                             // << ", breakpoint=" << bpPos
+                             // << ", Rclip=" << rClip.readCount
+                             // << "reads"
+                             // << " contig=" << rContigLen
+                             // << "bp"
+                             // << ", Lclip=" << lClip.readCount
+                             // << "reads"
+                             // << " contig=" << lContigLen
+                             // << "bp"
+                             // << endl;
                     }
                 }
             }
@@ -895,6 +944,7 @@ void Assembler::buildSvMSA(
                         sc.readCount, "SA-" + sc.svType});
             }
             detectSplitReadDels();
+            emitDelCalls();
             continue;
         }
 
@@ -921,9 +971,6 @@ void Assembler::buildSvMSA(
             bool markerDepleted;
         };
         vector<CovDropRegion> covDropRegions;
-
-        // DEL calls from diagonal-shift and split-read analyses.
-        vector<DelCallRecord> delCallRecords;
 
         // Step 3: Extract backbone segments from the reference.
         // -----------------------------------------------------------------
@@ -966,6 +1013,7 @@ void Assembler::buildSvMSA(
                         sc.readCount, "SA-" + sc.svType});
             }
             detectSplitReadDels();
+            emitDelCalls();
             continue;
         }
 
@@ -2827,15 +2875,15 @@ void Assembler::buildSvMSA(
                         // best match.
                         else if(insLenHom < -30) {
                             const int64_t delSize = std::abs(insLenHom);
-                            cout << "    >>> DELETION CALL"
-                                 << " (VNTR-depth-hom): size="
-                                 << delSize << "bp"
-                                 << ", breakpoint="
-                                 << breakpointPos
-                                 << ", refLen=" << vntrRefLen
-                                 << ", flankCov="
-                                 << flankCoverage
-                                 << endl;
+                            // cout << "    >>> DELETION CALL"
+                                 // << " (VNTR-depth-hom): size="
+                                 // << delSize << "bp"
+                                 // << ", breakpoint="
+                                 // << breakpointPos
+                                 // << ", refLen=" << vntrRefLen
+                                 // << ", flankCov="
+                                 // << flankCoverage
+                                 // << endl;
                             allDelCalls.push_back({
                                 breakpointPos, delSize,
                                 0, "VNTR-depth"});
@@ -2843,15 +2891,15 @@ void Assembler::buildSvMSA(
                             if(insLenHet < -30) {
                                 const int64_t delSizeHet =
                                     std::abs(insLenHet);
-                                cout << "    >>> DELETION CALL"
-                                     << " (VNTR-depth-het): size="
-                                     << delSizeHet << "bp"
-                                     << ", breakpoint="
-                                     << breakpointPos
-                                     << ", refLen=" << vntrRefLen
-                                     << ", flankCov="
-                                     << flankCoverage
-                                     << endl;
+                                // cout << "    >>> DELETION CALL"
+                                     // << " (VNTR-depth-het): size="
+                                     // << delSizeHet << "bp"
+                                     // << ", breakpoint="
+                                     // << breakpointPos
+                                     // << ", refLen=" << vntrRefLen
+                                     // << ", flankCov="
+                                     // << flankCoverage
+                                     // << endl;
                                 allDelCalls.push_back({
                                     breakpointPos, delSizeHet,
                                     0, "VNTR-depth"});
@@ -2860,12 +2908,12 @@ void Assembler::buildSvMSA(
                             // the breakpoint distance itself is
                             // a size estimate for the deletion.
                             if(vntrRefLen >= 30) {
-                                cout << "    >>> DELETION CALL"
-                                     << " (VNTR-refGap): size="
-                                     << vntrRefLen << "bp"
-                                     << ", breakpoint="
-                                     << breakpointPos
-                                     << endl;
+                                // cout << "    >>> DELETION CALL"
+                                     // << " (VNTR-refGap): size="
+                                     // << vntrRefLen << "bp"
+                                     // << ", breakpoint="
+                                     // << breakpointPos
+                                     // << endl;
                                 allDelCalls.push_back({
                                     breakpointPos, vntrRefLen,
                                     0, "VNTR-refGap"});
@@ -2873,25 +2921,25 @@ void Assembler::buildSvMSA(
                         } else if(insLenHet < -30) {
                             const int64_t delSize =
                                 std::abs(insLenHet);
-                            cout << "    >>> DELETION CALL"
-                                 << " (VNTR-depth-het): size="
-                                 << delSize << "bp"
-                                 << ", breakpoint="
-                                 << breakpointPos
-                                 << ", refLen=" << vntrRefLen
-                                 << ", flankCov="
-                                 << flankCoverage
-                                 << endl;
+                            // cout << "    >>> DELETION CALL"
+                                 // << " (VNTR-depth-het): size="
+                                 // << delSize << "bp"
+                                 // << ", breakpoint="
+                                 // << breakpointPos
+                                 // << ", refLen=" << vntrRefLen
+                                 // << ", flankCov="
+                                 // << flankCoverage
+                                 // << endl;
                             allDelCalls.push_back({
                                 breakpointPos, delSize,
                                 0, "VNTR-depth"});
                             if(vntrRefLen >= 30) {
-                                cout << "    >>> DELETION CALL"
-                                     << " (VNTR-refGap): size="
-                                     << vntrRefLen << "bp"
-                                     << ", breakpoint="
-                                     << breakpointPos
-                                     << endl;
+                                // cout << "    >>> DELETION CALL"
+                                     // << " (VNTR-refGap): size="
+                                     // << vntrRefLen << "bp"
+                                     // << ", breakpoint="
+                                     // << breakpointPos
+                                     // << endl;
                                 allDelCalls.push_back({
                                     breakpointPos, vntrRefLen,
                                     0, "VNTR-refGap"});
@@ -2904,12 +2952,12 @@ void Assembler::buildSvMSA(
                     // The breakpoint pair marks the deletion boundaries
                     // even when chains can't span the repeat.
                     if(!foundPath && bestDist >= 50) {
-                        cout << "    >>> DELETION CALL"
-                             << " (bp-pair-nofp): size="
-                             << bestDist << "bp"
-                             << ", breakpoint="
-                             << breakpointPos
-                             << endl;
+                        // cout << "    >>> DELETION CALL"
+                             // << " (bp-pair-nofp): size="
+                             // << bestDist << "bp"
+                             // << ", breakpoint="
+                             // << breakpointPos
+                             // << endl;
                         allDelCalls.push_back({
                             breakpointPos, int64_t(bestDist),
                             uint32_t(lbp.endpointCount
@@ -2947,15 +2995,15 @@ void Assembler::buildSvMSA(
                         if(isDeletion) {
                             const int64_t delSz = bestDist - reportedPathDist;
                             if(delSz > 20) {
-                                cout << "    >>> DELETION CALL (path-based): "
-                                     << "size=" << delSz << "bp, "
-                                     << "breakpoint=" << breakpointPos << ", "
-                                     << "leftEnds=" << lbp.endpointCount << ", "
-                                     << "rightStarts=" << bestRbp->endpointCount << ", "
-                                     << "hops=" << bestPathLen
-                                     << " (pathDist=" << reportedPathDist
-                                     << " refGap=" << bestDist << ")"
-                                     << endl;
+                                // cout << "    >>> DELETION CALL (path-based): "
+                                     // << "size=" << delSz << "bp, "
+                                     // << "breakpoint=" << breakpointPos << ", "
+                                     // << "leftEnds=" << lbp.endpointCount << ", "
+                                     // << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     // << "hops=" << bestPathLen
+                                     // << " (pathDist=" << reportedPathDist
+                                     // << " refGap=" << bestDist << ")"
+                                     // << endl;
                                 if(delSz >= 50) {
                                     allDelCalls.push_back({
                                         breakpointPos, delSz,
@@ -3185,15 +3233,15 @@ void Assembler::buildSvMSA(
                                          << ", breakpoint="
                                          << insBpPos << endl;
                                 } else {
-                                    cout << "    >>> INSERTION CALL: "
-                                         << "size=" << bestInsSz << "bp, "
-                                         << "breakpoint=" << insBpPos << ", "
-                                         << "leftEnds=" << lbp.endpointCount << ", "
-                                         << "rightStarts=" << bestInsRbp->endpointCount << ", "
-                                         << "hops=" << bestInsHops
-                                         << " (pathDist=" << bestInsPathDist
-                                         << " refGap=" << bestInsRefGap << ")"
-                                         << endl;
+                                    // cout << "    >>> INSERTION CALL: "
+                                         // << "size=" << bestInsSz << "bp, "
+                                         // << "breakpoint=" << insBpPos << ", "
+                                         // << "leftEnds=" << lbp.endpointCount << ", "
+                                         // << "rightStarts=" << bestInsRbp->endpointCount << ", "
+                                         // << "hops=" << bestInsHops
+                                         // << " (pathDist=" << bestInsPathDist
+                                         // << " refGap=" << bestInsRefGap << ")"
+                                         // << endl;
                                     insertionCallRegions.push_back({
                                         std::min(lbp.refPos, bestInsRbp->refPos),
                                         std::max(lbp.refPos, bestInsRbp->refPos)
@@ -3244,13 +3292,13 @@ void Assembler::buildSvMSA(
                                                 }
                                             }
                                         }
-                                        cout << "    >>> DELETION CALL"
-                                             << " (path-mirror):"
-                                             << " size="
-                                             << pmSize
-                                             << "bp, breakpoint="
-                                             << insBpPos
-                                             << endl;
+                                        // cout << "    >>> DELETION CALL"
+                                             // << " (path-mirror):"
+                                             // << " size="
+                                             // << pmSize
+                                             // << "bp, breakpoint="
+                                             // << insBpPos
+                                             // << endl;
                                         delCallRecords.push_back({
                                             insBpPos,
                                             pmSize,
@@ -3380,13 +3428,13 @@ void Assembler::buildSvMSA(
                                  << endl;
 
                             if(medianDel > 30) {
-                                cout << "    >>> DELETION CALL: "
-                                     << "size=" << medianDel << "bp, "
-                                     << "breakpoint=" << breakpointPos << ", "
-                                     << "leftEnds=" << lbp.endpointCount << ", "
-                                     << "rightStarts=" << bestRbp->endpointCount << ", "
-                                     << "supportingReads=" << delShifts.size()
-                                     << endl;
+                                // cout << "    >>> DELETION CALL: "
+                                     // << "size=" << medianDel << "bp, "
+                                     // << "breakpoint=" << breakpointPos << ", "
+                                     // << "leftEnds=" << lbp.endpointCount << ", "
+                                     // << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     // << "supportingReads=" << delShifts.size()
+                                     // << endl;
                                 delCallRecords.push_back({
                                     breakpointPos,
                                     medianDel,
@@ -3400,18 +3448,18 @@ void Assembler::buildSvMSA(
                                 // so the correct type can be scored.
                                 if(lbp.refPos > bestRbp->refPos
                                    && medianDel >= 50) {
-                                    cout << "    >>> INSERTION CALL"
-                                         << " (reversed-BP): size="
-                                         << medianDel << "bp"
-                                         << ", breakpoint="
-                                         << breakpointPos
-                                         << ", leftEnds="
-                                         << lbp.endpointCount
-                                         << ", rightStarts="
-                                         << bestRbp->endpointCount
-                                         << ", supportingReads="
-                                         << delShifts.size()
-                                         << endl;
+                                    // cout << "    >>> INSERTION CALL"
+                                         // << " (reversed-BP): size="
+                                         // << medianDel << "bp"
+                                         // << ", breakpoint="
+                                         // << breakpointPos
+                                         // << ", leftEnds="
+                                         // << lbp.endpointCount
+                                         // << ", rightStarts="
+                                         // << bestRbp->endpointCount
+                                         // << ", supportingReads="
+                                         // << delShifts.size()
+                                         // << endl;
                                 }
                             }
                         }
@@ -3465,12 +3513,12 @@ void Assembler::buildSvMSA(
                                     }
                                 }
                             }
-                            cout << "    >>> DELETION CALL"
-                                 << " (bp-pair): size="
-                                 << bpPairSize << "bp"
-                                 << ", breakpoint="
-                                 << breakpointPos
-                                 << endl;
+                            // cout << "    >>> DELETION CALL"
+                                 // << " (bp-pair): size="
+                                 // << bpPairSize << "bp"
+                                 // << ", breakpoint="
+                                 // << breakpointPos
+                                 // << endl;
                             delCallRecords.push_back({
                                 breakpointPos,
                                 bpPairSize,
@@ -3565,13 +3613,13 @@ void Assembler::buildSvMSA(
                                  << endl;
 
                             if(medianDel > 30) {
-                                cout << "    >>> DELETION CALL: "
-                                     << "size=" << medianDel << "bp, "
-                                     << "breakpoint=" << breakpointPos << ", "
-                                     << "leftEnds=" << lbp.endpointCount << ", "
-                                     << "rightStarts=" << bestRbp->endpointCount << ", "
-                                     << "supportingReads=" << delShifts.size()
-                                     << endl;
+                                // cout << "    >>> DELETION CALL: "
+                                     // << "size=" << medianDel << "bp, "
+                                     // << "breakpoint=" << breakpointPos << ", "
+                                     // << "leftEnds=" << lbp.endpointCount << ", "
+                                     // << "rightStarts=" << bestRbp->endpointCount << ", "
+                                     // << "supportingReads=" << delShifts.size()
+                                     // << endl;
                                 if(medianDel >= 50) {
                                     allDelCalls.push_back({
                                         breakpointPos,
@@ -3732,32 +3780,32 @@ void Assembler::buildSvMSA(
                             const uint32_t bpPos =
                                 (bestStrong->pos
                                  + bestPartner->pos) / 2;
-                            cout << "    >>> INSERTION CALL"
-                                 << " (large-ins): size="
-                                 << estSize << "bp"
-                                 << ", breakpoint=" << bpPos
-                                 << ", leftEnds="
-                                 << (bestStrong->isLeft
-                                     ? bestStrong->count
-                                     : bestPartner->count)
-                                 << " (fold="
-                                 << (bestStrong->isLeft
-                                     ? bestStrong->fold
-                                     : bestPartner->fold)
-                                 << ")"
-                                 << ", rightStarts="
-                                 << (bestStrong->isLeft
-                                     ? bestPartner->count
-                                     : bestStrong->count)
-                                 << " (fold="
-                                 << (bestStrong->isLeft
-                                     ? bestPartner->fold
-                                     : bestStrong->fold)
-                                 << ")"
-                                 << ", internalReads="
-                                 << indirectAlignedReads
-                                    .size()
-                                 << endl;
+                            // cout << "    >>> INSERTION CALL"
+                                 // << " (large-ins): size="
+                                 // << estSize << "bp"
+                                 // << ", breakpoint=" << bpPos
+                                 // << ", leftEnds="
+                                 // << (bestStrong->isLeft
+                                     // ? bestStrong->count
+                                     // : bestPartner->count)
+                                 // << " (fold="
+                                 // << (bestStrong->isLeft
+                                     // ? bestStrong->fold
+                                     // : bestPartner->fold)
+                                 // << ")"
+                                 // << ", rightStarts="
+                                 // << (bestStrong->isLeft
+                                     // ? bestPartner->count
+                                     // : bestStrong->count)
+                                 // << " (fold="
+                                 // << (bestStrong->isLeft
+                                     // ? bestPartner->fold
+                                     // : bestStrong->fold)
+                                 // << ")"
+                                 // << ", internalReads="
+                                 // << indirectAlignedReads
+                                    // .size()
+                                 // << endl;
                             // Het-corrected estimate: for het
                             // insertions, indirectBases/coverage
                             // gives ~half the true size because
@@ -3774,15 +3822,15 @@ void Assembler::buildSvMSA(
                                && estSize >= 100) {
                                 const int64_t hetSize =
                                     estSize * 2;
-                                cout << "    >>> INSERTION CALL"
-                                     << " (large-ins-het):"
-                                     << " size="
-                                     << hetSize << "bp"
-                                     << ", breakpoint="
-                                     << bpPos
-                                     << ", irCovRatio="
-                                     << irCovRatio
-                                     << endl;
+                                // cout << "    >>> INSERTION CALL"
+                                     // << " (large-ins-het):"
+                                     // << " size="
+                                     // << hetSize << "bp"
+                                     // << ", breakpoint="
+                                     // << bpPos
+                                     // << ", irCovRatio="
+                                     // << irCovRatio
+                                     // << endl;
                             }
                             insertionCallRegions.push_back({
                                 std::min(bestStrong->pos,
@@ -3817,23 +3865,23 @@ void Assembler::buildSvMSA(
                                 }
                             }
                             if(!hasOppositeBP) {
-                                cout << "    >>> INSERTION CALL"
-                                     << " (large-ins): size="
-                                     << estSize << "bp"
-                                     << ", breakpoint="
-                                     << bestStrong->pos
-                                     << ", "
-                                     << (bestStrong->isLeft
-                                         ? "leftEnds="
-                                         : "rightStarts=")
-                                     << bestStrong->count
-                                     << " (fold="
-                                     << bestStrong->fold
-                                     << ")"
-                                     << ", internalReads="
-                                     << indirectAlignedReads
-                                        .size()
-                                     << endl;
+                                // cout << "    >>> INSERTION CALL"
+                                     // << " (large-ins): size="
+                                     // << estSize << "bp"
+                                     // << ", breakpoint="
+                                     // << bestStrong->pos
+                                     // << ", "
+                                     // << (bestStrong->isLeft
+                                         // ? "leftEnds="
+                                         // : "rightStarts=")
+                                     // << bestStrong->count
+                                     // << " (fold="
+                                     // << bestStrong->fold
+                                     // << ")"
+                                     // << ", internalReads="
+                                     // << indirectAlignedReads
+                                        // .size()
+                                     // << endl;
                                 // Het-corrected estimate.
                                 const double irCovRatio2 =
                                     double(indirectAlignedReads
@@ -3843,16 +3891,16 @@ void Assembler::buildSvMSA(
                                    && estSize >= 100) {
                                     const int64_t hetSize2 =
                                         estSize * 2;
-                                    cout << "    >>> INSERTION"
-                                         << " CALL"
-                                         << " (large-ins-het):"
-                                         << " size="
-                                         << hetSize2 << "bp"
-                                         << ", breakpoint="
-                                         << bestStrong->pos
-                                         << ", irCovRatio="
-                                         << irCovRatio2
-                                         << endl;
+                                    // cout << "    >>> INSERTION"
+                                         // << " CALL"
+                                         // << " (large-ins-het):"
+                                         // << " size="
+                                         // << hetSize2 << "bp"
+                                         // << ", breakpoint="
+                                         // << bestStrong->pos
+                                         // << ", irCovRatio="
+                                         // << irCovRatio2
+                                         // << endl;
                                 }
                                 insertionCallRegions.push_back({
                                     bestStrong->pos > 200
@@ -4057,13 +4105,13 @@ void Assembler::buildSvMSA(
                             const uint32_t hdBp =
                                 (cluster.startPos + cluster.endPos) / 2;
                             if(clusterSpan >= 30) {
-                                cout << "    >>> DELETION CALL"
-                                     << " (covdrop-span): size="
-                                     << clusterSpan << "bp"
-                                     << ", breakpoint=" << hdBp
-                                     << ", minRatio="
-                                     << cluster.minRatio
-                                     << endl;
+                                // cout << "    >>> DELETION CALL"
+                                     // << " (covdrop-span): size="
+                                     // << clusterSpan << "bp"
+                                     // << ", breakpoint=" << hdBp
+                                     // << ", minRatio="
+                                     // << cluster.minRatio
+                                     // << endl;
                                 allDelCalls.push_back({
                                     hdBp, clusterSpan,
                                     0, "covdrop-span"});
@@ -4085,12 +4133,12 @@ void Assembler::buildSvMSA(
                              << endl;
 
                         if(diagShifts.size() >= 2 && medianShift > 20) {
-                            cout << "    >>> INSERTION CALL (hit-depth): "
-                                 << "size=" << medianShift << "bp, "
-                                 << "breakpoint=" << breakpointPos << ", "
-                                 << "supportingReads=" << diagShifts.size()
-                                 << ", minRatio=" << cluster.minRatio
-                                 << endl;
+                            // cout << "    >>> INSERTION CALL (hit-depth): "
+                                 // << "size=" << medianShift << "bp, "
+                                 // << "breakpoint=" << breakpointPos << ", "
+                                 // << "supportingReads=" << diagShifts.size()
+                                 // << ", minRatio=" << cluster.minRatio
+                                 // << endl;
                         }
                     }
                 }
@@ -4217,11 +4265,11 @@ void Assembler::buildSvMSA(
                                  << endl;
 
                             if(medianDel > 30 && cluster.readIds.size() >= 3) {
-                                cout << "    >>> DELETION CALL: "
-                                     << "size=" << medianDel << "bp, "
-                                     << "breakpoint=" << bpPos << ", "
-                                     << "supportingReads=" << cluster.readIds.size()
-                                     << endl;
+                                // cout << "    >>> DELETION CALL: "
+                                     // << "size=" << medianDel << "bp, "
+                                     // << "breakpoint=" << bpPos << ", "
+                                     // << "supportingReads=" << cluster.readIds.size()
+                                     // << endl;
                                 if(medianDel >= 50) {
                                     allDelCalls.push_back({
                                         bpPos,
@@ -4409,13 +4457,13 @@ void Assembler::buildSvMSA(
                                 (cl.startPos + cl.endPos) / 2;
 
                             if(medDel > 50) {
-                                cout << "    >>> DELETION CALL "
-                                     << "(split-read): "
-                                     << "size=" << medDel
-                                     << "bp, breakpoint=" << bpPos
-                                     << ", splitReads="
-                                     << cl.readIds.size()
-                                     << endl;
+                                // cout << "    >>> DELETION CALL "
+                                     // << "(split-read): "
+                                     // << "size=" << medDel
+                                     // << "bp, breakpoint=" << bpPos
+                                     // << ", splitReads="
+                                     // << cl.readIds.size()
+                                     // << endl;
                                 delCallRecords.push_back({
                                     bpPos,
                                     medDel,
@@ -4785,10 +4833,10 @@ void Assembler::buildSvMSA(
                         if(refAnchors.size() < 5) {
                             // Not enough anchors to analyze.
                             if(delSize >= 50 && delSize <= 2000) {
-                                cout << "    >>> DELETION CALL (coverage): "
-                                     << "size=" << delSize << "bp, "
-                                     << "breakpoint=" << bpPos
-                                     << endl;
+                                // cout << "    >>> DELETION CALL (coverage): "
+                                     // << "size=" << delSize << "bp, "
+                                     // << "breakpoint=" << bpPos
+                                     // << endl;
                                 allDelCalls.push_back({
                                     bpPos, delSize,
                                     0, "coverage"});
@@ -4971,11 +5019,11 @@ void Assembler::buildSvMSA(
                             // noise from repeat-induced small drops.
                             if(bestCount >= 2 && bestSize >= 50
                                && bestSize >= int64_t(delSize) / 4) {
-                                cout << "    >>> DELETION CALL (adaptive): "
-                                     << "size=" << bestSize << "bp, "
-                                     << "breakpoint=" << bestBp << ", "
-                                     << "reads=" << bestCount
-                                     << endl;
+                                // cout << "    >>> DELETION CALL (adaptive): "
+                                     // << "size=" << bestSize << "bp, "
+                                     // << "breakpoint=" << bestBp << ", "
+                                     // << "reads=" << bestCount
+                                     // << endl;
                                 allDelCalls.push_back({
                                     bestBp, bestSize,
                                     bestCount, "adaptive"});
@@ -5119,12 +5167,12 @@ void Assembler::buildSvMSA(
                                     // downstream pick the correct
                                     // type.
                                     if(flankShift >= 40) {
-                                        cout << "    >>> DELETION CALL"
-                                             << " (flank-gap): size="
-                                             << flankShift << "bp"
-                                             << ", breakpoint="
-                                             << bpPos
-                                             << endl;
+                                        // cout << "    >>> DELETION CALL"
+                                             // << " (flank-gap): size="
+                                             // << flankShift << "bp"
+                                             // << ", breakpoint="
+                                             // << bpPos
+                                             // << endl;
                                         delCallRecords.push_back({
                                             bpPos,
                                             flankShift,
@@ -5136,15 +5184,15 @@ void Assembler::buildSvMSA(
                                     const int64_t insCallSize =
                                         std::max(flankShift,
                                                  int64_t(delSize));
-                                    cout << "    >>> INSERTION CALL"
-                                         << " (flank-gap): size="
-                                         << insCallSize << "bp"
-                                         << ", breakpoint="
-                                         << bpPos
-                                         << ", indirectReads="
-                                         << indirectAlignedReads
-                                            .size()
-                                         << endl;
+                                    // cout << "    >>> INSERTION CALL"
+                                         // << " (flank-gap): size="
+                                         // << insCallSize << "bp"
+                                         // << ", breakpoint="
+                                         // << bpPos
+                                         // << ", indirectReads="
+                                         // << indirectAlignedReads
+                                            // .size()
+                                         // << endl;
                                     // Also emit a repeat-unit-
                                     // rounded estimate: the true
                                     // insertion is likely a whole
@@ -5163,20 +5211,20 @@ void Assembler::buildSvMSA(
                                             flankShift * nUnits;
                                         if(roundedSize != insCallSize
                                            && roundedSize >= 50) {
-                                            cout << "    >>> "
-                                                 << "INSERTION CALL"
-                                                 << " (flank-gap"
-                                                 << "-rounded):"
-                                                 << " size="
-                                                 << roundedSize
-                                                 << "bp"
-                                                 << ", breakpoint="
-                                                 << bpPos
-                                                 << ", repeatUnit="
-                                                 << flankShift
-                                                 << ", nUnits="
-                                                 << nUnits
-                                                 << endl;
+                                            // cout << "    >>> "
+                                                 // << "INSERTION CALL"
+                                                 // << " (flank-gap"
+                                                 // << "-rounded):"
+                                                 // << " size="
+                                                 // << roundedSize
+                                                 // << "bp"
+                                                 // << ", breakpoint="
+                                                 // << bpPos
+                                                 // << ", repeatUnit="
+                                                 // << flankShift
+                                                 // << ", nUnits="
+                                                 // << nUnits
+                                                 // << endl;
                                         }
                                     }
                                     insertionCallRegions.push_back(
@@ -5233,12 +5281,12 @@ void Assembler::buildSvMSA(
                                             break;
                                         }
                                     }
-                                    cout << "    >>> DELETION CALL"
-                                         << " (flank-gap): size="
-                                         << flankShift << "bp"
-                                         << ", breakpoint="
-                                         << bpPos
-                                         << endl;
+                                    // cout << "    >>> DELETION CALL"
+                                         // << " (flank-gap): size="
+                                         // << flankShift << "bp"
+                                         // << ", breakpoint="
+                                         // << bpPos
+                                         // << endl;
                                     if(flankShift >= 50) {
                                         delCallRecords.push_back({
                                             bpPos,
@@ -5259,16 +5307,16 @@ void Assembler::buildSvMSA(
                                             std::max(
                                                 flankShift,
                                                 int64_t(delSize));
-                                        cout << "    >>> INSERTION"
-                                             << " CALL (flank-gap"
-                                             << "-alt): size="
-                                             << insSize << "bp"
-                                             << ", breakpoint="
-                                             << bpPos
-                                             << ", indirectReads="
-                                             << indirectAlignedReads
-                                                .size()
-                                             << endl;
+                                        // cout << "    >>> INSERTION"
+                                             // << " CALL (flank-gap"
+                                             // << "-alt): size="
+                                             // << insSize << "bp"
+                                             // << ", breakpoint="
+                                             // << bpPos
+                                             // << ", indirectReads="
+                                             // << indirectAlignedReads
+                                                // .size()
+                                             // << endl;
                                     }
                                 }
                                 refinedCall = true;
@@ -5583,11 +5631,11 @@ void Assembler::buildSvMSA(
                                         break;
                                     }
                                 }
-                                cout << "    >>> DELETION CALL "
-                                     << "(adaptive-bimodal): "
-                                     << "size=" << bestShift << "bp, "
-                                     << "breakpoint=" << bpPos
-                                     << endl;
+                                // cout << "    >>> DELETION CALL "
+                                     // << "(adaptive-bimodal): "
+                                     // << "size=" << bestShift << "bp, "
+                                     // << "breakpoint=" << bpPos
+                                     // << endl;
                                 if(bestShift >= 50) {
                                     allDelCalls.push_back({
                                         bpPos, bestShift,
@@ -5625,16 +5673,16 @@ void Assembler::buildSvMSA(
                                && estInsSize <= 2000
                                && indirectAlignedReads.size()
                                   >= uint32_t(medianSpanning) / 3) {
-                                cout << "    >>> INSERTION CALL"
-                                     << " (covdrop-indirect):"
-                                     << " size=" << estInsSize
-                                     << "bp, breakpoint="
-                                     << bpPos
-                                     << ", indirectReads="
-                                     << indirectAlignedReads
-                                        .size()
-                                     << ", markerDepleted=1"
-                                     << endl;
+                                // cout << "    >>> INSERTION CALL"
+                                     // << " (covdrop-indirect):"
+                                     // << " size=" << estInsSize
+                                     // << "bp, breakpoint="
+                                     // << bpPos
+                                     // << ", indirectReads="
+                                     // << indirectAlignedReads
+                                        // .size()
+                                     // << ", markerDepleted=1"
+                                     // << endl;
                                 insertionCallRegions.push_back({
                                     cdc.startPos, cdc.endPos});
                                 refinedCall = true;
@@ -5643,10 +5691,10 @@ void Assembler::buildSvMSA(
 
                         if(!refinedCall && delSize >= 50
                            && delSize <= 2000) {
-                            cout << "    >>> DELETION CALL (coverage): "
-                                 << "size=" << delSize << "bp, "
-                                 << "breakpoint=" << bpPos
-                                 << endl;
+                            // cout << "    >>> DELETION CALL (coverage): "
+                                 // << "size=" << delSize << "bp, "
+                                 // << "breakpoint=" << bpPos
+                                 // << endl;
                             allDelCalls.push_back({
                                 bpPos, delSize,
                                 0, "coverage"});
@@ -5678,13 +5726,13 @@ void Assembler::buildSvMSA(
                    && cdrSize <= ci.size * 6
                    && cdrSize >= 100
                    && cdrSize <= 2000) {
-                    cout << "    >>> INSERTION CALL"
-                         << " (CIGAR-covdrop): size="
-                         << cdrSize << "bp"
-                         << ", breakpoint=" << ci.refPos
-                         << ", cigarReads=" << ci.readCount
-                         << ", cigarSize=" << ci.size
-                         << endl;
+                    // cout << "    >>> INSERTION CALL"
+                         // << " (CIGAR-covdrop): size="
+                         // << cdrSize << "bp"
+                         // << ", breakpoint=" << ci.refPos
+                         // << ", cigarReads=" << ci.readCount
+                         // << ", cigarSize=" << ci.size
+                         // << endl;
                     break;
                 }
             }
@@ -5737,12 +5785,12 @@ void Assembler::buildSvMSA(
                                << minSize << "\t"
                                << maxSize << "\n";
 
-                    cout << "    >>> " << typeStr << " CLUSTER: "
-                         << "id=" << cid << ", "
-                         << "size=" << (sumSize / int64_t(count)) << "bp, "
-                         << "breakpoint=" << (sumPos / count) << ", "
-                         << "reads=" << count
-                         << endl;
+                    // cout << "    >>> " << typeStr << " CLUSTER: "
+                         // << "id=" << cid << ", "
+                         // << "size=" << (sumSize / int64_t(count)) << "bp, "
+                         // << "breakpoint=" << (sumPos / count) << ", "
+                         // << "reads=" << count
+                         // << endl;
                     if(typeStr == "DEL"
                        && (sumSize / int64_t(count)) >= 20) {
                         allDelCalls.push_back({
@@ -5850,15 +5898,15 @@ void Assembler::buildSvMSA(
                         (base.type == SvType::Insertion) ? "INS" : "DEL";
 
                     if(mergedSize >= 50) {
-                        cout << "    >>> "
-                             << (base.type == SvType::Insertion
-                                 ? "INSERTION" : "DELETION")
-                             << " CALL (merged-clusters): "
-                             << "size=" << mergedSize << "bp, "
-                             << "breakpoint=" << mergedPos << ", "
-                             << "clusters=" << (j - i) << ", "
-                             << "reads=" << totalReads
-                             << endl;
+                        // cout << "    >>> "
+                             // << (base.type == SvType::Insertion
+                                 // ? "INSERTION" : "DELETION")
+                             // << " CALL (merged-clusters): "
+                             // << "size=" << mergedSize << "bp, "
+                             // << "breakpoint=" << mergedPos << ", "
+                             // << "clusters=" << (j - i) << ", "
+                             // << "reads=" << totalReads
+                             // << endl;
                         if(base.type != SvType::Insertion) {
                             allDelCalls.push_back({
                                 uint32_t(mergedPos), mergedSize,
@@ -5909,14 +5957,14 @@ void Assembler::buildSvMSA(
                     const int64_t posDiff =
                         int64_t(ci.refPos) - int64_t(clusterPos);
                     if(std::abs(posDiff) <= 200) {
-                        cout << "    >>> DELETION CALL"
-                             << " (CIGAR-corroborated): "
-                             << "size=" << clusterSize << "bp"
-                             << ", breakpoint=" << clusterPos
-                             << ", kmerReads=" << count
-                             << ", cigarReads=" << ci.readCount
-                             << ", cigarSize=" << ci.size << "bp"
-                             << endl;
+                        // cout << "    >>> DELETION CALL"
+                             // << " (CIGAR-corroborated): "
+                             // << "size=" << clusterSize << "bp"
+                             // << ", breakpoint=" << clusterPos
+                             // << ", kmerReads=" << count
+                             // << ", cigarReads=" << ci.readCount
+                             // << ", cigarSize=" << ci.size << "bp"
+                             // << endl;
                         if(clusterSize >= 50) {
                             allDelCalls.push_back({
                                 uint32_t(clusterPos),
@@ -5978,16 +6026,16 @@ void Assembler::buildSvMSA(
                         if(clusterSize <= int64_t(covDropSize)
                            && clusterSize * 2
                               >= int64_t(covDropSize)) {
-                            cout << "    >>> DELETION CALL"
-                                 << " (covdrop-corroborated):"
-                                 << " size="
-                                 << clusterSize << "bp"
-                                 << ", breakpoint="
-                                 << clusterPos
-                                 << ", kmerReads=" << count
-                                 << ", covDropSize="
-                                 << covDropSize << "bp"
-                                 << endl;
+                            // cout << "    >>> DELETION CALL"
+                                 // << " (covdrop-corroborated):"
+                                 // << " size="
+                                 // << clusterSize << "bp"
+                                 // << ", breakpoint="
+                                 // << clusterPos
+                                 // << ", kmerReads=" << count
+                                 // << ", covDropSize="
+                                 // << covDropSize << "bp"
+                                 // << endl;
                             if(clusterSize >= 50) {
                                 allDelCalls.push_back({
                                     uint32_t(clusterPos),
@@ -6199,16 +6247,16 @@ void Assembler::buildSvMSA(
                         const char* typeStr =
                             (medianDiff > 0) ? "INSERTION"
                                              : "DELETION";
-                        cout << "    >>> " << typeStr
-                             << " CALL (SDUST-STR): size="
-                             << std::abs(medianDiff) << "bp"
-                             << ", breakpoint="
-                             << (dustStart + dustEnd) / 2
-                             << ", spanningReads="
-                             << spanningReads.size()
-                             << ", motifPeriod="
-                             << motifPeriod
-                             << endl;
+                        // cout << "    >>> " << typeStr
+                             // << " CALL (SDUST-STR): size="
+                             // << std::abs(medianDiff) << "bp"
+                             // << ", breakpoint="
+                             // << (dustStart + dustEnd) / 2
+                             // << ", spanningReads="
+                             // << spanningReads.size()
+                             // << ", motifPeriod="
+                             // << motifPeriod
+                             // << endl;
                         if(medianDiff < 0
                            && std::abs(medianDiff) >= 50) {
                             allDelCalls.push_back({
@@ -6386,14 +6434,14 @@ void Assembler::buildSvMSA(
                     const char* typeStr =
                         (estimatedSvSize > 0) ? "INSERTION"
                                               : "DELETION";
-                    cout << "    >>> " << typeStr
-                         << " CALL (SDUST-VNTR): size="
-                         << std::abs(estimatedSvSize) << "bp"
-                         << ", breakpoint="
-                         << (dustStart + dustEnd) / 2
-                         << ", motifPeriod=" << motifPeriod
-                         << ", flankCov=" << flankCov
-                         << endl;
+                    // cout << "    >>> " << typeStr
+                         // << " CALL (SDUST-VNTR): size="
+                         // << std::abs(estimatedSvSize) << "bp"
+                         // << ", breakpoint="
+                         // << (dustStart + dustEnd) / 2
+                         // << ", motifPeriod=" << motifPeriod
+                         // << ", flankCov=" << flankCov
+                         // << endl;
                     if(estimatedSvSize < 0) {
                         allDelCalls.push_back({
                             (dustStart + dustEnd) / 2,
@@ -6439,12 +6487,12 @@ void Assembler::buildSvMSA(
                              << endl;
                         continue;
                     }
-                    cout << "    >>> " << sc.svType
-                         << " CALL (SA-tag): size="
-                         << sc.size << "bp"
-                         << ", breakpoint=" << sc.refPos
-                         << ", reads=" << sc.readCount
-                         << endl;
+                    // cout << "    >>> " << sc.svType
+                         // << " CALL (SA-tag): size="
+                         // << sc.size << "bp"
+                         // << ", breakpoint=" << sc.refPos
+                         // << ", reads=" << sc.readCount
+                         // << endl;
                     if(sc.svType == "DEL" && sc.size >= 50) {
                         allDelCalls.push_back({
                             sc.refPos, int64_t(sc.size),
@@ -6456,24 +6504,9 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
-        // Emit remaining direct DEL calls from delCallRecords.
+        // Deduplicate and emit all DEL calls.
         // -----------------------------------------------------------------
-        {
-            for(const auto& dc : delCallRecords) {
-                if(dc.size >= 50) {
-                    allDelCalls.push_back(dc);
-                }
-            }
-
-            // Emit all direct DEL calls.
-            for(const auto& dc : allDelCalls) {
-                cout << "    >>> DELETION CALL"
-                     << " (" << dc.source << "): size="
-                     << dc.size << "bp"
-                     << ", breakpoint="
-                     << dc.breakpointPos << endl;
-            }
-        }
+        emitDelCalls();
 
 
 
