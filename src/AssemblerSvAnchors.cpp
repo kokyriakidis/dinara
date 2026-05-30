@@ -835,7 +835,7 @@ void Assembler::buildSvMSA(
             for(const auto& ci : cigarIndels) {
                 const uint32_t minReads =
                     (ci.svType == "DEL") ? 2 : 3;
-                if(ci.readCount >= minReads && ci.size >= 50) {
+                if(ci.readCount >= minReads && ci.size >= 30) {
                     cout << "    >>> "
                          << (ci.svType == "DEL"
                              ? "DELETION" : "INSERTION")
@@ -2478,6 +2478,25 @@ void Assembler::buildSvMSA(
                                  << " — extending pair distance"
                                  << endl;
                         }
+                        // Allow pairing when both BPs have strong
+                        // signals, even without a hit-depth drop.
+                        if(bestDist > maxPairDist
+                           && lbp.foldEnrichment >= 3.0
+                           && bestRbp->foldEnrichment >= 3.0
+                           && lbp.ovhReadCount >= 3
+                           && bestRbp->ovhReadCount >= 3) {
+                            maxPairDist = bestDist + 1;
+                            vntrGaps.push_back({lbp.refPos, bestRbp->refPos});
+                            cout << "    Strong BP pair: L="
+                                 << lbp.refPos
+                                 << " (fold=" << lbp.foldEnrichment
+                                 << " ovh=" << lbp.ovhReadCount
+                                 << ") R=" << bestRbp->refPos
+                                 << " (fold=" << bestRbp->foldEnrichment
+                                 << " ovh=" << bestRbp->ovhReadCount
+                                 << ") dist=" << bestDist
+                                 << endl;
+                        }
                     }
 
                     if(!bestRbp || bestDist > maxPairDist) {
@@ -2509,6 +2528,30 @@ void Assembler::buildSvMSA(
                                 if(tgw > 0 && double(ldw)/double(tgw) > 0.5) {
                                     candMaxDist = candDist + 1;
                                     vntrGaps.push_back({lbp.refPos, candRbp->refPos});
+                                }
+                                // Also allow pairing when both BPs
+                                // have strong signals (high fold and
+                                // many overhang reads), even without
+                                // a hit-depth drop. This handles
+                                // tandem repeat deletions with
+                                // uniform coverage.
+                                if(candDist <= candMaxDist) {
+                                    // Already accepted above.
+                                } else if(lbp.foldEnrichment >= 3.0
+                                          && candRbp->foldEnrichment >= 3.0
+                                          && lbp.ovhReadCount >= 3
+                                          && candRbp->ovhReadCount >= 3) {
+                                    candMaxDist = candDist + 1;
+                                    vntrGaps.push_back({lbp.refPos, candRbp->refPos});
+                                    cout << "    Strong BP pair: L="
+                                         << lbp.refPos
+                                         << " (fold=" << lbp.foldEnrichment
+                                         << " ovh=" << lbp.ovhReadCount
+                                         << ") R=" << candRbp->refPos
+                                         << " (fold=" << candRbp->foldEnrichment
+                                         << " ovh=" << candRbp->ovhReadCount
+                                         << ") dist=" << candDist
+                                         << endl;
                                 }
                             }
                             if(candDist <= candMaxDist) {

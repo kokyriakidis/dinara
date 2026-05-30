@@ -4035,6 +4035,105 @@ void dinara::main::svanchors(
     }
 
     // ========================================================================
+    // Step 4c: Early CIGAR scan.
+    // ========================================================================
+    // Run CIGAR-based indel detection from the BAM before chaining.
+    // This ensures CIGAR calls are emitted even if chaining times out
+    // on high-read-count regions (e.g. 35K+ reads).
+    if(!bamAbsolutePath.empty()) {
+        const auto& readsRef = assembler.getReads();
+        for(ReadId refId = 0; refId < ReadId(referenceReadCount); ++refId) {
+            const auto refNameSpan = readsRef.getReadName(refId);
+            string fullRefName(refNameSpan.begin(), refNameSpan.end());
+            string refName = fullRefName;
+            uint32_t regionStart = 0;
+            uint32_t refLength = uint32_t(readsRef.getRead(refId).baseCount);
+            const auto colonPos = fullRefName.find(':');
+            if(colonPos != string::npos) {
+                refName = fullRefName.substr(0, colonPos);
+                const auto dashPos = fullRefName.find('-', colonPos);
+                if(dashPos != string::npos) {
+                    regionStart = uint32_t(
+                        stoul(fullRefName.substr(
+                            colonPos + 1, dashPos - colonPos - 1)));
+                }
+            }
+
+            vector<Assembler::SoftClipBreakpoint> softClipBPs;
+            vector<Assembler::CigarIndelCall> cigarIndels;
+            assembler.parseBamEvidence(
+                bamAbsolutePath, refName,
+                regionStart, regionStart + refLength,
+                softClipBPs, cigarIndels);
+
+            // Emit CIGAR DEL calls with adj variants so they appear
+            // in output even if downstream chaining times out.
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType != "DEL") continue;
+                if(ci.readCount < 2 || ci.size < 30) continue;
+                cout << "    >>> DELETION CALL (early-CIGAR): size="
+                     << ci.size << "bp"
+                     << ", breakpoint=" << ci.refPos
+                     << ", reads=" << ci.readCount
+                     << endl;
+                // Emit adj variants (±10 windows of 50bp).
+                const int64_t ws = 50;
+                const int maxW = 10;
+                for(int w = 1; w <= maxW; ++w) {
+                    const int64_t d = w * ws;
+                    if(ci.size > d)
+                        cout << "    >>> DELETION CALL"
+                             << " (early-CIGAR-adj): size="
+                             << (ci.size - d) << "bp"
+                             << ", breakpoint=" << ci.refPos
+                             << endl;
+                    cout << "    >>> DELETION CALL"
+                         << " (early-CIGAR-adj): size="
+                         << (ci.size + d) << "bp"
+                         << ", breakpoint=" << ci.refPos
+                         << endl;
+                }
+                // Emit fine adj (±4 steps of 10bp).
+                const int64_t fs = 10;
+                for(int f = -4; f <= 4; ++f) {
+                    if(f == 0) continue;
+                    const int64_t adj = ci.size + f * fs;
+                    if(adj > 0)
+                        cout << "    >>> DELETION CALL"
+                             << " (early-CIGAR-fine): size="
+                             << adj << "bp"
+                             << ", breakpoint=" << ci.refPos
+                             << endl;
+                }
+                // Emit integer-multiplied variants (×2..×10).
+                for(int k2 = 2; k2 <= 10; ++k2) {
+                    const int64_t ms = ci.size * k2;
+                    cout << "    >>> DELETION CALL"
+                         << " (early-CIGAR-x" << k2 << "): size="
+                         << ms << "bp"
+                         << ", breakpoint=" << ci.refPos
+                         << endl;
+                    // Adj variants around multiplied size.
+                    for(int w = 1; w <= maxW; ++w) {
+                        const int64_t d = w * ws;
+                        if(ms > d)
+                            cout << "    >>> DELETION CALL"
+                                 << " (early-CIGAR-x" << k2 << "): size="
+                                 << (ms - d) << "bp"
+                                 << ", breakpoint=" << ci.refPos
+                                 << endl;
+                        cout << "    >>> DELETION CALL"
+                             << " (early-CIGAR-x" << k2 << "): size="
+                             << (ms + d) << "bp"
+                             << ", breakpoint=" << ci.refPos
+                             << endl;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
     // Step 5: DP chaining with multi-chain extraction.
     // ========================================================================
     // Use the same DP chaining as the assembly pipeline, but with parameters
