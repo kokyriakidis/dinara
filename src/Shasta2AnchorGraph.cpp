@@ -417,10 +417,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Build the set of endpoint window pairs from backbone transitions.
+    // A window pair (A, B) is an endpoint pair if A's backbone goes to B
+    // or B's backbone comes from A.
+    auto normalize = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+    std::set<std::pair<uint32_t, uint32_t>> endpointWindowPairs;
+    for(uint32_t wid = 0; wid < windowCount; wid++) {
+        const auto& window = anchorWindows[wid];
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+        if(window.backbonePreviousWindow != noW) {
+            uint32_t prev = window.backbonePreviousWindow;
+            endpointWindowPairs.insert({prev, wid});
+            endpointWindowPairs.insert({wid, prev});
+        }
+        if(window.backboneNextWindow != noW) {
+            uint32_t next = window.backboneNextWindow;
+            endpointWindowPairs.insert({wid, next});
+            endpointWindowPairs.insert({next, wid});
+        }
+    }
+
     // For each window pair, pick the candidate with the most shared reads.
+    // Two passes: endpoint edges first (to reserve their anchors), then
+    // internal edges (skipping reserved anchors).
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowBelowCoverage = 0;
     uint64_t interWindowCreated = 0;
+    uint64_t interWindowEndpointCreated = 0;
+    uint64_t interWindowInternalCreated = 0;
+    uint64_t interWindowInternalSkipped = 0;
     // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, readCount).
     struct InterWindowEdgeInfo {
         std::pair<uint32_t, uint32_t> windowPair;
@@ -429,10 +456,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t readCount;
     };
     std::vector<InterWindowEdgeInfo> createdEdges;
-    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+
+    // Anchors reserved by endpoint edges — internal edges cannot use these.
+    std::set<uint64_t> reservedAnchors;
+
+    // Helper: pick the best candidate for a window pair, optionally
+    // skipping candidates that use a reserved anchor.
+    auto pickBestCandidate = [&](
+        const std::map<AnchorPairKey, uint32_t>& candidates,
+        bool skipReserved) -> std::pair<Shasta2AnchorPair, uint64_t>
+    {
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
         for(const auto& [apk, count] : candidates) {
+            if(skipReserved &&
+               (reservedAnchors.count(uint64_t(apk.anchorIdA)) ||
+                reservedAnchors.count(uint64_t(apk.anchorIdB)))) {
+                continue;
+            }
             Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
             anchorPair.removeNegativeOffsets(anchors);
             if(anchorPair.size() > bestSize) {
@@ -440,25 +481,176 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 bestPair = std::move(anchorPair);
             }
         }
+        return {std::move(bestPair), bestSize};
+    };
+
+    // Helper: create an edge from a chosen anchor pair.
+    auto createInterWindowEdge = [&](
+        const std::pair<uint32_t, uint32_t>& windowPair,
+        Shasta2AnchorPair& bestPair,
+        uint64_t bestSize)
+    {
+        DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
+        edge_descriptor e;
+        tie(e, ignore) = add_edge(
+            bestPair.anchorIdA,
+            bestPair.anchorIdB,
+            Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
+            anchorGraph);
+        anchorGraph[e].useForAssembly = true;
+        createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
+        ++interWindowCreated;
+    };
+
+    // Pass 1: Create endpoint edges and reserve their anchors.
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        const uint32_t srcNorm = normalize(windowPair.first);
+        const uint32_t dstNorm = normalize(windowPair.second);
+        if(srcNorm == dstNorm) continue;
+        if(!endpointWindowPairs.count({srcNorm, dstNorm})) continue;
+
+        auto [bestPair, bestSize] = pickBestCandidate(candidates, false);
         if(bestSize == 0) {
             ++interWindowZeroPairs;
         } else if(bestSize < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
-            DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
-
-            edge_descriptor e;
-            tie(e, ignore) = add_edge(
-                bestPair.anchorIdA,
-                bestPair.anchorIdB,
-                Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
-                anchorGraph);
-            anchorGraph[e].useForAssembly = true;
-            createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
-            ++interWindowCreated;
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdA));
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
+            // Also reserve RC mirrors so internal edges can't use them.
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+            createInterWindowEdge(windowPair, bestPair, bestSize);
+            ++interWindowEndpointCreated;
         }
     }
-    cout << "Inter-window edges: " << interWindowCreated << " created, "
+
+    // Build per-window backbone position boundaries from endpoint edges.
+    // headBound: backbone position of the endpoint anchor on the head side
+    //            (connection to backbonePreviousWindow).
+    // tailBound: backbone position of the endpoint anchor on the tail side
+    //            (connection to backboneNextWindow).
+    // Internal edges must land strictly between these positions.
+    struct WindowBounds {
+        uint32_t headBound = 0;           // inclusive lower bound for internals
+        uint32_t tailBound = UINT32_MAX;  // inclusive upper bound for internals
+        bool hasHead = false;
+        bool hasTail = false;
+    };
+    std::vector<WindowBounds> windowBounds(windowCount);
+    for(const auto& edgeInfo : createdEdges) {
+        const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
+        const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+
+        // Source anchor belongs to srcNorm window.
+        if(srcNorm < windowCount) {
+            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdA)];
+            const auto& w = anchorWindows[srcNorm];
+            // If dstNorm is the next window, this is a tail endpoint.
+            // Use min to get the most restrictive (innermost) bound.
+            if(w.backboneNextWindow == dstNorm) {
+                if(!windowBounds[srcNorm].hasTail || pos < windowBounds[srcNorm].tailBound) {
+                    windowBounds[srcNorm].tailBound = pos;
+                }
+                windowBounds[srcNorm].hasTail = true;
+            }
+            // If dstNorm is the previous window, this is a head endpoint.
+            // Use max to get the most restrictive (innermost) bound.
+            if(w.backbonePreviousWindow == dstNorm) {
+                if(!windowBounds[srcNorm].hasHead || pos > windowBounds[srcNorm].headBound) {
+                    windowBounds[srcNorm].headBound = pos;
+                }
+                windowBounds[srcNorm].hasHead = true;
+            }
+        }
+
+        // Target anchor belongs to dstNorm window.
+        if(dstNorm < windowCount) {
+            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdB)];
+            const auto& w = anchorWindows[dstNorm];
+            // If srcNorm is the previous window, this is a head endpoint.
+            if(w.backbonePreviousWindow == srcNorm) {
+                if(!windowBounds[dstNorm].hasHead || pos > windowBounds[dstNorm].headBound) {
+                    windowBounds[dstNorm].headBound = pos;
+                }
+                windowBounds[dstNorm].hasHead = true;
+            }
+            // If srcNorm is the next window, this is a tail endpoint.
+            if(w.backboneNextWindow == srcNorm) {
+                if(!windowBounds[dstNorm].hasTail || pos < windowBounds[dstNorm].tailBound) {
+                    windowBounds[dstNorm].tailBound = pos;
+                }
+                windowBounds[dstNorm].hasTail = true;
+            }
+        }
+    }
+
+    // Helper: check if an anchor is strictly between the endpoint
+    // boundaries of its window.
+    auto isInsideBounds = [&](uint64_t anchorId) -> bool {
+        if(anchorId >= anchorCount) return false;
+        const uint32_t wRaw = anchorToWindow[anchorId];
+        if(wRaw == noWindow) return false;
+        const uint32_t wNorm = normalize(wRaw);
+        if(wNorm >= windowCount) return false;
+        const auto& bounds = windowBounds[wNorm];
+        const uint32_t pos = anchorToBackbonePos[anchorId];
+        if(bounds.hasHead && pos <= bounds.headBound) return false;
+        if(bounds.hasTail && pos >= bounds.tailBound) return false;
+        return true;
+    };
+
+    // Pass 2: Create internal edges. Candidates must not use reserved
+    // anchors and must land strictly between endpoint boundaries.
+    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+        const uint32_t srcNorm = normalize(windowPair.first);
+        const uint32_t dstNorm = normalize(windowPair.second);
+        if(srcNorm == dstNorm) continue;
+        if(endpointWindowPairs.count({srcNorm, dstNorm})) continue; // already handled
+
+        // Pick best candidate that satisfies both reserved-anchor and
+        // backbone-position constraints.
+        Shasta2AnchorPair bestPair;
+        uint64_t bestSize = 0;
+        bool hadCandidates = false;
+        for(const auto& [apk, count] : candidates) {
+            if(reservedAnchors.count(uint64_t(apk.anchorIdA)) ||
+               reservedAnchors.count(uint64_t(apk.anchorIdB))) {
+                hadCandidates = true;
+                continue;
+            }
+            if(!isInsideBounds(uint64_t(apk.anchorIdA)) ||
+               !isInsideBounds(uint64_t(apk.anchorIdB))) {
+                hadCandidates = true;
+                continue;
+            }
+            Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
+            anchorPair.removeNegativeOffsets(anchors);
+            if(anchorPair.size() > bestSize) {
+                bestSize = anchorPair.size();
+                bestPair = std::move(anchorPair);
+            }
+            hadCandidates = true;
+        }
+
+        if(bestSize == 0) {
+            if(hadCandidates) {
+                ++interWindowInternalSkipped;
+            } else {
+                ++interWindowZeroPairs;
+            }
+        } else if(bestSize < minInterWindowCoverage) {
+            ++interWindowBelowCoverage;
+        } else {
+            createInterWindowEdge(windowPair, bestPair, bestSize);
+            ++interWindowInternalCreated;
+        }
+    }
+
+    cout << "Inter-window edges: " << interWindowCreated << " created ("
+         << interWindowEndpointCreated << " endpoint, "
+         << interWindowInternalCreated << " internal), "
+         << interWindowInternalSkipped << " internal skipped (reserved anchors), "
          << interWindowZeroPairs << " rejected (zero forward-flow reads), "
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
