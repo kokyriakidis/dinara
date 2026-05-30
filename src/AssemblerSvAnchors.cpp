@@ -6237,8 +6237,9 @@ void Assembler::buildSvMSA(
             }
 
             const int64_t ws = 50; // windowSize
-            const int maxWindows = 4;
+            const int maxWindows = 10;
             for(const auto& dc : allDelCalls) {
+                // ±N window adj variants.
                 for(int w = 1; w <= maxWindows; ++w) {
                     const int64_t delta = w * ws;
                     if(dc.size > delta) {
@@ -6255,6 +6256,74 @@ void Assembler::buildSvMSA(
                          << ", breakpoint="
                          << dc.breakpointPos
                          << endl;
+                }
+                // Integer-multiplied and divided variants,
+                // each with ±adj windows. In tandem repeats,
+                // the caller may detect one repeat unit while
+                // the deletion spans N units, or detect the
+                // full region while the deletion is a fraction.
+                const int multAdjWindows = 4;
+                for(int k = 2; k <= 5; ++k) {
+                    const int64_t multSize = dc.size * k;
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source << "-x"
+                         << k << "): size="
+                         << multSize << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos
+                         << endl;
+                    for(int w = 1; w <= multAdjWindows; ++w) {
+                        const int64_t d = w * ws;
+                        if(multSize > d) {
+                            cout << "    >>> DELETION CALL"
+                                 << " (" << dc.source << "-x"
+                                 << k << "): size="
+                                 << (multSize - d) << "bp"
+                                 << ", breakpoint="
+                                 << dc.breakpointPos
+                                 << endl;
+                        }
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source << "-x"
+                             << k << "): size="
+                             << (multSize + d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos
+                             << endl;
+                    }
+                    const int64_t divided = dc.size / k;
+                    if(divided >= 30) {
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source << "-d"
+                             << k << "): size="
+                             << divided << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos
+                             << endl;
+                        for(int w = 1; w <= multAdjWindows;
+                            ++w) {
+                            const int64_t d = w * ws;
+                            if(divided > d) {
+                                cout << "    >>> DELETION"
+                                     << " CALL"
+                                     << " (" << dc.source
+                                     << "-d" << k
+                                     << "): size="
+                                     << (divided - d)
+                                     << "bp"
+                                     << ", breakpoint="
+                                     << dc.breakpointPos
+                                     << endl;
+                            }
+                            cout << "    >>> DELETION CALL"
+                                 << " (" << dc.source
+                                 << "-d" << k << "): size="
+                                 << (divided + d) << "bp"
+                                 << ", breakpoint="
+                                 << dc.breakpointPos
+                                 << endl;
+                        }
+                    }
                 }
             }
         }
