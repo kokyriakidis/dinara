@@ -508,7 +508,74 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Pass 2: Create remaining (non-endpoint) edges, skipping reserved anchors.
+    // Build per-window backbone position boundaries from endpoint edges.
+    // headBound: position of the endpoint anchor connecting to backbonePreviousWindow.
+    // tailBound: position of the endpoint anchor connecting to backboneNextWindow.
+    // Internal edges must land strictly between these (when present).
+    // If only one side has an endpoint, the other side is unconstrained.
+    struct WindowBounds {
+        uint32_t headBound = 0;
+        uint32_t tailBound = 0;
+        bool hasHead = false;
+        bool hasTail = false;
+    };
+    std::vector<WindowBounds> windowBounds(windowCount);
+    for(const auto& edgeInfo : createdEdges) {
+        const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
+        const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+
+        if(srcNorm < windowCount) {
+            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdA)];
+            const auto& w = anchorWindows[srcNorm];
+            if(w.backboneNextWindow == dstNorm) {
+                if(!windowBounds[srcNorm].hasTail || pos < windowBounds[srcNorm].tailBound) {
+                    windowBounds[srcNorm].tailBound = pos;
+                }
+                windowBounds[srcNorm].hasTail = true;
+            }
+            if(w.backbonePreviousWindow == dstNorm) {
+                if(!windowBounds[srcNorm].hasHead || pos > windowBounds[srcNorm].headBound) {
+                    windowBounds[srcNorm].headBound = pos;
+                }
+                windowBounds[srcNorm].hasHead = true;
+            }
+        }
+
+        if(dstNorm < windowCount) {
+            const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdB)];
+            const auto& w = anchorWindows[dstNorm];
+            if(w.backbonePreviousWindow == srcNorm) {
+                if(!windowBounds[dstNorm].hasHead || pos > windowBounds[dstNorm].headBound) {
+                    windowBounds[dstNorm].headBound = pos;
+                }
+                windowBounds[dstNorm].hasHead = true;
+            }
+            if(w.backboneNextWindow == srcNorm) {
+                if(!windowBounds[dstNorm].hasTail || pos < windowBounds[dstNorm].tailBound) {
+                    windowBounds[dstNorm].tailBound = pos;
+                }
+                windowBounds[dstNorm].hasTail = true;
+            }
+        }
+    }
+
+    // Check if an anchor is inside its window's endpoint boundaries.
+    // Only the side that has an endpoint is constrained.
+    auto isInsideBounds = [&](uint64_t anchorId) -> bool {
+        if(anchorId >= anchorCount) return false;
+        const uint32_t wRaw = anchorToWindow[anchorId];
+        if(wRaw == noWindow) return false;
+        const uint32_t wNorm = normalize(wRaw);
+        if(wNorm >= windowCount) return false;
+        const auto& bounds = windowBounds[wNorm];
+        const uint32_t pos = anchorToBackbonePos[anchorId];
+        if(bounds.hasHead && pos <= bounds.headBound) return false;
+        if(bounds.hasTail && pos >= bounds.tailBound) return false;
+        return true;
+    };
+
+    // Pass 2: Create remaining (non-endpoint) edges, skipping reserved
+    // anchors and candidates outside endpoint boundaries.
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
@@ -522,6 +589,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             hadCandidates = true;
             if(reservedAnchors.count(uint64_t(apk.anchorIdA)) ||
                reservedAnchors.count(uint64_t(apk.anchorIdB))) {
+                continue;
+            }
+            if(!isInsideBounds(uint64_t(apk.anchorIdA)) ||
+               !isInsideBounds(uint64_t(apk.anchorIdB))) {
                 continue;
             }
             Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
