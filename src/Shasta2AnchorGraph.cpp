@@ -1025,12 +1025,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return false;
         };
 
-        // Check both forward anchor and its RC mirror.
+        // Check only the forward anchor itself, not its RC mirror.
+        // The RC mirror belongs to the RC window and should be
+        // trimmed independently based on its own inter-window edges.
         auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
-            if(anchorHasInterWindowEdge(aid)) return true;
-            const uint64_t rcAid = aid ^ 1ULL;
-            if(rcAid < anchorCount && anchorHasInterWindowEdge(rcAid)) return true;
-            return false;
+            return anchorHasInterWindowEdge(aid);
         };
 
         uint64_t trimmedVertexCount = 0;
