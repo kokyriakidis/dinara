@@ -511,14 +511,13 @@ void Assembler::buildSvMSA(
                 });
 
             // Deduplicate: suppress a call if a previously-emitted
-            // call has breakpoint within 100bp AND size ratio >= 0.9.
+            // call has size ratio >= 0.9 anywhere in the region.
+            // The region is typically ~4kb, so breakpoint proximity
+            // is not checked — same-size calls are the same event.
             vector<DelCallRecord> emitted;
             for(const auto& dc : allDelCalls) {
                 bool isDup = false;
                 for(const auto& prev : emitted) {
-                    const int64_t bpDist = int64_t(dc.breakpointPos)
-                        - int64_t(prev.breakpointPos);
-                    if(std::abs(bpDist) > 100) continue;
                     const double ratio =
                         double(std::min(dc.size, prev.size))
                         / double(std::max(dc.size, prev.size));
