@@ -499,9 +499,18 @@ void Assembler::buildSvMSA(
         // continues and at the end of the main loop body.
         auto emitAdjVariants = [&]() {
             const int64_t ws = 50;
-            const int maxW = 10;
+            const int defaultMaxW = 10;
             const int64_t fs = 10;
             for(const auto& dc : allDelCalls) {
+                // SA-tag gaps include unknown flanking
+                // alignment offset, so probe a wider range
+                // (up to 75% of call size).
+                const bool isSaTag =
+                    dc.source.substr(0, 3) == "SA-";
+                const int maxW = isSaTag
+                    ? std::max(defaultMaxW,
+                        int(dc.size * 3 / (4 * ws)))
+                    : defaultMaxW;
                 for(int w = 1; w <= maxW; ++w) {
                     const int64_t d = w * ws;
                     if(dc.size > d)
@@ -766,17 +775,23 @@ void Assembler::buildSvMSA(
                 bamFileName, refName,
                 regionStart, regionStart + refLength);
             // Convert breakpoint positions from absolute to
-            // relative to the reference subregion. Discard
-            // calls with breakpoints outside the region
-            // (e.g., SA-tag pointing to a distant location).
+            // relative to the reference subregion. Clamp
+            // positions outside the region to the boundary
+            // rather than discarding — SA-tag deletions
+            // often have breakpoints outside the extracted
+            // region because the aligner places the
+            // supplementary alignment in flanking unique
+            // sequence.
             {
                 vector<SaTagSvCall> localCalls;
                 for(auto& sc : saTagCalls) {
-                    if(sc.refPos >= regionStart
-                       && sc.refPos <= regionStart + refLength) {
+                    if(sc.refPos < regionStart)
+                        sc.refPos = 0;
+                    else if(sc.refPos > regionStart + refLength)
+                        sc.refPos = refLength;
+                    else
                         sc.refPos -= regionStart;
-                        localCalls.push_back(sc);
-                    }
+                    localCalls.push_back(sc);
                 }
                 saTagCalls = std::move(localCalls);
             }
