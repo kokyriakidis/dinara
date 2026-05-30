@@ -652,20 +652,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << minInterWindowCoverage << ")." << endl;
 
     // Set per-anchor endpoint flags on all edges.
-    // An anchor is tagged Endpoint on an edge only if it is in endpointAnchors
-    // AND the edge's window pair matches an endpoint window pair.
+    // An anchor is tagged Endpoint on an edge only if it is an endpoint
+    // anchor connecting to the window on the other side of that edge.
+    // Build a map: anchor ID -> set of normalized windows it connects to
+    // as an endpoint (from pass 1 createdEdges).
+    std::map<uint64_t, std::set<uint32_t>> endpointAnchorTargets;
+    for(const auto& edgeInfo : createdEdges) {
+        const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
+        const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+        const uint64_t aidA = uint64_t(edgeInfo.anchorIdA);
+        const uint64_t aidB = uint64_t(edgeInfo.anchorIdB);
+        // anchorIdA is in srcNorm's window, connecting toward dstNorm.
+        endpointAnchorTargets[aidA].insert(dstNorm);
+        endpointAnchorTargets[aidA ^ 1ULL].insert(dstNorm);
+        // anchorIdB is in dstNorm's window, connecting toward srcNorm.
+        endpointAnchorTargets[aidB].insert(srcNorm);
+        endpointAnchorTargets[aidB ^ 1ULL].insert(srcNorm);
+    }
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) continue;
         const uint64_t srcId = uint64_t(source(e, anchorGraph));
         const uint64_t dstId = uint64_t(target(e, anchorGraph));
-        const uint32_t srcRaw = anchorToWindow[srcId];
-        const uint32_t dstRaw = anchorToWindow[dstId];
-        const uint32_t srcNorm = normalize(srcRaw);
-        const uint32_t dstNorm = normalize(dstRaw);
-        const bool isEndpointPair = (srcNorm != dstNorm) &&
-            endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)}) > 0;
-        anchorGraph[e].isEndpointAnchorPrev = isEndpointPair && endpointAnchors.count(srcId) > 0;
-        anchorGraph[e].isEndpointAnchorNext = isEndpointPair && endpointAnchors.count(dstId) > 0;
+        const uint32_t srcNorm = normalize(anchorToWindow[srcId]);
+        const uint32_t dstNorm = normalize(anchorToWindow[dstId]);
+        // Source is Endpoint if it's an endpoint anchor connecting toward dstNorm.
+        auto srcIt = endpointAnchorTargets.find(srcId);
+        anchorGraph[e].isEndpointAnchorPrev = (srcIt != endpointAnchorTargets.end())
+            && srcIt->second.count(dstNorm) > 0;
+        // Target is Endpoint if it's an endpoint anchor connecting toward srcNorm.
+        auto dstIt = endpointAnchorTargets.find(dstId);
+        anchorGraph[e].isEndpointAnchorNext = (dstIt != endpointAnchorTargets.end())
+            && dstIt->second.count(srcNorm) > 0;
     }
 
     // ========================================================================
