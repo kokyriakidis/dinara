@@ -460,7 +460,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     auto createInterWindowEdge = [&](
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
-        uint64_t bestSize)
+        uint64_t bestSize,
+        bool isEndpoint)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
         edge_descriptor e;
@@ -470,6 +471,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
             anchorGraph);
         anchorGraph[e].useForAssembly = true;
+        anchorGraph[e].isEndpointEdge = isEndpoint;
         createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
         ++interWindowCreated;
     };
@@ -501,7 +503,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
             reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
-            createInterWindowEdge(windowPair, bestPair, bestSize);
+            createInterWindowEdge(windowPair, bestPair, bestSize, true);
             ++interWindowEndpointCreated;
         }
     }
@@ -638,7 +640,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         } else if(bestSize < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
-            createInterWindowEdge(windowPair, bestPair, bestSize);
+            createInterWindowEdge(windowPair, bestPair, bestSize, false);
             ++interWindowInternalCreated;
         }
     }
@@ -750,18 +752,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t singleEdgeRemovedCount = 0;
         for(const auto& [pair, edges] : pairEdges) {
             if(edges.size() != 1) continue;
-            const uint32_t wA = pair.first;
-            const uint32_t wB = pair.second;
 
-            // Skip if this is an endpoint connection for either window.
-            const auto& windowA = anchorWindows[wA];
-            const auto& windowB = anchorWindows[wB];
-            if(windowA.backbonePreviousWindow == wB ||
-               windowA.backboneNextWindow == wB ||
-               windowB.backbonePreviousWindow == wA ||
-               windowB.backboneNextWindow == wA) {
-                continue;
-            }
+            // Skip if this is an endpoint edge.
+            if(anchorGraph[edges[0]].isEndpointEdge) continue;
 
             disableEdge(edges[0]);
             ++singleEdgeRemovedCount;
@@ -849,14 +842,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             // For each neighbor window X that has both incoming and outgoing
             // connections, find pairs where incoming is at an earlier backbone
             // position than outgoing (X enters w then leaves w).
-            // Skip endpoint connections — X is a legitimate neighbor.
-            const uint32_t prevW = window.backbonePreviousWindow;
-            const uint32_t nextW = window.backboneNextWindow;
+            // Skip endpoint edges — only process internal connections.
             for(const auto& [xWindow, inEdges] : incoming) {
-                // Skip if X is an endpoint of w or w is an endpoint of X.
-                if(xWindow == prevW || xWindow == nextW) continue;
-                const auto& xWin = anchorWindows[xWindow];
-                if(xWin.backbonePreviousWindow == w || xWin.backboneNextWindow == w) continue;
+                // Skip if any edge to/from X is an endpoint edge.
+                bool hasEndpointEdge = false;
+                for(const auto& ie : inEdges) {
+                    if(anchorGraph[ie.e].isEndpointEdge) { hasEndpointEdge = true; break; }
+                }
+                if(hasEndpointEdge) continue;
                 auto outIt = outgoing.find(xWindow);
                 if(outIt == outgoing.end()) continue;
                 const auto& outEdges = outIt->second;
@@ -934,27 +927,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
             std::set<uint64_t> bbAnchorSet(bbAnchors.begin(), bbAnchors.end());
 
-            const uint32_t prevW = window.backbonePreviousWindow;
-            const uint32_t nextW = window.backboneNextWindow;
             std::set<uint32_t> orphanedIndices;
 
             for(uint32_t startIdx = 0; startIdx < bbAnchors.size(); startIdx++) {
                 if(orphanedIndices.count(startIdx)) continue;
                 const uint64_t startAid = bbAnchors[startIdx];
 
-                // Check for internal inter-window outgoing edges
-                // (skip edges to endpoint windows).
+                // Check for internal (non-endpoint) inter-window outgoing edges.
                 bool hasInternalInterWindow = false;
                 auto oe = boost::out_edges(startAid, anchorGraph);
                 for(auto it = oe.first; it != oe.second; ++it) {
                     if(!anchorGraph[*it].useForAssembly) continue;
+                    if(anchorGraph[*it].isEndpointEdge) continue;
                     const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                     if(tgt >= anchorCount) continue;
                     const uint32_t tgtRaw = anchorToWindow[tgt];
                     if(tgtRaw == noWindow) continue;
                     const uint32_t tgtW = normalize(tgtRaw);
                     if(tgtW == w) continue;
-                    if(tgtW == prevW || tgtW == nextW) continue;
                     hasInternalInterWindow = true;
                     break;
                 }
@@ -970,31 +960,31 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 std::queue<BfsEntry> q;
                 visited.insert(startAid);
 
-                // Seed BFS with internal inter-window neighbors.
+                // Seed BFS with internal (non-endpoint) inter-window neighbors.
                 auto seedBfs = [&](uint64_t aid) {
                     auto oe2 = boost::out_edges(aid, anchorGraph);
                     for(auto it = oe2.first; it != oe2.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
+                        if(anchorGraph[*it].isEndpointEdge) continue;
                         const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                         if(tgt >= anchorCount || visited.count(tgt)) continue;
                         const uint32_t tgtRaw = anchorToWindow[tgt];
                         if(tgtRaw == noWindow) continue;
                         const uint32_t tgtW = normalize(tgtRaw);
                         if(tgtW == w) continue;
-                        if(tgtW == prevW || tgtW == nextW) continue;
                         visited.insert(tgt);
                         q.push({tgt, 1, tgtW});
                     }
                     auto ie = boost::in_edges(aid, anchorGraph);
                     for(auto it = ie.first; it != ie.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
+                        if(anchorGraph[*it].isEndpointEdge) continue;
                         const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
                         if(src >= anchorCount || visited.count(src)) continue;
                         const uint32_t srcRaw = anchorToWindow[src];
                         if(srcRaw == noWindow) continue;
                         const uint32_t srcW = normalize(srcRaw);
                         if(srcW == w) continue;
-                        if(srcW == prevW || srcW == nextW) continue;
                         visited.insert(src);
                         q.push({src, 1, srcW});
                     }
@@ -1482,15 +1472,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(it->second.size() != 1) continue;
 
             const uint32_t neighbor = *it->second.begin();
-            const auto& window = anchorWindows[w];
-            const auto& nbrWindow = anchorWindows[neighbor];
 
-            // Check that the connection is internal for the neighbor.
-            // We don't check the spur window's endpoints — a spur with
-            // one neighbor always has that neighbor as its endpoint,
-            // so the check would always skip it.
-            if(nbrWindow.backbonePreviousWindow == w ||
-               nbrWindow.backboneNextWindow == w) continue;
+            // Skip if any edge between w and its neighbor is an endpoint edge.
+            bool hasEndpoint = false;
+            BGL_FORALL_EDGES(e2, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e2].useForAssembly) continue;
+                if(!anchorGraph[e2].isEndpointEdge) continue;
+                const uint64_t srcVal2 = uint64_t(source(e2, anchorGraph));
+                const uint64_t dstVal2 = uint64_t(target(e2, anchorGraph));
+                if(srcVal2 >= anchorCount || dstVal2 >= anchorCount) continue;
+                const uint32_t srcRaw2 = anchorToWindow[srcVal2];
+                const uint32_t dstRaw2 = anchorToWindow[dstVal2];
+                if(srcRaw2 == noWindow || dstRaw2 == noWindow) continue;
+                const uint32_t s2 = normalize(srcRaw2);
+                const uint32_t d2 = normalize(dstRaw2);
+                if((s2 == w && d2 == neighbor) || (s2 == neighbor && d2 == w)) {
+                    hasEndpoint = true;
+                    break;
+                }
+            }
+            if(hasEndpoint) continue;
 
             // Dead-end spur. Disable all inter-window edges of w.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
