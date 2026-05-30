@@ -977,7 +977,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Trim backbone outside the bounding inter-window connection span.
     auto trimBackbones = [&]() {
-        // Disable all active edges of an anchor and its RC mirror.
+        // Disable all active edges of an anchor.
         auto disableAllEdges = [&](uint64_t aid) {
             if(aid >= anchorCount) return;
             auto oe = boost::out_edges(aid, anchorGraph);
@@ -996,40 +996,54 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if an anchor has any active inter-window edge.
-        auto anchorHasInterWindowEdge = [&](uint64_t aid) -> bool {
-            if(aid >= anchorCount) return false;
-            const uint32_t aidWin = anchorToWindow[aid];
-            if(aidWin == noWindow) return false;
-            const uint32_t aidNorm = normalizeW(aidWin);
-            auto oe = boost::out_edges(aid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                if(tgt < anchorCount) {
-                    const uint32_t tgtWin = anchorToWindow[tgt];
-                    if(tgtWin != noWindow && normalizeW(tgtWin) != aidNorm)
-                        return true;
+        // Check if an anchor (or its RC mirror) has an active
+        // incoming inter-window edge.
+        auto hasIncomingInterWindowEdge = [&](uint64_t aid) -> bool {
+            auto check = [&](uint64_t a) -> bool {
+                if(a >= anchorCount) return false;
+                const uint32_t aWin = anchorToWindow[a];
+                if(aWin == noWindow) return false;
+                const uint32_t aNorm = normalizeW(aWin);
+                auto ie = boost::in_edges(a, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                    if(src < anchorCount) {
+                        const uint32_t srcWin = anchorToWindow[src];
+                        if(srcWin != noWindow && normalizeW(srcWin) != aNorm)
+                            return true;
+                    }
                 }
-            }
-            auto ie = boost::in_edges(aid, anchorGraph);
-            for(auto it = ie.first; it != ie.second; ++it) {
-                if(!anchorGraph[*it].useForAssembly) continue;
-                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                if(src < anchorCount) {
-                    const uint32_t srcWin = anchorToWindow[src];
-                    if(srcWin != noWindow && normalizeW(srcWin) != aidNorm)
-                        return true;
-                }
-            }
-            return false;
+                return false;
+            };
+            if(check(aid)) return true;
+            const uint64_t rcAid = aid ^ 1ULL;
+            return (rcAid < anchorCount && check(rcAid));
         };
 
-        // Check only the forward anchor itself, not its RC mirror.
-        // The RC mirror belongs to the RC window and should be
-        // trimmed independently based on its own inter-window edges.
-        auto hasInterWindowEdge = [&](uint64_t aid) -> bool {
-            return anchorHasInterWindowEdge(aid);
+        // Check if an anchor (or its RC mirror) has an active
+        // outgoing inter-window edge.
+        auto hasOutgoingInterWindowEdge = [&](uint64_t aid) -> bool {
+            auto check = [&](uint64_t a) -> bool {
+                if(a >= anchorCount) return false;
+                const uint32_t aWin = anchorToWindow[a];
+                if(aWin == noWindow) return false;
+                const uint32_t aNorm = normalizeW(aWin);
+                auto oe = boost::out_edges(a, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                    if(tgt < anchorCount) {
+                        const uint32_t tgtWin = anchorToWindow[tgt];
+                        if(tgtWin != noWindow && normalizeW(tgtWin) != aNorm)
+                            return true;
+                    }
+                }
+                return false;
+            };
+            if(check(aid)) return true;
+            const uint64_t rcAid = aid ^ 1ULL;
+            return (rcAid < anchorCount && check(rcAid));
         };
 
         uint64_t trimmedVertexCount = 0;
@@ -1042,23 +1056,23 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const auto journey = journeys[window.backboneOrientedReadId];
 
             // Head trim: walk from position 0 inward, trim anchors
-            // with no inter-window edge. Stop at the first anchor
-            // that connects to another window.
+            // before the first one that receives an incoming
+            // inter-window edge.
             uint64_t headTrim = 0;
             for(uint64_t i = 0; i < positions.size(); i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
-                if(hasInterWindowEdge(aid)) break;
+                if(hasIncomingInterWindowEdge(aid)) break;
                 ++headTrim;
             }
             if(headTrim >= positions.size()) headTrim = 0;
 
             // Tail trim: walk from last position inward, trim anchors
-            // with no inter-window edge. Stop at the first anchor
-            // that connects to another window.
+            // after the last one that sends an outgoing inter-window
+            // edge.
             uint64_t tailTrim = 0;
             for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
                 const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
-                if(hasInterWindowEdge(aid)) break;
+                if(hasOutgoingInterWindowEdge(aid)) break;
                 ++tailTrim;
             }
             if(headTrim + tailTrim >= positions.size()) tailTrim = 0;
