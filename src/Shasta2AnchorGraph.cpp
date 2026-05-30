@@ -460,7 +460,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     auto createInterWindowEdge = [&](
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
-        uint64_t bestSize)
+        uint64_t bestSize,
+        bool isEndpoint = false)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
         edge_descriptor e;
@@ -470,6 +471,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
             anchorGraph);
         anchorGraph[e].useForAssembly = true;
+        anchorGraph[e].isEndpointAnchorPrev = isEndpoint;
+        anchorGraph[e].isEndpointAnchorNext = isEndpoint;
         createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
         ++interWindowCreated;
     };
@@ -501,14 +504,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
             reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
-            createInterWindowEdge(windowPair, bestPair, bestSize);
+            createInterWindowEdge(windowPair, bestPair, bestSize, true);
             ++interWindowEndpointCreated;
         }
     }
 
     // Store endpoint anchors for GFA tagging.
     endpointAnchors = reservedAnchors;
-    const size_t endpointEdgeCount = createdEdges.size();
 
     // Early trim: disable backbone anchors beyond the endpoint anchors.
     // For each window, find the backbone positions of the endpoint anchors
@@ -652,39 +654,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Set per-anchor endpoint flags on all edges.
-    // An anchor is tagged Endpoint on an edge only if it is an endpoint
-    // anchor connecting to the window on the other side of that edge.
-    // Build a map: anchor ID -> set of normalized windows it connects to
-    // as an endpoint (from pass 1 createdEdges).
-    std::map<uint64_t, std::set<uint32_t>> endpointAnchorTargets;
-    for(size_t i = 0; i < endpointEdgeCount; i++) {
-        const auto& edgeInfo = createdEdges[i];
-        const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
-        const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
-        const uint64_t aidA = uint64_t(edgeInfo.anchorIdA);
-        const uint64_t aidB = uint64_t(edgeInfo.anchorIdB);
-        // anchorIdA is in srcNorm's window, connecting toward dstNorm.
-        endpointAnchorTargets[aidA].insert(dstNorm);
-        // anchorIdB is in dstNorm's window, connecting toward srcNorm.
-        endpointAnchorTargets[aidB].insert(srcNorm);
-        // Do not insert RC mirrors — they have their own createdEdges entries.
-    }
-    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-        if(!anchorGraph[e].useForAssembly) continue;
-        const uint64_t srcId = uint64_t(source(e, anchorGraph));
-        const uint64_t dstId = uint64_t(target(e, anchorGraph));
-        const uint32_t srcNorm = normalize(anchorToWindow[srcId]);
-        const uint32_t dstNorm = normalize(anchorToWindow[dstId]);
-        // Source is Endpoint if it's an endpoint anchor connecting toward dstNorm.
-        auto srcIt = endpointAnchorTargets.find(srcId);
-        anchorGraph[e].isEndpointAnchorPrev = (srcIt != endpointAnchorTargets.end())
-            && srcIt->second.count(dstNorm) > 0;
-        // Target is Endpoint if it's an endpoint anchor connecting toward srcNorm.
-        auto dstIt = endpointAnchorTargets.find(dstId);
-        anchorGraph[e].isEndpointAnchorNext = (dstIt != endpointAnchorTargets.end())
-            && dstIt->second.count(srcNorm) > 0;
-    }
+    // Per-anchor endpoint flags are set directly during edge creation:
+    // pass 1 edges get isEndpointAnchorPrev = isEndpointAnchorNext = true,
+    // pass 2 edges keep the default (false).
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
