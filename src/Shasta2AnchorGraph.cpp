@@ -650,68 +650,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Set per-anchor endpoint flags on all inter-window edges.
-    // An anchor is an endpoint anchor if its backbone position matches
-    // Set per-anchor endpoint flags on all edges.
-    // An anchor is an endpoint anchor if it is at the first or last
-    // position of its window's backbone (after early trim).
-    // Build the set of first/last backbone positions per window.
-    std::set<uint64_t> endpointPositionAnchors;
-    for(uint32_t w = 0; w < windowCount; w++) {
-        const auto& window = anchorWindows[w];
-        const auto& positions = window.filteredBackbonePositions;
-        if(positions.empty()) continue;
-        const auto journey = journeys[window.backboneOrientedReadId];
-
-        // Find first and last backbone positions that still have active edges.
-        for(uint32_t i = 0; i < positions.size(); i++) {
-            const uint64_t aid = uint64_t(journey[positions[i]]);
-            if(aid >= anchorCount) continue;
-            // Check if this anchor has any active edge.
-            bool hasActive = false;
-            auto oe = boost::out_edges(aid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it) {
-                if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
-            }
-            if(!hasActive) {
-                auto ie = boost::in_edges(aid, anchorGraph);
-                for(auto it = ie.first; it != ie.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
-                }
-            }
-            if(hasActive) {
-                endpointPositionAnchors.insert(aid);
-                endpointPositionAnchors.insert(aid ^ 1ULL);
-                break;
-            }
-        }
-        for(int i = int(positions.size()) - 1; i >= 0; i--) {
-            const uint64_t aid = uint64_t(journey[positions[i]]);
-            if(aid >= anchorCount) continue;
-            bool hasActive = false;
-            auto oe = boost::out_edges(aid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it) {
-                if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
-            }
-            if(!hasActive) {
-                auto ie = boost::in_edges(aid, anchorGraph);
-                for(auto it = ie.first; it != ie.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
-                }
-            }
-            if(hasActive) {
-                endpointPositionAnchors.insert(aid);
-                endpointPositionAnchors.insert(aid ^ 1ULL);
-                break;
-            }
-        }
-    }
+    // Set per-anchor endpoint flags on all edges using the endpointAnchors
+    // set populated during pass 1.
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) continue;
         const uint64_t srcId = uint64_t(source(e, anchorGraph));
         const uint64_t dstId = uint64_t(target(e, anchorGraph));
-        anchorGraph[e].isEndpointAnchorPrev = endpointPositionAnchors.count(srcId) > 0;
-        anchorGraph[e].isEndpointAnchorNext = endpointPositionAnchors.count(dstId) > 0;
+        anchorGraph[e].isEndpointAnchorPrev = endpointAnchors.count(srcId) > 0;
+        anchorGraph[e].isEndpointAnchorNext = endpointAnchors.count(dstId) > 0;
     }
 
     // ========================================================================
