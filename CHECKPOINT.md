@@ -153,7 +153,12 @@ After:  a0 → a1             a3 → a4  (linearized)
 ```
 
 #### `trimBackbones()`
-Directional head/tail trim respecting backbone orientation. Head trim: walks from position 0 inward, trims anchors before the first one that receives an **incoming** inter-window edge (checked on both forward anchor and RC mirror). Tail trim: walks from the last position inward, trims anchors after the last one that sends an **outgoing** inter-window edge. If no incoming inter-window edge exists on any anchor, head trim is skipped (resets to 0). Same for tail with outgoing. Disables all edges of trimmed anchors and their RC mirrors.
+Directional head/tail trim respecting backbone orientation. The backbone chain always goes forward (position 0 → position N-1), so incoming inter-window edges arrive at the head and outgoing inter-window edges depart from the tail.
+
+- **Head trim**: walks from position 0 inward, trims anchors before the first one with an **incoming** inter-window edge. If no anchor has an incoming inter-window edge, head trim is skipped (resets to 0).
+- **Tail trim**: walks from the last position inward, trims anchors after the last one with an **outgoing** inter-window edge. If no anchor has an outgoing inter-window edge, tail trim is skipped.
+- **RC direction flip**: when checking the RC mirror anchor `aid^1`, edge direction is inverted — an out-edge on `aid^1` counts as an in-edge on `aid`, and vice versa, because the RC of edge `A → B` is `B^1 → A^1`.
+- **Deletion**: disables all edges of trimmed anchors and their RC mirrors via `disableAllEdges(aid)` + `disableAllEdges(aid^1)`. Trimmed anchors are guaranteed to have no inter-window edges (otherwise the trim would have stopped), so only intra-window edges are destroyed. `disableEdge` ensures each disabled edge also disables its RC mirror.
 
 #### `recomputeBackboneEndpoints()`
 For each window, walks the backbone read's full journey, builds a window sequence from anchors that still have active edges, and updates `backbonePreviousWindow`/`backboneNextWindow`. Must run before any filter that uses these fields.
