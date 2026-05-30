@@ -149,4 +149,9 @@ public:
     static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
     vector<uint32_t> anchorToWindow;
     uint32_t windowCount = 0;
+
+    // Normalized endpoint window pairs from the two-pass edge creation.
+    // Stored as (min, max) for direction-independent lookup.
+    // A pair (A, B) means some backbone read transitions between A and B.
+    std::set<std::pair<uint32_t, uint32_t>> endpointWindowPairs;
 };

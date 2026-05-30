@@ -421,19 +421,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     auto normalize = [&](uint32_t w) -> uint32_t {
         return (w >= windowCount) ? (w - windowCount) : w;
     };
-    std::set<std::pair<uint32_t, uint32_t>> endpointWindowPairs;
+    endpointWindowPairs.clear();
     for(uint32_t wid = 0; wid < windowCount; wid++) {
         const auto& window = anchorWindows[wid];
         const uint32_t noW = AnchorWindowReadInterval::noWindow;
         if(window.backbonePreviousWindow != noW) {
             uint32_t prev = window.backbonePreviousWindow;
-            endpointWindowPairs.insert({prev, wid});
-            endpointWindowPairs.insert({wid, prev});
+            endpointWindowPairs.insert({std::min(prev, wid), std::max(prev, wid)});
         }
         if(window.backboneNextWindow != noW) {
             uint32_t next = window.backboneNextWindow;
-            endpointWindowPairs.insert({wid, next});
-            endpointWindowPairs.insert({next, wid});
+            endpointWindowPairs.insert({std::min(wid, next), std::max(wid, next)});
         }
     }
 
@@ -482,7 +480,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
         if(srcNorm == dstNorm) continue;
-        if(!endpointWindowPairs.count({srcNorm, dstNorm})) continue;
+        if(!endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)})) continue;
 
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
@@ -609,7 +607,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
         if(srcNorm == dstNorm) continue;
-        if(endpointWindowPairs.count({srcNorm, dstNorm})) continue;
+        if(endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)})) continue;
 
         Shasta2AnchorPair bestPair;
         uint64_t bestSize = 0;
