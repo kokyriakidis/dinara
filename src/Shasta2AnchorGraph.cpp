@@ -664,10 +664,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const uint64_t aidB = uint64_t(edgeInfo.anchorIdB);
         // anchorIdA is in srcNorm's window, connecting toward dstNorm.
         endpointAnchorTargets[aidA].insert(dstNorm);
-        endpointAnchorTargets[aidA ^ 1ULL].insert(dstNorm);
         // anchorIdB is in dstNorm's window, connecting toward srcNorm.
         endpointAnchorTargets[aidB].insert(srcNorm);
-        endpointAnchorTargets[aidB ^ 1ULL].insert(srcNorm);
+        // Do not insert RC mirrors — they have their own createdEdges entries.
     }
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) continue;
