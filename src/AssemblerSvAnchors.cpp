@@ -123,6 +123,7 @@ static uint32_t assembleClipSequences(
 }
 
 
+
 void Assembler::classifySplitAlignments(
     uint64_t referenceReadCount,
     double maskLevel,
@@ -494,107 +495,7 @@ void Assembler::buildSvMSA(
         // All INS calls, for INS-to-DEL flipping at the end.
         vector<DelCallRecord> allInsCalls;
 
-        // Lambda to emit adj/fine/mult/div variants for all
-        // calls currently in allDelCalls. Called before early
-        // continues and at the end of the main loop body.
-        auto emitAdjVariants = [&]() {
-            const int64_t ws = 50;
-            const int defaultMaxW = 10;
-            const int64_t fs = 10;
-            for(const auto& dc : allDelCalls) {
-                // SA-tag gaps include unknown flanking
-                // alignment offset, so probe a wider range
-                // (up to 75% of call size).
-                const bool isSaTag =
-                    dc.source.substr(0, 3) == "SA-";
-                const int maxW = isSaTag
-                    ? std::max(defaultMaxW,
-                        int(dc.size * 3 / (4 * ws)))
-                    : defaultMaxW;
-                for(int w = 1; w <= maxW; ++w) {
-                    const int64_t d = w * ws;
-                    if(dc.size > d)
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source
-                             << "-adj): size="
-                             << (dc.size - d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos << endl;
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source
-                         << "-adj): size="
-                         << (dc.size + d) << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos << endl;
-                }
-                for(int f = 1; f <= 4; ++f) {
-                    const int64_t d = f * fs;
-                    if(dc.size > d)
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source
-                             << "-fine): size="
-                             << (dc.size - d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos << endl;
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source
-                         << "-fine): size="
-                         << (dc.size + d) << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos << endl;
-                }
-                for(int k = 2; k <= 10; ++k) {
-                    const int64_t ms = dc.size * k;
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source << "-x"
-                         << k << "): size=" << ms << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos << endl;
-                    for(int w = 1; w <= 4; ++w) {
-                        const int64_t d = w * ws;
-                        if(ms > d)
-                            cout << "    >>> DELETION CALL"
-                                 << " (" << dc.source << "-x"
-                                 << k << "): size="
-                                 << (ms - d) << "bp"
-                                 << ", breakpoint="
-                                 << dc.breakpointPos << endl;
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source << "-x"
-                             << k << "): size="
-                             << (ms + d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos << endl;
-                    }
-                    const int64_t dv = dc.size / k;
-                    if(dv >= 30) {
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source << "-d"
-                             << k << "): size=" << dv << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos << endl;
-                        for(int w = 1; w <= 4; ++w) {
-                            const int64_t d = w * ws;
-                            if(dv > d)
-                                cout << "    >>> DELETION CALL"
-                                     << " (" << dc.source
-                                     << "-d" << k
-                                     << "): size="
-                                     << (dv - d) << "bp"
-                                     << ", breakpoint="
-                                     << dc.breakpointPos
-                                     << endl;
-                            cout << "    >>> DELETION CALL"
-                                 << " (" << dc.source
-                                 << "-d" << k << "): size="
-                                 << (dv + d) << "bp"
-                                 << ", breakpoint="
-                                 << dc.breakpointPos << endl;
-                        }
-                    }
-                }
-            }
-        };
+
 
         // Lambda to detect deletions from split-read chain
         // diagonal differences. Can be called before early
@@ -867,6 +768,40 @@ void Assembler::buildSvMSA(
                 }
             }
 
+            // Multi-k non-unique anchor deletion sizing.
+            // Run on ALL reads using weighted diagonal histograms
+            // from k-mers at multiple k values. Non-unique k-mers
+            // contribute with weight inversely proportional to
+            // their multiplicity.
+            {
+                vector<ReadId> allReadIds;
+                const uint32_t totalReads =
+                    uint32_t(readsRef.readCount());
+                for(uint32_t ri = uint32_t(referenceReadCount);
+                    ri < totalReads; ++ri) {
+                    allReadIds.push_back(ReadId(ri));
+                }
+                const auto mkCalls = multiKAnchorSizing(
+                    refId, allReadIds,
+                    0, refLength,
+                    uint32_t(assemblerInfo->k), 62);
+                for(const auto& mk : mkCalls) {
+                    if(mk.size >= 30 && mk.readCount >= 2) {
+                        cout << "    >>> DELETION CALL"
+                             << " (multi-k): size="
+                             << mk.size << "bp"
+                             << ", breakpoint=" << mk.breakpointPos
+                             << ", reads=" << mk.readCount
+                             << endl;
+                        allDelCalls.push_back({
+                            mk.breakpointPos,
+                            mk.size,
+                            mk.readCount,
+                            "multi-k"});
+                    }
+                }
+            }
+
             // Paired soft-clip INS sizing with de Bruijn assembly.
             // Right-clip reads end at the left breakpoint; their
             // clipped bases extend into the insertion. Left-clip
@@ -955,23 +890,13 @@ void Assembler::buildSvMSA(
             allRefOrdinals.end());
 
         if(allRefOrdinals.size() < 2) {
-            // Add INS-flip and SA-tag calls before emitting.
-            for(const auto& ci : cigarIndels) {
-                if(ci.svType == "INS" && ci.size >= 20)
-                    allDelCalls.push_back({ci.refPos,
-                        int64_t(ci.size), ci.readCount,
-                        "INS-flip"});
-            }
+            // Add SA-tag DEL calls.
             for(const auto& sc : saTagCalls) {
                 if(sc.size >= 50)
                     allDelCalls.push_back({sc.refPos, sc.size,
                         sc.readCount, "SA-" + sc.svType});
-                if(sc.svType == "INS" && sc.size >= 20)
-                    allDelCalls.push_back({sc.refPos, sc.size,
-                        sc.readCount, "SA-INS-flip"});
             }
             detectSplitReadDels();
-            emitAdjVariants();
             continue;
         }
 
@@ -1037,22 +962,13 @@ void Assembler::buildSvMSA(
         }
 
         if(badSegment || segmentStrings.empty()) {
-            for(const auto& ci : cigarIndels) {
-                if(ci.svType == "INS" && ci.size >= 20)
-                    allDelCalls.push_back({ci.refPos,
-                        int64_t(ci.size), ci.readCount,
-                        "INS-flip"});
-            }
+            // Add SA-tag DEL calls.
             for(const auto& sc : saTagCalls) {
                 if(sc.size >= 50)
                     allDelCalls.push_back({sc.refPos, sc.size,
                         sc.readCount, "SA-" + sc.svType});
-                if(sc.svType == "INS" && sc.size >= 20)
-                    allDelCalls.push_back({sc.refPos, sc.size,
-                        sc.readCount, "SA-INS-flip"});
             }
             detectSplitReadDels();
-            emitAdjVariants();
             continue;
         }
 
@@ -1357,8 +1273,7 @@ void Assembler::buildSvMSA(
         }
 
         // Emit individual per-read DEL and INS detections into
-        // allDelCalls/allInsCalls so they get adj/mult/div treatment
-        // even when they don't form clusters.
+        // allDelCalls as direct evidence calls.
         for(const auto& rg : readGroups) {
             if(rg.svType == SvType::Deletion && rg.svSize >= 20) {
                 allDelCalls.push_back({
@@ -3332,50 +3247,7 @@ void Assembler::buildSvMSA(
                                                   ->endpointCount),
                                             "path-mirror"});
 
-                                        // Adjacent-window variants.
-                                        if(pmSize
-                                           > int64_t(windowSize)) {
-                                            const int64_t adjPm =
-                                                pmSize
-                                                - int64_t(windowSize);
-                                            cout << "    >>> DELETION"
-                                                 << " CALL"
-                                                 << " (path-mirror-adj"
-                                                 << "): size="
-                                                 << adjPm
-                                                 << "bp, breakpoint="
-                                                 << insBpPos
-                                                 << endl;
-                                            delCallRecords.push_back({
-                                                insBpPos,
-                                                adjPm,
-                                                uint32_t(
-                                                    lbp.endpointCount
-                                                    + bestInsRbp
-                                                      ->endpointCount),
-                                                "path-mirror-adj"});
-                                        }
-                                        {
-                                            const int64_t adjPmUp =
-                                                pmSize
-                                                + int64_t(windowSize);
-                                            cout << "    >>> DELETION"
-                                                 << " CALL"
-                                                 << " (path-mirror-adj"
-                                                 << "): size="
-                                                 << adjPmUp
-                                                 << "bp, breakpoint="
-                                                 << insBpPos
-                                                 << endl;
-                                            delCallRecords.push_back({
-                                                insBpPos,
-                                                adjPmUp,
-                                                uint32_t(
-                                                    lbp.endpointCount
-                                                    + bestInsRbp
-                                                      ->endpointCount),
-                                                "path-mirror-adj"});
-                                        }
+
                                     }
                                 }
                             }
@@ -3594,45 +3466,7 @@ void Assembler::buildSvMSA(
                                     + bestRbp->endpointCount),
                                 "bp-pair"});
 
-                            // Emit adjacent-window variants.
-                            // BP windows can be off by one window
-                            // in either direction. Emit calls at
-                            // bestDist ± windowSize so the scorer
-                            // can pick whichever is closest.
-                            if(bpPairSize > int64_t(windowSize)) {
-                                const int64_t adjSize =
-                                    bpPairSize - int64_t(windowSize);
-                                cout << "    >>> DELETION CALL"
-                                     << " (bp-pair-adj): size="
-                                     << adjSize << "bp"
-                                     << ", breakpoint="
-                                     << breakpointPos
-                                     << endl;
-                                delCallRecords.push_back({
-                                    breakpointPos,
-                                    adjSize,
-                                    uint32_t(
-                                        lbp.endpointCount
-                                        + bestRbp->endpointCount),
-                                    "bp-pair-adj"});
-                            }
-                            {
-                                const int64_t adjSizeUp =
-                                    bpPairSize + int64_t(windowSize);
-                                cout << "    >>> DELETION CALL"
-                                     << " (bp-pair-adj): size="
-                                     << adjSizeUp << "bp"
-                                     << ", breakpoint="
-                                     << breakpointPos
-                                     << endl;
-                                delCallRecords.push_back({
-                                    breakpointPos,
-                                    adjSizeUp,
-                                    uint32_t(
-                                        lbp.endpointCount
-                                        + bestRbp->endpointCount),
-                                    "bp-pair-adj"});
-                            }
+
                         }
 
                     }
@@ -6682,210 +6516,26 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
-        // Emit adj variants for all DEL calls at ±1..4 windows.
-        // Breakpoint windows can be off by multiple windows,
-        // making sizes overshoot or undershoot. Emit calls at
-        // each ±N*windowSize so the scorer can pick the closest.
+        // Emit remaining direct DEL calls from delCallRecords.
         // -----------------------------------------------------------------
         {
-            // Also include delCallRecords entries (diagonal,
-            // split-read, flank-gap, bp-pair, path-mirror).
             for(const auto& dc : delCallRecords) {
                 if(dc.size >= 50) {
                     allDelCalls.push_back(dc);
                 }
             }
 
-            // INS-to-DEL flips: add all INS calls as DEL
-            // candidates so they get full adj/mult/div treatment.
-            for(const auto& ci : cigarIndels) {
-                if(ci.svType == "INS" && ci.size >= 20) {
-                    allDelCalls.push_back({
-                        ci.refPos, int64_t(ci.size),
-                        ci.readCount, "INS-flip"});
-                }
-            }
-            for(const auto& sc : saTagCalls) {
-                if(sc.svType == "INS" && sc.size >= 20) {
-                    allDelCalls.push_back({
-                        sc.refPos, sc.size,
-                        sc.readCount, "SA-INS-flip"});
-                }
-            }
-            for(const auto& ic : allInsCalls) {
-                if(ic.size >= 20) {
-                    allDelCalls.push_back({
-                        ic.breakpointPos, ic.size,
-                        ic.readCount,
-                        ic.source + "-flip"});
-                }
-            }
-
-            emitAdjVariants();
-        }
-
-        // -----------------------------------------------------------------
-        // Emit combinatorial DEL calls: pairwise sums, breakpoint
-        // distances, INS-to-DEL flips, and DEL+INS combinations.
-        // Each gets ±4 window adj variants.
-        // -----------------------------------------------------------------
-        {
-            vector<DelCallRecord> comboCalls;
-
-            // Pairwise sums of original DEL calls.
-            {
-                const size_t n = std::min(allDelCalls.size(),
-                                          size_t(10));
-                for(size_t i = 0; i < n; ++i) {
-                    for(size_t j = i + 1; j < n; ++j) {
-                        const int64_t s =
-                            allDelCalls[i].size
-                            + allDelCalls[j].size;
-                        if(s >= 50) {
-                            comboCalls.push_back({
-                                (allDelCalls[i].breakpointPos
-                                 + allDelCalls[j].breakpointPos)
-                                    / 2,
-                                s, 0, "pair-sum"});
-                        }
-                    }
-                }
-            }
-
-            // Breakpoint distances.
-            {
-                vector<uint32_t> bps;
-                for(const auto& dc : allDelCalls)
-                    bps.push_back(dc.breakpointPos);
-                std::sort(bps.begin(), bps.end());
-                bps.erase(std::unique(bps.begin(), bps.end()),
-                          bps.end());
-                const size_t n = std::min(bps.size(),
-                                          size_t(10));
-                for(size_t i = 0; i < n; ++i) {
-                    for(size_t j = i + 1; j < n; ++j) {
-                        const int64_t d =
-                            int64_t(bps[j]) - int64_t(bps[i]);
-                        if(d >= 50) {
-                            comboCalls.push_back({
-                                bps[i], d, 0, "bp-dist"});
-                        }
-                    }
-                }
-            }
-
-            // INS-to-DEL flips from all INS sources.
-            // CIGAR indels:
-            for(const auto& ci : cigarIndels) {
-                if(ci.svType == "INS" && ci.size >= 20) {
-                    comboCalls.push_back({
-                        ci.refPos, int64_t(ci.size),
-                        ci.readCount, "INS-flip"});
-                }
-            }
-            // SA-tag INS calls:
-            for(const auto& sc : saTagCalls) {
-                if(sc.svType == "INS" && sc.size >= 20) {
-                    comboCalls.push_back({
-                        sc.refPos, sc.size,
-                        sc.readCount, "SA-INS-flip"});
-                }
-            }
-            // Path-based and large-ins calls:
-            for(const auto& ic : allInsCalls) {
-                if(ic.size >= 20) {
-                    comboCalls.push_back({
-                        ic.breakpointPos, ic.size,
-                        ic.readCount,
-                        ic.source + "-flip"});
-                }
-            }
-
-            // DEL+INS combinations.
-            {
-                // Collect all INS sizes for combinations.
-                vector<DelCallRecord> allIns;
-                for(const auto& ci : cigarIndels) {
-                    if(ci.svType == "INS" && ci.size >= 20)
-                        allIns.push_back({ci.refPos,
-                            int64_t(ci.size), ci.readCount,
-                            "CIGAR-INS"});
-                }
-                for(const auto& ic : allInsCalls) {
-                    if(ic.size >= 20)
-                        allIns.push_back(ic);
-                }
-                const size_t nd = std::min(allDelCalls.size(),
-                                           size_t(10));
-                const size_t ni = std::min(allIns.size(),
-                                           size_t(10));
-                for(size_t i = 0; i < nd; ++i) {
-                    for(size_t j = 0; j < ni; ++j) {
-                        const int64_t s =
-                            allDelCalls[i].size
-                            + allIns[j].size;
-                        if(s >= 50) {
-                            comboCalls.push_back({
-                                allDelCalls[i].breakpointPos,
-                                s, 0, "del+ins"});
-                        }
-                    }
-                }
-            }
-
-            // Emit each combo call with ±4 window adj variants
-            // plus fine-grained 10bp-step adj.
-            const int comboAdj = 4;
-            const int64_t comboWs = 50;
-            for(const auto& dc : comboCalls) {
+            // Emit all direct DEL calls.
+            for(const auto& dc : allDelCalls) {
                 cout << "    >>> DELETION CALL"
                      << " (" << dc.source << "): size="
                      << dc.size << "bp"
                      << ", breakpoint="
-                     << dc.breakpointPos
-                     << endl;
-                for(int w = 1; w <= comboAdj; ++w) {
-                    const int64_t d = w * comboWs;
-                    if(dc.size > d) {
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source
-                             << "-adj): size="
-                             << (dc.size - d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos
-                             << endl;
-                    }
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source
-                         << "-adj): size="
-                         << (dc.size + d) << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos
-                         << endl;
-                }
-                // Fine-grained 10bp-step adj for combos.
-                const int64_t comboFineStep = 10;
-                for(int f = 1; f <= 4; ++f) {
-                    const int64_t d = f * comboFineStep;
-                    if(dc.size > d) {
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source
-                             << "-fine): size="
-                             << (dc.size - d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos
-                             << endl;
-                    }
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source
-                         << "-fine): size="
-                         << (dc.size + d) << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos
-                         << endl;
-                }
+                     << dc.breakpointPos << endl;
             }
         }
+
+
 
         // -----------------------------------------------------------------
         // Step 6b: Output MSA and consensus.
@@ -7131,6 +6781,245 @@ vector<Assembler::SaTagSvCall> Assembler::parseSaTagSvCalls(
             });
         }
         i = j;
+    }
+
+    return result;
+}
+
+
+// Multi-k unique anchor deletion sizing.
+//
+// For a given reference region and set of reads, find k-mers
+// that are unique in the reference (trying k=maxK down to minK),
+// match them against each read (requiring uniqueness in the read
+// too), and measure deletion size from diagonal drops in the
+// resulting (refPos, readPos) anchor pairs.
+//
+// Returns clustered deletion calls with size, breakpoint, and
+// supporting read count.
+vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
+    ReadId refId,
+    const vector<ReadId>& readIds,
+    uint32_t regionStart,
+    uint32_t regionEnd,
+    uint32_t minK,
+    uint32_t maxK) const
+{
+    vector<MultiKDelCall> result;
+    if(readIds.empty()) return result;
+
+    const auto& readsRef = getReads();
+    const uint32_t refSeqLen = uint32_t(
+        readsRef.getRead(refId).baseCount);
+
+    // Clamp region to reference bounds.
+    if(regionEnd > refSeqLen) regionEnd = refSeqLen;
+    if(regionStart >= regionEnd) return result;
+
+    // Get reference sequence.
+    const vector<Base> refSeq =
+        readsRef.getOrientedReadRawSequence(
+            OrientedReadId(refId, 0));
+
+    // Use multiple k values (even spacing from minK to maxK).
+    vector<uint32_t> kValues;
+    for(uint32_t k = minK; k <= maxK; k += 4) {
+        kValues.push_back(k);
+    }
+    if(kValues.empty()) return result;
+
+    // Phase 1: Build reference k-mer index for all k values.
+    // Include ALL k-mers (not just unique).
+    std::unordered_map<string, vector<uint32_t>> refKmerIdx;
+    for(const uint32_t k : kValues) {
+        for(uint32_t p = regionStart;
+            p + k <= regionEnd; ++p) {
+            string kmer;
+            kmer.reserve(k);
+            for(uint32_t j = 0; j < k; ++j) {
+                kmer.push_back(refSeq[p + j].character());
+            }
+            refKmerIdx[kmer].push_back(p);
+        }
+    }
+
+    // Phase 2: For each read, compute weighted diagonal histogram.
+    // Non-unique k-mers contribute with weight inversely
+    // proportional to their multiplicity.
+    struct DelSignal {
+        double gapSize;
+        uint32_t readIdx;
+    };
+    vector<DelSignal> allDelSignals;
+
+    const uint32_t maxMult = 30;
+
+    for(size_t ri = 0; ri < readIds.size(); ++ri) {
+        const ReadId rid = readIds[ri];
+        const vector<Base> readSeq =
+            readsRef.getOrientedReadRawSequence(
+                OrientedReadId(rid, 0));
+        const uint32_t readLen = uint32_t(readSeq.size());
+        if(readLen < kValues.front()) continue;
+
+        // Build read k-mer index for all k values.
+        std::unordered_map<string, vector<uint32_t>>
+            readKmerIdx;
+        for(const uint32_t k : kValues) {
+            if(readLen < k) continue;
+            for(uint32_t p = 0; p + k <= readLen; ++p) {
+                string kmer;
+                kmer.reserve(k);
+                for(uint32_t j = 0; j < k; ++j) {
+                    kmer.push_back(readSeq[p + j].character());
+                }
+                readKmerIdx[kmer].push_back(p);
+            }
+        }
+
+        // Compute weighted diagonal scores.
+        std::unordered_map<int64_t, double> diagScore;
+
+        for(const auto& [kmer, readPositions] : readKmerIdx) {
+            auto it = refKmerIdx.find(kmer);
+            if(it == refKmerIdx.end()) continue;
+            const auto& refPositions = it->second;
+            const uint32_t k = uint32_t(kmer.size());
+
+            const uint32_t refMult =
+                uint32_t(refPositions.size());
+            const uint32_t readMult =
+                uint32_t(readPositions.size());
+            if(refMult > maxMult || readMult > maxMult)
+                continue;
+
+            // Weight: k^2 / (refMult * readMult).
+            // Longer k-mers and lower multiplicity = stronger.
+            const double weight =
+                double(k) * double(k)
+                / (double(refMult) * double(readMult));
+
+            for(const uint32_t rp : refPositions) {
+                for(const uint32_t rdp : readPositions) {
+                    const int64_t d =
+                        int64_t(rp) - int64_t(rdp);
+                    diagScore[d] += weight;
+                }
+            }
+        }
+
+        if(diagScore.empty()) continue;
+
+        // Cluster nearby diagonals (within 3bp) into peaks.
+        vector<int64_t> sortedDiags;
+        sortedDiags.reserve(diagScore.size());
+        for(const auto& [d, s] : diagScore) {
+            sortedDiags.push_back(d);
+        }
+        sort(sortedDiags.begin(), sortedDiags.end());
+
+        struct Peak {
+            double center;
+            double score;
+        };
+        vector<Peak> peaks;
+
+        for(size_t i = 0; i < sortedDiags.size(); ) {
+            double scoreSum = 0;
+            double weightedSum = 0;
+            size_t j = i;
+            while(j < sortedDiags.size()
+                  && (j == i
+                      || sortedDiags[j] - sortedDiags[j-1]
+                         <= 3)) {
+                const double s = diagScore[sortedDiags[j]];
+                scoreSum += s;
+                weightedSum += double(sortedDiags[j]) * s;
+                ++j;
+            }
+            peaks.push_back({weightedSum / scoreSum,
+                             scoreSum});
+            i = j;
+        }
+
+        // Sort peaks by score descending.
+        sort(peaks.begin(), peaks.end(),
+            [](const Peak& a, const Peak& b) {
+                return a.score > b.score;
+            });
+
+        if(peaks.size() < 2) continue;
+
+        const double topDiag = peaks[0].center;
+        const double topScore = peaks[0].score;
+
+        // Find secondary peak = deletion signal.
+        for(size_t pi = 1; pi < peaks.size(); ++pi) {
+            if(peaks[pi].score < topScore * 0.10) break;
+
+            const double gap = topDiag - peaks[pi].center;
+            if(gap < 20.0 || gap > 2000.0) continue;
+
+            allDelSignals.push_back(
+                {gap, uint32_t(ri)});
+            break;
+        }
+    }
+
+    if(allDelSignals.empty()) return result;
+
+    // Phase 3: Cluster deletion signals by size.
+    sort(allDelSignals.begin(), allDelSignals.end(),
+        [](const DelSignal& a, const DelSignal& b) {
+            return a.gapSize < b.gapSize;
+        });
+
+    vector<bool> used(allDelSignals.size(), false);
+
+    for(size_t i = 0; i < allDelSignals.size(); ++i) {
+        if(used[i]) continue;
+
+        vector<size_t> cluster = {i};
+        for(size_t j = i + 1;
+            j < allDelSignals.size(); ++j) {
+            if(used[j]) continue;
+            const double ratio =
+                std::min(allDelSignals[i].gapSize,
+                         allDelSignals[j].gapSize)
+                / std::max(allDelSignals[i].gapSize,
+                           allDelSignals[j].gapSize);
+            if(ratio >= 0.7) {
+                cluster.push_back(j);
+                used[j] = true;
+            }
+        }
+        used[i] = true;
+
+        double sizeSum = 0;
+        for(const size_t c : cluster) {
+            sizeSum += allDelSignals[c].gapSize;
+        }
+        const int64_t avgSize =
+            int64_t(sizeSum / double(cluster.size()) + 0.5);
+        const uint32_t count = uint32_t(cluster.size());
+
+        // Deduplicate (same size ±10%).
+        bool duplicate = false;
+        for(const auto& existing : result) {
+            const double r =
+                double(std::min(existing.size, avgSize))
+                / double(std::max(existing.size, avgSize));
+            if(r > 0.9) {
+                duplicate = true;
+                break;
+            }
+        }
+        if(!duplicate) {
+            // Use region midpoint as breakpoint estimate.
+            const uint32_t bp =
+                (regionStart + regionEnd) / 2;
+            result.push_back({bp, avgSize, count});
+        }
     }
 
     return result;
