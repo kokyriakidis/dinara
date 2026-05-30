@@ -244,18 +244,22 @@ void ReadLoader::processFastaFileThreadFunction(size_t threadId)
             }
 
             // Get a base from this character.
-            const Base base = Base::fromCharacterNoException(c);
-            if(base.isValid()) {
-                read.push_back(base);
-            } else {
+            // Replace invalid/ambiguous bases (e.g. IUPAC codes
+            // M, R, W, S, Y, K, N) with 'A' so the read is not
+            // discarded entirely.
+            Base base = Base::fromCharacterNoException(c);
+            if(!base.isValid()) {
+                base = Base::fromCharacter('A');
                 ++invalidBaseCount;
             }
+            read.push_back(base);
             ++offset;
         }
 
 
-        // If we found invalid bases, skip this read.
-        if(invalidBaseCount) {
+        // Invalid bases were replaced with 'A' above.
+        // Only discard if the read is entirely invalid.
+        if(invalidBaseCount > 0 && invalidBaseCount >= read.size()) {
             __sync_fetch_and_add(&discardedInvalidBaseReadCount, 1);
             __sync_fetch_and_add(&discardedInvalidBaseReadCount, read.size());
             continue;

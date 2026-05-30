@@ -469,7 +469,6 @@ void Assembler::buildSvMSA(
 
     for(ReadId refId = 0; refId < ReadId(referenceReadCount); ++refId) {
         const auto& chainsForRef = chainsByRef[refId];
-        if(chainsForRef.empty()) continue;
 
         const OrientedReadId refOid(refId, 0);
         const auto refMarkers = markersRef[refOid.getValue()];
@@ -583,6 +582,160 @@ void Assembler::buildSvMSA(
                                  << ", breakpoint="
                                  << dc.breakpointPos << endl;
                         }
+                    }
+                }
+            }
+        };
+
+        // Lambda to detect deletions from split-read chain
+        // diagonal differences. Can be called before early
+        // continues when the MSA/segment path is not reached.
+        auto detectSplitReadDels = [&]() {
+            struct SplitDelEvent {
+                uint32_t refPos;
+                int64_t delSize;
+                uint32_t readId;
+            };
+            vector<SplitDelEvent> splitEvents;
+
+            std::unordered_map<uint32_t,
+                vector<uint32_t>> readChainIdx;
+            for(uint32_t ci = 0;
+                ci < chainsForRef.size(); ++ci) {
+                const auto& ce = chainsForRef[ci];
+                if(ce.readId == uint32_t(refId)) continue;
+                readChainIdx[ce.readId].push_back(ci);
+            }
+
+            for(const auto& [rdId, cis] : readChainIdx) {
+                if(cis.size() < 2) continue;
+                struct ChainSummary {
+                    int64_t medDiag;
+                    uint32_t minRefPos;
+                    uint32_t maxRefPos;
+                    uint32_t nAnchors;
+                };
+                vector<ChainSummary> summaries;
+                for(const auto ci : cis) {
+                    const auto& ce = chainsForRef[ci];
+                    if(!ce.isSameStrand) continue;
+                    const auto& al =
+                        alignments[ce.chainIndex];
+                    if(al.ordinals.size() < 3) continue;
+                    const Strand strand = 0;
+                    const auto rdMkrs = markersRef[
+                        OrientedReadId(
+                            ReadId(rdId), strand
+                        ).getValue()];
+                    vector<int64_t> diags;
+                    uint32_t minRp = UINT32_MAX;
+                    uint32_t maxRp = 0;
+                    for(const auto& ord : al.ordinals) {
+                        if(ord[0] >= refMarkers.size()
+                           || ord[1] >= rdMkrs.size())
+                            continue;
+                        const uint32_t rp = uint32_t(
+                            refMarkers[ord[0]].position);
+                        const uint32_t qp = uint32_t(
+                            rdMkrs[ord[1]].position);
+                        diags.push_back(
+                            int64_t(rp) - int64_t(qp));
+                        minRp = std::min(minRp, rp);
+                        maxRp = std::max(maxRp, rp);
+                    }
+                    if(diags.size() < 3) continue;
+                    sort(diags.begin(), diags.end());
+                    summaries.push_back({
+                        diags[diags.size() / 2],
+                        minRp, maxRp,
+                        uint32_t(diags.size())});
+                }
+                if(summaries.size() < 2) continue;
+                sort(summaries.begin(), summaries.end(),
+                    [](const ChainSummary& a,
+                       const ChainSummary& b) {
+                        return a.minRefPos < b.minRefPos;
+                    });
+                for(size_t a = 0;
+                    a + 1 < summaries.size(); ++a) {
+                    const auto& ca = summaries[a];
+                    const auto& cb = summaries[a + 1];
+                    if(cb.minRefPos <= ca.maxRefPos)
+                        continue;
+                    const int64_t refGap =
+                        int64_t(cb.minRefPos)
+                        - int64_t(ca.maxRefPos);
+                    const int64_t dd =
+                        cb.medDiag - ca.medDiag;
+                    if(dd > 20 && refGap < dd * 2) {
+                        const uint32_t gapMid =
+                            (ca.maxRefPos + cb.minRefPos) / 2;
+                        splitEvents.push_back(
+                            {gapMid, dd, rdId});
+                    }
+                }
+            }
+
+            if(!splitEvents.empty()) {
+                sort(splitEvents.begin(), splitEvents.end(),
+                    [](const SplitDelEvent& a,
+                       const SplitDelEvent& b) {
+                        return a.refPos < b.refPos;
+                    });
+                // Cluster by position.
+                struct SplitCluster {
+                    uint32_t startPos, endPos;
+                    vector<int64_t> sizes;
+                    std::unordered_set<uint32_t> readIds;
+                };
+                vector<SplitCluster> clusters;
+                SplitCluster cur;
+                cur.startPos = splitEvents[0].refPos;
+                cur.endPos = splitEvents[0].refPos;
+                cur.sizes.push_back(splitEvents[0].delSize);
+                cur.readIds.insert(splitEvents[0].readId);
+                for(size_t i = 1;
+                    i < splitEvents.size(); ++i) {
+                    if(splitEvents[i].refPos
+                       <= cur.endPos + 150) {
+                        cur.endPos = splitEvents[i].refPos;
+                        cur.sizes.push_back(
+                            splitEvents[i].delSize);
+                        cur.readIds.insert(
+                            splitEvents[i].readId);
+                    } else {
+                        clusters.push_back(std::move(cur));
+                        cur = SplitCluster();
+                        cur.startPos =
+                            splitEvents[i].refPos;
+                        cur.endPos =
+                            splitEvents[i].refPos;
+                        cur.sizes.push_back(
+                            splitEvents[i].delSize);
+                        cur.readIds.insert(
+                            splitEvents[i].readId);
+                    }
+                }
+                clusters.push_back(std::move(cur));
+
+                for(auto& cl : clusters) {
+                    sort(cl.sizes.begin(), cl.sizes.end());
+                    const int64_t medDel =
+                        cl.sizes[cl.sizes.size() / 2];
+                    const uint32_t bpPos =
+                        (cl.startPos + cl.endPos) / 2;
+                    if(medDel >= 20) {
+                        cout << "    >>> DELETION CALL "
+                             << "(early-split): "
+                             << "size=" << medDel
+                             << "bp, breakpoint=" << bpPos
+                             << ", splitReads="
+                             << cl.readIds.size()
+                             << endl;
+                        allDelCalls.push_back({
+                            bpPos, medDel,
+                            uint32_t(cl.readIds.size()),
+                            "early-split"});
                     }
                 }
             }
@@ -802,6 +955,7 @@ void Assembler::buildSvMSA(
                     allDelCalls.push_back({sc.refPos, sc.size,
                         sc.readCount, "SA-INS-flip"});
             }
+            detectSplitReadDels();
             emitAdjVariants();
             continue;
         }
@@ -882,6 +1036,7 @@ void Assembler::buildSvMSA(
                     allDelCalls.push_back({sc.refPos, sc.size,
                         sc.readCount, "SA-INS-flip"});
             }
+            detectSplitReadDels();
             emitAdjVariants();
             continue;
         }
@@ -1184,6 +1339,25 @@ void Assembler::buildSvMSA(
             }
 
             readGroups.push_back(std::move(rg));
+        }
+
+        // Emit individual per-read DEL and INS detections into
+        // allDelCalls/allInsCalls so they get adj/mult/div treatment
+        // even when they don't form clusters.
+        for(const auto& rg : readGroups) {
+            if(rg.svType == SvType::Deletion && rg.svSize >= 20) {
+                allDelCalls.push_back({
+                    rg.breakpointRefPos, rg.svSize,
+                    1, "per-read-DEL"});
+            }
+            if(rg.svType == SvType::Insertion && rg.svSize >= 20) {
+                allDelCalls.push_back({
+                    rg.breakpointRefPos, rg.svSize,
+                    1, "per-read-INS-flip"});
+                allInsCalls.push_back({
+                    rg.breakpointRefPos, rg.svSize,
+                    1, "per-read-INS"});
+            }
         }
 
         // -----------------------------------------------------------------
@@ -5705,7 +5879,7 @@ void Assembler::buildSvMSA(
                          << "reads=" << count
                          << endl;
                     if(typeStr == "DEL"
-                       && (sumSize / int64_t(count)) >= 50) {
+                       && (sumSize / int64_t(count)) >= 20) {
                         allDelCalls.push_back({
                             uint32_t(sumPos / count),
                             sumSize / int64_t(count),
