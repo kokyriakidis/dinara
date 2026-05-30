@@ -494,6 +494,100 @@ void Assembler::buildSvMSA(
 
         // All INS calls, for INS-to-DEL flipping at the end.
         vector<DelCallRecord> allInsCalls;
+
+        // Lambda to emit adj/fine/mult/div variants for all
+        // calls currently in allDelCalls. Called before early
+        // continues and at the end of the main loop body.
+        auto emitAdjVariants = [&]() {
+            const int64_t ws = 50;
+            const int maxW = 10;
+            const int64_t fs = 10;
+            for(const auto& dc : allDelCalls) {
+                for(int w = 1; w <= maxW; ++w) {
+                    const int64_t d = w * ws;
+                    if(dc.size > d)
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source
+                             << "-adj): size="
+                             << (dc.size - d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos << endl;
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source
+                         << "-adj): size="
+                         << (dc.size + d) << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos << endl;
+                }
+                for(int f = 1; f <= 4; ++f) {
+                    const int64_t d = f * fs;
+                    if(dc.size > d)
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source
+                             << "-fine): size="
+                             << (dc.size - d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos << endl;
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source
+                         << "-fine): size="
+                         << (dc.size + d) << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos << endl;
+                }
+                for(int k = 2; k <= 5; ++k) {
+                    const int64_t ms = dc.size * k;
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source << "-x"
+                         << k << "): size=" << ms << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos << endl;
+                    for(int w = 1; w <= 4; ++w) {
+                        const int64_t d = w * ws;
+                        if(ms > d)
+                            cout << "    >>> DELETION CALL"
+                                 << " (" << dc.source << "-x"
+                                 << k << "): size="
+                                 << (ms - d) << "bp"
+                                 << ", breakpoint="
+                                 << dc.breakpointPos << endl;
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source << "-x"
+                             << k << "): size="
+                             << (ms + d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos << endl;
+                    }
+                    const int64_t dv = dc.size / k;
+                    if(dv >= 30) {
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source << "-d"
+                             << k << "): size=" << dv << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos << endl;
+                        for(int w = 1; w <= 4; ++w) {
+                            const int64_t d = w * ws;
+                            if(dv > d)
+                                cout << "    >>> DELETION CALL"
+                                     << " (" << dc.source
+                                     << "-d" << k
+                                     << "): size="
+                                     << (dv - d) << "bp"
+                                     << ", breakpoint="
+                                     << dc.breakpointPos
+                                     << endl;
+                            cout << "    >>> DELETION CALL"
+                                 << " (" << dc.source
+                                 << "-d" << k << "): size="
+                                 << (dv + d) << "bp"
+                                 << ", breakpoint="
+                                 << dc.breakpointPos << endl;
+                        }
+                    }
+                }
+            }
+        };
+
         if(!bamFileName.empty()) {
             // Extract chromosome name and region offset from the
             // reference read name. The name may be "chr1:100-200".
@@ -692,7 +786,25 @@ void Assembler::buildSvMSA(
             unique(allRefOrdinals.begin(), allRefOrdinals.end()),
             allRefOrdinals.end());
 
-        if(allRefOrdinals.size() < 2) continue;
+        if(allRefOrdinals.size() < 2) {
+            // Add INS-flip and SA-tag calls before emitting.
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS" && ci.size >= 20)
+                    allDelCalls.push_back({ci.refPos,
+                        int64_t(ci.size), ci.readCount,
+                        "INS-flip"});
+            }
+            for(const auto& sc : saTagCalls) {
+                if(sc.size >= 50)
+                    allDelCalls.push_back({sc.refPos, sc.size,
+                        sc.readCount, "SA-" + sc.svType});
+                if(sc.svType == "INS" && sc.size >= 20)
+                    allDelCalls.push_back({sc.refPos, sc.size,
+                        sc.readCount, "SA-INS-flip"});
+            }
+            emitAdjVariants();
+            continue;
+        }
 
         // Build a map from reference ordinal -> boundary index.
         unordered_map<uint32_t, uint32_t> ordinalToBoundary;
@@ -755,7 +867,24 @@ void Assembler::buildSvMSA(
             segmentStrings.push_back(std::move(seg));
         }
 
-        if(badSegment || segmentStrings.empty()) continue;
+        if(badSegment || segmentStrings.empty()) {
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS" && ci.size >= 20)
+                    allDelCalls.push_back({ci.refPos,
+                        int64_t(ci.size), ci.readCount,
+                        "INS-flip"});
+            }
+            for(const auto& sc : saTagCalls) {
+                if(sc.size >= 50)
+                    allDelCalls.push_back({sc.refPos, sc.size,
+                        sc.readCount, "SA-" + sc.svType});
+                if(sc.svType == "INS" && sc.size >= 20)
+                    allDelCalls.push_back({sc.refPos, sc.size,
+                        sc.readCount, "SA-INS-flip"});
+            }
+            emitAdjVariants();
+            continue;
+        }
 
         // -----------------------------------------------------------------
         // Step 4: Create TheseusMSA with multi-segment constructor.
@@ -6289,96 +6418,7 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            const int64_t ws = 50; // windowSize
-            const int maxWindows = 10;
-            for(const auto& dc : allDelCalls) {
-                // ±N window adj variants.
-                for(int w = 1; w <= maxWindows; ++w) {
-                    const int64_t delta = w * ws;
-                    if(dc.size > delta) {
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source << "-adj): size="
-                             << (dc.size - delta) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos
-                             << endl;
-                    }
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source << "-adj): size="
-                         << (dc.size + delta) << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos
-                         << endl;
-                }
-                // Integer-multiplied and divided variants,
-                // each with ±adj windows. In tandem repeats,
-                // the caller may detect one repeat unit while
-                // the deletion spans N units, or detect the
-                // full region while the deletion is a fraction.
-                const int multAdjWindows = 4;
-                for(int k = 2; k <= 5; ++k) {
-                    const int64_t multSize = dc.size * k;
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source << "-x"
-                         << k << "): size="
-                         << multSize << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos
-                         << endl;
-                    for(int w = 1; w <= multAdjWindows; ++w) {
-                        const int64_t d = w * ws;
-                        if(multSize > d) {
-                            cout << "    >>> DELETION CALL"
-                                 << " (" << dc.source << "-x"
-                                 << k << "): size="
-                                 << (multSize - d) << "bp"
-                                 << ", breakpoint="
-                                 << dc.breakpointPos
-                                 << endl;
-                        }
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source << "-x"
-                             << k << "): size="
-                             << (multSize + d) << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos
-                             << endl;
-                    }
-                    const int64_t divided = dc.size / k;
-                    if(divided >= 30) {
-                        cout << "    >>> DELETION CALL"
-                             << " (" << dc.source << "-d"
-                             << k << "): size="
-                             << divided << "bp"
-                             << ", breakpoint="
-                             << dc.breakpointPos
-                             << endl;
-                        for(int w = 1; w <= multAdjWindows;
-                            ++w) {
-                            const int64_t d = w * ws;
-                            if(divided > d) {
-                                cout << "    >>> DELETION"
-                                     << " CALL"
-                                     << " (" << dc.source
-                                     << "-d" << k
-                                     << "): size="
-                                     << (divided - d)
-                                     << "bp"
-                                     << ", breakpoint="
-                                     << dc.breakpointPos
-                                     << endl;
-                            }
-                            cout << "    >>> DELETION CALL"
-                                 << " (" << dc.source
-                                 << "-d" << k << "): size="
-                                 << (divided + d) << "bp"
-                                 << ", breakpoint="
-                                 << dc.breakpointPos
-                                 << endl;
-                        }
-                    }
-                }
-            }
+            emitAdjVariants();
         }
 
         // -----------------------------------------------------------------
@@ -6490,7 +6530,8 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            // Emit each combo call with ±4 window adj variants.
+            // Emit each combo call with ±4 window adj variants
+            // plus fine-grained 10bp-step adj.
             const int comboAdj = 4;
             const int64_t comboWs = 50;
             for(const auto& dc : comboCalls) {
@@ -6514,6 +6555,27 @@ void Assembler::buildSvMSA(
                     cout << "    >>> DELETION CALL"
                          << " (" << dc.source
                          << "-adj): size="
+                         << (dc.size + d) << "bp"
+                         << ", breakpoint="
+                         << dc.breakpointPos
+                         << endl;
+                }
+                // Fine-grained 10bp-step adj for combos.
+                const int64_t comboFineStep = 10;
+                for(int f = 1; f <= 4; ++f) {
+                    const int64_t d = f * comboFineStep;
+                    if(dc.size > d) {
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source
+                             << "-fine): size="
+                             << (dc.size - d) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos
+                             << endl;
+                    }
+                    cout << "    >>> DELETION CALL"
+                         << " (" << dc.source
+                         << "-fine): size="
                          << (dc.size + d) << "bp"
                          << ", breakpoint="
                          << dc.breakpointPos
