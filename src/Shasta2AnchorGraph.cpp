@@ -569,10 +569,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(!ep.hasHead && !ep.hasTail) continue;
 
             const auto& window = anchorWindows[w];
-            const auto& positions = window.filteredBackbonePositions;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            for(const uint32_t pos : positions) {
+            // Walk the full backbone range, not just filteredBackbonePositions,
+            // to also catch anchors that were filtered out of the backbone chain.
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
                 bool outsideBounds = false;
                 if(ep.hasHead && pos < ep.headPos) outsideBounds = true;
                 if(ep.hasTail && pos > ep.tailPos) outsideBounds = true;
