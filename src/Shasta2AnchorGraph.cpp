@@ -665,41 +665,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if an anchor has any active edge (forward or RC).
-        auto anchorHasActiveEdge = [&](uint64_t aid) -> bool {
-            if(aid >= anchorCount) return false;
-            auto oe = boost::out_edges(aid, anchorGraph);
-            for(auto it = oe.first; it != oe.second; ++it) {
-                if(anchorGraph[*it].useForAssembly) return true;
-            }
-            auto ie = boost::in_edges(aid, anchorGraph);
-            for(auto it = ie.first; it != ie.second; ++it) {
-                if(anchorGraph[*it].useForAssembly) return true;
-            }
-            // Also check RC mirror.
-            const uint64_t rcAid = aid ^ 1ULL;
-            if(rcAid < anchorCount) {
-                auto oe2 = boost::out_edges(rcAid, anchorGraph);
-                for(auto it = oe2.first; it != oe2.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) return true;
-                }
-                auto ie2 = boost::in_edges(rcAid, anchorGraph);
-                for(auto it = ie2.first; it != ie2.second; ++it) {
-                    if(anchorGraph[*it].useForAssembly) return true;
-                }
-            }
-            return false;
-        };
-
         for(uint32_t wid = 0; wid < windowCount; wid++) {
             auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
             const auto journey = journeys[window.backboneOrientedReadId];
 
             // Walk the backbone read's full journey and build the sequence
-            // of distinct normalized windows, considering only anchors
-            // that still have active edges (forward or RC).
-            // Track which index in the sequence each journey position
-            // maps to, so we can find the correct occurrence of wid.
+            // of distinct normalized windows. Use anchorToWindow directly
+            // (not filtered by active edges) because the backbone read's
+            // path through windows is a property of the read, not the
+            // current edge state. Filtering by active edges would miss
+            // windows whose connecting anchors were trimmed.
             std::vector<uint32_t> windowSequence;
             std::vector<uint32_t> posToSeqIdx(journey.size(), UINT32_MAX);
             for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
@@ -707,7 +682,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(aid >= anchorCount) continue;
                 const uint32_t rawW = anchorToWindow[aid];
                 if(rawW == noWindow) continue;
-                if(!anchorHasActiveEdge(aid)) continue;
                 const uint32_t normW = normalize(rawW);
                 if(windowSequence.empty() || windowSequence.back() != normW) {
                     windowSequence.push_back(normW);
@@ -716,10 +690,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
 
             // Find the occurrence of wid in the sequence that corresponds
-            // to the backbone positions. Use the first active backbone
-            // position to locate the correct occurrence (the backbone
-            // read may re-enter wid after visiting other windows, and
-            // we need the occurrence that matches the backbone span).
+            // to the backbone positions. Use the first backbone position
+            // to locate the correct occurrence (the backbone read may
+            // re-enter wid after visiting other windows, and we need the
+            // occurrence that matches the backbone span).
             window.backbonePreviousWindow = AnchorWindowReadInterval::noWindow;
             window.backboneNextWindow = AnchorWindowReadInterval::noWindow;
 
