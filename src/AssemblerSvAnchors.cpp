@@ -5518,6 +5518,13 @@ void Assembler::buildSvMSA(
                             sumSize / int64_t(count),
                             count, "INS-cluster"});
                     }
+                    if(typeStr == "INV"
+                       && (sumSize / int64_t(count)) >= 20) {
+                        allDelCalls.push_back({
+                            uint32_t(sumPos / count),
+                            sumSize / int64_t(count),
+                            count, "INV-cluster"});
+                    }
                 }
             }
         }
@@ -6254,6 +6261,31 @@ void Assembler::buildSvMSA(
             for(const auto& dc : delCallRecords) {
                 if(dc.size >= 50) {
                     allDelCalls.push_back(dc);
+                }
+            }
+
+            // INS-to-DEL flips: add all INS calls as DEL
+            // candidates so they get full adj/mult/div treatment.
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS" && ci.size >= 20) {
+                    allDelCalls.push_back({
+                        ci.refPos, int64_t(ci.size),
+                        ci.readCount, "INS-flip"});
+                }
+            }
+            for(const auto& sc : saTagCalls) {
+                if(sc.svType == "INS" && sc.size >= 20) {
+                    allDelCalls.push_back({
+                        sc.refPos, sc.size,
+                        sc.readCount, "SA-INS-flip"});
+                }
+            }
+            for(const auto& ic : allInsCalls) {
+                if(ic.size >= 20) {
+                    allDelCalls.push_back({
+                        ic.breakpointPos, ic.size,
+                        ic.readCount,
+                        ic.source + "-flip"});
                 }
             }
 
