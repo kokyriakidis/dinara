@@ -508,6 +508,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Store endpoint anchors for GFA tagging.
     endpointAnchors = reservedAnchors;
+    const size_t endpointEdgeCount = createdEdges.size();
 
     // Early trim: disable backbone anchors beyond the endpoint anchors.
     // For each window, find the backbone positions of the endpoint anchors
@@ -657,7 +658,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Build a map: anchor ID -> set of normalized windows it connects to
     // as an endpoint (from pass 1 createdEdges).
     std::map<uint64_t, std::set<uint32_t>> endpointAnchorTargets;
-    for(const auto& edgeInfo : createdEdges) {
+    for(size_t i = 0; i < endpointEdgeCount; i++) {
+        const auto& edgeInfo = createdEdges[i];
         const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
         const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
         const uint64_t aidA = uint64_t(edgeInfo.anchorIdA);
