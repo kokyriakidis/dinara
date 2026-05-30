@@ -996,54 +996,58 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if an anchor (or its RC mirror) has an active
-        // incoming inter-window edge.
-        auto hasIncomingInterWindowEdge = [&](uint64_t aid) -> bool {
-            auto check = [&](uint64_t a) -> bool {
-                if(a >= anchorCount) return false;
-                const uint32_t aWin = anchorToWindow[a];
-                if(aWin == noWindow) return false;
-                const uint32_t aNorm = normalizeW(aWin);
-                auto ie = boost::in_edges(a, anchorGraph);
-                for(auto it = ie.first; it != ie.second; ++it) {
-                    if(!anchorGraph[*it].useForAssembly) continue;
-                    const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                    if(src < anchorCount) {
-                        const uint32_t srcWin = anchorToWindow[src];
-                        if(srcWin != noWindow && normalizeW(srcWin) != aNorm)
-                            return true;
-                    }
+        // Check if an anchor has an inter-window in-edge or out-edge.
+        auto anchorHasInterWindowInEdge = [&](uint64_t a) -> bool {
+            if(a >= anchorCount) return false;
+            const uint32_t aWin = anchorToWindow[a];
+            if(aWin == noWindow) return false;
+            const uint32_t aNorm = normalizeW(aWin);
+            auto ie = boost::in_edges(a, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src < anchorCount) {
+                    const uint32_t srcWin = anchorToWindow[src];
+                    if(srcWin != noWindow && normalizeW(srcWin) != aNorm)
+                        return true;
                 }
-                return false;
-            };
-            if(check(aid)) return true;
-            const uint64_t rcAid = aid ^ 1ULL;
-            return (rcAid < anchorCount && check(rcAid));
+            }
+            return false;
+        };
+        auto anchorHasInterWindowOutEdge = [&](uint64_t a) -> bool {
+            if(a >= anchorCount) return false;
+            const uint32_t aWin = anchorToWindow[a];
+            if(aWin == noWindow) return false;
+            const uint32_t aNorm = normalizeW(aWin);
+            auto oe = boost::out_edges(a, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt < anchorCount) {
+                    const uint32_t tgtWin = anchorToWindow[tgt];
+                    if(tgtWin != noWindow && normalizeW(tgtWin) != aNorm)
+                        return true;
+                }
+            }
+            return false;
         };
 
-        // Check if an anchor (or its RC mirror) has an active
-        // outgoing inter-window edge.
-        auto hasOutgoingInterWindowEdge = [&](uint64_t aid) -> bool {
-            auto check = [&](uint64_t a) -> bool {
-                if(a >= anchorCount) return false;
-                const uint32_t aWin = anchorToWindow[a];
-                if(aWin == noWindow) return false;
-                const uint32_t aNorm = normalizeW(aWin);
-                auto oe = boost::out_edges(a, anchorGraph);
-                for(auto it = oe.first; it != oe.second; ++it) {
-                    if(!anchorGraph[*it].useForAssembly) continue;
-                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                    if(tgt < anchorCount) {
-                        const uint32_t tgtWin = anchorToWindow[tgt];
-                        if(tgtWin != noWindow && normalizeW(tgtWin) != aNorm)
-                            return true;
-                    }
-                }
-                return false;
-            };
-            if(check(aid)) return true;
+        // Head: check for incoming inter-window edges.
+        // On the RC mirror, direction flips: an out-edge on aid^1
+        // corresponds to an in-edge on aid in forward orientation.
+        auto hasIncomingInterWindowEdge = [&](uint64_t aid) -> bool {
+            if(anchorHasInterWindowInEdge(aid)) return true;
             const uint64_t rcAid = aid ^ 1ULL;
-            return (rcAid < anchorCount && check(rcAid));
+            return (rcAid < anchorCount && anchorHasInterWindowOutEdge(rcAid));
+        };
+
+        // Tail: check for outgoing inter-window edges.
+        // On the RC mirror, direction flips: an in-edge on aid^1
+        // corresponds to an out-edge on aid in forward orientation.
+        auto hasOutgoingInterWindowEdge = [&](uint64_t aid) -> bool {
+            if(anchorHasInterWindowOutEdge(aid)) return true;
+            const uint64_t rcAid = aid ^ 1ULL;
+            return (rcAid < anchorCount && anchorHasInterWindowInEdge(rcAid));
         };
 
         uint64_t trimmedVertexCount = 0;
@@ -1056,8 +1060,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const auto journey = journeys[window.backboneOrientedReadId];
 
             // Head trim: walk from position 0 inward, trim anchors
-            // before the first one that receives an incoming
-            // inter-window edge.
+            // before the first one with an incoming inter-window edge.
             uint64_t headTrim = 0;
             for(uint64_t i = 0; i < positions.size(); i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
@@ -1067,8 +1070,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(headTrim >= positions.size()) headTrim = 0;
 
             // Tail trim: walk from last position inward, trim anchors
-            // after the last one that sends an outgoing inter-window
-            // edge.
+            // after the last one with an outgoing inter-window edge.
             uint64_t tailTrim = 0;
             for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
                 const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
