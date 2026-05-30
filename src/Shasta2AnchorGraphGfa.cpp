@@ -51,13 +51,13 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             << dst << "\t+\t0M"
             << "\tRC:i:" << edge.coverage();
 
-        // Classify each side of the edge independently.
+        // Classify each anchor of the edge.
         // Each link gets two tags:
         //   pw:Z: — source anchor classification
         //   nw:Z: — target anchor classification
-        // Values: "Endpoint" (this anchor was used by an endpoint edge),
-        //         "intra" (same window), "internal" (inter-window but
-        //         not an endpoint anchor).
+        // Values: "Endpoint" (anchor is an endpoint anchor of its window),
+        //         "intra" (same window), "internal" (inter-window,
+        //         anchor is not an endpoint anchor).
         if(windowCount > 0 &&
            uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
             const uint32_t srcW = anchorToWindow[uint64_t(src)];
@@ -70,9 +70,9 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
                 if(srcNorm == dstNorm) {
                     gfa << "\tpw:Z:intra\tnw:Z:intra";
                 } else {
-                    const char* srcTag = endpointAnchors.count(uint64_t(src))
+                    const char* srcTag = edge.isEndpointAnchorPrev
                         ? "Endpoint" : "internal";
-                    const char* dstTag = endpointAnchors.count(uint64_t(dst))
+                    const char* dstTag = edge.isEndpointAnchorNext
                         ? "Endpoint" : "internal";
                     gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
                 }

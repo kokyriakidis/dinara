@@ -38,7 +38,8 @@ public:
     uint64_t offset = invalid<uint64_t>;
     uint64_t id = invalid<uint64_t>;
     bool useForAssembly = false;
-    bool isEndpointEdge = false;
+    bool isEndpointAnchorPrev = false;  // source anchor is an endpoint anchor
+    bool isEndpointAnchorNext = false;  // target anchor is an endpoint anchor
 
     Shasta2AnchorGraphEdge(const Shasta2AnchorPair& anchorPair, uint64_t offset, uint64_t id) :
         anchorPair(anchorPair),

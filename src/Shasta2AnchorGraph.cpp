@@ -460,8 +460,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     auto createInterWindowEdge = [&](
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
-        uint64_t bestSize,
-        bool isEndpoint)
+        uint64_t bestSize)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
         edge_descriptor e;
@@ -471,7 +470,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
             anchorGraph);
         anchorGraph[e].useForAssembly = true;
-        anchorGraph[e].isEndpointEdge = isEndpoint;
         createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
         ++interWindowCreated;
     };
@@ -503,7 +501,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
             reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
             reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
-            createInterWindowEdge(windowPair, bestPair, bestSize, true);
+            createInterWindowEdge(windowPair, bestPair, bestSize);
             ++interWindowEndpointCreated;
         }
     }
@@ -516,12 +514,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // (from pass 1). Disable all intra-window edges on anchors before the
     // head endpoint or after the tail endpoint, and add those anchors to
     // reservedAnchors so pass 2 can't use them.
-    {
-        // Per-window endpoint positions on the backbone.
-        struct EndpointPos {
-            uint32_t headPos = 0;           // position of head endpoint anchor
-            uint32_t tailPos = UINT32_MAX;  // position of tail endpoint anchor
-            bool hasHead = false;
+
+    // Per-window endpoint positions on the backbone.
+    struct EndpointPos {
+        uint32_t headPos = 0;           // position of head endpoint anchor
+        uint32_t tailPos = UINT32_MAX;  // position of tail endpoint anchor
+        bool hasHead = false;
             bool hasTail = false;
         };
         std::vector<EndpointPos> endpointPos(windowCount);
@@ -603,9 +601,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
         }
-        cout << "Early trim after endpoint edges: " << earlyTrimCount
-             << " backbone anchors disabled." << endl;
-    }
+    cout << "Early trim after endpoint edges: " << earlyTrimCount
+         << " backbone anchors disabled." << endl;
 
     // Pass 2: Create remaining (non-endpoint) edges, skipping reserved anchors.
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
@@ -640,7 +637,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         } else if(bestSize < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
-            createInterWindowEdge(windowPair, bestPair, bestSize, false);
+            createInterWindowEdge(windowPair, bestPair, bestSize);
             ++interWindowInternalCreated;
         }
     }
@@ -652,6 +649,30 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowZeroPairs << " rejected (zero forward-flow reads), "
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
+
+    // Set per-anchor endpoint flags on all inter-window edges.
+    // An anchor is an endpoint anchor if its backbone position matches
+    // the head or tail endpoint position of its window.
+    auto isEndpointPosition = [&](uint64_t anchorId) -> bool {
+        if(anchorId >= anchorCount) return false;
+        const uint32_t rawW = anchorToWindow[anchorId];
+        if(rawW == noWindow) return false;
+        const uint32_t normW = normalize(rawW);
+        if(normW >= windowCount) return false;
+        const auto& ep = endpointPos[normW];
+        if(!ep.hasHead && !ep.hasTail) return false;
+        const uint32_t pos = anchorToBackbonePos[anchorId];
+        if(ep.hasHead && pos == ep.headPos) return true;
+        if(ep.hasTail && pos == ep.tailPos) return true;
+        return false;
+    };
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t srcId = uint64_t(source(e, anchorGraph));
+        const uint64_t dstId = uint64_t(target(e, anchorGraph));
+        anchorGraph[e].isEndpointAnchorPrev = isEndpointPosition(srcId);
+        anchorGraph[e].isEndpointAnchorNext = isEndpointPosition(dstId);
+    }
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
@@ -754,7 +775,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(edges.size() != 1) continue;
 
             // Skip if this is an endpoint edge.
-            if(anchorGraph[edges[0]].isEndpointEdge) continue;
+            if(anchorGraph[edges[0]].isEndpointAnchorPrev || anchorGraph[edges[0]].isEndpointAnchorNext) continue;
 
             disableEdge(edges[0]);
             ++singleEdgeRemovedCount;
@@ -847,7 +868,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 // Skip if any edge to/from X is an endpoint edge.
                 bool hasEndpointEdge = false;
                 for(const auto& ie : inEdges) {
-                    if(anchorGraph[ie.e].isEndpointEdge) { hasEndpointEdge = true; break; }
+                    if(anchorGraph[ie.e].isEndpointAnchorPrev || anchorGraph[ie.e].isEndpointAnchorNext) { hasEndpointEdge = true; break; }
                 }
                 if(hasEndpointEdge) continue;
                 auto outIt = outgoing.find(xWindow);
@@ -938,7 +959,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 auto oe = boost::out_edges(startAid, anchorGraph);
                 for(auto it = oe.first; it != oe.second; ++it) {
                     if(!anchorGraph[*it].useForAssembly) continue;
-                    if(anchorGraph[*it].isEndpointEdge) continue;
+                    if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                     const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                     if(tgt >= anchorCount) continue;
                     const uint32_t tgtRaw = anchorToWindow[tgt];
@@ -965,7 +986,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     auto oe2 = boost::out_edges(aid, anchorGraph);
                     for(auto it = oe2.first; it != oe2.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
-                        if(anchorGraph[*it].isEndpointEdge) continue;
+                        if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                         const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
                         if(tgt >= anchorCount || visited.count(tgt)) continue;
                         const uint32_t tgtRaw = anchorToWindow[tgt];
@@ -978,7 +999,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     auto ie = boost::in_edges(aid, anchorGraph);
                     for(auto it = ie.first; it != ie.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
-                        if(anchorGraph[*it].isEndpointEdge) continue;
+                        if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                         const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
                         if(src >= anchorCount || visited.count(src)) continue;
                         const uint32_t srcRaw = anchorToWindow[src];
@@ -1477,7 +1498,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             bool hasEndpoint = false;
             BGL_FORALL_EDGES(e2, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e2].useForAssembly) continue;
-                if(!anchorGraph[e2].isEndpointEdge) continue;
+                if(!(anchorGraph[e2].isEndpointAnchorPrev || anchorGraph[e2].isEndpointAnchorNext)) continue;
                 const uint64_t srcVal2 = uint64_t(source(e2, anchorGraph));
                 const uint64_t dstVal2 = uint64_t(target(e2, anchorGraph));
                 if(srcVal2 >= anchorCount || dstVal2 >= anchorCount) continue;
