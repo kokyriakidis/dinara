@@ -127,7 +127,10 @@ public:
     void load(const string& name);
 
     // Write the graph to GFA format.
-    void writeGfa(const string& fileName) const;
+    // If anchorWindows is provided, each link line gets a tp:Z: tag
+    // classifying it as "intra", "endpoint", or "internal".
+    void writeGfa(const string& fileName,
+                  const vector<AnchorWindow>* anchorWindows = nullptr) const;
     void writeBubbleFinderGraph(const string& fileName, bool useForAssemblyOnly = true) const;
 
     // Write Bandage color CSV: each anchor colored by its window.

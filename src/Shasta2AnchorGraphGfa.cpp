@@ -11,13 +11,40 @@
 using namespace dinara;
 using namespace std;
 
-void Shasta2AnchorGraph::writeGfa(const string& fileName) const
+void Shasta2AnchorGraph::writeGfa(const string& fileName,
+                                  const vector<AnchorWindow>* anchorWindows) const
 {
     ofstream gfa(fileName);
     if(!gfa) {
         throw runtime_error("Cannot open " + fileName + " for writing.");
     }
     gfa << "H\tVN:Z:1.0\n";
+
+    const uint64_t anchorCount = anchorToWindow.size();
+
+    auto normalize = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Build a set of endpoint window pairs from backbonePreviousWindow /
+    // backboneNextWindow. An inter-window edge is an "endpoint" edge if
+    // its (normalized) window pair appears here; otherwise it is "internal".
+    std::set<std::pair<uint32_t, uint32_t>> endpointPairs;
+    if(anchorWindows && windowCount > 0) {
+        for(uint32_t wid = 0; wid < windowCount; wid++) {
+            const auto& window = (*anchorWindows)[wid];
+            const uint32_t noW = AnchorWindowReadInterval::noWindow;
+            if(window.backbonePreviousWindow != noW) {
+                uint32_t prev = window.backbonePreviousWindow;
+                // Store both orderings so lookup is direction-independent.
+                endpointPairs.insert({std::min(wid, prev), std::max(wid, prev)});
+            }
+            if(window.backboneNextWindow != noW) {
+                uint32_t next = window.backboneNextWindow;
+                endpointPairs.insert({std::min(wid, next), std::max(wid, next)});
+            }
+        }
+    }
 
     // Collect vertices that have at least one active edge.
     std::set<vertex_descriptor> activeVertices;
@@ -36,9 +63,40 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName) const
     BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
         const auto& edge = (*this)[e];
         if(!edge.useForAssembly) continue;
-        gfa << "L\t" << source(e, *this) << "\t+\t"
-            << target(e, *this) << "\t+\t0M"
-            << "\tRC:i:" << edge.coverage() << "\n";
+
+        const auto src = source(e, *this);
+        const auto dst = target(e, *this);
+
+        gfa << "L\t" << src << "\t+\t"
+            << dst << "\t+\t0M"
+            << "\tRC:i:" << edge.coverage();
+
+        // Classify edge type if anchorWindows were provided.
+        if(anchorWindows && windowCount > 0 &&
+           uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
+            const uint32_t srcW = anchorToWindow[uint64_t(src)];
+            const uint32_t dstW = anchorToWindow[uint64_t(dst)];
+
+            if(srcW != noWindow && dstW != noWindow) {
+                const uint32_t srcNorm = normalize(srcW);
+                const uint32_t dstNorm = normalize(dstW);
+
+                if(srcNorm == dstNorm) {
+                    gfa << "\ttp:Z:intra";
+                } else {
+                    auto key = std::make_pair(
+                        std::min(srcNorm, dstNorm),
+                        std::max(srcNorm, dstNorm));
+                    if(endpointPairs.count(key)) {
+                        gfa << "\ttp:Z:endpoint";
+                    } else {
+                        gfa << "\ttp:Z:internal";
+                    }
+                }
+            }
+        }
+
+        gfa << "\n";
     }
 }
 

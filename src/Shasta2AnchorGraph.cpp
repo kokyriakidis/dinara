@@ -1323,9 +1323,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const auto& window = anchorWindows[w];
             const auto& nbrWindow = anchorWindows[neighbor];
 
-            // Check that the connection is internal for both windows.
-            if(window.backbonePreviousWindow == neighbor ||
-               window.backboneNextWindow == neighbor) continue;
+            // Check that the connection is internal for the neighbor.
+            // We don't check the spur window's endpoints — a spur with
+            // one neighbor always has that neighbor as its endpoint,
+            // so the check would always skip it.
             if(nbrWindow.backbonePreviousWindow == w ||
                nbrWindow.backboneNextWindow == w) continue;
 
