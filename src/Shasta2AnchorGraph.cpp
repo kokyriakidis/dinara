@@ -478,7 +478,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if an anchor has any active edge.
+        // Check if an anchor has any active edge (forward or RC).
         auto anchorHasActiveEdge = [&](uint64_t aid) -> bool {
             if(aid >= anchorCount) return false;
             auto oe = boost::out_edges(aid, anchorGraph);
@@ -489,6 +489,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             for(auto it = ie.first; it != ie.second; ++it) {
                 if(anchorGraph[*it].useForAssembly) return true;
             }
+            // Also check RC mirror.
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount) {
+                auto oe2 = boost::out_edges(rcAid, anchorGraph);
+                for(auto it = oe2.first; it != oe2.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) return true;
+                }
+                auto ie2 = boost::in_edges(rcAid, anchorGraph);
+                for(auto it = ie2.first; it != ie2.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) return true;
+                }
+            }
             return false;
         };
 
@@ -498,8 +510,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             // Walk the backbone read's full journey and build the sequence
             // of distinct normalized windows, considering only anchors
-            // that still have active edges.
+            // that still have active edges (forward or RC).
+            // Track which index in the sequence each journey position
+            // maps to, so we can find the correct occurrence of wid.
             std::vector<uint32_t> windowSequence;
+            std::vector<uint32_t> posToSeqIdx(journey.size(), UINT32_MAX);
             for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
                 const uint64_t aid = uint64_t(journey[pos]);
                 if(aid >= anchorCount) continue;
@@ -510,20 +525,33 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(windowSequence.empty() || windowSequence.back() != normW) {
                     windowSequence.push_back(normW);
                 }
+                posToSeqIdx[pos] = uint32_t(windowSequence.size() - 1);
             }
 
-            // Find wid in the sequence and extract prev/next.
+            // Find the occurrence of wid in the sequence that corresponds
+            // to the backbone positions. Use the first active backbone
+            // position to locate the correct occurrence (the backbone
+            // read may re-enter wid after visiting other windows, and
+            // we need the occurrence that matches the backbone span).
             window.backbonePreviousWindow = AnchorWindowReadInterval::noWindow;
             window.backboneNextWindow = AnchorWindowReadInterval::noWindow;
-            for(uint64_t i = 0; i < windowSequence.size(); i++) {
-                if(windowSequence[i] == wid) {
-                    if(i > 0) {
-                        window.backbonePreviousWindow = windowSequence[i - 1];
-                    }
-                    if(i + 1 < windowSequence.size()) {
-                        window.backboneNextWindow = windowSequence[i + 1];
-                    }
+
+            const auto& positions = window.filteredBackbonePositions;
+            uint32_t seqIdx = UINT32_MAX;
+            for(const uint32_t pos : positions) {
+                if(pos < posToSeqIdx.size() && posToSeqIdx[pos] != UINT32_MAX) {
+                    seqIdx = posToSeqIdx[pos];
                     break;
+                }
+            }
+
+            if(seqIdx != UINT32_MAX && seqIdx < windowSequence.size() &&
+               windowSequence[seqIdx] == wid) {
+                if(seqIdx > 0) {
+                    window.backbonePreviousWindow = windowSequence[seqIdx - 1];
+                }
+                if(seqIdx + 1 < windowSequence.size()) {
+                    window.backboneNextWindow = windowSequence[seqIdx + 1];
                 }
             }
         }
