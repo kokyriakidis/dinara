@@ -26,26 +26,6 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         return (w >= windowCount) ? (w - windowCount) : w;
     };
 
-    // Build a set of endpoint window pairs from backbonePreviousWindow /
-    // backboneNextWindow. An inter-window edge is an "endpoint" edge if
-    // its (normalized) window pair appears here; otherwise it is "internal".
-    std::set<std::pair<uint32_t, uint32_t>> endpointPairs;
-    if(anchorWindows && windowCount > 0) {
-        for(uint32_t wid = 0; wid < windowCount; wid++) {
-            const auto& window = (*anchorWindows)[wid];
-            const uint32_t noW = AnchorWindowReadInterval::noWindow;
-            if(window.backbonePreviousWindow != noW) {
-                uint32_t prev = window.backbonePreviousWindow;
-                // Store both orderings so lookup is direction-independent.
-                endpointPairs.insert({std::min(wid, prev), std::max(wid, prev)});
-            }
-            if(window.backboneNextWindow != noW) {
-                uint32_t next = window.backboneNextWindow;
-                endpointPairs.insert({std::min(wid, next), std::max(wid, next)});
-            }
-        }
-    }
-
     // Collect vertices that have at least one active edge.
     std::set<vertex_descriptor> activeVertices;
     BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
@@ -71,7 +51,14 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             << dst << "\t+\t0M"
             << "\tRC:i:" << edge.coverage();
 
-        // Classify edge type if anchorWindows were provided.
+        // Classify edge from each side's perspective if anchorWindows
+        // were provided. Each link gets two tags:
+        //   pw:Z: — relationship of the source anchor to its window
+        //   nw:Z: — relationship of the target anchor to its window
+        // Values: "prev" (connects to backbonePreviousWindow),
+        //         "next" (connects to backboneNextWindow),
+        //         "intra" (same window), "internal" (different window,
+        //         not a backbone transition).
         if(anchorWindows && windowCount > 0 &&
            uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
             const uint32_t srcW = anchorToWindow[uint64_t(src)];
@@ -82,16 +69,23 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
                 const uint32_t dstNorm = normalize(dstW);
 
                 if(srcNorm == dstNorm) {
-                    gfa << "\ttp:Z:intra";
+                    gfa << "\tpw:Z:intra\tnw:Z:intra";
                 } else {
-                    auto key = std::make_pair(
-                        std::min(srcNorm, dstNorm),
-                        std::max(srcNorm, dstNorm));
-                    if(endpointPairs.count(key)) {
-                        gfa << "\ttp:Z:endpoint";
-                    } else {
-                        gfa << "\ttp:Z:internal";
-                    }
+                    const uint32_t noW = AnchorWindowReadInterval::noWindow;
+
+                    // Source side: what is dstNorm to srcNorm's window?
+                    const auto& srcWindow = (*anchorWindows)[srcNorm];
+                    const char* srcTag = "internal";
+                    if(srcWindow.backbonePreviousWindow == dstNorm) srcTag = "prevEndpoint";
+                    else if(srcWindow.backboneNextWindow == dstNorm) srcTag = "nextEndpoint";
+
+                    // Target side: what is srcNorm to dstNorm's window?
+                    const auto& dstWindow = (*anchorWindows)[dstNorm];
+                    const char* dstTag = "internal";
+                    if(dstWindow.backbonePreviousWindow == srcNorm) dstTag = "prevEndpoint";
+                    else if(dstWindow.backboneNextWindow == srcNorm) dstTag = "nextEndpoint";
+
+                    gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
                 }
             }
         }
