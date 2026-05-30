@@ -975,9 +975,81 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // Trim backbone outside the bounding inter-window connection span.
+    // ========================================================================
+    // trimBackbones: remove dangling backbone ends that extend beyond
+    // the outermost inter-window connections.
+    //
+    // Each window's backbone is an ordered chain of anchors along a
+    // single read (the backbone read). The chain always goes forward:
+    //   position 0 → position 1 → ... → position N-1
+    // Intra-window edges connect consecutive positions. Inter-window
+    // edges connect backbone anchors to anchors in other windows.
+    //
+    // The backbone chain direction is fixed by construction:
+    //   - Head (position 0 side): where reads enter the window.
+    //     Inter-window edges arriving here are INCOMING (other → this).
+    //   - Tail (position N-1 side): where reads leave the window.
+    //     Inter-window edges departing here are OUTGOING (this → other).
+    //
+    // Trimming removes backbone anchors that are beyond the outermost
+    // inter-window connections:
+    //   - Head trim: removes anchors before the first one that has an
+    //     incoming inter-window edge. If no anchor has an incoming
+    //     inter-window edge, head trim is skipped entirely (the window
+    //     has no predecessor connection, so nothing to trim toward).
+    //   - Tail trim: removes anchors after the last one that has an
+    //     outgoing inter-window edge. If no anchor has an outgoing
+    //     inter-window edge, tail trim is skipped entirely.
+    //
+    // Example (positions 0..6, inter-window edges at positions 2 and 5):
+    //
+    //   A0 -- A1 -- A2 -- A3 -- A4 -- A5 -- A6
+    //                ↑ incoming          ↓ outgoing
+    //   [trimmed]    [kept .............]  [trimmed]
+    //   headTrim=2                         tailTrim=1
+    //
+    // RC mirror handling:
+    //   Each forward anchor aid has an RC mirror aid^1. The RC mirror
+    //   belongs to the virtual RC window (w + windowCount). Inter-window
+    //   edges may exist only on the RC anchor (discovered by RC-strand
+    //   reads). We must check both aid and aid^1 when deciding whether
+    //   to trim, because disableAllEdges(aid^1) will destroy the RC
+    //   anchor's edges too.
+    //
+    //   Edge direction flips on the RC mirror: the RC of edge A→B is
+    //   B^1→A^1. So:
+    //     - An OUT-edge on aid^1 = an IN-edge on aid (forward orientation)
+    //     - An IN-edge on aid^1 = an OUT-edge on aid (forward orientation)
+    //
+    // Deletion:
+    //   Trimmed anchors have no inter-window edges by construction
+    //   (otherwise the trim would have stopped before them). So
+    //   disableAllEdges only destroys intra-window edges. We call it
+    //   on both aid and aid^1 to symmetrically disconnect both the
+    //   forward and RC anchors. disableEdge() ensures each disabled
+    //   edge also disables its RC mirror edge (dst^1 → src^1).
+    //
+    // Safety checks:
+    //   - If headTrim >= positions.size() (no anchor has an incoming
+    //     inter-window edge), headTrim resets to 0 — no head trim.
+    //     The window may be isolated or tail-only; handled elsewhere.
+    //   - If headTrim + tailTrim >= positions.size(), tailTrim resets
+    //     to 0 — prevents consuming all positions from both sides.
+    //   - Windows with <= 1 backbone position are skipped.
+    //
+    // Called after each filter step to clean up backbone ends exposed
+    // by edge removal. filteredBackbonePositions is NOT updated — the
+    // trimmed anchors remain in the array but have all edges disabled.
+    // On subsequent calls, they are re-examined and re-trimmed (no-op
+    // since their edges are already disabled).
+    // ========================================================================
     auto trimBackbones = [&]() {
-        // Disable all active edges of an anchor.
+
+        // Disable all active edges of a single anchor. Iterates both
+        // out-edges and in-edges, calling disableEdge on each active
+        // one. disableEdge sets useForAssembly=false on the edge AND
+        // its RC mirror (dst^1 → src^1), so this also partially
+        // disconnects the RC anchor aid^1.
         auto disableAllEdges = [&](uint64_t aid) {
             if(aid >= anchorCount) return;
             auto oe = boost::out_edges(aid, anchorGraph);
@@ -992,11 +1064,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         };
 
+        // Normalize a window ID: RC windows (>= windowCount) map to
+        // their forward counterpart. Forward windows map to themselves.
         auto normalizeW = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Check if an anchor has an inter-window in-edge or out-edge.
+        // Check if anchor `a` has any active incoming edge from a
+        // different normalized window. An incoming edge means some
+        // other window's anchor has a directed edge INTO this anchor.
         auto anchorHasInterWindowInEdge = [&](uint64_t a) -> bool {
             if(a >= anchorCount) return false;
             const uint32_t aWin = anchorToWindow[a];
@@ -1014,6 +1090,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
             return false;
         };
+
+        // Check if anchor `a` has any active outgoing edge to a
+        // different normalized window. An outgoing edge means this
+        // anchor has a directed edge TO some other window's anchor.
         auto anchorHasInterWindowOutEdge = [&](uint64_t a) -> bool {
             if(a >= anchorCount) return false;
             const uint32_t aWin = anchorToWindow[a];
@@ -1032,18 +1112,28 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return false;
         };
 
-        // Head: check for incoming inter-window edges.
-        // On the RC mirror, direction flips: an out-edge on aid^1
-        // corresponds to an in-edge on aid in forward orientation.
+        // Check if anchor `aid` (or its RC mirror) has an incoming
+        // inter-window edge in forward orientation.
+        //
+        // For the forward anchor aid: check in-edges directly.
+        // For the RC anchor aid^1: check OUT-edges, because the RC
+        // of edge X → aid is aid^1 → X^1 (direction reverses).
+        // So an out-edge on aid^1 to another window = an in-edge
+        // on aid from that window in forward orientation.
         auto hasIncomingInterWindowEdge = [&](uint64_t aid) -> bool {
             if(anchorHasInterWindowInEdge(aid)) return true;
             const uint64_t rcAid = aid ^ 1ULL;
             return (rcAid < anchorCount && anchorHasInterWindowOutEdge(rcAid));
         };
 
-        // Tail: check for outgoing inter-window edges.
-        // On the RC mirror, direction flips: an in-edge on aid^1
-        // corresponds to an out-edge on aid in forward orientation.
+        // Check if anchor `aid` (or its RC mirror) has an outgoing
+        // inter-window edge in forward orientation.
+        //
+        // For the forward anchor aid: check out-edges directly.
+        // For the RC anchor aid^1: check IN-edges, because the RC
+        // of edge aid → Y is Y^1 → aid^1 (direction reverses).
+        // So an in-edge on aid^1 from another window = an out-edge
+        // on aid to that window in forward orientation.
         auto hasOutgoingInterWindowEdge = [&](uint64_t aid) -> bool {
             if(anchorHasInterWindowOutEdge(aid)) return true;
             const uint64_t rcAid = aid ^ 1ULL;
@@ -1053,41 +1143,75 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t trimmedVertexCount = 0;
         uint64_t trimmedWindowCount = 0;
 
+        // Iterate forward windows only. RC windows are virtual (no
+        // AnchorWindow entries). RC anchors are handled via
+        // disableAllEdges(aid^1) when their forward counterpart is
+        // trimmed.
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
             const auto& positions = window.filteredBackbonePositions;
             if(positions.size() <= 1) continue;
             const auto journey = journeys[window.backboneOrientedReadId];
 
-            // Head trim: walk from position 0 inward, trim anchors
-            // before the first one with an incoming inter-window edge.
+            // --- Head trim ---
+            // Walk from position 0 (head) inward. Count consecutive
+            // anchors that have no incoming inter-window edge. Stop
+            // at the first anchor that does — that's where the window's
+            // predecessor connection lands.
             uint64_t headTrim = 0;
             for(uint64_t i = 0; i < positions.size(); i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
                 if(hasIncomingInterWindowEdge(aid)) break;
                 ++headTrim;
             }
+            // Safety: if no anchor has an incoming inter-window edge,
+            // headTrim == positions.size(). Reset to 0 — the window
+            // has no predecessor, so don't trim the head. (The window
+            // may be a telomere start or isolated; handled elsewhere.)
             if(headTrim >= positions.size()) headTrim = 0;
 
-            // Tail trim: walk from last position inward, trim anchors
-            // after the last one with an outgoing inter-window edge.
+            // --- Tail trim ---
+            // Walk from position N-1 (tail) inward toward headTrim.
+            // Count consecutive anchors that have no outgoing
+            // inter-window edge. Stop at the first anchor that does —
+            // that's where the window's successor connection departs.
             uint64_t tailTrim = 0;
             for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
                 const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
                 if(hasOutgoingInterWindowEdge(aid)) break;
                 ++tailTrim;
             }
+            // Safety: if headTrim + tailTrim >= positions.size(), the
+            // head and tail trims overlap (no outgoing edge found in
+            // the remaining range). Reset tailTrim to 0 to avoid
+            // consuming all positions.
             if(headTrim + tailTrim >= positions.size()) tailTrim = 0;
 
+            // Nothing to trim for this window.
             if(headTrim == 0 && tailTrim == 0) continue;
             ++trimmedWindowCount;
 
+            // --- Disable edges of trimmed head anchors ---
+            // These anchors are before the first incoming inter-window
+            // edge, so they have no inter-window edges (incoming or
+            // outgoing). All their edges are intra-window.
+            // disableAllEdges(aid): disables all edges of the forward
+            //   anchor. Each disableEdge call also disables the RC
+            //   mirror edge on aid^1.
+            // disableAllEdges(aid^1): disables any remaining edges on
+            //   the RC anchor that weren't RC mirrors of aid's edges
+            //   (e.g., RC-only intra-window edges created when
+            //   addEdgeIfValid succeeded for RC but not forward).
             for(uint64_t i = 0; i < headTrim; i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
                 disableAllEdges(aid);
                 disableAllEdges(aid ^ 1ULL);
                 ++trimmedVertexCount;
             }
+
+            // --- Disable edges of trimmed tail anchors ---
+            // Same logic: these anchors are after the last outgoing
+            // inter-window edge, so they have no inter-window edges.
             for(uint64_t i = positions.size() - tailTrim; i < positions.size(); i++) {
                 const uint64_t aid = uint64_t(journey[positions[i]]);
                 disableAllEdges(aid);
