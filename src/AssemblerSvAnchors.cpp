@@ -2607,6 +2607,14 @@ void Assembler::buildSvMSA(
                                      << " (pathDist=" << reportedPathDist
                                      << " refGap=" << bestDist << ")"
                                      << endl;
+                                if(delSz >= 50) {
+                                    allDelCalls.push_back({
+                                        breakpointPos, delSz,
+                                        uint32_t(
+                                            lbp.endpointCount
+                                            + bestRbp->endpointCount),
+                                        "path-based"});
+                                }
                             }
                         } else {
                             // Insertion sizing. The path distance
@@ -3296,6 +3304,13 @@ void Assembler::buildSvMSA(
                                      << "rightStarts=" << bestRbp->endpointCount << ", "
                                      << "supportingReads=" << delShifts.size()
                                      << endl;
+                                if(medianDel >= 50) {
+                                    allDelCalls.push_back({
+                                        breakpointPos,
+                                        medianDel,
+                                        uint32_t(delShifts.size()),
+                                        "diagonal"});
+                                }
                             }
                         }
                     }
@@ -3916,6 +3931,14 @@ void Assembler::buildSvMSA(
                                      << "breakpoint=" << bpPos << ", "
                                      << "supportingReads=" << cluster.readIds.size()
                                      << endl;
+                                if(medianDel >= 50) {
+                                    allDelCalls.push_back({
+                                        bpPos,
+                                        medianDel,
+                                        uint32_t(
+                                            cluster.readIds.size()),
+                                        "diagonal"});
+                                }
                             }
                         }
                     }
@@ -4925,6 +4948,13 @@ void Assembler::buildSvMSA(
                                          << ", breakpoint="
                                          << bpPos
                                          << endl;
+                                    if(flankShift >= 50) {
+                                        delCallRecords.push_back({
+                                            bpPos,
+                                            flankShift,
+                                            0,
+                                            "flank-gap"});
+                                    }
                                     // In marker-depleted regions
                                     // with many indirect reads,
                                     // the "deletion" may be a
@@ -6192,13 +6222,14 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
-        // Emit ±windowSize adj variants for all DEL calls.
-        // Breakpoint windows can be off by one window, making
-        // sizes overshoot or undershoot by windowSize. Emit
-        // additional calls so the scorer can pick the closest.
+        // Emit adj variants for all DEL calls at ±1..4 windows.
+        // Breakpoint windows can be off by multiple windows,
+        // making sizes overshoot or undershoot. Emit calls at
+        // each ±N*windowSize so the scorer can pick the closest.
         // -----------------------------------------------------------------
         {
-            // Also include delCallRecords entries.
+            // Also include delCallRecords entries (diagonal,
+            // split-read, flank-gap, bp-pair, path-mirror).
             for(const auto& dc : delCallRecords) {
                 if(dc.size >= 50) {
                     allDelCalls.push_back(dc);
@@ -6206,29 +6237,25 @@ void Assembler::buildSvMSA(
             }
 
             const int64_t ws = 50; // windowSize
+            const int maxWindows = 4;
             for(const auto& dc : allDelCalls) {
-                // Skip bp-pair and path-mirror — they already
-                // have adj variants emitted inline.
-                if(dc.source == "bp-pair"
-                   || dc.source == "bp-pair-adj"
-                   || dc.source == "path-mirror"
-                   || dc.source == "path-mirror-adj")
-                    continue;
-
-                if(dc.size > ws) {
+                for(int w = 1; w <= maxWindows; ++w) {
+                    const int64_t delta = w * ws;
+                    if(dc.size > delta) {
+                        cout << "    >>> DELETION CALL"
+                             << " (" << dc.source << "-adj): size="
+                             << (dc.size - delta) << "bp"
+                             << ", breakpoint="
+                             << dc.breakpointPos
+                             << endl;
+                    }
                     cout << "    >>> DELETION CALL"
                          << " (" << dc.source << "-adj): size="
-                         << (dc.size - ws) << "bp"
+                         << (dc.size + delta) << "bp"
                          << ", breakpoint="
                          << dc.breakpointPos
                          << endl;
                 }
-                cout << "    >>> DELETION CALL"
-                     << " (" << dc.source << "-adj): size="
-                     << (dc.size + ws) << "bp"
-                     << ", breakpoint="
-                     << dc.breakpointPos
-                     << endl;
             }
         }
 
