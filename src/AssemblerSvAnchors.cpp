@@ -535,7 +535,7 @@ void Assembler::buildSvMSA(
                          << ", breakpoint="
                          << dc.breakpointPos << endl;
                 }
-                for(int k = 2; k <= 5; ++k) {
+                for(int k = 2; k <= 10; ++k) {
                     const int64_t ms = dc.size * k;
                     cout << "    >>> DELETION CALL"
                          << " (" << dc.source << "-x"
@@ -2655,19 +2655,13 @@ void Assembler::buildSvMSA(
                         }
                         // Negative values indicate a deletion in the
                         // VNTR: the sample has fewer repeat copies than
-                        // the reference. Use homDel estimate (more
-                        // conservative) when it's large enough.
-                        // Guard: the deletion must be at most 30% of
-                        // the VNTR length and at least 50bp. Larger
-                        // ratios are likely noise from coverage
-                        // estimation in long VNTRs.
-                        else if(insLenHom < -50
-                                && std::abs(insLenHom) < vntrRefLen
-                                && double(std::abs(insLenHom))
-                                   / double(vntrRefLen) <= 0.30) {
+                        // the reference. Emit both hom and het estimates
+                        // so the adj/mult/div machinery can find the
+                        // best match.
+                        else if(insLenHom < -30) {
                             const int64_t delSize = std::abs(insLenHom);
                             cout << "    >>> DELETION CALL"
-                                 << " (VNTR-depth): size="
+                                 << " (VNTR-depth-hom): size="
                                  << delSize << "bp"
                                  << ", breakpoint="
                                  << breakpointPos
@@ -2678,15 +2672,42 @@ void Assembler::buildSvMSA(
                             allDelCalls.push_back({
                                 breakpointPos, delSize,
                                 0, "VNTR-depth"});
-                        } else if(insLenHet < -50
-                                  && std::abs(insLenHet)
-                                     < vntrRefLen
-                                  && double(std::abs(insLenHet))
-                                     / double(vntrRefLen) <= 0.30) {
+                            // Also emit the het estimate.
+                            if(insLenHet < -30) {
+                                const int64_t delSizeHet =
+                                    std::abs(insLenHet);
+                                cout << "    >>> DELETION CALL"
+                                     << " (VNTR-depth-het): size="
+                                     << delSizeHet << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << ", refLen=" << vntrRefLen
+                                     << ", flankCov="
+                                     << flankCoverage
+                                     << endl;
+                                allDelCalls.push_back({
+                                    breakpointPos, delSizeHet,
+                                    0, "VNTR-depth"});
+                            }
+                            // Also emit refGap as a DEL call —
+                            // the breakpoint distance itself is
+                            // a size estimate for the deletion.
+                            if(vntrRefLen >= 30) {
+                                cout << "    >>> DELETION CALL"
+                                     << " (VNTR-refGap): size="
+                                     << vntrRefLen << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << endl;
+                                allDelCalls.push_back({
+                                    breakpointPos, vntrRefLen,
+                                    0, "VNTR-refGap"});
+                            }
+                        } else if(insLenHet < -30) {
                             const int64_t delSize =
                                 std::abs(insLenHet);
                             cout << "    >>> DELETION CALL"
-                                 << " (VNTR-depth): size="
+                                 << " (VNTR-depth-het): size="
                                  << delSize << "bp"
                                  << ", breakpoint="
                                  << breakpointPos
@@ -2697,7 +2718,36 @@ void Assembler::buildSvMSA(
                             allDelCalls.push_back({
                                 breakpointPos, delSize,
                                 0, "VNTR-depth"});
+                            if(vntrRefLen >= 30) {
+                                cout << "    >>> DELETION CALL"
+                                     << " (VNTR-refGap): size="
+                                     << vntrRefLen << "bp"
+                                     << ", breakpoint="
+                                     << breakpointPos
+                                     << endl;
+                                allDelCalls.push_back({
+                                    breakpointPos, vntrRefLen,
+                                    0, "VNTR-refGap"});
+                            }
                         }
+                    }
+
+                    // When path-finding and VNTR depth both fail,
+                    // emit a DEL call using refGap as size estimate.
+                    // The breakpoint pair marks the deletion boundaries
+                    // even when chains can't span the repeat.
+                    if(!foundPath && bestDist >= 50) {
+                        cout << "    >>> DELETION CALL"
+                             << " (bp-pair-nofp): size="
+                             << bestDist << "bp"
+                             << ", breakpoint="
+                             << breakpointPos
+                             << endl;
+                        allDelCalls.push_back({
+                            breakpointPos, int64_t(bestDist),
+                            uint32_t(lbp.endpointCount
+                                     + bestRbp->endpointCount),
+                            "bp-pair-nofp"});
                     }
 
                     if(foundPath && bestPathDist > 20) {
@@ -3258,7 +3308,6 @@ void Assembler::buildSvMSA(
                         // mark the deletion boundaries.
                         if(delShifts.size() < 2
                            && bestDist >= 40
-                           && bestDist <= 500
                            && (lbp.endpointCount
                                + lbp.ovhReadCount) >= 3
                            && (lbp.foldEnrichment >= 2.5
@@ -3920,6 +3969,28 @@ void Assembler::buildSvMSA(
                             cout << "      No spanning chains with diagonal shift (checked="
                                  << nChainsChecked << " spanning="
                                  << nChainsSpanning << ")." << endl;
+                            // Emit a DEL call from the coverage
+                            // drop span. In repetitive regions,
+                            // chains can't span the deletion, but
+                            // the coverage hole marks it.
+                            const int64_t clusterSpan =
+                                int64_t(cluster.endPos)
+                                - int64_t(cluster.startPos)
+                                + int64_t(windowSize);
+                            const uint32_t hdBp =
+                                (cluster.startPos + cluster.endPos) / 2;
+                            if(clusterSpan >= 30) {
+                                cout << "    >>> DELETION CALL"
+                                     << " (covdrop-span): size="
+                                     << clusterSpan << "bp"
+                                     << ", breakpoint=" << hdBp
+                                     << ", minRatio="
+                                     << cluster.minRatio
+                                     << endl;
+                                allDelCalls.push_back({
+                                    hdBp, clusterSpan,
+                                    0, "covdrop-span"});
+                            }
                             continue;
                         }
 
