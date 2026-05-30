@@ -651,14 +651,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
 
-    // Set per-anchor endpoint flags on all edges using the endpointAnchors
-    // set populated during pass 1.
+    // Set per-anchor endpoint flags on all edges.
+    // An anchor is tagged Endpoint on an edge only if it is in endpointAnchors
+    // AND the edge's window pair matches an endpoint window pair.
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) continue;
         const uint64_t srcId = uint64_t(source(e, anchorGraph));
         const uint64_t dstId = uint64_t(target(e, anchorGraph));
-        anchorGraph[e].isEndpointAnchorPrev = endpointAnchors.count(srcId) > 0;
-        anchorGraph[e].isEndpointAnchorNext = endpointAnchors.count(dstId) > 0;
+        const uint32_t srcRaw = anchorToWindow[srcId];
+        const uint32_t dstRaw = anchorToWindow[dstId];
+        const uint32_t srcNorm = normalize(srcRaw);
+        const uint32_t dstNorm = normalize(dstRaw);
+        const bool isEndpointPair = (srcNorm != dstNorm) &&
+            endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)}) > 0;
+        anchorGraph[e].isEndpointAnchorPrev = isEndpointPair && endpointAnchors.count(srcId) > 0;
+        anchorGraph[e].isEndpointAnchorNext = isEndpointPair && endpointAnchors.count(dstId) > 0;
     }
 
     // ========================================================================
