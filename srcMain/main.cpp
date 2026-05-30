@@ -4076,59 +4076,6 @@ void dinara::main::svanchors(
                      << ", breakpoint=" << ci.refPos
                      << ", reads=" << ci.readCount
                      << endl;
-                // Emit adj variants (±10 windows of 50bp).
-                const int64_t ws = 50;
-                const int maxW = 10;
-                for(int w = 1; w <= maxW; ++w) {
-                    const int64_t d = w * ws;
-                    if(ci.size > d)
-                        cout << "    >>> DELETION CALL"
-                             << " (early-CIGAR-adj): size="
-                             << (ci.size - d) << "bp"
-                             << ", breakpoint=" << ci.refPos
-                             << endl;
-                    cout << "    >>> DELETION CALL"
-                         << " (early-CIGAR-adj): size="
-                         << (ci.size + d) << "bp"
-                         << ", breakpoint=" << ci.refPos
-                         << endl;
-                }
-                // Emit fine adj (±4 steps of 10bp).
-                const int64_t fs = 10;
-                for(int f = -4; f <= 4; ++f) {
-                    if(f == 0) continue;
-                    const int64_t adj = ci.size + f * fs;
-                    if(adj > 0)
-                        cout << "    >>> DELETION CALL"
-                             << " (early-CIGAR-fine): size="
-                             << adj << "bp"
-                             << ", breakpoint=" << ci.refPos
-                             << endl;
-                }
-                // Emit integer-multiplied variants (×2..×10).
-                for(int k2 = 2; k2 <= 10; ++k2) {
-                    const int64_t ms = ci.size * k2;
-                    cout << "    >>> DELETION CALL"
-                         << " (early-CIGAR-x" << k2 << "): size="
-                         << ms << "bp"
-                         << ", breakpoint=" << ci.refPos
-                         << endl;
-                    // Adj variants around multiplied size.
-                    for(int w = 1; w <= maxW; ++w) {
-                        const int64_t d = w * ws;
-                        if(ms > d)
-                            cout << "    >>> DELETION CALL"
-                                 << " (early-CIGAR-x" << k2 << "): size="
-                                 << (ms - d) << "bp"
-                                 << ", breakpoint=" << ci.refPos
-                                 << endl;
-                        cout << "    >>> DELETION CALL"
-                             << " (early-CIGAR-x" << k2 << "): size="
-                             << (ms + d) << "bp"
-                             << ", breakpoint=" << ci.refPos
-                             << endl;
-                    }
-                }
             }
         }
     }

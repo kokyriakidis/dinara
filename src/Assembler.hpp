@@ -2635,6 +2635,23 @@ public:
         string insSeq;     // inserted sequence (for INS only)
     };
 
+    // Multi-k unique anchor deletion sizing.
+    // Finds k-mers unique in the reference (k=maxK down to minK),
+    // matches them against each read, and measures deletion size
+    // from diagonal drops in the (refPos, readPos) anchor pairs.
+    struct MultiKDelCall {
+        uint32_t breakpointPos;  // reference position of the diagonal drop
+        int64_t size;            // deletion size from diagonal drop
+        uint32_t readCount;      // number of reads supporting this size
+    };
+    vector<MultiKDelCall> multiKAnchorSizing(
+        ReadId refId,
+        const vector<ReadId>& readIds,
+        uint32_t regionStart,
+        uint32_t regionEnd,
+        uint32_t minK,
+        uint32_t maxK) const;
+
     // Parse soft-clip breakpoints and CIGAR indels from BAM.
     // Returns soft-clip breakpoints and CIGAR indel calls in
     // a single BAM pass for efficiency.
