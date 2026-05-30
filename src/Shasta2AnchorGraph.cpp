@@ -724,21 +724,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        uint64_t parallelRemovedCount = 0;
+        uint64_t bubblesPopped = 0;
+        uint64_t anchorsDisconnected = 0;
+        const uint32_t maxWindowsTraversed = 3;
 
         for(uint32_t w = 0; w < windowCount; w++) {
             const auto& window = anchorWindows[w];
-            const uint32_t prevW = window.backbonePreviousWindow;
-            const uint32_t nextW = window.backboneNextWindow;
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.size() < 3) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
 
-            // Parallel flow: backbone comes from and returns to the same window.
-            if(prevW == noWindow || nextW == noWindow) continue;
-            if(prevW != nextW) continue;
+            // Build ordered backbone anchor list and index lookup.
+            std::vector<uint64_t> bbAnchors;
+            std::map<uint64_t, uint32_t> bbAnchorIndex;
+            for(uint32_t pi = 0; pi < positions.size(); pi++) {
+                const uint64_t aid = uint64_t(journey[positions[pi]]);
+                bbAnchors.push_back(aid);
+                bbAnchorIndex[aid] = pi;
+            }
+            std::set<uint64_t> bbAnchorSet(bbAnchors.begin(), bbAnchors.end());
 
-            // For each backbone anchor, find internal inter-window outgoing
-            // edges and BFS to see if they return to a later backbone anchor.
-            // Skip endpoint connections (to prevW/nextW).
-            // Process from left to right; skip anchors already orphaned.
             const uint32_t prevW = window.backbonePreviousWindow;
             const uint32_t nextW = window.backboneNextWindow;
             std::set<uint32_t> orphanedIndices;
@@ -766,7 +771,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(!hasInternalInterWindow) continue;
 
                 // BFS from startAid through inter-window edges.
-                // If we reach another backbone anchor of w, we found a bubble.
                 struct BfsEntry {
                     uint64_t aid;
                     uint32_t windowsCrossed;
@@ -776,8 +780,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 std::queue<BfsEntry> q;
                 visited.insert(startAid);
 
-                // Seed BFS with internal inter-window neighbors of startAid.
-                // Skip endpoint windows (prevW/nextW).
+                // Seed BFS with internal inter-window neighbors.
                 auto seedBfs = [&](uint64_t aid) {
                     auto oe2 = boost::out_edges(aid, anchorGraph);
                     for(auto it = oe2.first; it != oe2.second; ++it) {
@@ -808,15 +811,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 };
                 seedBfs(startAid);
 
-                // Track the best (closest) sink backbone anchor found.
                 uint32_t bestSinkIdx = UINT32_MAX;
 
                 while(!q.empty()) {
                     auto entry = q.front();
                     q.pop();
 
-                    // Check if we reached a backbone anchor of w
-                    // (later than startIdx).
                     if(bbAnchorSet.count(entry.aid)) {
                         auto idxIt = bbAnchorIndex.find(entry.aid);
                         if(idxIt != bbAnchorIndex.end() &&
@@ -824,20 +824,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                            idxIt->second < bestSinkIdx) {
                             bestSinkIdx = idxIt->second;
                         }
-                        continue; // don't extend past backbone anchors of w
+                        continue;
                     }
 
                     if(entry.windowsCrossed >= maxWindowsTraversed) continue;
 
-                    // Extend BFS.
                     auto processNeighbor = [&](uint64_t nbrAid) {
                         if(nbrAid >= anchorCount || visited.count(nbrAid)) return;
                         const uint32_t nbrRaw = anchorToWindow[nbrAid];
                         const uint32_t nbrW = (nbrRaw != noWindow) ? normalize(nbrRaw) : noWindow;
-
-                        // Allow re-entering w only at backbone anchors.
                         if(nbrW == w && !bbAnchorSet.count(nbrAid)) return;
-
                         uint32_t newWC = entry.windowsCrossed;
                         if(nbrW != noWindow && nbrW != w && nbrW != entry.currentWindow) {
                             newWC++;
@@ -859,18 +855,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
 
                 if(bestSinkIdx == UINT32_MAX) continue;
-                if(bestSinkIdx <= startIdx + 1) continue; // no interior to pop
+                if(bestSinkIdx <= startIdx + 1) continue;
 
-                // Found bubble: startIdx → ... → bestSinkIdx.
-                // Disable intra-window edges of intermediate backbone
-                // anchors to remove the backbone segment. The anchors
-                // stay in window w but are no longer part of the active
-                // backbone chain.
                 for(uint32_t idx = startIdx + 1; idx < bestSinkIdx; idx++) {
                     if(orphanedIndices.count(idx)) continue;
                     const uint64_t aid = bbAnchors[idx];
 
-                    // Disable intra-window edges (edges to other anchors of w).
                     auto disableIntraWindow = [&](uint64_t a) {
                         if(a >= anchorCount) return;
                         auto oe4 = boost::out_edges(a, anchorGraph);
@@ -905,9 +895,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        if(parallelRemovedCount > 0) {
-            cout << "Parallel filter: removed " << parallelRemovedCount
-                 << " parallel flow edges." << endl;
+        if(bubblesPopped > 0) {
+            cout << "Bubble pop: popped " << bubblesPopped
+                 << " bubbles, disconnected " << anchorsDisconnected
+                 << " backbone anchors." << endl;
         }
     };
 
