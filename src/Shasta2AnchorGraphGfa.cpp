@@ -55,10 +55,10 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         // were provided. Each link gets two tags:
         //   pw:Z: — relationship of the source anchor to its window
         //   nw:Z: — relationship of the target anchor to its window
-        // Values: "prev" (connects to backbonePreviousWindow),
-        //         "next" (connects to backboneNextWindow),
+        // Values: "Endpoint" (backbone transition between these windows),
         //         "intra" (same window), "internal" (different window,
         //         not a backbone transition).
+        // An edge is Endpoint if EITHER side's backbone connects them.
         if(anchorWindows && windowCount > 0 &&
            uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
             const uint32_t srcW = anchorToWindow[uint64_t(src)];
@@ -71,21 +71,17 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
                 if(srcNorm == dstNorm) {
                     gfa << "\tpw:Z:intra\tnw:Z:intra";
                 } else {
-                    const uint32_t noW = AnchorWindowReadInterval::noWindow;
-
-                    // Source side: what is dstNorm to srcNorm's window?
+                    // Check if any backbone connects these two windows.
                     const auto& srcWindow = (*anchorWindows)[srcNorm];
-                    const char* srcTag = "internal";
-                    if(srcWindow.backbonePreviousWindow == dstNorm) srcTag = "prevEndpoint";
-                    else if(srcWindow.backboneNextWindow == dstNorm) srcTag = "nextEndpoint";
-
-                    // Target side: what is srcNorm to dstNorm's window?
                     const auto& dstWindow = (*anchorWindows)[dstNorm];
-                    const char* dstTag = "internal";
-                    if(dstWindow.backbonePreviousWindow == srcNorm) dstTag = "prevEndpoint";
-                    else if(dstWindow.backboneNextWindow == srcNorm) dstTag = "nextEndpoint";
+                    bool isEndpoint =
+                        srcWindow.backbonePreviousWindow == dstNorm ||
+                        srcWindow.backboneNextWindow == dstNorm ||
+                        dstWindow.backbonePreviousWindow == srcNorm ||
+                        dstWindow.backboneNextWindow == srcNorm;
 
-                    gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
+                    const char* tag = isEndpoint ? "Endpoint" : "internal";
+                    gfa << "\tpw:Z:" << tag << "\tnw:Z:" << tag;
                 }
             }
         }
