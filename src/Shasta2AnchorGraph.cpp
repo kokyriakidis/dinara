@@ -529,10 +529,197 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // Parallel filter: a window has a parallel flow if its backbone
-    // read comes from and returns to the same window (prevW == nextW).
-    // Remove only the edges between w and that neighbor.
-    auto runParallelFilter = [&]() {
+    // Case 2: Remove single internal-edge connections between windows.
+    // If two windows are connected by exactly one inter-window edge
+    // and that edge is not an endpoint connection (not matching
+    // backbonePreviousWindow or backboneNextWindow of either window),
+    // it's a spurious single-point connection — delete it.
+    auto runSingleEdgeFilter = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Count inter-window edges per (normalized) window pair.
+        // Also collect the edge descriptors.
+        std::map<std::pair<uint32_t, uint32_t>, std::vector<edge_descriptor>> pairEdges;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcRaw = anchorToWindow[srcVal];
+            const uint32_t dstRaw = anchorToWindow[dstVal];
+            if(srcRaw == noWindow || dstRaw == noWindow) continue;
+            const uint32_t s = normalize(srcRaw);
+            const uint32_t d = normalize(dstRaw);
+            if(s == d) continue;
+            auto key = (s < d) ? std::make_pair(s, d) : std::make_pair(d, s);
+            pairEdges[key].push_back(e);
+        }
+
+        uint64_t singleEdgeRemovedCount = 0;
+        for(const auto& [pair, edges] : pairEdges) {
+            if(edges.size() != 1) continue;
+            const uint32_t wA = pair.first;
+            const uint32_t wB = pair.second;
+
+            // Skip if this is an endpoint connection for either window.
+            const auto& windowA = anchorWindows[wA];
+            const auto& windowB = anchorWindows[wB];
+            if(windowA.backbonePreviousWindow == wB ||
+               windowA.backboneNextWindow == wB ||
+               windowB.backbonePreviousWindow == wA ||
+               windowB.backboneNextWindow == wA) {
+                continue;
+            }
+
+            disableEdge(edges[0]);
+            ++singleEdgeRemovedCount;
+        }
+
+        if(singleEdgeRemovedCount > 0) {
+            cout << "Single-edge filter: removed " << singleEdgeRemovedCount
+                 << " single-point internal connections." << endl;
+        }
+    };
+
+    // Case 1: Bypass detour through another window.
+    // Walking window w's backbone, if we find an incoming edge from
+    // window X at anchor a_i and an outgoing edge to the same window X
+    // at a later anchor a_j, then X's path detours through w's backbone.
+    // Create a bypass edge in X (connecting X's anchors on either side
+    // of the detour) and remove the inter-window edges.
+    //
+    // Example:
+    //   Before: Window X: ... → x1          x2 → ...
+    //                           |           ↑
+    //           Window w: a0 → a_i → ... → a_j → a4
+    //
+    //   After:  Window X: ... → x1 ------→ x2 → ...  (bypass edge)
+    //           Window w: a0 → a_i → ... → a_j → a4  (backbone intact)
+    //           Inter-window edges x1→a_i and a_j→x2 removed.
+    //
+    auto runBypassDetourFilter = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        uint64_t detoursFixed = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.size() < 2) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            // Walk backbone anchors and collect inter-window connections.
+            // For each backbone anchor, record incoming and outgoing
+            // inter-window edges grouped by neighbor window.
+            struct InterWindowEdge {
+                edge_descriptor e;
+                uint64_t otherAnchor; // anchor in the other window
+                uint32_t bbIdx;       // index in backbone
+            };
+            // incoming[neighborWindow] = edges coming INTO w from that window
+            // outgoing[neighborWindow] = edges going OUT of w to that window
+            std::map<uint32_t, std::vector<InterWindowEdge>> incoming;
+            std::map<uint32_t, std::vector<InterWindowEdge>> outgoing;
+
+            for(uint32_t pi = 0; pi < positions.size(); pi++) {
+                const uint64_t aid = uint64_t(journey[positions[pi]]);
+                if(aid >= anchorCount) continue;
+
+                // Check incoming edges (from other windows into this anchor).
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                    if(src >= anchorCount) continue;
+                    const uint32_t srcRaw = anchorToWindow[src];
+                    if(srcRaw == noWindow) continue;
+                    const uint32_t srcW = normalize(srcRaw);
+                    if(srcW == w) continue; // intra-window, skip
+                    incoming[srcW].push_back({*it, src, pi});
+                }
+
+                // Check outgoing edges (from this anchor to other windows).
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                    if(tgt >= anchorCount) continue;
+                    const uint32_t tgtRaw = anchorToWindow[tgt];
+                    if(tgtRaw == noWindow) continue;
+                    const uint32_t tgtW = normalize(tgtRaw);
+                    if(tgtW == w) continue;
+                    outgoing[tgtW].push_back({*it, tgt, pi});
+                }
+            }
+
+            // For each neighbor window X that has both incoming and outgoing
+            // connections, find pairs where incoming is at an earlier backbone
+            // position than outgoing (X enters w then leaves w).
+            // Skip endpoint connections — X is a legitimate neighbor.
+            const uint32_t prevW = window.backbonePreviousWindow;
+            const uint32_t nextW = window.backboneNextWindow;
+            for(const auto& [xWindow, inEdges] : incoming) {
+                // Skip if X is an endpoint of w or w is an endpoint of X.
+                if(xWindow == prevW || xWindow == nextW) continue;
+                const auto& xWin = anchorWindows[xWindow];
+                if(xWin.backbonePreviousWindow == w || xWin.backboneNextWindow == w) continue;
+                auto outIt = outgoing.find(xWindow);
+                if(outIt == outgoing.end()) continue;
+                const auto& outEdges = outIt->second;
+
+                // Find earliest incoming and latest outgoing.
+                // incoming at a_i (earliest), outgoing at a_j (latest after a_i).
+                for(const auto& inE : inEdges) {
+                    for(const auto& outE : outEdges) {
+                        if(outE.bbIdx <= inE.bbIdx) continue;
+
+                        // X enters w at inE.bbIdx, leaves at outE.bbIdx.
+                        // Create bypass edge in X: inE.otherAnchor → outE.otherAnchor
+                        const Shasta2AnchorId bypassSrc(inE.otherAnchor);
+                        const Shasta2AnchorId bypassDst(outE.otherAnchor);
+                        const bool bypassCreated = addEdgeIfValid(bypassSrc, bypassDst);
+                        if(!bypassCreated) continue;
+                        // Also create RC mirror bypass edge.
+                        const Shasta2AnchorId rcBypassSrc(outE.otherAnchor ^ 1ULL);
+                        const Shasta2AnchorId rcBypassDst(inE.otherAnchor ^ 1ULL);
+                        addEdgeIfValid(rcBypassSrc, rcBypassDst);
+
+                        // Remove the inter-window edges.
+                        disableEdge(inE.e);
+                        disableEdge(outE.e);
+                        ++detoursFixed;
+                    }
+                }
+            }
+        }
+
+        if(detoursFixed > 0) {
+            cout << "Bypass detour filter: fixed " << detoursFixed
+                 << " detours through other windows." << endl;
+        }
+    };
+
+    // Bubble popping filter (graph surgery): for each window, detect
+    // bubbles where inter-window edges create alternate paths between
+    // backbone anchors. When found, keep the inter-window path and
+    // remove the intra-window backbone segment between the two connection
+    // points. Intermediate backbone anchors become orphaned.
+    //
+    // Example:
+    //   Before: a0 → a1 → a2 → a3 → a4  (backbone of w)
+    //                 |              ↑
+    //                 → [X] ------→ |    (inter-window path)
+    //
+    //   After:  a0 → a1             a3 → a4  (backbone of w, linearized)
+    //                 |              ↑
+    //                 → [X] ------→ |    (inter-window path kept)
+    //           a2 orphaned (all edges disabled)
+    //
+    auto runBubblePopFilter = [&]() {
         auto normalize = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
@@ -548,22 +735,173 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(prevW == noWindow || nextW == noWindow) continue;
             if(prevW != nextW) continue;
 
-            // Remove edges between w and prevW (== nextW).
-            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-                if(!anchorGraph[e].useForAssembly) continue;
-                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
-                const uint32_t srcRaw = anchorToWindow[srcVal];
-                const uint32_t dstRaw = anchorToWindow[dstVal];
-                if(srcRaw == noWindow || dstRaw == noWindow) continue;
-                const uint32_t s = normalize(srcRaw);
-                const uint32_t d = normalize(dstRaw);
-                if(s == d) continue;
-                if((s == w && d == prevW) || (d == w && s == prevW)) {
-                    disableEdge(e);
-                    ++parallelRemovedCount;
+            // For each backbone anchor, find internal inter-window outgoing
+            // edges and BFS to see if they return to a later backbone anchor.
+            // Skip endpoint connections (to prevW/nextW).
+            // Process from left to right; skip anchors already orphaned.
+            const uint32_t prevW = window.backbonePreviousWindow;
+            const uint32_t nextW = window.backboneNextWindow;
+            std::set<uint32_t> orphanedIndices;
+
+            for(uint32_t startIdx = 0; startIdx < bbAnchors.size(); startIdx++) {
+                if(orphanedIndices.count(startIdx)) continue;
+                const uint64_t startAid = bbAnchors[startIdx];
+
+                // Check for internal inter-window outgoing edges
+                // (skip edges to endpoint windows).
+                bool hasInternalInterWindow = false;
+                auto oe = boost::out_edges(startAid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) {
+                    if(!anchorGraph[*it].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                    if(tgt >= anchorCount) continue;
+                    const uint32_t tgtRaw = anchorToWindow[tgt];
+                    if(tgtRaw == noWindow) continue;
+                    const uint32_t tgtW = normalize(tgtRaw);
+                    if(tgtW == w) continue;
+                    if(tgtW == prevW || tgtW == nextW) continue;
+                    hasInternalInterWindow = true;
+                    break;
                 }
+                if(!hasInternalInterWindow) continue;
+
+                // BFS from startAid through inter-window edges.
+                // If we reach another backbone anchor of w, we found a bubble.
+                struct BfsEntry {
+                    uint64_t aid;
+                    uint32_t windowsCrossed;
+                    uint32_t currentWindow;
+                };
+                std::set<uint64_t> visited;
+                std::queue<BfsEntry> q;
+                visited.insert(startAid);
+
+                // Seed BFS with internal inter-window neighbors of startAid.
+                // Skip endpoint windows (prevW/nextW).
+                auto seedBfs = [&](uint64_t aid) {
+                    auto oe2 = boost::out_edges(aid, anchorGraph);
+                    for(auto it = oe2.first; it != oe2.second; ++it) {
+                        if(!anchorGraph[*it].useForAssembly) continue;
+                        const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                        if(tgt >= anchorCount || visited.count(tgt)) continue;
+                        const uint32_t tgtRaw = anchorToWindow[tgt];
+                        if(tgtRaw == noWindow) continue;
+                        const uint32_t tgtW = normalize(tgtRaw);
+                        if(tgtW == w) continue;
+                        if(tgtW == prevW || tgtW == nextW) continue;
+                        visited.insert(tgt);
+                        q.push({tgt, 1, tgtW});
+                    }
+                    auto ie = boost::in_edges(aid, anchorGraph);
+                    for(auto it = ie.first; it != ie.second; ++it) {
+                        if(!anchorGraph[*it].useForAssembly) continue;
+                        const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                        if(src >= anchorCount || visited.count(src)) continue;
+                        const uint32_t srcRaw = anchorToWindow[src];
+                        if(srcRaw == noWindow) continue;
+                        const uint32_t srcW = normalize(srcRaw);
+                        if(srcW == w) continue;
+                        if(srcW == prevW || srcW == nextW) continue;
+                        visited.insert(src);
+                        q.push({src, 1, srcW});
+                    }
+                };
+                seedBfs(startAid);
+
+                // Track the best (closest) sink backbone anchor found.
+                uint32_t bestSinkIdx = UINT32_MAX;
+
+                while(!q.empty()) {
+                    auto entry = q.front();
+                    q.pop();
+
+                    // Check if we reached a backbone anchor of w
+                    // (later than startIdx).
+                    if(bbAnchorSet.count(entry.aid)) {
+                        auto idxIt = bbAnchorIndex.find(entry.aid);
+                        if(idxIt != bbAnchorIndex.end() &&
+                           idxIt->second > startIdx &&
+                           idxIt->second < bestSinkIdx) {
+                            bestSinkIdx = idxIt->second;
+                        }
+                        continue; // don't extend past backbone anchors of w
+                    }
+
+                    if(entry.windowsCrossed >= maxWindowsTraversed) continue;
+
+                    // Extend BFS.
+                    auto processNeighbor = [&](uint64_t nbrAid) {
+                        if(nbrAid >= anchorCount || visited.count(nbrAid)) return;
+                        const uint32_t nbrRaw = anchorToWindow[nbrAid];
+                        const uint32_t nbrW = (nbrRaw != noWindow) ? normalize(nbrRaw) : noWindow;
+
+                        // Allow re-entering w only at backbone anchors.
+                        if(nbrW == w && !bbAnchorSet.count(nbrAid)) return;
+
+                        uint32_t newWC = entry.windowsCrossed;
+                        if(nbrW != noWindow && nbrW != w && nbrW != entry.currentWindow) {
+                            newWC++;
+                        }
+                        visited.insert(nbrAid);
+                        q.push({nbrAid, newWC, nbrW});
+                    };
+
+                    auto oe3 = boost::out_edges(entry.aid, anchorGraph);
+                    for(auto it = oe3.first; it != oe3.second; ++it) {
+                        if(!anchorGraph[*it].useForAssembly) continue;
+                        processNeighbor(uint64_t(boost::target(*it, anchorGraph)));
+                    }
+                    auto ie3 = boost::in_edges(entry.aid, anchorGraph);
+                    for(auto it = ie3.first; it != ie3.second; ++it) {
+                        if(!anchorGraph[*it].useForAssembly) continue;
+                        processNeighbor(uint64_t(boost::source(*it, anchorGraph)));
+                    }
+                }
+
+                if(bestSinkIdx == UINT32_MAX) continue;
+                if(bestSinkIdx <= startIdx + 1) continue; // no interior to pop
+
+                // Found bubble: startIdx → ... → bestSinkIdx.
+                // Disable intra-window edges of intermediate backbone
+                // anchors to remove the backbone segment. The anchors
+                // stay in window w but are no longer part of the active
+                // backbone chain.
+                for(uint32_t idx = startIdx + 1; idx < bestSinkIdx; idx++) {
+                    if(orphanedIndices.count(idx)) continue;
+                    const uint64_t aid = bbAnchors[idx];
+
+                    // Disable intra-window edges (edges to other anchors of w).
+                    auto disableIntraWindow = [&](uint64_t a) {
+                        if(a >= anchorCount) return;
+                        auto oe4 = boost::out_edges(a, anchorGraph);
+                        for(auto it = oe4.first; it != oe4.second; ++it) {
+                            if(!anchorGraph[*it].useForAssembly) continue;
+                            const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                            if(tgt >= anchorCount) continue;
+                            const uint32_t tgtRaw = anchorToWindow[tgt];
+                            if(tgtRaw == noWindow) continue;
+                            if(normalize(tgtRaw) == w) {
+                                disableEdge(*it);
+                            }
+                        }
+                        auto ie4 = boost::in_edges(a, anchorGraph);
+                        for(auto it = ie4.first; it != ie4.second; ++it) {
+                            if(!anchorGraph[*it].useForAssembly) continue;
+                            const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                            if(src >= anchorCount) continue;
+                            const uint32_t srcRaw = anchorToWindow[src];
+                            if(srcRaw == noWindow) continue;
+                            if(normalize(srcRaw) == w) {
+                                disableEdge(*it);
+                            }
+                        }
+                    };
+                    disableIntraWindow(aid);
+
+                    orphanedIndices.insert(idx);
+                    ++anchorsDisconnected;
+                }
+                ++bubblesPopped;
             }
         }
 
@@ -791,6 +1129,73 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //     Count maps are updated by disableAndUpdateCounts before re-check.
     // 10. Empty edgeIndices: if a window appears dangling by raw counts but
     //     has no active edges (stale counts from backbone cleanup), skip it.
+    // Remove dead-end spurs: windows that connect to exactly one other
+    // window, and that connection is internal (not an endpoint connection
+    // for either window). The spur adds nothing to the graph.
+    auto removeDeadEndSpurs = [&]() {
+        auto normalize = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+
+        // Build per-window neighbor sets from active edges.
+        std::map<uint32_t, std::set<uint32_t>> neighbors;
+        BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+            if(!anchorGraph[e].useForAssembly) continue;
+            const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+            const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+            if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+            const uint32_t srcRaw = anchorToWindow[srcVal];
+            const uint32_t dstRaw = anchorToWindow[dstVal];
+            if(srcRaw == noWindow || dstRaw == noWindow) continue;
+            const uint32_t s = normalize(srcRaw);
+            const uint32_t d = normalize(dstRaw);
+            if(s == d) continue;
+            neighbors[s].insert(d);
+            neighbors[d].insert(s);
+        }
+
+        uint64_t spursRemoved = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            auto it = neighbors.find(w);
+            if(it == neighbors.end()) continue;
+            if(it->second.size() != 1) continue;
+
+            const uint32_t neighbor = *it->second.begin();
+            const auto& window = anchorWindows[w];
+            const auto& nbrWindow = anchorWindows[neighbor];
+
+            // Check that the connection is internal for both windows.
+            if(window.backbonePreviousWindow == neighbor ||
+               window.backboneNextWindow == neighbor) continue;
+            if(nbrWindow.backbonePreviousWindow == w ||
+               nbrWindow.backboneNextWindow == w) continue;
+
+            // Dead-end spur. Disable all inter-window edges of w.
+            BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
+                if(!anchorGraph[e].useForAssembly) continue;
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if(srcVal >= anchorCount || dstVal >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[srcVal];
+                const uint32_t dstRaw = anchorToWindow[dstVal];
+                if(srcRaw == noWindow || dstRaw == noWindow) continue;
+                const uint32_t s = normalize(srcRaw);
+                const uint32_t d = normalize(dstRaw);
+                if(s == d) continue;
+                if(s == w || d == w) {
+                    disableEdge(e);
+                }
+            }
+            ++spursRemoved;
+        }
+
+        if(spursRemoved > 0) {
+            cout << "Dead-end spur removal: removed " << spursRemoved
+                 << " spur windows." << endl;
+        }
+    };
+
     auto removeDanglingWindows = [&](const string& label) {
         auto normalize = [&](uint32_t w2) -> uint32_t {
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
@@ -1298,10 +1703,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // ========================================================================
     trimBackbones();
     recomputeBackboneEndpoints();
-    runShortcutFilter();
+    removeDeadEndSpurs();           // Remove single-neighbor internal spurs
     trimBackbones();
     recomputeBackboneEndpoints();
-    runParallelFilter();
+    runSingleEdgeFilter();          // Case 2: remove single-point connections
+    trimBackbones();
+    recomputeBackboneEndpoints();
+    runBypassDetourFilter();        // Case 1: bypass detours through other windows
+    trimBackbones();
+    recomputeBackboneEndpoints();
+    runBubblePopFilter();           // Case 3: pop bubbles returning to same window
+    trimBackbones();
+    recomputeBackboneEndpoints();
+    runShortcutFilter();
     trimBackbones();
     recomputeBackboneEndpoints();
     runCrossWindowFilter();

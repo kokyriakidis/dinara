@@ -90,15 +90,18 @@ Prints per-window incoming/outgoing counts and transition flows.
 
 All edge disabling goes through `disableEdge()`, which sets `useForAssembly=false` on the edge and its RC mirror (`dst^1 → src^1`). Edges remain in the graph but are excluded from assembly and GFA/CSV output.
 
-The pipeline runs `trimBackbones()` and `recomputeBackboneEndpoints()` between each filter so every filter sees a clean graph with accurate backbone endpoint data.
+The pipeline runs `trimBackbones()` between each filter and `recomputeBackboneEndpoints()` before filters that use backbone endpoint fields.
 
 ```
 trimBackbones()
-recomputeBackboneEndpoints()
-runShortcutFilter()
+runSingleEdgeFilter()           // Case 2
+trimBackbones()
+runBypassDetourFilter()         // Case 1
+trimBackbones()
+runBubblePopFilter()            // Case 3
 trimBackbones()
 recomputeBackboneEndpoints()
-runParallelFilter()
+runShortcutFilter()
 trimBackbones()
 recomputeBackboneEndpoints()
 runCrossWindowFilter()
@@ -110,6 +113,39 @@ trimBackbones()
 removeDanglingWindowsIterative("post-filter")
 ```
 
+#### Graph Surgery Filters (Cases 1–3)
+
+Three filters that restructure inter-window edges to linearize the graph:
+
+#### `runSingleEdgeFilter()` (Case 2)
+If two windows are connected by exactly one inter-window edge, it's a spurious single-point connection. Delete it and its RC mirror.
+
+#### `runBypassDetourFilter()` (Case 1)
+Walking window `w`'s backbone, if window X has an incoming edge at backbone anchor `a_i` and an outgoing edge at a later anchor `a_j`, then X's path detours through `w`. Create a bypass edge in X (connecting X's anchors on either side of the detour), then remove the inter-window edges. Window `w`'s backbone stays intact.
+
+```
+Before: Window X: ... → x1          x2 → ...
+                         |           ↑
+        Window w: a0 → a_i → ... → a_j → a4
+
+After:  Window X: ... → x1 ------→ x2 → ...  (bypass edge created)
+        Window w: a0 → a_i → ... → a_j → a4  (backbone intact)
+```
+
+#### `runBubblePopFilter()` (Case 3)
+For each backbone anchor with inter-window edges, BFS through the anchor graph (limited by windows traversed, max 3). If the BFS reaches a later backbone anchor of the same window, a bubble exists. Keep the inter-window path, disable intra-window edges of intermediate backbone anchors.
+
+```
+Before: a0 → a1 → a2 → a3 → a4  (backbone of w)
+              |              ↑
+              → [X] ------→ |
+
+After:  a0 → a1             a3 → a4  (linearized)
+              |              ↑
+              → [X] ------→ |
+        a2 disconnected from backbone chain
+```
+
 #### `trimBackbones()`
 Symmetric head/tail trim. Walks from both ends of each window's backbone, stops at the first anchor with an active inter-window edge (checking both forward and RC mirror). Disables all edges of trimmed anchors and their RC mirrors.
 
@@ -118,9 +154,6 @@ For each window, walks the backbone read's full journey, builds a window sequenc
 
 #### `runShortcutFilter()`
 A window is a **shortcut** if `prevW ≠ nextW`, both are not `noWindow`, and `prevW` and `nextW` are directly connected (have an anchor-level edge between them). The window is a redundant bypass. Removes only edges between `w↔prevW` and `w↔nextW`; edges to other windows are preserved.
-
-#### `runParallelFilter()`
-A window has a **parallel flow** if `prevW == nextW` (and not `noWindow`). The backbone comes from and returns to the same window (A→w→A pattern). Removes edges between `w` and `prevW`.
 
 #### `runCrossWindowFilter()`
 A window is a **cross-window** if `prevW ≠ nextW`, both are not `noWindow`, and `prevW` and `nextW` are NOT connected. The backbone bridges unrelated regions. Removes all inter-window edges of `w`, making it isolated for cleanup by `removeIsolatedWindows()`.
