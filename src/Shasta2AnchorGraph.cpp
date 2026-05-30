@@ -652,26 +652,66 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Set per-anchor endpoint flags on all inter-window edges.
     // An anchor is an endpoint anchor if its backbone position matches
-    // the head or tail endpoint position of its window.
-    auto isEndpointPosition = [&](uint64_t anchorId) -> bool {
-        if(anchorId >= anchorCount) return false;
-        const uint32_t rawW = anchorToWindow[anchorId];
-        if(rawW == noWindow) return false;
-        const uint32_t normW = normalize(rawW);
-        if(normW >= windowCount) return false;
-        const auto& ep = endpointPos[normW];
-        if(!ep.hasHead && !ep.hasTail) return false;
-        const uint32_t pos = anchorToBackbonePos[anchorId];
-        if(ep.hasHead && pos == ep.headPos) return true;
-        if(ep.hasTail && pos == ep.tailPos) return true;
-        return false;
-    };
+    // Set per-anchor endpoint flags on all edges.
+    // An anchor is an endpoint anchor if it is at the first or last
+    // position of its window's backbone (after early trim).
+    // Build the set of first/last backbone positions per window.
+    std::set<uint64_t> endpointPositionAnchors;
+    for(uint32_t w = 0; w < windowCount; w++) {
+        const auto& window = anchorWindows[w];
+        const auto& positions = window.filteredBackbonePositions;
+        if(positions.empty()) continue;
+        const auto journey = journeys[window.backboneOrientedReadId];
+
+        // Find first and last backbone positions that still have active edges.
+        for(uint32_t i = 0; i < positions.size(); i++) {
+            const uint64_t aid = uint64_t(journey[positions[i]]);
+            if(aid >= anchorCount) continue;
+            // Check if this anchor has any active edge.
+            bool hasActive = false;
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+            }
+            if(!hasActive) {
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+                }
+            }
+            if(hasActive) {
+                endpointPositionAnchors.insert(aid);
+                endpointPositionAnchors.insert(aid ^ 1ULL);
+                break;
+            }
+        }
+        for(int i = int(positions.size()) - 1; i >= 0; i--) {
+            const uint64_t aid = uint64_t(journey[positions[i]]);
+            if(aid >= anchorCount) continue;
+            bool hasActive = false;
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+            }
+            if(!hasActive) {
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) {
+                    if(anchorGraph[*it].useForAssembly) { hasActive = true; break; }
+                }
+            }
+            if(hasActive) {
+                endpointPositionAnchors.insert(aid);
+                endpointPositionAnchors.insert(aid ^ 1ULL);
+                break;
+            }
+        }
+    }
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) continue;
         const uint64_t srcId = uint64_t(source(e, anchorGraph));
         const uint64_t dstId = uint64_t(target(e, anchorGraph));
-        anchorGraph[e].isEndpointAnchorPrev = isEndpointPosition(srcId);
-        anchorGraph[e].isEndpointAnchorNext = isEndpointPosition(dstId);
+        anchorGraph[e].isEndpointAnchorPrev = endpointPositionAnchors.count(srcId) > 0;
+        anchorGraph[e].isEndpointAnchorNext = endpointPositionAnchors.count(dstId) > 0;
     }
 
     // ========================================================================
@@ -680,67 +720,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Use the member function disableEdge() for all edge disabling.
     // (Defined at the end of this file.)
-
-    // Recompute backbonePreviousWindow / backboneNextWindow for each window
-    // based on current active edges. Must be called after any filter that
-    // changes edge state before filters that use these fields.
-    auto recomputeBackboneEndpoints = [&]() {
-        auto normalize = [&](uint32_t w2) -> uint32_t {
-            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
-        };
-
-        for(uint32_t wid = 0; wid < windowCount; wid++) {
-            auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
-            const auto journey = journeys[window.backboneOrientedReadId];
-
-            // Walk the backbone read's full journey and build the sequence
-            // of distinct normalized windows. Use anchorToWindow directly
-            // (not filtered by active edges) because the backbone read's
-            // path through windows is a property of the read, not the
-            // current edge state. Filtering by active edges would miss
-            // windows whose connecting anchors were trimmed.
-            std::vector<uint32_t> windowSequence;
-            std::vector<uint32_t> posToSeqIdx(journey.size(), UINT32_MAX);
-            for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
-                const uint64_t aid = uint64_t(journey[pos]);
-                if(aid >= anchorCount) continue;
-                const uint32_t rawW = anchorToWindow[aid];
-                if(rawW == noWindow) continue;
-                const uint32_t normW = normalize(rawW);
-                if(windowSequence.empty() || windowSequence.back() != normW) {
-                    windowSequence.push_back(normW);
-                }
-                posToSeqIdx[pos] = uint32_t(windowSequence.size() - 1);
-            }
-
-            // Find the occurrence of wid in the sequence that corresponds
-            // to the backbone positions. Use the first backbone position
-            // to locate the correct occurrence (the backbone read may
-            // re-enter wid after visiting other windows, and we need the
-            // occurrence that matches the backbone span).
-            window.backbonePreviousWindow = AnchorWindowReadInterval::noWindow;
-            window.backboneNextWindow = AnchorWindowReadInterval::noWindow;
-
-            const auto& positions = window.filteredBackbonePositions;
-            uint32_t seqIdx = UINT32_MAX;
-            for(const uint32_t pos : positions) {
-                if(pos < posToSeqIdx.size() && posToSeqIdx[pos] != UINT32_MAX) {
-                    seqIdx = posToSeqIdx[pos];
-                    break;
-                }
-            }
-
-            if(seqIdx != UINT32_MAX && seqIdx < windowSequence.size() &&
-               windowSequence[seqIdx] == wid) {
-                if(seqIdx > 0) {
-                    window.backbonePreviousWindow = windowSequence[seqIdx - 1];
-                }
-                if(seqIdx + 1 < windowSequence.size()) {
-                    window.backboneNextWindow = windowSequence[seqIdx + 1];
-                }
-            }
-        }
-    };
 
     // Case 2: Remove single internal-edge connections between windows.
     // If two windows are connected by exactly one inter-window edge
@@ -2041,26 +2020,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // ========================================================================
     // Filter pipeline: trimBackbones runs after each filter to clean up
-    // backbone ends exposed by edge removal. recomputeBackboneEndpoints
-    // runs before filters that use backbonePreviousWindow/backboneNextWindow.
+    // backbone ends exposed by edge removal.
+    // backbonePreviousWindow/backboneNextWindow are set once during
+    // construction and do not change (recomputeBackboneEndpoints is not
+    // needed since it always returns the same result).
     // ========================================================================
     trimBackbones();
-    recomputeBackboneEndpoints();
     removeDeadEndSpurs();           // Remove single-neighbor internal spurs
     trimBackbones();
-    recomputeBackboneEndpoints();
     runSingleEdgeFilter();          // Case 2: remove single-point connections
     trimBackbones();
-    recomputeBackboneEndpoints();
     runBypassDetourFilter();        // Case 1: bypass detours through other windows
     trimBackbones();
-    recomputeBackboneEndpoints();
     runBubblePopFilter();           // Case 3: pop bubbles returning to same window
     trimBackbones();
-    recomputeBackboneEndpoints();
     runShortcutFilter();
     trimBackbones();
-    recomputeBackboneEndpoints();
     runCrossWindowFilter();
     trimBackbones();
     removeIsolatedWindows();
