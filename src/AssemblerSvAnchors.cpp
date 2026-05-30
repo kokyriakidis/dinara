@@ -6953,22 +6953,37 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         const double topDiag = peaks[0].center;
         const double topScore = peaks[0].score;
 
-        // Find secondary peak = deletion signal.
-        for(size_t pi = 1; pi < peaks.size(); ++pi) {
-            if(peaks[pi].score < topScore * 0.10) break;
-
-            const double gap = topDiag - peaks[pi].center;
-            if(gap < 20.0 || gap > 2000.0) continue;
-
-            allDelSignals.push_back(
-                {gap, uint32_t(ri)});
-            break;
+        // Emit pairwise gaps between all strong peaks.
+        // In tandem repeats, the deletion may show up as the
+        // gap between peaks 2 and 3 (not 1 and 2), because
+        // peak 2 is a repeat-period artifact. Emitting all
+        // pairwise gaps lets cross-read clustering find the
+        // true deletion.
+        const size_t maxPeaks = std::min(peaks.size(),
+                                         size_t(6));
+        for(size_t pi = 0; pi < maxPeaks; ++pi) {
+            if(pi > 0
+               && peaks[pi].score < topScore * 0.05)
+                break;
+            for(size_t pj = pi + 1; pj < maxPeaks;
+                ++pj) {
+                if(peaks[pj].score < topScore * 0.05)
+                    break;
+                const double gap =
+                    peaks[pi].center - peaks[pj].center;
+                if(gap >= 20.0 && gap <= 2000.0) {
+                    allDelSignals.push_back(
+                        {gap, uint32_t(ri)});
+                }
+            }
         }
     }
 
     if(allDelSignals.empty()) return result;
 
     // Phase 3: Cluster deletion signals by size.
+    // Count unique reads per cluster (a read can contribute
+    // multiple signals from different secondary peaks).
     sort(allDelSignals.begin(), allDelSignals.end(),
         [](const DelSignal& a, const DelSignal& b) {
             return a.gapSize < b.gapSize;
@@ -6995,13 +7010,17 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         }
         used[i] = true;
 
+        // Compute average size and unique read count.
         double sizeSum = 0;
+        std::set<uint32_t> uniqueReads;
         for(const size_t c : cluster) {
             sizeSum += allDelSignals[c].gapSize;
+            uniqueReads.insert(allDelSignals[c].readIdx);
         }
         const int64_t avgSize =
             int64_t(sizeSum / double(cluster.size()) + 0.5);
-        const uint32_t count = uint32_t(cluster.size());
+        const uint32_t readCount =
+            uint32_t(uniqueReads.size());
 
         // Deduplicate (same size ±10%).
         bool duplicate = false;
@@ -7015,10 +7034,9 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
             }
         }
         if(!duplicate) {
-            // Use region midpoint as breakpoint estimate.
             const uint32_t bp =
                 (regionStart + regionEnd) / 2;
-            result.push_back({bp, avgSize, count});
+            result.push_back({bp, avgSize, readCount});
         }
     }
 
