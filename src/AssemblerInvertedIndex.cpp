@@ -2013,6 +2013,7 @@ static inline void configureInvertedIndexDataForChaining(
     InvertedIndexData& data,
     const OverlapCandidatesOptions& overlapCandidatesOptions,
     const uint64_t coverageHet,
+    const uint64_t coverageHom,
     const double maxDriftRate)
 {
     data.maxDriftRate = maxDriftRate;
@@ -2037,6 +2038,10 @@ static inline void configureInvertedIndexDataForChaining(
     data.mcopyOcvWeakKeepRatio = overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio;
     data.minOverlapLength = overlapCandidatesOptions.minOverlapLength;
     data.maxEndFuzz = overlapCandidatesOptions.maxEndFuzz;
+    // Effective chaining cutoff: min(coverageHom * 5, maxChainingFreq).
+    // Matches hifiasm's min(hom_cov * 5, max_kmer_cnt) logic.
+    data.maxChainingFreq = uint32_t(std::min(coverageHom * 5,
+        uint64_t(overlapCandidatesOptions.maxChainingFreq)));
     data.chainingMode = overlapCandidatesOptions.chainingMode;
     data.minimap2Bw = overlapCandidatesOptions.minimap2Bw;
     data.minimap2MaxGap = overlapCandidatesOptions.minimap2MaxGap;
@@ -2250,6 +2255,7 @@ private:
         const int32_t minimap2MaxGap = invertedIndexData.minimap2MaxGap;
         const int32_t minimap2MinChainScore = invertedIndexData.minimap2MinChainScore;
         const uint64_t referenceReadCount = invertedIndexData.referenceReadCount;
+        const uint32_t maxChainingFreq = invertedIndexData.maxChainingFreq;
 
         uint64_t startBatch, endBatch;
         while(getNextBatch(startBatch, endBatch)) {
@@ -2358,7 +2364,7 @@ private:
                         slotIdx = (slotIdx + 1) & hashMask;
                     }
 
-                    if(!found) {
+                    if(!found || (maxChainingFreq > 0 && count > maxChainingFreq)) {
                         if(downsampleHighFrequencyMarkers) {
                             doFlushStreak(posA);
                             lastNonHighBoundaryPos = posA;
@@ -2830,6 +2836,7 @@ void Assembler::chainAlignmentCandidates(
         invertedIndexData,
         overlapCandidatesOptions,
         assemblerInfo->kmerDistributionInfo.coverageHet,
+        assemblerInfo->kmerDistributionInfo.coverageHom,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 
@@ -2942,6 +2949,7 @@ void Assembler::chainPafCandidates(
         invertedIndexData,
         overlapCandidatesOptions,
         assemblerInfo->kmerDistributionInfo.coverageHet,
+        assemblerInfo->kmerDistributionInfo.coverageHom,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 
@@ -3002,6 +3010,7 @@ void Assembler::chainPafCandidates(
     const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
     const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
     const double mcopyOcvWeakKeepRatio = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyOcvWeakKeepRatio));
+    const uint32_t maxChainingFreq = invertedIndexData.maxChainingFreq;
 
     struct PafChainedCandidate {
         OrientedReadPair candidate;
@@ -3149,7 +3158,7 @@ void Assembler::chainPafCandidates(
                             slotIdx = (slotIdx + 1) & hashMask;
                         }
 
-                        if(!found) {
+                        if(!found || (maxChainingFreq > 0 && count > maxChainingFreq)) {
                             if(downsampleHighFrequencyMarkers) {
                                 doFlushStreak(posA);
                                 lastNonHighBoundaryPos = posA;
@@ -4243,6 +4252,7 @@ void Assembler::flagPalindromicReads(
     configureInvertedIndexDataForChaining(
         invertedIndexData, overlapCandidatesOptions,
         assemblerInfo->kmerDistributionInfo.coverageHet,
+        assemblerInfo->kmerDistributionInfo.coverageHom,
         maxDriftRate);
     rebuildWeightLut(invertedIndexData);
 

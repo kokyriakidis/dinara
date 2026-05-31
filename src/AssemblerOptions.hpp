@@ -205,6 +205,7 @@ public:
     int minChainMarkerCount = 2;    // Minimum marker count required for a chained overlap candidate. Hifiasm: min_lc_cnt = 2 (inter.cpp:496).
     uint32_t minOverlapLength = 0; // If >0, minimum raw marker chain span (bases) for a candidate to be kept (min of query/target spans).
     uint32_t maxEndFuzz = 0;       // If >0, discard candidates needing more extension (bases) to reach read ends.
+    uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during chaining (markers still kept for journeys).
 
     // Additional knobs for the InvertedIndex chaining path (defaults match hifiasm behavior).
     // These exist so we can more easily match hifiasm/minimap2 behavior when needed.

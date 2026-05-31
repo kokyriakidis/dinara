@@ -806,8 +806,10 @@ void dinara::main::assemble(
         const uint64_t coverageHet = assembler.assemblerInfo->kmerDistributionInfo.coverageHet;
         const uint64_t coverageHom = assembler.assemblerInfo->kmerDistributionInfo.coverageHom;
         const uint64_t minFreq = 2;
-        const uint64_t maxFreq = min(coverageHom * 5,
-            uint64_t(assemblerOptions.overlapCandidatesOptions.invertedIndexMaxKmerCount));
+        // Keep all markers with freq >= 2 in the marker arrays (for complete
+        // journeys/anchors). High-frequency kmers are excluded from chaining
+        // via maxChainingFreq in the inverted index.
+        const uint64_t maxFreq = std::numeric_limits<uint64_t>::max();
         const bool removePalindromicKmers = true;
         uint64_t distinctKmerCount = 0;
         for(uint64_t bucketId=0; bucketId<assembler.kmerCounter->kmerIdFrequencies.size(); bucketId++) {
@@ -817,11 +819,15 @@ void dinara::main::assemble(
         cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
         cout << "Filtering minimizers: het coverage=" << coverageHet
              << ", hom coverage=" << coverageHom << "." << endl;
-        cout << "Keeping k-mers with frequency [" << minFreq << ", " << maxFreq << "]";
+        cout << "Keeping k-mers with frequency >= " << minFreq;
         if(removePalindromicKmers) {
             cout << " and excluding palindromic k-mers";
         }
-        cout << "." << endl;
+        // Effective chaining cutoff: min(coverageHom * 5, maxChainingFreq).
+        // Matches hifiasm's min(hom_cov * 5, max_kmer_cnt) logic.
+        const uint64_t effectiveChainingFreq = min(coverageHom * 5,
+            uint64_t(assemblerOptions.overlapCandidatesOptions.maxChainingFreq));
+        cout << ". Chaining limited to frequency <= " << effectiveChainingFreq << "." << endl;
 
         [[maybe_unused]]
         auto writeReadMarkerGapDiagnostic = [&assembler](const string& label, ReadId readId) {

@@ -2728,6 +2728,7 @@ public:
              double mcopyOcvWeakKeepRatio = 0.70;
              uint32_t minOverlapLength = 0;  // If >0, reject candidates whose min(qSpan, tSpan) < threshold.
              uint32_t maxEndFuzz = 0;        // If >0, reject candidates needing more extension to read ends.
+             uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during hit collection.
 	             vector<uint32_t> weightLut; // size 512 (pow(weightBase, weightExponent) truncated)
 	         
          // Compact vector for Query (8 bytes/hit).
