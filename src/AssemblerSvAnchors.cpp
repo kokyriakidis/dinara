@@ -806,11 +806,8 @@ void Assembler::buildSvMSA(
                          // << ", breakpoint=" << ci.refPos
                          // << ", reads=" << ci.readCount
                          // << endl;
-                    if(ci.svType == "DEL") {
-                        allDelCalls.push_back({
-                            ci.refPos, int64_t(ci.size),
-                            ci.readCount, "CIGAR"});
-                    }
+                    // CIGAR calls are redundant with early-CIGAR
+                    // from main.cpp — suppressed.
                 }
             }
 
@@ -2913,9 +2910,7 @@ void Assembler::buildSvMSA(
                                      // << ", breakpoint="
                                      // << breakpointPos
                                      // << endl;
-                                allDelCalls.push_back({
-                                    breakpointPos, vntrRefLen,
-                                    0, "VNTR-refGap"});
+                                // VNTR-refGap suppressed (redundant).
                             }
                         } else if(insLenHet < -30) {
                             const int64_t delSize =
@@ -2939,9 +2934,7 @@ void Assembler::buildSvMSA(
                                      // << ", breakpoint="
                                      // << breakpointPos
                                      // << endl;
-                                allDelCalls.push_back({
-                                    breakpointPos, vntrRefLen,
-                                    0, "VNTR-refGap"});
+                                // VNTR-refGap suppressed (redundant).
                             }
                         }
                     }
@@ -4836,9 +4829,9 @@ void Assembler::buildSvMSA(
                                      // << "size=" << delSize << "bp, "
                                      // << "breakpoint=" << bpPos
                                      // << endl;
-                                allDelCalls.push_back({
-                                    bpPos, delSize,
-                                    0, "coverage"});
+                                // allDelCalls.push_back({
+                                    // bpPos, delSize,
+                                    // 0, "coverage"});
                             }
                             continue; // next covDropCluster
                         }
@@ -5023,9 +5016,9 @@ void Assembler::buildSvMSA(
                                      // << "breakpoint=" << bestBp << ", "
                                      // << "reads=" << bestCount
                                      // << endl;
-                                allDelCalls.push_back({
-                                    bestBp, bestSize,
-                                    bestCount, "adaptive"});
+                                // allDelCalls.push_back({
+                                    // bestBp, bestSize,
+                                    // bestCount, "adaptive"});
                                 refinedCall = true;
                             }
                         }
@@ -5694,9 +5687,9 @@ void Assembler::buildSvMSA(
                                  // << "size=" << delSize << "bp, "
                                  // << "breakpoint=" << bpPos
                                  // << endl;
-                            allDelCalls.push_back({
-                                bpPos, delSize,
-                                0, "coverage"});
+                            // allDelCalls.push_back({
+                                // bpPos, delSize,
+                                // 0, "coverage"});
                         }
                     }
                 }
@@ -5965,10 +5958,10 @@ void Assembler::buildSvMSA(
                              // << ", cigarSize=" << ci.size << "bp"
                              // << endl;
                         if(clusterSize >= 50) {
-                            allDelCalls.push_back({
-                                uint32_t(clusterPos),
-                                clusterSize, count,
-                                "CIGAR-corroborated"});
+                            // allDelCalls.push_back({
+                                // uint32_t(clusterPos),
+                                // clusterSize, count,
+                                // "CIGAR-corroborated"});
                         }
                         break;
                     }
@@ -6036,10 +6029,10 @@ void Assembler::buildSvMSA(
                                  // << covDropSize << "bp"
                                  // << endl;
                             if(clusterSize >= 50) {
-                                allDelCalls.push_back({
-                                    uint32_t(clusterPos),
-                                    clusterSize, count,
-                                    "covdrop-corroborated"});
+                                // allDelCalls.push_back({
+                                    // uint32_t(clusterPos),
+                                    // clusterSize, count,
+                                    // "covdrop-corroborated"});
                             }
                             break;
                         }
@@ -6258,11 +6251,11 @@ void Assembler::buildSvMSA(
                              // << endl;
                         if(medianDiff < 0
                            && std::abs(medianDiff) >= 50) {
-                            allDelCalls.push_back({
-                                (dustStart + dustEnd) / 2,
-                                int64_t(std::abs(medianDiff)),
-                                uint32_t(spanningReads.size()),
-                                "SDUST-STR"});
+                            // allDelCalls.push_back({
+                                // (dustStart + dustEnd) / 2,
+                                // int64_t(std::abs(medianDiff)),
+                                // uint32_t(spanningReads.size()),
+                                // "SDUST-STR"});
                         }
                     }
                     continue;
@@ -6442,10 +6435,10 @@ void Assembler::buildSvMSA(
                          // << ", flankCov=" << flankCov
                          // << endl;
                     if(estimatedSvSize < 0) {
-                        allDelCalls.push_back({
-                            (dustStart + dustEnd) / 2,
-                            int64_t(std::abs(estimatedSvSize)),
-                            0, "SDUST-VNTR"});
+                        // allDelCalls.push_back({
+                            // (dustStart + dustEnd) / 2,
+                            // int64_t(std::abs(estimatedSvSize)),
+                            // 0, "SDUST-VNTR"});
                     }
                 }
             }
