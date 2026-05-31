@@ -863,9 +863,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return (w2 >= windowCount) ? (w2 - windowCount) : w2;
         };
 
-        // Count inter-window edges per (normalized) window pair.
-        // Also collect the edge descriptors.
-        std::map<std::pair<uint32_t, uint32_t>, std::vector<edge_descriptor>> pairEdges;
+        // Count unique anchor pairs per (normalized) window pair.
+        // fw-fw and rc-rc edges for the same logical connection share
+        // the same normalized anchor pair (min, max), so they count as one.
+        struct WindowPairInfo {
+            std::set<std::pair<uint64_t, uint64_t>> uniqueAnchorPairs;
+            std::vector<edge_descriptor> edges;
+        };
+        std::map<std::pair<uint32_t, uint32_t>, WindowPairInfo> pairInfo;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
             if(!anchorGraph[e].useForAssembly) continue;
             const uint64_t srcVal = uint64_t(source(e, anchorGraph));
@@ -878,20 +883,39 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t d = normalize(dstRaw);
             if(s == d) continue;
             auto key = (s < d) ? std::make_pair(s, d) : std::make_pair(d, s);
-            pairEdges[key].push_back(e);
+            auto& info = pairInfo[key];
+            info.edges.push_back(e);
+            // Normalize anchor pair: use (min, max) so fw-fw and rc-rc
+            // edges with anchors (a, b) and (a^1, b^1) map to the same pair.
+            const uint64_t normSrc = std::min(srcVal, srcVal ^ 1ULL);
+            const uint64_t normDst = std::min(dstVal, dstVal ^ 1ULL);
+            const auto ap = (normSrc < normDst)
+                ? std::make_pair(normSrc, normDst)
+                : std::make_pair(normDst, normSrc);
+            info.uniqueAnchorPairs.insert(ap);
         }
 
         uint64_t singleEdgeRemovedCount = 0;
-        for(const auto& [pair, edges] : pairEdges) {
-            if(edges.size() != 1) continue;
+        for(const auto& [pair, info] : pairInfo) {
+            if(info.uniqueAnchorPairs.size() != 1) continue;
 
-            // Skip if either anchor is an endNode.
-            const uint64_t srcVal = uint64_t(source(edges[0], anchorGraph));
-            const uint64_t dstVal = uint64_t(target(edges[0], anchorGraph));
-            if((srcVal < anchorCount && isEndpointAnchor[srcVal]) ||
-               (dstVal < anchorCount && isEndpointAnchor[dstVal])) continue;
+            // Skip if any edge touches an endNode anchor.
+            bool hasEndNode = false;
+            for(const auto& e : info.edges) {
+                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
+                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
+                if((srcVal < anchorCount && isEndpointAnchor[srcVal]) ||
+                   (dstVal < anchorCount && isEndpointAnchor[dstVal])) {
+                    hasEndNode = true;
+                    break;
+                }
+            }
+            if(hasEndNode) continue;
 
-            disableEdge(edges[0]);
+            // Remove all edges for this single-connection pair.
+            for(const auto& e : info.edges) {
+                disableEdge(e);
+            }
             ++singleEdgeRemovedCount;
         }
 
