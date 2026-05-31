@@ -160,4 +160,9 @@ public:
     // Anchors used by endpoint edges (and their RC mirrors).
     // An anchor in this set is at an endpoint position of its window.
     std::set<uint64_t> endpointAnchors;
+
+    // Per-anchor endpoint flag, indexed by anchor ID.
+    // true = endNode (endpoint anchor), false = intraNode.
+    // Populated after pass 1 and chain-end promotion.
+    vector<bool> isEndpointAnchor;
 };

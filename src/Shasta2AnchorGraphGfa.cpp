@@ -34,9 +34,13 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         activeVertices.insert(target(e, *this));
     }
 
-    // Write active vertices only.
+    // Write active vertices with node type tag.
+    // nt:Z:endNode — endpoint anchor (pass 1 or chain-end promoted)
+    // nt:Z:intraNode — internal anchor within its window
     for(const auto v : activeVertices) {
-        gfa << "S\t" << v << "\t*\tLN:i:1\n";
+        const char* nodeTag = (uint64_t(v) < isEndpointAnchor.size() && isEndpointAnchor[uint64_t(v)])
+            ? "endNode" : "intraNode";
+        gfa << "S\t" << v << "\t*\tLN:i:1\tnt:Z:" << nodeTag << "\n";
     }
 
     // Write edges. All edges are forward-to-forward.
@@ -51,32 +55,13 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             << dst << "\t+\t0M"
             << "\tRC:i:" << edge.coverage();
 
-        // Classify each anchor of the edge.
-        // Each link gets two tags:
-        //   pw:Z: — source anchor classification
-        //   nw:Z: — target anchor classification
-        // Values: "Endpoint" (anchor is an endpoint anchor of its window),
-        //         "intra" (same window), "internal" (inter-window,
-        //         anchor is not an endpoint anchor).
-        if(windowCount > 0 &&
-           uint64_t(src) < anchorCount && uint64_t(dst) < anchorCount) {
-            const uint32_t srcW = anchorToWindow[uint64_t(src)];
-            const uint32_t dstW = anchorToWindow[uint64_t(dst)];
-
-            if(srcW != noWindow && dstW != noWindow) {
-                const uint32_t srcNorm = normalize(srcW);
-                const uint32_t dstNorm = normalize(dstW);
-
-                if(srcNorm == dstNorm) {
-                    gfa << "\tpw:Z:intra\tnw:Z:intra";
-                } else {
-                    const char* srcTag = edge.isEndpointAnchorPrev
-                        ? "Endpoint" : "internal";
-                    const char* dstTag = edge.isEndpointAnchorNext
-                        ? "Endpoint" : "internal";
-                    gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
-                }
-            }
+        // Edge tags derived from node tags.
+        if(!isEndpointAnchor.empty() &&
+           uint64_t(src) < isEndpointAnchor.size() &&
+           uint64_t(dst) < isEndpointAnchor.size()) {
+            const char* srcTag = isEndpointAnchor[uint64_t(src)] ? "endNode" : "intraNode";
+            const char* dstTag = isEndpointAnchor[uint64_t(dst)] ? "endNode" : "intraNode";
+            gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
         }
 
         gfa << "\n";
