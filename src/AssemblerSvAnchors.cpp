@@ -31,7 +31,6 @@
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -825,39 +824,6 @@ void Assembler::buildSvMSA(
                 // nearby position — the call is likely a harmonic.
                 // Only applied to multi-k calls.
                 // Skip for small deletions (< 300bp).
-                if(fr.computed && dc.size >= 300
-                   && fr.dhffc >= 0.95
-                   && dc.source == "multi-k") {
-                    cout << "    --- FILTERED (depth-fc="
-                         << std::fixed << std::setprecision(2)
-                         << fr.dhffc
-                         << "): " << dc.source
-                         << " size=" << dc.size << "bp"
-                         << ", breakpoint=" << dc.breakpointPos
-                         << ", reads=" << dc.readCount
-                         << endl;
-                    continue;
-                }
-
-                // MAPQ0 fraction filter (Manta-style).
-                // If > 80% of reads near the breakpoint have MAPQ=0,
-                // the region is likely unmappable and the call is
-                // unreliable. Threshold is higher than Manta's 0.4
-                // because Roche consensus reads can have MAPQ=0 in
-                // moderately repetitive regions that still contain
-                // real variants.
-                if(fr.computed && fr.mapq0Frac > 0.8) {
-                    cout << "    --- FILTERED (mapq0="
-                         << std::fixed << std::setprecision(2)
-                         << fr.mapq0Frac
-                         << "): " << dc.source
-                         << " size=" << dc.size << "bp"
-                         << ", breakpoint=" << dc.breakpointPos
-                         << ", reads=" << dc.readCount
-                         << endl;
-                    continue;
-                }
-
                 cout << "    >>> DELETION CALL"
                      << " (" << dc.source
                      << "): size=" << dc.size << "bp"
@@ -6808,6 +6774,375 @@ void Assembler::buildSvMSA(
                             sc.readCount, "SA-tag"});
                     }
 
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // K-mer journey DEL detection (top-down multi-resolution).
+        // For each read, build a journey by scanning with decreasing
+        // k-mer sizes: k=60,50,40,30,20,14,10,8,6. Large k-mers
+        // provide high-confidence anchors; smaller k-mers fill gaps
+        // near breakpoints for precise size estimation.
+        // No inverted index needed — works directly from sequences.
+        // -----------------------------------------------------------------
+        {
+            const auto refSeq = readsRef.getRead(refId);
+            const uint64_t refLen = refSeq.baseCount;
+
+            // Hash function for a k-mer at a given position.
+            auto seqHash = [](
+                const LongBaseSequenceView& seq,
+                uint32_t pos, uint32_t kk,
+                uint64_t seqLen) -> uint64_t {
+                if(pos + kk > seqLen) return UINT64_MAX;
+                uint64_t h = 0;
+                for(uint32_t j = 0; j < kk; ++j)
+                    h = (h * 5) + uint64_t(seq[pos + j].value);
+                return h;
+            };
+
+            // K-mer sizes to scan, largest first.
+            // Don't go below k=14 — smaller k-mers produce
+            // too many spurious matches on ~4kb references.
+            const uint32_t kSizes[] =
+                {60, 50, 40, 30, 20, 14};
+            const uint32_t nKSizes = 6;
+
+            // Pre-build reference k-mer hash tables for each k.
+            // For each k, store hash -> refPos (unique only).
+            struct RefKmerTable {
+                unordered_map<uint64_t, uint32_t> table;
+            };
+            vector<RefKmerTable> refTables(nKSizes);
+            for(uint32_t ki = 0; ki < nKSizes; ++ki) {
+                const uint32_t kk = kSizes[ki];
+                if(kk > refLen) continue;
+                auto& tbl = refTables[ki].table;
+                tbl.reserve(refLen);
+                for(uint32_t rp = 0;
+                    rp + kk <= refLen; ++rp) {
+                    uint64_t h = seqHash(
+                        refSeq, rp, kk, refLen);
+                    if(h == UINT64_MAX) continue;
+                    auto it = tbl.find(h);
+                    if(it == tbl.end())
+                        tbl[h] = rp;
+                    else
+                        it->second = UINT32_MAX; // non-unique
+                }
+            }
+
+            struct JourneyVote {
+                uint32_t breakpointRefPos;
+                int64_t delSize;
+            };
+            vector<JourneyVote> journeyVotes;
+
+            // Process each read that has a chain.
+            for(const auto& ce : chainsForRef) {
+                if(!ce.isSameStrand) continue;
+                const auto& al = alignments[ce.chainIndex];
+                if(al.ordinals.size() < 2) continue;
+
+                const uint32_t rdIdVal = uint32_t(ce.readId);
+                const auto rdSeq =
+                    readsRef.getRead(ReadId(rdIdVal));
+                const uint64_t rdLen = rdSeq.baseCount;
+                if(rdLen < 6) continue;
+
+                // Compute median diagonal from chain.
+                const auto rdMkrs = markersRef[
+                    OrientedReadId(
+                        ReadId(ce.readId), 0).getValue()];
+                vector<int64_t> diags;
+                for(const auto& ord : al.ordinals) {
+                    if(ord[0] >= refMarkers.size()
+                       || ord[1] >= rdMkrs.size())
+                        continue;
+                    diags.push_back(
+                        int64_t(refMarkers[ord[0]].position)
+                        - int64_t(rdMkrs[ord[1]].position));
+                }
+                if(diags.size() < 2) continue;
+                sort(diags.begin(), diags.end());
+                const int64_t medDiag =
+                    diags[diags.size() / 2];
+
+                // Build journey top-down.
+                // Each step: (readPos, refPos).
+                struct JStep {
+                    uint32_t readPos;
+                    uint32_t refPos;
+                };
+                vector<JStep> journey;
+
+                // Track which read positions are already
+                // covered by a higher-k anchor.
+                vector<bool> covered(rdLen, false);
+
+                for(uint32_t ki = 0; ki < nKSizes; ++ki) {
+                    const uint32_t kk = kSizes[ki];
+                    if(kk > rdLen) continue;
+                    const auto& tbl = refTables[ki].table;
+                    if(tbl.empty()) continue;
+
+                    for(uint32_t qp = 0;
+                        qp + kk <= rdLen; ++qp) {
+                        // Skip if this position is already
+                        // covered by a larger k anchor.
+                        if(covered[qp]) continue;
+
+                        uint64_t h = seqHash(
+                            rdSeq, qp, kk, rdLen);
+                        if(h == UINT64_MAX) continue;
+                        auto it = tbl.find(h);
+                        if(it == tbl.end()
+                           || it->second == UINT32_MAX)
+                            continue;
+
+                        uint32_t rp = it->second;
+                        // Diagonal filter.
+                        const int64_t diag =
+                            int64_t(rp) - int64_t(qp);
+                        if(diag < medDiag - 200
+                           || diag > medDiag + 5000)
+                            continue;
+
+                        journey.push_back({qp, rp});
+                        // Mark only the start position
+                        // so smaller k-mers can still add
+                        // anchors within this span.
+                        covered[qp] = true;
+                    }
+                }
+
+                if(journey.size() < 2) continue;
+
+                // Sort by readPos.
+                sort(journey.begin(), journey.end(),
+                    [](const JStep& a, const JStep& b) {
+                        return a.readPos < b.readPos;
+                    });
+
+                // Combined approach:
+                // 1. Two-diagonal: find the two most
+                //    populated diagonals, emit their
+                //    difference as the deletion size.
+                // 2. Triplet: for non-consecutive anchors
+                //    A,C that flank the deletion with B
+                //    in the transition zone, emit gAC.
+                if(journey.size() < 3) continue;
+
+                // Compute all diagonals.
+                vector<int64_t> jDiags(journey.size());
+                for(size_t ji = 0;
+                    ji < journey.size(); ++ji) {
+                    jDiags[ji] =
+                        int64_t(journey[ji].refPos)
+                        - int64_t(journey[ji].readPos);
+                }
+
+                // --- Two-diagonal ---
+                if(journey.size() >= 4) {
+                    vector<int64_t> sd = jDiags;
+                    sort(sd.begin(), sd.end());
+
+                    int64_t d1 = sd[0];
+                    uint32_t c1 = 0;
+                    for(size_t i = 0; i < sd.size(); ++i) {
+                        uint32_t cnt = 0;
+                        for(size_t j = i; j < sd.size();
+                            ++j) {
+                            if(sd[j] - sd[i] <= 40)
+                                cnt++;
+                            else break;
+                        }
+                        if(cnt > c1) {
+                            c1 = cnt;
+                            d1 = sd[i + cnt / 2];
+                        }
+                    }
+
+                    int64_t d2 = 0;
+                    uint32_t c2 = 0;
+                    for(size_t i = 0; i < sd.size(); ++i) {
+                        if(abs(sd[i] - d1) < 30) continue;
+                        uint32_t cnt = 0;
+                        for(size_t j = i; j < sd.size();
+                            ++j) {
+                            if(abs(sd[j] - d1) < 30)
+                                continue;
+                            if(sd[j] - sd[i] <= 40)
+                                cnt++;
+                            else break;
+                        }
+                        if(cnt > c2) {
+                            c2 = cnt;
+                            d2 = sd[i + cnt / 2];
+                        }
+                    }
+
+                    if(c1 >= 2 && c2 >= 2) {
+                        int64_t ld = min(d1, d2);
+                        int64_t rd = max(d1, d2);
+                        int64_t dsz = rd - ld;
+                        if(dsz >= 30) {
+                            uint32_t bp = 0;
+                            for(size_t ji = 0;
+                                ji < journey.size();
+                                ++ji) {
+                                if(abs(jDiags[ji] - ld)
+                                   <= 20
+                                   && journey[ji].refPos
+                                      > bp)
+                                    bp =
+                                        journey[ji]
+                                            .refPos;
+                            }
+                            if(bp > 0)
+                                journeyVotes.push_back(
+                                    {bp, dsz});
+                        }
+                    }
+                }
+
+                // --- Triplet: scan all A,C pairs
+                // within a readPos window, looking for
+                // cases where gAC >= 30 and there exists
+                // at least one anchor B between them
+                // with partial gaps on both sides. ---
+                for(size_t ai = 0;
+                    ai < journey.size(); ++ai) {
+                    for(size_t ci = ai + 2;
+                        ci < journey.size()
+                        && ci <= ai + 5; ++ci) {
+                        const auto& A = journey[ai];
+                        const auto& C = journey[ci];
+                        if(C.refPos <= A.refPos) continue;
+                        if(C.readPos <= A.readPos) continue;
+                        const int64_t gAC =
+                            (int64_t(C.refPos)
+                             - int64_t(A.refPos))
+                            - (int64_t(C.readPos)
+                               - int64_t(A.readPos));
+                        if(gAC < 30) continue;
+
+                        // Check that at least one anchor
+                        // between A and C has partial
+                        // gaps on both sides (transition
+                        // zone anchor).
+                        bool hasTransition = false;
+                        for(size_t bi = ai + 1;
+                            bi < ci; ++bi) {
+                            const auto& B = journey[bi];
+                            if(B.refPos <= A.refPos)
+                                continue;
+                            if(C.refPos <= B.refPos)
+                                continue;
+                            if(B.readPos <= A.readPos)
+                                continue;
+                            if(C.readPos <= B.readPos)
+                                continue;
+                            const int64_t gAB =
+                                (int64_t(B.refPos)
+                                 - int64_t(A.refPos))
+                                - (int64_t(B.readPos)
+                                   - int64_t(A.readPos));
+                            const int64_t gBC =
+                                (int64_t(C.refPos)
+                                 - int64_t(B.refPos))
+                                - (int64_t(C.readPos)
+                                   - int64_t(B.readPos));
+                            if(gAB >= 10 && gBC >= 10) {
+                                hasTransition = true;
+                                break;
+                            }
+                        }
+                        if(hasTransition) {
+                            journeyVotes.push_back(
+                                {A.refPos, gAC});
+                        }
+                    }
+                }
+            }
+
+            // Cluster per-read votes and emit one call
+            // per cluster.
+            if(!journeyVotes.empty()) {
+                cout << "    Journey: "
+                     << journeyVotes.size()
+                     << " read-votes" << endl;
+
+                sort(journeyVotes.begin(),
+                     journeyVotes.end(),
+                    [](const JourneyVote& a,
+                       const JourneyVote& b) {
+                        return a.breakpointRefPos
+                            < b.breakpointRefPos;
+                    });
+
+                struct JCluster {
+                    vector<uint32_t> bps;
+                    vector<int64_t> sizes;
+                };
+                vector<JCluster> clusters;
+
+                for(const auto& v : journeyVotes) {
+                    bool merged = false;
+                    for(auto& c : clusters) {
+                        sort(c.sizes.begin(),
+                             c.sizes.end());
+                        const int64_t cSize =
+                            c.sizes[c.sizes.size() / 2];
+                        sort(c.bps.begin(), c.bps.end());
+                        const uint32_t cBp =
+                            c.bps[c.bps.size() / 2];
+                        if(abs(int64_t(v.breakpointRefPos)
+                               - int64_t(cBp)) <= 100
+                           && cSize > 0
+                           && v.delSize > 0) {
+                            const double ratio =
+                                double(std::min(
+                                    v.delSize, cSize))
+                                / double(std::max(
+                                    v.delSize, cSize));
+                            if(ratio >= 0.5) {
+                                c.bps.push_back(
+                                    v.breakpointRefPos);
+                                c.sizes.push_back(
+                                    v.delSize);
+                                merged = true;
+                                break;
+                            }
+                        }
+                    }
+                    if(!merged) {
+                        JCluster nc;
+                        nc.bps.push_back(
+                            v.breakpointRefPos);
+                        nc.sizes.push_back(v.delSize);
+                        clusters.push_back(
+                            std::move(nc));
+                    }
+                }
+
+                for(auto& c : clusters) {
+                    sort(c.sizes.begin(),
+                         c.sizes.end());
+                    sort(c.bps.begin(), c.bps.end());
+                    const uint32_t bp =
+                        c.bps[c.bps.size() / 2];
+                    const int64_t sz =
+                        c.sizes[c.sizes.size() / 2];
+                    const uint32_t cnt =
+                        uint32_t(c.sizes.size());
+                    if(cnt < 2) continue;
+                    if(sz >= 50) {
+                        delCallRecords.push_back(
+                            {bp, sz, cnt,
+                             "kmer-journey"});
+                    }
                 }
             }
         }
