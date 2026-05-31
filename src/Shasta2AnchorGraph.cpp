@@ -338,7 +338,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint32_t oidValue;
         Shasta2AnchorId lastAnchorInA;
         Shasta2AnchorId firstAnchorInB;
-        uint64_t supportingSpan;  // baseSpanA + baseSpanB (finalized in second pass)
+        uint64_t supportingSpanProduct;  // spanA * spanB (for selection)
+        uint64_t supportingSpanSum;      // spanA + spanB (for edge attribute)
     };
 
     // Per window pair: all read transitions.
@@ -379,8 +380,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            // Track which reads touch each window.
-            windowReads[windowId].insert(uint32_t(oidValue));
+            // Track which oriented reads touch each window.
+            // Normalize to forward window so both strands contribute
+            // to the same window's read set.
+            const uint32_t normalizedWin = (windowId >= windowCount) ? (windowId - windowCount) : windowId;
+            windowReads[normalizedWin].insert(uint32_t(oidValue));
 
             // Track per-read per-window base span.
             const uint32_t basePos = anchors.getPosition(anchorId, oid);
@@ -403,9 +407,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
                 if(currentWindow != noWindow) {
                     auto key = std::make_pair(currentWindow, windowId);
-                    // supportingSpan is 0 for now — finalized in second pass.
+                    // Spans are 0 for now — finalized in second pass.
                     windowPairTransitions[key].push_back(
-                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0});
+                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0, 0});
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
@@ -413,11 +417,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Second pass: finalize supportingSpan for each read transition
-    // using the completed readWindowSpans.
-    // supportingSpan = spanA * spanB (geometric product).
-    // This rewards both balance and magnitude: a read covering 5000bp
-    // in each window (product 25M) beats one covering 10000+500 (product 5M).
+    // Second pass: finalize supporting spans for each read transition.
+    // Product (spanA * spanB) is used for selection — rewards balanced
+    // and deep coverage. Sum (spanA + spanB) is stored on the edge
+    // as a human-readable metric.
     for(auto& [windowPair, transitions] : windowPairTransitions) {
         for(auto& t : transitions) {
             auto readSpanIt = readWindowSpans.find(t.oidValue);
@@ -428,15 +431,75 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             auto itB = spans.find(windowPair.second);
             if(itA != spans.end()) spanA = itA->second.lastBasePos - itA->second.firstBasePos;
             if(itB != spans.end()) spanB = itB->second.lastBasePos - itB->second.firstBasePos;
-            t.supportingSpan = spanA * spanB;
+            t.supportingSpanProduct = spanA * spanB;
+            t.supportingSpanSum = spanA + spanB;
         }
+    }
+
+    // Merge RC-mirror window pair transitions to eliminate duplicate edges.
+    //
+    // createInterWindowEdge creates both a forward edge and its RC mirror.
+    // If windowPairTransitions contains both a key and its RC-mirror key,
+    // both would be processed, creating duplicate edge pairs.
+    //
+    // RC-mirror key relationship: key (X, Y) has RC mirror (rcY, rcX)
+    // where rc(w) = w >= wc ? w - wc : w + wc. This covers three cases:
+    //   fw-fw (A, B)       ↔  rc-rc (B+wc, A+wc)
+    //   fw-rc (A, B+wc)    ↔  fw-rc (B, A+wc)
+    //   rc-fw (A+wc, B)    ↔  rc-fw (B+wc, A)
+    //
+    // For each pair of RC-mirror keys, we keep the lexicographically
+    // smaller key (the "canonical" one) and merge the other's transitions
+    // into it, RC-transforming the anchor pairs.
+    {
+        auto rcWindow = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
+
+        // Collect non-canonical keys (those whose RC mirror is lexicographically smaller).
+        std::vector<std::pair<uint32_t, uint32_t>> keysToMerge;
+        for(const auto& [wp, transitions] : windowPairTransitions) {
+            const auto mirrorKey = std::make_pair(rcWindow(wp.second), rcWindow(wp.first));
+            // Merge into the smaller key. If equal (self-RC-mirror), skip.
+            if(wp > mirrorKey) {
+                keysToMerge.push_back(wp);
+            }
+        }
+
+        uint64_t mergedTransitions = 0;
+        for(const auto& key : keysToMerge) {
+            const auto canonicalKey = std::make_pair(rcWindow(key.second), rcWindow(key.first));
+
+            auto& srcTransitions = windowPairTransitions[key];
+            auto& dstTransitions = windowPairTransitions[canonicalKey];
+            for(auto& t : srcTransitions) {
+                // Transform anchors: RC both and swap roles (direction reverses).
+                // Original: lastAnchorInA is in key.first, firstAnchorInB is in key.second.
+                // Canonical: rc(firstAnchorInB) becomes lastInA (in rcWindow(key.second)),
+                //            rc(lastAnchorInA) becomes firstInB (in rcWindow(key.first)).
+                const Shasta2AnchorId newLastInA =
+                    Shasta2AnchorId(uint64_t(t.firstAnchorInB) ^ 1ULL);
+                const Shasta2AnchorId newFirstInB =
+                    Shasta2AnchorId(uint64_t(t.lastAnchorInA) ^ 1ULL);
+                dstTransitions.push_back({
+                    t.oidValue, newLastInA, newFirstInB,
+                    t.supportingSpanProduct, t.supportingSpanSum});
+                ++mergedTransitions;
+            }
+            windowPairTransitions.erase(key);
+        }
+        cout << "Merged " << mergedTransitions << " transitions from "
+             << keysToMerge.size() << " non-canonical window pairs into their RC-mirror canonical pairs." << endl;
     }
 
     // Count shared reads between each window pair: reads that touch
     // both windows anywhere in their journey (not just direct transitions).
     auto countSharedReads = [&](uint32_t windowA, uint32_t windowB) -> uint64_t {
-        auto itA = windowReads.find(windowA);
-        auto itB = windowReads.find(windowB);
+        // Normalize to forward windows — windowReads is keyed by forward window ID.
+        const uint32_t normA = (windowA >= windowCount) ? (windowA - windowCount) : windowA;
+        const uint32_t normB = (windowB >= windowCount) ? (windowB - windowCount) : windowB;
+        auto itA = windowReads.find(normA);
+        auto itB = windowReads.find(normB);
         if(itA == windowReads.end() || itB == windowReads.end()) return 0;
         const auto& setA = itA->second;
         const auto& setB = itB->second;
@@ -450,8 +513,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return count;
     };
 
-    // Diagnostic: count window pairs and transitions.
+    // Diagnostic: count window pairs and transitions (after RC-mirror merge).
     {
+        auto rcWindow = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
         uint64_t totalTransitions = 0;
         uint64_t fwFwPairs = 0, fwRcPairs = 0, rcFwPairs = 0, rcRcPairs = 0;
         for(const auto& [wp, transitions] : windowPairTransitions) {
@@ -462,8 +528,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             else if(!aIsRc && bIsRc) ++fwRcPairs;
             else if(aIsRc && !bIsRc) ++rcFwPairs;
             else ++rcRcPairs;
+            // Verify no non-canonical keys remain.
+            const auto mirrorKey = std::make_pair(rcWindow(wp.second), rcWindow(wp.first));
+            DINARA_ASSERT(wp <= mirrorKey);
         }
-        cout << "Inter-window edge discovery: " << windowPairTransitions.size()
+        cout << "Inter-window edge discovery (post-merge): " << windowPairTransitions.size()
              << " window pairs (" << fwFwPairs << " fw-fw, "
              << rcRcPairs << " rc-rc, "
              << fwRcPairs << " fw-rc, "
@@ -578,12 +647,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const uint32_t dstNorm = normalize(windowPair.second);
         if(srcNorm == dstNorm) continue;
 
-        // Find the read with the highest spanA * spanB.
-        uint64_t bestSpan = 0;
+        // Find the read with the highest spanA * spanB (product).
+        uint64_t bestProduct = 0;
         const ReadTransition* bestTransition = nullptr;
         for(const auto& t : transitions) {
-            if(t.supportingSpan > bestSpan) {
-                bestSpan = t.supportingSpan;
+            if(t.supportingSpanProduct > bestProduct) {
+                bestProduct = t.supportingSpanProduct;
                 bestTransition = &t;
             }
         }
@@ -593,6 +662,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         // Create the edge from the best-spanning read's transition anchors.
+        // Store the sum (spanA + spanB) as the edge attribute.
         Shasta2AnchorPair anchorPair(anchors,
             bestTransition->lastAnchorInA, bestTransition->firstAnchorInB, false);
         anchorPair.removeNegativeOffsets(anchors);
@@ -602,7 +672,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
-        createInterWindowEdge(windowPair, anchorPair, sharedReads, bestSpan);
+        createInterWindowEdge(windowPair, anchorPair, sharedReads, bestTransition->supportingSpanSum);
     }
 
     // (Old two-pass endpoint/internal edge code removed.)
