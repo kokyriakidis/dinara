@@ -320,6 +320,16 @@ void Assembler::computeAnchorWindowsClean(
             return; // Too few anchors.
         }
 
+        // Verify this covers the full journey.
+        const auto fullJourney = (*shasta2Journeys)[backboneOid];
+        if(seedBegin != 0 || seedEnd != uint32_t(fullJourney.size())) {
+            cout << "WARNING: window " << anchorWindows.size()
+                 << " backbone " << backboneOid
+                 << " does NOT cover full journey: [" << seedBegin
+                 << ", " << seedEnd << ") vs journey size "
+                 << fullJourney.size() << endl;
+        }
+
         vector<uint32_t> filteredPositions;
         filteredPositions.reserve(n);
         for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
