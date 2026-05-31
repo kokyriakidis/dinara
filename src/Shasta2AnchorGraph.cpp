@@ -2850,23 +2850,26 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
         if(positions.size() <= 1) continue;
         const auto journey = journeys[window.backboneOrientedReadId];
 
-        // Head trim.
+        // Head trim: remove anchors before the first one with any
+        // inter-window edge (incoming or outgoing).
         uint64_t headTrim = 0;
         for(uint64_t i = 0; i < positions.size(); i++) {
             const uint64_t aid = uint64_t(journey[positions[i]]);
-            if(hasIncomingInterWindowEdge(aid)) break;
+            if(hasIncomingInterWindowEdge(aid) || hasOutgoingInterWindowEdge(aid)) break;
             ++headTrim;
         }
-        if(headTrim >= positions.size()) headTrim = 0;
+        // No anchor has any inter-window edge — window is isolated.
+        // Don't trim (leave for the isolated-window filter).
+        if(headTrim >= positions.size()) continue;
 
-        // Tail trim.
+        // Tail trim: remove anchors after the last one with any
+        // inter-window edge (incoming or outgoing).
         uint64_t tailTrim = 0;
-        for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
+        for(int64_t i = int64_t(positions.size()) - 1; i > int64_t(headTrim); i--) {
             const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
-            if(hasOutgoingInterWindowEdge(aid)) break;
+            if(hasIncomingInterWindowEdge(aid) || hasOutgoingInterWindowEdge(aid)) break;
             ++tailTrim;
         }
-        if(headTrim + tailTrim >= positions.size()) tailTrim = 0;
 
         if(headTrim == 0 && tailTrim == 0) continue;
         ++trimmedWindowCount;
