@@ -508,6 +508,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         ++interWindowCreated;
     };
 
+    // Inter-window edge creation disabled for testing.
+#if 0
     // Pass 1: Create endpoint edges from backbone read overlaps.
     // For each endpoint window pair, find the anchor pair where the backbone
     // reads transition between the two windows. This is the specific anchor
@@ -871,6 +873,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowZeroPairs << " rejected (zero forward-flow reads), "
          << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
          << minInterWindowCoverage << ")." << endl;
+#endif
 
     // Per-anchor endpoint flags are set directly during edge creation:
     // pass 1 edges get isEndpointAnchorPrev = isEndpointAnchorNext = true,
