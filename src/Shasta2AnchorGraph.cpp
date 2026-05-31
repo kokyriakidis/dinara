@@ -658,6 +658,77 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // pass 1 edges get isEndpointAnchorPrev = isEndpointAnchorNext = true,
     // pass 2 edges keep the default (false).
 
+    // Promote chain-end edges to endpoint status.
+    // Windows at the start of a backbone chain (no backbonePreviousWindow)
+    // have no pass 1 endpoint edge on the head side. Similarly, windows at
+    // the end (no backboneNextWindow) have none on the tail side.
+    // For each such unconnected side, find the outermost backbone anchor
+    // that has an inter-window edge and promote that edge to endpoint.
+    {
+        auto normalizeW = [&](uint32_t w2) -> uint32_t {
+            return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+        };
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+        uint64_t promotedCount = 0;
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            // Helper: mark inter-window edges on an anchor (and its RC mirror)
+            // as endpoint on this window's side. Intra-window edges are skipped.
+            auto promoteInterWindowEdges = [&](uint64_t aid) {
+                if(aid >= anchorCount) return;
+                auto promote = [&](edge_descriptor e) {
+                    if(!anchorGraph[e].useForAssembly) return;
+                    const uint64_t src = uint64_t(source(e, anchorGraph));
+                    const uint64_t dst = uint64_t(target(e, anchorGraph));
+                    if(src >= anchorCount || dst >= anchorCount) return;
+                    const uint32_t srcNorm = normalizeW(anchorToWindow[src]);
+                    const uint32_t dstNorm = normalizeW(anchorToWindow[dst]);
+                    if(srcNorm == dstNorm) return; // skip intra-window
+                    if(srcNorm == w) {
+                        anchorGraph[e].isEndpointAnchorPrev = true;
+                    } else {
+                        anchorGraph[e].isEndpointAnchorNext = true;
+                    }
+                };
+                auto oe = boost::out_edges(aid, anchorGraph);
+                for(auto it = oe.first; it != oe.second; ++it) promote(*it);
+                auto ie = boost::in_edges(aid, anchorGraph);
+                for(auto it = ie.first; it != ie.second; ++it) promote(*it);
+                const uint64_t rcAid = aid ^ 1ULL;
+                if(rcAid < anchorCount) {
+                    auto oe2 = boost::out_edges(rcAid, anchorGraph);
+                    for(auto it = oe2.first; it != oe2.second; ++it) promote(*it);
+                    auto ie2 = boost::in_edges(rcAid, anchorGraph);
+                    for(auto it = ie2.first; it != ie2.second; ++it) promote(*it);
+                }
+            };
+
+            // Head side: no backbonePreviousWindow.
+            // The first backbone anchor defines the window boundary.
+            // Mark it as endpoint so filters protect it (e.g. telomeres).
+            if(window.backbonePreviousWindow == noW) {
+                const uint64_t aid = uint64_t(journey[positions[0]]);
+                promoteInterWindowEdges(aid);
+                ++promotedCount;
+            }
+
+            // Tail side: no backboneNextWindow.
+            // The last backbone anchor defines the window boundary.
+            if(window.backboneNextWindow == noW) {
+                const uint64_t aid = uint64_t(journey[positions[positions.size() - 1]]);
+                promoteInterWindowEdges(aid);
+                ++promotedCount;
+            }
+        }
+        cout << "Chain-end endpoint promotion: " << promotedCount
+             << " edges promoted." << endl;
+    }
+
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
     // ========================================================================
