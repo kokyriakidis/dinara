@@ -1217,12 +1217,6 @@ void Assembler::buildSvMSA(
             allRefOrdinals.end());
 
         if(allRefOrdinals.size() < 2) {
-            // Add SA-tag DEL calls.
-            for(const auto& sc : saTagCalls) {
-                if(sc.size >= 50)
-                    allDelCalls.push_back({sc.refPos, sc.size,
-                        sc.readCount, "SA-" + sc.svType});
-            }
             detectSplitReadDels();
             emitDelCalls();
             continue;
@@ -1286,12 +1280,6 @@ void Assembler::buildSvMSA(
         }
 
         if(badSegment || segmentStrings.empty()) {
-            // Add SA-tag DEL calls.
-            for(const auto& sc : saTagCalls) {
-                if(sc.size >= 50)
-                    allDelCalls.push_back({sc.refPos, sc.size,
-                        sc.readCount, "SA-" + sc.svType});
-            }
             detectSplitReadDels();
             emitDelCalls();
             continue;
