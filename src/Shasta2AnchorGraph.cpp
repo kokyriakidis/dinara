@@ -895,8 +895,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             info.uniqueAnchorPairs.insert(ap);
         }
 
+        // Helper: check if an anchor has at least one active intra-window
+        // backbone edge (same normalized window).
+        auto hasIntraWindowEdge = [&](uint64_t aid) -> bool {
+            if(aid >= anchorCount) return false;
+            const uint32_t aidRaw = anchorToWindow[aid];
+            if(aidRaw == noWindow) return false;
+            const uint32_t aidW = normalize(aidRaw);
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t tgt = uint64_t(target(*it, anchorGraph));
+                if(tgt >= anchorCount) continue;
+                const uint32_t tgtRaw = anchorToWindow[tgt];
+                if(tgtRaw == noWindow) continue;
+                if(normalize(tgtRaw) == aidW) return true;
+            }
+            auto ie = boost::in_edges(aid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t src = uint64_t(source(*it, anchorGraph));
+                if(src >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[src];
+                if(srcRaw == noWindow) continue;
+                if(normalize(srcRaw) == aidW) return true;
+            }
+            return false;
+        };
+
         uint64_t singleEdgeRemovedCount = 0;
         for(const auto& [pair, info] : pairInfo) {
+            // 1. Must have only one unique anchor pair (single-point connection).
             if(info.uniqueAnchorPairs.size() != 1) continue;
 
             // Skip if any edge touches an endNode anchor.
@@ -911,6 +940,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
             if(hasEndNode) continue;
+
+            // 2. Both anchors must have alternative intra-window backbone edges.
+            // Check using the first edge (all edges share the same normalized pair).
+            const uint64_t srcVal = uint64_t(source(info.edges[0], anchorGraph));
+            const uint64_t dstVal = uint64_t(target(info.edges[0], anchorGraph));
+            if(!hasIntraWindowEdge(srcVal) || !hasIntraWindowEdge(dstVal)) continue;
 
             // Remove all edges for this single-connection pair.
             for(const auto& e : info.edges) {
