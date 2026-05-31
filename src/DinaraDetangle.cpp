@@ -38,12 +38,16 @@
 //     would find a1 (since nextW == prevW), leaving no room for
 //     lastInPrev before it.
 //
-//   Case 3: read revisits X (A -> X -> B -> X -> A)
-//     Journey: [a1, x1, x2, b1, x3, x4, a2]
-//     X span: x1..x4 (covers both visits).
-//     lastInPrev=a1, firstInNext=a2.
-//     The span encompasses all X anchors, so the bypass connects
-//     the anchors outside the entire X region.
+//   Case 3: read revisits X (A -> X -> B -> X -> C)
+//     Journey: [a1, x1, x2, b1, x3, x4, c1]
+//     X runs: [x1,x2] and [x3,x4].
+//     transitionReads records this read twice for window X:
+//       {A,B} (first visit) and {B,C} (second visit).
+//     For {A,B}: run [x1,x2] has A before and B after → match.
+//       lastInPrev=a1, firstInNext=b1. Bypass: a1 → b1.
+//     For {B,C}: run [x1,x2] has no B before → skip.
+//       run [x3,x4] has B before and C after → match.
+//       lastInPrev=b1, firstInNext=c1. Bypass: b1 → c1.
 //
 //   Case 4: other windows interleaved before X
 //     Journey: [a1, c1, a2, x1, x2, b1]
@@ -164,61 +168,57 @@ uint64_t dinara::detangleWindows(
                 const auto journey = journeys[oid];
                 if(journey.empty()) continue;
 
-                // Find the span of window X (wIdx) in the journey,
-                // then pick lastInPrev before that span and firstInNext
-                // after it. This handles prevW == nextW correctly.
-
-                // Find the first and last journey positions belonging to
-                // the bypassed window X.
-                uint32_t xFirst = uint32_t(journey.size());
-                uint32_t xLast = 0;
-                for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                // Build per-position window labels for this journey.
+                const uint32_t jLen = uint32_t(journey.size());
+                vector<uint32_t> posWindow(jLen, noW);
+                for(uint32_t pos = 0; pos < jLen; pos++) {
                     const Shasta2AnchorId anchorId = journey[pos];
                     if(uint64_t(anchorId) >= anchorCount) continue;
                     const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
                     if(aw == noW) continue;
-                    if(normalize(aw) == wIdx) {
-                        if(xFirst == uint32_t(journey.size())) xFirst = pos;
-                        xLast = pos;
-                    }
-                }
-                // Read must actually touch window X.
-                if(xFirst == uint32_t(journey.size())) continue;
-
-                // lastInPrev: last anchor in prevW before the X span.
-                Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
-                bool foundPrev = false;
-                for(uint32_t pos = 0; pos < xFirst; pos++) {
-                    const Shasta2AnchorId anchorId = journey[pos];
-                    if(uint64_t(anchorId) >= anchorCount) continue;
-                    const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
-                    if(aw == noW) continue;
-                    if(normalize(aw) == prevW) {
-                        lastInPrev = anchorId;
-                        foundPrev = true;
-                    }
+                    posWindow[pos] = normalize(aw);
                 }
 
-                // firstInNext: first anchor in nextW after the X span.
-                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
-                bool foundNext = false;
-                for(uint32_t pos = xLast + 1; pos < uint32_t(journey.size()); pos++) {
-                    const Shasta2AnchorId anchorId = journey[pos];
-                    if(uint64_t(anchorId) >= anchorCount) continue;
-                    const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
-                    if(aw == noW) continue;
-                    if(normalize(aw) == nextW) {
-                        firstInNext = anchorId;
-                        foundNext = true;
-                        break;
-                    }
-                }
+                // Scan for contiguous runs of window X. For each run,
+                // check if prevW appears before it and nextW after it.
+                // A read that visits X multiple times (A→X→B→X→C) has
+                // multiple runs; each run matches a different transition.
+                uint32_t pos = 0;
+                while(pos < jLen) {
+                    // Find start of an X run.
+                    if(posWindow[pos] != wIdx) { pos++; continue; }
+                    const uint32_t runStart = pos;
+                    while(pos < jLen && posWindow[pos] == wIdx) pos++;
+                    const uint32_t runEnd = pos; // exclusive
 
-                if(foundPrev && foundNext) {
-                    auto pairKey = pair<uint64_t, uint64_t>(
-                        uint64_t(lastInPrev), uint64_t(firstInNext));
-                    anchorPairCounts[pairKey]++;
-                    anchorPairReads[pairKey].push_back(oid.getValue());
+                    // lastInPrev: last anchor in prevW before runStart.
+                    Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
+                    bool foundPrev = false;
+                    for(uint32_t p = 0; p < runStart; p++) {
+                        if(posWindow[p] == prevW) {
+                            lastInPrev = journey[p];
+                            foundPrev = true;
+                        }
+                    }
+
+                    // firstInNext: first anchor in nextW at or after runEnd.
+                    Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
+                    bool foundNext = false;
+                    for(uint32_t p = runEnd; p < jLen; p++) {
+                        if(posWindow[p] == nextW) {
+                            firstInNext = journey[p];
+                            foundNext = true;
+                            break;
+                        }
+                    }
+
+                    if(foundPrev && foundNext) {
+                        auto pairKey = pair<uint64_t, uint64_t>(
+                            uint64_t(lastInPrev), uint64_t(firstInNext));
+                        anchorPairCounts[pairKey]++;
+                        anchorPairReads[pairKey].push_back(oid.getValue());
+                        break; // Use the first matching run for this read.
+                    }
                 }
             }
 
