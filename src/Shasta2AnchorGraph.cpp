@@ -885,8 +885,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(const auto& [pair, edges] : pairEdges) {
             if(edges.size() != 1) continue;
 
-            // Skip if this is an endpoint edge.
-            if(anchorGraph[edges[0]].isEndpointAnchorPrev || anchorGraph[edges[0]].isEndpointAnchorNext) continue;
+            // Skip if either anchor is an endNode.
+            const uint64_t srcVal = uint64_t(source(edges[0], anchorGraph));
+            const uint64_t dstVal = uint64_t(target(edges[0], anchorGraph));
+            if((srcVal < anchorCount && isEndpointAnchor[srcVal]) ||
+               (dstVal < anchorCount && isEndpointAnchor[dstVal])) continue;
 
             disableEdge(edges[0]);
             ++singleEdgeRemovedCount;
@@ -979,7 +982,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 // Skip if any edge to/from X is an endpoint edge.
                 bool hasEndpointEdge = false;
                 for(const auto& ie : inEdges) {
-                    if(anchorGraph[ie.e].isEndpointAnchorPrev || anchorGraph[ie.e].isEndpointAnchorNext) { hasEndpointEdge = true; break; }
+                    const uint64_t s = uint64_t(source(ie.e, anchorGraph));
+                    const uint64_t d = uint64_t(target(ie.e, anchorGraph));
+                    if((s < anchorCount && isEndpointAnchor[s]) ||
+                       (d < anchorCount && isEndpointAnchor[d])) { hasEndpointEdge = true; break; }
                 }
                 if(hasEndpointEdge) continue;
                 auto outIt = outgoing.find(xWindow);
@@ -1070,8 +1076,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 auto oe = boost::out_edges(startAid, anchorGraph);
                 for(auto it = oe.first; it != oe.second; ++it) {
                     if(!anchorGraph[*it].useForAssembly) continue;
-                    if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                     const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                    if((startAid < anchorCount && isEndpointAnchor[startAid]) ||
+                       (tgt < anchorCount && isEndpointAnchor[tgt])) continue;
                     if(tgt >= anchorCount) continue;
                     const uint32_t tgtRaw = anchorToWindow[tgt];
                     if(tgtRaw == noWindow) continue;
@@ -1097,8 +1104,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     auto oe2 = boost::out_edges(aid, anchorGraph);
                     for(auto it = oe2.first; it != oe2.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
-                        if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                         const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                        if((aid < anchorCount && isEndpointAnchor[aid]) ||
+                           (tgt < anchorCount && isEndpointAnchor[tgt])) continue;
                         if(tgt >= anchorCount || visited.count(tgt)) continue;
                         const uint32_t tgtRaw = anchorToWindow[tgt];
                         if(tgtRaw == noWindow) continue;
@@ -1110,8 +1118,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     auto ie = boost::in_edges(aid, anchorGraph);
                     for(auto it = ie.first; it != ie.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
-                        if(anchorGraph[*it].isEndpointAnchorPrev || anchorGraph[*it].isEndpointAnchorNext) continue;
                         const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                        if((aid < anchorCount && isEndpointAnchor[aid]) ||
+                           (src < anchorCount && isEndpointAnchor[src])) continue;
                         if(src >= anchorCount || visited.count(src)) continue;
                         const uint32_t srcRaw = anchorToWindow[src];
                         if(srcRaw == noWindow) continue;
@@ -1609,9 +1618,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             bool hasEndpoint = false;
             BGL_FORALL_EDGES(e2, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e2].useForAssembly) continue;
-                if(!(anchorGraph[e2].isEndpointAnchorPrev || anchorGraph[e2].isEndpointAnchorNext)) continue;
                 const uint64_t srcVal2 = uint64_t(source(e2, anchorGraph));
                 const uint64_t dstVal2 = uint64_t(target(e2, anchorGraph));
+                if(!((srcVal2 < anchorCount && isEndpointAnchor[srcVal2]) ||
+                     (dstVal2 < anchorCount && isEndpointAnchor[dstVal2]))) continue;
                 if(srcVal2 >= anchorCount || dstVal2 >= anchorCount) continue;
                 const uint32_t srcRaw2 = anchorToWindow[srcVal2];
                 const uint32_t dstRaw2 = anchorToWindow[dstVal2];
