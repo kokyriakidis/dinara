@@ -2227,6 +2227,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // construction and do not change (recomputeBackboneEndpoints is not
     // needed since it always returns the same result).
     // ========================================================================
+    // Filter pipeline disabled — detangleWindows runs first externally.
+#if 0
     trimBackbones();
     removeDeadEndSpurs();           // Remove single-neighbor internal spurs
     trimBackbones();
@@ -2245,6 +2247,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     removeSmallWindows(2);
     trimBackbones();
     removeDanglingWindowsIterative("post-filter");
+#endif
 
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
