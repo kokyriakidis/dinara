@@ -3117,25 +3117,18 @@ void Assembler::buildSvMSA(
                                  // << ", flankCov="
                                  // << flankCoverage
                                  // << endl;
-                            allDelCalls.push_back({
-                                breakpointPos, delSize,
-                                0, "VNTR-depth"});
+                            // VNTR-depth suppressed (0% precision).
+                            // allDelCalls.push_back({
+                            //     breakpointPos, delSize,
+                            //     0, "VNTR-depth"});
                             // Also emit the het estimate.
                             if(insLenHet < -30) {
                                 const int64_t delSizeHet =
                                     std::abs(insLenHet);
-                                // cout << "    >>> DELETION CALL"
-                                     // << " (VNTR-depth-het): size="
-                                     // << delSizeHet << "bp"
-                                     // << ", breakpoint="
-                                     // << breakpointPos
-                                     // << ", refLen=" << vntrRefLen
-                                     // << ", flankCov="
-                                     // << flankCoverage
-                                     // << endl;
-                                allDelCalls.push_back({
-                                    breakpointPos, delSizeHet,
-                                    0, "VNTR-depth"});
+                                // VNTR-depth-het suppressed.
+                                // allDelCalls.push_back({
+                                //     breakpointPos, delSizeHet,
+                                //     0, "VNTR-depth"});
                             }
                             // Also emit refGap as a DEL call —
                             // the breakpoint distance itself is
@@ -3161,9 +3154,10 @@ void Assembler::buildSvMSA(
                                  // << ", flankCov="
                                  // << flankCoverage
                                  // << endl;
-                            allDelCalls.push_back({
-                                breakpointPos, delSize,
-                                0, "VNTR-depth"});
+                            // VNTR-depth suppressed (0% precision).
+                            // allDelCalls.push_back({
+                            //     breakpointPos, delSize,
+                            //     0, "VNTR-depth"});
                             if(vntrRefLen >= 30) {
                                 // cout << "    >>> DELETION CALL"
                                      // << " (VNTR-refGap): size="
@@ -3187,11 +3181,12 @@ void Assembler::buildSvMSA(
                              // << ", breakpoint="
                              // << breakpointPos
                              // << endl;
-                        allDelCalls.push_back({
-                            breakpointPos, int64_t(bestDist),
-                            uint32_t(lbp.endpointCount
-                                     + bestRbp->endpointCount),
-                            "bp-pair-nofp"});
+                        // bp-pair-nofp suppressed (9% precision).
+                        // allDelCalls.push_back({
+                        //     breakpointPos, int64_t(bestDist),
+                        //     uint32_t(lbp.endpointCount
+                        //              + bestRbp->endpointCount),
+                        //     "bp-pair-nofp"});
                     }
 
                     if(foundPath && bestPathDist > 20) {
@@ -3528,14 +3523,15 @@ void Assembler::buildSvMSA(
                                              // << "bp, breakpoint="
                                              // << insBpPos
                                              // << endl;
-                                        delCallRecords.push_back({
-                                            insBpPos,
-                                            pmSize,
-                                            uint32_t(
-                                                lbp.endpointCount
-                                                + bestInsRbp
-                                                  ->endpointCount),
-                                            "path-mirror"});
+                                        // path-mirror suppressed (0% precision).
+                                        // delCallRecords.push_back({
+                                        //     insBpPos,
+                                        //     pmSize,
+                                        //     uint32_t(
+                                        //         lbp.endpointCount
+                                        //         + bestInsRbp
+                                        //           ->endpointCount),
+                                        //     "path-mirror"});
 
 
                                     }
@@ -3748,13 +3744,14 @@ void Assembler::buildSvMSA(
                                  // << ", breakpoint="
                                  // << breakpointPos
                                  // << endl;
-                            delCallRecords.push_back({
-                                breakpointPos,
-                                bpPairSize,
-                                uint32_t(
-                                    lbp.endpointCount
-                                    + bestRbp->endpointCount),
-                                "bp-pair"});
+                            // bp-pair suppressed (8% precision).
+                            // delCallRecords.push_back({
+                            //     breakpointPos,
+                            //     bpPairSize,
+                            //     uint32_t(
+                            //         lbp.endpointCount
+                            //         + bestRbp->endpointCount),
+                            //     "bp-pair"});
 
 
                         }
@@ -4341,9 +4338,10 @@ void Assembler::buildSvMSA(
                                      // << ", minRatio="
                                      // << cluster.minRatio
                                      // << endl;
-                                allDelCalls.push_back({
-                                    hdBp, clusterSpan,
-                                    0, "covdrop-span"});
+                                // covdrop-span suppressed (7% precision).
+                                // allDelCalls.push_back({
+                                //     hdBp, clusterSpan,
+                                //     0, "covdrop-span"});
                             }
                             continue;
                         }
@@ -5865,11 +5863,12 @@ void Assembler::buildSvMSA(
                                      // << "size=" << bestShift << "bp, "
                                      // << "breakpoint=" << bpPos
                                      // << endl;
-                                if(bestShift >= 50) {
-                                    allDelCalls.push_back({
-                                        bpPos, bestShift,
-                                        0, "adaptive-bimodal"});
-                                }
+                                // adaptive-bimodal suppressed (20% precision).
+                                // if(bestShift >= 50) {
+                                //     allDelCalls.push_back({
+                                //         bpPos, bestShift,
+                                //         0, "adaptive-bimodal"});
+                                // }
                                 refinedCall = true;
                             }
                         }
