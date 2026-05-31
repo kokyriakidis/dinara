@@ -597,9 +597,15 @@ void Assembler::computeAnchorWindowsClean(
         }
         const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
 
-        // Check if the interval is still fully unclaimed.
+        // Only accept full-journey candidates. Fragment candidates
+        // (from pushCurrentUnclaimedIntervals) are discarded.
+        if(candidate.begin != 0 || candidate.end != uint32_t(journey.size())) {
+            continue;
+        }
+
+        // Check if the full journey is still unclaimed.
         bool isStillUnclaimed = true;
-        for(uint32_t position = candidate.begin; position < candidate.end; position++) {
+        for(uint32_t position = 0; position < uint32_t(journey.size()); position++) {
             if(anchorOwner[uint64_t(journey[position])] != anchorUnclaimed) {
                 isStillUnclaimed = false;
                 break;
@@ -607,10 +613,6 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         if(!isStillUnclaimed) {
-            // Some anchors were claimed since this candidate was pushed.
-            // Bump generation and re-push remaining unclaimed intervals.
-            ++candidateGeneration[uint64_t(readId)];
-            pushCurrentUnclaimedIntervals(candidate.backboneOrientedReadId);
             continue;
         }
 
