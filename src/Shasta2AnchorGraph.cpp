@@ -528,6 +528,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // For each endpoint window pair, find the anchor pair where the backbone
     // reads transition between the two windows. This is the specific anchor
     // pair from the backbone reads, not the best-sharing pair from all reads.
+    // Track which normalized pairs have already set endNode tags — only the
+    // first raw pair per normalized pair sets them. Subsequent raw pairs
+    // (rc-rc etc.) still create edges but don't add more endNode anchors.
+    std::set<std::pair<uint32_t, uint32_t>> endpointTaggedPairs;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
@@ -610,65 +614,64 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         } else if(bestSize < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
-            // Override isEndpointAnchor: clear old default endpoints on the
-            // sides where pass 1 found actual connections, then set new ones.
             const uint64_t aidA = uint64_t(bestPair.anchorIdA);
             const uint64_t aidB = uint64_t(bestPair.anchorIdB);
 
-            // aidA is in srcNorm, connecting toward dstNorm (tail side).
-            // Clear srcNorm's old last anchor if different from aidA.
-            auto clearOld = [&](uint64_t oldAid) {
-                if(oldAid == UINT64_MAX || oldAid >= anchorCount) return;
-                isEndpointAnchor[oldAid] = false;
-                endpointAnchors.erase(oldAid);
-                if((oldAid ^ 1ULL) < anchorCount) {
-                    isEndpointAnchor[oldAid ^ 1ULL] = false;
-                    endpointAnchors.erase(oldAid ^ 1ULL);
+            // Only the first raw pair per normalized pair sets endNode tags.
+            // Subsequent raw pairs (rc-rc etc.) create edges but don't tag.
+            const auto normPair = std::make_pair(
+                std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm));
+            if(endpointTaggedPairs.insert(normPair).second) {
+                // Clear old default endpoints on the sides where pass 1
+                // found actual connections, then set new ones.
+                auto clearOld = [&](uint64_t oldAid) {
+                    if(oldAid == UINT64_MAX || oldAid >= anchorCount) return;
+                    isEndpointAnchor[oldAid] = false;
+                    endpointAnchors.erase(oldAid);
+                    if((oldAid ^ 1ULL) < anchorCount) {
+                        isEndpointAnchor[oldAid ^ 1ULL] = false;
+                        endpointAnchors.erase(oldAid ^ 1ULL);
+                    }
+                };
+                if(srcNorm < windowCount) {
+                    const auto& srcW = anchorWindows[srcNorm];
+                    if(srcW.backboneNextWindow == dstNorm) {
+                        uint64_t oldLast = initialEndpoints[srcNorm].lastAid;
+                        if(oldLast != aidA) clearOld(oldLast);
+                    }
+                    if(srcW.backbonePreviousWindow == dstNorm) {
+                        uint64_t oldFirst = initialEndpoints[srcNorm].firstAid;
+                        if(oldFirst != aidA) clearOld(oldFirst);
+                    }
                 }
-            };
-            if(srcNorm < windowCount) {
-                const auto& srcW = anchorWindows[srcNorm];
-                if(srcW.backboneNextWindow == dstNorm) {
-                    // Tail side: clear old last anchor.
-                    uint64_t oldLast = initialEndpoints[srcNorm].lastAid;
-                    if(oldLast != aidA) clearOld(oldLast);
+                if(dstNorm < windowCount) {
+                    const auto& dstW = anchorWindows[dstNorm];
+                    if(dstW.backbonePreviousWindow == srcNorm) {
+                        uint64_t oldFirst = initialEndpoints[dstNorm].firstAid;
+                        if(oldFirst != aidB) clearOld(oldFirst);
+                    }
+                    if(dstW.backboneNextWindow == srcNorm) {
+                        uint64_t oldLast = initialEndpoints[dstNorm].lastAid;
+                        if(oldLast != aidB) clearOld(oldLast);
+                    }
                 }
-                if(srcW.backbonePreviousWindow == dstNorm) {
-                    // Head side: clear old first anchor.
-                    uint64_t oldFirst = initialEndpoints[srcNorm].firstAid;
-                    if(oldFirst != aidA) clearOld(oldFirst);
-                }
-            }
-            // aidB is in dstNorm, connecting toward srcNorm (head side).
-            if(dstNorm < windowCount) {
-                const auto& dstW = anchorWindows[dstNorm];
-                if(dstW.backbonePreviousWindow == srcNorm) {
-                    // Head side: clear old first anchor.
-                    uint64_t oldFirst = initialEndpoints[dstNorm].firstAid;
-                    if(oldFirst != aidB) clearOld(oldFirst);
-                }
-                if(dstW.backboneNextWindow == srcNorm) {
-                    // Tail side: clear old last anchor.
-                    uint64_t oldLast = initialEndpoints[dstNorm].lastAid;
-                    if(oldLast != aidB) clearOld(oldLast);
-                }
-            }
 
-            // Set new endpoints (both anchor and RC mirror).
-            if(aidA < anchorCount) {
-                isEndpointAnchor[aidA] = true;
-                endpointAnchors.insert(aidA);
-                if((aidA ^ 1ULL) < anchorCount) {
-                    isEndpointAnchor[aidA ^ 1ULL] = true;
-                    endpointAnchors.insert(aidA ^ 1ULL);
+                // Set new endpoints (both anchor and RC mirror).
+                if(aidA < anchorCount) {
+                    isEndpointAnchor[aidA] = true;
+                    endpointAnchors.insert(aidA);
+                    if((aidA ^ 1ULL) < anchorCount) {
+                        isEndpointAnchor[aidA ^ 1ULL] = true;
+                        endpointAnchors.insert(aidA ^ 1ULL);
+                    }
                 }
-            }
-            if(aidB < anchorCount) {
-                isEndpointAnchor[aidB] = true;
-                endpointAnchors.insert(aidB);
-                if((aidB ^ 1ULL) < anchorCount) {
-                    isEndpointAnchor[aidB ^ 1ULL] = true;
-                    endpointAnchors.insert(aidB ^ 1ULL);
+                if(aidB < anchorCount) {
+                    isEndpointAnchor[aidB] = true;
+                    endpointAnchors.insert(aidB);
+                    if((aidB ^ 1ULL) < anchorCount) {
+                        isEndpointAnchor[aidB ^ 1ULL] = true;
+                        endpointAnchors.insert(aidB ^ 1ULL);
+                    }
                 }
             }
             reservedAnchors.insert(aidA);
