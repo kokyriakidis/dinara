@@ -2259,9 +2259,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // construction and do not change (recomputeBackboneEndpoints is not
     // needed since it always returns the same result).
     // ========================================================================
-    // Filter pipeline disabled — detangleWindows runs first externally.
-#if 0
     trimBackbones();
+
+    // Remaining filters disabled — detangleWindows runs externally.
+#if 0
     removeDeadEndSpurs();           // Remove single-neighbor internal spurs
     trimBackbones();
     runSingleEdgeFilter();          // Case 2: remove single-point connections
