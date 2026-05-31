@@ -1,40 +1,29 @@
 // ============================================================================
-// Detangle Case 1: 1-to-1 bypass
+// Detangle: window bypass
 // ============================================================================
 //
-// Resolves tangled windows where multiple genomic paths (flows) pass
-// through the same window. A window is tangled when it has ≥2 distinct
-// flows, where a flow is a group of reads that enter from one neighbor
-// window and exit to another.
+// For each window X with through-flows (A -> X -> B), creates bypass
+// edges connecting A directly to B, skipping X.
 //
-// For each tangled window B with a flow triplet (A -> B -> C):
-//   - The flow reads are the reads common between windows A and C
-//     (reads that traverse B from A to C), taken from transitionReads.
-//   - A bypass edge is created connecting A's exit anchor directly to
-//     C's entry anchor, skipping over B.
-//   - The flow reads are removed from every backbone anchor of B
-//     (and their RC counterparts), so B's backbone retains only reads
-//     that don't participate in any bypass flow.
+// Algorithm:
+//   1. Build a local anchorToWindow map from backbone positions.
+//   2. For each window X, iterate transitionReads to find (A, B) pairs
+//      where reads flow A -> X -> B (both A and B are real windows).
+//   3. For each (A, B) pair, walk each flow read's journey to find the
+//      last anchor in A and the first anchor in B. Tally (anchorA, anchorB)
+//      pairs and pick the one with the most reads as the bypass edge.
+//   4. Create bypass edge (forward + RC mirror).
+//   5. Remove flow reads from X's backbone anchors.
 //
-// Processing order:
-//   All bypass candidates across all tangled windows are collected,
-//   sorted by flow read count (descending), and processed strongest
-//   first. This ensures the most confident flows get their full read
-//   sets. Weaker flows that share reads with stronger ones see the
-//   reduced read sets after prior removals.
+// No minimum number of distinct flows is required — even a single
+// A -> X -> B flow is bypassed if it meets minFlowCoverage.
 //
-// Anchor modification:
-//   Since anchorMarkerInfos is a MemoryMapped::VectorOfVectors that
-//   cannot be modified in place, all anchor data is copied to a mutable
-//   std::vector<std::vector<>> at the start. Read removals are applied
-//   immediately so subsequent candidates see the updated state. The
-//   VectorOfVectors is rebuilt once at the end.
+// Processing order: candidates sorted by flow read count (descending)
+// so stronger flows get their full read sets first.
 //
-// RC handling:
-//   For each forward bypass edge (A -> C), an RC mirror edge (C' -> A')
-//   is also created. When removing reads from backbone anchors, both
-//   the canonical and RC anchors are updated (with strand-flipped read
-//   IDs for the RC anchor).
+// RC handling: for each forward bypass edge (anchorA -> anchorB),
+// an RC mirror (anchorB' -> anchorA') is also created. Read removals
+// update both canonical and RC anchors.
 // ============================================================================
 
 #include "DinaraDetangle.hpp"
@@ -62,148 +51,180 @@ uint64_t dinara::detangleWindows(
     uint64_t minFlowCoverage,
     vector<DetangleBypassEdge>& bypassEdges)
 {
-    cout << timestamp << "Detangle Case 1 (1-to-1 bypass) begins." << endl;
+    cout << timestamp << "Detangle (window bypass) begins." << endl;
 
     const uint32_t noW = AnchorWindow::noWindow;
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
     bypassEdges.clear();
 
-    // ---- Step 1: Copy anchor data to a mutable structure. ----
-    // This allows in-place read removal so each processed candidate's
-    // changes are immediately visible to subsequent candidates.
+    // ---- Step 1: Build local anchorToWindow map. ----
     const uint64_t anchorCount = anchors.anchorMarkerInfos.size();
+    vector<uint32_t> anchorToWindow(anchorCount, noW);
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const auto backboneJourney = journeys[window.backboneOrientedReadId];
+
+        const auto& positions = window.filteredBackbonePositions.empty()
+            ? [&]() -> const vector<uint32_t>& {
+                static thread_local vector<uint32_t> allPositions;
+                allPositions.clear();
+                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                    allPositions.push_back(pos);
+                }
+                return allPositions;
+            }()
+            : window.filteredBackbonePositions;
+
+        for(const uint32_t pos : positions) {
+            const uint64_t aid = uint64_t(backboneJourney[pos]);
+            if(aid < anchorCount) {
+                anchorToWindow[aid] = windowId;
+            }
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount) {
+                anchorToWindow[rcAid] = windowId + windowCount;
+            }
+        }
+    }
+
+    auto normalize = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // ---- Step 2: Copy anchor data to a mutable structure. ----
     vector<vector<Shasta2AnchorMarkerInfo>> mutableAnchors(anchorCount);
     for(uint64_t i = 0; i < anchorCount; i++) {
         const auto span = anchors.anchorMarkerInfos[i];
         mutableAnchors[i].assign(span.begin(), span.end());
     }
 
-    // ---- Step 2: Collect bypass candidates from all tangled windows. ----
-    // A bypass candidate represents a single directional flow
-    // (prevW -> tangledW -> nextW). The flow reads are the reads
-    // common between prevW and nextW, obtained from transitionReads.
+    // ---- Step 3: Collect bypass candidates. ----
+    // For each window X and each (A, B) flow through it, walk the flow
+    // reads' journeys to find the best anchor pair between A and B.
     struct BypassCandidate {
-        uint32_t windowId;                // The tangled window being bypassed.
-        uint32_t prevW;                   // Previous window.
-        uint32_t nextW;                   // Next window.
-        Shasta2AnchorId prevExitAnchor;   // Last anchor in prev window.
-        Shasta2AnchorId nextEntryAnchor;  // First anchor in next window.
-        set<uint32_t> flowReads;          // Reads common between prevW and nextW.
+        uint32_t windowId;                // The window being bypassed (X).
+        uint32_t prevW;                   // Window A.
+        uint32_t nextW;                   // Window B.
+        Shasta2AnchorId bestAnchorA;      // Last anchor in A (best pair).
+        Shasta2AnchorId bestAnchorB;      // First anchor in B (best pair).
+        vector<uint32_t> flowReadIds;     // Oriented read IDs for this flow.
     };
     vector<BypassCandidate> candidates;
 
-    for(uint32_t wIdx = 0; wIdx < anchorWindows.size(); wIdx++) {
+    for(uint32_t wIdx = 0; wIdx < windowCount; wIdx++) {
         const AnchorWindow& window = anchorWindows[wIdx];
 
-        // Identify flows from transitionReads. Each (prev, next) pair
-        // where both are real windows defines a directional flow.
-        // Merge directional pairs (A->B) and (B->A) into a single
-        // canonical flow to count distinct genomic paths.
-        using FlowKey = pair<uint32_t, uint32_t>;
-        map<FlowKey, set<uint32_t>> mergedFlows;
-
         for(const auto& [key, reads] : window.transitionReads) {
             if(key.first == noW || key.second == noW) continue;
-            FlowKey canonical = {std::min(key.first, key.second),
-                                 std::max(key.first, key.second)};
+            if(reads.size() < minFlowCoverage) continue;
+
+            const uint32_t prevW = key.first;
+            const uint32_t nextW = key.second;
+
+            // Walk each flow read's journey to find the last anchor in
+            // prevW and the first anchor in nextW. Tally anchor pairs.
+            map<pair<uint64_t, uint64_t>, uint64_t> anchorPairCounts;
+            map<pair<uint64_t, uint64_t>, vector<uint32_t>> anchorPairReads;
+
             for(const OrientedReadId& oid : reads) {
-                mergedFlows[canonical].insert(oid.getValue());
-            }
-        }
+                const auto journey = journeys[oid];
+                if(journey.empty()) continue;
 
-        // A window is tangled only if it has ≥2 distinct flows.
-        if(mergedFlows.size() < 2) continue;
+                // Find the last anchor belonging to prevW and the first
+                // anchor belonging to nextW in this read's journey.
+                Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
+                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
+                bool foundPrev = false;
+                bool foundNext = false;
 
-        // Create a candidate for each directional flow.
-        // Each directional key (prev -> next) gets its own bypass edge.
-        for(const auto& [key, reads] : window.transitionReads) {
-            if(key.first == noW || key.second == noW) continue;
+                for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                    const Shasta2AnchorId anchorId = journey[pos];
+                    if(uint64_t(anchorId) >= anchorCount) continue;
+                    const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
+                    if(aw == noW) continue;
+                    const uint32_t normW = normalize(aw);
 
-            // Find the connection anchors from the inter-window edges.
-            // inEdge from prevW: anchorIdA = last anchor in prevW.
-            Shasta2AnchorId prevExitAnchor = Shasta2AnchorId(0);
-            bool foundPrev = false;
-            for(const auto& ie : window.inEdges) {
-                if(ie.otherWindow == key.first) {
-                    prevExitAnchor = ie.anchorIdA;
-                    foundPrev = true;
-                    break;
+                    if(normW == prevW) {
+                        lastInPrev = anchorId;
+                        foundPrev = true;
+                    }
+                    if(normW == nextW && !foundNext) {
+                        firstInNext = anchorId;
+                        foundNext = true;
+                    }
+                }
+
+                if(foundPrev && foundNext) {
+                    auto pairKey = pair<uint64_t, uint64_t>(
+                        uint64_t(lastInPrev), uint64_t(firstInNext));
+                    anchorPairCounts[pairKey]++;
+                    anchorPairReads[pairKey].push_back(oid.getValue());
                 }
             }
 
-            // outEdge to nextW: anchorIdB = first anchor in nextW.
-            Shasta2AnchorId nextEntryAnchor = Shasta2AnchorId(0);
-            bool foundNext = false;
-            for(const auto& oe : window.outEdges) {
-                if(oe.otherWindow == key.second) {
-                    nextEntryAnchor = oe.anchorIdB;
-                    foundNext = true;
-                    break;
-                }
-            }
+            if(anchorPairCounts.empty()) continue;
 
-            if(foundPrev && foundNext) {
-                FlowKey canonical = {std::min(key.first, key.second),
-                                     std::max(key.first, key.second)};
-                candidates.push_back({wIdx, key.first, key.second,
-                                      prevExitAnchor, nextEntryAnchor,
-                                      mergedFlows[canonical]});
-            }
+            // Pick the anchor pair with the most reads.
+            auto bestIt = std::max_element(
+                anchorPairCounts.begin(), anchorPairCounts.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second < b.second;
+                });
+
+            if(bestIt->second < minFlowCoverage) continue;
+
+            candidates.push_back({
+                wIdx, prevW, nextW,
+                Shasta2AnchorId(bestIt->first.first),
+                Shasta2AnchorId(bestIt->first.second),
+                anchorPairReads[bestIt->first]
+            });
         }
     }
 
-    // ---- Step 3: Sort candidates by flow read count (descending). ----
-    // Strongest flows are processed first to get their full read sets.
+    // ---- Step 4: Sort candidates by flow read count (descending). ----
     std::sort(candidates.begin(), candidates.end(),
         [](const BypassCandidate& a, const BypassCandidate& b) {
-            return a.flowReads.size() > b.flowReads.size();
+            return a.flowReadIds.size() > b.flowReadIds.size();
         });
 
-    // ---- Step 4: Process each candidate. ----
-    // For each candidate:
-    //   a) Recompute common reads (prior removals may have reduced them).
-    //   b) Create bypass edge (forward + RC).
-    //   c) Remove common reads from backbone anchors of the tangled window.
+    // ---- Step 5: Process each candidate. ----
     set<uint32_t> detangledWindows;
     uint64_t processedCount = 0;
 
     for(const auto& cand : candidates) {
 
-        // (a) Recompute common reads between connection anchors.
-        // Only keep reads that are still present on both anchors
-        // AND were in the original flow read set.
-        set<uint32_t> prevReads, nextReads;
-        for(const auto& mi : mutableAnchors[uint64_t(cand.prevExitAnchor)]) {
-            prevReads.insert(mi.orientedReadId.getValue());
+        // Recompute: only keep reads still present on both anchors.
+        set<uint32_t> anchorAReads, anchorBReads;
+        for(const auto& mi : mutableAnchors[uint64_t(cand.bestAnchorA)]) {
+            anchorAReads.insert(mi.orientedReadId.getValue());
         }
-        for(const auto& mi : mutableAnchors[uint64_t(cand.nextEntryAnchor)]) {
-            nextReads.insert(mi.orientedReadId.getValue());
+        for(const auto& mi : mutableAnchors[uint64_t(cand.bestAnchorB)]) {
+            anchorBReads.insert(mi.orientedReadId.getValue());
         }
         set<uint32_t> commonReads;
-        for(const uint32_t r : cand.flowReads) {
-            if(prevReads.count(r) && nextReads.count(r)) {
+        for(const uint32_t r : cand.flowReadIds) {
+            if(anchorAReads.count(r) && anchorBReads.count(r)) {
                 commonReads.insert(r);
             }
         }
 
-        if(commonReads.empty()) {
-            continue;
-        }
+        if(commonReads.size() < minFlowCoverage) continue;
 
-        // (b) Create bypass edges.
-        bypassEdges.push_back({cand.prevExitAnchor, cand.nextEntryAnchor});
+        // Create bypass edges (forward + RC mirror).
+        bypassEdges.push_back({cand.bestAnchorA, cand.bestAnchorB});
 
-        // RC mirror: B' -> A'.
-        const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(cand.prevExitAnchor) ^ 1ULL);
-        const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(cand.nextEntryAnchor) ^ 1ULL);
+        const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(cand.bestAnchorA) ^ 1ULL);
+        const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(cand.bestAnchorB) ^ 1ULL);
         bypassEdges.push_back({rcB, rcA});
 
         cout << "  Bypass: window " << cand.windowId
-             << " " << cand.prevExitAnchor << " -> " << cand.nextEntryAnchor
+             << " anchor " << cand.bestAnchorA << " -> " << cand.bestAnchorB
              << " (+ RC " << rcB << " -> " << rcA << ")"
              << " prev=" << cand.prevW << " next=" << cand.nextW
-             << " commonReads=" << commonReads.size() << endl;
+             << " reads=" << commonReads.size() << endl;
 
-        // (c) Remove common reads from backbone anchors of the tangled window.
+        // Remove flow reads from backbone anchors of the bypassed window.
         const AnchorWindow& window = anchorWindows[cand.windowId];
         const auto backboneJourney = journeys[window.backboneOrientedReadId];
         const auto& positions = window.filteredBackbonePositions;
@@ -241,14 +262,14 @@ uint64_t dinara::detangleWindows(
         ++processedCount;
     }
 
-    // ---- Step 5: Rebuild anchorMarkerInfos from the modified copy. ----
+    // ---- Step 6: Rebuild anchorMarkerInfos from the modified copy. ----
     anchors.anchorMarkerInfos.clear();
     for(const auto& anchorData : mutableAnchors) {
         anchors.anchorMarkerInfos.appendVector(anchorData);
     }
 
-    cout << timestamp << "Detangle Case 1: " << detangledWindows.size()
-         << " windows detangled, "
+    cout << timestamp << "Detangle: " << detangledWindows.size()
+         << " windows bypassed, "
          << processedCount << " bypasses processed, "
          << bypassEdges.size() << " bypass edges created." << endl;
 
