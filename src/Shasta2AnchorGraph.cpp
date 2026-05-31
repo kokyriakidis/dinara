@@ -543,32 +543,56 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
 
     // Single-pass inter-window edge creation.
-    // For each window pair, pick the anchor pair from the read with the
-    // largest supporting span (baseSpanA + baseSpanB). This read covers
-    // the most genomic territory across both windows, providing the
-    // strongest evidence for the connection.
+    // For each window pair, group transitions by anchor pair and pick
+    // the one with the most reads (consensus transition point).
+    // Tiebreak by best spanA * spanB. The best span among the winning
+    // group's reads is stored as maxSupportingSpan on the edge.
     for(const auto& [windowPair, transitions] : windowPairTransitions) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
         if(srcNorm == dstNorm) continue;
 
-        // Find the read with the largest supporting span.
-        uint64_t bestSpan = 0;
-        const ReadTransition* bestTransition = nullptr;
+        // Group transitions by anchor pair: count reads and track best span.
+        struct AnchorPairKey {
+            Shasta2AnchorId lastInA;
+            Shasta2AnchorId firstInB;
+            bool operator<(const AnchorPairKey& o) const {
+                if(lastInA != o.lastInA) return lastInA < o.lastInA;
+                return firstInB < o.firstInB;
+            }
+        };
+        struct AnchorPairStats {
+            uint32_t readCount = 0;
+            uint64_t bestSpan = 0;
+        };
+        std::map<AnchorPairKey, AnchorPairStats> anchorPairGroups;
+
         for(const auto& t : transitions) {
-            if(t.supportingSpan > bestSpan) {
-                bestSpan = t.supportingSpan;
-                bestTransition = &t;
+            auto& stats = anchorPairGroups[{t.lastAnchorInA, t.firstAnchorInB}];
+            stats.readCount++;
+            stats.bestSpan = std::max(stats.bestSpan, t.supportingSpan);
+        }
+
+        // Pick the anchor pair with the most reads.
+        const AnchorPairKey* bestKey = nullptr;
+        uint32_t bestReadCount = 0;
+        uint64_t bestSpan = 0;
+        for(const auto& [key, stats] : anchorPairGroups) {
+            if(stats.readCount > bestReadCount ||
+               (stats.readCount == bestReadCount && stats.bestSpan > bestSpan)) {
+                bestKey = &key;
+                bestReadCount = stats.readCount;
+                bestSpan = stats.bestSpan;
             }
         }
-        if(!bestTransition) {
+        if(!bestKey) {
             ++interWindowZeroPairs;
             continue;
         }
 
-        // Create the anchor pair from the best read's transition anchors.
+        // Create the edge from the consensus anchor pair.
         Shasta2AnchorPair anchorPair(anchors,
-            bestTransition->lastAnchorInA, bestTransition->firstAnchorInB, false);
+            bestKey->lastInA, bestKey->firstInB, false);
         anchorPair.removeNegativeOffsets(anchors);
         if(anchorPair.size() == 0) {
             ++interWindowZeroPairs;
