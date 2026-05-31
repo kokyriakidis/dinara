@@ -599,34 +599,42 @@ void Assembler::buildSvMSA(
                                     // Absolute breakpoint position.
                                     const uint32_t absBp =
                                         regionStart + dc.breakpointPos;
-                                    const uint32_t delEnd =
-                                        absBp + uint32_t(dc.size);
 
-                                    // Flanking window: 500bp on each
-                                    // side of the deletion.
+                                    // Scanning depth filter: scan
+                                    // breakpoint positions within
+                                    // ±scanRange of the predicted
+                                    // breakpoint to find the position
+                                    // that gives the lowest DHFFC.
+                                    // This handles breakpoint
+                                    // imprecision from multi-k.
                                     const uint32_t flankSize = 500;
-                                    const uint32_t leftStart =
-                                        absBp > flankSize
-                                        ? absBp - flankSize : 0;
-                                    const uint32_t rightEnd =
-                                        delEnd + flankSize;
+                                    const uint32_t scanRange = 500;
+                                    const uint32_t scanStep = 10;
 
-                                    // Query the region spanning
-                                    // left flank through right flank.
+                                    // Query region covers the full
+                                    // scan range plus flanks.
+                                    const uint32_t queryStart =
+                                        absBp > (scanRange + flankSize)
+                                        ? absBp - scanRange - flankSize
+                                        : 0;
+                                    const uint32_t queryEnd =
+                                        absBp + scanRange
+                                        + uint32_t(dc.size) + flankSize;
+                                    const uint32_t spanLen =
+                                        queryEnd - queryStart;
+
+                                    // Per-base depth array.
+                                    vector<uint32_t> perBaseDepth(
+                                        spanLen, 0);
+
                                     hts_itr_t* iter = sam_itr_queryi(
                                         idx, tid,
-                                        int(leftStart), int(rightEnd));
+                                        int(queryStart),
+                                        int(queryEnd));
                                     if(!iter) continue;
 
-                                    uint64_t depthInside = 0;
-                                    uint64_t countInside = 0;
-                                    uint64_t depthFlank = 0;
-                                    uint64_t countFlank = 0;
                                     uint64_t mapq0Count = 0;
                                     uint64_t totalBpReads = 0;
-
-                                    // MAPQ0 window: ±100bp around
-                                    // breakpoint.
                                     const uint32_t mapqWin = 100;
                                     const uint32_t mapqStart =
                                         absBp > mapqWin
@@ -643,41 +651,65 @@ void Assembler::buildSvMSA(
                                             | BAM_FDUP))
                                             continue;
 
-                                        const int32_t pos =
+                                        const uint32_t* cigar =
+                                            bam_get_cigar(aln);
+                                        const int nCigar =
+                                            aln->core.n_cigar;
+                                        int32_t refPos =
                                             aln->core.pos;
-                                        // Approximate read end from
-                                        // pos + read length.
-                                        const int32_t rlen =
-                                            aln->core.l_qseq;
-                                        const int32_t endPos =
-                                            pos + rlen;
-                                        // Midpoint of the read.
-                                        const int32_t mid =
-                                            (pos + endPos) / 2;
 
-                                        // Count depth inside the
-                                        // deletion (absBp to delEnd).
-                                        if(mid >= int32_t(absBp)
-                                           && mid < int32_t(delEnd)) {
-                                            ++depthInside;
-                                            ++countInside;
-                                        }
-                                        // Count depth in flanking
-                                        // regions.
-                                        else if(
-                                            (mid >= int32_t(leftStart)
-                                             && mid < int32_t(absBp))
-                                            || (mid >= int32_t(delEnd)
-                                                && mid < int32_t(
-                                                    rightEnd))) {
-                                            ++depthFlank;
-                                            ++countFlank;
+                                        for(int ci = 0;
+                                            ci < nCigar; ++ci) {
+                                            const int op =
+                                                bam_cigar_op(
+                                                    cigar[ci]);
+                                            const int len =
+                                                bam_cigar_oplen(
+                                                    cigar[ci]);
+
+                                            if(op == BAM_CMATCH
+                                               || op == BAM_CEQUAL
+                                               || op == BAM_CDIFF) {
+                                                for(int j = 0;
+                                                    j < len; ++j) {
+                                                    const int32_t p =
+                                                        refPos + j;
+                                                    if(p >= int32_t(
+                                                           queryStart)
+                                                       && p < int32_t(
+                                                           queryEnd))
+                                                    {
+                                                        ++perBaseDepth[
+                                                            p
+                                                            - queryStart
+                                                        ];
+                                                    }
+                                                }
+                                                refPos += len;
+                                            } else if(
+                                                op == BAM_CDEL
+                                                || op == BAM_CREF_SKIP)
+                                            {
+                                                refPos += len;
+                                            } else if(
+                                                op == BAM_CINS
+                                                || op == BAM_CSOFT_CLIP)
+                                            {
+                                                // query only
+                                            } else if(
+                                                op == BAM_CHARD_CLIP
+                                                || op == BAM_CPAD)
+                                            {
+                                                // no consumption
+                                            }
                                         }
 
-                                        // MAPQ0 fraction near
-                                        // breakpoint.
-                                        if(pos < int32_t(mapqEnd)
-                                           && endPos > int32_t(
+                                        const int32_t readEnd =
+                                            refPos;
+                                        const int32_t readStart =
+                                            aln->core.pos;
+                                        if(readStart < int32_t(mapqEnd)
+                                           && readEnd > int32_t(
                                                mapqStart)) {
                                             ++totalBpReads;
                                             if(aln->core.qual == 0)
@@ -687,26 +719,78 @@ void Assembler::buildSvMSA(
                                     bam_destroy1(aln);
                                     hts_itr_destroy(iter);
 
-                                    // Compute DHFFC: normalize by
-                                    // region width to get per-base
-                                    // depth, then take ratio.
-                                    double dhffc = 1.0;
-                                    const uint32_t insideLen =
-                                        uint32_t(dc.size);
-                                    const uint32_t flankLen =
-                                        2 * flankSize;
-                                    if(countFlank > 0
-                                       && flankLen > 0
-                                       && insideLen > 0) {
-                                        const double depthPerBpInside =
-                                            double(depthInside)
-                                            / double(insideLen);
-                                        const double depthPerBpFlank =
-                                            double(depthFlank)
-                                            / double(flankLen);
-                                        if(depthPerBpFlank > 0) {
-                                            dhffc = depthPerBpInside
-                                                / depthPerBpFlank;
+                                    // Scan breakpoint positions to
+                                    // find the minimum DHFFC.
+                                    double bestDhffc = 1.0;
+                                    const int32_t scanLo =
+                                        -int32_t(scanRange);
+                                    const int32_t scanHi =
+                                        int32_t(scanRange);
+                                    for(int32_t offset = scanLo;
+                                        offset <= scanHi;
+                                        offset += int32_t(scanStep)) {
+                                        const int32_t testBp =
+                                            int32_t(absBp) + offset;
+                                        if(testBp < 0) continue;
+                                        const uint32_t testEnd =
+                                            uint32_t(testBp)
+                                            + uint32_t(dc.size);
+
+                                        const uint32_t lf =
+                                            uint32_t(testBp)
+                                            > flankSize
+                                            ? uint32_t(testBp)
+                                              - flankSize
+                                            : 0;
+                                        const uint32_t rf =
+                                            testEnd + flankSize;
+
+                                        if(lf < queryStart
+                                           || rf > queryEnd)
+                                            continue;
+
+                                        uint64_t sumIn = 0;
+                                        uint32_t cntIn = 0;
+                                        uint64_t sumFl = 0;
+                                        uint32_t cntFl = 0;
+
+                                        // Left flank.
+                                        for(uint32_t p = lf;
+                                            p < uint32_t(testBp);
+                                            ++p) {
+                                            sumFl += perBaseDepth[
+                                                p - queryStart];
+                                            ++cntFl;
+                                        }
+                                        // Inside.
+                                        for(uint32_t p =
+                                                uint32_t(testBp);
+                                            p < testEnd; ++p) {
+                                            sumIn += perBaseDepth[
+                                                p - queryStart];
+                                            ++cntIn;
+                                        }
+                                        // Right flank.
+                                        for(uint32_t p = testEnd;
+                                            p < rf; ++p) {
+                                            sumFl += perBaseDepth[
+                                                p - queryStart];
+                                            ++cntFl;
+                                        }
+
+                                        if(cntIn > 0 && cntFl > 0) {
+                                            const double mi =
+                                                double(sumIn)
+                                                / double(cntIn);
+                                            const double mf =
+                                                double(sumFl)
+                                                / double(cntFl);
+                                            if(mf > 0) {
+                                                const double d =
+                                                    mi / mf;
+                                                if(d < bestDhffc)
+                                                    bestDhffc = d;
+                                            }
                                         }
                                     }
 
@@ -717,7 +801,7 @@ void Assembler::buildSvMSA(
                                     }
 
                                     filterResults[di] = {
-                                        dhffc, mq0frac, true};
+                                        bestDhffc, mq0frac, true};
                                 }
                             }
                             hts_idx_destroy(idx);
@@ -733,19 +817,16 @@ void Assembler::buildSvMSA(
                 const auto& dc = deduped[di];
                 const auto& fr = filterResults[di];
 
-                // Depth fold-change filter (Duphold-style).
-                // A real deletion should have depth inside < depth
-                // flanking. DHFFC >= 1.25 means depth is 25% higher
-                // inside the "deletion" — a strong contradiction.
-                // Only applied to multi-k calls, which produce
-                // harmonics that the depth filter is designed to
-                // catch. Other sources (per-read-DEL, SA-tag,
-                // merged-clusters, etc.) provide direct alignment
-                // evidence that shouldn't be overridden by depth.
-                // Skip for small deletions (< 300bp) where depth
-                // signal is unreliable.
+                // Depth fold-change filter with breakpoint scanning.
+                // Scans ±500bp around the predicted breakpoint to
+                // find the position giving the lowest DHFFC (handles
+                // breakpoint imprecision from multi-k). DHFFC >= 0.95
+                // after scanning means no depth drop was found at any
+                // nearby position — the call is likely a harmonic.
+                // Only applied to multi-k calls.
+                // Skip for small deletions (< 300bp).
                 if(fr.computed && dc.size >= 300
-                   && fr.dhffc >= 1.25
+                   && fr.dhffc >= 0.95
                    && dc.source == "multi-k") {
                     cout << "    --- FILTERED (depth-fc="
                          << std::fixed << std::setprecision(2)
