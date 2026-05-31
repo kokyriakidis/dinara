@@ -202,14 +202,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         if(backboneAnchors.size() < 2) continue;
 
+        uint64_t fwCreated = 0, fwRejected = 0;
         for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
-            addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
+            if(addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1])) {
+                ++fwCreated;
+            } else {
+                ++fwRejected;
+            }
             // RC mirror edge.
             const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
             const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
             if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
                 addEdgeIfValid(rcB, rcA);
             }
+        }
+        if(fwRejected > 0) {
+            cout << "  Window " << window.windowId
+                 << " backbone " << window.backboneOrientedReadId
+                 << ": " << backboneAnchors.size() << " anchors, "
+                 << fwCreated << " edges created, "
+                 << fwRejected << " edges rejected (negative offsets)." << endl;
         }
     }
 
