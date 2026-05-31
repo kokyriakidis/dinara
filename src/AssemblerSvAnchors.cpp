@@ -737,10 +737,16 @@ void Assembler::buildSvMSA(
                 // A real deletion should have depth inside < depth
                 // flanking. DHFFC >= 1.25 means depth is 25% higher
                 // inside the "deletion" — a strong contradiction.
+                // Only applied to multi-k calls, which produce
+                // harmonics that the depth filter is designed to
+                // catch. Other sources (per-read-DEL, SA-tag,
+                // merged-clusters, etc.) provide direct alignment
+                // evidence that shouldn't be overridden by depth.
                 // Skip for small deletions (< 300bp) where depth
                 // signal is unreliable.
                 if(fr.computed && dc.size >= 300
-                   && fr.dhffc >= 1.25) {
+                   && fr.dhffc >= 1.25
+                   && dc.source == "multi-k") {
                     cout << "    --- FILTERED (depth-fc="
                          << std::fixed << std::setprecision(2)
                          << fr.dhffc
