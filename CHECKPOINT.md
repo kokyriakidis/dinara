@@ -831,3 +831,189 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
    - **Larger DELs (100-500bp)**: Breakpoints placed in wrong windows. Called size ≠ nearest 50bp multiple to truth.
    - **Approaches tried and failed**: (a) Raw chain endpoint positions — overestimates by variable amount. (b) K-mer diagonal sizing — unreliable, net -5 on full benchmark. (c) Shared-read diagonal differences — chain endpoints have near-zero diagonal shift because chainer absorbs deletion. (d) astarpa2 global alignment — prefers many small edits over one big DEL in repeats.
    - **Fundamental blocker**: bp-pair fires when <2 spanning reads have diagonal shifts. Without spanning reads, no direct measurement of deletion size exists. The window-center distance is the only available estimate.
+
+---
+
+## Full DEL Evaluation — HG002 Q100 v5.0q (May 2026)
+
+### Dataset
+
+- **Truth**: HG002 Q100 v5.0q stvar truthset, 10,173 DEL entries ≥50bp
+- **Reads**: Roche 2×250bp variable-length consensus reads, GRCh38, ~30x coverage
+- **Matching criterion**: `min(call_size, truth_size) / max(call_size, truth_size) >= 0.7`
+- **Cases directory**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/cases/` (10,173 directories, each with `reference.fa`, `reads.fa`, `region.bam`, `info.txt`)
+- **Eval script**: `analyze.py cases results_<version>`
+
+### Version History
+
+| Version | Key Change | Recall | Avg calls/case |
+|---|---|---|---|
+| V35 | Baseline (no journey) | 98.7% | 11.0 |
+| V36d | K-mer journey: two-diagonal only | 98.9% | 11.4 |
+| V36e | K-mer journey: all diagonal pairs | 98.9% | 11.8 |
+| V36g | K-mer journey: two-diagonal + triplet | 98.9% | 11.5 |
+| V36h | + removed MAPQ0 filter | 99.1% | 11.6 |
+| V36i | + removed depth-fc filter | 99.2% | 11.9 |
+| V36j | + source-priority dedup + SA-DEL removal | 99.2% | 11.8 |
+
+### Current State (V36j, commit `c9d5f94`)
+
+- **Recall**: 99.2% (10,089 / 10,173)
+- **84 remaining misses**: ALL are wrong-size calls (multi-k harmonics in tandem repeat arrays). 0 cases with no calls at all. 100% detection sensitivity.
+- **Avg calls/case**: 11.8
+
+### Active DEL Sources (V36i numbers, pre-source-priority)
+
+| Source | Calls | TPs | Unique TPs | Precision | Accuracy when disagreeing with winner |
+|---|---|---|---|---|---|
+| merged-clusters | 1,419 | 1,280 | 169 | 90.2% | 98.9% |
+| diagonal | 798 | 644 | 39 | 80.7% | 94.9% |
+| early-CIGAR | 12,499 | 6,070 | 7 | 48.6% | 87.9% |
+| SA-tag | 2,142 | 1,208 | 233 | 56.4% | 87.8% |
+| split-read | 53 | 25 | 1 | 47.2% | 84.2% |
+| cluster | 2,821 | 916 | 90 | 32.5% | 68.2% |
+| flank-gap | 1,785 | 571 | 20 | 32.0% | 68.4% |
+| kmer-journey | 7,202 | 2,024 | 50 | 28.1% | 65.0% |
+| per-read-DEL | 2,524 | 709 | 14 | 28.1% | 60.9% |
+| path-based | 795 | 238 | 1 | 29.9% | 54.4% |
+| INV-cluster | 3,482 | 677 | 6 | 19.4% | 51.6% |
+| multi-k | 85,266 | 11,774 | 1,933 | 13.8% | 9.8% |
+
+"Accuracy when disagreeing with winner" = when this source and the dedup winner have different sizes, how often is this source correct. This is the key metric for ranking.
+
+### Removed Sources/Filters
+
+- **SA-DEL** (commit `7e340a3`): 18 calls, 2 TPs, 0 unique TPs. Generated in two early-exit paths (lines 1224, 1293) via `"SA-" + sc.svType` when region lacked sufficient reference markers for MSA. Removed — all TPs covered by other sources.
+- **MAPQ0 filter** (V36h): Removed. Was filtering calls where >80% of reads had MAPQ=0. Removal gained +25 TPs, 0 regressions.
+- **Depth fold-change filter** (V36i): Removed. Was filtering multi-k calls ≥300bp with DHFFC ≥0.95. Removal gained +5 TPs (het DELs where other haplotype fills depth), 0 regressions.
+
+### Source-Priority Dedup (V36j, commit `c9d5f94`)
+
+**Problem**: The old dedup sorted calls by read count descending. multi-k always won (most reads) but was correct only 9.8% of the time when disagreeing with other sources. In 5,791 of 10,173 loci, multi-k was the wrong-size winner with a correct-size call from another source available.
+
+**Solution**: Sort by source accuracy instead of read count. Priority order: merged-clusters > diagonal > early-CIGAR > SA-tag > split-read > cluster > flank-gap > kmer-journey > per-read-DEL > INV-cluster > path-based > multi-k. Read count is tiebreaker within same source.
+
+**Impact on recall**: None — recall is 99.2% for both V36i and V36j because the eval counts ALL emitted calls, not just the top one.
+
+**Impact on top-N call selection** (relevant for downstream ML model):
+
+| Top-N | V36i (read-count) | V36j (source-priority) |
+|---|---|---|
+| Top-1 | 51.1% | 64.2% |
+| Top-2 | 63.7% | 77.7% |
+| Top-3 | 71.5% | 83.7% |
+| Top-5 | 82.6% | 90.1% |
+| All | 99.2% | 99.2% |
+
+### Multi-Source Overlap Analysis
+
+**96.6% of loci** (9,826/10,173) have calls from multiple sources. Source count distribution:
+
+| Sources | Loci |
+|---|---|
+| 1 | 347 |
+| 2 | 1,829 |
+| 3 | 3,481 |
+| 4 | 2,736 |
+| 5 | 1,299 |
+| 6 | 408 |
+| 7 | 66 |
+| 8 | 7 |
+
+### Call Selection Strategy Analysis
+
+Tested different strategies for ranking the ~12 calls per locus to surface the correct one. All strategies operate on the same set of emitted calls (99.2% recall).
+
+| Strategy | Top-1 | Top-3 | Top-5 |
+|---|---|---|---|
+| by-reads (old V36i) | 22.0% | 52.3% | 73.3% |
+| source-only (V36j) | 61.9% | 79.3% | 87.2% |
+| tier+dhffc | 63.0% | 80.2% | 88.4% |
+| **dedup(tier+dhffc)+rank** | **63.0%** | **82.1%** | **90.2%** |
+| dhffc-only | 27.7% | 68.4% | 87.1% |
+| oracle | 99.2% | 99.2% | 99.2% |
+
+**Best strategy: `dedup(tier+dhffc)+rank`** — dedup using source tiers + dhffc, then rank survivors the same way.
+
+**Source tiers** (grouping by accuracy class instead of 12 strict ranks):
+
+| Tier | Sources | Accuracy |
+|---|---|---|
+| 0 | merged-clusters, diagonal | >90% |
+| 1 | early-CIGAR, SA-tag, split-read | 45-88% |
+| 2 | cluster, flank-gap, kmer-journey, per-read-DEL, INV-cluster, path-based | 25-68% |
+| 3 | multi-k | <15% |
+
+Within same tier, DHFFC (depth fold-change) decides — lower dhffc = stronger depth evidence = better.
+
+**Per size bin (best strategy vs source-only):**
+
+| Size Bin | source-only Top-1 | dedup(tier+dhffc) Top-1 | source-only Top-5 | dedup(tier+dhffc) Top-5 |
+|---|---|---|---|---|
+| 50-100bp | 70.6% | 69.4% | 89.3% | 94.9% |
+| 100-500bp | 55.6% | 58.5% | 85.8% | 89.3% |
+| 500-1000bp | 34.7% | 44.3% | 75.3% | 70.0% |
+| 1000+bp | 70.1% | 67.6% | 91.4% | 84.0% |
+
+### Gap Analysis (37% where correct call isn't top-1)
+
+3,790 cases where source-priority picks the wrong call as #1 but a correct call exists:
+
+- **early-CIGAR is the main blocker** (63.6% of gap cases) — high priority but often wrong size
+- **multi-k has the correct call** in 49% of gap cases — produces many calls, one often matches truth
+- **DHFFC distinguishes correct from wrong** in 63.6% of gap cases (correct call has lower dhffc). In 54.3%, the dhffc gap is >0.2 (strong signal).
+- **Read count is uninformative**: correct call has more reads only 49.3% of the time (coin flip)
+- **Correct call rank distribution**: 30% at rank 2, 47% within top-3, 68% within top-5, 94% within top-10
+
+### Downstream ML Model Consideration
+
+The downstream ML model classifies calls. For maximum sensitivity, report ALL calls (99.2% recall) and let the ML model select. The source-priority dedup and tier+dhffc ranking are useful if the ML model uses emission order or rank as a feature, but don't affect the set of calls available.
+
+### K-mer Journey Implementation Details
+
+Located in `src/AssemblerSvAnchors.cpp` (~lines 6842-7150).
+
+**Approach**: Multi-resolution k-mer scanning (k=60,50,40,30,20,14) builds per-read anchor positions against the reference. Two methods extract deletion signals:
+
+1. **Two-diagonal**: Cluster anchor diagonals (refPos-readPos), find two most populated clusters, difference = DEL size. Best precision (30%).
+2. **Triplet**: For anchor pairs A,C with transition-zone anchor B between them, compute refGap-readGap across A-C. Adds ~255 TPs but also ~1,027 FPs.
+
+**Key implementation detail**: `covered[]` array marks only the start position of each k-mer (not the full k-mer span), allowing denser anchors at multiple k values.
+
+**Votes are clustered by median** for robustness to outlier votes.
+
+### Tandem Repeat Limitation
+
+The 84 remaining misses are all in tandem repeat arrays where:
+- The repeat unit is shorter than the read length
+- Every read fits entirely within the repeat — no unique-sequence flanking anchors exist
+- K-mer anchors match repeat copies at wrong reference positions
+- All sources produce wrong sizes (multi-k harmonics)
+- 10 of 13 analyzed strong cases had NO reads with the correct diagonal pair
+- This is a fundamental limitation of k-mer matching in tandem repeats
+
+### Cluster Paths and Binaries
+
+- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..j}_*`
+- **Results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/results_v36{d..j}/`
+- **Analysis scripts**: `analyze.py`, `source_essentiality.py`, `analyze_multisource_v2.py`, `analyze_gap.py`, `analyze_adaptive.py` in `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/`
+- **SLURM template**: `run_eval_v36j.sh` — array job, 100 cases per task, 102 tasks
+
+### Build and Deploy
+
+```bash
+# Build locally
+cd /workspaces/dinara/build && make -j$(nproc)
+
+# Deploy to cluster
+scp build/Executable/dinara kyriakik@ec-hub.sc1.science.roche.com:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_<version>
+
+# Run eval
+ssh kyriakik@ec-hub.sc1.science.roche.com
+cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval
+sbatch run_eval_<version>.sh
+
+# Analyze
+python3 analyze.py cases results_<version>
+```
+
