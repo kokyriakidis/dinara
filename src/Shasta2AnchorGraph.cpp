@@ -2358,15 +2358,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Bypass edges from detangling: direct connections that skip over
     // tangled windows whose flow reads have been removed.
+    // Bypass edges must meet the same minInterWindowCoverage threshold
+    // as regular inter-window edges.
     uint64_t bypassEdgeCount = 0;
+    uint64_t bypassBelowCoverage = 0;
     if(bypassEdges) {
         for(const auto& be : *bypassEdges) {
+            const uint64_t sharedReads = anchors.countCommon(be.anchorIdA, be.anchorIdB);
+            if(sharedReads < minInterWindowCoverage) {
+                ++bypassBelowCoverage;
+                continue;
+            }
             if(addEdgeIfValid(be.anchorIdA, be.anchorIdB)) {
                 ++bypassEdgeCount;
             }
         }
-        if(bypassEdgeCount > 0) {
-            cout << "Bypass edges: " << bypassEdgeCount << " created from "
+        if(bypassEdgeCount > 0 || bypassBelowCoverage > 0) {
+            cout << "Bypass edges: " << bypassEdgeCount << " created, "
+                 << bypassBelowCoverage << " rejected (below minInterWindowCoverage="
+                 << minInterWindowCoverage << ") from "
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
