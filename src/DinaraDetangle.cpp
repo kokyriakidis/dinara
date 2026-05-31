@@ -130,30 +130,31 @@ uint64_t dinara::detangleWindows(
                 const auto journey = journeys[oid];
                 if(journey.empty()) continue;
 
-                // Find the last anchor in prevW that appears before the
-                // first anchor in nextW. This enforces the A→X→B ordering
-                // so we don't pick anchors from a later revisit of prevW.
+                // Find the span of window X (wIdx) in the journey,
+                // then pick lastInPrev before that span and firstInNext
+                // after it. This handles prevW == nextW correctly.
 
-                // Pass 1: find the first anchor in nextW.
-                uint32_t firstNextPos = uint32_t(journey.size());
-                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
+                // Find the first and last journey positions belonging to
+                // the bypassed window X.
+                uint32_t xFirst = uint32_t(journey.size());
+                uint32_t xLast = 0;
                 for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
                     const Shasta2AnchorId anchorId = journey[pos];
                     if(uint64_t(anchorId) >= anchorCount) continue;
                     const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
                     if(aw == noW) continue;
-                    if(normalize(aw) == nextW) {
-                        firstNextPos = pos;
-                        firstInNext = anchorId;
-                        break;
+                    if(normalize(aw) == wIdx) {
+                        if(xFirst == uint32_t(journey.size())) xFirst = pos;
+                        xLast = pos;
                     }
                 }
-                if(firstNextPos == uint32_t(journey.size())) continue;
+                // Read must actually touch window X.
+                if(xFirst == uint32_t(journey.size())) continue;
 
-                // Pass 2: find the last anchor in prevW before firstNextPos.
+                // lastInPrev: last anchor in prevW before the X span.
                 Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
                 bool foundPrev = false;
-                for(uint32_t pos = 0; pos < firstNextPos; pos++) {
+                for(uint32_t pos = 0; pos < xFirst; pos++) {
                     const Shasta2AnchorId anchorId = journey[pos];
                     if(uint64_t(anchorId) >= anchorCount) continue;
                     const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
@@ -164,7 +165,22 @@ uint64_t dinara::detangleWindows(
                     }
                 }
 
-                if(foundPrev) {
+                // firstInNext: first anchor in nextW after the X span.
+                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
+                bool foundNext = false;
+                for(uint32_t pos = xLast + 1; pos < uint32_t(journey.size()); pos++) {
+                    const Shasta2AnchorId anchorId = journey[pos];
+                    if(uint64_t(anchorId) >= anchorCount) continue;
+                    const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
+                    if(aw == noW) continue;
+                    if(normalize(aw) == nextW) {
+                        firstInNext = anchorId;
+                        foundNext = true;
+                        break;
+                    }
+                }
+
+                if(foundPrev && foundNext) {
                     auto pairKey = pair<uint64_t, uint64_t>(
                         uint64_t(lastInPrev), uint64_t(firstInNext));
                     anchorPairCounts[pairKey]++;
