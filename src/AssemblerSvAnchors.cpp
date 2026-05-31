@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <queue>
 #include <set>
 #include <string>
@@ -475,6 +476,31 @@ void Assembler::buildSvMSA(
         const auto refMarkers = markersRef[refOid.getValue()];
         const uint32_t refLength = uint32_t(readsRef.getRead(refId).baseCount);
 
+        // Extract chromosome name and region offset from the
+        // reference read name early, so they are available to
+        // the emitDelCalls lambda for depth/MAPQ filtering.
+        string refName;
+        uint32_t regionStart = 0;
+        {
+            const auto refNameSpan =
+                readsRef.getReadName(refId);
+            string fullRefName(
+                refNameSpan.begin(), refNameSpan.end());
+            refName = fullRefName;
+            const auto colonPos = fullRefName.find(':');
+            if(colonPos != string::npos) {
+                refName = fullRefName.substr(0, colonPos);
+                const auto dashPos =
+                    fullRefName.find('-', colonPos);
+                if(dashPos != string::npos) {
+                    regionStart = uint32_t(
+                        stoul(fullRefName.substr(
+                            colonPos + 1,
+                            dashPos - colonPos - 1)));
+                }
+            }
+        }
+
         // Parse SA tag SV evidence from BAM if provided.
         vector<SaTagSvCall> saTagCalls;
         vector<SoftClipBreakpoint> softClipBPs;
@@ -496,6 +522,8 @@ void Assembler::buildSvMSA(
 
         // Lambda: merge delCallRecords into allDelCalls,
         // deduplicate near-identical calls, and emit.
+        // After deduplication, applies depth fold-change and
+        // MAPQ0 fraction filters inspired by Duphold/Delly/Manta.
         auto emitDelCalls = [&]() {
             for(const auto& dc : delCallRecords) {
                 if(dc.size >= 50) {
@@ -514,10 +542,10 @@ void Assembler::buildSvMSA(
             // call has size ratio >= 0.9 anywhere in the region.
             // The region is typically ~4kb, so breakpoint proximity
             // is not checked — same-size calls are the same event.
-            vector<DelCallRecord> emitted;
+            vector<DelCallRecord> deduped;
             for(const auto& dc : allDelCalls) {
                 bool isDup = false;
-                for(const auto& prev : emitted) {
+                for(const auto& prev : deduped) {
                     const double ratio =
                         double(std::min(dc.size, prev.size))
                         / double(std::max(dc.size, prev.size));
@@ -527,15 +555,237 @@ void Assembler::buildSvMSA(
                     }
                 }
                 if(!isDup) {
-                    emitted.push_back(dc);
-                    cout << "    >>> DELETION CALL"
-                         << " (" << dc.source
-                         << "): size=" << dc.size << "bp"
-                         << ", breakpoint="
-                         << dc.breakpointPos
+                    deduped.push_back(dc);
+                }
+            }
+
+            // ---------------------------------------------------------
+            // Post-dedup filters: depth fold-change and MAPQ0 fraction.
+            // Query the BAM once for all deduped calls.
+            // ---------------------------------------------------------
+            struct DepthFilterResult {
+                double dhffc;      // depth inside / depth flanking
+                double mapq0Frac;  // fraction of MAPQ=0 reads at breakpoint
+                bool computed;
+            };
+            vector<DepthFilterResult> filterResults(
+                deduped.size(), {1.0, 0.0, false});
+
+            if(!bamFileName.empty() && !deduped.empty()) {
+                htsFile* fp = hts_open(bamFileName.c_str(), "r");
+                if(fp) {
+                    sam_hdr_t* hdr = sam_hdr_read(fp);
+                    if(hdr) {
+                        hts_idx_t* idx = sam_index_load(
+                            fp, bamFileName.c_str());
+                        if(idx) {
+                            // Resolve tid with chr prefix fallback.
+                            int tid = sam_hdr_name2tid(
+                                hdr, refName.c_str());
+                            if(tid < 0) {
+                                string altName;
+                                if(refName.size() > 3
+                                   && refName.substr(0, 3) == "chr")
+                                    altName = refName.substr(3);
+                                else
+                                    altName = "chr" + refName;
+                                tid = sam_hdr_name2tid(
+                                    hdr, altName.c_str());
+                            }
+                            if(tid >= 0) {
+                                for(size_t di = 0;
+                                    di < deduped.size(); ++di) {
+                                    const auto& dc = deduped[di];
+                                    // Absolute breakpoint position.
+                                    const uint32_t absBp =
+                                        regionStart + dc.breakpointPos;
+                                    const uint32_t delEnd =
+                                        absBp + uint32_t(dc.size);
+
+                                    // Flanking window: 500bp on each
+                                    // side of the deletion.
+                                    const uint32_t flankSize = 500;
+                                    const uint32_t leftStart =
+                                        absBp > flankSize
+                                        ? absBp - flankSize : 0;
+                                    const uint32_t rightEnd =
+                                        delEnd + flankSize;
+
+                                    // Query the region spanning
+                                    // left flank through right flank.
+                                    hts_itr_t* iter = sam_itr_queryi(
+                                        idx, tid,
+                                        int(leftStart), int(rightEnd));
+                                    if(!iter) continue;
+
+                                    uint64_t depthInside = 0;
+                                    uint64_t countInside = 0;
+                                    uint64_t depthFlank = 0;
+                                    uint64_t countFlank = 0;
+                                    uint64_t mapq0Count = 0;
+                                    uint64_t totalBpReads = 0;
+
+                                    // MAPQ0 window: ±100bp around
+                                    // breakpoint.
+                                    const uint32_t mapqWin = 100;
+                                    const uint32_t mapqStart =
+                                        absBp > mapqWin
+                                        ? absBp - mapqWin : 0;
+                                    const uint32_t mapqEnd =
+                                        absBp + mapqWin;
+
+                                    bam1_t* aln = bam_init1();
+                                    while(sam_itr_next(
+                                        fp, iter, aln) >= 0) {
+                                        if(aln->core.flag &
+                                           (BAM_FUNMAP
+                                            | BAM_FSECONDARY
+                                            | BAM_FDUP))
+                                            continue;
+
+                                        const int32_t pos =
+                                            aln->core.pos;
+                                        // Approximate read end from
+                                        // pos + read length.
+                                        const int32_t rlen =
+                                            aln->core.l_qseq;
+                                        const int32_t endPos =
+                                            pos + rlen;
+                                        // Midpoint of the read.
+                                        const int32_t mid =
+                                            (pos + endPos) / 2;
+
+                                        // Count depth inside the
+                                        // deletion (absBp to delEnd).
+                                        if(mid >= int32_t(absBp)
+                                           && mid < int32_t(delEnd)) {
+                                            ++depthInside;
+                                            ++countInside;
+                                        }
+                                        // Count depth in flanking
+                                        // regions.
+                                        else if(
+                                            (mid >= int32_t(leftStart)
+                                             && mid < int32_t(absBp))
+                                            || (mid >= int32_t(delEnd)
+                                                && mid < int32_t(
+                                                    rightEnd))) {
+                                            ++depthFlank;
+                                            ++countFlank;
+                                        }
+
+                                        // MAPQ0 fraction near
+                                        // breakpoint.
+                                        if(pos < int32_t(mapqEnd)
+                                           && endPos > int32_t(
+                                               mapqStart)) {
+                                            ++totalBpReads;
+                                            if(aln->core.qual == 0)
+                                                ++mapq0Count;
+                                        }
+                                    }
+                                    bam_destroy1(aln);
+                                    hts_itr_destroy(iter);
+
+                                    // Compute DHFFC: normalize by
+                                    // region width to get per-base
+                                    // depth, then take ratio.
+                                    double dhffc = 1.0;
+                                    const uint32_t insideLen =
+                                        uint32_t(dc.size);
+                                    const uint32_t flankLen =
+                                        2 * flankSize;
+                                    if(countFlank > 0
+                                       && flankLen > 0
+                                       && insideLen > 0) {
+                                        const double depthPerBpInside =
+                                            double(depthInside)
+                                            / double(insideLen);
+                                        const double depthPerBpFlank =
+                                            double(depthFlank)
+                                            / double(flankLen);
+                                        if(depthPerBpFlank > 0) {
+                                            dhffc = depthPerBpInside
+                                                / depthPerBpFlank;
+                                        }
+                                    }
+
+                                    double mq0frac = 0.0;
+                                    if(totalBpReads > 0) {
+                                        mq0frac = double(mapq0Count)
+                                            / double(totalBpReads);
+                                    }
+
+                                    filterResults[di] = {
+                                        dhffc, mq0frac, true};
+                                }
+                            }
+                            hts_idx_destroy(idx);
+                        }
+                        sam_hdr_destroy(hdr);
+                    }
+                    hts_close(fp);
+                }
+            }
+
+            // Emit calls, applying filters.
+            for(size_t di = 0; di < deduped.size(); ++di) {
+                const auto& dc = deduped[di];
+                const auto& fr = filterResults[di];
+
+                // Depth fold-change filter (Duphold-style).
+                // A real deletion should have depth inside < depth
+                // flanking. DHFFC >= 1.25 means depth is 25% higher
+                // inside the "deletion" — a strong contradiction.
+                // Skip for small deletions (< 300bp) where depth
+                // signal is unreliable.
+                if(fr.computed && dc.size >= 300
+                   && fr.dhffc >= 1.25) {
+                    cout << "    --- FILTERED (depth-fc="
+                         << std::fixed << std::setprecision(2)
+                         << fr.dhffc
+                         << "): " << dc.source
+                         << " size=" << dc.size << "bp"
+                         << ", breakpoint=" << dc.breakpointPos
                          << ", reads=" << dc.readCount
                          << endl;
+                    continue;
                 }
+
+                // MAPQ0 fraction filter (Manta-style).
+                // If > 80% of reads near the breakpoint have MAPQ=0,
+                // the region is likely unmappable and the call is
+                // unreliable. Threshold is higher than Manta's 0.4
+                // because Roche consensus reads can have MAPQ=0 in
+                // moderately repetitive regions that still contain
+                // real variants.
+                if(fr.computed && fr.mapq0Frac > 0.8) {
+                    cout << "    --- FILTERED (mapq0="
+                         << std::fixed << std::setprecision(2)
+                         << fr.mapq0Frac
+                         << "): " << dc.source
+                         << " size=" << dc.size << "bp"
+                         << ", breakpoint=" << dc.breakpointPos
+                         << ", reads=" << dc.readCount
+                         << endl;
+                    continue;
+                }
+
+                cout << "    >>> DELETION CALL"
+                     << " (" << dc.source
+                     << "): size=" << dc.size << "bp"
+                     << ", breakpoint="
+                     << dc.breakpointPos
+                     << ", reads=" << dc.readCount;
+                if(fr.computed) {
+                    cout << ", dhffc="
+                         << std::fixed << std::setprecision(2)
+                         << fr.dhffc
+                         << ", mapq0="
+                         << std::fixed << std::setprecision(2)
+                         << fr.mapq0Frac;
+                }
+                cout << endl;
             }
         };
 
@@ -698,26 +948,7 @@ void Assembler::buildSvMSA(
         };
 
         if(!bamFileName.empty()) {
-            // Extract chromosome name and region offset from the
-            // reference read name. The name may be "chr1:100-200".
-            const auto refNameSpan =
-                readsRef.getReadName(refId);
-            string fullRefName(
-                refNameSpan.begin(), refNameSpan.end());
-            string refName = fullRefName;
-            uint32_t regionStart = 0;
-            const auto colonPos = fullRefName.find(':');
-            if(colonPos != string::npos) {
-                refName = fullRefName.substr(0, colonPos);
-                const auto dashPos =
-                    fullRefName.find('-', colonPos);
-                if(dashPos != string::npos) {
-                    regionStart = uint32_t(
-                        stoul(fullRefName.substr(
-                            colonPos + 1,
-                            dashPos - colonPos - 1)));
-                }
-            }
+            // refName and regionStart already parsed above.
             saTagCalls = parseSaTagSvCalls(
                 bamFileName, refName,
                 regionStart, regionStart + refLength);
