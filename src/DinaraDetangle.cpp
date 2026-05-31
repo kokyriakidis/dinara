@@ -18,12 +18,46 @@
 // No minimum number of distinct flows is required — even a single
 // A -> X -> B flow is bypassed if it meets minFlowCoverage.
 //
+// Anchor pair selection (step 3):
+//   For each flow read, find the span of window X in the journey
+//   (first and last positions belonging to X), then search for:
+//     - lastInPrev:  last anchor in A *before* the X span
+//     - firstInNext: first anchor in B *after* the X span
+//   This X-span-relative search handles all topologies:
+//
+//   Case 1: A != B (distinct prev/next windows)
+//     Journey: [a1, a2, x1, x2, x3, b1, b2]
+//     X span: x1..x3.  lastInPrev=a2, firstInNext=b1.
+//     Bypass edge: a2 -> b1.
+//
+//   Case 2: A == B (flow exits to the same window it entered from)
+//     Journey: [a1, a2, x1, x2, x3, a3, a4]
+//     X span: x1..x3.  lastInPrev=a2, firstInNext=a3.
+//     Bypass edge: a2 -> a3.
+//     Without the X-span approach, searching for "first nextW anchor"
+//     would find a1 (since nextW == prevW), leaving no room for
+//     lastInPrev before it.
+//
+//   Case 3: read revisits X (A -> X -> B -> X -> A)
+//     Journey: [a1, x1, x2, b1, x3, x4, a2]
+//     X span: x1..x4 (covers both visits).
+//     lastInPrev=a1, firstInNext=a2.
+//     The span encompasses all X anchors, so the bypass connects
+//     the anchors outside the entire X region.
+//
+//   Case 4: other windows interleaved before X
+//     Journey: [a1, c1, a2, x1, x2, b1]
+//     X span: x1..x2.  lastInPrev=a2 (c1 skipped), firstInNext=b1.
+//     Only anchors matching prevW/nextW are considered.
+//
 // Processing order: candidates sorted by flow read count (descending)
-// so stronger flows get their full read sets first.
+// so stronger flows get their full read sets first. Weaker flows that
+// share reads with stronger ones see reduced read sets after prior
+// removals.
 //
 // RC handling: for each forward bypass edge (anchorA -> anchorB),
 // an RC mirror (anchorB' -> anchorA') is also created. Read removals
-// update both canonical and RC anchors.
+// check both oid and oid^1 to handle flow reads on either strand.
 // ============================================================================
 
 #include "DinaraDetangle.hpp"
