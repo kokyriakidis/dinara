@@ -282,6 +282,9 @@ void Assembler::computeAnchorWindows(
     }
 
     // Process the heap.
+    // Each backbone window uses the full journey of its read.
+    // A read is only eligible if its entire journey is unclaimed.
+    uint64_t skippedOverlapping = 0;
     while(!candidateHeap.empty()) {
         const AnchorWindowCandidate candidate = candidateHeap.top();
         candidateHeap.pop();
@@ -294,28 +297,28 @@ void Assembler::computeAnchorWindows(
             continue;
         }
         const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
-        if(journey.empty() || candidate.end > journey.size()) {
+        if(journey.empty()) {
             continue;
         }
 
-        // Check if the interval is still fully unclaimed.
-        bool isStillUnclaimed = true;
-        for(uint32_t position = candidate.begin; position < candidate.end; position++) {
+        // Check if the entire journey is unclaimed.
+        bool isFullyUnclaimed = true;
+        for(uint32_t position = 0; position < uint32_t(journey.size()); position++) {
             if(anchorOwner[uint64_t(journey[position])] != anchorUnclaimed) {
-                isStillUnclaimed = false;
+                isFullyUnclaimed = false;
                 break;
             }
         }
 
-        if(!isStillUnclaimed) {
-            // Some anchors were claimed since this candidate was pushed.
-            // Bump generation and re-push remaining unclaimed intervals.
-            ++candidateGeneration[uint64_t(readId)];
-            pushCurrentUnclaimedIntervals(candidate.backboneOrientedReadId);
+        if(!isFullyUnclaimed) {
+            // Some anchors in this read's journey are already claimed.
+            // Skip this read entirely — no sub-interval splitting.
+            ++skippedOverlapping;
             continue;
         }
 
-        createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
+        // Create window using the full journey.
+        createWindow(candidate.backboneOrientedReadId, 0, uint32_t(journey.size()));
     }
 
     // Count unclaimed anchors.
@@ -335,6 +338,7 @@ void Assembler::computeAnchorWindows(
          << " claimedAnchors=" << claimedAnchors
          << " unclaimedAnchors=" << unclaimedAnchorCount
          << " readIntervals=" << totalReadIntervals
+         << " skippedOverlapping=" << skippedOverlapping
          << " seconds=" << std::fixed << std::setprecision(2) << elapsedSeconds
          << std::defaultfloat << endl;
 }
