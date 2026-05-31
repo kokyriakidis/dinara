@@ -64,6 +64,14 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
         }
 
+        // Inter-window edge attributes.
+        if(edge.maxSupportingSpan > 0) {
+            gfa << "\tms:i:" << edge.maxSupportingSpan;
+        }
+        if(edge.sharedReadCount > 0) {
+            gfa << "\tsr:i:" << edge.sharedReadCount;
+        }
+
         gfa << "\n";
     }
 }

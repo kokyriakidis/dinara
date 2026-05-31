@@ -41,6 +41,16 @@ public:
     bool isEndpointAnchorPrev = false;  // source anchor is an endpoint anchor
     bool isEndpointAnchorNext = false;  // target anchor is an endpoint anchor
 
+    // Inter-window edge attributes.
+    // maxSupportingSpan: best (baseSpanA * baseSpanB) among reads that
+    // transition between the two windows. The product rewards both
+    // balanced and deep coverage across both windows.
+    // 0 for intra-window edges.
+    uint64_t maxSupportingSpan = 0;
+    // sharedReadCount: number of distinct reads that touch both windows
+    // (not just the reads using this specific anchor pair).
+    uint64_t sharedReadCount = 0;
+
     Shasta2AnchorGraphEdge(const Shasta2AnchorPair& anchorPair, uint64_t offset, uint64_t id) :
         anchorPair(anchorPair),
         offset(offset),
@@ -57,6 +67,8 @@ public:
         ar & offset;
         ar & id;
         ar & useForAssembly;
+        ar & maxSupportingSpan;
+        ar & sharedReadCount;
     }
 };
 

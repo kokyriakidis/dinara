@@ -332,17 +332,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // ordered window pair. Pick the candidate with the highest shared
     // read count (commonReadCount).
 
-    // For each window pair, collect all candidate (anchorA, anchorB) pairs.
-    struct AnchorPairKey {
-        Shasta2AnchorId anchorIdA;
-        Shasta2AnchorId anchorIdB;
-        bool operator<(const AnchorPairKey& o) const {
-            if(anchorIdA != o.anchorIdA) return anchorIdA < o.anchorIdA;
-            return anchorIdB < o.anchorIdB;
-        }
+    // Per-read transition: which anchor pair the read uses at the boundary,
+    // plus the read's supporting span across both windows.
+    struct ReadTransition {
+        uint32_t oidValue;
+        Shasta2AnchorId lastAnchorInA;
+        Shasta2AnchorId firstAnchorInB;
+        uint64_t supportingSpan;  // baseSpanA + baseSpanB (finalized in second pass)
     };
+
+    // Per window pair: all read transitions.
     std::map<std::pair<uint32_t, uint32_t>,
-             std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
+             std::vector<ReadTransition>> windowPairTransitions;
+
+    // Per-read per-window: first and last base positions visited.
+    struct ReadWindowSpan {
+        uint32_t firstBasePos;
+        uint32_t lastBasePos;
+    };
+    std::map<uint64_t, std::map<uint32_t, ReadWindowSpan>> readWindowSpans;
 
     // windowReads and readWindows are class members, populated here.
 
@@ -374,20 +382,53 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             // Track which reads touch each window.
             windowReads[windowId].insert(uint32_t(oidValue));
 
+            // Track per-read per-window base span.
+            const uint32_t basePos = anchors.getPosition(anchorId, oid);
+            if(basePos != invalid<uint32_t>) {
+                auto& spanMap = readWindowSpans[oidValue];
+                auto spanIt = spanMap.find(windowId);
+                if(spanIt == spanMap.end()) {
+                    spanMap[windowId] = {basePos, basePos};
+                } else {
+                    spanIt->second.firstBasePos = std::min(spanIt->second.firstBasePos, basePos);
+                    spanIt->second.lastBasePos = std::max(spanIt->second.lastBasePos, basePos);
+                }
+            }
+
             if(windowId == currentWindow) {
                 lastAnchorInCurrentWindow = anchorId;
             } else {
-                // New window transition — record in readWindows (ordered sequence).
+                // New window transition.
                 readWindows[uint32_t(oidValue)].push_back(windowId);
 
                 if(currentWindow != noWindow) {
                     auto key = std::make_pair(currentWindow, windowId);
-                    AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
-                    windowPairCandidates[key][apk]++;
+                    // supportingSpan is 0 for now — finalized in second pass.
+                    windowPairTransitions[key].push_back(
+                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0});
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
             }
+        }
+    }
+
+    // Second pass: finalize supportingSpan for each read transition
+    // using the completed readWindowSpans.
+    // supportingSpan = spanA * spanB (geometric product).
+    // This rewards both balance and magnitude: a read covering 5000bp
+    // in each window (product 25M) beats one covering 10000+500 (product 5M).
+    for(auto& [windowPair, transitions] : windowPairTransitions) {
+        for(auto& t : transitions) {
+            auto readSpanIt = readWindowSpans.find(t.oidValue);
+            if(readSpanIt == readWindowSpans.end()) continue;
+            const auto& spans = readSpanIt->second;
+            uint64_t spanA = 0, spanB = 0;
+            auto itA = spans.find(windowPair.first);
+            auto itB = spans.find(windowPair.second);
+            if(itA != spans.end()) spanA = itA->second.lastBasePos - itA->second.firstBasePos;
+            if(itB != spans.end()) spanB = itB->second.lastBasePos - itB->second.firstBasePos;
+            t.supportingSpan = spanA * spanB;
         }
     }
 
@@ -409,12 +450,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return count;
     };
 
-    // Diagnostic: count window pairs and candidates.
+    // Diagnostic: count window pairs and transitions.
     {
-        uint64_t totalCandidateEdges = 0;
+        uint64_t totalTransitions = 0;
         uint64_t fwFwPairs = 0, fwRcPairs = 0, rcFwPairs = 0, rcRcPairs = 0;
-        for(const auto& [wp, cands] : windowPairCandidates) {
-            totalCandidateEdges += cands.size();
+        for(const auto& [wp, transitions] : windowPairTransitions) {
+            totalTransitions += transitions.size();
             const bool aIsRc = (wp.first >= windowCount);
             const bool bIsRc = (wp.second >= windowCount);
             if(!aIsRc && !bIsRc) ++fwFwPairs;
@@ -422,12 +463,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             else if(aIsRc && !bIsRc) ++rcFwPairs;
             else ++rcRcPairs;
         }
-        cout << "Inter-window edge discovery: " << windowPairCandidates.size()
+        cout << "Inter-window edge discovery: " << windowPairTransitions.size()
              << " window pairs (" << fwFwPairs << " fw-fw, "
              << rcRcPairs << " rc-rc, "
              << fwRcPairs << " fw-rc, "
              << rcFwPairs << " rc-fw) with "
-             << totalCandidateEdges << " candidate anchor pairs." << endl;
+             << totalTransitions << " read transitions." << endl;
 
         // Count how many anchors are mapped vs total.
         uint64_t mappedCount = 0;
@@ -470,12 +511,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Two passes: endpoint edges first (to reserve their anchors), then
     // remaining edges (skipping reserved anchors).
     uint64_t interWindowZeroPairs = 0;
-    uint64_t interWindowBelowCoverage = 0;
     uint64_t interWindowCreated = 0;
-    uint64_t interWindowEndpointCreated = 0;
-    uint64_t interWindowInternalCreated = 0;
-    uint64_t interWindowInternalSkipped = 0;
-    // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, readCount).
+    // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, sharedReadCount).
     struct InterWindowEdgeInfo {
         std::pair<uint32_t, uint32_t> windowPair;
         Shasta2AnchorId anchorIdA;
@@ -484,15 +521,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
     std::vector<InterWindowEdgeInfo> createdEdges;
 
-    // Anchors reserved by endpoint edges — other edges cannot use these.
-    std::set<uint64_t> reservedAnchors;
-
-    // Helper: create an edge from a chosen anchor pair.
+    // Helper: create an inter-window edge from a chosen anchor pair.
     auto createInterWindowEdge = [&](
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
-        uint64_t bestSize,
-        bool isEndpoint = false)
+        uint64_t sharedReads,
+        uint64_t bestSpan)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
         edge_descriptor e;
@@ -502,384 +536,53 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
             anchorGraph);
         anchorGraph[e].useForAssembly = true;
-        anchorGraph[e].isEndpointAnchorPrev = isEndpoint;
-        anchorGraph[e].isEndpointAnchorNext = isEndpoint;
-        createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, bestSize});
+        anchorGraph[e].maxSupportingSpan = bestSpan;
+        anchorGraph[e].sharedReadCount = sharedReads;
+        createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, sharedReads});
         ++interWindowCreated;
     };
 
-    // Inter-window edge creation disabled for testing.
-#if 0
-    // Pass 1: Create endpoint edges from backbone read overlaps.
-    // For each endpoint window pair, find the anchor pair where the backbone
-    // reads transition between the two windows. This is the specific anchor
-    // pair from the backbone reads, not the best-sharing pair from all reads.
-    for(const auto& [windowPair, candidates] : windowPairCandidates) {
+    // Single-pass inter-window edge creation.
+    // For each window pair, pick the anchor pair from the read with the
+    // largest supporting span (baseSpanA + baseSpanB). This read covers
+    // the most genomic territory across both windows, providing the
+    // strongest evidence for the connection.
+    for(const auto& [windowPair, transitions] : windowPairTransitions) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
         if(srcNorm == dstNorm) continue;
-        if(!endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)})) continue;
 
-        // Find the candidate anchor pair that comes from the backbone reads.
-        // The backbone read of srcNorm transitions to dstNorm: its last anchor
-        // in srcNorm and first anchor in dstNorm form the transition pair.
-        // Check both backbone reads (src's and dst's) and pick the best.
-        Shasta2AnchorPair bestPair;
-        uint64_t bestSize = 0;
-
-        // Collect backbone read IDs for both windows.
-        std::set<uint64_t> backboneOids;
-        if(srcNorm < windowCount) {
-            backboneOids.insert(anchorWindows[srcNorm].backboneOrientedReadId.getValue());
-        }
-        if(dstNorm < windowCount) {
-            backboneOids.insert(anchorWindows[dstNorm].backboneOrientedReadId.getValue());
-        }
-        // Also add RC backbone reads for RC window pairs.
-        const uint32_t srcRaw = windowPair.first;
-        const uint32_t dstRaw = windowPair.second;
-        if(srcRaw >= windowCount && srcNorm < windowCount) {
-            // RC window: the backbone read's RC
-            const uint32_t bbOid = anchorWindows[srcNorm].backboneOrientedReadId.getValue();
-            backboneOids.insert(bbOid ^ 1);
-        }
-        if(dstRaw >= windowCount && dstNorm < windowCount) {
-            const uint32_t bbOid = anchorWindows[dstNorm].backboneOrientedReadId.getValue();
-            backboneOids.insert(bbOid ^ 1);
-        }
-
-        for(const auto& [apk, count] : candidates) {
-            // Only consider candidates discovered by backbone reads.
-            bool fromBackbone = false;
-            // A candidate was discovered by a read that transitions between
-            // the two windows. Check if any backbone read contributed.
-            // The count in windowPairCandidates is the number of reads that
-            // produced this anchor pair. We need to check if the backbone
-            // read is among them by verifying the anchors are on the backbone.
-            const uint64_t aidA = uint64_t(apk.anchorIdA);
-            const uint64_t aidB = uint64_t(apk.anchorIdB);
-            // Check if both anchors are visited by a backbone read.
-            for(const uint64_t bbOid : backboneOids) {
-                const auto bbJourney = journeys[OrientedReadId::fromValue(ReadId(bbOid))];
-                bool hasA = false, hasB = false;
-                for(uint32_t pos = 0; pos < uint32_t(bbJourney.size()); pos++) {
-                    if(uint64_t(bbJourney[pos]) == aidA) hasA = true;
-                    if(uint64_t(bbJourney[pos]) == aidB) hasB = true;
-                    if(hasA && hasB) break;
-                }
-                if(hasA && hasB) { fromBackbone = true; break; }
-            }
-            if(!fromBackbone) continue;
-
-            Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
-            anchorPair.removeNegativeOffsets(anchors);
-            if(anchorPair.size() > bestSize) {
-                bestSize = anchorPair.size();
-                bestPair = std::move(anchorPair);
+        // Find the read with the largest supporting span.
+        uint64_t bestSpan = 0;
+        const ReadTransition* bestTransition = nullptr;
+        for(const auto& t : transitions) {
+            if(t.supportingSpan > bestSpan) {
+                bestSpan = t.supportingSpan;
+                bestTransition = &t;
             }
         }
-
-        // Fallback: if no backbone-read candidate found, use best from all reads.
-        if(bestSize == 0) {
-            for(const auto& [apk, count] : candidates) {
-                Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
-                anchorPair.removeNegativeOffsets(anchors);
-                if(anchorPair.size() > bestSize) {
-                    bestSize = anchorPair.size();
-                    bestPair = std::move(anchorPair);
-                }
-            }
-        }
-
-        // Coverage check: distinct oriented read IDs that touch both windows.
-        const uint64_t totalSharedReads = countSharedReads(windowPair.first, windowPair.second);
-
-        if(bestSize == 0) {
+        if(!bestTransition) {
             ++interWindowZeroPairs;
-        } else if(totalSharedReads < minInterWindowCoverage) {
-            ++interWindowBelowCoverage;
-        } else {
-            reservedAnchors.insert(uint64_t(bestPair.anchorIdA));
-            reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
-            reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
-            reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
-            createInterWindowEdge(windowPair, bestPair, bestSize, true);
-            ++interWindowEndpointCreated;
+            continue;
         }
+
+        // Create the anchor pair from the best read's transition anchors.
+        Shasta2AnchorPair anchorPair(anchors,
+            bestTransition->lastAnchorInA, bestTransition->firstAnchorInB, false);
+        anchorPair.removeNegativeOffsets(anchors);
+        if(anchorPair.size() == 0) {
+            ++interWindowZeroPairs;
+            continue;
+        }
+
+        const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
+        createInterWindowEdge(windowPair, anchorPair, sharedReads, bestSpan);
     }
 
-    // Select endNode anchors per window.
-    // For each window, among all pass 1 endpoint anchors on the head side,
-    // pick the one closest to position 0. On the tail side, pick the one
-    // closest to position N-1. Chain-end windows (no backbone transition on
-    // a side) use the first/last backbone anchor as default.
-    {
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
-
-        // Collect pass 1 anchors per window.
-        // For each window, store (backbonePos, anchorId) for head-side and
-        // tail-side endpoint anchors separately.
-        struct WindowEndpointCandidates {
-            // Head side: anchors from connections to backbonePreviousWindow.
-            // We want the one with the smallest backbone position.
-            uint64_t headAid = UINT64_MAX;
-            uint32_t headPos = UINT32_MAX;
-            // Tail side: anchors from connections to backboneNextWindow.
-            // We want the one with the largest backbone position.
-            uint64_t tailAid = UINT64_MAX;
-            uint32_t tailPos = 0;
-            bool hasHead = false;
-            bool hasTail = false;
-        };
-        std::vector<WindowEndpointCandidates> wec(windowCount);
-
-        for(const auto& edgeInfo : createdEdges) {
-            const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
-            const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
-            // Only process endpoint edges (pass 1).
-            if(!endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)}))
-                continue;
-
-            const uint64_t aidA = uint64_t(edgeInfo.anchorIdA);
-            const uint64_t aidB = uint64_t(edgeInfo.anchorIdB);
-            const uint32_t posA = (aidA < anchorCount) ? anchorToBackbonePos[aidA] : UINT32_MAX;
-            const uint32_t posB = (aidB < anchorCount) ? anchorToBackbonePos[aidB] : UINT32_MAX;
-
-            // aidA is in srcNorm's window.
-            if(srcNorm < windowCount && aidA < anchorCount) {
-                const auto& srcW = anchorWindows[srcNorm];
-                if(srcW.backboneNextWindow == dstNorm) {
-                    // Tail side: want largest pos.
-                    if(!wec[srcNorm].hasTail || posA > wec[srcNorm].tailPos) {
-                        wec[srcNorm].tailAid = aidA;
-                        wec[srcNorm].tailPos = posA;
-                        wec[srcNorm].hasTail = true;
-                    }
-                }
-                if(srcW.backbonePreviousWindow == dstNorm) {
-                    // Head side: want smallest pos.
-                    if(!wec[srcNorm].hasHead || posA < wec[srcNorm].headPos) {
-                        wec[srcNorm].headAid = aidA;
-                        wec[srcNorm].headPos = posA;
-                        wec[srcNorm].hasHead = true;
-                    }
-                }
-            }
-
-            // aidB is in dstNorm's window.
-            if(dstNorm < windowCount && aidB < anchorCount) {
-                const auto& dstW = anchorWindows[dstNorm];
-                if(dstW.backbonePreviousWindow == srcNorm) {
-                    // Head side: want smallest pos.
-                    if(!wec[dstNorm].hasHead || posB < wec[dstNorm].headPos) {
-                        wec[dstNorm].headAid = aidB;
-                        wec[dstNorm].headPos = posB;
-                        wec[dstNorm].hasHead = true;
-                    }
-                }
-                if(dstW.backboneNextWindow == srcNorm) {
-                    // Tail side: want largest pos.
-                    if(!wec[dstNorm].hasTail || posB > wec[dstNorm].tailPos) {
-                        wec[dstNorm].tailAid = aidB;
-                        wec[dstNorm].tailPos = posB;
-                        wec[dstNorm].hasTail = true;
-                    }
-                }
-            }
-        }
-
-        // Now set endNode tags: for each window, use the selected head/tail
-        // anchor, or fall back to first/last backbone anchor for chain-ends.
-        auto markEndpoint = [&](uint64_t aid) {
-            if(aid >= anchorCount) return;
-            isEndpointAnchor[aid] = true;
-            endpointAnchors.insert(aid);
-            if((aid ^ 1ULL) < anchorCount) {
-                isEndpointAnchor[aid ^ 1ULL] = true;
-                endpointAnchors.insert(aid ^ 1ULL);
-            }
-        };
-
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& window = anchorWindows[w];
-            const auto& positions = window.filteredBackbonePositions;
-            if(positions.empty()) continue;
-            const auto journey = journeys[window.backboneOrientedReadId];
-
-            // Head side.
-            if(wec[w].hasHead) {
-                markEndpoint(wec[w].headAid);
-            } else if(window.backbonePreviousWindow == noW) {
-                // Chain-start: use first backbone anchor.
-                markEndpoint(uint64_t(journey[positions[0]]));
-            }
-
-            // Tail side.
-            if(wec[w].hasTail) {
-                markEndpoint(wec[w].tailAid);
-            } else if(window.backboneNextWindow == noW) {
-                // Chain-end: use last backbone anchor.
-                markEndpoint(uint64_t(journey[positions[positions.size() - 1]]));
-            }
-        }
-
-        cout << "Endpoint anchors: " << endpointAnchors.size()
-             << " (" << windowCount << " windows)." << endl;
-    }
-
-    // Store reserved anchors for pass 2 exclusion.
-
-    // Early trim: disable backbone anchors beyond the endpoint anchors.
-    // For each window, find the backbone positions of the endpoint anchors
-    // (from pass 1). Disable all intra-window edges on anchors before the
-    // head endpoint or after the tail endpoint, and add those anchors to
-    // reservedAnchors so pass 2 can't use them.
-
-    // Per-window endpoint positions on the backbone.
-    struct EndpointPos {
-        uint32_t headPos = 0;           // position of head endpoint anchor
-        uint32_t tailPos = UINT32_MAX;  // position of tail endpoint anchor
-        bool hasHead = false;
-            bool hasTail = false;
-        };
-        std::vector<EndpointPos> endpointPos(windowCount);
-
-        for(const auto& edgeInfo : createdEdges) {
-            const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
-            const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
-
-            if(srcNorm < windowCount) {
-                const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdA)];
-                const auto& w = anchorWindows[srcNorm];
-                if(w.backboneNextWindow == dstNorm) {
-                    if(!endpointPos[srcNorm].hasTail || pos < endpointPos[srcNorm].tailPos) {
-                        endpointPos[srcNorm].tailPos = pos;
-                    }
-                    endpointPos[srcNorm].hasTail = true;
-                }
-                if(w.backbonePreviousWindow == dstNorm) {
-                    if(!endpointPos[srcNorm].hasHead || pos > endpointPos[srcNorm].headPos) {
-                        endpointPos[srcNorm].headPos = pos;
-                    }
-                    endpointPos[srcNorm].hasHead = true;
-                }
-            }
-
-            if(dstNorm < windowCount) {
-                const uint32_t pos = anchorToBackbonePos[uint64_t(edgeInfo.anchorIdB)];
-                const auto& w = anchorWindows[dstNorm];
-                if(w.backbonePreviousWindow == srcNorm) {
-                    if(!endpointPos[dstNorm].hasHead || pos > endpointPos[dstNorm].headPos) {
-                        endpointPos[dstNorm].headPos = pos;
-                    }
-                    endpointPos[dstNorm].hasHead = true;
-                }
-                if(w.backboneNextWindow == srcNorm) {
-                    if(!endpointPos[dstNorm].hasTail || pos < endpointPos[dstNorm].tailPos) {
-                        endpointPos[dstNorm].tailPos = pos;
-                    }
-                    endpointPos[dstNorm].hasTail = true;
-                }
-            }
-        }
-
-        uint64_t earlyTrimCount = 0;
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& ep = endpointPos[w];
-            if(!ep.hasHead && !ep.hasTail) continue;
-
-            const auto& window = anchorWindows[w];
-            const auto journey = journeys[window.backboneOrientedReadId];
-
-            // Walk the full backbone range, not just filteredBackbonePositions,
-            // to also catch anchors that were filtered out of the backbone chain.
-            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-                bool outsideBounds = false;
-                if(ep.hasHead && pos < ep.headPos) outsideBounds = true;
-                if(ep.hasTail && pos > ep.tailPos) outsideBounds = true;
-
-                if(outsideBounds) {
-                    const uint64_t aid = uint64_t(journey[pos]);
-                    // Disable all edges on this anchor and its RC mirror.
-                    auto disableAll = [&](uint64_t a) {
-                        if(a >= anchorCount) return;
-                        auto oe = boost::out_edges(a, anchorGraph);
-                        for(auto it = oe.first; it != oe.second; ++it) {
-                            if(anchorGraph[*it].useForAssembly)
-                                disableEdge(*it);
-                        }
-                        auto ie = boost::in_edges(a, anchorGraph);
-                        for(auto it = ie.first; it != ie.second; ++it) {
-                            if(anchorGraph[*it].useForAssembly)
-                                disableEdge(*it);
-                        }
-                    };
-                    disableAll(aid);
-                    disableAll(aid ^ 1ULL);
-                    reservedAnchors.insert(aid);
-                    reservedAnchors.insert(aid ^ 1ULL);
-                    ++earlyTrimCount;
-                }
-            }
-        }
-    cout << "Early trim after endpoint edges: " << earlyTrimCount
-         << " backbone anchors disabled." << endl;
-
-    // Pass 2: Create remaining (non-endpoint) edges, skipping reserved anchors.
-    for(const auto& [windowPair, candidates] : windowPairCandidates) {
-        const uint32_t srcNorm = normalize(windowPair.first);
-        const uint32_t dstNorm = normalize(windowPair.second);
-        if(srcNorm == dstNorm) continue;
-        if(endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)})) continue;
-
-        Shasta2AnchorPair bestPair;
-        uint64_t bestSize = 0;
-        bool hadCandidates = false;
-        for(const auto& [apk, count] : candidates) {
-            hadCandidates = true;
-            if(reservedAnchors.count(uint64_t(apk.anchorIdA)) ||
-               reservedAnchors.count(uint64_t(apk.anchorIdB))) {
-                continue;
-            }
-            Shasta2AnchorPair anchorPair(anchors, apk.anchorIdA, apk.anchorIdB, false);
-            anchorPair.removeNegativeOffsets(anchors);
-            if(anchorPair.size() > bestSize) {
-                bestSize = anchorPair.size();
-                bestPair = std::move(anchorPair);
-            }
-        }
-
-        // Coverage check: distinct oriented read IDs that touch both windows.
-        const uint64_t totalSharedReads = countSharedReads(windowPair.first, windowPair.second);
-
-        if(bestSize == 0) {
-            if(hadCandidates) {
-                ++interWindowInternalSkipped;
-            } else {
-                ++interWindowZeroPairs;
-            }
-        } else if(totalSharedReads < minInterWindowCoverage) {
-            ++interWindowBelowCoverage;
-        } else {
-            createInterWindowEdge(windowPair, bestPair, bestSize);
-            ++interWindowInternalCreated;
-        }
-    }
-
-    cout << "Inter-window edges: " << interWindowCreated << " created ("
-         << interWindowEndpointCreated << " endpoint, "
-         << interWindowInternalCreated << " internal), "
-         << interWindowInternalSkipped << " internal skipped (reserved anchors), "
-         << interWindowZeroPairs << " rejected (zero forward-flow reads), "
-         << interWindowBelowCoverage << " rejected (below minInterWindowCoverage="
-         << minInterWindowCoverage << ")." << endl;
-#endif
-
-    // Per-anchor endpoint flags are set directly during edge creation:
-    // pass 1 edges get isEndpointAnchorPrev = isEndpointAnchorNext = true,
-    // pass 2 edges keep the default (false).
-    // isEndpointAnchor and endpointAnchors are already fully populated
-    // (initialized with first/last backbone anchors, updated by pass 1).
+    // (Old two-pass endpoint/internal edge code removed.)
+    // Diagnostic summary.
+    cout << "Inter-window edges: " << interWindowCreated << " created, "
+         << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
