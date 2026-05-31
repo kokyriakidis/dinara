@@ -589,6 +589,10 @@ public:
     // backbone journeys for well-supported consecutive pairs.
     uint64_t maxSkipForBackbone;
 
+    // Minimum base span (first anchor to last anchor) for a read's
+    // journey to be accepted as a window backbone.
+    uint64_t minWindowBaseSpan;
+
     // Options used by class mode3::LocalAssembly
     class LocalAssemblyOptions {
     public:

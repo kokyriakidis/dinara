@@ -53,7 +53,8 @@ void Assembler::computeAnchorWindowsClean(
     vector<AnchorWindow>& anchorWindows,
     uint64_t threadCount,
     uint64_t minCommonForBackbone,
-    uint64_t maxSkipForBackbone)
+    uint64_t maxSkipForBackbone,
+    uint64_t minWindowBaseSpan)
 {
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
@@ -624,6 +625,20 @@ void Assembler::computeAnchorWindowsClean(
 
         if(!isStillUnclaimed) {
             continue;
+        }
+
+        // Skip reads whose journey base span is below the threshold.
+        // A window with a tiny base span is noise — too few anchors
+        // spanning too little genomic sequence to be informative.
+        if(minWindowBaseSpan > 0 && journey.size() >= 2) {
+            const Shasta2AnchorId firstAnchor = journey[0];
+            const Shasta2AnchorId lastAnchor = journey[journey.size() - 1];
+            const uint32_t firstPos = shasta2Anchors->getPosition(firstAnchor, candidate.backboneOrientedReadId);
+            const uint32_t lastPos = shasta2Anchors->getPosition(lastAnchor, candidate.backboneOrientedReadId);
+            const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
+            if(baseSpan < minWindowBaseSpan) {
+                continue;
+            }
         }
 
         createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
