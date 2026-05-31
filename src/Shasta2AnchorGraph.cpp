@@ -2324,9 +2324,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 
     // Bypass edges from detangling: direct connections that skip over
-    // tangled windows whose backbone reads have been removed.
-    // Bypass edges from detangling — disabled for now.
-#if 0
+    // tangled windows whose flow reads have been removed.
     uint64_t bypassEdgeCount = 0;
     if(bypassEdges) {
         for(const auto& be : *bypassEdges) {
@@ -2339,7 +2337,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
-#endif
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
