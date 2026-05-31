@@ -1483,6 +1483,13 @@ void AssemblerOptions::addConfigurableOptions()
         "for well-supported consecutive anchor pairs. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minWindowBaseSpan",
+        value<uint64_t>(&assemblyOptions.mode3Options.minWindowBaseSpan)->
+        default_value(4000),
+        "Minimum base span (first anchor to last anchor) for a read's "
+        "journey to be accepted as a window backbone. Reads with shorter "
+        "journey spans are skipped during window creation.")
+
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
         default_value(0),
@@ -1931,6 +1938,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minInterWindowCoverage = " << minInterWindowCoverage << "\n";
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
+    s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);

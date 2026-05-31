@@ -1275,7 +1275,8 @@ void dinara::main::assemble(
         anchorWindows,
         threadCount,
         minCommonForBackbone,
-        maxSkipForBackbone);
+        maxSkipForBackbone,
+        assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan);
 
     // // CIGAR-based het SNP detection per window.
     // {
