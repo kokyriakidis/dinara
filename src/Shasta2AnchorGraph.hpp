@@ -155,8 +155,9 @@ public:
     // Per-window: distinct oriented read IDs that touch the window.
     std::map<uint32_t, std::set<uint32_t>> windowReads;
 
-    // Per-read: windows that the oriented read participates in.
-    std::map<uint32_t, std::set<uint32_t>> readWindows;
+    // Per-read: ordered window sequence (consecutive duplicates removed).
+    // Gives the order in which the read visits windows.
+    std::map<uint32_t, vector<uint32_t>> readWindows;
 
     // Normalized endpoint window pairs from the two-pass edge creation.
     // Stored as (min, max) for direction-independent lookup.

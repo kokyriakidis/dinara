@@ -371,13 +371,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            // Track which reads touch each window and vice versa.
+            // Track which reads touch each window.
             windowReads[windowId].insert(uint32_t(oidValue));
-            readWindows[uint32_t(oidValue)].insert(windowId);
 
             if(windowId == currentWindow) {
                 lastAnchorInCurrentWindow = anchorId;
             } else {
+                // New window transition — record in readWindows (ordered sequence).
+                readWindows[uint32_t(oidValue)].push_back(windowId);
+
                 if(currentWindow != noWindow) {
                     auto key = std::make_pair(currentWindow, windowId);
                     AnchorPairKey apk{lastAnchorInCurrentWindow, anchorId};
