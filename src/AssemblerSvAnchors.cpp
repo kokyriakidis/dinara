@@ -537,6 +537,14 @@ void Assembler::buildSvMSA(
                     return a.readCount > b.readCount;
                 });
 
+            // Dump all pre-dedup calls for multi-source analysis.
+            for(const auto& dc : allDelCalls) {
+                cout << "    PRE-DEDUP: source=" << dc.source
+                     << ", size=" << dc.size
+                     << ", bp=" << dc.breakpointPos
+                     << ", reads=" << dc.readCount << endl;
+            }
+
             // Deduplicate: suppress a call if a previously-emitted
             // call has size ratio >= 0.9 anywhere in the region.
             // The region is typically ~4kb, so breakpoint proximity
