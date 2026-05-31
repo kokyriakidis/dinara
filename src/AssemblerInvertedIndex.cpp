@@ -2704,9 +2704,13 @@ private:
                         // Reject candidates whose raw marker chain span is below
                         // the threshold. Uses pre-extension base positions from
                         // the actual chain hits, not the extended coordinates.
+                        // self_offset/offset are end-of-kmer positions (shifted
+                        // by seedSpan-1), so add seedSpan-1 to get the full
+                        // span from first kmer start to last kmer end.
                         if(invertedIndexData.minOverlapLength > 0) {
-                            const uint32_t rawQspan = (rawQmax >= rawQmin) ? (rawQmax - rawQmin + 1) : 0;
-                            const uint32_t rawTspan = (rawTmax >= rawTmin) ? (rawTmax - rawTmin + 1) : 0;
+                            const uint32_t seedSpan = uint32_t(kmerLen);
+                            const uint32_t rawQspan = (rawQmax >= rawQmin) ? (rawQmax - rawQmin + seedSpan) : 0;
+                            const uint32_t rawTspan = (rawTmax >= rawTmin) ? (rawTmax - rawTmin + seedSpan) : 0;
                             if(std::min(rawQspan, rawTspan) < invertedIndexData.minOverlapLength) {
                                 continue;
                             }
