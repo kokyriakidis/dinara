@@ -437,8 +437,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Initialize isEndpointAnchor: first and last backbone anchor of each
     // window define the default window boundaries.
-    // Both the anchor and its RC mirror are marked — they are the same
-    // physical anchor in different orientations, same normalized window.
+    // Both the anchor and its RC mirror are marked — the window
+    // represents both strands.
     isEndpointAnchor.assign(anchorCount, false);
     endpointAnchors.clear();
     for(uint32_t wid = 0; wid < windowCount; wid++) {
@@ -451,14 +451,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(firstAid < anchorCount) {
             isEndpointAnchor[firstAid] = true;
             endpointAnchors.insert(firstAid);
-            endpointAnchors.insert(firstAid ^ 1ULL);
-            if((firstAid ^ 1ULL) < anchorCount) isEndpointAnchor[firstAid ^ 1ULL] = true;
+            if((firstAid ^ 1ULL) < anchorCount) {
+                isEndpointAnchor[firstAid ^ 1ULL] = true;
+                endpointAnchors.insert(firstAid ^ 1ULL);
+            }
         }
         if(lastAid < anchorCount) {
             isEndpointAnchor[lastAid] = true;
             endpointAnchors.insert(lastAid);
-            endpointAnchors.insert(lastAid ^ 1ULL);
-            if((lastAid ^ 1ULL) < anchorCount) isEndpointAnchor[lastAid ^ 1ULL] = true;
+            if((lastAid ^ 1ULL) < anchorCount) {
+                isEndpointAnchor[lastAid ^ 1ULL] = true;
+                endpointAnchors.insert(lastAid ^ 1ULL);
+            }
         }
     }
     // Track initial first/last anchors per window for clearing during pass 1.
@@ -617,8 +621,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 if(oldAid == UINT64_MAX || oldAid >= anchorCount) return;
                 isEndpointAnchor[oldAid] = false;
                 endpointAnchors.erase(oldAid);
-                endpointAnchors.erase(oldAid ^ 1ULL);
-                if((oldAid ^ 1ULL) < anchorCount) isEndpointAnchor[oldAid ^ 1ULL] = false;
+                if((oldAid ^ 1ULL) < anchorCount) {
+                    isEndpointAnchor[oldAid ^ 1ULL] = false;
+                    endpointAnchors.erase(oldAid ^ 1ULL);
+                }
             };
             if(srcNorm < windowCount) {
                 const auto& srcW = anchorWindows[srcNorm];
@@ -648,18 +654,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
 
-            // Set new endpoints.
+            // Set new endpoints (both anchor and RC mirror).
             if(aidA < anchorCount) {
                 isEndpointAnchor[aidA] = true;
                 endpointAnchors.insert(aidA);
-                endpointAnchors.insert(aidA ^ 1ULL);
-                if((aidA ^ 1ULL) < anchorCount) isEndpointAnchor[aidA ^ 1ULL] = true;
+                if((aidA ^ 1ULL) < anchorCount) {
+                    isEndpointAnchor[aidA ^ 1ULL] = true;
+                    endpointAnchors.insert(aidA ^ 1ULL);
+                }
             }
             if(aidB < anchorCount) {
                 isEndpointAnchor[aidB] = true;
                 endpointAnchors.insert(aidB);
-                endpointAnchors.insert(aidB ^ 1ULL);
-                if((aidB ^ 1ULL) < anchorCount) isEndpointAnchor[aidB ^ 1ULL] = true;
+                if((aidB ^ 1ULL) < anchorCount) {
+                    isEndpointAnchor[aidB ^ 1ULL] = true;
+                    endpointAnchors.insert(aidB ^ 1ULL);
+                }
             }
             reservedAnchors.insert(aidA);
             reservedAnchors.insert(aidB);
