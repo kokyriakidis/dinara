@@ -435,52 +435,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Initialize isEndpointAnchor: first and last backbone anchor of each
-    // window define the default window boundaries.
-    // Both the anchor and its RC mirror are marked — the window
-    // represents both strands.
+    // isEndpointAnchor and endpointAnchors are populated after pass 1,
+    // once we know the actual endpoint anchors per window.
     isEndpointAnchor.assign(anchorCount, false);
     endpointAnchors.clear();
-    for(uint32_t wid = 0; wid < windowCount; wid++) {
-        const auto& window = anchorWindows[wid];
-        const auto& positions = window.filteredBackbonePositions;
-        if(positions.empty()) continue;
-        const auto journey = journeys[window.backboneOrientedReadId];
-        const uint64_t firstAid = uint64_t(journey[positions[0]]);
-        const uint64_t lastAid = uint64_t(journey[positions[positions.size() - 1]]);
-        if(firstAid < anchorCount) {
-            isEndpointAnchor[firstAid] = true;
-            endpointAnchors.insert(firstAid);
-            if((firstAid ^ 1ULL) < anchorCount) {
-                isEndpointAnchor[firstAid ^ 1ULL] = true;
-                endpointAnchors.insert(firstAid ^ 1ULL);
-            }
-        }
-        if(lastAid < anchorCount) {
-            isEndpointAnchor[lastAid] = true;
-            endpointAnchors.insert(lastAid);
-            if((lastAid ^ 1ULL) < anchorCount) {
-                isEndpointAnchor[lastAid ^ 1ULL] = true;
-                endpointAnchors.insert(lastAid ^ 1ULL);
-            }
-        }
-    }
-    // Track initial first/last anchors per window for clearing during pass 1.
-    struct WindowEndpoints {
-        uint64_t firstAid = UINT64_MAX;
-        uint64_t lastAid = UINT64_MAX;
-    };
-    std::vector<WindowEndpoints> initialEndpoints(windowCount);
-    for(uint32_t wid = 0; wid < windowCount; wid++) {
-        const auto& window = anchorWindows[wid];
-        const auto& positions = window.filteredBackbonePositions;
-        if(positions.empty()) continue;
-        const auto journey = journeys[window.backboneOrientedReadId];
-        initialEndpoints[wid].firstAid = uint64_t(journey[positions[0]]);
-        initialEndpoints[wid].lastAid = uint64_t(journey[positions[positions.size() - 1]]);
-    }
-    cout << "Initial endpoint anchors: " << endpointAnchors.size()
-         << " (first/last backbone anchors of " << windowCount << " windows)." << endl;
 
     // For each window pair, pick the candidate with the most shared reads.
     // Two passes: endpoint edges first (to reserve their anchors), then
@@ -528,10 +486,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // For each endpoint window pair, find the anchor pair where the backbone
     // reads transition between the two windows. This is the specific anchor
     // pair from the backbone reads, not the best-sharing pair from all reads.
-    // Track which normalized pairs have already set endNode tags — only the
-    // first raw pair per normalized pair sets them. Subsequent raw pairs
-    // (rc-rc etc.) still create edges but don't add more endNode anchors.
-    std::set<std::pair<uint32_t, uint32_t>> endpointTaggedPairs;
     for(const auto& [windowPair, candidates] : windowPairCandidates) {
         const uint32_t srcNorm = normalize(windowPair.first);
         const uint32_t dstNorm = normalize(windowPair.second);
@@ -614,77 +568,135 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         } else if(bestSize < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
-            const uint64_t aidA = uint64_t(bestPair.anchorIdA);
-            const uint64_t aidB = uint64_t(bestPair.anchorIdB);
-
-            // Only the first raw pair per normalized pair sets endNode tags.
-            // Subsequent raw pairs (rc-rc etc.) create edges but don't tag.
-            const auto normPair = std::make_pair(
-                std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm));
-            if(endpointTaggedPairs.insert(normPair).second) {
-                // Clear old default endpoints on the sides where pass 1
-                // found actual connections, then set new ones.
-                auto clearOld = [&](uint64_t oldAid) {
-                    if(oldAid == UINT64_MAX || oldAid >= anchorCount) return;
-                    isEndpointAnchor[oldAid] = false;
-                    endpointAnchors.erase(oldAid);
-                    if((oldAid ^ 1ULL) < anchorCount) {
-                        isEndpointAnchor[oldAid ^ 1ULL] = false;
-                        endpointAnchors.erase(oldAid ^ 1ULL);
-                    }
-                };
-                if(srcNorm < windowCount) {
-                    const auto& srcW = anchorWindows[srcNorm];
-                    if(srcW.backboneNextWindow == dstNorm) {
-                        uint64_t oldLast = initialEndpoints[srcNorm].lastAid;
-                        if(oldLast != aidA) clearOld(oldLast);
-                    }
-                    if(srcW.backbonePreviousWindow == dstNorm) {
-                        uint64_t oldFirst = initialEndpoints[srcNorm].firstAid;
-                        if(oldFirst != aidA) clearOld(oldFirst);
-                    }
-                }
-                if(dstNorm < windowCount) {
-                    const auto& dstW = anchorWindows[dstNorm];
-                    if(dstW.backbonePreviousWindow == srcNorm) {
-                        uint64_t oldFirst = initialEndpoints[dstNorm].firstAid;
-                        if(oldFirst != aidB) clearOld(oldFirst);
-                    }
-                    if(dstW.backboneNextWindow == srcNorm) {
-                        uint64_t oldLast = initialEndpoints[dstNorm].lastAid;
-                        if(oldLast != aidB) clearOld(oldLast);
-                    }
-                }
-
-                // Set new endpoints (both anchor and RC mirror).
-                if(aidA < anchorCount) {
-                    isEndpointAnchor[aidA] = true;
-                    endpointAnchors.insert(aidA);
-                    if((aidA ^ 1ULL) < anchorCount) {
-                        isEndpointAnchor[aidA ^ 1ULL] = true;
-                        endpointAnchors.insert(aidA ^ 1ULL);
-                    }
-                }
-                if(aidB < anchorCount) {
-                    isEndpointAnchor[aidB] = true;
-                    endpointAnchors.insert(aidB);
-                    if((aidB ^ 1ULL) < anchorCount) {
-                        isEndpointAnchor[aidB ^ 1ULL] = true;
-                        endpointAnchors.insert(aidB ^ 1ULL);
-                    }
-                }
-            }
-            reservedAnchors.insert(aidA);
-            reservedAnchors.insert(aidB);
-            reservedAnchors.insert(aidA ^ 1ULL);
-            reservedAnchors.insert(aidB ^ 1ULL);
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdA));
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdB));
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+            reservedAnchors.insert(uint64_t(bestPair.anchorIdB) ^ 1ULL);
             createInterWindowEdge(windowPair, bestPair, bestSize, true);
             ++interWindowEndpointCreated;
         }
     }
 
+    // Select endNode anchors per window.
+    // For each window, among all pass 1 endpoint anchors on the head side,
+    // pick the one closest to position 0. On the tail side, pick the one
+    // closest to position N-1. Chain-end windows (no backbone transition on
+    // a side) use the first/last backbone anchor as default.
+    {
+        const uint32_t noW = AnchorWindowReadInterval::noWindow;
+
+        // Collect pass 1 anchors per window.
+        // For each window, store (backbonePos, anchorId) for head-side and
+        // tail-side endpoint anchors separately.
+        struct WindowEndpointCandidates {
+            // Head side: anchors from connections to backbonePreviousWindow.
+            // We want the one with the smallest backbone position.
+            uint64_t headAid = UINT64_MAX;
+            uint32_t headPos = UINT32_MAX;
+            // Tail side: anchors from connections to backboneNextWindow.
+            // We want the one with the largest backbone position.
+            uint64_t tailAid = UINT64_MAX;
+            uint32_t tailPos = 0;
+            bool hasHead = false;
+            bool hasTail = false;
+        };
+        std::vector<WindowEndpointCandidates> wec(windowCount);
+
+        for(const auto& edgeInfo : createdEdges) {
+            const uint32_t srcNorm = normalize(edgeInfo.windowPair.first);
+            const uint32_t dstNorm = normalize(edgeInfo.windowPair.second);
+            // Only process endpoint edges (pass 1).
+            if(!endpointWindowPairs.count({std::min(srcNorm, dstNorm), std::max(srcNorm, dstNorm)}))
+                continue;
+
+            const uint64_t aidA = uint64_t(edgeInfo.anchorIdA);
+            const uint64_t aidB = uint64_t(edgeInfo.anchorIdB);
+            const uint32_t posA = (aidA < anchorCount) ? anchorToBackbonePos[aidA] : UINT32_MAX;
+            const uint32_t posB = (aidB < anchorCount) ? anchorToBackbonePos[aidB] : UINT32_MAX;
+
+            // aidA is in srcNorm's window.
+            if(srcNorm < windowCount && aidA < anchorCount) {
+                const auto& srcW = anchorWindows[srcNorm];
+                if(srcW.backboneNextWindow == dstNorm) {
+                    // Tail side: want largest pos.
+                    if(!wec[srcNorm].hasTail || posA > wec[srcNorm].tailPos) {
+                        wec[srcNorm].tailAid = aidA;
+                        wec[srcNorm].tailPos = posA;
+                        wec[srcNorm].hasTail = true;
+                    }
+                }
+                if(srcW.backbonePreviousWindow == dstNorm) {
+                    // Head side: want smallest pos.
+                    if(!wec[srcNorm].hasHead || posA < wec[srcNorm].headPos) {
+                        wec[srcNorm].headAid = aidA;
+                        wec[srcNorm].headPos = posA;
+                        wec[srcNorm].hasHead = true;
+                    }
+                }
+            }
+
+            // aidB is in dstNorm's window.
+            if(dstNorm < windowCount && aidB < anchorCount) {
+                const auto& dstW = anchorWindows[dstNorm];
+                if(dstW.backbonePreviousWindow == srcNorm) {
+                    // Head side: want smallest pos.
+                    if(!wec[dstNorm].hasHead || posB < wec[dstNorm].headPos) {
+                        wec[dstNorm].headAid = aidB;
+                        wec[dstNorm].headPos = posB;
+                        wec[dstNorm].hasHead = true;
+                    }
+                }
+                if(dstW.backboneNextWindow == srcNorm) {
+                    // Tail side: want largest pos.
+                    if(!wec[dstNorm].hasTail || posB > wec[dstNorm].tailPos) {
+                        wec[dstNorm].tailAid = aidB;
+                        wec[dstNorm].tailPos = posB;
+                        wec[dstNorm].hasTail = true;
+                    }
+                }
+            }
+        }
+
+        // Now set endNode tags: for each window, use the selected head/tail
+        // anchor, or fall back to first/last backbone anchor for chain-ends.
+        auto markEndpoint = [&](uint64_t aid) {
+            if(aid >= anchorCount) return;
+            isEndpointAnchor[aid] = true;
+            endpointAnchors.insert(aid);
+            if((aid ^ 1ULL) < anchorCount) {
+                isEndpointAnchor[aid ^ 1ULL] = true;
+                endpointAnchors.insert(aid ^ 1ULL);
+            }
+        };
+
+        for(uint32_t w = 0; w < windowCount; w++) {
+            const auto& window = anchorWindows[w];
+            const auto& positions = window.filteredBackbonePositions;
+            if(positions.empty()) continue;
+            const auto journey = journeys[window.backboneOrientedReadId];
+
+            // Head side.
+            if(wec[w].hasHead) {
+                markEndpoint(wec[w].headAid);
+            } else if(window.backbonePreviousWindow == noW) {
+                // Chain-start: use first backbone anchor.
+                markEndpoint(uint64_t(journey[positions[0]]));
+            }
+
+            // Tail side.
+            if(wec[w].hasTail) {
+                markEndpoint(wec[w].tailAid);
+            } else if(window.backboneNextWindow == noW) {
+                // Chain-end: use last backbone anchor.
+                markEndpoint(uint64_t(journey[positions[positions.size() - 1]]));
+            }
+        }
+
+        cout << "Endpoint anchors: " << endpointAnchors.size()
+             << " (" << windowCount << " windows)." << endl;
+    }
+
     // Store reserved anchors for pass 2 exclusion.
-    // endpointAnchors already includes both initial (first/last) and pass 1 anchors.
 
     // Early trim: disable backbone anchors beyond the endpoint anchors.
     // For each window, find the backbone positions of the endpoint anchors
