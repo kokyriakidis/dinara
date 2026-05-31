@@ -437,6 +437,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Initialize isEndpointAnchor: first and last backbone anchor of each
     // window define the default window boundaries.
+    // Only mark the anchor itself, not its RC mirror — the RC mirror
+    // belongs to a different window where it may be internal.
     isEndpointAnchor.assign(anchorCount, false);
     endpointAnchors.clear();
     for(uint32_t wid = 0; wid < windowCount; wid++) {
@@ -449,14 +451,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(firstAid < anchorCount) {
             isEndpointAnchor[firstAid] = true;
             endpointAnchors.insert(firstAid);
-            endpointAnchors.insert(firstAid ^ 1ULL);
-            if((firstAid ^ 1ULL) < anchorCount) isEndpointAnchor[firstAid ^ 1ULL] = true;
         }
         if(lastAid < anchorCount) {
             isEndpointAnchor[lastAid] = true;
             endpointAnchors.insert(lastAid);
-            endpointAnchors.insert(lastAid ^ 1ULL);
-            if((lastAid ^ 1ULL) < anchorCount) isEndpointAnchor[lastAid ^ 1ULL] = true;
         }
     }
     cout << "Initial endpoint anchors: " << endpointAnchors.size()
@@ -591,20 +589,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             ++interWindowBelowCoverage;
         } else {
             // Override isEndpointAnchor: the pass 1 anchors become the new
-            // endpoints. The old first/last defaults remain unless overridden.
+            // endpoints. Only mark the anchors themselves, not RC mirrors.
+            // RC mirrors are reserved (for pass 2 exclusion) but not tagged
+            // as endpoint — they belong to a different window.
             const uint64_t aidA = uint64_t(bestPair.anchorIdA);
             const uint64_t aidB = uint64_t(bestPair.anchorIdB);
             if(aidA < anchorCount) {
                 isEndpointAnchor[aidA] = true;
                 endpointAnchors.insert(aidA);
-                endpointAnchors.insert(aidA ^ 1ULL);
-                if((aidA ^ 1ULL) < anchorCount) isEndpointAnchor[aidA ^ 1ULL] = true;
             }
             if(aidB < anchorCount) {
                 isEndpointAnchor[aidB] = true;
                 endpointAnchors.insert(aidB);
-                endpointAnchors.insert(aidB ^ 1ULL);
-                if((aidB ^ 1ULL) < anchorCount) isEndpointAnchor[aidB ^ 1ULL] = true;
             }
             reservedAnchors.insert(aidA);
             reservedAnchors.insert(aidB);
