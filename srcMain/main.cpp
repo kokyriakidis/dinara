@@ -1176,8 +1176,8 @@ void dinara::main::assemble(
     // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coverageHet) / 2));
     // const uint64_t maxAnchorCoverage = (uint64_t)(1.5 * double(coverageHet));
     
-    const uint64_t minVertexCoverage = 4;
-    const uint64_t maxVertexCoverage = 5 * coverageHet;
+    const uint64_t minVertexCoverage = 2;
+    const uint64_t maxVertexCoverage = std::numeric_limits<uint64_t>::max();
 
     // Build marker graph vertices by transitive alignment collapse.
     // Each alignment merges its aligned marker pairs into a disjoint set.
@@ -1220,8 +1220,8 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    const uint64_t minAnchorCoverage = 4;
-    const uint64_t maxAnchorCoverage = 5 * coverageHet;
+    const uint64_t minAnchorCoverage = 2;
+    const uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max();
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
