@@ -152,6 +152,12 @@ public:
     vector<uint32_t> anchorToWindow;
     uint32_t windowCount = 0;
 
+    // Per-window: distinct oriented read IDs that touch the window.
+    std::map<uint32_t, std::set<uint32_t>> windowReads;
+
+    // Per-read: windows that the oriented read participates in.
+    std::map<uint32_t, std::set<uint32_t>> readWindows;
+
     // Normalized endpoint window pairs from the two-pass edge creation.
     // Stored as (min, max) for direction-independent lookup.
     // A pair (A, B) means some backbone read transitions between A and B.

@@ -344,8 +344,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
-    // Distinct oriented read IDs that touch each window (for shared read counting).
-    std::map<uint32_t, std::set<uint32_t>> windowReads;
+    // windowReads and readWindows are class members, populated here.
 
     uint64_t containedSkipCount = 0;
     const uint64_t journeyCount = journeys.size();
@@ -372,8 +371,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            // Track which reads touch each window.
+            // Track which reads touch each window and vice versa.
             windowReads[windowId].insert(uint32_t(oidValue));
+            readWindows[uint32_t(oidValue)].insert(windowId);
 
             if(windowId == currentWindow) {
                 lastAnchorInCurrentWindow = anchorId;
