@@ -553,32 +553,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Build the set of endpoint window pairs from backbone transitions.
     auto normalize = [&](uint32_t w) -> uint32_t {
         return (w >= windowCount) ? (w - windowCount) : w;
     };
-    endpointWindowPairs.clear();
-    for(uint32_t wid = 0; wid < windowCount; wid++) {
-        const auto& window = anchorWindows[wid];
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
-        if(window.backbonePreviousWindow != noW) {
-            uint32_t prev = window.backbonePreviousWindow;
-            endpointWindowPairs.insert({std::min(prev, wid), std::max(prev, wid)});
-        }
-        if(window.backboneNextWindow != noW) {
-            uint32_t next = window.backboneNextWindow;
-            endpointWindowPairs.insert({std::min(wid, next), std::max(wid, next)});
-        }
-    }
-
-    // isEndpointAnchor and endpointAnchors are populated after pass 1,
-    // once we know the actual endpoint anchors per window.
-    isEndpointAnchor.assign(anchorCount, false);
-    endpointAnchors.clear();
-
-    // For each window pair, pick the candidate with the most shared reads.
-    // Two passes: endpoint edges first (to reserve their anchors), then
-    // remaining edges (skipping reserved anchors).
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowCreated = 0;
     // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, sharedReadCount).
@@ -637,42 +614,102 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // Single-pass inter-window edge creation.
-    // For each window pair, the read with the highest spanA * spanB
-    // picks the anchor pair (its lastInA, firstInB). This selects the
-    // transition point from the read with the deepest balanced coverage
-    // across both windows.
+    // Two-edge inter-window edge creation.
+    // For each window pair A→B, create up to two edges:
+    //   1. Entry edge: the read whose firstAnchorInB is the earliest
+    //      entry into B (in B's traversal order). This ensures all
+    //      reads' entry points into B are reachable via backbone edges.
+    //   2. Exit edge: the read whose lastAnchorInA is the latest
+    //      exit from A (in A's traversal order). This ensures all
+    //      reads' exit points from A can reach the edge via backbone.
+    // If both select the same read, only one edge is created.
+    // Tiebreak by span product in both cases.
+    //
+    // For forward windows, traversal order matches backbone position
+    // (increasing). For RC windows, traversal order is reversed
+    // (decreasing backbone position). So:
+    //   Entry into forward B: lowest backbone pos
+    //   Entry into RC B:      highest backbone pos
+    //   Exit from forward A:  highest backbone pos
+    //   Exit from RC A:       lowest backbone pos
     for(const auto& [windowPair, transitions] : windowPairTransitions) {
-        const uint32_t srcNorm = normalize(windowPair.first);
-        const uint32_t dstNorm = normalize(windowPair.second);
-        if(srcNorm == dstNorm) continue;
+        const bool srcIsRc = (windowPair.first >= windowCount);
+        const bool dstIsRc = (windowPair.second >= windowCount);
 
-        // Find the read with the highest spanA * spanB (product).
-        uint64_t bestProduct = 0;
-        const ReadTransition* bestTransition = nullptr;
+        // Find entry edge: earliest entry into B.
+        // Forward B: lowest backbone pos. RC B: highest backbone pos.
+        uint32_t bestEntryPos = dstIsRc ? 0 : std::numeric_limits<uint32_t>::max();
+        uint64_t bestEntryProduct = 0;
+        const ReadTransition* entryTransition = nullptr;
+        bool entryPosInitialized = false;
         for(const auto& t : transitions) {
-            if(t.supportingSpanProduct > bestProduct) {
-                bestProduct = t.supportingSpanProduct;
-                bestTransition = &t;
+            const uint32_t bPos = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
+            const bool isBetter = dstIsRc
+                ? (bPos > bestEntryPos)    // RC: higher pos = earlier in traversal
+                : (bPos < bestEntryPos);   // Fwd: lower pos = earlier in traversal
+            if(!entryPosInitialized || isBetter ||
+               (bPos == bestEntryPos && t.supportingSpanProduct > bestEntryProduct)) {
+                bestEntryPos = bPos;
+                bestEntryProduct = t.supportingSpanProduct;
+                entryTransition = &t;
+                entryPosInitialized = true;
             }
         }
-        if(!bestTransition) {
-            ++interWindowZeroPairs;
-            continue;
-        }
 
-        // Create the edge from the best-spanning read's transition anchors.
-        // Store the sum (spanA + spanB) as the edge attribute.
-        Shasta2AnchorPair anchorPair(anchors,
-            bestTransition->lastAnchorInA, bestTransition->firstAnchorInB, false);
-        anchorPair.removeNegativeOffsets(anchors);
-        if(anchorPair.size() == 0) {
-            ++interWindowZeroPairs;
-            continue;
+        // Find exit edge: latest exit from A.
+        // Forward A: highest backbone pos. RC A: lowest backbone pos.
+        uint32_t bestExitPos = srcIsRc ? std::numeric_limits<uint32_t>::max() : 0;
+        uint64_t bestExitProduct = 0;
+        const ReadTransition* exitTransition = nullptr;
+        bool exitPosInitialized = false;
+        for(const auto& t : transitions) {
+            const uint32_t aPos = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
+            const bool isBetter = srcIsRc
+                ? (aPos < bestExitPos)     // RC: lower pos = later in traversal
+                : (aPos > bestExitPos);    // Fwd: higher pos = later in traversal
+            if(!exitPosInitialized || isBetter ||
+               (aPos == bestExitPos && t.supportingSpanProduct > bestExitProduct)) {
+                bestExitPos = aPos;
+                bestExitProduct = t.supportingSpanProduct;
+                exitTransition = &t;
+                exitPosInitialized = true;
+            }
         }
 
         const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
-        createInterWindowEdge(windowPair, anchorPair, sharedReads, bestTransition->supportingSpanSum);
+
+        // Create entry edge.
+        bool entryCreated = false;
+        if(entryTransition) {
+            Shasta2AnchorPair entryPair(anchors,
+                entryTransition->lastAnchorInA, entryTransition->firstAnchorInB, false);
+            entryPair.removeNegativeOffsets(anchors);
+            if(entryPair.size() > 0) {
+                createInterWindowEdge(windowPair, entryPair, sharedReads,
+                    entryTransition->supportingSpanSum);
+                entryCreated = true;
+            }
+        }
+
+        // Create exit edge (skip if same read or same anchor pair as entry edge).
+        bool exitCreated = false;
+        if(exitTransition &&
+           (!entryTransition || (exitTransition != entryTransition &&
+            !(exitTransition->lastAnchorInA == entryTransition->lastAnchorInA &&
+              exitTransition->firstAnchorInB == entryTransition->firstAnchorInB)))) {
+            Shasta2AnchorPair exitPair(anchors,
+                exitTransition->lastAnchorInA, exitTransition->firstAnchorInB, false);
+            exitPair.removeNegativeOffsets(anchors);
+            if(exitPair.size() > 0) {
+                createInterWindowEdge(windowPair, exitPair, sharedReads,
+                    exitTransition->supportingSpanSum);
+                exitCreated = true;
+            }
+        }
+
+        if(!entryCreated && !exitCreated) {
+            ++interWindowZeroPairs;
+        }
     }
 
     // (Old two-pass endpoint/internal edge code removed.)
@@ -762,19 +799,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(const auto& [pair, info] : pairInfo) {
             // 1. Must have only one unique anchor pair (single-point connection).
             if(info.uniqueAnchorPairs.size() != 1) continue;
-
-            // Skip if any edge touches an endNode anchor.
-            bool hasEndNode = false;
-            for(const auto& e : info.edges) {
-                const uint64_t srcVal = uint64_t(source(e, anchorGraph));
-                const uint64_t dstVal = uint64_t(target(e, anchorGraph));
-                if((srcVal < anchorCount && isEndpointAnchor[srcVal]) ||
-                   (dstVal < anchorCount && isEndpointAnchor[dstVal])) {
-                    hasEndNode = true;
-                    break;
-                }
-            }
-            if(hasEndNode) continue;
 
             // 2. Both anchors must have both incoming and outgoing intra-window
             // edges, so removing this inter-window edge won't create a dead end.
@@ -871,17 +895,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             // For each neighbor window X that has both incoming and outgoing
             // connections, find pairs where incoming is at an earlier backbone
             // position than outgoing (X enters w then leaves w).
-            // Skip endpoint edges — only process internal connections.
             for(const auto& [xWindow, inEdges] : incoming) {
-                // Skip if any edge to/from X is an endpoint edge.
-                bool hasEndpointEdge = false;
-                for(const auto& ie : inEdges) {
-                    const uint64_t s = uint64_t(source(ie.e, anchorGraph));
-                    const uint64_t d = uint64_t(target(ie.e, anchorGraph));
-                    if((s < anchorCount && isEndpointAnchor[s]) ||
-                       (d < anchorCount && isEndpointAnchor[d])) { hasEndpointEdge = true; break; }
-                }
-                if(hasEndpointEdge) continue;
                 auto outIt = outgoing.find(xWindow);
                 if(outIt == outgoing.end()) continue;
                 const auto& outEdges = outIt->second;
@@ -971,8 +985,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 for(auto it = oe.first; it != oe.second; ++it) {
                     if(!anchorGraph[*it].useForAssembly) continue;
                     const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                    if((startAid < anchorCount && isEndpointAnchor[startAid]) ||
-                       (tgt < anchorCount && isEndpointAnchor[tgt])) continue;
                     if(tgt >= anchorCount) continue;
                     const uint32_t tgtRaw = anchorToWindow[tgt];
                     if(tgtRaw == noWindow) continue;
@@ -999,8 +1011,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     for(auto it = oe2.first; it != oe2.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
                         const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                        if((aid < anchorCount && isEndpointAnchor[aid]) ||
-                           (tgt < anchorCount && isEndpointAnchor[tgt])) continue;
                         if(tgt >= anchorCount || visited.count(tgt)) continue;
                         const uint32_t tgtRaw = anchorToWindow[tgt];
                         if(tgtRaw == noWindow) continue;
@@ -1013,8 +1023,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     for(auto it = ie.first; it != ie.second; ++it) {
                         if(!anchorGraph[*it].useForAssembly) continue;
                         const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                        if((aid < anchorCount && isEndpointAnchor[aid]) ||
-                           (src < anchorCount && isEndpointAnchor[src])) continue;
                         if(src >= anchorCount || visited.count(src)) continue;
                         const uint32_t srcRaw = anchorToWindow[src];
                         if(srcRaw == noWindow) continue;
@@ -1259,30 +1267,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(it == neighbors.end()) continue;
             if(it->second.size() != 1) continue;
 
-            const uint32_t neighbor = *it->second.begin();
-
-            // Skip if any edge between w and its neighbor is an endpoint edge.
-            bool hasEndpoint = false;
-            BGL_FORALL_EDGES(e2, anchorGraph, Shasta2AnchorGraph) {
-                if(!anchorGraph[e2].useForAssembly) continue;
-                const uint64_t srcVal2 = uint64_t(source(e2, anchorGraph));
-                const uint64_t dstVal2 = uint64_t(target(e2, anchorGraph));
-                if(!((srcVal2 < anchorCount && isEndpointAnchor[srcVal2]) ||
-                     (dstVal2 < anchorCount && isEndpointAnchor[dstVal2]))) continue;
-                if(srcVal2 >= anchorCount || dstVal2 >= anchorCount) continue;
-                const uint32_t srcRaw2 = anchorToWindow[srcVal2];
-                const uint32_t dstRaw2 = anchorToWindow[dstVal2];
-                if(srcRaw2 == noWindow || dstRaw2 == noWindow) continue;
-                const uint32_t s2 = normalize(srcRaw2);
-                const uint32_t d2 = normalize(dstRaw2);
-                if((s2 == w && d2 == neighbor) || (s2 == neighbor && d2 == w)) {
-                    hasEndpoint = true;
-                    break;
-                }
-            }
-            if(hasEndpoint) continue;
-
-            // Dead-end spur. Disable all inter-window edges of w.
+            // Dead-end spur: window w has only one neighbor. Disable all
+            // inter-window edges of w.
             BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
                 if(!anchorGraph[e].useForAssembly) continue;
                 const uint64_t srcVal = uint64_t(source(e, anchorGraph));

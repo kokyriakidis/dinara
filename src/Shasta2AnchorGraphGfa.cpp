@@ -34,13 +34,9 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         activeVertices.insert(target(e, *this));
     }
 
-    // Write active vertices with node type tag.
-    // nt:Z:endNode — endpoint anchor (pass 1 or chain-end promoted)
-    // nt:Z:intraNode — internal anchor within its window
+    // Write active vertices.
     for(const auto v : activeVertices) {
-        const char* nodeTag = (uint64_t(v) < isEndpointAnchor.size() && isEndpointAnchor[uint64_t(v)])
-            ? "endNode" : "intraNode";
-        gfa << "S\t" << v << "\t*\tLN:i:1\tnt:Z:" << nodeTag << "\n";
+        gfa << "S\t" << v << "\t*\tLN:i:1\n";
     }
 
     // Write edges. All edges are forward-to-forward.
@@ -54,15 +50,6 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         gfa << "L\t" << src << "\t+\t"
             << dst << "\t+\t0M"
             << "\tRC:i:" << edge.coverage();
-
-        // Edge tags derived from node tags.
-        if(!isEndpointAnchor.empty() &&
-           uint64_t(src) < isEndpointAnchor.size() &&
-           uint64_t(dst) < isEndpointAnchor.size()) {
-            const char* srcTag = isEndpointAnchor[uint64_t(src)] ? "endNode" : "intraNode";
-            const char* dstTag = isEndpointAnchor[uint64_t(dst)] ? "endNode" : "intraNode";
-            gfa << "\tpw:Z:" << srcTag << "\tnw:Z:" << dstTag;
-        }
 
         // Inter-window edge attributes.
         if(edge.maxSupportingSpan > 0) {
