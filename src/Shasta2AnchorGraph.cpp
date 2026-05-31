@@ -344,6 +344,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::map<AnchorPairKey, uint32_t>> windowPairCandidates;
 
+    // Distinct oriented read IDs that touch each window (for shared read counting).
+    std::map<uint32_t, std::set<uint32_t>> windowReads;
+
     uint64_t containedSkipCount = 0;
     const uint64_t journeyCount = journeys.size();
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
@@ -369,6 +372,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
+            // Track which reads touch each window.
+            windowReads[windowId].insert(uint32_t(oidValue));
+
             if(windowId == currentWindow) {
                 lastAnchorInCurrentWindow = anchorId;
             } else {
@@ -382,6 +388,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
     }
+
+    // Count shared reads between each window pair: reads that touch
+    // both windows anywhere in their journey (not just direct transitions).
+    auto countSharedReads = [&](uint32_t windowA, uint32_t windowB) -> uint64_t {
+        auto itA = windowReads.find(windowA);
+        auto itB = windowReads.find(windowB);
+        if(itA == windowReads.end() || itB == windowReads.end()) return 0;
+        const auto& setA = itA->second;
+        const auto& setB = itB->second;
+        // Iterate the smaller set and check membership in the larger.
+        const auto& smaller = (setA.size() <= setB.size()) ? setA : setB;
+        const auto& larger  = (setA.size() <= setB.size()) ? setB : setA;
+        uint64_t count = 0;
+        for(const uint32_t r : smaller) {
+            if(larger.count(r)) ++count;
+        }
+        return count;
+    };
 
     // Diagnostic: count window pairs and candidates.
     {
@@ -563,9 +587,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
+        // Coverage check: distinct oriented read IDs that touch both windows.
+        const uint64_t totalSharedReads = countSharedReads(windowPair.first, windowPair.second);
+
         if(bestSize == 0) {
             ++interWindowZeroPairs;
-        } else if(bestSize < minInterWindowCoverage) {
+        } else if(totalSharedReads < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
             reservedAnchors.insert(uint64_t(bestPair.anchorIdA));
@@ -818,13 +845,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
+        // Coverage check: distinct oriented read IDs that touch both windows.
+        const uint64_t totalSharedReads = countSharedReads(windowPair.first, windowPair.second);
+
         if(bestSize == 0) {
             if(hadCandidates) {
                 ++interWindowInternalSkipped;
             } else {
                 ++interWindowZeroPairs;
             }
-        } else if(bestSize < minInterWindowCoverage) {
+        } else if(totalSharedReads < minInterWindowCoverage) {
             ++interWindowBelowCoverage;
         } else {
             createInterWindowEdge(windowPair, bestPair, bestSize);
