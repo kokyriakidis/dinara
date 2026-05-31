@@ -42,9 +42,10 @@ public:
     bool isEndpointAnchorNext = false;  // target anchor is an endpoint anchor
 
     // Inter-window edge attributes.
-    // maxSupportingSpan: best (baseSpanA * baseSpanB) among reads that
-    // transition between the two windows. The product rewards both
-    // balanced and deep coverage across both windows.
+    // maxSupportingSpan: baseSpanA + baseSpanB of the read with the
+    // highest spanA * spanB product. Selection uses the product
+    // (rewards balanced coverage), but the stored value is the sum
+    // (human-readable total base coverage across both windows).
     // 0 for intra-window edges.
     uint64_t maxSupportingSpan = 0;
     // sharedReadCount: number of distinct reads that touch both windows
