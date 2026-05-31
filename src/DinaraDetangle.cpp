@@ -237,10 +237,9 @@ uint64_t dinara::detangleWindows(
                     const uint32_t runStart = pos;
                     // Extend through X and noW positions. Stop at a
                     // position belonging to a different window.
+                    // After this, pos points to the first position past
+                    // the run (either a different window or jLen).
                     while(pos < jLen && (posWindow[pos] == wIdx || posWindow[pos] == noW)) pos++;
-                    // Trim trailing noW positions from the run.
-                    uint32_t runEnd = pos; // exclusive
-                    while(runEnd > runStart && posWindow[runEnd - 1] == noW) runEnd--;
 
                     // Check immediate previous window: last mapped
                     // window before runStart must be prevW.
@@ -252,8 +251,7 @@ uint64_t dinara::detangleWindows(
                     if(immPrev != prevW) continue;
 
                     // Check immediate next window: first mapped
-                    // window at or after runEnd must be nextW.
-                    // (pos already points past any trailing noW.)
+                    // window at or after pos must be nextW.
                     uint32_t immNext = noW;
                     for(uint32_t p = pos; p < jLen; p++) {
                         if(posWindow[p] != noW) { immNext = posWindow[p]; break; }
@@ -270,7 +268,7 @@ uint64_t dinara::detangleWindows(
                         }
                     }
 
-                    // firstInNext: first anchor in nextW after the run.
+                    // firstInNext: first anchor in nextW at or after pos.
                     Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
                     bool foundNext = false;
                     for(uint32_t p = pos; p < jLen; p++) {
