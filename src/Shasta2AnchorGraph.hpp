@@ -38,8 +38,6 @@ public:
     uint64_t offset = invalid<uint64_t>;
     uint64_t id = invalid<uint64_t>;
     bool useForAssembly = false;
-    bool isEndpointAnchorPrev = false;  // source anchor is an endpoint anchor
-    bool isEndpointAnchorNext = false;  // target anchor is an endpoint anchor
 
     // Inter-window edge attributes.
     // maxSupportingSpan: baseSpanA + baseSpanB of the read with the
@@ -178,17 +176,4 @@ public:
     // Gives the order in which the read visits windows.
     std::map<uint32_t, vector<uint32_t>> readWindows;
 
-    // Normalized endpoint window pairs from the two-pass edge creation.
-    // Stored as (min, max) for direction-independent lookup.
-    // A pair (A, B) means some backbone read transitions between A and B.
-    std::set<std::pair<uint32_t, uint32_t>> endpointWindowPairs;
-
-    // Anchors used by endpoint edges (and their RC mirrors).
-    // An anchor in this set is at an endpoint position of its window.
-    std::set<uint64_t> endpointAnchors;
-
-    // Per-anchor endpoint flag, indexed by anchor ID.
-    // true = endNode (endpoint anchor), false = intraNode.
-    // Populated after pass 1 and chain-end promotion.
-    vector<bool> isEndpointAnchor;
 };
