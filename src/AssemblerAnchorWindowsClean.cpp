@@ -314,22 +314,24 @@ void Assembler::computeAnchorWindowsClean(
     };
 
     auto createWindow = [&](OrientedReadId backboneOid, uint32_t seedBegin, uint32_t seedEnd) {
-        // Filter the backbone journey to keep only the longest subsequence
-        // where consecutive pairs have sufficient common read support.
-        vector<uint32_t> filteredPositions;
-        filterBackboneJourney(backboneOid, seedBegin, seedEnd, filteredPositions);
+        // Use the full backbone range — no filtering.
+        const uint32_t n = seedEnd - seedBegin;
+        if(n < minBackboneWindowAnchors) {
+            return; // Too few anchors.
+        }
 
-        if(filteredPositions.size() < minBackboneWindowAnchors) {
-            return; // Too few anchors after filtering.
+        vector<uint32_t> filteredPositions;
+        filteredPositions.reserve(n);
+        for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
+            filteredPositions.push_back(pos);
         }
 
         const uint32_t windowId = uint32_t(anchorWindows.size());
         AnchorWindow window;
         window.windowId = windowId;
         window.backboneOrientedReadId = backboneOid;
-        // Use the filtered positions: first and last define the span.
-        window.backboneBegin = filteredPositions.front();
-        window.backboneEnd = filteredPositions.back() + 1;
+        window.backboneBegin = seedBegin;
+        window.backboneEnd = seedEnd;
         window.filteredBackbonePositions = filteredPositions;
 
         // Get backbone journey and build a lookup: anchorId -> position in backbone.
