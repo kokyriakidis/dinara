@@ -1661,6 +1661,9 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
+    // Trim dangling backbone ends beyond outermost inter-window edges.
+    shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
+
     // Save the pre-detangling anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");

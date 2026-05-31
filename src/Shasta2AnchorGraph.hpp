@@ -123,6 +123,12 @@ public:
     // Disable an edge and its RC mirror (dst^1 -> src^1).
     void disableEdge(edge_descriptor e);
 
+    // Trim dangling backbone ends beyond outermost inter-window edges.
+    // Returns the number of trimmed vertices.
+    uint64_t trimBackbones(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
+
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
 public:
