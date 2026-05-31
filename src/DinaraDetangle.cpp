@@ -130,31 +130,41 @@ uint64_t dinara::detangleWindows(
                 const auto journey = journeys[oid];
                 if(journey.empty()) continue;
 
-                // Find the last anchor belonging to prevW and the first
-                // anchor belonging to nextW in this read's journey.
-                Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
-                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
-                bool foundPrev = false;
-                bool foundNext = false;
+                // Find the last anchor in prevW that appears before the
+                // first anchor in nextW. This enforces the A→X→B ordering
+                // so we don't pick anchors from a later revisit of prevW.
 
+                // Pass 1: find the first anchor in nextW.
+                uint32_t firstNextPos = uint32_t(journey.size());
+                Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
                 for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
                     const Shasta2AnchorId anchorId = journey[pos];
                     if(uint64_t(anchorId) >= anchorCount) continue;
                     const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
                     if(aw == noW) continue;
-                    const uint32_t normW = normalize(aw);
+                    if(normalize(aw) == nextW) {
+                        firstNextPos = pos;
+                        firstInNext = anchorId;
+                        break;
+                    }
+                }
+                if(firstNextPos == uint32_t(journey.size())) continue;
 
-                    if(normW == prevW) {
+                // Pass 2: find the last anchor in prevW before firstNextPos.
+                Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
+                bool foundPrev = false;
+                for(uint32_t pos = 0; pos < firstNextPos; pos++) {
+                    const Shasta2AnchorId anchorId = journey[pos];
+                    if(uint64_t(anchorId) >= anchorCount) continue;
+                    const uint32_t aw = anchorToWindow[uint64_t(anchorId)];
+                    if(aw == noW) continue;
+                    if(normalize(aw) == prevW) {
                         lastInPrev = anchorId;
                         foundPrev = true;
                     }
-                    if(normW == nextW && !foundNext) {
-                        firstInNext = anchorId;
-                        foundNext = true;
-                    }
                 }
 
-                if(foundPrev && foundNext) {
+                if(foundPrev) {
                     auto pairKey = pair<uint64_t, uint64_t>(
                         uint64_t(lastInPrev), uint64_t(firstInNext));
                     anchorPairCounts[pairKey]++;
@@ -227,7 +237,16 @@ uint64_t dinara::detangleWindows(
         // Remove flow reads from backbone anchors of the bypassed window.
         const AnchorWindow& window = anchorWindows[cand.windowId];
         const auto backboneJourney = journeys[window.backboneOrientedReadId];
-        const auto& positions = window.filteredBackbonePositions;
+
+        // Use filtered positions if available, otherwise all positions.
+        vector<uint32_t> allPositions;
+        if(window.filteredBackbonePositions.empty()) {
+            for(uint32_t p = window.backboneBegin; p < window.backboneEnd; p++) {
+                allPositions.push_back(p);
+            }
+        }
+        const auto& positions = window.filteredBackbonePositions.empty()
+            ? allPositions : window.filteredBackbonePositions;
 
         set<Shasta2AnchorId> processedAnchors;
         for(const uint32_t pos : positions) {
@@ -238,23 +257,22 @@ uint64_t dinara::detangleWindows(
             if(processedAnchors.count(canonicalId)) continue;
             processedAnchors.insert(canonicalId);
 
-            // Canonical anchor: remove reads matching flow read IDs.
+            // Remove flow reads from both the canonical and RC anchor.
+            // commonReads contains oriented read IDs which may be on
+            // either strand, so check both oid and oid^1.
+            auto isFlowRead = [&](const Shasta2AnchorMarkerInfo& mi) {
+                const uint32_t oid = mi.orientedReadId.getValue();
+                return commonReads.count(oid) || commonReads.count(oid ^ 1);
+            };
+
             auto& canonicalData = mutableAnchors[uint64_t(canonicalId)];
             canonicalData.erase(
-                std::remove_if(canonicalData.begin(), canonicalData.end(),
-                    [&](const Shasta2AnchorMarkerInfo& mi) {
-                        return commonReads.count(mi.orientedReadId.getValue());
-                    }),
+                std::remove_if(canonicalData.begin(), canonicalData.end(), isFlowRead),
                 canonicalData.end());
 
-            // RC anchor: flow reads are forward-strand values,
-            // RC anchor reads are strand-flipped.
             auto& rcData = mutableAnchors[uint64_t(rcId)];
             rcData.erase(
-                std::remove_if(rcData.begin(), rcData.end(),
-                    [&](const Shasta2AnchorMarkerInfo& mi) {
-                        return commonReads.count(mi.orientedReadId.getValue() ^ 1);
-                    }),
+                std::remove_if(rcData.begin(), rcData.end(), isFlowRead),
                 rcData.end());
         }
 
