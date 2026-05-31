@@ -51,8 +51,44 @@
 //
 //   Case 4: other windows interleaved before X
 //     Journey: [a1, c1, a2, x1, x2, b1]
-//     X span: x1..x2.  lastInPrev=a2 (c1 skipped), firstInNext=b1.
+//     X run: [x1,x2]. Immediate prev=A, immediate next=B.
+//     lastInPrev=a2 (c1 skipped), firstInNext=b1.
 //     Only anchors matching prevW/nextW are considered.
+//
+//   Case 5: same prevW, multiple X visits (A -> X -> A -> X -> B)
+//     Journey: [a1, x1, a2, x2, x3, b1]
+//     X runs: [x1] and [x2,x3].
+//     For {A,B}: run [x1] has immediate prev=A, immediate next=A.
+//       A != B → skip. Run [x2,x3] has immediate prev=A, immediate
+//       next=B → match. lastInPrev=a2, firstInNext=b1.
+//     The immediate-neighbor check prevents run [x1] from falsely
+//     matching transition {A,B} just because B exists later.
+//
+//   Case 6: read starts in X (no prevW before X)
+//     Journey: [x1, x2, b1, b2]
+//     X run: [x1,x2]. Immediate prev=noW.
+//     prevW != noW (filtered at entry) → no run matches.
+//     Read is correctly skipped — it doesn't flow through X.
+//
+//   Case 7: read ends in X (no nextW after X)
+//     Journey: [a1, a2, x1, x2]
+//     X run: [x1,x2]. Immediate next=noW.
+//     nextW != noW → no run matches. Read correctly skipped.
+//
+//   Case 8: unmapped anchors (noW) between prevW and X
+//     Journey: [a1, ?1, ?2, x1, x2, b1]
+//     posWindow: [A, noW, noW, X, X, B]
+//     X run: [x1,x2]. Immediate prev scan skips noW positions,
+//     finds A → match. lastInPrev=a1, firstInNext=b1.
+//     Unmapped anchors don't break the immediate-neighbor check.
+//
+//   Case 9: noW gap inside an X visit
+//     Journey: [a1, x1, ?1, x2, x3, b1]
+//     posWindow: [A, X, noW, X, X, B]
+//     The run extends through X and noW positions, stopping at B.
+//     Single run: [x1, ?1, x2, x3] (pos 1..4). Immediate prev=A,
+//     immediate next=B → match. lastInPrev=a1, firstInNext=b1.
+//     noW gaps from unmapped anchors don't split the run.
 //
 // Processing order: candidates sorted by flow read count (descending)
 // so stronger flows get their full read sets first. Weaker flows that
@@ -179,17 +215,50 @@ uint64_t dinara::detangleWindows(
                     posWindow[pos] = normalize(aw);
                 }
 
-                // Scan for contiguous runs of window X. For each run,
-                // check if prevW appears before it and nextW after it.
-                // A read that visits X multiple times (A→X→B→X→C) has
-                // multiple runs; each run matches a different transition.
+                // Scan for runs of window X (contiguous X positions,
+                // possibly separated by noW gaps). For each run,
+                // verify that the immediate neighboring windows match
+                // (prevW, nextW) for this transition, then find the
+                // best anchor pair across that boundary.
+                //
+                // "Run" = maximal stretch of positions that are either
+                // X or noW, containing at least one X. A noW gap
+                // inside an X visit (from unmapped anchors) doesn't
+                // split the run. Only a position belonging to a
+                // different window ends the run.
+                //
+                // "Immediate neighbor" = first mapped window (not noW)
+                // before/after the run. This ensures each run matches
+                // only its own transition.
                 uint32_t pos = 0;
                 while(pos < jLen) {
-                    // Find start of an X run.
+                    // Find start of an X run (first X position).
                     if(posWindow[pos] != wIdx) { pos++; continue; }
                     const uint32_t runStart = pos;
-                    while(pos < jLen && posWindow[pos] == wIdx) pos++;
-                    const uint32_t runEnd = pos; // exclusive
+                    // Extend through X and noW positions. Stop at a
+                    // position belonging to a different window.
+                    while(pos < jLen && (posWindow[pos] == wIdx || posWindow[pos] == noW)) pos++;
+                    // Trim trailing noW positions from the run.
+                    uint32_t runEnd = pos; // exclusive
+                    while(runEnd > runStart && posWindow[runEnd - 1] == noW) runEnd--;
+
+                    // Check immediate previous window: last mapped
+                    // window before runStart must be prevW.
+                    uint32_t immPrev = noW;
+                    for(uint32_t p = runStart; p > 0; ) {
+                        p--;
+                        if(posWindow[p] != noW) { immPrev = posWindow[p]; break; }
+                    }
+                    if(immPrev != prevW) continue;
+
+                    // Check immediate next window: first mapped
+                    // window at or after runEnd must be nextW.
+                    // (pos already points past any trailing noW.)
+                    uint32_t immNext = noW;
+                    for(uint32_t p = pos; p < jLen; p++) {
+                        if(posWindow[p] != noW) { immNext = posWindow[p]; break; }
+                    }
+                    if(immNext != nextW) continue;
 
                     // lastInPrev: last anchor in prevW before runStart.
                     Shasta2AnchorId lastInPrev = Shasta2AnchorId(0);
@@ -201,10 +270,10 @@ uint64_t dinara::detangleWindows(
                         }
                     }
 
-                    // firstInNext: first anchor in nextW at or after runEnd.
+                    // firstInNext: first anchor in nextW after the run.
                     Shasta2AnchorId firstInNext = Shasta2AnchorId(0);
                     bool foundNext = false;
-                    for(uint32_t p = runEnd; p < jLen; p++) {
+                    for(uint32_t p = pos; p < jLen; p++) {
                         if(posWindow[p] == nextW) {
                             firstInNext = journey[p];
                             foundNext = true;
