@@ -521,7 +521,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
     std::vector<InterWindowEdgeInfo> createdEdges;
 
-    // Helper: create an inter-window edge from a chosen anchor pair.
+    // Helper: create an inter-window edge and its RC mirror.
     auto createInterWindowEdge = [&](
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
@@ -529,6 +529,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t bestSpan)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
+        // Forward edge.
         edge_descriptor e;
         tie(e, ignore) = add_edge(
             bestPair.anchorIdA,
@@ -540,6 +541,31 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         anchorGraph[e].sharedReadCount = sharedReads;
         createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, sharedReads});
         ++interWindowCreated;
+
+        // RC mirror edge: reverse the anchor pair and flip both anchor IDs.
+        const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+        const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+        if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+            Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
+            rcPair.removeNegativeOffsets(anchors);
+            if(rcPair.size() > 0) {
+                edge_descriptor eRc;
+                tie(eRc, ignore) = add_edge(
+                    rcB, rcA,
+                    Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
+                    anchorGraph);
+                anchorGraph[eRc].useForAssembly = true;
+                anchorGraph[eRc].maxSupportingSpan = bestSpan;
+                anchorGraph[eRc].sharedReadCount = sharedReads;
+                // RC window pair.
+                const uint32_t rcSrc = (windowPair.second < windowCount)
+                    ? windowPair.second + windowCount : windowPair.second - windowCount;
+                const uint32_t rcDst = (windowPair.first < windowCount)
+                    ? windowPair.first + windowCount : windowPair.first - windowCount;
+                createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
+                ++interWindowCreated;
+            }
+        }
     };
 
     // Single-pass inter-window edge creation.
