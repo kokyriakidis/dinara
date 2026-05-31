@@ -887,8 +887,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             info.edges.push_back(e);
             // Normalize anchor pair: use (min, max) so fw-fw and rc-rc
             // edges with anchors (a, b) and (a^1, b^1) map to the same pair.
-            const uint64_t normSrc = std::min(srcVal, srcVal ^ 1ULL);
-            const uint64_t normDst = std::min(dstVal, dstVal ^ 1ULL);
+            const uint64_t normSrc = std::min(srcVal, uint64_t(srcVal ^ 1ULL));
+            const uint64_t normDst = std::min(dstVal, uint64_t(dstVal ^ 1ULL));
             const auto ap = (normSrc < normDst)
                 ? std::make_pair(normSrc, normDst)
                 : std::make_pair(normDst, normSrc);
