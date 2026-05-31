@@ -519,6 +519,26 @@ void Assembler::buildSvMSA(
         // DEL calls from diagonal-shift and split-read analyses.
         vector<DelCallRecord> delCallRecords;
 
+        // Source priority for dedup: when multiple sources call
+        // the same locus with similar size, prefer the source
+        // with higher empirical accuracy. Derived from V36i
+        // "accuracy when disagreeing with winner" analysis.
+        auto sourcePriority = [](const string& src) -> int {
+            if(src == "merged-clusters") return 0;
+            if(src == "diagonal")        return 1;
+            if(src == "early-CIGAR")     return 2;
+            if(src == "SA-tag")          return 3;
+            if(src == "split-read")      return 4;
+            if(src == "cluster")         return 5;
+            if(src == "flank-gap")       return 6;
+            if(src == "kmer-journey")    return 7;
+            if(src == "per-read-DEL")    return 8;
+            if(src == "INV-cluster")     return 9;
+            if(src == "path-based")      return 10;
+            if(src == "multi-k")         return 11;
+            return 12;
+        };
+
         // Lambda: merge delCallRecords into allDelCalls,
         // deduplicate near-identical calls, and emit.
         // After deduplication, applies depth fold-change and
@@ -530,20 +550,16 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            // Sort by read count descending so the most-supported
-            // call for each event survives deduplication.
+            // Sort by source priority (best first), then by
+            // read count descending as tiebreaker within the
+            // same priority level.
             sort(allDelCalls.begin(), allDelCalls.end(),
-                [](const DelCallRecord& a, const DelCallRecord& b) {
+                [&](const DelCallRecord& a, const DelCallRecord& b) {
+                    const int pa = sourcePriority(a.source);
+                    const int pb = sourcePriority(b.source);
+                    if(pa != pb) return pa < pb;
                     return a.readCount > b.readCount;
                 });
-
-            // Dump all pre-dedup calls for multi-source analysis.
-            for(const auto& dc : allDelCalls) {
-                cout << "    PRE-DEDUP: source=" << dc.source
-                     << ", size=" << dc.size
-                     << ", bp=" << dc.breakpointPos
-                     << ", reads=" << dc.readCount << endl;
-            }
 
             // Deduplicate: suppress a call if a previously-emitted
             // call has size ratio >= 0.9 anywhere in the region.
