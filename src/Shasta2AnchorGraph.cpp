@@ -714,6 +714,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(window.backbonePreviousWindow == noW) {
                 const uint64_t aid = uint64_t(journey[positions[0]]);
                 promoteInterWindowEdges(aid);
+                endpointAnchors.insert(aid);
+                endpointAnchors.insert(aid ^ 1ULL);
                 ++promotedCount;
             }
 
@@ -722,11 +724,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(window.backboneNextWindow == noW) {
                 const uint64_t aid = uint64_t(journey[positions[positions.size() - 1]]);
                 promoteInterWindowEdges(aid);
+                endpointAnchors.insert(aid);
+                endpointAnchors.insert(aid ^ 1ULL);
                 ++promotedCount;
             }
         }
         cout << "Chain-end endpoint promotion: " << promotedCount
              << " edges promoted." << endl;
+    }
+
+    // Build per-anchor endpoint flag from endpointAnchors set.
+    isEndpointAnchor.assign(anchorCount, false);
+    for(const uint64_t aid : endpointAnchors) {
+        if(aid < anchorCount) {
+            isEndpointAnchor[aid] = true;
+        }
     }
 
     // ========================================================================
