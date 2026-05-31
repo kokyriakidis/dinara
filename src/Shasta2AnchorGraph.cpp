@@ -2358,35 +2358,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     // Bypass edges from detangling: direct connections that skip over
     // tangled windows whose flow reads have been removed.
-    // Coverage check uses total shared reads between the two windows
-    // (same metric as regular inter-window edges), not just the reads
-    // on the specific anchor pair.
+    // No coverage threshold — bypass edges are validated by the detangle
+    // algorithm (journey walk, X-span matching, anchor pair selection).
+    // Requiring minInterWindowCoverage here would leave tangles unresolved.
     uint64_t bypassEdgeCount = 0;
-    uint64_t bypassBelowCoverage = 0;
     if(bypassEdges) {
         for(const auto& be : *bypassEdges) {
-            const uint64_t aidA = uint64_t(be.anchorIdA);
-            const uint64_t aidB = uint64_t(be.anchorIdB);
-            if(aidA >= anchorCount || aidB >= anchorCount) continue;
-            const uint32_t winA = anchorToWindow[aidA];
-            const uint32_t winB = anchorToWindow[aidB];
-            if(winA == noWindow || winB == noWindow) {
-                ++bypassBelowCoverage;
-                continue;
-            }
-            const uint64_t sharedReads = countSharedReads(winA, winB);
-            if(sharedReads < minInterWindowCoverage) {
-                ++bypassBelowCoverage;
-                continue;
-            }
             if(addEdgeIfValid(be.anchorIdA, be.anchorIdB)) {
                 ++bypassEdgeCount;
             }
         }
-        if(bypassEdgeCount > 0 || bypassBelowCoverage > 0) {
-            cout << "Bypass edges: " << bypassEdgeCount << " created, "
-                 << bypassBelowCoverage << " rejected (below minInterWindowCoverage="
-                 << minInterWindowCoverage << ") from "
+        if(bypassEdgeCount > 0) {
+            cout << "Bypass edges: " << bypassEdgeCount << " created from "
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
