@@ -1463,7 +1463,7 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.minInterWindowCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.minInterWindowCoverage)->
-        default_value(4),
+        default_value(1),
         "Minimum shared read count for an inter-window edge. "
         "Candidates with fewer shared reads are discarded. "
         "(Mode 3 assembly only).")
