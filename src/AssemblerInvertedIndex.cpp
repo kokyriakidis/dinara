@@ -2652,6 +2652,14 @@ private:
                             continue;  // Skip this overlap - hit indices out of bounds
                         }
 
+                        // Compute raw (pre-extension) marker chain span from the
+                        // first and last chain hits. The extended coordinates
+                        // (x_pos_s/x_pos_e) are left-normalized and right-extended
+                        // to read boundaries, so they overestimate the actual
+                        // marker-supported overlap region.
+                        uint32_t rawQmin = UINT32_MAX, rawQmax = 0;
+                        uint32_t rawTmin = UINT32_MAX, rawTmax = 0;
+
                         al.ordinals.reserve(n_hit);
                         for(uint64_t j = 0; j < n_hit; ++j) {
                             const uint64_t g = uint64_t(hifiasmChainHitIndexFlat[size_t(off + j)]);
@@ -2667,6 +2675,12 @@ private:
                                 continue;  // Skip this hit - ordinal not mapped
                             }
 
+                            // Track raw base positions for chain span computation.
+                            rawQmin = std::min(rawQmin, h.self_offset);
+                            rawQmax = std::max(rawQmax, h.self_offset);
+                            rawTmin = std::min(rawTmin, h.offset);
+                            rawTmax = std::max(rawTmax, h.offset);
+
                             if(!isSameStrand) {
                                 ordB = markerCountB - 1U - ordB;
                             }
@@ -2681,11 +2695,13 @@ private:
                         al.ts = tS;
                         al.te = tE;
 
-                        // Optional: reject candidates with small pre-extension overlap span.
+                        // Reject candidates whose raw marker chain span is below
+                        // the threshold. Uses pre-extension base positions from
+                        // the actual chain hits, not the extended coordinates.
                         if(invertedIndexData.minOverlapLength > 0) {
-                            const uint32_t qSpan = qE - qS;
-                            const uint32_t tSpan = tE - tS;
-                            if(std::min(qSpan, tSpan) < invertedIndexData.minOverlapLength) {
+                            const uint32_t rawQspan = (rawQmax >= rawQmin) ? (rawQmax - rawQmin + 1) : 0;
+                            const uint32_t rawTspan = (rawTmax >= rawTmin) ? (rawTmax - rawTmin + 1) : 0;
+                            if(std::min(rawQspan, rawTspan) < invertedIndexData.minOverlapLength) {
                                 continue;
                             }
                         }
