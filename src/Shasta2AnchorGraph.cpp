@@ -202,26 +202,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         if(backboneAnchors.size() < 2) continue;
 
-        uint64_t fwCreated = 0, fwRejected = 0;
         for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
-            if(addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1])) {
-                ++fwCreated;
-            } else {
-                ++fwRejected;
-            }
+            addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
             // RC mirror edge.
             const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
             const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
             if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
                 addEdgeIfValid(rcB, rcA);
             }
-        }
-        if(fwRejected > 0) {
-            cout << "  Window " << window.windowId
-                 << " backbone " << window.backboneOrientedReadId
-                 << ": " << backboneAnchors.size() << " anchors, "
-                 << fwCreated << " edges created, "
-                 << fwRejected << " edges rejected (negative offsets)." << endl;
         }
     }
 
@@ -2315,61 +2303,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Per-window connectivity summary using transitionReads.
-    {
-        const uint32_t noW = AnchorWindow::noWindow;
-        cout << "Per-window connectivity (per-read transitions):" << endl;
-        for(uint32_t w = 0; w < windowCount; w++) {
-            const auto& window = anchorWindows[w];
 
-            // Aggregate incoming and outgoing counts from transitionReads.
-            std::map<uint32_t, uint64_t> incomingCounts, outgoingCounts;
-            uint64_t totalTransitionReads = 0;
-            for(const auto& [key, reads] : window.transitionReads) {
-                totalTransitionReads += reads.size();
-                if(key.first != noW) {
-                    incomingCounts[key.first] += reads.size();
-                }
-                if(key.second != noW) {
-                    outgoingCounts[key.second] += reads.size();
-                }
-            }
-
-            cout << "  Window " << w
-                 << " (" << totalTransitionReads << " reads): incoming=[";
-            bool first = true;
-            for(const auto& [fromW, count] : incomingCounts) {
-                if(!first) cout << ", ";
-                cout << fromW << ":" << count;
-                first = false;
-            }
-            cout << "] outgoing=[";
-            first = true;
-            for(const auto& [toW, count] : outgoingCounts) {
-                if(!first) cout << ", ";
-                cout << toW << ":" << count;
-                first = false;
-            }
-            cout << "]";
-
-            // Show transition flows if there are multiple distinct patterns.
-            if(window.transitionReads.size() > 1) {
-                cout << " flows={";
-                first = true;
-                for(const auto& [key, reads] : window.transitionReads) {
-                    if(!first) cout << ", ";
-                    cout << "(";
-                    if(key.first == noW) cout << "-"; else cout << key.first;
-                    cout << "→";
-                    if(key.second == noW) cout << "-"; else cout << key.second;
-                    cout << "):" << reads.size();
-                    first = false;
-                }
-                cout << "}";
-            }
-            cout << endl;
-        }
-    }
 
     // Bypass edges from detangling: direct connections that skip over
     // tangled windows whose flow reads have been removed.
