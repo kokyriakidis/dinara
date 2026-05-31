@@ -1667,7 +1667,6 @@ void dinara::main::assemble(
             *shasta2Anchors,
             *shasta2Journeys,
             anchorWindows,
-            minInterWindowCoverage,
             bypassEdges);
 
         if(detangledCount > 0) {

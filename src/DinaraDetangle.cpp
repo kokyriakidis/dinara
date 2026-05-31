@@ -16,7 +16,7 @@
 //   5. Remove flow reads from X's backbone anchors.
 //
 // No minimum number of distinct flows is required — even a single
-// A -> X -> B flow is bypassed if it meets minFlowCoverage.
+// Every A -> X -> B flow is bypassed regardless of read count.
 //
 // Anchor pair selection (step 3):
 //   For each flow read, find the span of window X in the journey
@@ -122,7 +122,6 @@ uint64_t dinara::detangleWindows(
     Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
     const vector<AnchorWindow>& anchorWindows,
-    uint64_t minFlowCoverage,
     vector<DetangleBypassEdge>& bypassEdges)
 {
     cout << timestamp << "Detangle (window bypass) begins." << endl;
@@ -190,8 +189,6 @@ uint64_t dinara::detangleWindows(
 
         for(const auto& [key, reads] : window.transitionReads) {
             if(key.first == noW || key.second == noW) continue;
-            if(reads.size() < minFlowCoverage) continue;
-
             const uint32_t prevW = key.first;
             const uint32_t nextW = key.second;
 
@@ -298,8 +295,6 @@ uint64_t dinara::detangleWindows(
                     return a.second < b.second;
                 });
 
-            if(bestIt->second < minFlowCoverage) continue;
-
             candidates.push_back({
                 wIdx, prevW, nextW,
                 Shasta2AnchorId(bestIt->first.first),
@@ -336,7 +331,7 @@ uint64_t dinara::detangleWindows(
             }
         }
 
-        if(commonReads.size() < minFlowCoverage) continue;
+        if(commonReads.empty()) continue;
 
         // Create bypass edges (forward + RC mirror).
         bypassEdges.push_back({cand.bestAnchorA, cand.bestAnchorB});
