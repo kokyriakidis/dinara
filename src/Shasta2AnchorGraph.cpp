@@ -620,11 +620,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Two-edge inter-window edge creation.
     // For each window pair A→B, create up to two edges:
     //   1. Entry edge: the read whose firstAnchorInB is the earliest
-    //      entry into B (in B's traversal order). This ensures all
-    //      reads' entry points into B are reachable via backbone edges.
+    //      entry into B. Ensures all reads' entry points into B are
+    //      reachable via backbone edges from the landing point.
     //   2. Exit edge: the read whose lastAnchorInA is the latest
-    //      exit from A (in A's traversal order). This ensures all
-    //      reads' exit points from A can reach the edge via backbone.
+    //      exit from A. Ensures all reads' exit points from A can
+    //      reach the departure point via backbone edges.
+    // Both edges are needed: the entry edge optimizes the B side,
+    // the exit edge optimizes the A side. Without the exit edge,
+    // reads that exit A late have no graph path to B.
     // If both select the same read, only one edge is created.
     // Tiebreak by span product in both cases.
     //
@@ -641,41 +644,41 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         // Find entry edge: earliest entry into B.
         // Forward B: lowest backbone pos. RC B: highest backbone pos.
-        uint32_t bestEntryPos = dstIsRc ? 0 : std::numeric_limits<uint32_t>::max();
+        uint32_t bestEntryPos = 0;
         uint64_t bestEntryProduct = 0;
         const ReadTransition* entryTransition = nullptr;
-        bool entryPosInitialized = false;
+        bool entryInitialized = false;
         for(const auto& t : transitions) {
             const uint32_t bPos = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
             const bool isBetter = dstIsRc
                 ? (bPos > bestEntryPos)    // RC: higher pos = earlier in traversal
                 : (bPos < bestEntryPos);   // Fwd: lower pos = earlier in traversal
-            if(!entryPosInitialized || isBetter ||
+            if(!entryInitialized || isBetter ||
                (bPos == bestEntryPos && t.supportingSpanProduct > bestEntryProduct)) {
                 bestEntryPos = bPos;
                 bestEntryProduct = t.supportingSpanProduct;
                 entryTransition = &t;
-                entryPosInitialized = true;
+                entryInitialized = true;
             }
         }
 
         // Find exit edge: latest exit from A.
         // Forward A: highest backbone pos. RC A: lowest backbone pos.
-        uint32_t bestExitPos = srcIsRc ? std::numeric_limits<uint32_t>::max() : 0;
+        uint32_t bestExitPos = 0;
         uint64_t bestExitProduct = 0;
         const ReadTransition* exitTransition = nullptr;
-        bool exitPosInitialized = false;
+        bool exitInitialized = false;
         for(const auto& t : transitions) {
             const uint32_t aPos = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
             const bool isBetter = srcIsRc
                 ? (aPos < bestExitPos)     // RC: lower pos = later in traversal
                 : (aPos > bestExitPos);    // Fwd: higher pos = later in traversal
-            if(!exitPosInitialized || isBetter ||
+            if(!exitInitialized || isBetter ||
                (aPos == bestExitPos && t.supportingSpanProduct > bestExitProduct)) {
                 bestExitPos = aPos;
                 bestExitProduct = t.supportingSpanProduct;
                 exitTransition = &t;
-                exitPosInitialized = true;
+                exitInitialized = true;
             }
         }
 
