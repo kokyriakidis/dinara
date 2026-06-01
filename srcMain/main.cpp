@@ -26,6 +26,7 @@
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AssemblyGraph.hpp"
 #include "DinaraDetangle.hpp"
+#include "WindowTransitions.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -1646,6 +1647,13 @@ void dinara::main::assemble(
             }
         }
     }
+
+    // Compute window transitions from journeys before graph construction.
+    // This populates transitionReads, per-read previousWindow/nextWindow,
+    // and backbonePreviousWindow/backboneNextWindow on each AnchorWindow.
+    // Detangling uses these; the graph constructor recomputes them from
+    // its own anchorToWindow (which may differ after detangling modifies anchors).
+    computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows);
 
     const uint64_t minInterWindowCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
