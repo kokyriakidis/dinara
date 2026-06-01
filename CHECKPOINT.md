@@ -855,37 +855,77 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 | V36h | + removed MAPQ0 filter | 99.1% | 11.6 |
 | V36i | + removed depth-fc filter | 99.2% | 11.9 |
 | V36j | + source-priority dedup + SA-DEL removal | 99.2% | 11.8 |
+| V36k | + depth-deficit DEL source | 99.4% | 13.9 |
 
-### Current State (V36j, commit `c9d5f94`)
+### Current State (V36k)
 
-- **Recall**: 99.2% (10,089 / 10,173)
-- **84 remaining misses**: ALL are wrong-size calls (multi-k harmonics in tandem repeat arrays). 0 cases with no calls at all. 100% detection sensitivity.
-- **Avg calls/case**: 11.8
+- **Recall**: 99.4% (10,112 / 10,173)
+- **61 remaining misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
+- **Avg calls/case**: 13.9
 
-### Active DEL Sources (V36i numbers, pre-source-priority)
+### Active DEL Sources
 
-| Source | Calls | TPs | Unique TPs | Precision | Accuracy when disagreeing with winner |
-|---|---|---|---|---|---|
-| merged-clusters | 1,419 | 1,280 | 169 | 90.2% | 98.9% |
-| diagonal | 798 | 644 | 39 | 80.7% | 94.9% |
-| early-CIGAR | 12,499 | 6,070 | 7 | 48.6% | 87.9% |
-| SA-tag | 2,142 | 1,208 | 233 | 56.4% | 87.8% |
-| split-read | 53 | 25 | 1 | 47.2% | 84.2% |
-| cluster | 2,821 | 916 | 90 | 32.5% | 68.2% |
-| flank-gap | 1,785 | 571 | 20 | 32.0% | 68.4% |
-| kmer-journey | 7,202 | 2,024 | 50 | 28.1% | 65.0% |
-| per-read-DEL | 2,524 | 709 | 14 | 28.1% | 60.9% |
-| path-based | 795 | 238 | 1 | 29.9% | 54.4% |
-| INV-cluster | 3,482 | 677 | 6 | 19.4% | 51.6% |
-| multi-k | 85,266 | 11,774 | 1,933 | 13.8% | 9.8% |
+**V36k numbers (with source-priority dedup + depth-deficit):**
 
-"Accuracy when disagreeing with winner" = when this source and the dedup winner have different sizes, how often is this source correct. This is the key metric for ranking.
+| Source | Calls | TPs | Precision |
+|---|---|---|---|
+| merged-clusters | 3,519 | 3,128 | 88.9% |
+| diagonal | 2,110 | 1,745 | 82.7% |
+| early-CIGAR | 12,499 | 6,070 | 48.6% |
+| SA-tag | 3,147 | 1,396 | 44.4% |
+| split-read | 642 | 343 | 53.4% |
+| cluster | 5,340 | 1,299 | 24.3% |
+| flank-gap | 2,548 | 797 | 31.3% |
+| kmer-journey | 10,882 | 1,965 | 18.1% |
+| per-read-DEL | 1,614 | 548 | 34.0% |
+| path-based | 664 | 146 | 22.0% |
+| INV-cluster | 5,210 | 862 | 16.5% |
+| depth-deficit-hom | 17,072 | 2,370 | 13.9% |
+| depth-deficit-het | 16,701 | 1,286 | 7.7% |
+| multi-k | 59,285 | 6,550 | 11.0% |
+
+**Source accuracy when disagreeing with dedup winner (V36i analysis, pre-source-priority):**
+
+| Source | Right | Wrong | Accuracy |
+|---|---|---|---|
+| merged-clusters | 916 | 10 | 98.9% |
+| diagonal | 506 | 27 | 94.9% |
+| early-CIGAR | 3,605 | 495 | 87.9% |
+| SA-tag | 830 | 115 | 87.8% |
+| split-read | 16 | 3 | 84.2% |
+| cluster | 693 | 323 | 68.2% |
+| flank-gap | 396 | 183 | 68.4% |
+| kmer-journey | 1,049 | 566 | 65.0% |
+| per-read-DEL | 427 | 274 | 60.9% |
+| multi-k | 99 | 908 | 9.8% |
+
+This accuracy metric drove the source-priority ranking in the dedup step.
 
 ### Removed Sources/Filters
 
 - **SA-DEL** (commit `7e340a3`): 18 calls, 2 TPs, 0 unique TPs. Generated in two early-exit paths (lines 1224, 1293) via `"SA-" + sc.svType` when region lacked sufficient reference markers for MSA. Removed — all TPs covered by other sources.
 - **MAPQ0 filter** (V36h): Removed. Was filtering calls where >80% of reads had MAPQ=0. Removal gained +25 TPs, 0 regressions.
 - **Depth fold-change filter** (V36i): Removed. Was filtering multi-k calls ≥300bp with DHFFC ≥0.95. Removal gained +5 TPs (het DELs where other haplotype fills depth), 0 regressions.
+
+### Depth-Deficit DEL Source (V36k)
+
+Infers deletion size from the integrated depth deficit across the entire region, without needing to identify repeat units or localize breakpoints.
+
+**Algorithm:**
+1. Compute per-base depth from BAM across the full region
+2. Measure flanking depth (median of left/right edges)
+3. `deficit = flank_depth × region_length - sum(all_depths)`
+4. `hom_del_size = deficit / flank_depth`
+5. `het_del_size = deficit / (flank_depth / 2)`
+6. Emit both as separate calls with source "depth-deficit-hom" / "depth-deficit-het"
+
+**Why it works:** In tandem repeat regions, k-mer-based sources produce wrong sizes because anchors land on wrong repeat copies. But the total integrated depth across the region still reflects the missing bases — a deletion means fewer total bases mapped, regardless of where individual reads land.
+
+**Tries 4 flank sizes** (200, 300, 500, 800bp) to handle varying region sizes. Each flank size produces independent hom/het calls.
+
+**Impact:** +23 TPs (99.2% → 99.4%). Largest gain in 1000+bp bin (98.6% → 99.9%). Adds ~33K calls with low precision (7.7-13.9%), acceptable since downstream ML model handles classification.
+
+**Limitations:** Fails for small DELs in large repeat arrays where mappability loss across the entire repeat dominates the deficit signal, swamping the small deletion contribution.
 
 ### Source-Priority Dedup (V36j, commit `c9d5f94`)
 
@@ -984,20 +1024,25 @@ Located in `src/AssemblerSvAnchors.cpp` (~lines 6842-7150).
 
 ### Tandem Repeat Limitation
 
-The 84 remaining misses are all in tandem repeat arrays where:
+The 61 remaining misses (down from 84 after depth-deficit source) are small DELs in large tandem repeat arrays where:
 - The repeat unit is shorter than the read length
 - Every read fits entirely within the repeat — no unique-sequence flanking anchors exist
 - K-mer anchors match repeat copies at wrong reference positions
-- All sources produce wrong sizes (multi-k harmonics)
+- All sequence-based sources produce wrong sizes (multi-k harmonics)
+- The depth-deficit approach also fails because the deletion is tiny relative to the repeat-induced mappability loss across the whole region (e.g., 67bp DEL in a 4kb repeat array)
 - 10 of 13 analyzed strong cases had NO reads with the correct diagonal pair
-- This is a fundamental limitation of k-mer matching in tandem repeats
+- This is a fundamental limitation of short-read sequencing in tandem repeats
+
+**Size distribution of remaining 61 misses:** 43 are 50-100bp, 11 are 100-500bp, 7 are 1000+bp.
+
+**Depth-deficit recovered 23 of the original 84:** Mostly larger DELs (1000+bp) and cases where the repeat array is small enough that the deletion contributes a measurable fraction of the total depth deficit.
 
 ### Cluster Paths and Binaries
 
-- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..j}_*`
-- **Results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/results_v36{d..j}/`
+- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..k}_*`
+- **Results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/results_v36{d..k}/`
 - **Analysis scripts**: `analyze.py`, `source_essentiality.py`, `analyze_multisource_v2.py`, `analyze_gap.py`, `analyze_adaptive.py` in `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/`
-- **SLURM template**: `run_eval_v36j.sh` — array job, 100 cases per task, 102 tasks
+- **SLURM template**: `run_eval_v36k.sh` — array job, 100 cases per task, 102 tasks
 
 ### Build and Deploy
 

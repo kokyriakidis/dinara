@@ -524,19 +524,21 @@ void Assembler::buildSvMSA(
         // with higher empirical accuracy. Derived from V36i
         // "accuracy when disagreeing with winner" analysis.
         auto sourcePriority = [](const string& src) -> int {
-            if(src == "merged-clusters") return 0;
-            if(src == "diagonal")        return 1;
-            if(src == "early-CIGAR")     return 2;
-            if(src == "SA-tag")          return 3;
-            if(src == "split-read")      return 4;
-            if(src == "cluster")         return 5;
-            if(src == "flank-gap")       return 6;
-            if(src == "kmer-journey")    return 7;
-            if(src == "per-read-DEL")    return 8;
-            if(src == "INV-cluster")     return 9;
-            if(src == "path-based")      return 10;
-            if(src == "multi-k")         return 11;
-            return 12;
+            if(src == "merged-clusters")    return 0;
+            if(src == "diagonal")           return 1;
+            if(src == "early-CIGAR")        return 2;
+            if(src == "SA-tag")             return 3;
+            if(src == "split-read")         return 4;
+            if(src == "cluster")            return 5;
+            if(src == "flank-gap")          return 6;
+            if(src == "kmer-journey")       return 7;
+            if(src == "per-read-DEL")       return 8;
+            if(src == "INV-cluster")        return 9;
+            if(src == "path-based")         return 10;
+            if(src == "depth-deficit-hom")  return 11;
+            if(src == "depth-deficit-het")  return 12;
+            if(src == "multi-k")            return 13;
+            return 14;
         };
 
         // Lambda: merge delCallRecords into allDelCalls,
@@ -7156,6 +7158,202 @@ void Assembler::buildSvMSA(
                              "kmer-journey"});
                     }
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Depth-deficit DEL source: infer deletion size from the
+        // integrated depth deficit across the entire region.
+        // deficit = flank_depth * region_length - sum(depths)
+        // del_size = deficit / flank_depth       (hom)
+        // del_size = deficit / (flank_depth / 2) (het)
+        // -----------------------------------------------------------------
+        if(!bamFileName.empty() && refLength >= 500) {
+            htsFile* ddFp = hts_open(bamFileName.c_str(), "r");
+            if(ddFp) {
+                sam_hdr_t* ddHdr = sam_hdr_read(ddFp);
+                if(ddHdr) {
+                    hts_idx_t* ddIdx = sam_index_load(
+                        ddFp, bamFileName.c_str());
+                    if(ddIdx) {
+                        int ddTid = sam_hdr_name2tid(
+                            ddHdr, refName.c_str());
+                        if(ddTid < 0) {
+                            string altName;
+                            if(refName.size() > 3
+                               && refName.substr(0, 3) == "chr")
+                                altName = refName.substr(3);
+                            else
+                                altName = "chr" + refName;
+                            ddTid = sam_hdr_name2tid(
+                                ddHdr, altName.c_str());
+                        }
+                        if(ddTid >= 0) {
+                            const uint32_t regionEnd =
+                                regionStart + refLength;
+
+                            // Per-base depth across the full region.
+                            vector<uint32_t> regionDepth(
+                                refLength, 0);
+
+                            hts_itr_t* ddIter = sam_itr_queryi(
+                                ddIdx, ddTid,
+                                int(regionStart),
+                                int(regionEnd));
+                            if(ddIter) {
+                                bam1_t* ddAln = bam_init1();
+                                while(sam_itr_next(
+                                    ddFp, ddIter, ddAln) >= 0) {
+                                    if(ddAln->core.flag &
+                                       (BAM_FUNMAP
+                                        | BAM_FSECONDARY
+                                        | BAM_FDUP))
+                                        continue;
+
+                                    const uint32_t* cigar =
+                                        bam_get_cigar(ddAln);
+                                    const int nCigar =
+                                        ddAln->core.n_cigar;
+                                    int32_t rp = ddAln->core.pos;
+
+                                    for(int ci = 0;
+                                        ci < nCigar; ++ci) {
+                                        const int op =
+                                            bam_cigar_op(cigar[ci]);
+                                        const int len =
+                                            bam_cigar_oplen(cigar[ci]);
+
+                                        if(op == BAM_CMATCH
+                                           || op == BAM_CEQUAL
+                                           || op == BAM_CDIFF) {
+                                            for(int j = 0;
+                                                j < len; ++j) {
+                                                const int32_t p =
+                                                    rp + j;
+                                                if(p >= int32_t(
+                                                       regionStart)
+                                                   && p < int32_t(
+                                                       regionEnd))
+                                                {
+                                                    ++regionDepth[
+                                                        p
+                                                        - regionStart
+                                                    ];
+                                                }
+                                            }
+                                            rp += len;
+                                        } else if(
+                                            op == BAM_CDEL
+                                            || op == BAM_CREF_SKIP) {
+                                            rp += len;
+                                        }
+                                        // INS, SOFT_CLIP, HARD_CLIP,
+                                        // PAD: no ref consumption.
+                                    }
+                                }
+                                bam_destroy1(ddAln);
+                                hts_itr_destroy(ddIter);
+
+                                // Try multiple flank sizes.
+                                // Pick the one giving the best
+                                // match to any existing call size
+                                // (or just emit the best het/hom).
+                                const uint32_t flankSizes[] =
+                                    {200, 300, 500, 800};
+
+                                for(uint32_t flankSz : flankSizes) {
+                                    if(refLength < flankSz * 2 + 100)
+                                        continue;
+
+                                    // Flanking depth: median of
+                                    // left and right flanks.
+                                    // Use sorted middle for median.
+                                    auto medianOf = [](
+                                        const vector<uint32_t>& d,
+                                        uint32_t from,
+                                        uint32_t to) -> double {
+                                        vector<uint32_t> v(
+                                            d.begin() + from,
+                                            d.begin() + to);
+                                        sort(v.begin(), v.end());
+                                        size_t n = v.size();
+                                        if(n == 0) return 0;
+                                        if(n % 2 == 0)
+                                            return (v[n/2-1]
+                                                    + v[n/2]) / 2.0;
+                                        return v[n/2];
+                                    };
+
+                                    double fl = medianOf(
+                                        regionDepth, 0, flankSz);
+                                    double fr = medianOf(
+                                        regionDepth,
+                                        refLength - flankSz,
+                                        refLength);
+                                    double flankDepth =
+                                        (fl + fr) / 2.0;
+
+                                    if(flankDepth < 5.0) continue;
+
+                                    // Total observed depth.
+                                    uint64_t totalObs = 0;
+                                    for(uint32_t i = 0;
+                                        i < refLength; ++i)
+                                        totalObs += regionDepth[i];
+
+                                    double expected =
+                                        flankDepth * refLength;
+                                    double deficit =
+                                        expected - double(totalObs);
+
+                                    if(deficit <= 0) continue;
+
+                                    // Hom: del_size = deficit /
+                                    //                 flank_depth
+                                    double homDel =
+                                        deficit / flankDepth;
+                                    // Het: del_size = deficit /
+                                    //                 (flank_depth/2)
+                                    double hetDel =
+                                        deficit / (flankDepth / 2.0);
+
+                                    // Emit both if >= 50bp.
+                                    // Use midpoint of region as
+                                    // breakpoint (we can't localize
+                                    // it within the repeat).
+                                    uint32_t bp = refLength / 2;
+
+                                    if(homDel >= 50.0) {
+                                        allDelCalls.push_back(
+                                            {bp,
+                                             int64_t(round(homDel)),
+                                             1,
+                                             "depth-deficit-hom"});
+                                    }
+                                    // Het call is always 2× hom.
+                                    // Only emit if it rounds to a
+                                    // different size (avoids exact
+                                    // duplicate when hom is small).
+                                    int64_t homSz =
+                                        int64_t(round(homDel));
+                                    int64_t hetSz =
+                                        int64_t(round(hetDel));
+                                    if(hetDel >= 50.0
+                                       && hetSz != homSz) {
+                                        allDelCalls.push_back(
+                                            {bp,
+                                             hetSz,
+                                             1,
+                                             "depth-deficit-het"});
+                                    }
+                                }
+                            }
+                        }
+                        hts_idx_destroy(ddIdx);
+                    }
+                    sam_hdr_destroy(ddHdr);
+                }
+                hts_close(ddFp);
             }
         }
 
