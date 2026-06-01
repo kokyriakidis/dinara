@@ -356,12 +356,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<std::pair<uint32_t, uint32_t>,
              std::vector<ReadTransition>> windowPairTransitions;
 
-    // Per-read per-window: first and last base positions and anchor IDs visited.
+    // Per-read per-window: first and last base positions visited.
     struct ReadWindowSpan {
         uint32_t firstBasePos;
         uint32_t lastBasePos;
-        Shasta2AnchorId firstAnchor;
-        Shasta2AnchorId lastAnchor;
     };
     std::map<uint64_t, std::map<uint32_t, ReadWindowSpan>> readWindowSpans;
 
@@ -396,22 +394,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t normalizedWin = (windowId >= windowCount) ? (windowId - windowCount) : windowId;
             windowReads[normalizedWin].insert(uint32_t(oidValue));
 
-            // Track per-read per-window base span and anchor IDs.
+            // Track per-read per-window base span.
             const uint32_t basePos = anchors.getPosition(anchorId, oid);
             if(basePos != invalid<uint32_t>) {
                 auto& spanMap = readWindowSpans[oidValue];
                 auto spanIt = spanMap.find(windowId);
                 if(spanIt == spanMap.end()) {
-                    spanMap[windowId] = {basePos, basePos, anchorId, anchorId};
+                    spanMap[windowId] = {basePos, basePos};
                 } else {
-                    if(basePos < spanIt->second.firstBasePos) {
-                        spanIt->second.firstBasePos = basePos;
-                        spanIt->second.firstAnchor = anchorId;
-                    }
-                    if(basePos > spanIt->second.lastBasePos) {
-                        spanIt->second.lastBasePos = basePos;
-                        spanIt->second.lastAnchor = anchorId;
-                    }
+                    spanIt->second.firstBasePos = std::min(spanIt->second.firstBasePos, basePos);
+                    spanIt->second.lastBasePos = std::max(spanIt->second.lastBasePos, basePos);
                 }
             }
 
@@ -638,75 +630,43 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // Furthest-reachable-window inter-window edges.
-    // For each window W, find the read that reaches the furthest window
-    // after W in its window sequence. Create one forward edge from W to
-    // that furthest window using the read's last anchor in W and first
-    // anchor in the furthest window.
+    // For each source window, find the single best forward connection
+    // based on geometric span: the read with the highest spanA * spanB
+    // across all candidate next windows determines the connection.
+    // This gives each window at most one outgoing inter-window edge
+    // (plus its RC mirror).
     {
-        auto rcWindow = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        // Collect the best read transition per source window across all
+        // destination windows. Key: source window ID (raw, may be RC).
+        struct BestForward {
+            std::pair<uint32_t, uint32_t> windowPair;
+            const ReadTransition* transition = nullptr;
+            uint64_t bestSpanProduct = 0;
         };
+        std::map<uint32_t, BestForward> bestPerSource;
 
-        // For each source window (raw ID), track the best candidate:
-        // the read that reaches the most windows past the source.
-        struct FurthestCandidate {
-            uint32_t srcWindow = noWindow;
-            uint32_t dstWindow = noWindow;
-            uint32_t oidValue = 0;
-            uint64_t distanceInSequence = 0;  // how many windows past src
-            Shasta2AnchorId lastAnchorInSrc;
-            Shasta2AnchorId firstAnchorInDst;
-            uint64_t spanSrc = 0;
-            uint64_t spanDst = 0;
-        };
-        std::map<uint32_t, FurthestCandidate> bestPerSource;
-
-        // Walk each read's window sequence.
-        for(const auto& [oidVal, windows] : readWindows) {
-            if(windows.size() < 2) continue;
-
-            const auto spanIt = readWindowSpans.find(oidVal);
-
-            for(uint64_t i = 0; i < windows.size(); i++) {
-                const uint32_t srcW = windows[i];
-                // The furthest window this read reaches after srcW
-                // is the last entry in the window sequence.
-                const uint32_t lastIdx = uint32_t(windows.size() - 1);
-                if(i >= lastIdx) continue;  // srcW is already the last window
-
-                const uint32_t dstW = windows[lastIdx];
-                const uint64_t dist = lastIdx - i;
-
-                auto& best = bestPerSource[srcW];
-                if(dist > best.distanceInSequence) {
-                    // Find anchor pair from readWindowSpans.
-                    Shasta2AnchorId lastInSrc = Shasta2AnchorId(0);
-                    Shasta2AnchorId firstInDst = Shasta2AnchorId(0);
-                    uint64_t sSrc = 0, sDst = 0;
-                    if(spanIt != readWindowSpans.end()) {
-                        auto srcSpanIt = spanIt->second.find(srcW);
-                        auto dstSpanIt = spanIt->second.find(dstW);
-                        if(srcSpanIt != spanIt->second.end()) {
-                            lastInSrc = srcSpanIt->second.lastAnchor;
-                            sSrc = srcSpanIt->second.lastBasePos - srcSpanIt->second.firstBasePos;
-                        }
-                        if(dstSpanIt != spanIt->second.end()) {
-                            firstInDst = dstSpanIt->second.firstAnchor;
-                            sDst = dstSpanIt->second.lastBasePos - dstSpanIt->second.firstBasePos;
-                        }
-                    }
-                    best = {srcW, dstW, oidVal, dist, lastInSrc, firstInDst, sSrc, sDst};
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            const uint32_t srcW = windowPair.first;
+            for(const auto& t : transitions) {
+                if(t.supportingSpanProduct > bestPerSource[srcW].bestSpanProduct) {
+                    bestPerSource[srcW] = {windowPair, &t, t.supportingSpanProduct};
                 }
             }
         }
 
-        // Deduplicate RC-mirror source windows.
+        // Deduplicate RC-mirror source windows: if both a forward window
+        // and its RC mirror selected a best connection, keep only the
+        // canonical (lower ID) one. The createInterWindowEdge helper
+        // creates the RC mirror edge automatically.
+        auto rcWindow = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
         std::set<uint32_t> skip;
         for(const auto& [srcW, best] : bestPerSource) {
             if(skip.count(srcW)) continue;
             const uint32_t rcSrc = rcWindow(srcW);
             if(bestPerSource.count(rcSrc)) {
+                // Keep the canonical (lower) key, skip the other.
                 if(srcW > rcSrc) {
                     skip.insert(srcW);
                 } else {
@@ -715,29 +675,28 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        // Create edges.
         for(const auto& [srcW, best] : bestPerSource) {
             if(skip.count(srcW)) continue;
-            if(best.dstWindow == noWindow) {
+            if(!best.transition) {
                 ++interWindowZeroPairs;
                 continue;
             }
 
             Shasta2AnchorPair anchorPair(anchors,
-                best.lastAnchorInSrc, best.firstAnchorInDst, false);
+                best.transition->lastAnchorInA, best.transition->firstAnchorInB, false);
             anchorPair.removeNegativeOffsets(anchors);
             if(anchorPair.size() == 0) {
                 ++interWindowZeroPairs;
                 continue;
             }
 
-            const uint64_t sharedReads = countSharedReads(best.srcWindow, best.dstWindow);
-            auto windowPair = std::make_pair(best.srcWindow, best.dstWindow);
-            createInterWindowEdge(windowPair, anchorPair, sharedReads,
-                best.spanSrc, best.spanDst);
+            const uint64_t sharedReads = countSharedReads(
+                best.windowPair.first, best.windowPair.second);
+            createInterWindowEdge(best.windowPair, anchorPair, sharedReads,
+                best.transition->supportingSpanA, best.transition->supportingSpanB);
         }
 
-        cout << "Furthest-reachable inter-window edges: "
+        cout << "Best-span-product inter-window edges: "
              << bestPerSource.size() << " source windows evaluated, "
              << skip.size() << " RC duplicates skipped." << endl;
     }
