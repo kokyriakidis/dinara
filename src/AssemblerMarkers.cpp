@@ -1857,3 +1857,121 @@ void Assembler::removeNonUniqueReferenceMarkers(
         << "Removed " << (totalBefore - totalAfter) << " markers." << endl;
 }
 
+
+
+// Remove all markers from reads whose marker span covers less than
+// minSpanFraction of the read length.
+// Span = (lastMarkerPos + k - firstMarkerPos) / readLength.
+void Assembler::filterReadsByMarkerSpanCoverage(
+    double minSpanFraction,
+    uint64_t threadCount)
+{
+    cout << timestamp << "filterReadsByMarkerSpanCoverage begins "
+         << "(minSpanFraction=" << minSpanFraction << ")." << endl;
+
+    checkMarkersAreOpen();
+    DINARA_ASSERT(markerKmerIds->isOpen());
+
+    const uint64_t k = assemblerInfo->k;
+    const uint64_t readCount = reads->readCount();
+
+    // Determine which reads pass the span coverage threshold.
+    vector<bool> keepRead(readCount, true);
+    uint64_t discardedCount = 0;
+    uint64_t noMarkerCount = 0;
+
+    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
+        const auto orientedReadId = OrientedReadId(readId, 0);
+        const auto readMarkers = (*markers)[orientedReadId.getValue()];
+        const uint64_t readLength = reads->getReadRawSequenceLength(readId);
+
+        if(readMarkers.size() == 0) {
+            keepRead[readId] = false;
+            ++noMarkerCount;
+            continue;
+        }
+
+        const uint32_t firstPos = readMarkers.front().position;
+        const uint32_t lastPos = readMarkers.back().position;
+        const uint64_t span = uint64_t(lastPos) + k - uint64_t(firstPos);
+        const double fraction = double(span) / double(readLength);
+
+        if(fraction < minSpanFraction) {
+            keepRead[readId] = false;
+            ++discardedCount;
+        }
+    }
+
+    cout << timestamp << "filterReadsByMarkerSpanCoverage: "
+         << discardedCount << " reads discarded (span < "
+         << minSpanFraction << "), "
+         << noMarkerCount << " reads had no markers, "
+         << (readCount - discardedCount - noMarkerCount) << " reads kept." << endl;
+
+    if(discardedCount == 0 && noMarkerCount == 0) {
+        cout << timestamp << "filterReadsByMarkerSpanCoverage: nothing to filter." << endl;
+        return;
+    }
+
+    // Rebuild markers and markerKmerIds, keeping only passing reads.
+    const string markersName = markers->getName();
+    const string kmerIdsName = markerKmerIds->getName();
+
+    auto oldMarkers = markers;
+    auto oldMarkerKmerIds = markerKmerIds;
+
+    if(!markersName.empty()) {
+        oldMarkers->rename(markersName + ".spanfilter.old");
+    }
+    if(!kmerIdsName.empty()) {
+        oldMarkerKmerIds->rename(kmerIdsName + ".spanfilter.old");
+    }
+
+    markers = make_shared<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>>();
+    markerKmerIds = make_shared<MemoryMapped::VectorOfVectors<KmerId, uint64_t>>();
+
+    markers->createNew(markersName, largeDataPageSize);
+    markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
+
+    // Pass 1: count markers per oriented read.
+    const uint64_t orientedReadCount = 2 * readCount;
+    markers->beginPass1(orientedReadCount);
+    markerKmerIds->beginPass1(orientedReadCount);
+
+    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
+        for(Strand strand = 0; strand < 2; ++strand) {
+            const auto oid = OrientedReadId(readId, strand);
+            const uint64_t n = keepRead[readId]
+                ? (*oldMarkers)[oid.getValue()].size()
+                : 0;
+            markers->incrementCount(oid.getValue(), n);
+            markerKmerIds->incrementCount(oid.getValue(), n);
+        }
+    }
+
+    // Pass 2: copy markers for passing reads.
+    markers->beginPass2();
+    markerKmerIds->beginPass2();
+
+    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
+        if(!keepRead[readId]) continue;
+        for(Strand strand = 0; strand < 2; ++strand) {
+            const auto oid = OrientedReadId(readId, strand);
+            const auto oldM = (*oldMarkers)[oid.getValue()];
+            const auto oldK = (*oldMarkerKmerIds)[oid.getValue()];
+            for(uint64_t i = 0; i < oldM.size(); ++i) {
+                markers->store(oid.getValue(), oldM[i]);
+                markerKmerIds->store(oid.getValue(), oldK[i]);
+            }
+        }
+    }
+
+    markers->endPass2(false);
+    markerKmerIds->endPass2(false);
+
+    // Clean up old data.
+    oldMarkers->remove();
+    oldMarkerKmerIds->remove();
+
+    cout << timestamp << "filterReadsByMarkerSpanCoverage done." << endl;
+}

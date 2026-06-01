@@ -406,6 +406,13 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(11),
         "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
 
+        ("Kmers.minMarkerSpanFraction",
+        value<double>(&kmersOptions.minMarkerSpanFraction)->
+        default_value(0.5),
+        "Minimum fraction of read length that must be covered by the marker span "
+        "(lastMarkerPos + k - firstMarkerPos). Reads below this threshold have all "
+        "markers removed. Set to 0 to disable.")
+
         ("Kmers.minimizerW",
         value<int>(&kmersOptions.minimizerW)->
         default_value(1),
@@ -1679,6 +1686,7 @@ void KmersOptions::write(ostream& s) const
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
     s << "syncmerS = " << syncmerS << "\n";
+    s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
     s << "minimizerW = " << minimizerW << "\n";
 }
 
