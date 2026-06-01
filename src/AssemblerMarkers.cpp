@@ -1953,15 +1953,18 @@ void Assembler::filterReadsByMarkerSpanCoverage(
     markers->beginPass2();
     markerKmerIds->beginPass2();
 
+    // store() writes in reverse order (decrements count as index),
+    // so iterate backwards to preserve the original marker order.
     for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
         if(!keepRead[readId]) continue;
         for(Strand strand = 0; strand < 2; ++strand) {
             const auto oid = OrientedReadId(readId, strand);
             const auto oldM = (*oldMarkers)[oid.getValue()];
             const auto oldK = (*oldMarkerKmerIds)[oid.getValue()];
-            for(uint64_t i = 0; i < oldM.size(); ++i) {
-                markers->store(oid.getValue(), oldM[i]);
-                markerKmerIds->store(oid.getValue(), oldK[i]);
+            const uint64_t n = oldM.size();
+            for(uint64_t i = n; i > 0; --i) {
+                markers->store(oid.getValue(), oldM[i - 1]);
+                markerKmerIds->store(oid.getValue(), oldK[i - 1]);
             }
         }
     }
