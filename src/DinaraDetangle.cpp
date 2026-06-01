@@ -340,9 +340,17 @@ uint64_t dinara::detangleWindows(
 
         // Log the tangle.
         cout << "  Tangle at window " << wIdx << ": "
-             << predecessors.size() << " preds, "
-             << successors.size() << " succs, "
+             << predecessors.size() << " preds (" << coveredInNeighbors.size() << " full-triplet), "
+             << successors.size() << " succs (" << coveredOutNeighbors.size() << " full-triplet), "
              << solidTriplets.size() << " solid triplets" << endl;
+        if(solidTriplets.empty()) {
+            // Show all triplet counts for debugging.
+            for(const auto& [key, reads] : window.transitionReads) {
+                if(key.first == noW || key.second == noW) continue;
+                cout << "    triplet (" << key.first << ", " << key.second
+                     << "): " << reads.size() << " reads" << endl;
+            }
+        }
 
         // Create bypass candidates for each solid triplet.
         for(const auto& [prevW, nextW] : solidTriplets) {
