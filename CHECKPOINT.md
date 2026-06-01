@@ -15,10 +15,11 @@ Dinara is a genome assembler with two active workstreams:
 2. **Flag contained reads** — `flagContainedReads(1000, 0.8, 0, threadCount)` before window creation
 3. **Compute anchor windows** — `computeAnchorWindowsClean()` with backbone filtering parameters `minCommonForBackbone` (default 2) and `maxSkipForBackbone` (default 10)
 4. **Phasing / clustering / alternate paths** — per-window het SNP detection, read clustering, alternate path creation
-5. **Build anchor graph** — `Shasta2AnchorGraph` constructor from anchor windows
-6. **Detangle** — `detangleWindows()` splits backbone anchors of tangled windows, then rebuilds the graph with parallel chains per path
-7. **Export for shasta2** — external anchors (`Shasta2ExternalAnchors`) and anchor graph (`Shasta2ExternalAnchorGraph`) in shasta2-native binary format
-8. **Early return** — post-graph steps (transitive reduction, assembly graph) are currently disabled via `return;`
+5. **Compute window transitions** — `computeWindowTransitions()` walks all journeys and populates `transitionReads`, per-read `previousWindow`/`nextWindow`, and `backbonePreviousWindow`/`backboneNextWindow` on each `AnchorWindow`. Runs before graph construction so detangling has transition data available.
+6. **Build anchor graph** — `Shasta2AnchorGraph` constructor from anchor windows. Recomputes transitions from its own `anchorToWindow` (clears and repopulates).
+7. **Detangle** — `detangleWindows()` splits backbone anchors of tangled windows, then rebuilds the graph with parallel chains per path
+8. **Export for shasta2** — external anchors (`Shasta2ExternalAnchors`) and anchor graph (`Shasta2ExternalAnchorGraph`) in shasta2-native binary format
+9. **Early return** — post-graph steps (transitive reduction, assembly graph) are currently disabled via `return;`
 
 ### Key Data Structures
 
@@ -186,26 +187,43 @@ Recounts edge types (intra/inter/alt-path) after trimming. Warns about edges wit
 
 ## Detangling (`src/DinaraDetangle.hpp/cpp`)
 
-After the initial anchor graph is built (including Rule 1 and `transitionReads` population), detangling splits backbone anchors of tangled windows so that each path through the window gets its own anchor copies.
+After the initial anchor graph is built (including `transitionReads` population), detangling creates bypass edges around tangled windows using Verkko-style triplet resolution.
 
 ### When a Window Is Tangled
 
-A window is a detangling candidate if it has ≥ 2 distinct **through-flows** — `(prev, next)` pairs in `transitionReads` where both `prev ≠ noWindow` and `next ≠ noWindow`, each with ≥ `minInterWindowCoverage` reads.
+A window is a detangling candidate if it has ≥ 2 distinct predecessors OR ≥ 2 distinct successors (from `transitionReads` entries where `key != noWindow`). Linear windows (≤1 pred AND ≤1 succ) are skipped. Hairpin windows (a neighbor normalizes to the window itself, i.e., transitions to/from its own RC mirror) are also skipped.
 
-### Algorithm
+### Verkko-Style Triplet Resolution
 
-1. **Identify candidates**: Scan each window's `transitionReads` for through-flows.
-2. **Partition reads by path**: Each through-flow `(prev, next)` defines a path. Reads are assigned to their path based on their `(prev, next)` pair.
-3. **Split backbone anchors**: For each backbone anchor pair (canonical + RC) in a tangled window, create new anchor copies — one per path — containing only that path's reads. RC subsets are built by matching strand-flipped read IDs.
-4. **Deferred appending**: All new anchors are collected first, then appended to `anchorMarkerInfos` in bulk to avoid invalidating spans during iteration.
-5. **Build split map**: `anchorSplitMap[originalId] = [newId_path0, newId_path1, ...]`.
-6. **Rebuild the graph**: The `Shasta2AnchorGraph` constructor accepts the split map. For windows whose backbone anchors appear in the map, parallel intra-window chains are created — one per path — using the new anchor IDs.
+The algorithm uses iterative resolve steps with decreasing `minEdgeSupport` thresholds (default: {20, 10, 5}), resolving easy tangles first.
 
-### Current Limitations
+For each non-linear, non-hairpin window X:
 
-- Only handles through-flow reads (both `prev` and `next` are real windows). Reads that start or end at a tangled window are excluded from all split anchor copies.
-- Runs once (no iterative detangling for cascading tangles).
-- Uses `minInterWindowCoverage` as the flow threshold.
+1. **Count edge coverage**: Only full triplets `(pred, succ)` where both sides are known contribute. Entries with `noW` on either side (reads starting/ending inside the window) are excluded — they cannot form triplets and would inflate edge coverage, blocking resolution.
+
+2. **Identify solid triplets**: A triplet `(pred, X, succ)` is "solid" if its read count ≥ `minEdgeSupport`.
+
+3. **Check resolvability**: Every significant edge (coverage ≥ `minEdgeCoverage`, default 5) must be covered by at least one solid triplet. An edge is skippable if its coverage < `minEdgeCoverage` AND the neighbor window is "removable" (average anchor coverage < `minEdgeCoverage`).
+
+4. **Find anchor pairs**: For each solid triplet, walk flow reads' journeys to find the best `(lastAnchorInPred, firstAnchorInSucc)` pair. The most popular pair across reads is selected.
+
+5. **Create bypass edges**: Forward bypass `A→B` plus RC mirror `rc(B)→rc(A)`.
+
+6. **Remove flow reads**: Flow reads are removed from the bypassed window's backbone anchors (both canonical and RC) in a mutable copy of `anchorMarkerInfos`. A `commonReads` recomputation ensures only reads still present on both bypass anchors are removed.
+
+7. **Rebuild**: After all resolve steps, `anchorMarkerInfos` is rebuilt from the modified copy.
+
+### Key Design Decisions
+
+- **Edge coverage excludes `noW` entries**: Reads that enter a window but don't exit (or vice versa) cannot form triplets. Including them inflated edge coverage, making edges look significant but uncoverable, which blocked nearly all resolutions.
+- **Significance check iterates `coveredInNeighbors`/`coveredOutNeighbors`** (maps built from full triplets only), not the broader `predecessors`/`successors` sets. Predecessors that only appear in `(pred, noW)` entries are invisible to the check.
+- **No "borders unresolvable" check**: Verkko prevents resolving adjacent tangles simultaneously. We don't implement this — the `commonReads` recomputation provides some protection, and our windows are larger than Verkko's k-mer nodes.
+- **No hairpin resolution**: Verkko resolves some hairpins by unfolding them into paired fw/bw nodes. We skip hairpins entirely (conservative).
+- **Iterative steps allow progressive resolution**: A window partially resolved at `minEdgeSupport=20` can have additional triplets resolved at lower thresholds.
+
+### 0-Full-Triplet Windows
+
+Many windows show "2 preds, 2 succs" but have 0 full-triplet predecessors/successors. This means no reads span the entire window from predecessor to successor — the "2 preds" come from `(pred, noW)` entries (reads entering but ending inside) and the "2 succs" from `(noW, succ)` entries. These aren't real tangles — the windows are too long for reads to span. They pass the significance check harmlessly (no full-triplet edges to block on) and produce no candidates.
 
 ## Shasta2 Export (`src/Shasta2AnchorGraphExport.cpp`)
 
@@ -245,7 +263,7 @@ The `--k` value must match dinara's k-mer length (default 50). The `--min-read-l
 
 ## Output Files
 
-- `Shasta2AnchorGraph.gfa` — GFA with non-isolated vertices only, all edges `+/+` orientation, `RC:i:` coverage tag
+- `Shasta2AnchorGraph.gfa` — GFA with non-isolated vertices only, all edges `+/+` orientation, tags: `RC:i:` (coverage), `wn:i:` (window ID, `noWindow` if unassigned), `ws:Z:` (strand: `fw`/`rc`/`none`)
 - `Shasta2AnchorGraph.csv` — Bandage color CSV, HSL color per window, RC mirrors get same color as forward window
 - `Shasta2ExternalAnchors` — binary external anchors for shasta2
 - `Shasta2ExternalAnchorGraph` — binary anchor graph for shasta2
@@ -259,6 +277,7 @@ The `--k` value must match dinara's k-mer length (default 50). The `--min-read-l
 | `src/Shasta2AnchorGraph.cpp` | Anchor-window constructor: edge creation, transitions, Rule 1 |
 | `src/Shasta2AnchorGraphExport.cpp` | `saveForShasta2()` — binary export for shasta2 |
 | `src/Shasta2AnchorGraphGfa.cpp` | `writeGfa()` and `writeCsv()` implementations |
+| `src/WindowTransitions.hpp/cpp` | `computeWindowTransitions()` — standalone transition counting from journeys, decoupled from graph |
 | `src/DinaraDetangle.hpp/cpp` | `detangleWindows()` — split backbone anchors of tangled windows |
 | `src/Shasta2AnchorPair.hpp/cpp` | `Shasta2AnchorPair` with `removeNegativeOffsets()` |
 | `src/Shasta2Anchors.hpp/cpp` | Anchor construction, `writeExternalAnchors()` |
