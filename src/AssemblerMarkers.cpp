@@ -73,38 +73,12 @@ static size_t getSyncmerMarkersForRead(
         readSequence[i] = read[i].character();
     }
 
-    // Compute canonical closed syncmer positions and merge with forced read ends (0 and baseCount - k_scan).
-    // Read end forcing ensures that the very first and last possible k-mers of every read
-    // are included as markers, which is critical for graph connectivity at read boundaries.
+    // Compute canonical closed syncmer positions.
     SyncmerList syncmerList = canonical_syncmer_positions(
         sketcher, readSequence.c_str(), readSequence.size());
     
     positionBuffer.assign(syncmerList.data, syncmerList.data + syncmerList.len);
     free_syncmer_list(syncmerList);
-
-    // Force all k-mer positions before the first syncmer and after the last syncmer.
-    // This ensures that read boundaries are fully covered with candidates,
-    // maximizing the chance that at least one survives frequency filtering.
-    const uint32_t lastKmerPos = uint32_t(baseCount - k_scan);
-    if(!positionBuffer.empty()) {
-        const uint32_t firstSyncmer = positionBuffer.front();
-        const uint32_t lastSyncmer  = positionBuffer.back();
-        for(uint32_t p = 0; p < firstSyncmer; ++p) {
-            positionBuffer.push_back(p);
-        }
-        for(uint32_t p = lastSyncmer + 1; p <= lastKmerPos; ++p) {
-            positionBuffer.push_back(p);
-        }
-    } else {
-        // No syncmers found: force all positions.
-        for(uint32_t p = 0; p <= lastKmerPos; ++p) {
-            positionBuffer.push_back(p);
-        }
-    }
-
-    // Sort and deduplicate to handle cases where read ends were already selected as syncmers.
-    std::sort(positionBuffer.begin(), positionBuffer.end());
-    positionBuffer.erase(std::unique(positionBuffer.begin(), positionBuffer.end()), positionBuffer.end());
 
     const size_t uniqueCandidateCount = positionBuffer.size();
     
