@@ -783,19 +783,19 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD closed syncmers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
-        // // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
-        // assembler.findMarkersSimdClosedSyncmers(
-        //     threadCount,
-        //     assemblerOptions.kmersOptions.k,
-        //     assemblerOptions.kmersOptions.syncmerS);
-
-        // Use SIMD-accelerated minimizers instead of closed syncmers.
-        // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
-        // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
-        assembler.findMarkersSimdMinimizers(
+        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
+        assembler.findMarkersSimdClosedSyncmers(
             threadCount,
             assemblerOptions.kmersOptions.k,
-            assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
+            assemblerOptions.kmersOptions.syncmerS);
+
+        // // Use SIMD-accelerated minimizers instead of closed syncmers.
+        // // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
+        // // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+        // assembler.findMarkersSimdMinimizers(
+        //     threadCount,
+        //     assemblerOptions.kmersOptions.k,
+        //     assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
 
         // Compute histogram using the pre-calculated KmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
@@ -829,112 +829,6 @@ void dinara::main::assemble(
         const uint64_t effectiveChainingFreq = min(coverageHom * 5,
             uint64_t(assemblerOptions.overlapCandidatesOptions.maxChainingFreq));
         cout << ". Chaining limited to frequency <= " << effectiveChainingFreq << "." << endl;
-
-        [[maybe_unused]]
-        auto writeReadMarkerGapDiagnostic = [&assembler](const string& label, ReadId readId) {
-            const OrientedReadId oid(readId, 0);
-            const auto read = assembler.getReads().getRead(readId);
-            const auto readMarkers = (*assembler.markers)[oid.getValue()];
-            const auto readKmerIds = (*assembler.markerKmerIds)[oid.getValue()];
-            const uint64_t k = assembler.assemblerInfo->k;
-
-            class GapInfo {
-            public:
-                string type;
-                uint32_t begin = 0;
-                uint32_t end = 0;
-                uint64_t markerStartDistance = 0;
-                uint64_t noMarkerBases = 0;
-                uint64_t leftFrequency = 0;
-                uint64_t rightFrequency = 0;
-            };
-
-            auto frequency = [&](KmerId kmerId) {
-                const Kmer kmer(kmerId, k);
-                const KmerId rcKmerId = kmer.reverseComplement(k).id(k);
-                return assembler.kmerCounter->getFrequencyFast(min(kmerId, rcKmerId));
-            };
-
-            vector<GapInfo> gaps;
-            if(readMarkers.empty()) {
-                gaps.push_back(GapInfo{
-                    "wholeRead",
-                    0,
-                    uint32_t(read.baseCount),
-                    read.baseCount,
-                    read.baseCount,
-                    0,
-                    0});
-            } else {
-                const uint32_t firstPosition = readMarkers.front().position;
-                if(firstPosition != 0) {
-                    gaps.push_back(GapInfo{
-                        "prefix",
-                        0,
-                        firstPosition,
-                        firstPosition,
-                        firstPosition,
-                        0,
-                        frequency(readKmerIds.front())});
-                }
-                for(uint64_t i=1; i<readMarkers.size(); i++) {
-                    const uint32_t previousPosition = readMarkers[i - 1].position;
-                    const uint32_t nextPosition = readMarkers[i].position;
-                    const uint64_t markerStartDistance = nextPosition > previousPosition ?
-                        nextPosition - previousPosition : 0;
-                    const uint64_t previousEnd = uint64_t(previousPosition) + k;
-                    const uint64_t noMarkerBases = uint64_t(nextPosition) > previousEnd ?
-                        uint64_t(nextPosition) - previousEnd : 0;
-                    gaps.push_back(GapInfo{
-                        "internal",
-                        previousPosition,
-                        nextPosition,
-                        markerStartDistance,
-                        noMarkerBases,
-                        frequency(readKmerIds[i - 1]),
-                        frequency(readKmerIds[i])});
-                }
-                const uint64_t lastEnd = uint64_t(readMarkers.back().position) + k;
-                if(read.baseCount > lastEnd) {
-                    gaps.push_back(GapInfo{
-                        "suffix",
-                        uint32_t(lastEnd),
-                        uint32_t(read.baseCount),
-                        read.baseCount - lastEnd,
-                        read.baseCount - lastEnd,
-                        frequency(readKmerIds.back()),
-                        0});
-                }
-            }
-
-            sort(gaps.begin(), gaps.end(),
-                [](const GapInfo& a, const GapInfo& b) {
-                    if(a.noMarkerBases != b.noMarkerBases) {
-                        return a.noMarkerBases > b.noMarkerBases;
-                    }
-                    return a.markerStartDistance > b.markerStartDistance;
-                });
-
-            cout << timestamp << "[MarkerGapDiagnostic] " << label
-                 << " readId=" << readId
-                 << " readLength=" << read.baseCount
-                 << " markerCount=" << readMarkers.size()
-                 << endl;
-            for(uint64_t i=0; i<min<uint64_t>(10, gaps.size()); i++) {
-                const GapInfo& gap = gaps[i];
-                cout << timestamp << "  rank=" << i
-                     << " type=" << gap.type
-                     << " begin=" << gap.begin
-                     << " end=" << gap.end
-                     << " markerStartDistance=" << gap.markerStartDistance
-                     << " noMarkerBases=" << gap.noMarkerBases
-                     << " leftFrequency=" << gap.leftFrequency
-                     << " rightFrequency=" << gap.rightFrequency
-                     << endl;
-            }
-        };
-
-        // writeReadMarkerGapDiagnostic("beforeFrequencyFilter", ReadId(3729));
              
         // Prune the existing minimizer markers in-place.
         // applyKmerCountFilter keeps a marker only if:
