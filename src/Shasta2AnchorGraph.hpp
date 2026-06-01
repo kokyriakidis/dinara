@@ -40,12 +40,11 @@ public:
     bool useForAssembly = false;
 
     // Inter-window edge attributes.
-    // maxSupportingSpan: baseSpanA + baseSpanB of the read with the
-    // highest spanA * spanB product. Selection uses the product
-    // (rewards balanced coverage), but the stored value is the sum
-    // (human-readable total base coverage across both windows).
+    // supportingSpanPrev/Next: base-level span of the selected read
+    // in the source (prev) and destination (next) window.
     // 0 for intra-window edges.
-    uint64_t maxSupportingSpan = 0;
+    uint64_t supportingSpanPrev = 0;
+    uint64_t supportingSpanNext = 0;
     // sharedReadCount: number of distinct reads that touch both windows
     // (not just the reads using this specific anchor pair).
     uint64_t sharedReadCount = 0;
@@ -66,7 +65,8 @@ public:
         ar & offset;
         ar & id;
         ar & useForAssembly;
-        ar & maxSupportingSpan;
+        ar & supportingSpanPrev;
+        ar & supportingSpanNext;
         ar & sharedReadCount;
     }
 };
