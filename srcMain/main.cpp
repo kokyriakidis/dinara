@@ -1221,7 +1221,7 @@ void dinara::main::assemble(
     assembler.findMarkerGraphReverseComplementVertices(threadCount);
 
 
-    const uint64_t minAnchorCoverage = 2;
+    const uint64_t minAnchorCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
     const uint64_t maxAnchorCoverage = std::numeric_limits<uint64_t>::max();
 
     // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
@@ -1669,6 +1669,8 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
+    // Trimming and detangling disabled — output the raw graph.
+#if 0
     // Trim dangling backbone ends beyond outermost inter-window edges.
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
@@ -1700,8 +1702,9 @@ void dinara::main::assemble(
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
         }
     }
+#endif
 
-    // Write external anchors after detangling so new split anchors are included.
+    // Write external anchors.
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
     const uint64_t exportedExternalAnchorCount =
