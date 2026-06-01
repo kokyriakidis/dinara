@@ -547,8 +547,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << " anchors mapped to " << windowCount << " original + "
              << windowCount << " RC mirror windows." << endl;
         if(reads) {
-            cout << "Skipped " << containedSkipCount
-                 << " contained oriented reads for inter-window edge discovery." << endl;
+            cout << "Found " << containedSkipCount
+                 << " contained oriented reads (included in inter-window edge discovery)." << endl;
         }
     }
 
@@ -591,9 +591,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         // RC mirror edge: reverse the anchor pair and flip both anchor IDs.
         // Spans swap: the RC mirror's prev is the forward's next and vice versa.
+        // Skip for self-RC-mirror window pairs (W, W+wc) where the RC mirror
+        // edge would land on the same window pair, creating a duplicate.
         const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
         const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
-        if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+        const uint32_t rcSrc = (windowPair.second < windowCount)
+            ? windowPair.second + windowCount : windowPair.second - windowCount;
+        const uint32_t rcDst = (windowPair.first < windowCount)
+            ? windowPair.first + windowCount : windowPair.first - windowCount;
+        const bool isSelfRcMirror =
+            (rcSrc == windowPair.first && rcDst == windowPair.second);
+        if(!isSelfRcMirror &&
+           uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
             Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
             rcPair.removeNegativeOffsets(anchors);
             if(rcPair.size() > 0) {
@@ -606,116 +615,71 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 anchorGraph[eRc].supportingSpanPrev = spanNext;
                 anchorGraph[eRc].supportingSpanNext = spanPrev;
                 anchorGraph[eRc].sharedReadCount = sharedReads;
-                // RC window pair.
-                const uint32_t rcSrc = (windowPair.second < windowCount)
-                    ? windowPair.second + windowCount : windowPair.second - windowCount;
-                const uint32_t rcDst = (windowPair.first < windowCount)
-                    ? windowPair.first + windowCount : windowPair.first - windowCount;
                 createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
                 ++interWindowCreated;
             }
         }
     };
 
-    // Two-edge inter-window edge creation.
-    // For each window pair A→B, create up to two edges:
-    //   1. Entry edge: the read whose firstAnchorInB is the earliest
-    //      entry into B. Ensures all reads' entry points into B are
-    //      reachable via backbone edges from the landing point.
-    //   2. Exit edge: the read whose lastAnchorInA is the latest
-    //      exit from A. Ensures all reads' exit points from A can
-    //      reach the departure point via backbone edges.
-    // Both edges are needed: the entry edge optimizes the B side,
-    // the exit edge optimizes the A side. Without the exit edge,
-    // reads that exit A late have no graph path to B.
-    // If both select the same read, only one edge is created.
-    // Tiebreak by span product in both cases.
+    // One edge per window pair, optimized for earliest entry into the
+    // destination window. For window pair A→B, select the read whose
+    // firstAnchorInB is earliest in B's traversal order. This ensures
+    // all reads' entry points into B are reachable via backbone edges
+    // from the landing point.
+    //
+    // The "exit from B" is handled by the reverse window pair (B→A,
+    // B→C, etc.), whose entry edge departs from B at whatever point
+    // that read exits B. For A→B→A flows, the (B,A) entry edge
+    // provides the exit from B.
+    //
+    // The A-side departure point is not independently optimized.
+    // Reads exiting A after the entry edge's departure point lose
+    // their A-side anchors to trimBackbones, but the sequence is
+    // preserved in B's backbone (those reads also enter B).
     //
     // For forward windows, traversal order matches backbone position
     // (increasing). For RC windows, traversal order is reversed
-    // (decreasing backbone position). So:
-    //   Entry into forward B: lowest backbone pos
-    //   Entry into RC B:      highest backbone pos
-    //   Exit from forward A:  highest backbone pos
-    //   Exit from RC A:       lowest backbone pos
+    // (decreasing backbone position).
     for(const auto& [windowPair, transitions] : windowPairTransitions) {
-        const bool srcIsRc = (windowPair.first >= windowCount);
         const bool dstIsRc = (windowPair.second >= windowCount);
 
-        // Find entry edge: earliest entry into B.
+        // Find the read with the earliest entry into B.
         // Forward B: lowest backbone pos. RC B: highest backbone pos.
-        uint32_t bestEntryPos = 0;
-        uint64_t bestEntryProduct = 0;
-        const ReadTransition* entryTransition = nullptr;
-        bool entryInitialized = false;
+        // Tiebreak by highest span product.
+        uint32_t bestPos = 0;
+        uint64_t bestProduct = 0;
+        const ReadTransition* bestTransition = nullptr;
+        bool initialized = false;
         for(const auto& t : transitions) {
             const uint32_t bPos = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
             const bool isBetter = dstIsRc
-                ? (bPos > bestEntryPos)    // RC: higher pos = earlier in traversal
-                : (bPos < bestEntryPos);   // Fwd: lower pos = earlier in traversal
-            if(!entryInitialized || isBetter ||
-               (bPos == bestEntryPos && t.supportingSpanProduct > bestEntryProduct)) {
-                bestEntryPos = bPos;
-                bestEntryProduct = t.supportingSpanProduct;
-                entryTransition = &t;
-                entryInitialized = true;
+                ? (bPos > bestPos)    // RC: higher pos = earlier in traversal
+                : (bPos < bestPos);   // Fwd: lower pos = earlier in traversal
+            if(!initialized || isBetter ||
+               (bPos == bestPos && t.supportingSpanProduct > bestProduct)) {
+                bestPos = bPos;
+                bestProduct = t.supportingSpanProduct;
+                bestTransition = &t;
+                initialized = true;
             }
         }
 
-        // Find exit edge: latest exit from A.
-        // Forward A: highest backbone pos. RC A: lowest backbone pos.
-        uint32_t bestExitPos = 0;
-        uint64_t bestExitProduct = 0;
-        const ReadTransition* exitTransition = nullptr;
-        bool exitInitialized = false;
-        for(const auto& t : transitions) {
-            const uint32_t aPos = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
-            const bool isBetter = srcIsRc
-                ? (aPos < bestExitPos)     // RC: lower pos = later in traversal
-                : (aPos > bestExitPos);    // Fwd: higher pos = later in traversal
-            if(!exitInitialized || isBetter ||
-               (aPos == bestExitPos && t.supportingSpanProduct > bestExitProduct)) {
-                bestExitPos = aPos;
-                bestExitProduct = t.supportingSpanProduct;
-                exitTransition = &t;
-                exitInitialized = true;
-            }
+        if(!bestTransition) {
+            ++interWindowZeroPairs;
+            continue;
+        }
+
+        Shasta2AnchorPair anchorPair(anchors,
+            bestTransition->lastAnchorInA, bestTransition->firstAnchorInB, false);
+        anchorPair.removeNegativeOffsets(anchors);
+        if(anchorPair.size() == 0) {
+            ++interWindowZeroPairs;
+            continue;
         }
 
         const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
-
-        // Create entry edge.
-        bool entryCreated = false;
-        if(entryTransition) {
-            Shasta2AnchorPair entryPair(anchors,
-                entryTransition->lastAnchorInA, entryTransition->firstAnchorInB, false);
-            entryPair.removeNegativeOffsets(anchors);
-            if(entryPair.size() > 0) {
-                createInterWindowEdge(windowPair, entryPair, sharedReads,
-                    entryTransition->supportingSpanA, entryTransition->supportingSpanB);
-                entryCreated = true;
-            }
-        }
-
-        // Create exit edge (skip if same read or same anchor pair as entry edge).
-        bool exitCreated = false;
-        if(exitTransition &&
-           (!entryTransition || (exitTransition != entryTransition &&
-            !(exitTransition->lastAnchorInA == entryTransition->lastAnchorInA &&
-              exitTransition->firstAnchorInB == entryTransition->firstAnchorInB)))) {
-            Shasta2AnchorPair exitPair(anchors,
-                exitTransition->lastAnchorInA, exitTransition->firstAnchorInB, false);
-            exitPair.removeNegativeOffsets(anchors);
-            if(exitPair.size() > 0) {
-                createInterWindowEdge(windowPair, exitPair, sharedReads,
-                    exitTransition->supportingSpanA, exitTransition->supportingSpanB);
-                exitCreated = true;
-            }
-        }
-
-        if(!entryCreated && !exitCreated) {
-            ++interWindowZeroPairs;
-        }
+        createInterWindowEdge(windowPair, anchorPair, sharedReads,
+            bestTransition->supportingSpanA, bestTransition->supportingSpanB);
     }
 
     // (Old two-pass endpoint/internal edge code removed.)
