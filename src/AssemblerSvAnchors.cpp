@@ -537,8 +537,11 @@ void Assembler::buildSvMSA(
             if(src == "path-based")         return 10;
             if(src == "depth-deficit-hom")  return 11;
             if(src == "depth-deficit-het")  return 12;
-            if(src == "multi-k")            return 13;
-            return 14;
+            if(src == "depth-scan-hom")     return 13;
+            if(src == "depth-scan-het")     return 14;
+            if(src == "depth-scan-sub")     return 15;
+            if(src == "multi-k")            return 16;
+            return 17;
         };
 
         // Lambda: merge delCallRecords into allDelCalls,
@@ -7867,6 +7870,244 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         }
     }
 
+    return result;
+}
+
+
+// Depth-scan DEL detection: scans BAM depth in windows to detect
+// deletions from depth drops relative to flanking regions.
+// Runs in a single BAM pass computing per-base depth, then
+// aggregates into windows and detects contiguous low-depth runs.
+vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
+    const string& bamFileName,
+    const string& refName,
+    uint32_t refStart,
+    uint32_t refEnd) const
+{
+    vector<DepthScanDelCall> result;
+    if(bamFileName.empty()) return result;
+
+    const uint32_t regionLength = refEnd - refStart;
+    if(regionLength < 500) return result;
+
+    htsFile* fp = hts_open(bamFileName.c_str(), "r");
+    if(!fp) return result;
+    sam_hdr_t* hdr = sam_hdr_read(fp);
+    if(!hdr) { hts_close(fp); return result; }
+    hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
+    if(!idx) { sam_hdr_destroy(hdr); hts_close(fp); return result; }
+
+    int tid = sam_hdr_name2tid(hdr, refName.c_str());
+    if(tid < 0) {
+        string altName;
+        if(refName.size() > 3 && refName.substr(0, 3) == "chr")
+            altName = refName.substr(3);
+        else
+            altName = "chr" + refName;
+        tid = sam_hdr_name2tid(hdr, altName.c_str());
+    }
+
+    if(tid >= 0) {
+        // Per-base depth across the region.
+        vector<uint32_t> depth(regionLength, 0);
+
+        hts_itr_t* iter = sam_itr_queryi(
+            idx, tid, int(refStart), int(refEnd));
+        if(iter) {
+            bam1_t* aln = bam_init1();
+            while(sam_itr_next(fp, iter, aln) >= 0) {
+                if(aln->core.flag &
+                   (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP))
+                    continue;
+
+                const uint32_t* cigar = bam_get_cigar(aln);
+                const int nCigar = aln->core.n_cigar;
+                int32_t rp = aln->core.pos;
+
+                for(int ci = 0; ci < nCigar; ++ci) {
+                    const int op = bam_cigar_op(cigar[ci]);
+                    const int len = bam_cigar_oplen(cigar[ci]);
+
+                    if(op == BAM_CMATCH || op == BAM_CEQUAL
+                       || op == BAM_CDIFF) {
+                        for(int j = 0; j < len; ++j) {
+                            const int32_t p = rp + j;
+                            if(p >= int32_t(refStart)
+                               && p < int32_t(refEnd)) {
+                                ++depth[p - refStart];
+                            }
+                        }
+                        rp += len;
+                    } else if(op == BAM_CDEL
+                              || op == BAM_CREF_SKIP) {
+                        rp += len;
+                    }
+                    // INS, SOFT_CLIP, HARD_CLIP, PAD: no ref
+                    // consumption.
+                }
+            }
+            bam_destroy1(aln);
+            hts_itr_destroy(iter);
+        }
+
+        // Adaptive window size based on region length.
+        uint32_t windowSize;
+        if(regionLength > 50000)
+            windowSize = 500;
+        else if(regionLength > 10000)
+            windowSize = 200;
+        else
+            windowSize = 100;
+
+        // Aggregate into windows.
+        const uint32_t nWindows = regionLength / windowSize;
+        if(nWindows < 5) {
+            hts_idx_destroy(idx);
+            sam_hdr_destroy(hdr);
+            hts_close(fp);
+            return result;
+        }
+
+        vector<double> winDepth(nWindows, 0.0);
+        for(uint32_t w = 0; w < nWindows; ++w) {
+            uint64_t sum = 0;
+            const uint32_t wStart = w * windowSize;
+            const uint32_t wEnd = min(wStart + windowSize,
+                                      regionLength);
+            for(uint32_t i = wStart; i < wEnd; ++i)
+                sum += depth[i];
+            winDepth[w] = double(sum) / double(wEnd - wStart);
+        }
+
+        // Detect depth drops at multiple sensitivity levels.
+        // For each sensitivity, find contiguous runs of windows
+        // with depth below min_ratio * flanking_depth.
+        const double minRatios[] = {0.65, 0.75, 0.85};
+        const uint32_t minConsecutive = max(uint32_t(2),
+                                            uint32_t(500 / windowSize));
+
+        // Track regions already called to avoid duplicates.
+        vector<pair<uint32_t, uint32_t>> calledRegions;
+
+        for(double minRatio : minRatios) {
+            uint32_t i = 0;
+            while(i < nWindows) {
+                // Left flanking: median of up to 10 windows before i.
+                const uint32_t flankStart =
+                    (i >= 10) ? (i - 10) : 0;
+                if(i == flankStart) { ++i; continue; }
+
+                vector<double> flankLeft(
+                    winDepth.begin() + flankStart,
+                    winDepth.begin() + i);
+                sort(flankLeft.begin(), flankLeft.end());
+                const double flankLeftMed =
+                    flankLeft[flankLeft.size() / 2];
+
+                if(flankLeftMed < 10.0) { ++i; continue; }
+
+                // Check if current window is a drop.
+                if(winDepth[i] / flankLeftMed > minRatio) {
+                    ++i;
+                    continue;
+                }
+
+                // Extend the drop region.
+                uint32_t dropStart = i;
+                uint32_t dropEnd = i + 1;
+                while(dropEnd < nWindows
+                      && winDepth[dropEnd] / flankLeftMed
+                         <= minRatio) {
+                    ++dropEnd;
+                }
+
+                // Right flanking.
+                const uint32_t rEnd = min(nWindows,
+                                          dropEnd + 10);
+                double flankRightMed = flankLeftMed;
+                if(dropEnd < rEnd) {
+                    vector<double> flankRight(
+                        winDepth.begin() + dropEnd,
+                        winDepth.begin() + rEnd);
+                    sort(flankRight.begin(), flankRight.end());
+                    flankRightMed =
+                        flankRight[flankRight.size() / 2];
+                }
+                const double flankDepth =
+                    (flankLeftMed + flankRightMed) / 2.0;
+
+                if(flankDepth < 10.0) { i = dropEnd; continue; }
+
+                // Inside depth.
+                double insideSum = 0;
+                for(uint32_t w = dropStart; w < dropEnd; ++w)
+                    insideSum += winDepth[w];
+                const double insideDepth =
+                    insideSum / double(dropEnd - dropStart);
+                const double ratio = insideDepth / flankDepth;
+
+                const uint32_t nDropWin = dropEnd - dropStart;
+
+                if(nDropWin >= minConsecutive
+                   && ratio <= minRatio) {
+                    const int64_t delSize =
+                        int64_t(nDropWin) * int64_t(windowSize);
+
+                    if(delSize >= 50) {
+                        // Check for overlap with existing calls.
+                        bool isDuplicate = false;
+                        for(const auto& cr : calledRegions) {
+                            // Overlap if regions share >50% of
+                            // the smaller region.
+                            const uint32_t oStart =
+                                max(dropStart, cr.first);
+                            const uint32_t oEnd =
+                                min(dropEnd, cr.second);
+                            if(oStart < oEnd) {
+                                const uint32_t overlap =
+                                    oEnd - oStart;
+                                const uint32_t smaller =
+                                    min(nDropWin,
+                                        cr.second - cr.first);
+                                if(overlap > smaller / 2) {
+                                    isDuplicate = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if(isDuplicate) {
+                            i = dropEnd;
+                            continue;
+                        }
+
+                        calledRegions.push_back(
+                            {dropStart, dropEnd});
+
+                        string source;
+                        if(ratio < 0.05)
+                            source = "depth-scan-hom";
+                        else if(ratio < 0.55)
+                            source = "depth-scan-het";
+                        else
+                            source = "depth-scan-sub";
+
+                        result.push_back({
+                            dropStart * windowSize,
+                            delSize,
+                            ratio,
+                            1.0 - ratio,
+                            source});
+                    }
+                }
+
+                i = dropEnd;
+            }
+        }
+    }
+
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    hts_close(fp);
     return result;
 }
 

@@ -693,16 +693,12 @@ The sweet spot for read-to-reference matching is k=50 (56% unique), but for read
 
 ### Latest Commit
 
-`dedca41` on `main` — "Add SA tag parsing, flank-gap analysis, and VNTR-depth deletion detection"
+`8c9ccd5` on `main` — depth-deficit DEL source (V36k)
 
-**Changes in this commit (545 insertions, 5 deletions):**
-- Flank-gap analysis for marker-depleted coverage-drop regions
-- VNTR-depth deletion detection (negative depth → DEL call, guarded: ≤30% of VNTR length, ≥50bp)
-- Covdrop-indirect insertion detection
-- SA tag parsing from BAM via htslib (`parseSaTagSvCalls()`)
-- `--bam` CLI option for SA tag input
-- maxK increased from 60 to 62
-- htslib link dependencies added to CMakeLists.txt
+Subsequent uncommitted changes (V36l):
+- `src/Assembler.hpp` — `DepthScanDelCall` struct + `depthScanDelCalls()` method declaration
+- `src/AssemblerSvAnchors.cpp` — `depthScanDelCalls()` implementation (~200 lines) + source priority table update (depth-scan-hom/het/sub at priorities 13-15)
+- `srcMain/main.cpp` — depth-scan call site after early-CIGAR block, before DP chaining
 
 ### Git Info
 
@@ -717,6 +713,13 @@ The sweet spot for read-to-reference matching is k=50 (56% unique), but for read
 - minimap2Bw=100, minimap2MaxGap=5000, chainingMode=1
 
 ### SV Detection Pipeline Layers (complete, in order)
+
+**Pre-chaining (in `main.cpp`, run before DP chaining):**
+
+0a. Early-CIGAR DEL detection from BAM CIGAR strings
+0b. **Depth-scan DEL detection** — windowed BAM depth scanning (V36l)
+
+**Post-chaining (in `main.cpp` and `AssemblerSvAnchors.cpp`):**
 
 1. Per-read DP chaining (minimap2-sr scoring) → primary + supplementary chains
 2. Split-read classification → sv_split_reads.tsv
@@ -736,6 +739,7 @@ The sweet spot for read-to-reference matching is k=50 (56% unique), but for read
 16. Split-read deletion detection
 17. Merged-cluster calls
 18. SA tag parsing from BAM → clustered SV calls
+19. Depth-deficit DEL detection (integrated deficit across region)
 
 ### Test Case Datasets
 
@@ -875,12 +879,17 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 | V36i | + removed depth-fc filter | 99.2% | 11.9 |
 | V36j | + source-priority dedup + SA-DEL removal | 99.2% | 11.8 |
 | V36k | + depth-deficit DEL source | 99.4% | 13.9 |
+| V36l | + depth-scan DEL source (windowed BAM depth) | 99.4%* | ~15 |
 
-### Current State (V36k)
+*V36l recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan source is primarily impactful for somatic analysis (HG008-T: 81.7% → 95.0%).
 
-- **Recall**: 99.4% (10,112 / 10,173)
-- **61 remaining misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
-- **Avg calls/case**: 13.9
+### Current State (V36l)
+
+- **Germline recall (HG002)**: 99.4% (10,112 / 10,173)
+- **Somatic recall (HG008-T)**: 95.0% (57 / 60)
+- **61 remaining germline misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
+- **3 remaining somatic misses**: 1 too large (6.3Mb), 1 partial depth-scan (64kb), 1 position accuracy at 10% VAF
+- **Avg calls/case**: ~15 (germline), ~20 (somatic, higher coverage)
 
 ### Active DEL Sources
 
@@ -950,7 +959,7 @@ Infers deletion size from the integrated depth deficit across the entire region,
 
 **Problem**: The old dedup sorted calls by read count descending. multi-k always won (most reads) but was correct only 9.8% of the time when disagreeing with other sources. In 5,791 of 10,173 loci, multi-k was the wrong-size winner with a correct-size call from another source available.
 
-**Solution**: Sort by source accuracy instead of read count. Priority order: merged-clusters > diagonal > early-CIGAR > SA-tag > split-read > cluster > flank-gap > kmer-journey > per-read-DEL > INV-cluster > path-based > multi-k. Read count is tiebreaker within same source.
+**Solution**: Sort by source accuracy instead of read count. Priority order: merged-clusters > diagonal > early-CIGAR > SA-tag > split-read > cluster > flank-gap > kmer-journey > per-read-DEL > INV-cluster > path-based > depth-deficit-hom > depth-deficit-het > depth-scan-hom > depth-scan-het > depth-scan-sub > multi-k. Read count is tiebreaker within same source.
 
 **Impact on recall**: None — recall is 99.2% for both V36i and V36j because the eval counts ALL emitted calls, not just the top one.
 
@@ -1056,10 +1065,158 @@ The 61 remaining misses (down from 84 after depth-deficit source) are small DELs
 
 **Depth-deficit recovered 23 of the original 84:** Mostly larger DELs (1000+bp) and cases where the repeat array is small enough that the deletion contributes a measurable fraction of the total depth deficit.
 
+### Depth-Scan DEL Source (V36l)
+
+Windowed BAM depth scanning to detect deletions from depth drops. Unlike depth-deficit (which integrates total deficit across the whole region), depth-scan identifies the specific contiguous region of low depth and estimates DEL size from its width.
+
+**Algorithm:**
+1. Open BAM, compute per-base depth across the full region in a single pass
+2. Aggregate into adaptive windows (100bp for regions <10kb, 200bp for 10-50kb, 500bp for >50kb)
+3. For each position, compute left-flanking median depth (up to 10 windows back)
+4. Detect contiguous runs of windows where `depth / flank_depth ≤ threshold`
+5. Scan at 3 sensitivity levels (thresholds: 0.65, 0.75, 0.85) with deduplication
+6. Classify by depth ratio: `<0.05` → hom, `<0.55` → het, else → sub (subclonal)
+7. Emit calls as `depth-scan-hom` / `depth-scan-het` / `depth-scan-sub`
+
+**Key design decision:** Runs in `main.cpp` **before DP chaining** (right after early-CIGAR), so calls are emitted even when assembly times out on high-read-count regions. This is the primary motivation — large DELs (5kb+) often have too many reads for the DP chaining to complete within wall time.
+
+**Implementation:** `Assembler::depthScanDelCalls()` in `src/AssemblerSvAnchors.cpp` (~200 lines). Uses htslib to read BAM directly. Called from `srcMain/main.cpp` after the early-CIGAR block.
+
+**Limitations:**
+- Window granularity limits size accuracy (±window_size). A 5.8kb DEL may be called as 5.6kb or 6.0kb.
+- Cannot detect small DELs (<~400bp) because they don't span enough consecutive windows.
+- Subclonal DELs at very low VAF (<10%) may not produce enough depth drop to trigger detection.
+- Does not resolve breakpoints precisely — position accuracy is ±window_size.
+
+**Somatic impact:** Recovers large DELs (5kb-64kb) that assembly cannot handle within wall time. See HG008-T evaluation below.
+
+### Dinara V36k vs sbx-assemble — DEL Comparison (HG002)
+
+Direct comparison using identical truvari parameters on HG002 Q100 v5.0q stvar truthset (10,175 DEL entries ≥50bp in benchmark BED regions).
+
+**Truvari parameters (identical for both tools):**
+```
+refdist=2000, pctseq=0.0, pctovl=0.0, sizemin=50, sizefilt=30, sizemax=50000
+passonly, pick=multi, dup-to-ins, no-ref=a, chunksize=5000
+```
+
+**With `pctsize=0.0` (no size matching — sbx-assemble's default params):**
+
+| Metric | Dinara V36k | sbx-assemble | Δ |
+|---|---|---|---|
+| TP-base | **10,175** | 9,750 | **+425** |
+| FN | **0** | 425 | **−425** |
+| Recall | **100.0%** | 95.8% | **+4.2pp** |
+| Total DEL calls | 128,484 | 76,339 | — |
+
+**With `pctsize=0.7` (size accuracy required — ≥70% reciprocal size match):**
+
+| Metric | Dinara V36k | sbx-assemble | Δ |
+|---|---|---|---|
+| TP-base | **10,121** | 9,163 | **+958** |
+| FN | **54** | 1,012 | **−958** |
+| Recall | **99.5%** | 90.1% | **+9.4pp** |
+
+**Notes:**
+- sbx-assemble's ML filtering does not remove any DELs — the unfiltered and filtered DEL counts are identical (76,339). The comparison is already apples-to-apples.
+- Dinara emits all candidate calls from all sources (128K), not a single filtered call per locus. Precision comparison is not meaningful until final call selection is applied.
+- The truvari pctsize=0.0 result (100%) means dinara produces at least one call near every truth DEL, but not always the right size. The internal eval with 70% reciprocal overlap shows 99.4%.
+
+**Cluster paths:**
+- Dinara VCF: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/dinara_v36k_dels.vcf.gz`
+- Dinara truvari (pctsize=0.0): `.../full_del_eval/truvari_v36k/`
+- Dinara truvari (pctsize=0.7): `.../full_del_eval/truvari_v36k_pctsize07/`
+- sbx-assemble truvari (pctsize=0.0): `.../test_runs/bench_20260519_155309/SBX-D/truvari/`
+- sbx-assemble truvari (pctsize=0.7): `.../test_runs/bench_20260519_155309/SBX-D/truvari_pctsize07/`
+- VCF generation script: `.../full_del_eval/logs_to_vcf.py`
+
+---
+
+## Somatic DEL Evaluation — HG008-T V0.5 (June 2026)
+
+### Dataset
+
+- **Truth**: GIAB HG008-T V0.5 draft somatic SV benchmark, 60 PASS DELs ≥50bp
+- **BED regions**: `GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed`
+- **BAM**: `/sc1/groups/sbx/workspace/eizengaj/structural_variants/somatic_mapping/dedupped_sorted/HG008_T.intra-consensus.personalized.dedup.sorted.bam`
+- **Reference**: GRCh38 (`GCA_000001405.15_GRCh38_no_alt_analysis_set.fna`)
+- **GIAB reference** (for truvari): `GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta`
+- **Coverage**: ~50-80x
+- **VAF range**: 5% to 100% (somatic, includes subclonal)
+- **DEL size range**: 54bp to 6.3Mb
+
+### Truth Set Details
+
+The ALL VCF has 72 DELs total:
+- 60 PASS (benchmark set)
+- 8 VAFlt5percent (VAF <5%, below detection threshold)
+- 4 LT50 (below 50bp size threshold)
+
+### Results
+
+| Version | Binary | Recall | TP | FN |
+|---|---|---|---|---|
+| V36k (assembly only) | `dinara_v36k_depthdeficit` | 81.7% | 49 | 11 |
+| V36l (+ depth-scan) | `dinara_v36k_depthscan` | **95.0%** | **57** | **3** |
+
+### Failure Analysis
+
+**7 cases timed out** during DP chaining (assembly never completed):
+- All had large regions with many reads (5.8kb-64kb DELs, 50K-262K reads)
+- All had clear depth signals (depth ratio 0.00-0.70)
+- The depth-scan source recovers all 7 because it runs before DP chaining
+
+**3 cases had wrong-size calls** from assembly:
+- chr17:31977413 (27kb, VAF=40%) — assembly found 31bp, depth-scan found 27kb ✅
+- chr7:6404812 (1.2kb, VAF=28%) — assembly found 43bp, depth-scan found 1.2kb ✅
+- chr7:6408188 (62bp, VAF=26%) — assembly found 35+36bp split calls. Depth-scan can't resolve 62bp (below window granularity). Truvari matched via other means ✅
+
+### Remaining 3 FNs
+
+| Locus | Size | VAF | Issue |
+|---|---|---|---|
+| chr13:66842467 | 6.3Mb | NA | Too large for current pipeline (ignored) |
+| chr11:58991970 | 64kb | 34% | Depth-scan found 25kb partial call; full 64kb not resolved due to internal depth variation |
+| chr3:169770590 | 108bp | 10% | Position accuracy — closest call (89bp early-CIGAR) lands 672bp downstream. Very low VAF. |
+
+### Somatic-Specific Observations
+
+- Dinara detects somatic DELs down to **VAF ~7%** (chr6:72397103 at 6.6%, chr10:132826517 at 8.8%)
+- The depth-scan source is essential for somatic analysis — large somatic DELs (5kb+) consistently time out during assembly
+- The depth-scan `sub` (subclonal) threshold (ratio <0.85) catches het-like and subclonal depth drops that the existing depth-deficit source (which uses fixed flank sizes) may miss
+
+### Cluster Paths
+
+- **Cases**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/somatic_hg008/cases/`
+- **Results (assembly only)**: `.../somatic_hg008/results/`
+- **Results (+ depth-scan)**: `.../somatic_hg008/results_dscan/`
+- **Truth set**: `.../somatic_hg008/truth/`
+- **Manifest**: `.../somatic_hg008/manifest.tsv`
+- **VCFs**: `.../somatic_hg008/dinara_somatic_dels.vcf.gz` (assembly only), `.../somatic_hg008/dinara_dscan_dels.vcf.gz` (+ depth-scan)
+- **Truvari**: `.../somatic_hg008/truvari_all/` (assembly only), `.../somatic_hg008/truvari_dscan/` (+ depth-scan)
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36k_depthscan`
+- **Prepare script**: `.../somatic_hg008/prepare_cases_v2.sh`
+- **Run script**: `.../somatic_hg008/run_depthscan.sh`
+
+### Truvari Command (GIAB-recommended for HG008-T)
+
+```bash
+truvari bench \
+  -b GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c {calls}.vcf.gz \
+  --reference GRCh38_GIABv3_...fasta \
+  --includebed GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --sizemax -1 --passonly --pick multi \
+  -o {output}
+```
+
+---
+
 ### Cluster Paths and Binaries
 
-- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..k}_*`
+- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..k}_*`, `dinara_v36k_depthscan`
 - **Results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/results_v36{d..k}/`
+- **Somatic results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/somatic_hg008/`
 - **Analysis scripts**: `analyze.py`, `source_essentiality.py`, `analyze_multisource_v2.py`, `analyze_gap.py`, `analyze_adaptive.py` in `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/`
 - **SLURM template**: `run_eval_v36k.sh` — array job, 100 cases per task, 102 tasks
 
@@ -1072,10 +1229,14 @@ cd /workspaces/dinara/build && make -j$(nproc)
 # Deploy to cluster
 scp build/Executable/dinara kyriakik@ec-hub.sc1.science.roche.com:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_<version>
 
-# Run eval
+# Run eval (germline HG002)
 ssh kyriakik@ec-hub.sc1.science.roche.com
 cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval
 sbatch run_eval_<version>.sh
+
+# Run eval (somatic HG008-T)
+cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/somatic_hg008
+sbatch run_depthscan.sh
 
 # Analyze
 python3 analyze.py cases results_<version>

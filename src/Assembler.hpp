@@ -2656,6 +2656,23 @@ public:
         uint32_t minK,
         uint32_t maxK) const;
 
+    // Depth-scan DEL detection: scans BAM depth in windows to
+    // detect deletions from depth drops relative to flanking
+    // regions. Works for large DELs and subclonal somatic DELs
+    // where assembly may time out or CIGAR signals are absent.
+    struct DepthScanDelCall {
+        uint32_t breakpointPos;  // start of depth drop (local coords)
+        int64_t size;            // estimated DEL size
+        double depthRatio;       // inside_depth / flank_depth
+        double estimatedVaf;     // 1.0 - depthRatio
+        string source;           // "depth-scan-hom", "depth-scan-het", "depth-scan-sub"
+    };
+    vector<DepthScanDelCall> depthScanDelCalls(
+        const string& bamFileName,
+        const string& refName,
+        uint32_t refStart,
+        uint32_t refEnd) const;
+
     // Parse soft-clip breakpoints and CIGAR indels from BAM.
     // Returns soft-clip breakpoints and CIGAR indel calls in
     // a single BAM pass for efficiency.
