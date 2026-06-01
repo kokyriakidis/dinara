@@ -362,7 +362,10 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         vector<uint32_t> filteredPositions;
-        filterBackboneJourney(backboneOid, seedBegin, seedEnd, filteredPositions);
+        filteredPositions.reserve(n);
+        for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
+            filteredPositions.push_back(pos);
+        }
 
         const uint32_t windowId = uint32_t(anchorWindows.size());
         AnchorWindow window;
