@@ -168,6 +168,11 @@ public:
     bool useSimdClosedSyncmers;
     int syncmerS;
 
+    // Minimum fraction of read length that must be covered by the marker span
+    // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
+    // 0 disables the filter.
+    double minMarkerSpanFraction;
+
     // Minimizer window size for --command svanchors.
     // w=1 selects every k-mer position (no subsampling).
     int minimizerW;

@@ -2569,6 +2569,10 @@ public:
     // Prune existing markers based on KmerCounter frequencies.
     void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes = true);
 
+    // Remove all markers from reads whose marker span covers less than
+    // minSpanFraction of the read length. Span = lastMarkerPos + k - firstMarkerPos.
+    void filterReadsByMarkerSpanCoverage(double minSpanFraction, uint64_t threadCount);
+
     // Remove markers whose k-mer appears more than once in the reference reads
     // (read IDs 0..referenceReadCount-1). Non-unique reference k-mers are
     // ambiguous anchors and cannot be used for read-to-reference alignment.

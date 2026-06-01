@@ -861,6 +861,14 @@ void dinara::main::assemble(
         // The SIMD path does this via countKmersFromMarkerKmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
     }
+
+    // Filter reads whose marker span covers less than the threshold fraction
+    // of the read length. Reads with sparse markers contribute noise.
+    if(assemblerOptions.kmersOptions.minMarkerSpanFraction > 0.0) {
+        assembler.filterReadsByMarkerSpanCoverage(
+            assemblerOptions.kmersOptions.minMarkerSpanFraction, threadCount);
+    }
+
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
 
