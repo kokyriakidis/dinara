@@ -272,23 +272,40 @@ void Assembler::computeAnchorWindowsClean(
         const auto journey = (*shasta2Journeys)[backboneOid];
         const uint32_t n = seedEnd - seedBegin;
         if(n == 0) return;
-        if(n == 1) {
-            filteredPositions.push_back(seedBegin);
+        if(n <= 2) {
+            for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
+                filteredPositions.push_back(pos);
+            }
             return;
         }
 
-        // dp[i] = length of longest consistent subsequence ending at position i.
-        // prev[i] = predecessor index in the subsequence (-1 if none).
-        vector<uint32_t> dp(n, 1);
-        vector<int32_t> prev(n, -1);
+        // Run LIS on the interior positions [1..n-2], keeping only
+        // consecutive pairs with >= minCommonForBackbone common reads.
+        // First and last positions are always kept.
+        const uint32_t interiorN = n - 2;  // number of interior positions
 
-        for(uint32_t i = 1; i < n; i++) {
-            const Shasta2AnchorId anchorI = journey[seedBegin + i];
-            // Look back up to maxSkipForBackbone positions.
+        // dp[i] = length of longest consistent subsequence ending at interior position i.
+        // prev[i] = predecessor index in the subsequence (-1 if none).
+        vector<uint32_t> dp(interiorN, 0);
+        vector<int32_t> prev(interiorN, -1);
+
+        // Seed: interior positions reachable from the first anchor.
+        const Shasta2AnchorId firstAnchor = journey[seedBegin];
+        for(uint32_t i = 0; i < interiorN && i < maxSkipForBackbone; i++) {
+            const Shasta2AnchorId anchorI = journey[seedBegin + 1 + i];
+            if(shasta2Anchors->countCommon(firstAnchor, anchorI) >= minCommonForBackbone) {
+                dp[i] = 1;
+            }
+        }
+
+        // Fill DP for interior positions.
+        for(uint32_t i = 1; i < interiorN; i++) {
+            const Shasta2AnchorId anchorI = journey[seedBegin + 1 + i];
             const uint32_t lookBack = min(uint64_t(i), maxSkipForBackbone);
             for(uint32_t step = 1; step <= lookBack; step++) {
                 const uint32_t j = i - step;
-                const Shasta2AnchorId anchorJ = journey[seedBegin + j];
+                if(dp[j] == 0) continue;  // j not reachable from first anchor
+                const Shasta2AnchorId anchorJ = journey[seedBegin + 1 + j];
                 if(shasta2Anchors->countCommon(anchorJ, anchorI) >= minCommonForBackbone) {
                     if(dp[j] + 1 > dp[i]) {
                         dp[i] = dp[j] + 1;
@@ -298,20 +315,33 @@ void Assembler::computeAnchorWindowsClean(
             }
         }
 
-        // Find the position with the longest subsequence.
-        uint32_t bestEnd = 0;
-        for(uint32_t i = 1; i < n; i++) {
-            if(dp[i] > dp[bestEnd]) {
-                bestEnd = i;
+        // Find the best interior endpoint that also connects to the last anchor.
+        const Shasta2AnchorId lastAnchor = journey[seedEnd - 1];
+        int32_t bestEnd = -1;
+        for(int32_t i = int32_t(interiorN) - 1;
+            i >= 0 && i >= int32_t(interiorN) - int32_t(maxSkipForBackbone);
+            i--)
+        {
+            if(dp[i] == 0) continue;
+            const Shasta2AnchorId anchorI = journey[seedBegin + 1 + uint32_t(i)];
+            if(shasta2Anchors->countCommon(anchorI, lastAnchor) >= minCommonForBackbone) {
+                if(bestEnd < 0 || dp[i] > dp[bestEnd]) {
+                    bestEnd = i;
+                }
             }
         }
 
-        // Reconstruct the subsequence.
-        vector<uint32_t> reversePath;
-        for(int32_t idx = int32_t(bestEnd); idx >= 0; idx = prev[idx]) {
-            reversePath.push_back(seedBegin + uint32_t(idx));
+        // Build result: first anchor + interior LIS + last anchor.
+        filteredPositions.push_back(seedBegin);
+        if(bestEnd >= 0) {
+            vector<uint32_t> reversePath;
+            for(int32_t idx = bestEnd; idx >= 0; idx = prev[idx]) {
+                reversePath.push_back(seedBegin + 1 + uint32_t(idx));
+            }
+            filteredPositions.insert(filteredPositions.end(),
+                reversePath.rbegin(), reversePath.rend());
         }
-        filteredPositions.assign(reversePath.rbegin(), reversePath.rend());
+        filteredPositions.push_back(seedEnd - 1);
     };
 
     auto createWindow = [&](OrientedReadId backboneOid, uint32_t seedBegin, uint32_t seedEnd) {
@@ -332,10 +362,7 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         vector<uint32_t> filteredPositions;
-        filteredPositions.reserve(n);
-        for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
-            filteredPositions.push_back(pos);
-        }
+        filterBackboneJourney(backboneOid, seedBegin, seedEnd, filteredPositions);
 
         const uint32_t windowId = uint32_t(anchorWindows.size());
         AnchorWindow window;
