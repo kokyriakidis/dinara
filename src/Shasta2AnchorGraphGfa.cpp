@@ -34,9 +34,19 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
         activeVertices.insert(target(e, *this));
     }
 
-    // Write active vertices.
+    // Write active vertices with window ID and strand tags.
     for(const auto v : activeVertices) {
-        gfa << "S\t" << v << "\t*\tLN:i:1\n";
+        gfa << "S\t" << v << "\t*\tLN:i:1";
+        if(uint64_t(v) < anchorCount) {
+            const uint32_t wid = anchorToWindow[uint64_t(v)];
+            if(wid != noWindow) {
+                const uint32_t fwdWid = normalize(wid);
+                const bool isRc = (wid >= windowCount);
+                gfa << "\twn:i:" << fwdWid
+                    << "\tws:Z:" << (isRc ? "rc" : "fw");
+            }
+        }
+        gfa << "\n";
     }
 
     // Write edges. All edges are forward-to-forward.

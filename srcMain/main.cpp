@@ -1668,9 +1668,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
-    // Detangle Case 1: create bypass edges and remove flow reads from backbone.
-    // COMMENTED OUT pending validation on larger datasets.
-#if 0
+    // Detangle: tangle-aware window bypass using G-test + Verkko-style triplet validation.
     std::vector<DetangleBypassEdge> bypassEdges;
     {
         const uint64_t detangledCount = detangleWindows(
@@ -1694,7 +1692,6 @@ void dinara::main::assemble(
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
         }
     }
-#endif
 
     // Write external anchors after detangling so new split anchors are included.
     cout << timestamp << "Writing Shasta2 external anchors to "

@@ -17,12 +17,13 @@ struct DetangleBypassEdge {
     Shasta2AnchorId anchorIdB;  // First anchor in next window.
 };
 
-// Detangle windows by bypassing all through-flows.
+// Detangle windows using Verkko-style triplet resolution.
 //
-// For each window X with reads flowing A -> X -> B, creates bypass
-// edges connecting A directly to B and removes the flow reads from
-// X's backbone anchors. Every through-flow is bypassed regardless
-// of read count.
+// For each window X with multiple predecessors and/or successors,
+// checks if every significant edge is covered by a solid triplet.
+// If so, creates bypass edges for each solid (prev, succ) pairing
+// and removes the flow reads from X's backbone anchors.
+// Linear windows (≤1 predecessor AND ≤1 successor) are never bypassed.
 //
 // Returns the number of windows detangled.
 // bypassEdges: edges to add to the anchor graph.
