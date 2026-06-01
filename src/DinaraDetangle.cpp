@@ -283,15 +283,16 @@ uint64_t dinara::detangleWindows(
         set<pair<uint32_t, uint32_t>> solidTriplets;
         set<uint32_t> tripletCoveredPreds, tripletCoveredSuccs;
 
-        // Count per-edge coverage from ALL transitions (including edge-of-graph
-        // entries where one side is noW). Matching Verkko, which counts
-        // covered_in/out_neighbors from pairwise adjacency, not just full triplets.
+        // Count per-edge coverage and identify solid triplets.
+        // Only full triplets (both pred and succ known) contribute.
+        // Reads with noW on one side (starting/ending inside the window)
+        // cannot form triplets and should not inflate edge coverage.
         map<uint32_t, uint64_t> coveredInNeighbors, coveredOutNeighbors;
         for(const auto& [key, reads] : window.transitionReads) {
-            if(key.first != noW) coveredInNeighbors[key.first] += reads.size();
-            if(key.second != noW) coveredOutNeighbors[key.second] += reads.size();
-            // Only full triplets (both sides known) can be solid.
-            if(key.first != noW && key.second != noW && reads.size() >= minEdgeSupport) {
+            if(key.first == noW || key.second == noW) continue;
+            coveredInNeighbors[key.first] += reads.size();
+            coveredOutNeighbors[key.second] += reads.size();
+            if(reads.size() >= minEdgeSupport) {
                 solidTriplets.insert({key.first, key.second});
                 tripletCoveredPreds.insert(key.first);
                 tripletCoveredSuccs.insert(key.second);
@@ -299,13 +300,11 @@ uint64_t dinara::detangleWindows(
         }
 
         // Check: every significant predecessor edge must be covered.
-        // An edge is skippable only if BOTH its coverage < minEdgeCoverage
+        // Only predecessors that appear in full triplets (both sides known)
+        // are checked. An edge is skippable if its coverage < minEdgeCoverage
         // AND the neighbor window is removable (low coverage).
-        // Matching Verkko: weak edges to disposable neighbors are ignored.
         bool tripletClean = true;
-        for(const uint32_t pred : predecessors) {
-            auto it = coveredInNeighbors.find(pred);
-            uint64_t cov = (it != coveredInNeighbors.end()) ? it->second : 0;
+        for(const auto& [pred, cov] : coveredInNeighbors) {
             if(cov < minEdgeCoverage && isRemovable(pred)) continue;
             if(tripletCoveredPreds.find(pred) == tripletCoveredPreds.end()) {
                 const uint32_t normPred = normalize(pred);
@@ -320,9 +319,7 @@ uint64_t dinara::detangleWindows(
 
         // Check: every significant successor edge must be covered.
         if(tripletClean) {
-            for(const uint32_t succ : successors) {
-                auto it = coveredOutNeighbors.find(succ);
-                uint64_t cov = (it != coveredOutNeighbors.end()) ? it->second : 0;
+            for(const auto& [succ, cov] : coveredOutNeighbors) {
                 if(cov < minEdgeCoverage && isRemovable(succ)) continue;
                 if(tripletCoveredSuccs.find(succ) == tripletCoveredSuccs.end()) {
                     const uint32_t normSucc = normalize(succ);
