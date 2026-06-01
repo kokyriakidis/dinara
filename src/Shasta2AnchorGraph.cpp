@@ -363,12 +363,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const auto journey = journeys[oid];
         if(journey.empty()) continue;
 
-        // Skip contained reads for inter-window edge discovery.
         if(reads) {
             const ReadId readId = oid.getReadId();
             if(readId < reads->readCount() && reads->getFlags(readId).isContained) {
                 ++containedSkipCount;
-                continue;
             }
         }
 
