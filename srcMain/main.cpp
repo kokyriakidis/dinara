@@ -3993,6 +3993,27 @@ void dinara::main::svanchors(
                      << ", reads=" << ci.readCount
                      << endl;
             }
+
+            // Depth-scan DEL detection: detect deletions from
+            // depth drops in windowed BAM depth. Runs before
+            // DP chaining so calls are emitted even if chaining
+            // times out on high-read-count regions.
+            auto depthCalls = assembler.depthScanDelCalls(
+                bamAbsolutePath, refName,
+                regionStart, regionStart + refLength);
+            for(const auto& dc : depthCalls) {
+                // Format dhffc to 2 decimal places.
+                char dhffcBuf[16];
+                snprintf(dhffcBuf, sizeof(dhffcBuf),
+                         "%.2f", dc.depthRatio);
+                cout << "    >>> DELETION CALL (" << dc.source
+                     << "): size=" << dc.size << "bp"
+                     << ", breakpoint=" << dc.breakpointPos
+                     << ", reads=0"
+                     << ", dhffc=" << dhffcBuf
+                     << ", mapq0=0.00"
+                     << endl;
+            }
         }
     }
 
