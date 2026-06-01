@@ -52,8 +52,9 @@ void Shasta2AnchorGraph::writeGfa(const string& fileName,
             << "\tRC:i:" << edge.coverage();
 
         // Inter-window edge attributes.
-        if(edge.maxSupportingSpan > 0) {
-            gfa << "\tms:i:" << edge.maxSupportingSpan;
+        if(edge.supportingSpanPrev > 0 || edge.supportingSpanNext > 0) {
+            gfa << "\tsp:i:" << edge.supportingSpanPrev
+                << "\tsn:i:" << edge.supportingSpanNext;
         }
         if(edge.sharedReadCount > 0) {
             gfa << "\tsr:i:" << edge.sharedReadCount;

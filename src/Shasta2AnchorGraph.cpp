@@ -339,7 +339,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         Shasta2AnchorId lastAnchorInA;
         Shasta2AnchorId firstAnchorInB;
         uint64_t supportingSpanProduct;  // spanA * spanB (for selection)
-        uint64_t supportingSpanSum;      // spanA + spanB (for edge attribute)
+        uint64_t supportingSpanA;        // base span in source window
+        uint64_t supportingSpanB;        // base span in destination window
     };
 
     // Per window pair: all read transitions.
@@ -409,7 +410,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     auto key = std::make_pair(currentWindow, windowId);
                     // Spans are 0 for now — finalized in second pass.
                     windowPairTransitions[key].push_back(
-                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0, 0});
+                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0, 0, 0});
                 }
                 currentWindow = windowId;
                 lastAnchorInCurrentWindow = anchorId;
@@ -418,9 +419,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 
     // Second pass: finalize supporting spans for each read transition.
-    // Product (spanA * spanB) is used for selection — rewards balanced
-    // and deep coverage. Sum (spanA + spanB) is stored on the edge
-    // as a human-readable metric.
+    // Product (spanA * spanB) is used for tiebreaking selection.
+    // Individual spans are stored on the edge as separate attributes.
     for(auto& [windowPair, transitions] : windowPairTransitions) {
         for(auto& t : transitions) {
             auto readSpanIt = readWindowSpans.find(t.oidValue);
@@ -432,7 +432,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(itA != spans.end()) spanA = itA->second.lastBasePos - itA->second.firstBasePos;
             if(itB != spans.end()) spanB = itB->second.lastBasePos - itB->second.firstBasePos;
             t.supportingSpanProduct = spanA * spanB;
-            t.supportingSpanSum = spanA + spanB;
+            t.supportingSpanA = spanA;
+            t.supportingSpanB = spanB;
         }
     }
 
@@ -483,7 +484,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     Shasta2AnchorId(uint64_t(t.lastAnchorInA) ^ 1ULL);
                 dstTransitions.push_back({
                     t.oidValue, newLastInA, newFirstInB,
-                    t.supportingSpanProduct, t.supportingSpanSum});
+                    t.supportingSpanProduct, t.supportingSpanB, t.supportingSpanA});
                 ++mergedTransitions;
             }
             windowPairTransitions.erase(key);
@@ -572,7 +573,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         const std::pair<uint32_t, uint32_t>& windowPair,
         Shasta2AnchorPair& bestPair,
         uint64_t sharedReads,
-        uint64_t bestSpan)
+        uint64_t spanPrev,
+        uint64_t spanNext)
     {
         DINARA_ASSERT(anchors.countCommon(bestPair.anchorIdA, bestPair.anchorIdB) > 0);
         // Forward edge.
@@ -583,12 +585,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             Shasta2AnchorGraphEdge(bestPair, bestPair.getAverageOffset(anchors), nextEdgeId++),
             anchorGraph);
         anchorGraph[e].useForAssembly = true;
-        anchorGraph[e].maxSupportingSpan = bestSpan;
+        anchorGraph[e].supportingSpanPrev = spanPrev;
+        anchorGraph[e].supportingSpanNext = spanNext;
         anchorGraph[e].sharedReadCount = sharedReads;
         createdEdges.push_back({windowPair, bestPair.anchorIdA, bestPair.anchorIdB, sharedReads});
         ++interWindowCreated;
 
         // RC mirror edge: reverse the anchor pair and flip both anchor IDs.
+        // Spans swap: the RC mirror's prev is the forward's next and vice versa.
         const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
         const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
         if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
@@ -601,7 +605,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
                     anchorGraph);
                 anchorGraph[eRc].useForAssembly = true;
-                anchorGraph[eRc].maxSupportingSpan = bestSpan;
+                anchorGraph[eRc].supportingSpanPrev = spanNext;
+                anchorGraph[eRc].supportingSpanNext = spanPrev;
                 anchorGraph[eRc].sharedReadCount = sharedReads;
                 // RC window pair.
                 const uint32_t rcSrc = (windowPair.second < windowCount)
@@ -686,7 +691,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             entryPair.removeNegativeOffsets(anchors);
             if(entryPair.size() > 0) {
                 createInterWindowEdge(windowPair, entryPair, sharedReads,
-                    entryTransition->supportingSpanSum);
+                    entryTransition->supportingSpanA, entryTransition->supportingSpanB);
                 entryCreated = true;
             }
         }
@@ -702,7 +707,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             exitPair.removeNegativeOffsets(anchors);
             if(exitPair.size() > 0) {
                 createInterWindowEdge(windowPair, exitPair, sharedReads,
-                    exitTransition->supportingSpanSum);
+                    exitTransition->supportingSpanA, exitTransition->supportingSpanB);
                 exitCreated = true;
             }
         }
