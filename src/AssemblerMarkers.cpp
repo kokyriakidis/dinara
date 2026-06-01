@@ -318,36 +318,13 @@ static size_t getMinimizerMarkersForRead(
         readSequence[i] = read[i].character();
     }
 
-    // Compute canonical minimizer positions and merge with forced read ends (0 and baseCount - k).
-    // Read end forcing ensures that the very first and last possible k-mers of every read
-    // are included as markers, which is critical for graph connectivity at read boundaries.
+    // Compute canonical minimizer positions.
     MinimizerList minimizerList = canonical_minimizer_positions(
         sketcher,
         readSequence.c_str(),
         readSequence.size());
     positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
     free_minimizer_list(minimizerList);
-
-    // Force all k-mer positions before the first minimizer and after the last minimizer.
-    const uint32_t lastKmerPos = uint32_t(baseCount - k);
-    if(!positionBuffer.empty()) {
-        const uint32_t firstMinimizer = positionBuffer.front();
-        const uint32_t lastMinimizer  = positionBuffer.back();
-        for(uint32_t p = 0; p < firstMinimizer; ++p) {
-            positionBuffer.push_back(p);
-        }
-        for(uint32_t p = lastMinimizer + 1; p <= lastKmerPos; ++p) {
-            positionBuffer.push_back(p);
-        }
-    } else {
-        for(uint32_t p = 0; p <= lastKmerPos; ++p) {
-            positionBuffer.push_back(p);
-        }
-    }
-
-    // Sort and deduplicate to handle cases where read ends were already selected as minimizers.
-    std::sort(positionBuffer.begin(), positionBuffer.end());
-    positionBuffer.erase(std::unique(positionBuffer.begin(), positionBuffer.end()), positionBuffer.end());
 
     const size_t uniqueCandidateCount = positionBuffer.size();
 
