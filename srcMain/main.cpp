@@ -1615,7 +1615,7 @@ void dinara::main::assemble(
     // Save the post-detangling anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
-    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
+    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
 
     // Export in shasta2-native format for --external-anchor-graph-name.
     shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
@@ -3119,7 +3119,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
     shasta2AnchorGraph->saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
-    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph");
+    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
 
 
     // Transitive reduction.

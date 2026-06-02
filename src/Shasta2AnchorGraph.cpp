@@ -2109,41 +2109,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Recount edge types after trimming (clear_vertex may have removed edges).
+    // Recount edge types (only active edges).
     uint64_t finalIntraCount = 0;
-    uint64_t finalAltPathCount = 0;
     uint64_t finalInterCount = 0;
+    uint64_t finalDisabledCount = 0;
+    uint64_t finalActiveCount = 0;
+    std::set<Shasta2AnchorId> activeVertices;
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
         if(!anchorGraph[e].useForAssembly) {
-            ++finalAltPathCount;
+            ++finalDisabledCount;
+            continue;
+        }
+        ++finalActiveCount;
+        activeVertices.insert(source(e, anchorGraph));
+        activeVertices.insert(target(e, anchorGraph));
+        const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
+        const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
+        const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
+        const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
+        if(srcWin != noWindow && srcWin == dstWin) {
+            ++finalIntraCount;
         } else {
-            // Check if both endpoints belong to the same window.
-            const uint64_t srcAnchor = uint64_t(source(e, anchorGraph));
-            const uint64_t dstAnchor = uint64_t(target(e, anchorGraph));
-            const uint32_t srcWin = (srcAnchor < anchorCount) ? anchorToWindow[srcAnchor] : noWindow;
-            const uint32_t dstWin = (dstAnchor < anchorCount) ? anchorToWindow[dstAnchor] : noWindow;
-            if(srcWin != noWindow && srcWin == dstWin) {
-                ++finalIntraCount;
-            } else {
-                ++finalInterCount;
-            }
+            ++finalInterCount;
         }
     }
 
-    // Count non-isolated vertices (vertices with at least one edge).
-    uint64_t nonIsolatedVertexCount = 0;
-    for(Shasta2AnchorId v = 0; v < anchorCount; v++) {
-        if(in_degree(v, anchorGraph) > 0 || out_degree(v, anchorGraph) > 0) {
-            ++nonIsolatedVertexCount;
-        }
-    }
-
-    cout << "The anchor graph has " << nonIsolatedVertexCount
-         << " non-isolated vertices (" << num_vertices(*this) << " total), "
-         << num_edges(*this) << " edges"
+    cout << "The anchor graph has " << activeVertices.size()
+         << " active vertices (" << num_vertices(*this) << " total), "
+         << finalActiveCount << " active edges"
          << " (" << finalIntraCount << " intra-window, "
-         << finalAltPathCount << " alternate-path, "
-         << finalInterCount << " inter-window)." << endl;
+         << finalInterCount << " inter-window, "
+         << finalDisabledCount << " disabled)." << endl;
 
     // Verify all edges: for each orientedReadId, check its base position
     // on both anchors. Report edges where any read has negative base offset
@@ -2153,6 +2149,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t missingReadEdgeCount = 0;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
             const auto& dEdge = anchorGraph[e];
+            if(!dEdge.useForAssembly) continue;
             const auto& ap = dEdge.anchorPair;
             if(ap.orientedReadIds.empty()) continue;
 
