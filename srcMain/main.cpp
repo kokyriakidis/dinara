@@ -4135,9 +4135,10 @@ void dinara::main::svanchors(
     // ========================================================================
     // Step 7: Build Theseus MSA using chain anchors as segment boundaries.
     // ========================================================================
-    cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
-    assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile,
-                         bamAbsolutePath);
+    // Commented out: not used for DEL calling. Re-enable for INS calling.
+    // cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
+    // assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile,
+    //                      bamAbsolutePath);
 
     // ========================================================================
     // Summary.
