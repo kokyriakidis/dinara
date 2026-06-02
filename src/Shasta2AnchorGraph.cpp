@@ -559,19 +559,18 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
            uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
             Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
             rcPair.assertNoNegativeOffsets(anchors);
-            if(rcPair.size() > 0) {
-                edge_descriptor eRc;
-                tie(eRc, ignore) = add_edge(
-                    rcB, rcA,
-                    Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
-                    anchorGraph);
-                anchorGraph[eRc].useForAssembly = true;
-                anchorGraph[eRc].supportingSpanPrev = spanNext;
-                anchorGraph[eRc].supportingSpanNext = spanPrev;
-                anchorGraph[eRc].sharedReadCount = sharedReads;
-                createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
-                ++interWindowCreated;
-            }
+            DINARA_ASSERT(rcPair.size() > 0);
+            edge_descriptor eRc;
+            tie(eRc, ignore) = add_edge(
+                rcB, rcA,
+                Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[eRc].useForAssembly = true;
+            anchorGraph[eRc].supportingSpanPrev = spanNext;
+            anchorGraph[eRc].supportingSpanNext = spanPrev;
+            anchorGraph[eRc].sharedReadCount = sharedReads;
+            createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
+            ++interWindowCreated;
         }
     };
 
