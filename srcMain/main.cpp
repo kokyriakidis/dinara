@@ -1582,14 +1582,13 @@ void dinara::main::assemble(
     // Disabled: needs further tuning.
     // shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
 
-#if 0
-    // Detangling disabled.
+    // G-test based detangling.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
     std::vector<DetangleBypassEdge> bypassEdges;
     {
-        const uint64_t detangledCount = detangleWindows(
+        const uint64_t detangledCount = detangleWindowsGTest(
             *shasta2Anchors,
             *shasta2Journeys,
             anchorWindows,
@@ -1609,7 +1608,6 @@ void dinara::main::assemble(
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
         }
     }
-#endif
 
     // Write external anchors.
     cout << timestamp << "Writing Shasta2 external anchors to "
