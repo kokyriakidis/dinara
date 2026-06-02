@@ -336,10 +336,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Inter-window edges: walk each read's journey and collect candidate
-    // anchor pairs (lastAnchorInWindowA, firstAnchorInWindowB) for each
-    // ordered window pair. Pick the candidate with the highest shared
-    // read count (commonReadCount).
+    // Inter-window edges disabled.
+#if 0
 
     // Per-read transition: which anchor pair the read uses at the boundary,
     // plus the read's supporting span across both windows.
@@ -705,6 +703,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Diagnostic summary.
     cout << "Inter-window edges: " << interWindowCreated << " created, "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
+#endif
+    cout << "Inter-window edges disabled." << endl;
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
@@ -1811,23 +1811,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     removeDanglingWindowsIterative("post-filter");
 #endif
 
-    // Populate per-window outEdges/inEdges from createdEdges.
-    for(const auto& edgeInfo : createdEdges) {
-        const uint32_t srcW = edgeInfo.windowPair.first;
-        const uint32_t dstW = edgeInfo.windowPair.second;
-        // anchorWindows only has windowCount entries (forward windows).
-        // For RC mirror windows (>= windowCount), skip — they don't have
-        // AnchorWindow entries. The RC edges are already tracked via the
-        // forward window's edges + anchor ^ 1.
-        if(srcW < windowCount) {
-            auto& w = const_cast<AnchorWindow&>(anchorWindows[srcW]);
-            w.outEdges.push_back({dstW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
-        }
-        if(dstW < windowCount) {
-            auto& w = const_cast<AnchorWindow&>(anchorWindows[dstW]);
-            w.inEdges.push_back({srcW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
-        }
-    }
+    // Populate per-window outEdges/inEdges from createdEdges (disabled — no inter-window edges).
 
 
 
