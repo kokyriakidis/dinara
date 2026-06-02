@@ -124,10 +124,18 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
     }
 
     uint64_t edgeCount = 0;
+    uint64_t skippedEdgeCount = 0;
     BGL_FORALL_EDGES(e, dinaraGraph, Shasta2AnchorGraphBaseClass) {
+        const auto& dEdge = dinaraGraph[e];
+
+        // Only export active edges.
+        if(!dEdge.useForAssembly) {
+            ++skippedEdgeCount;
+            continue;
+        }
+
         const auto src = boost::source(e, dinaraGraph);
         const auto tgt = boost::target(e, dinaraGraph);
-        const auto& dEdge = dinaraGraph[e];
 
         // Convert dinara AnchorPair -> shasta2 AnchorPair.
         shasta2::AnchorPair shastaPair;
@@ -141,7 +149,7 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
         }
 
         shasta2::AnchorGraphEdge shastaEdge(shastaPair, dEdge.offset, dEdge.id);
-        shastaEdge.useForAssembly = dEdge.useForAssembly;
+        shastaEdge.useForAssembly = true;
 
         boost::add_edge(src, tgt, shastaEdge, shastaGraph);
         ++edgeCount;
@@ -149,7 +157,8 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
 
     cout << "Exporting AnchorGraph for shasta2: "
          << nVertices << " vertices, "
-         << edgeCount << " edges." << endl;
+         << edgeCount << " active edges ("
+         << skippedEdgeCount << " disabled edges skipped)." << endl;
 
     // Serialize with the same archive structure as shasta2::AnchorGraph.
     ostringstream oss;
