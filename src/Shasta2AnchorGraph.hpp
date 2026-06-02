@@ -145,6 +145,16 @@ public:
         const Shasta2Journeys& journeys,
         uint32_t maxTipWindows = 3);
 
+    // Pop superbubbles: find superbubbles in the active-edge subgraph,
+    // choose the best path through each (prefer the source window's
+    // backbone path), and disable edges on all other paths.
+    // maxSize limits the number of internal vertices per superbubble.
+    // Returns the number of superbubbles popped.
+    uint64_t popSuperbubbles(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys,
+        uint64_t maxSize = 100);
+
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
 public:
