@@ -116,6 +116,9 @@ public:
     // Remove from the Shasta2AnchorPair OrientedReadIds that have negative offsets.
     void removeNegativeOffsets(const Shasta2Anchors&);
 
+    // Assert that no reads have negative base offsets (anchorB position < anchorA position).
+    void assertNoNegativeOffsets(const Shasta2Anchors&) const;
+
     bool contains(OrientedReadId) const;
 
     // Return the url for the exploreAnchorPair2 page for this Shasta2AnchorPair.

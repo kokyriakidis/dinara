@@ -177,6 +177,27 @@ void Shasta2AnchorPair::removeNegativeOffsets(const Shasta2Anchors& anchors)
 
 
 
+void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) const
+{
+    vector< pair<uint32_t, uint32_t> > anchorPositions;
+    getAnchorPositions(anchors, anchorPositions);
+    DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
+
+    for(uint64_t i = 0; i < orientedReadIds.size(); i++) {
+        const auto& p = anchorPositions[i];
+        if(p.second < p.first) {
+            cout << "Negative base offset on edge "
+                 << anchorIdA << " -> " << anchorIdB
+                 << ": " << orientedReadIds[i]
+                 << " basePos A=" << p.first << " B=" << p.second
+                 << " (offset " << int64_t(p.second) - int64_t(p.first) << ")"
+                 << endl;
+            DINARA_ASSERT(false);
+        }
+    }
+}
+
+
 // Same as the above, but also returns compute the sequences.
 void Shasta2AnchorPair::get(
     const Shasta2Anchors& anchors,

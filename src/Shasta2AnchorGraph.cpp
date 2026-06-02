@@ -78,7 +78,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(uint64_t i=0; i<children.size(); i++) {
             const Shasta2AnchorId anchorIdB = children[i];
             Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, true);
-            anchorPair.removeNegativeOffsets(anchors);
+            anchorPair.assertNoNegativeOffsets(anchors);
             if(anchorPair.orientedReadIds.empty()) {
                 continue;
             }
@@ -166,7 +166,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
-        anchorPair.removeNegativeOffsets(anchors);
+        anchorPair.assertNoNegativeOffsets(anchors);
         if(anchorPair.orientedReadIds.empty()) {
             return false;
         }
@@ -558,7 +558,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(!isSelfRcMirror &&
            uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
             Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
-            rcPair.removeNegativeOffsets(anchors);
+            rcPair.assertNoNegativeOffsets(anchors);
             if(rcPair.size() > 0) {
                 edge_descriptor eRc;
                 tie(eRc, ignore) = add_edge(
@@ -607,7 +607,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
-        anchorPair.removeNegativeOffsets(anchors);
+        anchorPair.assertNoNegativeOffsets(anchors);
         if(anchorPair.size() == 0) {
             ++interWindowZeroPairs;
             continue;
