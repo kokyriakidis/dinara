@@ -3853,7 +3853,13 @@ void dinara::main::svanchors(
     // Tunable via --Kmers.minimizerW (default 1 = all positions).
     const int w = assemblerOptions.kmersOptions.minimizerW;
     cout << timestamp << "Finding minimizer markers (k=" << k << ", w=" << w << ")." << endl;
-    assembler.findMarkersSimdMinimizers(threadCount, k, w);
+    {
+        const auto tMark0 = steady_clock::now();
+        assembler.findMarkersSimdMinimizers(threadCount, k, w);
+        const auto tMark1 = steady_clock::now();
+        cout << "    findMarkersSimdMinimizers completed in "
+             << seconds(tMark1 - tMark0) << " s." << endl;
+    }
 
     // ========================================================================
     // Step 3b: Remove markers whose k-mer is non-unique in the reference.
@@ -3874,7 +3880,13 @@ void dinara::main::svanchors(
     // Downstream chaining will query the index to find shared markers between
     // each short read and the reference.
     cout << timestamp << "Building inverted index." << endl;
-    assembler.buildInvertedIndex(threadCount);
+    {
+        const auto tIdx0 = steady_clock::now();
+        assembler.buildInvertedIndex(threadCount);
+        const auto tIdx1 = steady_clock::now();
+        cout << "    buildInvertedIndex completed in "
+             << seconds(tIdx1 - tIdx0) << " s." << endl;
+    }
 
     // ========================================================================
     // Step 4b: K-mer hit depth along the reference.
@@ -4072,11 +4084,17 @@ void dinara::main::svanchors(
     const double maxDriftRate = svOpts.driftRateTolerance;
     const uint64_t maxChainLimit = 0;  // No limit on chains per read.
 
-    assembler.chainAlignmentCandidates(
-        maxDriftRate,
-        maxChainLimit,
-        svOpts,
-        threadCount);
+    {
+        const auto tChain0 = steady_clock::now();
+        assembler.chainAlignmentCandidates(
+            maxDriftRate,
+            maxChainLimit,
+            svOpts,
+            threadCount);
+        const auto tChain1 = steady_clock::now();
+        cout << "    chainAlignmentCandidates completed in "
+             << seconds(tChain1 - tChain0) << " s." << endl;
+    }
 
     // Replace hifiasm-extended qs/qe/ts/te with raw anchor coordinates.
     // push_ovlp_chain_qgen left-normalizes and right-extends to read
@@ -4127,17 +4145,29 @@ void dinara::main::svanchors(
     // (split-read SV signal). Chains overlapping a primary on the query
     // are secondary. Uses minimap2's mask_level=0.5 threshold.
     cout << timestamp << "Classifying split alignments." << endl;
-    assembler.classifySplitAlignments(
-        referenceReadCount,
-        0.5,    // maskLevel: max query overlap fraction to be supplementary.
-        "sv_split_reads.tsv");
+    {
+        const auto tSplit0 = steady_clock::now();
+        assembler.classifySplitAlignments(
+            referenceReadCount,
+            0.5,    // maskLevel: max query overlap fraction to be supplementary.
+            "sv_split_reads.tsv");
+        const auto tSplit1 = steady_clock::now();
+        cout << "    classifySplitAlignments completed in "
+             << seconds(tSplit1 - tSplit0) << " s." << endl;
+    }
 
     // ========================================================================
     // Step 7: Build Theseus MSA using chain anchors as segment boundaries.
     // ========================================================================
     cout << timestamp << "Building Theseus MSA from chain anchors." << endl;
-    assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile,
-                         bamAbsolutePath);
+    {
+        const auto tMsa0 = steady_clock::now();
+        assembler.buildSvMSA(referenceReadCount, "sv_msa", refHitDepthProfile,
+                             bamAbsolutePath);
+        const auto tMsa1 = steady_clock::now();
+        cout << "    buildSvMSA completed in "
+             << seconds(tMsa1 - tMsa0) << " s." << endl;
+    }
 
     // ========================================================================
     // Summary.
