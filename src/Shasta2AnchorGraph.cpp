@@ -2739,7 +2739,20 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
 
     for(uint32_t w = 0; w < windowCount; w++) {
         const auto& window = anchorWindows[w];
-        const auto& positions = window.filteredBackbonePositions;
+
+        // Use filteredBackbonePositions if available, otherwise all positions.
+        static thread_local vector<uint32_t> allPositions;
+        const vector<uint32_t>* positionsPtr;
+        if(!window.filteredBackbonePositions.empty()) {
+            positionsPtr = &window.filteredBackbonePositions;
+        } else {
+            allPositions.clear();
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                allPositions.push_back(pos);
+            }
+            positionsPtr = &allPositions;
+        }
+        const auto& positions = *positionsPtr;
         if(positions.size() <= 1) continue;
         const auto journey = journeys[window.backboneOrientedReadId];
 
