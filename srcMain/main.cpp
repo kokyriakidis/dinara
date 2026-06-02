@@ -1579,7 +1579,8 @@ void dinara::main::assemble(
 
     // Remove short tip chains (dead-end linear chains of <= maxTipWindows windows).
     // Long tips are kept as legitimate subregion ends.
-    shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
+    // Disabled: needs further tuning.
+    // shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
 
 #if 0
     // Detangling disabled.
