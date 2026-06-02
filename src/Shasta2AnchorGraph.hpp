@@ -128,6 +128,23 @@ public:
         const vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
+    // Disable all edges of windows that have no active inter-window edges.
+    // Returns the number of isolated windows removed.
+    uint64_t removeIsolatedWindows(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
+
+    // Remove short tip chains from the window graph.
+    // A tip is a dead-end linear chain of windows (connected on only one side).
+    // Chains of length <= maxTipWindows are removed (all their edges disabled).
+    // This mirrors hifiasm's asg_arc_cut_tips: short tips are artifacts,
+    // long tips are legitimate subregion ends.
+    // Returns the number of windows removed.
+    uint64_t removeTipWindows(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys,
+        uint32_t maxTipWindows = 3);
+
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
 public:
