@@ -1575,11 +1575,11 @@ void dinara::main::assemble(
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
     // Remove isolated windows (no inter-window edges).
-    // shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
+    shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
 
     // Remove short tip chains (dead-end linear chains of <= maxTipWindows windows).
     // Long tips are kept as legitimate subregion ends.
-    // shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
+    shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
 
 #if 0
     // Detangling disabled.
