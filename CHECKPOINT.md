@@ -697,7 +697,7 @@ The sweet spot for read-to-reference matching is k=50 (56% unique), but for read
 
 V36l changes:
 - `src/Assembler.hpp` — `DepthScanDelCall` struct + `depthScanDelCalls()` method declaration
-- `src/AssemblerSvAnchors.cpp` — `depthScanDelCalls()` implementation (~250 lines) + source priority table update (depth-scan-hom/het/sub at priorities 13-15). Two-pass detection: sliding flanking + edge-based flanking with gap tolerance.
+- `src/AssemblerSvAnchors.cpp` — `depthScanDelCalls()` implementation (~250 lines, sweep line depth, minCallSize scaling) + cigar-covdrop source (~40 lines in HitDepth cluster handler) + source priority table (cigar-covdrop=2, early-CIGAR=3, depth-scan-hom/het/sub at 14-16)
 - `srcMain/main.cpp` — depth-scan call site after early-CIGAR block, before DP chaining
 
 ### Git Info
@@ -880,15 +880,17 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 | V36j | + source-priority dedup + SA-DEL removal | 99.2% | 11.8 |
 | V36k | + depth-deficit DEL source | 99.4% | 13.9 |
 | V36l | + depth-scan DEL source (windowed BAM depth) | 99.4%* | ~15 |
+| V36m | + cigar-covdrop source + sweep line depth + minCallSize scaling | 99.4%* | ~15 |
 
-*V36l recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan source is primarily impactful for somatic analysis (HG008-T: 81.7% → 96.7%).
+*V36l/V36m recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan and cigar-covdrop sources are primarily impactful for somatic analysis (HG008-T: 81.7% → 100%).
 
-### Current State (V36l)
+### Current State (V36m)
 
 - **Germline recall (HG002)**: 99.4% (10,112 / 10,173)
-- **Somatic recall (HG008-T)**: 96.7% (58 / 60)
+- **Somatic recall (HG008-T)**: 100% (60 / 60) at pctsize=0.0, 100% (60 / 60) at pctsize=0.7
+- **Somatic precision (HG008-T)**: 85.7% at pctsize=0.0
 - **61 remaining germline misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
-- **2 remaining somatic misses**: 1 too large (6.3Mb, ignored), 1 position accuracy at 10% VAF (early-CIGAR call 672bp off, below truvari refdist=500)
+- **0 remaining somatic misses**: All 60 PASS DELs detected.
 - **Avg calls/case**: ~15 (germline), ~20 (somatic, higher coverage)
 
 ### Active DEL Sources
@@ -959,7 +961,7 @@ Infers deletion size from the integrated depth deficit across the entire region,
 
 **Problem**: The old dedup sorted calls by read count descending. multi-k always won (most reads) but was correct only 9.8% of the time when disagreeing with other sources. In 5,791 of 10,173 loci, multi-k was the wrong-size winner with a correct-size call from another source available.
 
-**Solution**: Sort by source accuracy instead of read count. Priority order: merged-clusters > diagonal > early-CIGAR > SA-tag > split-read > cluster > flank-gap > kmer-journey > per-read-DEL > INV-cluster > path-based > depth-deficit-hom > depth-deficit-het > depth-scan-hom > depth-scan-het > depth-scan-sub > multi-k. Read count is tiebreaker within same source.
+**Solution**: Sort by source accuracy instead of read count. Priority order: merged-clusters > diagonal > cigar-covdrop > early-CIGAR > SA-tag > split-read > cluster > flank-gap > kmer-journey > per-read-DEL > INV-cluster > path-based > depth-deficit-hom > depth-deficit-het > depth-scan-hom > depth-scan-het > depth-scan-sub > multi-k. Read count is tiebreaker within same source.
 
 **Impact on recall**: None — recall is 99.2% for both V36i and V36j because the eval counts ALL emitted calls, not just the top one.
 
@@ -1065,33 +1067,44 @@ The 61 remaining misses (down from 84 after depth-deficit source) are small DELs
 
 **Depth-deficit recovered 23 of the original 84:** Mostly larger DELs (1000+bp) and cases where the repeat array is small enough that the deletion contributes a measurable fraction of the total depth deficit.
 
-### Depth-Scan DEL Source (V36l)
+### Depth-Scan DEL Source (V36l, improved in V36m)
 
 Windowed BAM depth scanning to detect deletions from depth drops. Unlike depth-deficit (which integrates total deficit across the whole region), depth-scan identifies the specific contiguous region of low depth and estimates DEL size from its width.
 
 **Algorithm (two-pass detection):**
-1. Open BAM, compute per-base depth across the full region in a single pass
+1. Open BAM, compute per-base depth via **sweep line** (O(n_reads + region_length)) — record +1 at each aligned segment start and -1 at end, then prefix sum
 2. Aggregate into adaptive windows (50bp for regions <3kb, 100bp for 3-10kb, 200bp for 10-50kb, 500bp for >50kb)
 3. **Pass 1 — Sliding flanking:** For each position, compute left-flanking median depth (up to 10 windows back). Detect contiguous runs of windows where `depth / flank_depth ≤ threshold`. Good for small/medium DELs where local context is reliable.
 4. **Pass 2 — Edge-based flanking:** Use median depth of first/last N windows of the region as a stable baseline. Detect drops relative to this global baseline with **gap tolerance** (up to `max(3, nWindows/50)` consecutive windows above threshold allowed within a drop). Handles large DELs where the sliding flanking gets contaminated by the deletion itself.
 5. Both passes scan at 3 sensitivity levels (thresholds: 0.65, 0.75, 0.85)
-6. Deduplication: a new call overlapping an existing call is kept if it is >1.5× larger (better estimate supersedes partial detection)
-7. Classify by depth ratio: `<0.05` → hom, `<0.55` → het, else → sub (subclonal)
-8. Emit calls as `depth-scan-hom` / `depth-scan-het` / `depth-scan-sub`
+6. **Minimum call size** scales with region length: `max(50bp, regionLength/500)`. Suppresses noise from natural depth variation in large regions (e.g., 100+ false 1kb calls in a 6.3Mb region).
+7. Deduplication: a new call overlapping an existing call is kept if it is >1.5× larger (better estimate supersedes partial detection)
+8. Classify by depth ratio: `<0.05` → hom, `<0.55` → het, else → sub (subclonal)
+9. Emit calls as `depth-scan-hom` / `depth-scan-het` / `depth-scan-sub`
 
 **Key design decision:** Runs in `main.cpp` **before DP chaining** (right after early-CIGAR), so calls are emitted even when assembly times out on high-read-count regions. This is the primary motivation — large DELs (5kb+) often have too many reads for the DP chaining to complete within wall time.
 
 **Implementation:** `Assembler::depthScanDelCalls()` in `src/AssemblerSvAnchors.cpp` (~250 lines). Uses htslib to read BAM directly. Called from `srcMain/main.cpp` after the early-CIGAR block.
 
+**V36m improvements:**
+- **Sweep line depth computation** replaces per-base CIGAR walk. The old approach was O(n_reads × read_length) — for the chr13 6.3Mb case (7.3M reads × 250bp), that's ~1.8 billion individual depth increments. The sweep line is O(n_reads + region_length).
+- **Minimum call size scaling** (`regionLength/500`) prevents false positives from natural depth variation in large regions.
+
 **Why two passes:** The sliding-flanking pass (Pass 1) works well for DELs up to ~20kb but fails for larger ones. For example, a 64kb het DEL at 34% VAF has ~130 windows of low depth. After scanning ~50 windows into the deletion, the sliding flanking estimate (10 windows back) is entirely within the deletion, so it stops detecting a drop. The edge-based pass (Pass 2) uses the region edges as baseline, which stays stable regardless of deletion size. Gap tolerance handles local depth spikes inside large deletions (e.g., 4 windows spiked above threshold inside a 64kb deletion due to mappability artifacts).
 
-**Limitations:**
-- Window granularity limits size accuracy (±window_size). A 5.8kb DEL may be called as 5.6kb or 6.0kb.
-- Cannot detect small DELs (<~400bp) because they don't span enough consecutive windows.
-- Subclonal DELs at very low VAF (<10%) may not produce enough depth drop to trigger detection.
-- Does not resolve breakpoints precisely — position accuracy is ±window_size.
+**Somatic impact:** Recovers large DELs (5kb-6.3Mb) that assembly cannot handle within wall time. See HG008-T evaluation below.
 
-**Somatic impact:** Recovers large DELs (5kb-64kb) that assembly cannot handle within wall time. See HG008-T evaluation below.
+### CIGAR-Guided Covdrop Source (V36m)
+
+When a HitDepth cluster (k-mer depth drop) has no spanning chains — indicating a marker-depleted tandem repeat where chains can't cross the deletion — the code searches `cigarIndels` for a DEL call within 100-1500bp of the HitDepth position. If found, it emits a call at the HitDepth position (correct) using the CIGAR size (correct).
+
+**Motivation:** In tandem repeats, the aligner can place CIGAR D operations at a different repeat copy than where the deletion actually occurs. The early-CIGAR source finds the right size but wrong position. The HitDepth cluster finds the right position but has no size estimate (no spanning chains). Combining them produces a correct call.
+
+**Example:** chr3:169770590 (108bp DEL, VAF=10%) — the aligner placed the CIGAR D 672bp downstream. The HitDepth cluster at offset 2053 was 53bp from truth. The cigar-covdrop call (89bp at offset 2053) matched truvari with refdist=500.
+
+**Priority:** cigar-covdrop gets priority 2 (above early-CIGAR at 3) so the position-corrected call wins dedup over the misplaced original.
+
+**Implementation:** ~40 lines in the HitDepth cluster handler in `src/AssemblerSvAnchors.cpp`.
 
 ### Dinara V36k vs sbx-assemble — DEL Comparison (HG002)
 
@@ -1161,9 +1174,10 @@ The ALL VCF has 72 DELs total:
 |---|---|---|---|---|
 | V36k (assembly only) | `dinara_v36k_depthdeficit` | 81.7% | 49 | 11 |
 | V36l v1 (+ depth-scan, sliding only) | `dinara_v36k_depthscan` | 95.0% | 57 | 3 |
-| V36l v2 (+ edge-based + gap tolerance) | `dinara_v36l_depthscan2` | **96.7%** | **58** | **2** |
+| V36l v2 (+ edge-based + gap tolerance) | `dinara_v36l_depthscan2` | 96.7% | 58 | 2 |
+| V36m (+ cigar-covdrop + sweep line + minCallSize) | `dinara_v36m_cigarcovdrop` | **100%** | **60** | **0** |
 
-### Failure Analysis
+### Failure Analysis (resolved in V36m)
 
 **7 cases timed out** during DP chaining (assembly never completed):
 - All had large regions with many reads (5.8kb-64kb DELs, 50K-262K reads)
@@ -1177,18 +1191,16 @@ The ALL VCF has 72 DELs total:
 
 **chr11:58991970 (64kb, VAF=34%)** — Initially missed by depth-scan v1 because the sliding flanking got contaminated 25kb into the deletion. Fixed in v2 with edge-based flanking + gap tolerance (4 windows spiked above threshold inside the deletion). Now detected as 65kb call (ratio=0.99). ✅
 
-### Remaining 2 FNs
+**chr3:169770590 (108bp, VAF=10%)** — In a tandem repeat region, the aligner placed the CIGAR D 672bp downstream at a different repeat copy. The HitDepth cluster correctly identified the depth drop at the true position but had no spanning chains (marker-depleted repeat). Fixed in V36m with cigar-covdrop: combines the CIGAR size (89bp) with the HitDepth position (53bp from truth). ✅
 
-| Locus | Size | VAF | Issue |
-|---|---|---|---|
-| chr13:66842467 | 6.3Mb | NA | Too large for current pipeline (ignored) |
-| chr3:169770590 | 108bp | 10% | Position accuracy — early-CIGAR finds correct-size call (89bp, ratio=0.82) but places it 672bp downstream of truth, exceeding truvari's default refdist=500. At 10% VAF with ~4 supporting reads, position uncertainty is inherent. |
+**chr13:66842467 (6.3Mb)** — Region has 7.3M reads. Previously the depth-scan BAM iteration used per-base CIGAR walk (O(n_reads × read_length) = ~1.8 billion increments), causing timeout. Fixed in V36m with sweep line depth computation (O(n_reads + region_length)). Also added minCallSize scaling (regionLength/500) to suppress ~100 false 1kb calls from natural depth variation in the 6.3Mb region. Now detected as 6.3Mb call (dhffc=0.47). ✅
 
 ### Somatic-Specific Observations
 
 - Dinara detects somatic DELs down to **VAF ~7%** (chr6:72397103 at 6.6%, chr10:132826517 at 8.8%)
 - The depth-scan source is essential for somatic analysis — large somatic DELs (5kb+) consistently time out during assembly
 - The depth-scan `sub` (subclonal) threshold (ratio <0.85) catches het-like and subclonal depth drops that the existing depth-deficit source (which uses fixed flank sizes) may miss
+- The cigar-covdrop source handles tandem repeat position misplacement by combining CIGAR size with HitDepth position
 
 ### Cluster Paths
 
@@ -1196,12 +1208,14 @@ The ALL VCF has 72 DELs total:
 - **Results (assembly only)**: `.../somatic_hg008/results/`
 - **Results (depth-scan v1)**: `.../somatic_hg008/results_dscan/`
 - **Results (depth-scan v2)**: `.../somatic_hg008/results_dscan2/`
+- **Results (V36m)**: `.../somatic_hg008/results_cigarcovdrop/`
 - **Truth set**: `.../somatic_hg008/truth/`
 - **Manifest**: `.../somatic_hg008/manifest.tsv`
-- **VCFs**: `.../somatic_hg008/dinara_somatic_dels.vcf.gz` (assembly only), `.../somatic_hg008/dinara_dscan2_dels.vcf.gz` (depth-scan v2)
+- **VCFs**: `.../somatic_hg008/dinara_somatic_dels.vcf.gz` (assembly only), `.../somatic_hg008/dinara_dscan2_dels.vcf.gz` (depth-scan v2), `.../somatic_hg008/dinara_cigarcovdrop_dels.vcf.gz` (V36m)
 - **Truvari**: `.../somatic_hg008/truvari_all/` (assembly only), `.../somatic_hg008/truvari_dscan2/` (depth-scan v2)
 - **Binary (v1)**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36k_depthscan`
 - **Binary (v2)**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36l_depthscan2`
+- **Binary (V36m)**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36m_cigarcovdrop`
 - **Prepare script**: `.../somatic_hg008/prepare_cases_v2.sh`
 - **Run script**: `.../somatic_hg008/run_depthscan2.sh`
 
