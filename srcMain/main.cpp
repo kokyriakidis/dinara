@@ -4078,7 +4078,7 @@ void dinara::main::svanchors(
     svOpts.invertedIndexMcopyNum = 20;                // minimap2 -N20.
     svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
     svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
-    svOpts.referenceReadCount = 0;                     // Chain all-vs-all (needed for read graph in svAnchors analysis).
+    svOpts.referenceReadCount = referenceReadCount;     // Read-vs-reference only: O(n) chaining for DEL detection.
     svOpts.invertedIndexDownsampleHighFrequencyMarkers = false;  // Disable: coverageHet is not computed in svanchors.
 
     const double maxDriftRate = svOpts.driftRateTolerance;
