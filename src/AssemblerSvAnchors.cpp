@@ -7396,34 +7396,36 @@ void Assembler::buildSvMSA(
 
         // -----------------------------------------------------------------
         // Step 6b: Output MSA and consensus.
+        // Skipped: MSA file output and consensus not used for DEL
+        // calling. Re-enable for INS calling.
         // -----------------------------------------------------------------
         if(seqId <= 1) continue;  // Only backbone, no reads aligned.
 
-        const string msaFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".msa";
-        {
-            ofstream msaOut(msaFileName);
-            if(msaOut) {
-                aligner.print_as_msa(msaOut, seqId, &seqNames);
-            }
-        }
+        // const string msaFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".msa";
+        // {
+        //     ofstream msaOut(msaFileName);
+        //     if(msaOut) {
+        //         aligner.print_as_msa(msaOut, seqId, &seqNames);
+        //     }
+        // }
 
-        const string consensusFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".consensus";
-        {
-            ofstream consOut(consensusFileName);
-            if(consOut) {
-                vector<int> consensusWeights;
-                string consensusSeq;
-                string consensusGapped;
-                aligner.majority_voting_consensus(consensusWeights, consensusSeq, consensusGapped);
-                consOut << ">ref" << uint32_t(refId) << "_consensus\n"
-                        << consensusSeq << "\n";
-            }
-        }
+        // const string consensusFileName = outputPrefix + "_ref" + to_string(uint32_t(refId)) + ".consensus";
+        // {
+        //     ofstream consOut(consensusFileName);
+        //     if(consOut) {
+        //         vector<int> consensusWeights;
+        //         string consensusSeq;
+        //         string consensusGapped;
+        //         aligner.majority_voting_consensus(consensusWeights, consensusSeq, consensusGapped);
+        //         consOut << ">ref" << uint32_t(refId) << "_consensus\n"
+        //                 << consensusSeq << "\n";
+        //     }
+        // }
 
         ++totalMSAs;
         cout << "  Reference " << refId << ": " << nBoundaries << " anchor boundaries, "
              << nSegments << " segments, " << chainsForRef.size() << " chains, "
-             << (seqId - 1) << " reads aligned. Output: " << msaFileName << endl;
+             << (seqId - 1) << " reads aligned." << endl;
     }
 
     const auto tEnd = std::chrono::steady_clock::now();
