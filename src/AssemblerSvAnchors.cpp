@@ -8065,13 +8065,21 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
             return false;
         };
 
+        // Minimum call size scales with region length to
+        // suppress noise from natural depth variation in
+        // large regions. A 1kb dip in a 6Mb region is noise;
+        // a 1kb dip in a 4kb region is signal.
+        const int64_t minCallSize = std::max(
+            int64_t(50),
+            int64_t(regionLength) / 500);
+
         // Helper lambda to emit a call.
         auto emitCall = [&](uint32_t dStart, uint32_t dEnd,
                             double flankD, double insideD) {
             const double ratio = insideD / flankD;
             const int64_t delSize =
                 int64_t(dEnd - dStart) * int64_t(windowSize);
-            if(delSize < 50) return;
+            if(delSize < minCallSize) return;
             if(isDuplicateCall(dStart, dEnd)) return;
 
             calledRegions.push_back({dStart, dEnd});
