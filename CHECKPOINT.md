@@ -880,7 +880,7 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 | V36j | + source-priority dedup + SA-DEL removal | 99.2% | 11.8 |
 | V36k | + depth-deficit DEL source | 99.4% | 13.9 |
 | V36l | + depth-scan DEL source (windowed BAM depth) | 99.4%* | ~15 |
-| V36m | + cigar-covdrop source + sweep line depth + minCallSize scaling | 99.4%* | ~15 |
+| V36m | + cigar-covdrop + sweep line + minCallSize + skip MSA + ref-only chaining | 99.4%* | ~15 |
 
 *V36l/V36m recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan and cigar-covdrop sources are primarily impactful for somatic analysis (HG008-T: 81.7% → 100%).
 
@@ -892,6 +892,34 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 - **61 remaining germline misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
 - **0 remaining somatic misses**: All 60 PASS DELs detected.
 - **Avg calls/case**: ~15 (germline), ~20 (somatic, higher coverage)
+
+### Performance (V36m)
+
+Three optimizations reduced per-case runtime by 4-25×:
+
+1. **Skip Theseus MSA** — not used for DEL calling (saves 19-146s per case). Commented out, re-enable for INS calling.
+2. **Read-vs-reference chaining only** — `referenceReadCount` set to actual count instead of 0 (all-vs-all). Skips O(n²) read-vs-read pairs that are only needed for Theseus MSA. Saves 40-75% of chaining time.
+3. **Sweep line depth computation** — O(n_reads + region_length) instead of O(n_reads × read_length). Critical for the chr13 6.3Mb case (7.3M reads).
+
+| Case | Before | After | Speedup |
+|------|--------|-------|---------|
+| chr16 (168bp DEL, 12K reads) | 296s | 12s | 25× |
+| chr20 (44kb DEL, 63K reads) | 556s | 137s | 4× |
+| chr13 (6.3Mb DEL, 7.3M reads) | timeout | ~40min | now completes |
+
+**Profiled breakdown (chr20, 63K reads):**
+
+| Step | Time |
+|------|------|
+| Read loading | 3.4s |
+| Markers + index | 4.1s |
+| parseBamEvidence | 1.5s |
+| depthScanDelCalls | 0.03s |
+| DP chaining | 131s |
+| Split-read classification | 0.2s |
+| **Total** | **137s** |
+
+**Remaining bottleneck**: DP chaining (131s for chr20). This is inherent — all 63K reads share markers with the same reference, so every read is a candidate pair. Running 60 cases in parallel, wall time is ~2-3 minutes.
 
 ### Active DEL Sources
 
