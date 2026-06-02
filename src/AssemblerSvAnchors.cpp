@@ -7933,8 +7933,10 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
     }
 
     if(tid >= 0) {
-        // Per-base depth across the region.
-        vector<uint32_t> depth(regionLength, 0);
+        // Per-base depth via sweep line: O(n_reads) for
+        // events + O(region_length) prefix sum, instead of
+        // O(n_reads * read_length) per-base increments.
+        vector<int32_t> sweep(regionLength + 1, 0);
 
         hts_itr_t* iter = sam_itr_queryi(
             idx, tid, int(refStart), int(refEnd));
@@ -7955,12 +7957,16 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
 
                     if(op == BAM_CMATCH || op == BAM_CEQUAL
                        || op == BAM_CDIFF) {
-                        for(int j = 0; j < len; ++j) {
-                            const int32_t p = rp + j;
-                            if(p >= int32_t(refStart)
-                               && p < int32_t(refEnd)) {
-                                ++depth[p - refStart];
-                            }
+                        // Clamp aligned segment to region.
+                        const int32_t segStart = rp;
+                        const int32_t segEnd = rp + len;
+                        const int32_t clampStart = std::max(
+                            segStart, int32_t(refStart));
+                        const int32_t clampEnd = std::min(
+                            segEnd, int32_t(refEnd));
+                        if(clampStart < clampEnd) {
+                            ++sweep[clampStart - refStart];
+                            --sweep[clampEnd - refStart];
                         }
                         rp += len;
                     } else if(op == BAM_CDEL
@@ -7974,6 +7980,18 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
             bam_destroy1(aln);
             hts_itr_destroy(iter);
         }
+
+        // Prefix sum to get per-base depth.
+        vector<uint32_t> depth(regionLength, 0);
+        {
+            int32_t running = 0;
+            for(uint32_t i = 0; i < regionLength; ++i) {
+                running += sweep[i];
+                depth[i] = uint32_t(std::max(running, 0));
+            }
+        }
+        // Free sweep memory.
+        { vector<int32_t>().swap(sweep); }
 
         // Adaptive window size based on region length.
         uint32_t windowSize;
