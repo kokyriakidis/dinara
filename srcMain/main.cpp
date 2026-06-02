@@ -4066,7 +4066,7 @@ void dinara::main::svanchors(
     svOpts.invertedIndexMcopyNum = 20;                // minimap2 -N20.
     svOpts.invertedIndexMcopyRate = 0.50;             // minimap2 -p.5 secondary ratio.
     svOpts.minChainMarkerCount = 2;                   // minimap2 -n2.
-    svOpts.referenceReadCount = 0;                     // Chain all-vs-all (needed for indirect alignment of insertion-internal reads).
+    svOpts.referenceReadCount = referenceReadCount;     // Read-vs-reference only (all-vs-all not needed with Theseus MSA disabled).
     svOpts.invertedIndexDownsampleHighFrequencyMarkers = false;  // Disable: coverageHet is not computed in svanchors.
 
     const double maxDriftRate = svOpts.driftRateTolerance;
