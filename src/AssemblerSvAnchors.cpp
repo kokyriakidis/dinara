@@ -526,22 +526,23 @@ void Assembler::buildSvMSA(
         auto sourcePriority = [](const string& src) -> int {
             if(src == "merged-clusters")    return 0;
             if(src == "diagonal")           return 1;
-            if(src == "early-CIGAR")        return 2;
-            if(src == "SA-tag")             return 3;
-            if(src == "split-read")         return 4;
-            if(src == "cluster")            return 5;
-            if(src == "flank-gap")          return 6;
-            if(src == "kmer-journey")       return 7;
-            if(src == "per-read-DEL")       return 8;
-            if(src == "INV-cluster")        return 9;
-            if(src == "path-based")         return 10;
-            if(src == "depth-deficit-hom")  return 11;
-            if(src == "depth-deficit-het")  return 12;
-            if(src == "depth-scan-hom")     return 13;
-            if(src == "depth-scan-het")     return 14;
-            if(src == "depth-scan-sub")     return 15;
-            if(src == "multi-k")            return 16;
-            return 17;
+            if(src == "cigar-covdrop")      return 2;
+            if(src == "early-CIGAR")        return 3;
+            if(src == "SA-tag")             return 4;
+            if(src == "split-read")         return 5;
+            if(src == "cluster")            return 6;
+            if(src == "flank-gap")          return 7;
+            if(src == "kmer-journey")       return 8;
+            if(src == "per-read-DEL")       return 9;
+            if(src == "INV-cluster")        return 10;
+            if(src == "path-based")         return 11;
+            if(src == "depth-deficit-hom")  return 12;
+            if(src == "depth-deficit-het")  return 13;
+            if(src == "depth-scan-hom")     return 14;
+            if(src == "depth-scan-het")     return 15;
+            if(src == "depth-scan-sub")     return 16;
+            if(src == "multi-k")            return 17;
+            return 18;
         };
 
         // Lambda: merge delCallRecords into allDelCalls,
@@ -4384,28 +4385,52 @@ void Assembler::buildSvMSA(
                             cout << "      No spanning chains with diagonal shift (checked="
                                  << nChainsChecked << " spanning="
                                  << nChainsSpanning << ")." << endl;
-                            // Emit a DEL call from the coverage
-                            // drop span. In repetitive regions,
-                            // chains can't span the deletion, but
-                            // the coverage hole marks it.
-                            const int64_t clusterSpan =
-                                int64_t(cluster.endPos)
-                                - int64_t(cluster.startPos)
-                                + int64_t(windowSize);
+
+                            // CIGAR-guided covdrop: when chains can't
+                            // span the deletion (tandem repeat), use
+                            // a nearby CIGAR DEL call to provide the
+                            // size and emit at the HitDepth position.
                             const uint32_t hdBp =
                                 (cluster.startPos + cluster.endPos) / 2;
-                            if(clusterSpan >= 30) {
-                                // cout << "    >>> DELETION CALL"
-                                     // << " (covdrop-span): size="
-                                     // << clusterSpan << "bp"
-                                     // << ", breakpoint=" << hdBp
-                                     // << ", minRatio="
-                                     // << cluster.minRatio
-                                     // << endl;
-                                // covdrop-span suppressed (7% precision).
-                                // allDelCalls.push_back({
-                                //     hdBp, clusterSpan,
-                                //     0, "covdrop-span"});
+                            bool emittedCigarCovdrop = false;
+                            for(const auto& ci : cigarIndels) {
+                                if(ci.svType != "DEL") continue;
+                                if(ci.readCount < 2 || ci.size < 30) continue;
+                                // CIGAR call within 1500bp of the
+                                // HitDepth cluster center? In tandem
+                                // repeats the aligner can place the
+                                // CIGAR D at a different repeat copy.
+                                const int64_t posDiff = std::abs(
+                                    int64_t(ci.refPos) - int64_t(hdBp));
+                                if(posDiff > 1500) continue;
+                                // Skip if the CIGAR call is already
+                                // at the HitDepth position (no
+                                // relocation needed — the normal
+                                // early-CIGAR call handles it).
+                                if(posDiff < 100) continue;
+                                cout << "      CIGAR-guided covdrop:"
+                                     << " cigarPos=" << ci.refPos
+                                     << " cigarSize=" << ci.size
+                                     << " hdPos=" << hdBp
+                                     << " posDiff=" << posDiff
+                                     << " cigarReads=" << ci.readCount
+                                     << endl;
+                                cout << "    >>> DELETION CALL"
+                                     << " (cigar-covdrop): size="
+                                     << ci.size << "bp"
+                                     << ", breakpoint=" << hdBp
+                                     << ", reads=" << ci.readCount
+                                     << endl;
+                                allDelCalls.push_back({
+                                    hdBp, ci.size,
+                                    ci.readCount,
+                                    "cigar-covdrop"});
+                                emittedCigarCovdrop = true;
+                                break;
+                            }
+                            if(!emittedCigarCovdrop) {
+                                // No CIGAR corroboration — don't emit
+                                // a standalone covdrop-span (7% precision).
                             }
                             continue;
                         }
