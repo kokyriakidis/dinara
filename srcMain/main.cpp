@@ -3977,10 +3977,16 @@ void dinara::main::svanchors(
 
             vector<Assembler::SoftClipBreakpoint> softClipBPs;
             vector<Assembler::CigarIndelCall> cigarIndels;
-            assembler.parseBamEvidence(
-                bamAbsolutePath, refName,
-                regionStart, regionStart + refLength,
-                softClipBPs, cigarIndels);
+            {
+                const auto tBam0 = steady_clock::now();
+                assembler.parseBamEvidence(
+                    bamAbsolutePath, refName,
+                    regionStart, regionStart + refLength,
+                    softClipBPs, cigarIndels);
+                const auto tBam1 = steady_clock::now();
+                cout << "    parseBamEvidence completed in "
+                     << seconds(tBam1 - tBam0) << " s." << endl;
+            }
 
             // Emit CIGAR DEL calls with adj variants so they appear
             // in output even if downstream chaining times out.
@@ -3998,21 +4004,27 @@ void dinara::main::svanchors(
             // depth drops in windowed BAM depth. Runs before
             // DP chaining so calls are emitted even if chaining
             // times out on high-read-count regions.
-            auto depthCalls = assembler.depthScanDelCalls(
-                bamAbsolutePath, refName,
-                regionStart, regionStart + refLength);
-            for(const auto& dc : depthCalls) {
-                // Format dhffc to 2 decimal places.
-                char dhffcBuf[16];
-                snprintf(dhffcBuf, sizeof(dhffcBuf),
-                         "%.2f", dc.depthRatio);
-                cout << "    >>> DELETION CALL (" << dc.source
-                     << "): size=" << dc.size << "bp"
-                     << ", breakpoint=" << dc.breakpointPos
-                     << ", reads=0"
-                     << ", dhffc=" << dhffcBuf
-                     << ", mapq0=0.00"
-                     << endl;
+            {
+                const auto tDs0 = steady_clock::now();
+                auto depthCalls = assembler.depthScanDelCalls(
+                    bamAbsolutePath, refName,
+                    regionStart, regionStart + refLength);
+                const auto tDs1 = steady_clock::now();
+                cout << "    depthScanDelCalls completed in "
+                     << seconds(tDs1 - tDs0) << " s." << endl;
+                for(const auto& dc : depthCalls) {
+                    // Format dhffc to 2 decimal places.
+                    char dhffcBuf[16];
+                    snprintf(dhffcBuf, sizeof(dhffcBuf),
+                             "%.2f", dc.depthRatio);
+                    cout << "    >>> DELETION CALL (" << dc.source
+                         << "): size=" << dc.size << "bp"
+                         << ", breakpoint=" << dc.breakpointPos
+                         << ", reads=0"
+                         << ", dhffc=" << dhffcBuf
+                         << ", mapq0=0.00"
+                         << endl;
+                }
             }
         }
     }
