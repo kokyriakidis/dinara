@@ -33,4 +33,24 @@ uint64_t detangleWindows(
     const std::vector<AnchorWindow>& anchorWindows,
     std::vector<DetangleBypassEdge>& bypassEdges);
 
+// Detangle windows using the G-test (log-likelihood ratio test).
+//
+// For each window X with multiple predecessors and/or successors,
+// builds a tangle matrix from transitionReads and runs the G-test
+// to find the best connectivity hypothesis. If the best hypothesis
+// is injective (each entrance maps to at most one exit and vice versa),
+// creates bypass edges for each connected (entrance, exit) pair
+// and removes the flow reads from X's backbone anchors.
+//
+// epsilon: noise parameter for the G-test (default 0.1).
+//          Higher values tolerate more off-diagonal noise.
+//
+// Returns the number of windows detangled.
+uint64_t detangleWindowsGTest(
+    Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys,
+    const std::vector<AnchorWindow>& anchorWindows,
+    std::vector<DetangleBypassEdge>& bypassEdges,
+    double epsilon = 0.1);
+
 } // namespace dinara
