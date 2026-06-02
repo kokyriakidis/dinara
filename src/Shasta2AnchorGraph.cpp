@@ -579,13 +579,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     //   - The latest lastAnchorInA across all reads (highest backbone pos in A)
     //   - The earliest firstAnchorInB across all reads (lowest backbone pos in B)
     // This maximizes backbone retention on both sides after trimming.
+    // Backbone positions always increase from backboneBegin to backboneEnd
+    // regardless of forward/RC, so "latest" = highest pos and "earliest" =
+    // lowest pos in all cases.
     for(const auto& [windowPair, transitions] : windowPairTransitions) {
-        const bool srcIsRc = (windowPair.first >= windowCount);
-        const bool dstIsRc = (windowPair.second >= windowCount);
 
-        // Find the latest departure from A (highest backbone pos for forward,
-        // lowest for RC) and earliest arrival in B (lowest backbone pos for
-        // forward, highest for RC).
         Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
         Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
         uint32_t bestPosA = anchorToBackbonePos[uint64_t(bestLastInA)];
@@ -595,16 +593,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t posA = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
             const uint32_t posB = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
 
-            // Latest in A: forward = highest pos, RC = lowest pos.
-            const bool betterA = srcIsRc ? (posA < bestPosA) : (posA > bestPosA);
-            if(betterA) {
+            // Latest in A: highest backbone position.
+            if(posA > bestPosA) {
                 bestLastInA = t.lastAnchorInA;
                 bestPosA = posA;
             }
 
-            // Earliest in B: forward = lowest pos, RC = highest pos.
-            const bool betterB = dstIsRc ? (posB > bestPosB) : (posB < bestPosB);
-            if(betterB) {
+            // Earliest in B: lowest backbone position.
+            if(posB < bestPosB) {
                 bestFirstInB = t.firstAnchorInB;
                 bestPosB = posB;
             }
