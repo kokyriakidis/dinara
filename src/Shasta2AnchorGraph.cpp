@@ -336,18 +336,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Inter-window edges disabled.
-#if 0
-
-    // Per-read transition: which anchor pair the read uses at the boundary,
-    // plus the read's supporting span across both windows.
+    // Per-read transition: which anchor pair the read uses at the boundary.
     struct ReadTransition {
         uint32_t oidValue;
         Shasta2AnchorId lastAnchorInA;
         Shasta2AnchorId firstAnchorInB;
-        uint64_t supportingSpanProduct;  // spanA * spanB (for selection)
-        uint64_t supportingSpanA;        // base span in source window
-        uint64_t supportingSpanB;        // base span in destination window
+        uint64_t supportingSpanProduct;
+        uint64_t supportingSpanA;
+        uint64_t supportingSpanB;
     };
 
     // Per window pair: all read transitions.
@@ -386,13 +382,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
 
-            // Track which oriented reads touch each window.
-            // Normalize to forward window so both strands contribute
-            // to the same window's read set.
             const uint32_t normalizedWin = (windowId >= windowCount) ? (windowId - windowCount) : windowId;
             windowReads[normalizedWin].insert(uint32_t(oidValue));
 
-            // Track per-read per-window base span.
             const uint32_t basePos = anchors.getPosition(anchorId, oid);
             if(basePos != invalid<uint32_t>) {
                 auto& spanMap = readWindowSpans[oidValue];
@@ -408,12 +400,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(windowId == currentWindow) {
                 lastAnchorInCurrentWindow = anchorId;
             } else {
-                // New window transition.
                 readWindows[uint32_t(oidValue)].push_back(windowId);
-
                 if(currentWindow != noWindow) {
                     auto key = std::make_pair(currentWindow, windowId);
-                    // Spans are 0 for now — finalized in second pass.
                     windowPairTransitions[key].push_back(
                         {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0, 0, 0});
                 }
@@ -423,9 +412,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Second pass: finalize supporting spans for each read transition.
-    // Product (spanA * spanB) is used for tiebreaking selection.
-    // Individual spans are stored on the edge as separate attributes.
+    // Second pass: finalize supporting spans.
     for(auto& [windowPair, transitions] : windowPairTransitions) {
         for(auto& t : transitions) {
             auto readSpanIt = readWindowSpans.find(t.oidValue);
@@ -442,47 +429,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Merge RC-mirror window pair transitions to eliminate duplicate edges.
-    //
-    // createInterWindowEdge creates both a forward edge and its RC mirror.
-    // If windowPairTransitions contains both a key and its RC-mirror key,
-    // both would be processed, creating duplicate edge pairs.
-    //
-    // RC-mirror key relationship: key (X, Y) has RC mirror (rcY, rcX)
-    // where rc(w) = w >= wc ? w - wc : w + wc. This covers three cases:
-    //   fw-fw (A, B)       ↔  rc-rc (B+wc, A+wc)
-    //   fw-rc (A, B+wc)    ↔  fw-rc (B, A+wc)
-    //   rc-fw (A+wc, B)    ↔  rc-fw (B+wc, A)
-    //
-    // For each pair of RC-mirror keys, we keep the lexicographically
-    // smaller key (the "canonical" one) and merge the other's transitions
-    // into it, RC-transforming the anchor pairs.
+    // Merge RC-mirror window pair transitions.
     {
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
         };
-
-        // Collect non-canonical keys (those whose RC mirror is lexicographically smaller).
         std::vector<std::pair<uint32_t, uint32_t>> keysToMerge;
         for(const auto& [wp, transitions] : windowPairTransitions) {
             const auto mirrorKey = std::make_pair(rcWindow(wp.second), rcWindow(wp.first));
-            // Merge into the smaller key. If equal (self-RC-mirror), skip.
             if(wp > mirrorKey) {
                 keysToMerge.push_back(wp);
             }
         }
-
         uint64_t mergedTransitions = 0;
         for(const auto& key : keysToMerge) {
             const auto canonicalKey = std::make_pair(rcWindow(key.second), rcWindow(key.first));
-
             auto& srcTransitions = windowPairTransitions[key];
             auto& dstTransitions = windowPairTransitions[canonicalKey];
             for(auto& t : srcTransitions) {
-                // Transform anchors: RC both and swap roles (direction reverses).
-                // Original: lastAnchorInA is in key.first, firstAnchorInB is in key.second.
-                // Canonical: rc(firstAnchorInB) becomes lastInA (in rcWindow(key.second)),
-                //            rc(lastAnchorInA) becomes firstInB (in rcWindow(key.first)).
                 const Shasta2AnchorId newLastInA =
                     Shasta2AnchorId(uint64_t(t.firstAnchorInB) ^ 1ULL);
                 const Shasta2AnchorId newFirstInB =
@@ -495,13 +459,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             windowPairTransitions.erase(key);
         }
         cout << "Merged " << mergedTransitions << " transitions from "
-             << keysToMerge.size() << " non-canonical window pairs into their RC-mirror canonical pairs." << endl;
+             << keysToMerge.size() << " non-canonical window pairs." << endl;
     }
 
-    // Count shared reads between each window pair: reads that touch
-    // both windows anywhere in their journey (not just direct transitions).
+    // Count shared reads between window pairs.
     auto countSharedReads = [&](uint32_t windowA, uint32_t windowB) -> uint64_t {
-        // Normalize to forward windows — windowReads is keyed by forward window ID.
         const uint32_t normA = (windowA >= windowCount) ? (windowA - windowCount) : windowA;
         const uint32_t normB = (windowB >= windowCount) ? (windowB - windowCount) : windowB;
         auto itA = windowReads.find(normA);
@@ -509,7 +471,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(itA == windowReads.end() || itB == windowReads.end()) return 0;
         const auto& setA = itA->second;
         const auto& setB = itB->second;
-        // Iterate the smaller set and check membership in the larger.
         const auto& smaller = (setA.size() <= setB.size()) ? setA : setB;
         const auto& larger  = (setA.size() <= setB.size()) ? setB : setA;
         uint64_t count = 0;
@@ -519,7 +480,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return count;
     };
 
-    // Diagnostic: count window pairs and transitions (after RC-mirror merge).
+    // Diagnostics.
     {
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
@@ -534,7 +495,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             else if(!aIsRc && bIsRc) ++fwRcPairs;
             else if(aIsRc && !bIsRc) ++rcFwPairs;
             else ++rcRcPairs;
-            // Verify no non-canonical keys remain.
             const auto mirrorKey = std::make_pair(rcWindow(wp.second), rcWindow(wp.first));
             DINARA_ASSERT(wp <= mirrorKey);
         }
@@ -544,27 +504,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << fwRcPairs << " fw-rc, "
              << rcFwPairs << " rc-fw) with "
              << totalTransitions << " read transitions." << endl;
-
-        // Count how many anchors are mapped vs total.
-        uint64_t mappedCount = 0;
-        for(uint64_t i = 0; i < anchorCount; i++) {
-            if(anchorToWindow[i] != noWindow) mappedCount++;
-        }
-        cout << "anchorToWindow: " << mappedCount << " of " << anchorCount
-             << " anchors mapped to " << windowCount << " original + "
-             << windowCount << " RC mirror windows." << endl;
         if(reads) {
             cout << "Found " << containedSkipCount
                  << " contained oriented reads (included in inter-window edge discovery)." << endl;
         }
     }
 
-    auto normalize = [&](uint32_t w) -> uint32_t {
-        return (w >= windowCount) ? (w - windowCount) : w;
-    };
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowCreated = 0;
-    // Track created inter-window edges: (windowPair, anchorIdA, anchorIdB, sharedReadCount).
     struct InterWindowEdgeInfo {
         std::pair<uint32_t, uint32_t> windowPair;
         Shasta2AnchorId anchorIdA;
@@ -628,83 +575,62 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     };
 
-    // For each source window, find the single best forward connection
-    // based on geometric span: the read with the highest spanA * spanB
-    // across all candidate next windows determines the connection.
-    // This gives each window at most one outgoing inter-window edge
-    // (plus its RC mirror).
-    {
-        // Collect the best read transition per source window across all
-        // destination windows. Key: source window ID (raw, may be RC).
-        struct BestForward {
-            std::pair<uint32_t, uint32_t> windowPair;
-            const ReadTransition* transition = nullptr;
-            uint64_t bestSpanProduct = 0;
-        };
-        std::map<uint32_t, BestForward> bestPerSource;
+    // For each window pair (A, B), create one edge using:
+    //   - The latest lastAnchorInA across all reads (highest backbone pos in A)
+    //   - The earliest firstAnchorInB across all reads (lowest backbone pos in B)
+    // This maximizes backbone retention on both sides after trimming.
+    for(const auto& [windowPair, transitions] : windowPairTransitions) {
+        const bool srcIsRc = (windowPair.first >= windowCount);
+        const bool dstIsRc = (windowPair.second >= windowCount);
 
-        for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            const uint32_t srcW = windowPair.first;
-            for(const auto& t : transitions) {
-                if(t.supportingSpanProduct > bestPerSource[srcW].bestSpanProduct) {
-                    bestPerSource[srcW] = {windowPair, &t, t.supportingSpanProduct};
-                }
+        // Find the latest departure from A (highest backbone pos for forward,
+        // lowest for RC) and earliest arrival in B (lowest backbone pos for
+        // forward, highest for RC).
+        Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
+        Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
+        uint32_t bestPosA = anchorToBackbonePos[uint64_t(bestLastInA)];
+        uint32_t bestPosB = anchorToBackbonePos[uint64_t(bestFirstInB)];
+
+        for(const auto& t : transitions) {
+            const uint32_t posA = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
+            const uint32_t posB = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
+
+            // Latest in A: forward = highest pos, RC = lowest pos.
+            const bool betterA = srcIsRc ? (posA < bestPosA) : (posA > bestPosA);
+            if(betterA) {
+                bestLastInA = t.lastAnchorInA;
+                bestPosA = posA;
+            }
+
+            // Earliest in B: forward = lowest pos, RC = highest pos.
+            const bool betterB = dstIsRc ? (posB > bestPosB) : (posB < bestPosB);
+            if(betterB) {
+                bestFirstInB = t.firstAnchorInB;
+                bestPosB = posB;
             }
         }
 
-        // Deduplicate RC-mirror source windows: if both a forward window
-        // and its RC mirror selected a best connection, keep only the
-        // canonical (lower ID) one. The createInterWindowEdge helper
-        // creates the RC mirror edge automatically.
-        auto rcWindow = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
-        };
-        std::set<uint32_t> skip;
-        for(const auto& [srcW, best] : bestPerSource) {
-            if(skip.count(srcW)) continue;
-            const uint32_t rcSrc = rcWindow(srcW);
-            if(bestPerSource.count(rcSrc)) {
-                // Keep the canonical (lower) key, skip the other.
-                if(srcW > rcSrc) {
-                    skip.insert(srcW);
-                } else {
-                    skip.insert(rcSrc);
-                }
-            }
+        Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
+        anchorPair.removeNegativeOffsets(anchors);
+        if(anchorPair.size() == 0) {
+            ++interWindowZeroPairs;
+            continue;
         }
 
-        for(const auto& [srcW, best] : bestPerSource) {
-            if(skip.count(srcW)) continue;
-            if(!best.transition) {
-                ++interWindowZeroPairs;
-                continue;
-            }
-
-            Shasta2AnchorPair anchorPair(anchors,
-                best.transition->lastAnchorInA, best.transition->firstAnchorInB, false);
-            anchorPair.removeNegativeOffsets(anchors);
-            if(anchorPair.size() == 0) {
-                ++interWindowZeroPairs;
-                continue;
-            }
-
-            const uint64_t sharedReads = countSharedReads(
-                best.windowPair.first, best.windowPair.second);
-            createInterWindowEdge(best.windowPair, anchorPair, sharedReads,
-                best.transition->supportingSpanA, best.transition->supportingSpanB);
+        const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
+        // Use average spans across all transitions for the edge attributes.
+        uint64_t totalSpanA = 0, totalSpanB = 0;
+        for(const auto& t : transitions) {
+            totalSpanA += t.supportingSpanA;
+            totalSpanB += t.supportingSpanB;
         }
-
-        cout << "Best-span-product inter-window edges: "
-             << bestPerSource.size() << " source windows evaluated, "
-             << skip.size() << " RC duplicates skipped." << endl;
+        const uint64_t avgSpanA = totalSpanA / transitions.size();
+        const uint64_t avgSpanB = totalSpanB / transitions.size();
+        createInterWindowEdge(windowPair, anchorPair, sharedReads, avgSpanA, avgSpanB);
     }
 
-    // (Old two-pass endpoint/internal edge code removed.)
-    // Diagnostic summary.
     cout << "Inter-window edges: " << interWindowCreated << " created, "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
-#endif
-    cout << "Inter-window edges disabled." << endl;
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
@@ -1811,7 +1737,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     removeDanglingWindowsIterative("post-filter");
 #endif
 
-    // Populate per-window outEdges/inEdges from createdEdges (disabled — no inter-window edges).
+    // Populate per-window outEdges/inEdges from createdEdges.
+    for(const auto& edgeInfo : createdEdges) {
+        const uint32_t srcW = edgeInfo.windowPair.first;
+        const uint32_t dstW = edgeInfo.windowPair.second;
+        if(srcW < windowCount) {
+            auto& w = const_cast<AnchorWindow&>(anchorWindows[srcW]);
+            w.outEdges.push_back({dstW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
+        }
+        if(dstW < windowCount) {
+            auto& w = const_cast<AnchorWindow&>(anchorWindows[dstW]);
+            w.inEdges.push_back({srcW, edgeInfo.anchorIdA, edgeInfo.anchorIdB, edgeInfo.readCount});
+        }
+    }
 
 
 
