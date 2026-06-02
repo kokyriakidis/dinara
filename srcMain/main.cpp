@@ -1609,6 +1609,9 @@ void dinara::main::assemble(
         }
     }
 
+    // Pop superbubbles: choose a single path through each superbubble.
+    shasta2AnchorGraph->popSuperbubbles(anchorWindows, *shasta2Journeys);
+
     // Write external anchors.
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
