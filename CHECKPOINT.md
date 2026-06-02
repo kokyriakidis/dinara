@@ -695,9 +695,9 @@ The sweet spot for read-to-reference matching is k=50 (56% unique), but for read
 
 `8c9ccd5` on `main` — depth-deficit DEL source (V36k)
 
-Subsequent uncommitted changes (V36l):
+V36l changes:
 - `src/Assembler.hpp` — `DepthScanDelCall` struct + `depthScanDelCalls()` method declaration
-- `src/AssemblerSvAnchors.cpp` — `depthScanDelCalls()` implementation (~200 lines) + source priority table update (depth-scan-hom/het/sub at priorities 13-15)
+- `src/AssemblerSvAnchors.cpp` — `depthScanDelCalls()` implementation (~250 lines) + source priority table update (depth-scan-hom/het/sub at priorities 13-15). Two-pass detection: sliding flanking + edge-based flanking with gap tolerance.
 - `srcMain/main.cpp` — depth-scan call site after early-CIGAR block, before DP chaining
 
 ### Git Info
@@ -881,14 +881,14 @@ python3 /tmp/eval_sbxd2.py < /tmp/sbxd_all_results.txt
 | V36k | + depth-deficit DEL source | 99.4% | 13.9 |
 | V36l | + depth-scan DEL source (windowed BAM depth) | 99.4%* | ~15 |
 
-*V36l recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan source is primarily impactful for somatic analysis (HG008-T: 81.7% → 95.0%).
+*V36l recall on HG002 is unchanged (depth-scan adds calls but doesn't recover new TPs for germline). The depth-scan source is primarily impactful for somatic analysis (HG008-T: 81.7% → 96.7%).
 
 ### Current State (V36l)
 
 - **Germline recall (HG002)**: 99.4% (10,112 / 10,173)
-- **Somatic recall (HG008-T)**: 95.0% (57 / 60)
+- **Somatic recall (HG008-T)**: 96.7% (58 / 60)
 - **61 remaining germline misses**: Small DELs in large tandem repeat arrays where depth deficit is dominated by mappability loss. 0 cases with no calls at all. 100% detection sensitivity.
-- **3 remaining somatic misses**: 1 too large (6.3Mb), 1 partial depth-scan (64kb), 1 position accuracy at 10% VAF
+- **2 remaining somatic misses**: 1 too large (6.3Mb, ignored), 1 position accuracy at 10% VAF (early-CIGAR call 672bp off, below truvari refdist=500)
 - **Avg calls/case**: ~15 (germline), ~20 (somatic, higher coverage)
 
 ### Active DEL Sources
@@ -1069,18 +1069,21 @@ The 61 remaining misses (down from 84 after depth-deficit source) are small DELs
 
 Windowed BAM depth scanning to detect deletions from depth drops. Unlike depth-deficit (which integrates total deficit across the whole region), depth-scan identifies the specific contiguous region of low depth and estimates DEL size from its width.
 
-**Algorithm:**
+**Algorithm (two-pass detection):**
 1. Open BAM, compute per-base depth across the full region in a single pass
-2. Aggregate into adaptive windows (100bp for regions <10kb, 200bp for 10-50kb, 500bp for >50kb)
-3. For each position, compute left-flanking median depth (up to 10 windows back)
-4. Detect contiguous runs of windows where `depth / flank_depth ≤ threshold`
-5. Scan at 3 sensitivity levels (thresholds: 0.65, 0.75, 0.85) with deduplication
-6. Classify by depth ratio: `<0.05` → hom, `<0.55` → het, else → sub (subclonal)
-7. Emit calls as `depth-scan-hom` / `depth-scan-het` / `depth-scan-sub`
+2. Aggregate into adaptive windows (50bp for regions <3kb, 100bp for 3-10kb, 200bp for 10-50kb, 500bp for >50kb)
+3. **Pass 1 — Sliding flanking:** For each position, compute left-flanking median depth (up to 10 windows back). Detect contiguous runs of windows where `depth / flank_depth ≤ threshold`. Good for small/medium DELs where local context is reliable.
+4. **Pass 2 — Edge-based flanking:** Use median depth of first/last N windows of the region as a stable baseline. Detect drops relative to this global baseline with **gap tolerance** (up to `max(3, nWindows/50)` consecutive windows above threshold allowed within a drop). Handles large DELs where the sliding flanking gets contaminated by the deletion itself.
+5. Both passes scan at 3 sensitivity levels (thresholds: 0.65, 0.75, 0.85)
+6. Deduplication: a new call overlapping an existing call is kept if it is >1.5× larger (better estimate supersedes partial detection)
+7. Classify by depth ratio: `<0.05` → hom, `<0.55` → het, else → sub (subclonal)
+8. Emit calls as `depth-scan-hom` / `depth-scan-het` / `depth-scan-sub`
 
 **Key design decision:** Runs in `main.cpp` **before DP chaining** (right after early-CIGAR), so calls are emitted even when assembly times out on high-read-count regions. This is the primary motivation — large DELs (5kb+) often have too many reads for the DP chaining to complete within wall time.
 
-**Implementation:** `Assembler::depthScanDelCalls()` in `src/AssemblerSvAnchors.cpp` (~200 lines). Uses htslib to read BAM directly. Called from `srcMain/main.cpp` after the early-CIGAR block.
+**Implementation:** `Assembler::depthScanDelCalls()` in `src/AssemblerSvAnchors.cpp` (~250 lines). Uses htslib to read BAM directly. Called from `srcMain/main.cpp` after the early-CIGAR block.
+
+**Why two passes:** The sliding-flanking pass (Pass 1) works well for DELs up to ~20kb but fails for larger ones. For example, a 64kb het DEL at 34% VAF has ~130 windows of low depth. After scanning ~50 windows into the deletion, the sliding flanking estimate (10 windows back) is entirely within the deletion, so it stops detecting a drop. The edge-based pass (Pass 2) uses the region edges as baseline, which stays stable regardless of deletion size. Gap tolerance handles local depth spikes inside large deletions (e.g., 4 windows spiked above threshold inside a 64kb deletion due to mappability artifacts).
 
 **Limitations:**
 - Window granularity limits size accuracy (±window_size). A 5.8kb DEL may be called as 5.6kb or 6.0kb.
@@ -1157,7 +1160,8 @@ The ALL VCF has 72 DELs total:
 | Version | Binary | Recall | TP | FN |
 |---|---|---|---|---|
 | V36k (assembly only) | `dinara_v36k_depthdeficit` | 81.7% | 49 | 11 |
-| V36l (+ depth-scan) | `dinara_v36k_depthscan` | **95.0%** | **57** | **3** |
+| V36l v1 (+ depth-scan, sliding only) | `dinara_v36k_depthscan` | 95.0% | 57 | 3 |
+| V36l v2 (+ edge-based + gap tolerance) | `dinara_v36l_depthscan2` | **96.7%** | **58** | **2** |
 
 ### Failure Analysis
 
@@ -1171,13 +1175,14 @@ The ALL VCF has 72 DELs total:
 - chr7:6404812 (1.2kb, VAF=28%) — assembly found 43bp, depth-scan found 1.2kb ✅
 - chr7:6408188 (62bp, VAF=26%) — assembly found 35+36bp split calls. Depth-scan can't resolve 62bp (below window granularity). Truvari matched via other means ✅
 
-### Remaining 3 FNs
+**chr11:58991970 (64kb, VAF=34%)** — Initially missed by depth-scan v1 because the sliding flanking got contaminated 25kb into the deletion. Fixed in v2 with edge-based flanking + gap tolerance (4 windows spiked above threshold inside the deletion). Now detected as 65kb call (ratio=0.99). ✅
+
+### Remaining 2 FNs
 
 | Locus | Size | VAF | Issue |
 |---|---|---|---|
 | chr13:66842467 | 6.3Mb | NA | Too large for current pipeline (ignored) |
-| chr11:58991970 | 64kb | 34% | Depth-scan found 25kb partial call; full 64kb not resolved due to internal depth variation |
-| chr3:169770590 | 108bp | 10% | Position accuracy — closest call (89bp early-CIGAR) lands 672bp downstream. Very low VAF. |
+| chr3:169770590 | 108bp | 10% | Position accuracy — early-CIGAR finds correct-size call (89bp, ratio=0.82) but places it 672bp downstream of truth, exceeding truvari's default refdist=500. At 10% VAF with ~4 supporting reads, position uncertainty is inherent. |
 
 ### Somatic-Specific Observations
 
@@ -1189,14 +1194,16 @@ The ALL VCF has 72 DELs total:
 
 - **Cases**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/somatic_hg008/cases/`
 - **Results (assembly only)**: `.../somatic_hg008/results/`
-- **Results (+ depth-scan)**: `.../somatic_hg008/results_dscan/`
+- **Results (depth-scan v1)**: `.../somatic_hg008/results_dscan/`
+- **Results (depth-scan v2)**: `.../somatic_hg008/results_dscan2/`
 - **Truth set**: `.../somatic_hg008/truth/`
 - **Manifest**: `.../somatic_hg008/manifest.tsv`
-- **VCFs**: `.../somatic_hg008/dinara_somatic_dels.vcf.gz` (assembly only), `.../somatic_hg008/dinara_dscan_dels.vcf.gz` (+ depth-scan)
-- **Truvari**: `.../somatic_hg008/truvari_all/` (assembly only), `.../somatic_hg008/truvari_dscan/` (+ depth-scan)
-- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36k_depthscan`
+- **VCFs**: `.../somatic_hg008/dinara_somatic_dels.vcf.gz` (assembly only), `.../somatic_hg008/dinara_dscan2_dels.vcf.gz` (depth-scan v2)
+- **Truvari**: `.../somatic_hg008/truvari_all/` (assembly only), `.../somatic_hg008/truvari_dscan2/` (depth-scan v2)
+- **Binary (v1)**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36k_depthscan`
+- **Binary (v2)**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36l_depthscan2`
 - **Prepare script**: `.../somatic_hg008/prepare_cases_v2.sh`
-- **Run script**: `.../somatic_hg008/run_depthscan.sh`
+- **Run script**: `.../somatic_hg008/run_depthscan2.sh`
 
 ### Truvari Command (GIAB-recommended for HG008-T)
 
@@ -1214,7 +1221,7 @@ truvari bench \
 
 ### Cluster Paths and Binaries
 
-- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..k}_*`, `dinara_v36k_depthscan`
+- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36{d..k}_*`, `dinara_v36k_depthscan`, `dinara_v36l_depthscan2`
 - **Results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/results_v36{d..k}/`
 - **Somatic results**: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/somatic_hg008/`
 - **Analysis scripts**: `analyze.py`, `source_essentiality.py`, `analyze_multisource_v2.py`, `analyze_gap.py`, `analyze_adaptive.py` in `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/`

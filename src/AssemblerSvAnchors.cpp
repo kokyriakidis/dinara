@@ -7956,8 +7956,10 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
             windowSize = 500;
         else if(regionLength > 10000)
             windowSize = 200;
-        else
+        else if(regionLength > 3000)
             windowSize = 100;
+        else
+            windowSize = 50;
 
         // Aggregate into windows.
         const uint32_t nWindows = regionLength / windowSize;
@@ -7980,8 +7982,12 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
         }
 
         // Detect depth drops at multiple sensitivity levels.
-        // For each sensitivity, find contiguous runs of windows
-        // with depth below min_ratio * flanking_depth.
+        // Two passes:
+        // Pass 1: Sliding flanking (10 windows back) — good for
+        //   small/medium DELs where local context is reliable.
+        // Pass 2: Edge-based flanking (first/last N windows of
+        //   region) — handles large DELs where sliding flanking
+        //   gets contaminated by the deletion itself.
         const double minRatios[] = {0.65, 0.75, 0.85};
         const uint32_t minConsecutive = max(uint32_t(2),
                                             uint32_t(500 / windowSize));
@@ -7989,10 +7995,66 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
         // Track regions already called to avoid duplicates.
         vector<pair<uint32_t, uint32_t>> calledRegions;
 
+        // Helper lambda to check overlap with existing calls.
+        // A new call is a duplicate only if it overlaps an
+        // existing call of similar or larger size. If the new
+        // call is >1.5x larger than the overlapping existing
+        // call, it's not a duplicate — it's a better estimate.
+        auto isDuplicateCall = [&](uint32_t dStart,
+                                   uint32_t dEnd) -> bool {
+            const uint32_t nWin = dEnd - dStart;
+            for(const auto& cr : calledRegions) {
+                const uint32_t oStart = max(dStart, cr.first);
+                const uint32_t oEnd = min(dEnd, cr.second);
+                if(oStart < oEnd) {
+                    const uint32_t overlap = oEnd - oStart;
+                    const uint32_t existingSize =
+                        cr.second - cr.first;
+                    // If new call is much larger, don't skip.
+                    if(nWin > existingSize * 3 / 2)
+                        continue;
+                    const uint32_t smaller =
+                        min(nWin, existingSize);
+                    if(overlap > smaller / 2)
+                        return true;
+                }
+            }
+            return false;
+        };
+
+        // Helper lambda to emit a call.
+        auto emitCall = [&](uint32_t dStart, uint32_t dEnd,
+                            double flankD, double insideD) {
+            const double ratio = insideD / flankD;
+            const int64_t delSize =
+                int64_t(dEnd - dStart) * int64_t(windowSize);
+            if(delSize < 50) return;
+            if(isDuplicateCall(dStart, dEnd)) return;
+
+            calledRegions.push_back({dStart, dEnd});
+
+            string source;
+            if(ratio < 0.05)
+                source = "depth-scan-hom";
+            else if(ratio < 0.55)
+                source = "depth-scan-het";
+            else
+                source = "depth-scan-sub";
+
+            result.push_back({
+                dStart * windowSize,
+                delSize,
+                ratio,
+                1.0 - ratio,
+                source});
+        };
+
+        // Pass 1: Sliding flanking window.
         for(double minRatio : minRatios) {
             uint32_t i = 0;
             while(i < nWindows) {
-                // Left flanking: median of up to 10 windows before i.
+                // Left flanking: median of up to 10 windows
+                // before i.
                 const uint32_t flankStart =
                     (i >= 10) ? (i - 10) : 0;
                 if(i == flankStart) { ++i; continue; }
@@ -8006,13 +8068,11 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
 
                 if(flankLeftMed < 10.0) { ++i; continue; }
 
-                // Check if current window is a drop.
                 if(winDepth[i] / flankLeftMed > minRatio) {
                     ++i;
                     continue;
                 }
 
-                // Extend the drop region.
                 uint32_t dropStart = i;
                 uint32_t dropEnd = i + 1;
                 while(dropEnd < nWindows
@@ -8021,7 +8081,6 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
                     ++dropEnd;
                 }
 
-                // Right flanking.
                 const uint32_t rEnd = min(nWindows,
                                           dropEnd + 10);
                 double flankRightMed = flankLeftMed;
@@ -8036,9 +8095,11 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
                 const double flankDepth =
                     (flankLeftMed + flankRightMed) / 2.0;
 
-                if(flankDepth < 10.0) { i = dropEnd; continue; }
+                if(flankDepth < 10.0) {
+                    i = dropEnd;
+                    continue;
+                }
 
-                // Inside depth.
                 double insideSum = 0;
                 for(uint32_t w = dropStart; w < dropEnd; ++w)
                     insideSum += winDepth[w];
@@ -8046,61 +8107,108 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
                     insideSum / double(dropEnd - dropStart);
                 const double ratio = insideDepth / flankDepth;
 
-                const uint32_t nDropWin = dropEnd - dropStart;
-
-                if(nDropWin >= minConsecutive
+                if((dropEnd - dropStart) >= minConsecutive
                    && ratio <= minRatio) {
-                    const int64_t delSize =
-                        int64_t(nDropWin) * int64_t(windowSize);
-
-                    if(delSize >= 50) {
-                        // Check for overlap with existing calls.
-                        bool isDuplicate = false;
-                        for(const auto& cr : calledRegions) {
-                            // Overlap if regions share >50% of
-                            // the smaller region.
-                            const uint32_t oStart =
-                                max(dropStart, cr.first);
-                            const uint32_t oEnd =
-                                min(dropEnd, cr.second);
-                            if(oStart < oEnd) {
-                                const uint32_t overlap =
-                                    oEnd - oStart;
-                                const uint32_t smaller =
-                                    min(nDropWin,
-                                        cr.second - cr.first);
-                                if(overlap > smaller / 2) {
-                                    isDuplicate = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if(isDuplicate) {
-                            i = dropEnd;
-                            continue;
-                        }
-
-                        calledRegions.push_back(
-                            {dropStart, dropEnd});
-
-                        string source;
-                        if(ratio < 0.05)
-                            source = "depth-scan-hom";
-                        else if(ratio < 0.55)
-                            source = "depth-scan-het";
-                        else
-                            source = "depth-scan-sub";
-
-                        result.push_back({
-                            dropStart * windowSize,
-                            delSize,
-                            ratio,
-                            1.0 - ratio,
-                            source});
-                    }
+                    emitCall(dropStart, dropEnd,
+                             flankDepth, insideDepth);
                 }
 
                 i = dropEnd;
+            }
+        }
+
+        // Pass 2: Edge-based flanking with gap tolerance.
+        // Use median of first/last N windows as a stable
+        // baseline. This handles large DELs where the sliding
+        // flanking gets contaminated.
+        // Gap tolerance: allow up to maxGap consecutive windows
+        // above threshold within a drop region without breaking
+        // the run. This handles local depth spikes inside large
+        // deletions (e.g., from mappability artifacts).
+        const uint32_t edgeN = min(uint32_t(20),
+                                   nWindows / 4);
+        if(edgeN >= 3) {
+            vector<double> leftEdge(
+                winDepth.begin(),
+                winDepth.begin() + edgeN);
+            sort(leftEdge.begin(), leftEdge.end());
+            const double leftEdgeMed =
+                leftEdge[leftEdge.size() / 2];
+
+            vector<double> rightEdge(
+                winDepth.end() - edgeN,
+                winDepth.end());
+            sort(rightEdge.begin(), rightEdge.end());
+            const double rightEdgeMed =
+                rightEdge[rightEdge.size() / 2];
+
+            const double edgeFlank =
+                (leftEdgeMed + rightEdgeMed) / 2.0;
+
+            if(edgeFlank >= 10.0) {
+                // Allow gaps of up to 3 windows (or 2% of
+                // region, whichever is larger) above threshold.
+                const uint32_t maxGap = max(uint32_t(3),
+                    nWindows / 50);
+
+                for(double minRatio : minRatios) {
+                    uint32_t i = edgeN;
+                    while(i < nWindows - edgeN) {
+                        if(winDepth[i] / edgeFlank
+                           > minRatio) {
+                            ++i;
+                            continue;
+                        }
+
+                        // Found start of a drop. Extend with
+                        // gap tolerance.
+                        uint32_t dropStart = i;
+                        uint32_t dropEnd = i + 1;
+                        uint32_t gapCount = 0;
+
+                        while(dropEnd < nWindows - edgeN) {
+                            if(winDepth[dropEnd] / edgeFlank
+                               <= minRatio) {
+                                gapCount = 0;
+                                ++dropEnd;
+                            } else {
+                                // Window above threshold.
+                                ++gapCount;
+                                if(gapCount > maxGap)
+                                    break;
+                                ++dropEnd;
+                            }
+                        }
+
+                        // Trim trailing gap windows from end.
+                        while(dropEnd > dropStart
+                              && winDepth[dropEnd - 1]
+                                 / edgeFlank > minRatio) {
+                            --dropEnd;
+                        }
+
+                        if((dropEnd - dropStart)
+                           >= minConsecutive) {
+                            double insideSum = 0;
+                            for(uint32_t w = dropStart;
+                                w < dropEnd; ++w)
+                                insideSum += winDepth[w];
+                            const double insideDepth =
+                                insideSum
+                                / double(dropEnd - dropStart);
+                            const double ratio =
+                                insideDepth / edgeFlank;
+
+                            if(ratio <= minRatio) {
+                                emitCall(dropStart, dropEnd,
+                                         edgeFlank,
+                                         insideDepth);
+                            }
+                        }
+
+                        i = dropEnd;
+                    }
+                }
             }
         }
     }
