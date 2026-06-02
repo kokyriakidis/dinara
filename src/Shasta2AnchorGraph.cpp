@@ -2797,3 +2797,261 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
 }
 
 
+uint64_t Shasta2AnchorGraph::removeIsolatedWindows(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Find which normalized windows have active inter-window edges.
+    std::set<uint32_t> connectedWindows;
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcW = anchorToWindow[src];
+        const uint32_t dstW = anchorToWindow[dst];
+        if(srcW == noWindow || dstW == noWindow) continue;
+        const uint32_t srcNorm = normalizeW(srcW);
+        const uint32_t dstNorm = normalizeW(dstW);
+        if(srcNorm != dstNorm) {
+            connectedWindows.insert(srcNorm);
+            connectedWindows.insert(dstNorm);
+        }
+    }
+
+    // Disable all edges of isolated windows.
+    uint64_t removedCount = 0;
+    for(uint32_t w = 0; w < windowCount; w++) {
+        if(connectedWindows.count(w)) continue;
+
+        const auto& window = anchorWindows[w];
+        const auto backboneJourney = journeys[window.backboneOrientedReadId];
+
+        auto disableAnchor = [&](uint32_t pos) {
+            const uint64_t aid = uint64_t(backboneJourney[pos]);
+            if(aid < anchorCount) {
+                for(auto oe = boost::out_edges(aid, anchorGraph); oe.first != oe.second; ++oe.first) {
+                    if(anchorGraph[*oe.first].useForAssembly) disableEdge(*oe.first);
+                }
+                const uint64_t rcAid = aid ^ 1ULL;
+                if(rcAid < anchorCount) {
+                    for(auto oe = boost::out_edges(rcAid, anchorGraph); oe.first != oe.second; ++oe.first) {
+                        if(anchorGraph[*oe.first].useForAssembly) disableEdge(*oe.first);
+                    }
+                }
+            }
+        };
+
+        if(!window.filteredBackbonePositions.empty()) {
+            for(const uint32_t pos : window.filteredBackbonePositions) {
+                disableAnchor(pos);
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                disableAnchor(pos);
+            }
+        }
+        ++removedCount;
+    }
+
+    cout << "removeIsolatedWindows: " << removedCount << " isolated windows removed ("
+         << connectedWindows.size() << " connected)." << endl;
+    return removedCount;
+}
+
+
+uint64_t Shasta2AnchorGraph::removeTipWindows(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys,
+    uint32_t maxTipWindows)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Build window-level directed adjacency from active inter-window edges.
+    // Uses RAW window IDs (forward and RC windows are separate nodes).
+    // This is essential: with normalized IDs, the RC mirror of every
+    // inter-window edge creates a reverse edge between the same normalized
+    // pair, making every window appear to have both predecessors and
+    // successors, so no tips would ever be detected.
+    std::map<uint32_t, std::set<uint32_t>> windowPredecessors;
+    std::map<uint32_t, std::set<uint32_t>> windowSuccessors;
+
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcW = anchorToWindow[src];
+        const uint32_t dstW = anchorToWindow[dst];
+        if(srcW == noWindow || dstW == noWindow) continue;
+        if(srcW == dstW) continue;
+        if(normalizeW(srcW) == normalizeW(dstW)) continue;
+        windowSuccessors[srcW].insert(dstW);
+        windowPredecessors[dstW].insert(srcW);
+    }
+
+    // Helper to look up a raw window's neighbor set.
+    static const std::set<uint32_t> emptySet;
+    auto getPredecessors = [&](uint32_t ww) -> const std::set<uint32_t>& {
+        auto it = windowPredecessors.find(ww);
+        return (it != windowPredecessors.end()) ? it->second : emptySet;
+    };
+    auto getSuccessors = [&](uint32_t ww) -> const std::set<uint32_t>& {
+        auto it = windowSuccessors.find(ww);
+        return (it != windowSuccessors.end()) ? it->second : emptySet;
+    };
+
+    // Walk a tip chain from a dead-end raw window.
+    // Returns the chain (raw window IDs) if it's a valid linear tip,
+    // empty vector otherwise.
+    auto walkTipChain = [&](uint32_t w) -> std::vector<uint32_t> {
+        const bool hasPred = !getPredecessors(w).empty();
+        const bool hasSucc = !getSuccessors(w).empty();
+
+        // Must be dangling (one side only).
+        if(hasPred == hasSucc) return {};
+
+        std::vector<uint32_t> chain;
+        chain.push_back(w);
+        uint32_t current = w;
+
+        while(chain.size() <= maxTipWindows) {
+            const auto& neighbors = hasPred
+                ? getPredecessors(current)
+                : getSuccessors(current);
+
+            if(neighbors.size() != 1) break;
+
+            const uint32_t next = *neighbors.begin();
+
+            // Cycle check.
+            bool inChain = false;
+            for(const uint32_t c : chain) {
+                if(c == next) { inChain = true; break; }
+            }
+            if(inChain) break;
+
+            // Linearity: next must have exactly one neighbor facing back.
+            const auto& backNeighbors = hasPred
+                ? getSuccessors(next)
+                : getPredecessors(next);
+            if(backNeighbors.size() != 1) break;
+
+            chain.push_back(next);
+            current = next;
+        }
+
+        if(chain.size() <= maxTipWindows) return chain;
+        return {};
+    };
+
+    // Phase 1: Find all candidate tips and measure their chain length.
+    // Store as (chainLength, startRawWindow) sorted shortest-first.
+    std::vector<std::pair<uint32_t, uint32_t>> candidates;
+
+    // Collect all raw window IDs that have any inter-window edges.
+    std::set<uint32_t> allRawWindows;
+    for(const auto& [w, s] : windowPredecessors) allRawWindows.insert(w);
+    for(const auto& [w, s] : windowSuccessors) allRawWindows.insert(w);
+
+    for(const uint32_t w : allRawWindows) {
+        auto chain = walkTipChain(w);
+        if(!chain.empty()) {
+            candidates.push_back({(uint32_t)chain.size(), w});
+        }
+    }
+
+    // Sort shortest-first so removing short tips can expose longer ones.
+    std::sort(candidates.begin(), candidates.end());
+
+    // Phase 2: Process candidates shortest-first.
+    // Re-walk each tip to account for topology changes from prior removals.
+    // Track removed normalized windows to avoid double-processing.
+    std::set<uint32_t> normalizedWindowsRemoved;
+
+    // Helper to disable all edges of a normalized window and update
+    // the adjacency maps so subsequent re-walks see the new topology.
+    auto removeWindow = [&](uint32_t normW) {
+        if(!normalizedWindowsRemoved.insert(normW).second) return;
+
+        const auto& window = anchorWindows[normW];
+        const auto backboneJourney = journeys[window.backboneOrientedReadId];
+
+        // Collect all anchor IDs in this window.
+        std::vector<uint64_t> anchorIds;
+        if(!window.filteredBackbonePositions.empty()) {
+            for(const uint32_t pos : window.filteredBackbonePositions) {
+                anchorIds.push_back(uint64_t(backboneJourney[pos]));
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                anchorIds.push_back(uint64_t(backboneJourney[pos]));
+            }
+        }
+
+        // Disable all edges of each anchor (disableEdge handles RC mirrors).
+        for(const uint64_t aid : anchorIds) {
+            if(aid >= anchorCount) continue;
+            for(auto oe = boost::out_edges(aid, anchorGraph); oe.first != oe.second; ++oe.first) {
+                if(anchorGraph[*oe.first].useForAssembly)
+                    disableEdge(*oe.first);
+            }
+            for(auto ie = boost::in_edges(aid, anchorGraph); ie.first != ie.second; ++ie.first) {
+                if(anchorGraph[*ie.first].useForAssembly)
+                    disableEdge(*ie.first);
+            }
+        }
+
+        // Update adjacency maps: remove this window (both raw IDs)
+        // from all neighbor sets.
+        const uint32_t fwdW = normW;
+        const uint32_t rcW = normW + windowCount;
+        for(const uint32_t rawW : {fwdW, rcW}) {
+            // Remove rawW from successors of its predecessors.
+            for(const uint32_t pred : getPredecessors(rawW)) {
+                auto it = windowSuccessors.find(pred);
+                if(it != windowSuccessors.end()) it->second.erase(rawW);
+            }
+            // Remove rawW from predecessors of its successors.
+            for(const uint32_t succ : getSuccessors(rawW)) {
+                auto it = windowPredecessors.find(succ);
+                if(it != windowPredecessors.end()) it->second.erase(rawW);
+            }
+            windowPredecessors.erase(rawW);
+            windowSuccessors.erase(rawW);
+        }
+    };
+
+    for(const auto& [chainLen, startW] : candidates) {
+        const uint32_t startNorm = normalizeW(startW);
+
+        // Skip if already removed.
+        if(normalizedWindowsRemoved.count(startNorm)) continue;
+
+        // Re-walk: topology may have changed from prior removals.
+        auto chain = walkTipChain(startW);
+        if(chain.empty()) continue;
+
+        // Remove all windows in the chain.
+        for(const uint32_t cw : chain) {
+            removeWindow(normalizeW(cw));
+        }
+    }
+
+    cout << "removeTipWindows (maxTipWindows=" << maxTipWindows << "): "
+         << normalizedWindowsRemoved.size() << " windows removed." << endl;
+    return normalizedWindowsRemoved.size();
+}
+
