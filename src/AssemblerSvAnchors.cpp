@@ -603,6 +603,7 @@ void Assembler::buildSvMSA(
             if(!bamFileName.empty() && !deduped.empty()) {
                 htsFile* fp = hts_open(bamFileName.c_str(), "r");
                 if(fp) {
+                    hts_set_threads(fp, 4);
                     sam_hdr_t* hdr = sam_hdr_read(fp);
                     if(hdr) {
                         hts_idx_t* idx = sam_index_load(
@@ -7199,6 +7200,7 @@ void Assembler::buildSvMSA(
         if(!bamFileName.empty() && refLength >= 500) {
             htsFile* ddFp = hts_open(bamFileName.c_str(), "r");
             if(ddFp) {
+                hts_set_threads(ddFp, 4);
                 sam_hdr_t* ddHdr = sam_hdr_read(ddFp);
                 if(ddHdr) {
                     hts_idx_t* ddIdx = sam_index_load(
@@ -7456,6 +7458,7 @@ vector<Assembler::SaTagSvCall> Assembler::parseSaTagSvCalls(
              << bamFileName << endl;
         return result;
     }
+    hts_set_threads(fp, 4);
 
     sam_hdr_t* hdr = sam_hdr_read(fp);
     if(!hdr) {
@@ -7917,6 +7920,7 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
 
     htsFile* fp = hts_open(bamFileName.c_str(), "r");
     if(!fp) return result;
+    hts_set_threads(fp, 4);
     sam_hdr_t* hdr = sam_hdr_read(fp);
     if(!hdr) { hts_close(fp); return result; }
     hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
@@ -8288,6 +8292,7 @@ void Assembler::parseBamEvidence(
 
     htsFile* fp = hts_open(bamFileName.c_str(), "r");
     if(!fp) return;
+    hts_set_threads(fp, 4);
     sam_hdr_t* hdr = sam_hdr_read(fp);
     if(!hdr) { hts_close(fp); return; }
     hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
