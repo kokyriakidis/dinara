@@ -1262,6 +1262,149 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         ++removedCount;
     }
 
+    // Second pass: remove stub tips at multi-degree dead-end vertices.
+    // A dead-end vertex may have degree > 1 on the non-dead side,
+    // preventing walkTipChain from finding any chain. If some of those
+    // edges are short (satisfy tip conditions) and at least one is long
+    // (does not satisfy tip conditions), remove the short ones.
+    //
+    // Example: vertex with out_degree=0, in_degree=2 where one incoming
+    // edge is short (stub) and the other is long. The short edge is a
+    // stub tip that should be removed.
+    {
+        // Collect stub tip edges to remove.
+        struct StubTip {
+            uint32_t windows;
+            uint64_t length;
+            edge_descriptor edge;
+        };
+        vector<StubTip> stubTips;
+
+        BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+            // Dead end on outgoing side: out_degree=0, in_degree > 1.
+            if(out_degree(v, assemblyGraph) == 0 && in_degree(v, assemblyGraph) > 1) {
+                // Classify each incoming edge as short or long.
+                vector<edge_descriptor> shortEdges;
+                bool hasLongEdge = false;
+                BGL_FORALL_INEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                    const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+                    const uint32_t w = uint32_t(
+                        set<uint32_t>(edge.windowSequence.begin(),
+                                      edge.windowSequence.end()).size());
+                    if(w <= maxTipWindows && edge.length() <= maxTipLength) {
+                        shortEdges.push_back(e);
+                    } else {
+                        hasLongEdge = true;
+                    }
+                }
+                // Only remove short edges if there's at least one long edge remaining.
+                if(hasLongEdge) {
+                    for(const edge_descriptor e : shortEdges) {
+                        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+                        const uint32_t w = uint32_t(
+                            set<uint32_t>(edge.windowSequence.begin(),
+                                          edge.windowSequence.end()).size());
+                        stubTips.push_back({w, edge.length(), e});
+                    }
+                }
+            }
+
+            // Dead end on incoming side: in_degree=0, out_degree > 1.
+            if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) > 1) {
+                vector<edge_descriptor> shortEdges;
+                bool hasLongEdge = false;
+                BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                    const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+                    const uint32_t w = uint32_t(
+                        set<uint32_t>(edge.windowSequence.begin(),
+                                      edge.windowSequence.end()).size());
+                    if(w <= maxTipWindows && edge.length() <= maxTipLength) {
+                        shortEdges.push_back(e);
+                    } else {
+                        hasLongEdge = true;
+                    }
+                }
+                if(hasLongEdge) {
+                    for(const edge_descriptor e : shortEdges) {
+                        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+                        const uint32_t w = uint32_t(
+                            set<uint32_t>(edge.windowSequence.begin(),
+                                          edge.windowSequence.end()).size());
+                        stubTips.push_back({w, edge.length(), e});
+                    }
+                }
+            }
+        }
+
+        // Sort shortest first.
+        sort(stubTips.begin(), stubTips.end(),
+            [](const StubTip& a, const StubTip& b) {
+                if(a.windows != b.windows) return a.windows < b.windows;
+                return a.length < b.length;
+            });
+
+        // Remove each stub tip and its RC mirror edge.
+        for(const StubTip& stub : stubTips) {
+            // Verify edge still exists (may have been removed as RC mirror of earlier stub).
+            const edge_descriptor e = stub.edge;
+            const vertex_descriptor v0 = source(e, assemblyGraph);
+            const vertex_descriptor v1 = target(e, assemblyGraph);
+
+            // Check the edge is still present by scanning edges at v0.
+            bool edgeStillExists = false;
+            BGL_FORALL_OUTEDGES(v0, oe, assemblyGraph, Shasta2AssemblyGraph) {
+                if(oe == e) { edgeStillExists = true; break; }
+            }
+            if(!edgeStillExists) continue;
+
+            // Find the RC mirror edge.
+            // The edge goes v0 -> v1. Its RC mirror goes rc(v1) -> rc(v0).
+            const Shasta2AnchorId rcAnchorV0 =
+                Shasta2AnchorId(uint64_t(assemblyGraph[v0].anchorId) ^ 1ULL);
+            const Shasta2AnchorId rcAnchorV1 =
+                Shasta2AnchorId(uint64_t(assemblyGraph[v1].anchorId) ^ 1ULL);
+
+            // Remove the forward edge.
+            boost::remove_edge(e, assemblyGraph);
+
+            // Remove the RC mirror edge (rc(v1) -> rc(v0)).
+            auto itRcV1 = anchorToVertex.find(rcAnchorV1);
+            auto itRcV0 = anchorToVertex.find(rcAnchorV0);
+            if(itRcV1 != anchorToVertex.end() && itRcV0 != anchorToVertex.end()) {
+                const vertex_descriptor rcV1 = itRcV1->second;
+                const vertex_descriptor rcV0 = itRcV0->second;
+                boost::remove_edge(rcV1, rcV0, assemblyGraph);
+            }
+
+            // Clean up isolated vertices.
+            if(in_degree(v0, assemblyGraph) == 0 && out_degree(v0, assemblyGraph) == 0) {
+                anchorToVertex.erase(assemblyGraph[v0].anchorId);
+                boost::remove_vertex(v0, assemblyGraph);
+            }
+            if(in_degree(v1, assemblyGraph) == 0 && out_degree(v1, assemblyGraph) == 0) {
+                anchorToVertex.erase(assemblyGraph[v1].anchorId);
+                boost::remove_vertex(v1, assemblyGraph);
+            }
+            // Clean up isolated RC vertices.
+            if(itRcV1 != anchorToVertex.end()) {
+                const vertex_descriptor rcV1 = itRcV1->second;
+                if(in_degree(rcV1, assemblyGraph) == 0 && out_degree(rcV1, assemblyGraph) == 0) {
+                    anchorToVertex.erase(assemblyGraph[rcV1].anchorId);
+                    boost::remove_vertex(rcV1, assemblyGraph);
+                }
+            }
+            if(itRcV0 != anchorToVertex.end()) {
+                const vertex_descriptor rcV0 = itRcV0->second;
+                if(in_degree(rcV0, assemblyGraph) == 0 && out_degree(rcV0, assemblyGraph) == 0) {
+                    anchorToVertex.erase(assemblyGraph[rcV0].anchorId);
+                    boost::remove_vertex(rcV0, assemblyGraph);
+                }
+            }
+
+            ++removedCount;
+        }
+    }
+
     // Log edges with length 36168 (for debugging).
     BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
         const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
