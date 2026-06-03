@@ -2759,25 +2759,34 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
             }
         }
 
-        // Scan for repeated window visits, collapsing in-place.
-        // For each position i, find the nearest j>i where ws[j] == ws[i].
-        // The span i..j represents a detour: the read leaves window A,
-        // visits intermediate windows, then returns to A.
-        // Disable all inter-window edges along the detour and create
-        // a bypass within A. Then collapse and back up.
-        uint64_t i = 0;
-        while(i + 2 <= ws.size()) {
-            const uint32_t wA = ws[i].normWindow;
+        // Repeatedly find and collapse the shortest repeated window span.
+        // This ensures inside-out resolution: inner patterns (e.g. B->C->B)
+        // are resolved before outer ones (e.g. A->B->A), creating the
+        // correct bypass edges at each level.
+        while(ws.size() >= 3) {
+            // Find the shortest span (i,j) where ws[i] == ws[j], j >= i+2.
+            uint64_t bestI = 0, bestJ = 0, bestSpan = ws.size() + 1;
+            for(uint64_t i = 0; i + 2 <= ws.size(); i++) {
+                const uint32_t wA = ws[i].normWindow;
+                for(uint64_t j = i + 2; j < ws.size(); j++) {
+                    if(ws[j].normWindow == wA) {
+                        const uint64_t span = j - i;
+                        if(span < bestSpan) {
+                            bestI = i;
+                            bestJ = j;
+                            bestSpan = span;
+                        }
+                        break; // nearest repeat of ws[i], no need to look further
+                    }
+                }
+                if(bestSpan == 2) break; // can't do better than a triplet
+            }
 
-            // Find the nearest repeat of wA after position i.
-            uint64_t j = i + 2; // minimum span of 2 (at least one intermediate)
-            for(; j < ws.size(); j++) {
-                if(ws[j].normWindow == wA) break;
-            }
-            if(j >= ws.size()) {
-                ++i;
-                continue;
-            }
+            if(bestSpan > ws.size()) break; // no repeated window found
+
+            const uint64_t i = bestI;
+            const uint64_t j = bestJ;
+            const uint32_t wA = ws[i].normWindow;
 
             ++totalRepeats;
 
@@ -2836,9 +2845,6 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
             // Collapse: merge the two A visits, remove intermediates.
             ws[i].lastAnchor = ws[j].lastAnchor;
             ws.erase(ws.begin() + int64_t(i + 1), ws.begin() + int64_t(j + 1));
-
-            // Back up to catch newly exposed patterns.
-            if(i > 0) --i;
         }
     }
 
