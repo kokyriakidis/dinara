@@ -582,7 +582,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Backbone positions always increase from backboneBegin to backboneEnd
     // regardless of forward/RC, so "latest" = highest pos and "earliest" =
     // lowest pos in all cases.
+    uint64_t interWindowLowCoverage = 0;
     for(const auto& [windowPair, transitions] : windowPairTransitions) {
+
+        // Skip window pairs with insufficient read support.
+        if(transitions.size() < minInterWindowCoverage) {
+            ++interWindowLowCoverage;
+            continue;
+        }
 
         Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
         Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
@@ -626,6 +633,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 
     cout << "Inter-window edges: " << interWindowCreated << " created, "
+         << interWindowLowCoverage << " rejected (< " << minInterWindowCoverage << " reads), "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
 
     // ========================================================================
