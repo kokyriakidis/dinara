@@ -1341,15 +1341,15 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
                     edgePtrs.push_back(&assemblyGraph[ce]);
                 }
                 const uint32_t totalWindows = countDistinctWindows(edgePtrs);
-                cout << "  Remaining tip: vertex " << assemblyGraph[v].id
-                     << " direction=fwd edges=" << chainEdges.size()
+                cout << "  Remaining tip: segments=";
+                for(uint64_t i = 0; i < chainEdges.size(); i++) {
+                    if(i > 0) cout << ",";
+                    cout << assemblyGraph[chainEdges[i]].id;
+                }
+                cout << " direction=fwd"
                      << " windows=" << totalWindows
                      << " length=" << totalLength
-                     << " edgeIds=";
-                for(const edge_descriptor ce : chainEdges) {
-                    cout << assemblyGraph[ce].id << " ";
-                }
-                cout << endl;
+                     << endl;
             }
         }
         if(out_degree(v, assemblyGraph) == 0 && in_degree(v, assemblyGraph) >= 1) {
@@ -1365,15 +1365,15 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
                     edgePtrs.push_back(&assemblyGraph[ce]);
                 }
                 const uint32_t totalWindows = countDistinctWindows(edgePtrs);
-                cout << "  Remaining tip: vertex " << assemblyGraph[v].id
-                     << " direction=bwd edges=" << chainEdges.size()
+                cout << "  Remaining tip: segments=";
+                for(uint64_t i = 0; i < chainEdges.size(); i++) {
+                    if(i > 0) cout << ",";
+                    cout << assemblyGraph[chainEdges[i]].id;
+                }
+                cout << " direction=bwd"
                      << " windows=" << totalWindows
                      << " length=" << totalLength
-                     << " edgeIds=";
-                for(const edge_descriptor ce : chainEdges) {
-                    cout << assemblyGraph[ce].id << " ";
-                }
-                cout << endl;
+                     << endl;
             }
         }
     }
