@@ -1262,10 +1262,9 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         ++removedCount;
     }
 
-    // Log edges 16 and 17 with full vertex info (for debugging).
+    // Log all edges with full vertex info (for debugging).
     BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
         const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
-        if(edge.id != 16 && edge.id != 17) continue;
         const vertex_descriptor v0 = source(e, assemblyGraph);
         const vertex_descriptor v1 = target(e, assemblyGraph);
         cout << "  DEBUG Edge " << edge.id
