@@ -179,43 +179,6 @@ uint64_t Shasta2AssemblyGraph::popSuperbubbles(
 {
     Shasta2AssemblyGraph& assemblyGraph = *this;
 
-    // Estimate average coverage from long edges (same as cleanByCopyNumber).
-    double estimatedAverageCoverage = 0.;
-    {
-        const uint64_t minLengthForEstimate = 50000;
-        double coverageSum = 0.;
-        double lengthSum = 0.;
-        BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
-            const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
-            const uint64_t edgeLength = edge.length();
-            if(edgeLength >= minLengthForEstimate) {
-                coverageSum += edge.averageCoverage() * double(edgeLength);
-                lengthSum += double(edgeLength);
-            }
-        }
-        if(lengthSum > 0.) {
-            estimatedAverageCoverage = coverageSum / lengthSum;
-        } else {
-            // Fall back to all edges.
-            BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
-                const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
-                const uint64_t edgeLength = edge.length();
-                coverageSum += edge.averageCoverage() * double(edgeLength);
-                lengthSum += double(edgeLength);
-            }
-            if(lengthSum > 0.) {
-                estimatedAverageCoverage = coverageSum / lengthSum;
-            } else {
-                cout << "popSuperbubbles: no edges to estimate coverage from." << endl;
-                return 0;
-            }
-        }
-    }
-
-    const double maxPoppableCoverage = maxPoppableCoverageFraction * estimatedAverageCoverage;
-    cout << "popSuperbubbles: estimated average coverage = " << estimatedAverageCoverage
-         << ", max poppable coverage = " << maxPoppableCoverage << endl;
-
     // Find superbubbles.
     vector<Shasta2Superbubble> superbubbles;
     findSuperbubbles(superbubbles);
@@ -294,15 +257,13 @@ uint64_t Shasta2AssemblyGraph::popSuperbubbles(
             globalKeptEdges.insert(e);
         }
 
-        // Record candidate edges for removal (non-best paths, below threshold).
+        // Record candidate edges for removal (non-best paths).
         for(uint64_t i = 0; i < allPaths.size(); i++) {
             if(i == bestPathIndex) {
                 continue;
             }
             for(const edge_descriptor e : allPaths[i]) {
-                if(assemblyGraph[e].averageCoverage() < maxPoppableCoverage) {
-                    candidatesForRemoval.insert(e);
-                }
+                candidatesForRemoval.insert(e);
             }
         }
     }
