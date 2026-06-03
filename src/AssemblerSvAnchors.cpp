@@ -1180,7 +1180,7 @@ void Assembler::buildSvMSA(
                     if(lClip.readCount < 3) continue;
                     const int64_t gap = int64_t(lClip.refPos)
                                       - int64_t(rClip.refPos);
-                    if(gap < -10 || gap > 50) continue;
+                    if(gap < -200 || gap > 200) continue;
 
                     // Assemble each side's clip sequences.
                     const uint32_t rContigLen =
@@ -4170,9 +4170,38 @@ void Assembler::buildSvMSA(
                                       / coverage)
                             : 0;
                         if(estSize >= 50) {
+                            // Position: prefer soft-clip midpoint,
+                            // then HitDepth drop, then region center.
                             uint32_t bpPos =
                                 uint32_t(refLength / 2);
-                            if(!hitDepthBreakpoints.empty()) {
+                            bool posFromSoftClip = false;
+                            if(softClipBPs.size() >= 2) {
+                                // Use the two strongest clusters.
+                                uint32_t best1 = 0, best2 = 0;
+                                uint32_t pos1 = 0, pos2 = 0;
+                                for(const auto& sc : softClipBPs) {
+                                    if(sc.readCount > best1) {
+                                        best2 = best1; pos2 = pos1;
+                                        best1 = sc.readCount;
+                                        pos1 = sc.refPos;
+                                    } else if(sc.readCount > best2) {
+                                        best2 = sc.readCount;
+                                        pos2 = sc.refPos;
+                                    }
+                                }
+                                if(best2 >= 3) {
+                                    bpPos = (pos1 + pos2) / 2;
+                                    posFromSoftClip = true;
+                                }
+                            }
+                            if(!posFromSoftClip
+                               && softClipBPs.size() == 1
+                               && softClipBPs[0].readCount >= 3) {
+                                bpPos = softClipBPs[0].refPos;
+                                posFromSoftClip = true;
+                            }
+                            if(!posFromSoftClip
+                               && !hitDepthBreakpoints.empty()) {
                                 double bestDrop = 1.0;
                                 for(const auto& hbp :
                                     hitDepthBreakpoints) {
@@ -4214,9 +4243,37 @@ void Assembler::buildSvMSA(
                         ? int64_t(double(indirectBases) / coverage)
                         : 0;
                     if(estSize >= 50) {
+                        // Position: prefer soft-clip midpoint,
+                        // then HitDepth drop, then region center.
                         uint32_t bpPos =
                             uint32_t(refLength / 2);
-                        if(!hitDepthBreakpoints.empty()) {
+                        bool posFromSoftClip = false;
+                        if(softClipBPs.size() >= 2) {
+                            uint32_t best1 = 0, best2 = 0;
+                            uint32_t pos1 = 0, pos2 = 0;
+                            for(const auto& sc : softClipBPs) {
+                                if(sc.readCount > best1) {
+                                    best2 = best1; pos2 = pos1;
+                                    best1 = sc.readCount;
+                                    pos1 = sc.refPos;
+                                } else if(sc.readCount > best2) {
+                                    best2 = sc.readCount;
+                                    pos2 = sc.refPos;
+                                }
+                            }
+                            if(best2 >= 3) {
+                                bpPos = (pos1 + pos2) / 2;
+                                posFromSoftClip = true;
+                            }
+                        }
+                        if(!posFromSoftClip
+                           && softClipBPs.size() == 1
+                           && softClipBPs[0].readCount >= 3) {
+                            bpPos = softClipBPs[0].refPos;
+                            posFromSoftClip = true;
+                        }
+                        if(!posFromSoftClip
+                           && !hitDepthBreakpoints.empty()) {
                             double bestDrop = 1.0;
                             for(const auto& hbp :
                                 hitDepthBreakpoints) {
@@ -6059,6 +6116,64 @@ void Assembler::buildSvMSA(
                         ci.readCount,
                         "CIGAR-covdrop"});
                     break;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Unpaired soft-clip INS fallback.
+        // When no INS call was emitted but strong soft-clip clusters
+        // exist near the region center, emit an INS call using the
+        // clip length as a minimum size estimate.
+        // -----------------------------------------------------------------
+        if(allInsCalls.empty() && !softClipBPs.empty()) {
+            // Find the strongest soft-clip cluster.
+            const SoftClipBreakpoint* bestSc = nullptr;
+            for(const auto& sc : softClipBPs) {
+                if(sc.readCount >= 4
+                   && (!bestSc
+                       || sc.readCount > bestSc->readCount)) {
+                    bestSc = &sc;
+                }
+            }
+            if(bestSc != nullptr) {
+                // Look for a partner on the opposite side.
+                const SoftClipBreakpoint* partner = nullptr;
+                for(const auto& sc : softClipBPs) {
+                    if(sc.isLeftClip == bestSc->isLeftClip)
+                        continue;
+                    if(sc.readCount >= 3
+                       && (!partner
+                           || sc.readCount > partner->readCount)) {
+                        partner = &sc;
+                    }
+                }
+                if(partner != nullptr) {
+                    // Paired: use midpoint and sum of clip lengths.
+                    const uint32_t bpPos =
+                        (bestSc->refPos + partner->refPos) / 2;
+                    int64_t insSize =
+                        int64_t(bestSc->avgClipLen)
+                        + int64_t(partner->avgClipLen);
+                    if(insSize >= 50) {
+                        allInsCalls.push_back({
+                            bpPos,
+                            insSize,
+                            uint32_t(bestSc->readCount
+                                + partner->readCount),
+                            "softclip-unpaired"});
+                    }
+                } else {
+                    // Single strong cluster: use clip length.
+                    const int64_t insSize =
+                        int64_t(bestSc->avgClipLen);
+                    if(insSize >= 50) {
+                        allInsCalls.push_back({
+                            bestSc->refPos,
+                            insSize,
+                            uint32_t(bestSc->readCount),
+                            "softclip-unpaired"});
+                    }
                 }
             }
         }
