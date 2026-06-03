@@ -133,6 +133,7 @@ public:
     // For reads traversing internal connections, create bypass edges that
     // skip the internal windows. Returns the number of edges removed.
     uint64_t removeInternalConnections(
+        const Shasta2Anchors& anchors,
         const vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
