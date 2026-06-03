@@ -786,19 +786,19 @@ void dinara::main::assemble(
 
     // Find markers using either SIMD closed syncmers or the default k-mer based method.
     if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
-        // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
-        assembler.findMarkersSimdClosedSyncmers(
-            threadCount,
-            assemblerOptions.kmersOptions.k,
-            assemblerOptions.kmersOptions.syncmerS);
-
-        // // Use SIMD-accelerated minimizers instead of closed syncmers.
-        // // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
-        // // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
-        // assembler.findMarkersSimdMinimizers(
+        // // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
+        // assembler.findMarkersSimdClosedSyncmers(
         //     threadCount,
         //     assemblerOptions.kmersOptions.k,
-        //     assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
+        //     assemblerOptions.kmersOptions.syncmerS);
+
+        // Use SIMD-accelerated minimizers instead of closed syncmers.
+        // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
+        // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+        assembler.findMarkersSimdMinimizers(
+            threadCount,
+            assemblerOptions.kmersOptions.k,
+            assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
 
         // Compute histogram using the pre-calculated KmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
