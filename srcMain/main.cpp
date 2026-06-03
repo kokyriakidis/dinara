@@ -1571,9 +1571,6 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    // Trim dangling backbone ends beyond outermost inter-window edges.
-    shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
-
     // Remove isolated windows (no inter-window edges).
     shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
 

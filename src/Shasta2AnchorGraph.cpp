@@ -2207,6 +2207,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "Edge verification: " << backwardEdgeCount << " edges with backward reads, "
              << missingReadEdgeCount << " edges with reads on neither anchor." << endl;
     }
+
+    // Trim backbone ends that extend beyond inter-window connection points.
+    // This prevents dangling stubs in the assembly graph.
+    trimBackbones(anchorWindows, journeys);
 }
 
 
