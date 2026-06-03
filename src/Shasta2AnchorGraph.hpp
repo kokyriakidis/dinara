@@ -137,6 +137,9 @@ public:
         const vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
+    // Remove edges between a window and its RC counterpart.
+    uint64_t removeRcWindowConnections();
+
     // Disable all edges of windows that have no active inter-window edges.
     // Returns the number of isolated windows removed.
     uint64_t removeIsolatedWindows(

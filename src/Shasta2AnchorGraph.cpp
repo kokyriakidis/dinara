@@ -2662,6 +2662,41 @@ void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
 }
 
 
+uint64_t Shasta2AnchorGraph::removeRcWindowConnections()
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    uint64_t removedCount = 0;
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcWin = anchorToWindow[src];
+        const uint32_t dstWin = anchorToWindow[dst];
+        if(srcWin == noWindow || dstWin == noWindow) continue;
+        if(srcWin == dstWin) continue;
+
+        // Check if src and dst are in RC-paired windows.
+        // Window w and w + windowCount are RC counterparts.
+        const bool srcIsRc = (srcWin >= windowCount);
+        const bool dstIsRc = (dstWin >= windowCount);
+        const uint32_t srcNorm = srcIsRc ? (srcWin - windowCount) : srcWin;
+        const uint32_t dstNorm = dstIsRc ? (dstWin - windowCount) : dstWin;
+        if(srcNorm == dstNorm) {
+            // src is in window W, dst is in window W' (or vice versa).
+            disableEdge(e);
+            ++removedCount;
+        }
+    }
+
+    cout << "removeRcWindowConnections: removed " << removedCount
+         << " edges between RC window pairs." << endl;
+    return removedCount;
+}
+
+
 uint64_t Shasta2AnchorGraph::removeInternalConnections(
     const Shasta2Anchors& anchors,
     const vector<AnchorWindow>& anchorWindows,
