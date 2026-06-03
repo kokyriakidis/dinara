@@ -147,9 +147,26 @@ void Shasta2AssemblyGraph::findSuperbubbles(vector<Shasta2Superbubble>& superbub
 
     superbubbles.clear();
     uint64_t branchVertexCount = 0;
+    uint64_t debugCount = 0;
     BGL_FORALL_VERTICES(vSource, assemblyGraph, Shasta2AssemblyGraph) {
         if(out_degree(vSource, assemblyGraph) >= 2) {
             ++branchVertexCount;
+            // Log first few branch vertices for debugging.
+            if(debugCount < 5) {
+                cout << "  Branch vertex " << assemblyGraph[vSource].id
+                     << " (anchor " << assemblyGraph[vSource].anchorId << ")"
+                     << " in=" << in_degree(vSource, assemblyGraph)
+                     << " out=" << out_degree(vSource, assemblyGraph)
+                     << " out-targets:";
+                BGL_FORALL_OUTEDGES(vSource, e, assemblyGraph, Shasta2AssemblyGraph) {
+                    const vertex_descriptor w = target(e, assemblyGraph);
+                    cout << " " << assemblyGraph[w].id
+                         << "(in=" << in_degree(w, assemblyGraph)
+                         << ",out=" << out_degree(w, assemblyGraph) << ")";
+                }
+                cout << endl;
+                ++debugCount;
+            }
         }
         const vertex_descriptor vTarget =
             findSuperbubbleOnodera(assemblyGraph, vSource, maxCount);
