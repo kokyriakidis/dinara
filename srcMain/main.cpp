@@ -1586,8 +1586,9 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
+    const bool enableDetangling = false;
     std::vector<DetangleBypassEdge> bypassEdges;
-    {
+    if(enableDetangling) {
         const uint64_t detangledCount = detangleWindowsGTest(
             *shasta2Anchors,
             *shasta2Journeys,
