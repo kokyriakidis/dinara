@@ -317,6 +317,160 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
         << " vertices and " << num_edges(*this) << " edges." << endl;
 }
 
+
+
+// Construct from anchor graph with window information.
+// Like the base constructor, but also:
+// - Copies the anchorToWindow mapping from the anchor graph
+// - Stores a pointer to the anchor windows
+// - Builds anchorChain for each edge (full chain of AnchorIds like shasta2's Chain)
+// - Populates windowSequence for each edge and windowId for each vertex
+Shasta2AssemblyGraph::Shasta2AssemblyGraph(
+    const Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys,
+    const Shasta2AnchorGraph& anchorGraph,
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2AssemblyGraphOptions& options) :
+    MappedMemoryOwner(anchors),
+    MultithreadedObject<Shasta2AssemblyGraph>(*this),
+    orderById(*this),
+    anchorsPointer(&anchors),
+    journeysPointer(&journeys),
+    options(options),
+    anchorWindowsPointer(&anchorWindows)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Copy the anchor-to-window mapping from the anchor graph.
+    anchorToWindow = anchorGraph.anchorToWindow;
+    windowCount = anchorGraph.windowCount;
+
+    // Create a filtered AnchorGraph containing only edges marked useForAssembly.
+    using FilteredAnchorGraph = boost::filtered_graph<
+        Shasta2AnchorGraph,
+        Shasta2AnchorGraphEdgePredicate>;
+    const FilteredAnchorGraph filteredAnchorGraph(
+        anchorGraph,
+        Shasta2AnchorGraphEdgePredicate(anchorGraph));
+
+    // Find linear chains of edges in the filtered AnchorGraph.
+    vector< list<Shasta2AnchorGraph::edge_descriptor> > chains;
+    findLinearChains(filteredAnchorGraph, 1, chains);
+
+    // Generate vertices at chain endpoints.
+    map<Shasta2AnchorId, vertex_descriptor> vertexMap;
+    for(const auto& chain: chains) {
+        if(chain.empty()) {
+            continue;
+        }
+
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+
+        if(!vertexMap.contains(anchorId0)) {
+            const vertex_descriptor v0 = add_vertex(
+                Shasta2AssemblyGraphVertex(anchorId0, nextVertexId++),
+                assemblyGraph);
+            vertexMap.insert(make_pair(anchorId0, v0));
+        }
+
+        if(!vertexMap.contains(anchorId1)) {
+            const vertex_descriptor v1 = add_vertex(
+                Shasta2AssemblyGraphVertex(anchorId1, nextVertexId++),
+                assemblyGraph);
+            vertexMap.insert(make_pair(anchorId1, v1));
+        }
+    }
+    DINARA_ASSERT(vertexMap.size() == num_vertices(assemblyGraph));
+
+    // Generate one AssemblyGraph edge for each chain.
+    // Also build the anchorChain (full sequence of AnchorIds).
+    for(const auto& chain: chains) {
+        if(chain.empty()) {
+            continue;
+        }
+
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+        const vertex_descriptor v0 = vertexMap.at(anchorId0);
+        const vertex_descriptor v1 = vertexMap.at(anchorId1);
+
+        edge_descriptor e;
+        tie(e, ignore) = add_edge(
+            v0,
+            v1,
+            Shasta2AssemblyGraphEdge(nextEdgeId++),
+            assemblyGraph);
+        Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+
+        // Build the anchor chain and steps simultaneously.
+        for(const Shasta2AnchorGraph::edge_descriptor eA: chain) {
+            const Shasta2AnchorGraphEdge& edgeA = anchorGraph[eA];
+            edge.emplace_back(edgeA.anchorPair, edgeA.offset);
+
+            // Add the source anchor of this step to the chain.
+            // (The target of the last step is added after the loop.)
+            edge.anchorChain.push_back(edgeA.anchorPair.anchorIdA);
+        }
+        // Add the final anchor (target of the last step).
+        edge.anchorChain.push_back(anchorGraph[chain.back()].anchorPair.anchorIdB);
+    }
+
+    check();
+
+    // Populate window annotations for all vertices and edges.
+    populateWindowAnnotations();
+
+    cout << "The Shasta2AssemblyGraph has " << num_vertices(*this)
+        << " vertices and " << num_edges(*this) << " edges"
+        << " (with window info: " << windowCount << " windows)." << endl;
+}
+
+
+
+// Populate anchorChain and windowSequence for all edges,
+// and windowId for all vertices, using the current anchorToWindow mapping.
+void Shasta2AssemblyGraph::populateWindowAnnotations()
+{
+    if(windowCount == 0) {
+        return;
+    }
+
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Populate vertex windowId.
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        assemblyGraph[v].windowId = getWindowId(assemblyGraph[v].anchorId);
+    }
+
+    // Populate edge anchorChain (if not already set) and windowSequence.
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+
+        // Build anchorChain from steps if not already populated.
+        if(edge.anchorChain.empty() && !edge.empty()) {
+            for(const Shasta2AssemblyGraphEdgeStep& step : edge) {
+                edge.anchorChain.push_back(step.anchorPair.anchorIdA);
+            }
+            edge.anchorChain.push_back(edge.back().anchorPair.anchorIdB);
+        }
+
+        // Build windowSequence from anchorChain.
+        edge.windowSequence.clear();
+        for(const Shasta2AnchorId anchorId : edge.anchorChain) {
+            const uint32_t w = getWindowId(anchorId);
+            if(w == noWindow) {
+                continue;
+            }
+            if(edge.windowSequence.empty() || edge.windowSequence.back() != w) {
+                edge.windowSequence.push_back(w);
+            }
+        }
+    }
+}
+
+
+
 Shasta2AssemblyGraph::Shasta2AssemblyGraph(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
@@ -622,6 +776,16 @@ bool Shasta2AssemblyGraph::bubbleCleanup(const Bubble& bubble)
             assemblyGraph);
         Shasta2AssemblyGraphEdge& edgeNew = assemblyGraph[eNew];
         edgeNew.emplace_back(newAnchorPair, newAnchorPair.getAverageOffset(anchors));
+        edgeNew.anchorChain = {anchorId0, anchorId1};
+        // windowSequence will be populated by populateWindowAnnotations if needed.
+        if(windowCount > 0) {
+            const uint32_t w0 = getWindowId(anchorId0);
+            const uint32_t w1 = getWindowId(anchorId1);
+            if(w0 != noWindow) edgeNew.windowSequence.push_back(w0);
+            if(w1 != noWindow && (edgeNew.windowSequence.empty() || edgeNew.windowSequence.back() != w1)) {
+                edgeNew.windowSequence.push_back(w1);
+            }
+        }
 
         for(const uint64_t i: branchGroup) {
             boost::remove_edge(bubble.edges[i], assemblyGraph);
@@ -797,10 +961,34 @@ uint64_t Shasta2AssemblyGraph::compress()
             assemblyGraph);
         Shasta2AssemblyGraphEdge& edgeNew = assemblyGraph[eNew];
 
-        // Concatenate the steps of all the edges in the chain.
+        // Concatenate the steps and anchor chains of all the edges in the chain.
+        bool firstEdge = true;
         for(const edge_descriptor e: chain) {
             const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
             copy(edge.begin(), edge.end(), back_inserter(edgeNew));
+
+            // Merge anchor chains: skip the first anchor of subsequent edges
+            // (it's the same as the last anchor of the previous edge).
+            if(!edge.anchorChain.empty()) {
+                if(firstEdge) {
+                    edgeNew.anchorChain = edge.anchorChain;
+                } else {
+                    // Skip first element (duplicate of previous chain's last).
+                    edgeNew.anchorChain.insert(
+                        edgeNew.anchorChain.end(),
+                        edge.anchorChain.begin() + 1,
+                        edge.anchorChain.end());
+                }
+            }
+
+            // Merge window sequences: append, removing consecutive duplicates.
+            for(const uint32_t w : edge.windowSequence) {
+                if(edgeNew.windowSequence.empty() || edgeNew.windowSequence.back() != w) {
+                    edgeNew.windowSequence.push_back(w);
+                }
+            }
+
+            firstEdge = false;
         }
 
         if(compressDebugLevel >= 1) {
@@ -1668,6 +1856,11 @@ void Shasta2AssemblyGraph::connectAssemblyPaths(
                         DINARA_ASSERT(0);
                     }
                     bridgeEdge.emplace_back(rEdge.anchorPair, rEdge.offset);
+                    bridgeEdge.anchorChain.push_back(rEdge.anchorPair.anchorIdA);
+                }
+                if(!longestPath.empty()) {
+                    bridgeEdge.anchorChain.push_back(
+                        restrictedAnchorGraph[longestPath.back()].anchorPair.anchorIdB);
                 }
             }
         }
@@ -2123,18 +2316,31 @@ void Shasta2AssemblyGraph::writeGfa(ostream& gfa) const
             const uint64_t length = sequence.size();
             gfa << "\tLN:i:" << length;
             gfa << "\tRC:i:" << uint64_t(std::round(coverage * double(length)));
-            gfa << "\n";
-
         } else {
             if(edge.empty()) {
-                gfa << "*\tLN:i:0\n";
+                gfa << "*\tLN:i:0";
             } else {
                 const uint64_t offset = edge.offset();
                 gfa << "*\tLN:i:" << offset;
                 gfa << "\tRC:i:" << uint64_t(std::round(coverage * double(offset)));
-                gfa << "\n";
             }
         }
+
+        // Add window sequence tag if available.
+        if(!edge.windowSequence.empty()) {
+            gfa << "\tws:Z:";
+            for(uint64_t i = 0; i < edge.windowSequence.size(); i++) {
+                if(i > 0) gfa << ",";
+                gfa << edge.windowSequence[i];
+            }
+        }
+
+        // Add anchor chain length tag.
+        if(!edge.anchorChain.empty()) {
+            gfa << "\tac:i:" << edge.anchorChain.size();
+        }
+
+        gfa << "\n";
     }
 
     BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
@@ -2179,8 +2385,11 @@ void Shasta2AssemblyGraph::writeGraphviz(ostream& dot) const
         const Shasta2AssemblyGraphVertex& vertex = assemblyGraph[v];
         dot <<
             vertex.id <<
-            " [label=\"" << shasta2AnchorIdToString(vertex.anchorId) <<
-            "\\n" << vertex.id << "\"];\n";
+            " [label=\"" << shasta2AnchorIdToString(vertex.anchorId);
+        if(vertex.windowId != Shasta2AssemblyGraphVertex::noWindow) {
+            dot << "\\nW" << vertex.windowId;
+        }
+        dot << "\\n" << vertex.id << "\"];\n";
     }
 
     BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
@@ -2194,8 +2403,15 @@ void Shasta2AssemblyGraph::writeGraphviz(ostream& dot) const
             vertex1.id <<
             " [label=\"" << edge.id << "\\n" <<
             (edge.wasAssembled ? edge.sequenceLength() : edge.offset()) <<
-            "\\n" << edge.size() <<
-            "\"];\n";
+            "\\n" << edge.size() << " steps";
+        if(!edge.windowSequence.empty()) {
+            dot << "\\nW:";
+            for(uint64_t i = 0; i < edge.windowSequence.size(); i++) {
+                if(i > 0) dot << ",";
+                dot << edge.windowSequence[i];
+            }
+        }
+        dot << "\"];\n";
     }
 
     dot << "}\n";
@@ -2210,19 +2426,25 @@ void Shasta2AssemblyGraph::writeCsv(const string& fileName) const
 void Shasta2AssemblyGraph::writeCsv(ostream& csv) const
 {
     const Shasta2AssemblyGraph& assemblyGraph = *this;
-    csv << "Segment,Number of steps,Average coverage,Estimated length,Actual length\n";
+    csv << "Segment,Number of steps,Anchor chain length,Average coverage,Estimated length,Actual length,Window sequence\n";
     BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
         const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
         const uint64_t coverage = uint64_t(std::round(Shasta2AssemblyGraphEdgeAverageCoverage(edge)));
         csv <<
             edge.id << "," <<
             edge.size() << "," <<
+            edge.anchorChain.size() << "," <<
             coverage << "," <<
             edge.offset() << ",";
         if(edge.wasAssembled) {
             csv << edge.sequenceLength();
         }
-        csv << ",\n";
+        csv << ",";
+        for(uint64_t i = 0; i < edge.windowSequence.size(); i++) {
+            if(i > 0) csv << " ";
+            csv << edge.windowSequence[i];
+        }
+        csv << "\n";
     }
 }
 
@@ -2246,6 +2468,17 @@ void Shasta2AssemblyGraph::check() const
         for(uint64_t i1=1; i1<edge.size(); i1++) {
             const uint64_t i0 = i1 - 1;
             DINARA_ASSERT(edge[i0].anchorPair.anchorIdB == edge[i1].anchorPair.anchorIdA);
+        }
+
+        // Validate anchor chain consistency with steps, if populated.
+        if(!edge.anchorChain.empty()) {
+            DINARA_ASSERT(edge.anchorChain.size() == edge.size() + 1);
+            DINARA_ASSERT(edge.anchorChain.front() == anchorId0);
+            DINARA_ASSERT(edge.anchorChain.back() == anchorId1);
+            for(uint64_t i = 0; i < edge.size(); i++) {
+                DINARA_ASSERT(edge.anchorChain[i] == edge[i].anchorPair.anchorIdA);
+                DINARA_ASSERT(edge.anchorChain[i + 1] == edge[i].anchorPair.anchorIdB);
+            }
         }
     }
 }
