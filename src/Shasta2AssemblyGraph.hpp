@@ -222,6 +222,11 @@ public:
         uint64_t maxBubbleSize = 10,
         double maxPoppableCoverageFraction = 0.5);
 
+    // Remove parallel edges between the same pair of vertices.
+    // When multiple edges connect the same source to the same target,
+    // keep the one with highest average coverage and remove the rest.
+    uint64_t removeParallelEdges();
+
     // Remove weak stalks (dead-end linear chains leading to branch points).
     // Ported from Shasta2AnchorGraph::cutWeakStalksLeadingToBranch.
     // A stalk starts at a tip vertex (in-degree 0 or out-degree 0),
