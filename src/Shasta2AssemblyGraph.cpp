@@ -1341,7 +1341,7 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
                     edgePtrs.push_back(&assemblyGraph[ce]);
                 }
                 const uint32_t totalWindows = countDistinctWindows(edgePtrs);
-                cout << "  Remaining tip: vertex " << assemblyGraph[v].anchorId
+                cout << "  Remaining tip: vertex " << assemblyGraph[v].id
                      << " direction=fwd edges=" << chainEdges.size()
                      << " windows=" << totalWindows
                      << " length=" << totalLength
@@ -1365,7 +1365,7 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
                     edgePtrs.push_back(&assemblyGraph[ce]);
                 }
                 const uint32_t totalWindows = countDistinctWindows(edgePtrs);
-                cout << "  Remaining tip: vertex " << assemblyGraph[v].anchorId
+                cout << "  Remaining tip: vertex " << assemblyGraph[v].id
                      << " direction=bwd edges=" << chainEdges.size()
                      << " windows=" << totalWindows
                      << " length=" << totalLength
