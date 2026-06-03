@@ -2716,7 +2716,7 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
 
     uint64_t totalRemoved = 0;
     uint64_t totalBypasses = 0;
-    uint64_t totalTriplets = 0;
+    uint64_t totalRepeats = 0;
 
     struct WindowVisit {
         uint32_t normWindow;
@@ -2759,26 +2759,35 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
             }
         }
 
-        // Scan for A->B->A triplets, collapsing in-place.
-        // After collapsing a triplet, back up to catch newly exposed ones.
-        // Example: A->B->C->B->A finds B->C->B first, collapses to A->B->A,
-        // then finds A->B->A.
+        // Scan for repeated window visits, collapsing in-place.
+        // For each position i, find the nearest j>i where ws[j] == ws[i].
+        // The span i..j represents a detour: the read leaves window A,
+        // visits intermediate windows, then returns to A.
+        // Disable all inter-window edges along the detour and create
+        // a bypass within A. Then collapse and back up.
         uint64_t i = 0;
-        while(i + 2 < ws.size()) {
+        while(i + 2 <= ws.size()) {
             const uint32_t wA = ws[i].normWindow;
-            const uint32_t wB = ws[i + 1].normWindow;
-            const uint32_t wA2 = ws[i + 2].normWindow;
 
-            if(wA != wA2) {
+            // Find the nearest repeat of wA after position i.
+            uint64_t j = i + 2; // minimum span of 2 (at least one intermediate)
+            for(; j < ws.size(); j++) {
+                if(ws[j].normWindow == wA) break;
+            }
+            if(j >= ws.size()) {
                 ++i;
                 continue;
             }
 
-            ++totalTriplets;
+            ++totalRepeats;
 
-            // Disable all A->B and B->A edges.
-            disableWindowPair(wA, wB);
-            disableWindowPair(wB, wA);
+            // Disable all inter-window edges along the detour path.
+            for(uint64_t k = i; k < j; k++) {
+                const uint32_t wFrom = ws[k].normWindow;
+                const uint32_t wTo = ws[k + 1].normWindow;
+                disableWindowPair(wFrom, wTo);
+                disableWindowPair(wTo, wFrom);
+            }
 
             // Create a bypass edge from A (last anchor of first visit)
             // to A (first anchor of second visit).
@@ -2786,7 +2795,7 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 createdBypasses.insert({wA, wA});
 
                 const Shasta2AnchorId bypassFrom = ws[i].lastAnchor;
-                const Shasta2AnchorId bypassTo = ws[i + 2].firstAnchor;
+                const Shasta2AnchorId bypassTo = ws[j].firstAnchor;
 
                 if(uint64_t(bypassFrom) != uint64_t(bypassTo) &&
                    anchors.countCommon(bypassFrom, bypassTo) > 0) {
@@ -2824,18 +2833,17 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 }
             }
 
-            // Collapse the triplet: merge the two A visits, remove B.
-            // Keep firstAnchor from first A, lastAnchor from second A.
-            ws[i].lastAnchor = ws[i + 2].lastAnchor;
-            ws.erase(ws.begin() + int64_t(i + 1), ws.begin() + int64_t(i + 3));
+            // Collapse: merge the two A visits, remove intermediates.
+            ws[i].lastAnchor = ws[j].lastAnchor;
+            ws.erase(ws.begin() + int64_t(i + 1), ws.begin() + int64_t(j + 1));
 
-            // Back up to catch newly exposed triplets.
+            // Back up to catch newly exposed patterns.
             if(i > 0) --i;
         }
     }
 
-    cout << "removeInternalConnections: found " << totalTriplets
-         << " A->B->A triplets across " << removedPairs.size()
+    cout << "removeInternalConnections: found " << totalRepeats
+         << " repeated window visits across " << removedPairs.size()
          << " window pairs, removed " << totalRemoved
          << " internal edges, created " << totalBypasses
          << " bypass edges." << endl;
