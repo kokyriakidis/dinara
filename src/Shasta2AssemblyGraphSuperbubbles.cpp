@@ -137,36 +137,122 @@ void Shasta2AssemblyGraph::findSuperbubbles(vector<Shasta2Superbubble>& superbub
 {
     const Shasta2AssemblyGraph& assemblyGraph = *this;
 
-    // Use the Verkko/Onodera algorithm: from each vertex with out-degree >= 2,
-    // find the superbubble exit by topological-order processing.
-    // No vertex count limit — the algorithm naturally terminates on cycles
-    // and dead-ends (matching Verkko's find_bubble).
+    // Build anchorId -> vertex map once for RC lookup.
+    map<Shasta2AnchorId, vertex_descriptor> anchorToVertexLocal;
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        anchorToVertexLocal[assemblyGraph[v].anchorId] = v;
+    }
+
+    auto getRcVertex = [&](vertex_descriptor v) -> vertex_descriptor {
+        const Shasta2AnchorId rcAnchor =
+            Shasta2AnchorId(uint64_t(assemblyGraph[v].anchorId) ^ 1ULL);
+        auto it = anchorToVertexLocal.find(rcAnchor);
+        if(it != anchorToVertexLocal.end()) {
+            return it->second;
+        }
+        return null_vertex();
+    };
+
+    // Find a superbubble starting at vStart using the Onodera et al. 2013 algorithm.
+    // Matches Verkko's find_bubble, including the revnode(u) check for RC vertices.
+    auto findSuperbubble = [&](vertex_descriptor vStart) -> vertex_descriptor {
+        if(out_degree(vStart, assemblyGraph) < 2) {
+            return null_vertex();
+        }
+
+        vector<vertex_descriptor> S = {vStart};
+        set<vertex_descriptor> visited;
+        set<vertex_descriptor> seen;
+        seen.insert(vStart);
+
+        while(!S.empty()) {
+            const vertex_descriptor v = S.back();
+            S.pop_back();
+
+            seen.erase(v);
+            visited.insert(v);
+
+            // Dead end inside bubble: reject.
+            if(out_degree(v, assemblyGraph) == 0) {
+                return null_vertex();
+            }
+
+            // Explore out-edges.
+            BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
+                const vertex_descriptor u = target(e, assemblyGraph);
+
+                // Self-loop: reject.
+                if(u == v) {
+                    return null_vertex();
+                }
+
+                // Edge to own RC (same node, different orientation): reject.
+                // Matches Verkko's `u[1:] == v[1:]`.
+                const vertex_descriptor rcV = getRcVertex(v);
+                if(rcV != null_vertex() && u == rcV) {
+                    return null_vertex();
+                }
+
+                // RC of neighbor already visited: reject.
+                // Matches Verkko's `revnode(u) in visited`.
+                const vertex_descriptor rcU = getRcVertex(u);
+                if(rcU != null_vertex() && visited.count(rcU)) {
+                    return null_vertex();
+                }
+
+                // Edge back to start: cycle, reject.
+                if(u == vStart) {
+                    return null_vertex();
+                }
+
+                // Already visited: back-edge, reject.
+                if(visited.count(u)) {
+                    return null_vertex();
+                }
+
+                seen.insert(u);
+
+                // Check if all predecessors of u are visited.
+                bool hasNonvisitedParent = false;
+                BGL_FORALL_INEDGES(u, inEdge, assemblyGraph, Shasta2AssemblyGraph) {
+                    if(!visited.count(source(inEdge, assemblyGraph))) {
+                        hasNonvisitedParent = true;
+                        break;
+                    }
+                }
+
+                // If all predecessors visited, u is ready.
+                // Guard against parallel edges pushing the same vertex.
+                if(!hasNonvisitedParent) {
+                    if(std::find(S.begin(), S.end(), u) == S.end()) {
+                        S.push_back(u);
+                    }
+                }
+            }
+
+            // Exit condition: exactly one vertex in S and seen, and they're the same.
+            if(S.size() == 1 && seen.size() == 1 && S[0] == *seen.begin()) {
+                const vertex_descriptor t = S[0];
+                // Check that t doesn't have an edge back to start.
+                BGL_FORALL_OUTEDGES(t, outE, assemblyGraph, Shasta2AssemblyGraph) {
+                    if(target(outE, assemblyGraph) == vStart) {
+                        return null_vertex();
+                    }
+                }
+                return t;
+            }
+        }
+
+        return null_vertex();
+    };
 
     superbubbles.clear();
     uint64_t branchVertexCount = 0;
-    uint64_t debugCount = 0;
     BGL_FORALL_VERTICES(vSource, assemblyGraph, Shasta2AssemblyGraph) {
         if(out_degree(vSource, assemblyGraph) >= 2) {
             ++branchVertexCount;
-            // Log first few branch vertices for debugging.
-            if(debugCount < 5) {
-                cout << "  Branch vertex " << assemblyGraph[vSource].id
-                     << " (anchor " << assemblyGraph[vSource].anchorId << ")"
-                     << " in=" << in_degree(vSource, assemblyGraph)
-                     << " out=" << out_degree(vSource, assemblyGraph)
-                     << " out-targets:";
-                BGL_FORALL_OUTEDGES(vSource, e, assemblyGraph, Shasta2AssemblyGraph) {
-                    const vertex_descriptor w = target(e, assemblyGraph);
-                    cout << " " << assemblyGraph[w].id
-                         << "(in=" << in_degree(w, assemblyGraph)
-                         << ",out=" << out_degree(w, assemblyGraph) << ")";
-                }
-                cout << endl;
-                ++debugCount;
-            }
         }
-        const vertex_descriptor vTarget =
-            findSuperbubbleOnodera(assemblyGraph, vSource);
+        const vertex_descriptor vTarget = findSuperbubble(vSource);
         if(vTarget != null_vertex()) {
             superbubbles.emplace_back(assemblyGraph, vSource, vTarget);
         }
