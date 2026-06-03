@@ -101,6 +101,7 @@ public:
         const Shasta2Journeys&,
         const vector<AnchorWindow>& anchorWindows,
         uint64_t minInterWindowCoverage,
+        uint64_t minInterWindowEdgeCoverage,
         uint64_t threadCount,
         const Reads* reads = nullptr,
         const vector<DetangleBypassEdge>* bypassEdges = nullptr);

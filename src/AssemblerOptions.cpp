@@ -1475,6 +1475,13 @@ void AssemblerOptions::addConfigurableOptions()
         "Candidates with fewer shared reads are discarded. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minInterWindowEdgeCoverage",
+        value<uint64_t>(&assemblyOptions.mode3Options.minInterWindowEdgeCoverage)->
+        default_value(4),
+        "Minimum anchor pair coverage (common reads) for an inter-window edge. "
+        "Edges whose anchor pair has fewer common reads are discarded. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.minCommonForBackbone",
         value<uint64_t>(&assemblyOptions.mode3Options.minCommonForBackbone)->
         default_value(2),
@@ -1944,6 +1951,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minAnchorCoverageMultiplier = " << minAnchorCoverageMultiplier << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
     s << "mode3.minInterWindowCoverage = " << minInterWindowCoverage << "\n";
+    s << "mode3.minInterWindowEdgeCoverage = " << minInterWindowEdgeCoverage << "\n";
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
