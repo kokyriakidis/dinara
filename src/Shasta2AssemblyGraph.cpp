@@ -1035,6 +1035,70 @@ uint64_t Shasta2AssemblyGraph::compress()
 
 
 
+// Remove parallel edges between the same pair of vertices.
+// When multiple edges connect the same source to the same target,
+// keep the one with highest average coverage and remove the rest.
+uint64_t Shasta2AssemblyGraph::removeParallelEdges()
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Group edges by (source, target) vertex pair.
+    // Use vertex id pairs for deterministic ordering.
+    using VertexPair = pair<uint64_t, uint64_t>;
+    map<VertexPair, vector<edge_descriptor>> edgeGroups;
+
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const vertex_descriptor v0 = source(e, assemblyGraph);
+        const vertex_descriptor v1 = target(e, assemblyGraph);
+        const VertexPair key(assemblyGraph[v0].id, assemblyGraph[v1].id);
+        edgeGroups[key].push_back(e);
+    }
+
+    // Collect edges to remove.
+    set<edge_descriptor> edgesToRemove;
+    for(auto& [key, edges] : edgeGroups) {
+        if(edges.size() <= 1) continue;
+
+        // Find the edge with highest average coverage.
+        uint64_t bestIndex = 0;
+        double bestCoverage = assemblyGraph[edges[0]].averageCoverage();
+        for(uint64_t i = 1; i < edges.size(); i++) {
+            const double cov = assemblyGraph[edges[i]].averageCoverage();
+            if(cov > bestCoverage) {
+                bestCoverage = cov;
+                bestIndex = i;
+            }
+        }
+
+        // Mark all non-best edges for removal.
+        for(uint64_t i = 0; i < edges.size(); i++) {
+            if(i != bestIndex) {
+                edgesToRemove.insert(edges[i]);
+            }
+        }
+    }
+
+    // Remove edges and clean up isolated vertices.
+    set<vertex_descriptor> affectedVertices;
+    for(const edge_descriptor e : edgesToRemove) {
+        affectedVertices.insert(source(e, assemblyGraph));
+        affectedVertices.insert(target(e, assemblyGraph));
+        boost::remove_edge(e, assemblyGraph);
+    }
+
+    for(const vertex_descriptor v : affectedVertices) {
+        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) == 0) {
+            boost::remove_vertex(v, assemblyGraph);
+        }
+    }
+
+    const uint64_t removedCount = edgesToRemove.size();
+    cout << "removeParallelEdges: removed " << removedCount << " parallel edges." << endl;
+    return removedCount;
+}
+
+
+
 // Remove low-coverage dead-end edges (tips).
 // A tip is an edge where one endpoint is a dead end (no other connections
 // on that side). Adapted from MBG's tryRemoveTip.

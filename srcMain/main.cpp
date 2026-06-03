@@ -1647,13 +1647,15 @@ void dinara::main::assemble(
 
         changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
         shasta2AssemblyGraph->compress();
-        shasta2AssemblyGraph->writeGfa(
-            "Shasta2AssemblyGraph-tips-" + to_string(cleanRound) + ".gfa");
+
+        changeCount += shasta2AssemblyGraph->removeParallelEdges();
+        shasta2AssemblyGraph->compress();
 
         changeCount += shasta2AssemblyGraph->popSuperbubbles();
         shasta2AssemblyGraph->compress();
+
         shasta2AssemblyGraph->writeGfa(
-            "Shasta2AssemblyGraph-popped-" + to_string(cleanRound) + ".gfa");
+            "Shasta2AssemblyGraph-clean-" + to_string(cleanRound) + ".gfa");
 
         cout << timestamp << "Clean round " << cleanRound
              << ": " << changeCount << " changes." << endl;

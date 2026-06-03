@@ -111,8 +111,11 @@ typename Graph::vertex_descriptor dinara::findSuperbubbleOnodera(
             }
 
             // If all predecessors visited, u is ready.
+            // Guard against parallel edges pushing the same vertex multiple times.
             if(!hasNonvisitedParent) {
-                S.push_back(u);
+                if(std::find(S.begin(), S.end(), u) == S.end()) {
+                    S.push_back(u);
+                }
             }
         }
 
