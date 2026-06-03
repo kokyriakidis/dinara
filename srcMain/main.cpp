@@ -1619,7 +1619,7 @@ void dinara::main::assemble(
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
 
-    // Remove inter-window edges that land internally on a window's backbone.
+    // Remove A->B->A triplet connections iteratively until convergence.
     shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 

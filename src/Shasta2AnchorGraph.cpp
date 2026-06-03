@@ -2710,127 +2710,172 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
     cout << "removeInternalConnections: processing " << nonBackboneReads.size()
          << " non-backbone reads, looking for A->B->A triplets." << endl;
 
-    // Track which window pairs have already had edges removed or bypasses created.
+    // Track which window pairs have had edges removed or bypasses created.
     std::set<WindowPairKey> removedPairs;
     std::set<WindowPairKey> createdBypasses;
 
-    uint64_t removedCount = 0;
-    uint64_t bypassCount = 0;
-    uint64_t tripletCount = 0;
+    uint64_t totalRemoved = 0;
+    uint64_t totalBypasses = 0;
+    uint64_t totalTriplets = 0;
 
-    for(const OrientedReadId& orientedReadId : nonBackboneReads) {
-        const auto journey = journeys[orientedReadId];
+    struct WindowVisit {
+        uint32_t normWindow;
+        Shasta2AnchorId firstAnchor;
+        Shasta2AnchorId lastAnchor;
+    };
 
-        // Build the window sequence for this read's journey.
-        struct WindowVisit {
-            uint32_t normWindow;
-            Shasta2AnchorId firstAnchor;
-            Shasta2AnchorId lastAnchor;
-        };
-        vector<WindowVisit> windowSequence;
-        uint32_t prevNormWindow = noWindow;
-        for(uint64_t pos = 0; pos < journey.size(); pos++) {
-            const uint64_t aid = uint64_t(journey[pos]);
-            if(aid >= anchorCount) continue;
-            const uint32_t w = anchorToWindow[aid];
-            if(w == noWindow) continue;
-            const uint32_t normW = normalizeW(w);
-            if(normW != prevNormWindow) {
-                windowSequence.push_back({normW, journey[pos], journey[pos]});
-                prevNormWindow = normW;
-            } else if(!windowSequence.empty()) {
-                windowSequence.back().lastAnchor = journey[pos];
+    // Iterate until no new triplets are found. Each pass may remove
+    // window pairs, causing previously hidden triplets to appear
+    // when those windows are collapsed out of the sequence.
+    for(uint64_t iteration = 0; ; ++iteration) {
+        uint64_t iterationTriplets = 0;
+        uint64_t iterationRemoved = 0;
+        uint64_t iterationBypasses = 0;
+
+        for(const OrientedReadId& orientedReadId : nonBackboneReads) {
+            const auto journey = journeys[orientedReadId];
+
+            // Build the window sequence, skipping windows whose
+            // connections to their neighbors have already been removed.
+            // A window B is skipped if both (prev->B) and (B->next)
+            // are in removedPairs. Since we don't know "next" yet,
+            // we build the raw sequence first, then filter.
+            vector<WindowVisit> rawSequence;
+            uint32_t prevNormWindow = noWindow;
+            for(uint64_t pos = 0; pos < journey.size(); pos++) {
+                const uint64_t aid = uint64_t(journey[pos]);
+                if(aid >= anchorCount) continue;
+                const uint32_t w = anchorToWindow[aid];
+                if(w == noWindow) continue;
+                const uint32_t normW = normalizeW(w);
+                if(normW != prevNormWindow) {
+                    rawSequence.push_back({normW, journey[pos], journey[pos]});
+                    prevNormWindow = normW;
+                } else if(!rawSequence.empty()) {
+                    rawSequence.back().lastAnchor = journey[pos];
+                }
             }
-        }
 
-        if(windowSequence.size() < 3) continue;
+            // Filter out windows whose connections to both neighbors
+            // have been removed in previous iterations.
+            vector<WindowVisit> windowSequence;
+            for(uint64_t i = 0; i < rawSequence.size(); i++) {
+                const uint32_t w = rawSequence[i].normWindow;
+                if(i > 0 && i + 1 < rawSequence.size()) {
+                    const uint32_t wPrev = rawSequence[i - 1].normWindow;
+                    const uint32_t wNext = rawSequence[i + 1].normWindow;
+                    if(removedPairs.count({wPrev, w}) && removedPairs.count({w, wNext})) {
+                        continue; // Skip this window.
+                    }
+                }
+                // Merge with previous if same window after filtering.
+                if(!windowSequence.empty() && windowSequence.back().normWindow == w) {
+                    windowSequence.back().lastAnchor = rawSequence[i].lastAnchor;
+                } else {
+                    windowSequence.push_back(rawSequence[i]);
+                }
+            }
 
-        // Scan for A->B->A triplets.
-        for(uint64_t i = 0; i + 2 < windowSequence.size(); i++) {
-            const uint32_t wA = windowSequence[i].normWindow;
-            const uint32_t wB = windowSequence[i + 1].normWindow;
-            const uint32_t wA2 = windowSequence[i + 2].normWindow;
-            if(wA != wA2) continue;
+            if(windowSequence.size() < 3) continue;
 
-            ++tripletCount;
+            // Scan for A->B->A triplets.
+            for(uint64_t i = 0; i + 2 < windowSequence.size(); i++) {
+                const uint32_t wA = windowSequence[i].normWindow;
+                const uint32_t wB = windowSequence[i + 1].normWindow;
+                const uint32_t wA2 = windowSequence[i + 2].normWindow;
+                if(wA != wA2) continue;
 
-            // Disable all A->B edges.
-            if(!removedPairs.count({wA, wB})) {
-                removedPairs.insert({wA, wB});
-                auto it = windowPairEdges.find({wA, wB});
-                if(it != windowPairEdges.end()) {
-                    for(const edge_descriptor e : it->second) {
-                        if(anchorGraph[e].useForAssembly) {
-                            disableEdge(e);
-                            ++removedCount;
+                ++iterationTriplets;
+
+                // Disable all A->B edges.
+                if(!removedPairs.count({wA, wB})) {
+                    removedPairs.insert({wA, wB});
+                    auto it = windowPairEdges.find({wA, wB});
+                    if(it != windowPairEdges.end()) {
+                        for(const edge_descriptor e : it->second) {
+                            if(anchorGraph[e].useForAssembly) {
+                                disableEdge(e);
+                                ++iterationRemoved;
+                            }
                         }
                     }
                 }
-            }
 
-            // Disable all B->A edges.
-            if(!removedPairs.count({wB, wA})) {
-                removedPairs.insert({wB, wA});
-                auto it = windowPairEdges.find({wB, wA});
-                if(it != windowPairEdges.end()) {
-                    for(const edge_descriptor e : it->second) {
-                        if(anchorGraph[e].useForAssembly) {
-                            disableEdge(e);
-                            ++removedCount;
+                // Disable all B->A edges.
+                if(!removedPairs.count({wB, wA})) {
+                    removedPairs.insert({wB, wA});
+                    auto it = windowPairEdges.find({wB, wA});
+                    if(it != windowPairEdges.end()) {
+                        for(const edge_descriptor e : it->second) {
+                            if(anchorGraph[e].useForAssembly) {
+                                disableEdge(e);
+                                ++iterationRemoved;
+                            }
                         }
                     }
                 }
-            }
 
-            // Create a bypass edge from A (last anchor of first visit)
-            // to A (first anchor of second visit).
-            if(createdBypasses.count({wA, wA})) continue;
-            createdBypasses.insert({wA, wA});
+                // Create a bypass edge from A (last anchor of first visit)
+                // to A (first anchor of second visit).
+                if(createdBypasses.count({wA, wA})) continue;
+                createdBypasses.insert({wA, wA});
 
-            const Shasta2AnchorId bypassFrom = windowSequence[i].lastAnchor;
-            const Shasta2AnchorId bypassTo = windowSequence[i + 2].firstAnchor;
+                const Shasta2AnchorId bypassFrom = windowSequence[i].lastAnchor;
+                const Shasta2AnchorId bypassTo = windowSequence[i + 2].firstAnchor;
 
-            if(uint64_t(bypassFrom) == uint64_t(bypassTo)) continue;
-            if(anchors.countCommon(bypassFrom, bypassTo) == 0) continue;
+                if(uint64_t(bypassFrom) == uint64_t(bypassTo)) continue;
+                if(anchors.countCommon(bypassFrom, bypassTo) == 0) continue;
 
-            Shasta2AnchorPair bypassPair(anchors, bypassFrom, bypassTo, false);
-            if(bypassPair.size() == 0) continue;
-            bypassPair.assertNoNegativeOffsets(anchors);
+                Shasta2AnchorPair bypassPair(anchors, bypassFrom, bypassTo, false);
+                if(bypassPair.size() == 0) continue;
+                bypassPair.assertNoNegativeOffsets(anchors);
 
-            // Create forward edge.
-            edge_descriptor eBypass;
-            tie(eBypass, ignore) = add_edge(
-                uint64_t(bypassFrom), uint64_t(bypassTo),
-                Shasta2AnchorGraphEdge(bypassPair,
-                    bypassPair.getAverageOffset(anchors), nextEdgeId++),
-                anchorGraph);
-            anchorGraph[eBypass].useForAssembly = true;
+                // Create forward edge.
+                edge_descriptor eBypass;
+                tie(eBypass, ignore) = add_edge(
+                    uint64_t(bypassFrom), uint64_t(bypassTo),
+                    Shasta2AnchorGraphEdge(bypassPair,
+                        bypassPair.getAverageOffset(anchors), nextEdgeId++),
+                    anchorGraph);
+                anchorGraph[eBypass].useForAssembly = true;
 
-            // Create RC mirror edge.
-            const Shasta2AnchorId rcFrom = Shasta2AnchorId(uint64_t(bypassFrom) ^ 1ULL);
-            const Shasta2AnchorId rcTo = Shasta2AnchorId(uint64_t(bypassTo) ^ 1ULL);
-            if(uint64_t(rcFrom) < anchorCount && uint64_t(rcTo) < anchorCount) {
-                Shasta2AnchorPair rcPair(anchors, rcTo, rcFrom, false);
-                if(rcPair.size() > 0) {
-                    rcPair.assertNoNegativeOffsets(anchors);
-                    edge_descriptor eRc;
-                    tie(eRc, ignore) = add_edge(
-                        uint64_t(rcTo), uint64_t(rcFrom),
-                        Shasta2AnchorGraphEdge(rcPair,
-                            rcPair.getAverageOffset(anchors), nextEdgeId++),
-                        anchorGraph);
-                    anchorGraph[eRc].useForAssembly = true;
+                // Create RC mirror edge.
+                const Shasta2AnchorId rcFrom = Shasta2AnchorId(uint64_t(bypassFrom) ^ 1ULL);
+                const Shasta2AnchorId rcTo = Shasta2AnchorId(uint64_t(bypassTo) ^ 1ULL);
+                if(uint64_t(rcFrom) < anchorCount && uint64_t(rcTo) < anchorCount) {
+                    Shasta2AnchorPair rcPair(anchors, rcTo, rcFrom, false);
+                    if(rcPair.size() > 0) {
+                        rcPair.assertNoNegativeOffsets(anchors);
+                        edge_descriptor eRc;
+                        tie(eRc, ignore) = add_edge(
+                            uint64_t(rcTo), uint64_t(rcFrom),
+                            Shasta2AnchorGraphEdge(rcPair,
+                                rcPair.getAverageOffset(anchors), nextEdgeId++),
+                            anchorGraph);
+                        anchorGraph[eRc].useForAssembly = true;
+                    }
                 }
+                ++iterationBypasses;
             }
-            ++bypassCount;
         }
+
+        totalTriplets += iterationTriplets;
+        totalRemoved += iterationRemoved;
+        totalBypasses += iterationBypasses;
+
+        cout << "removeInternalConnections iteration " << iteration
+             << ": " << iterationTriplets << " triplets, "
+             << iterationRemoved << " edges removed, "
+             << iterationBypasses << " bypasses created." << endl;
+
+        if(iterationTriplets == 0) break;
     }
 
-    cout << "removeInternalConnections: found " << tripletCount
-         << " A->B->A triplets, removed " << removedCount
-         << " internal edges, created " << bypassCount
+    cout << "removeInternalConnections total: " << totalTriplets
+         << " A->B->A triplets, removed " << totalRemoved
+         << " internal edges, created " << totalBypasses
          << " bypass edges." << endl;
-    return removedCount + bypassCount;
+    return totalRemoved + totalBypasses;
 }
 
 
