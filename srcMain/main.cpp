@@ -1619,7 +1619,8 @@ void dinara::main::assemble(
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
 
-    // Remove repeated window visits and trim backbones.
+    // Remove edges between RC window pairs, repeated window visits, and trim backbones.
+    shasta2AnchorGraph->removeRcWindowConnections();
     shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
@@ -1645,7 +1646,8 @@ void dinara::main::assemble(
                 &bypassEdges2);
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-            // Remove internal connections and trim again after detangling.
+            // Clean again after detangling.
+            shasta2AnchorGraph->removeRcWindowConnections();
             shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
             shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
         }
