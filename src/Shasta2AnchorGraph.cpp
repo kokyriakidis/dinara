@@ -2786,6 +2786,10 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
     cout << "removeInternalConnections: processing " << nonBackboneReads.size()
          << " non-backbone reads (longest first)." << endl;
 
+    // Track which (fromWindow, toWindow) bypass pairs have already been created
+    // to avoid duplicate bypass edges from different reads.
+    std::set<WindowPairKey> createdBypasses;
+
     // Process each non-backbone read.
     uint64_t removedCount = 0;
     uint64_t bypassCount = 0;
@@ -2883,7 +2887,12 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
             }
 
             // Create a bypass edge: last anchor in source window -> first anchor
-            // in target window.
+            // in target window. Skip if this bypass pair was already created.
+            const uint32_t bypassWFrom = windowSequence[fromIdx].normWindow;
+            const uint32_t bypassWTo = windowSequence[toIdx].normWindow;
+            if(createdBypasses.count({bypassWFrom, bypassWTo})) continue;
+            createdBypasses.insert({bypassWFrom, bypassWTo});
+
             const Shasta2AnchorId bypassFrom = windowSequence[fromIdx].lastAnchor;
             const Shasta2AnchorId bypassTo = windowSequence[toIdx].firstAnchor;
 
