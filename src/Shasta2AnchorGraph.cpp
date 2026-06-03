@@ -3058,17 +3058,6 @@ uint64_t Shasta2AnchorGraph::removeTipWindows(
 
 
 
-// Functor for filtering active edges in the anchor graph.
-// Must be a named class (not a lambda) for boost::filtered_graph compatibility.
-struct ActiveEdgeFilter {
-    const Shasta2AnchorGraph* graph = nullptr;
-    ActiveEdgeFilter() = default;
-    ActiveEdgeFilter(const Shasta2AnchorGraph* g) : graph(g) {}
-    bool operator()(Shasta2AnchorGraphBaseClass::edge_descriptor e) const {
-        return (*graph)[e].useForAssembly;
-    }
-};
-
 uint64_t Shasta2AnchorGraph::popSuperbubbles(
     const vector<AnchorWindow>& anchorWindows,
     const Shasta2Journeys& journeys,
@@ -3077,100 +3066,152 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
     Shasta2AnchorGraph& anchorGraph = *this;
     const uint64_t anchorCount = num_vertices(anchorGraph);
 
-    // Create a filtered graph view that only includes active edges.
-    ActiveEdgeFilter edgePredicate(&anchorGraph);
-    using FilteredGraph = boost::filtered_graph<
-        Shasta2AnchorGraphBaseClass,
-        ActiveEdgeFilter>;
-    FilteredGraph filteredGraph(anchorGraph, edgePredicate);
-
-    // Helper to count active out-degree in the filtered graph.
-    auto activeOutDegree = [&](uint64_t v) -> uint64_t {
-        return out_degree(v, filteredGraph);
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
     };
 
-    // Track which vertices have been part of a popped superbubble
-    // to avoid overlapping pops.
-    std::set<uint64_t> poppedVertices;
+    // ---- Step 1: Build a window-level directed graph. ----
+    // Nodes are raw window IDs (forward and RC separate).
+    // Edges are inter-window connections from active anchor edges.
+    // Use adjacency_list with vecS so findSuperbubbleOnodera works.
+    //
+    // First, collect all raw window IDs and map them to dense indices.
+    std::map<uint32_t, std::set<uint32_t>> windowSuccessorsMap;
 
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcW = anchorToWindow[src];
+        const uint32_t dstW = anchorToWindow[dst];
+        if(srcW == noWindow || dstW == noWindow) continue;
+        if(srcW == dstW) continue;
+        if(normalizeW(srcW) == normalizeW(dstW)) continue;
+        windowSuccessorsMap[srcW].insert(dstW);
+    }
+
+    // Collect all raw window IDs.
+    std::set<uint32_t> allRawWindows;
+    for(const auto& [w, succs] : windowSuccessorsMap) {
+        allRawWindows.insert(w);
+        for(const uint32_t s : succs) allRawWindows.insert(s);
+    }
+
+    // Map raw window IDs to dense indices.
+    std::vector<uint32_t> indexToRawWindow(allRawWindows.begin(), allRawWindows.end());
+    std::map<uint32_t, uint32_t> rawWindowToIndex;
+    for(uint32_t i = 0; i < indexToRawWindow.size(); i++) {
+        rawWindowToIndex[indexToRawWindow[i]] = i;
+    }
+
+    // Build the window-level Boost graph.
+    using WindowGraph = boost::adjacency_list<
+        boost::vecS, boost::vecS, boost::bidirectionalS>;
+    const uint32_t nWindowNodes = uint32_t(indexToRawWindow.size());
+    WindowGraph windowGraph(nWindowNodes);
+
+    for(const auto& [srcW, succs] : windowSuccessorsMap) {
+        const uint32_t srcIdx = rawWindowToIndex[srcW];
+        for(const uint32_t dstW : succs) {
+            const uint32_t dstIdx = rawWindowToIndex[dstW];
+            boost::add_edge(srcIdx, dstIdx, windowGraph);
+        }
+    }
+
+    cout << "popSuperbubbles: window graph has " << nWindowNodes
+         << " nodes, " << num_edges(windowGraph) << " edges." << endl;
+
+    // ---- Step 2: Find and pop superbubbles in the window graph. ----
+    std::set<uint32_t> poppedWindowIndices;
     uint64_t poppedCount = 0;
 
-    // For each vertex with active out-degree >= 2, try to find a superbubble.
-    for(uint64_t v = 0; v < anchorCount; v++) {
-        if(activeOutDegree(v) < 2) continue;
-        if(poppedVertices.count(v)) continue;
+    for(uint32_t vi = 0; vi < nWindowNodes; vi++) {
+        if(out_degree(vi, windowGraph) < 2) continue;
+        if(poppedWindowIndices.count(vi)) continue;
 
-        // Find the superbubble exit.
-        const auto vExit = findSuperbubbleOnodera(filteredGraph, v, maxSize);
-        if(vExit == FilteredGraph::null_vertex()) continue;
+        const auto viExit = findSuperbubbleOnodera(windowGraph, vi, maxSize);
+        if(viExit == WindowGraph::null_vertex()) continue;
 
-        // Collect all vertices in the superbubble interior
-        // (between source and sink, inclusive) using BFS on the filtered graph.
-        std::set<uint64_t> interiorVertices;
+        // Collect interior vertices via BFS.
+        std::set<uint32_t> interiorIndices;
         {
-            std::vector<uint64_t> queue;
-            queue.push_back(v);
-            interiorVertices.insert(v);
+            std::vector<uint32_t> queue;
+            queue.push_back(vi);
+            interiorIndices.insert(vi);
             while(!queue.empty()) {
-                const uint64_t u = queue.back();
+                const uint32_t u = queue.back();
                 queue.pop_back();
-                if(u == vExit) continue;  // Don't expand past the exit.
-                BGL_FORALL_OUTEDGES_T(u, e, filteredGraph, FilteredGraph) {
-                    const uint64_t w = target(e, filteredGraph);
-                    if(interiorVertices.insert(w).second) {
+                if(u == viExit) continue;
+                BGL_FORALL_OUTEDGES_T(u, e, windowGraph, WindowGraph) {
+                    const uint32_t w = target(e, windowGraph);
+                    if(interiorIndices.insert(w).second) {
                         queue.push_back(w);
                     }
                 }
             }
         }
 
-        // Skip if any interior vertex is already part of a popped superbubble.
+        // Skip if overlapping with a previously popped superbubble.
         bool overlap = false;
-        for(const uint64_t u : interiorVertices) {
-            if(poppedVertices.count(u)) { overlap = true; break; }
+        for(const uint32_t u : interiorIndices) {
+            if(poppedWindowIndices.count(u)) { overlap = true; break; }
         }
         if(overlap) continue;
 
-        // Enumerate all paths from source to sink using DFS.
-        // Each path is a sequence of edge_descriptors.
-        std::vector<std::vector<edge_descriptor>> allPaths;
+        // Enumerate all paths from source to sink (as sequences of window indices).
+        std::vector<std::vector<uint32_t>> allPaths;
         {
             struct DfsFrame {
-                uint64_t vertex;
-                std::vector<edge_descriptor> pathSoFar;
+                uint32_t vertex;
+                std::vector<uint32_t> path;
             };
             std::vector<DfsFrame> stack;
-            stack.push_back({v, {}});
+            stack.push_back({vi, {vi}});
 
             while(!stack.empty()) {
                 auto [current, path] = std::move(stack.back());
                 stack.pop_back();
 
-                if(current == vExit) {
+                if(current == viExit) {
                     allPaths.push_back(std::move(path));
                     continue;
                 }
 
-                BGL_FORALL_OUTEDGES_T(current, e, filteredGraph, FilteredGraph) {
-                    const uint64_t w = target(e, filteredGraph);
-                    if(!interiorVertices.count(w)) continue;
+                BGL_FORALL_OUTEDGES_T(current, e, windowGraph, WindowGraph) {
+                    const uint32_t w = target(e, windowGraph);
+                    if(!interiorIndices.count(w)) continue;
                     auto newPath = path;
-                    newPath.push_back(e);
+                    newPath.push_back(w);
                     stack.push_back({w, std::move(newPath)});
                 }
             }
         }
 
-        // Need at least 2 paths to pop.
         if(allPaths.size() < 2) continue;
 
-        // Score each path. Prefer the path that stays in the source
-        // vertex's window (the backbone path through the window).
-        const uint32_t sourceWindow = (v < anchorCount) ? anchorToWindow[v] : noWindow;
-        uint32_t sourceWindowNorm = noWindow;
-        if(sourceWindow != noWindow) {
-            sourceWindowNorm = (sourceWindow >= windowCount)
-                ? (sourceWindow - windowCount) : sourceWindow;
+        // Score each path. Prefer the path that follows the source
+        // window's backbone chain (backboneNextWindow).
+        // Walk the backbone chain from the source to build the set of
+        // windows the backbone passes through.
+        const uint32_t sourceRawW = indexToRawWindow[vi];
+        const uint32_t sourceNormW = normalizeW(sourceRawW);
+        const uint32_t sinkNormW = normalizeW(indexToRawWindow[viExit]);
+
+        std::set<uint32_t> backboneChainNormWindows;
+        {
+            uint32_t current = sourceNormW;
+            backboneChainNormWindows.insert(current);
+            // Walk backboneNextWindow until we reach the sink or a dead end.
+            for(uint32_t step = 0; step < maxSize + 2; step++) {
+                if(current >= anchorWindows.size()) break;
+                const uint32_t next = anchorWindows[current].backboneNextWindow;
+                if(next == AnchorWindowReadInterval::noWindow) break;
+                const uint32_t nextNorm = normalizeW(next);
+                backboneChainNormWindows.insert(nextNorm);
+                if(nextNorm == sinkNormW) break;
+                current = nextNorm;
+            }
         }
 
         uint64_t bestPathIndex = 0;
@@ -3180,68 +3221,108 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
             const auto& path = allPaths[pi];
             uint64_t score = 0;
 
-            for(const auto& e : path) {
-                // Count how many edges in this path have both endpoints
-                // in the source's window.
-                const uint64_t src = uint64_t(source(e, anchorGraph));
-                const uint64_t dst = uint64_t(target(e, anchorGraph));
-                uint32_t srcW = noWindow, dstW = noWindow;
-                if(src < anchorCount) srcW = anchorToWindow[src];
-                if(dst < anchorCount) dstW = anchorToWindow[dst];
+            for(const uint32_t wIdx : path) {
+                const uint32_t normW = normalizeW(indexToRawWindow[wIdx]);
 
-                // Normalize.
-                if(srcW != noWindow && srcW >= windowCount) srcW -= windowCount;
-                if(dstW != noWindow && dstW >= windowCount) dstW -= windowCount;
+                // High score for windows on the backbone chain.
+                if(backboneChainNormWindows.count(normW)) {
+                    score += 1000;
+                }
 
-                if(srcW == sourceWindowNorm && dstW == sourceWindowNorm) {
-                    score += 2;  // Both in source window.
-                } else if(srcW == sourceWindowNorm || dstW == sourceWindowNorm) {
-                    score += 1;  // One endpoint in source window.
+                // Tiebreak: total transition read support.
+                if(normW < anchorWindows.size()) {
+                    const auto& window = anchorWindows[normW];
+                    for(const auto& [key, reads] : window.transitionReads) {
+                        score += reads.size();
+                    }
                 }
             }
 
-            // Tiebreak: prefer longer paths (more edges = more resolution).
-            // Encode as (score << 32) | pathLength for comparison.
-            const uint64_t compositeScore = (score << 32) | path.size();
-            if(compositeScore > bestScore) {
-                bestScore = compositeScore;
+            if(score > bestScore) {
+                bestScore = score;
                 bestPathIndex = pi;
             }
         }
 
-        // Collect edges on the best path.
-        std::set<edge_descriptor> bestPathEdges(
-            allPaths[bestPathIndex].begin(),
-            allPaths[bestPathIndex].end());
+        // Collect the set of normalized window IDs on the best path.
+        std::set<uint32_t> bestPathNormWindows;
+        for(const uint32_t wIdx : allPaths[bestPathIndex]) {
+            bestPathNormWindows.insert(normalizeW(indexToRawWindow[wIdx]));
+        }
 
-        // Disable all edges in the superbubble interior that are NOT
-        // on the best path.
-        uint64_t disabledCount = 0;
-        for(const uint64_t u : interiorVertices) {
-            if(u == vExit) continue;  // Don't disable edges leaving the exit.
-            BGL_FORALL_OUTEDGES_T(u, e, anchorGraph, Shasta2AnchorGraphBaseClass) {
-                if(!anchorGraph[e].useForAssembly) continue;
-                const uint64_t w = uint64_t(target(e, anchorGraph));
-                if(!interiorVertices.count(w)) continue;
-                if(bestPathEdges.count(e)) continue;
-                disableEdge(e);
-                ++disabledCount;
+        // Collect normalized window IDs on ALL paths.
+        std::set<uint32_t> allPathNormWindows;
+        for(const auto& path : allPaths) {
+            for(const uint32_t wIdx : path) {
+                allPathNormWindows.insert(normalizeW(indexToRawWindow[wIdx]));
             }
         }
 
-        if(disabledCount > 0) {
-            for(const uint64_t u : interiorVertices) {
-                poppedVertices.insert(u);
-            }
-            ++poppedCount;
-
-            cout << "  Superbubble popped: source=" << v
-                 << " sink=" << vExit
-                 << " interior=" << interiorVertices.size()
-                 << " paths=" << allPaths.size()
-                 << " disabled=" << disabledCount
-                 << " edges." << endl;
+        // Windows to disable: in the superbubble but NOT on the best path.
+        // Don't disable the source or sink — they're shared by all paths.
+        std::set<uint32_t> windowsToDisable;
+        for(const uint32_t normW : allPathNormWindows) {
+            if(bestPathNormWindows.count(normW)) continue;
+            if(normW == sourceNormW) continue;
+            if(normW == normalizeW(indexToRawWindow[viExit])) continue;
+            windowsToDisable.insert(normW);
         }
+
+        if(windowsToDisable.empty()) continue;
+
+        // Disable all anchor edges of the non-chosen windows.
+        // This is safe because the superbubble property guarantees
+        // interior vertices have no connections outside the bubble
+        // except through source and sink.
+        uint64_t disabledEdgeCount = 0;
+        for(const uint32_t normW : windowsToDisable) {
+            if(normW >= anchorWindows.size()) continue;
+            const auto& window = anchorWindows[normW];
+            const auto backboneJourney = journeys[window.backboneOrientedReadId];
+
+            vector<uint32_t> positions;
+            if(!window.filteredBackbonePositions.empty()) {
+                positions = window.filteredBackbonePositions;
+            } else {
+                for(uint32_t p = window.backboneBegin; p < window.backboneEnd; p++) {
+                    positions.push_back(p);
+                }
+            }
+
+            for(const uint32_t pos : positions) {
+                const uint64_t aid = uint64_t(backboneJourney[pos]);
+                if(aid >= anchorCount) continue;
+
+                for(auto oe = boost::out_edges(aid, anchorGraph); oe.first != oe.second; ++oe.first) {
+                    if(anchorGraph[*oe.first].useForAssembly) {
+                        disableEdge(*oe.first);
+                        ++disabledEdgeCount;
+                    }
+                }
+                for(auto ie = boost::in_edges(aid, anchorGraph); ie.first != ie.second; ++ie.first) {
+                    if(anchorGraph[*ie.first].useForAssembly) {
+                        disableEdge(*ie.first);
+                        ++disabledEdgeCount;
+                    }
+                }
+            }
+        }
+
+        for(const uint32_t u : interiorIndices) {
+            poppedWindowIndices.insert(u);
+        }
+        ++poppedCount;
+
+        cout << "  Superbubble popped: source=W" << sourceNormW
+             << " sink=W" << normalizeW(indexToRawWindow[viExit])
+             << " paths=" << allPaths.size()
+             << " best=[";
+        for(uint64_t i = 0; i < allPaths[bestPathIndex].size(); i++) {
+            if(i > 0) cout << ",";
+            cout << "W" << normalizeW(indexToRawWindow[allPaths[bestPathIndex][i]]);
+        }
+        cout << "] disabled=" << windowsToDisable.size()
+             << " windows, " << disabledEdgeCount << " edges." << endl;
     }
 
     cout << "popSuperbubbles: " << poppedCount << " superbubbles popped." << endl;
