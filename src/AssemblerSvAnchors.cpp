@@ -1117,23 +1117,17 @@ void Assembler::buildSvMSA(
             }
 
             // Emit CIGAR indel calls with sufficient support.
-            // DEL: >=2 reads (CIGAR D ops are high-confidence).
-            // INS: >=3 reads (insertions need more support to
-            // avoid false positives from alignment artifacts).
+            // DEL: suppressed (redundant with early-CIGAR from main.cpp).
+            // INS: emit as INS calls (early-CIGAR only handles DELs).
             for(const auto& ci : cigarIndels) {
-                const uint32_t minReads =
-                    (ci.svType == "DEL") ? 2 : 3;
-                if(ci.readCount >= minReads && ci.size >= 30) {
-                    // cout << "    >>> "
-                         // << (ci.svType == "DEL"
-                             // ? "DELETION" : "INSERTION")
-                         // << " CALL (CIGAR): size="
-                         // << ci.size << "bp"
-                         // << ", breakpoint=" << ci.refPos
-                         // << ", reads=" << ci.readCount
-                         // << endl;
-                    // CIGAR calls are redundant with early-CIGAR
-                    // from main.cpp — suppressed.
+                if(ci.svType == "INS"
+                   && ci.readCount >= 3
+                   && ci.size >= 30) {
+                    allInsCalls.push_back({
+                        ci.refPos,
+                        int64_t(ci.size),
+                        ci.readCount,
+                        "early-CIGAR"});
                 }
             }
 
@@ -4154,6 +4148,92 @@ void Assembler::buildSvMSA(
                                 });
                             }
                         }
+                    }
+
+                    // Fallback: no strong breakpoint but many indirect
+                    // reads. Estimate INS size from indirect read bases
+                    // divided by coverage. Position from deepest
+                    // HitDepth drop or region center.
+                    if(bestStrong == nullptr) {
+                        const double coverage =
+                            double(medianSpanning);
+                        uint64_t indirectBases = 0;
+                        for(const uint32_t rid :
+                            indirectAlignedReads) {
+                            indirectBases +=
+                                readsRef.getRead(ReadId(rid))
+                                    .baseCount;
+                        }
+                        const int64_t estSize =
+                            (coverage > 0)
+                            ? int64_t(double(indirectBases)
+                                      / coverage)
+                            : 0;
+                        if(estSize >= 50) {
+                            uint32_t bpPos =
+                                uint32_t(refLength / 2);
+                            if(!hitDepthBreakpoints.empty()) {
+                                double bestDrop = 1.0;
+                                for(const auto& hbp :
+                                    hitDepthBreakpoints) {
+                                    if(hbp.dropRatio < bestDrop) {
+                                        bestDrop = hbp.dropRatio;
+                                        bpPos = hbp.refPos;
+                                    }
+                                }
+                            }
+                            allInsCalls.push_back({
+                                bpPos,
+                                estSize,
+                                uint32_t(
+                                    indirectAlignedReads.size()),
+                                "indirect-covdrop"});
+                            insertionCallRegions.push_back({
+                                bpPos > 200 ? bpPos - 200 : 0,
+                                bpPos + 200});
+                        }
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // Indirect-covdrop fallback for hasDeletionLikePair cases.
+                // When a "deletion-like" BP pair exists but there are many
+                // indirect reads, the coverage drop is from an insertion.
+                // ---------------------------------------------------------
+                if(insertionCallRegions.empty()
+                   && indirectAlignedReads.size() >= 10
+                   && hasDeletionLikePair) {
+                    const double coverage = double(medianSpanning);
+                    uint64_t indirectBases = 0;
+                    for(const uint32_t rid : indirectAlignedReads) {
+                        indirectBases +=
+                            readsRef.getRead(ReadId(rid)).baseCount;
+                    }
+                    const int64_t estSize =
+                        (coverage > 0)
+                        ? int64_t(double(indirectBases) / coverage)
+                        : 0;
+                    if(estSize >= 50) {
+                        uint32_t bpPos =
+                            uint32_t(refLength / 2);
+                        if(!hitDepthBreakpoints.empty()) {
+                            double bestDrop = 1.0;
+                            for(const auto& hbp :
+                                hitDepthBreakpoints) {
+                                if(hbp.dropRatio < bestDrop) {
+                                    bestDrop = hbp.dropRatio;
+                                    bpPos = hbp.refPos;
+                                }
+                            }
+                        }
+                        allInsCalls.push_back({
+                            bpPos,
+                            estSize,
+                            uint32_t(indirectAlignedReads.size()),
+                            "indirect-covdrop"});
+                        insertionCallRegions.push_back({
+                            bpPos > 200 ? bpPos - 200 : 0,
+                            bpPos + 200});
                     }
                 }
 
