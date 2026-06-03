@@ -3137,8 +3137,27 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         if(poppedWindowIndices.count(vi)) continue;
         ++candidateCount;
 
+        // Diagnostic: log candidate details.
+        {
+            const uint32_t normW = indexToNormWindow[vi];
+            cout << "  Candidate W" << normW
+                 << " out-degree=" << out_degree(vi, windowGraph)
+                 << " in-degree=" << in_degree(vi, windowGraph)
+                 << " succs=[";
+            bool first = true;
+            BGL_FORALL_OUTEDGES_T(vi, e, windowGraph, WindowGraph) {
+                if(!first) cout << ",";
+                cout << "W" << indexToNormWindow[target(e, windowGraph)];
+                first = false;
+            }
+            cout << "]" << endl;
+        }
+
         const auto viExit = findSuperbubbleOnodera(windowGraph, vi, maxSize);
-        if(viExit == WindowGraph::null_vertex()) continue;
+        if(viExit == WindowGraph::null_vertex()) {
+            cout << "    -> no superbubble found." << endl;
+            continue;
+        }
 
         // Collect interior vertices via BFS.
         std::set<uint32_t> interiorIndices;
