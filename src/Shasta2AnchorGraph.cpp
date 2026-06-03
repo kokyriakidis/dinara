@@ -2662,6 +2662,179 @@ void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
 }
 
 
+uint64_t Shasta2AnchorGraph::removeInternalConnections(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // For each anchor, check if it has an active inter-window edge
+    // (incoming or outgoing to a different normalized window).
+    auto anchorHasInterWindowEdge = [&](uint64_t a) -> bool {
+        if(a >= anchorCount) return false;
+        const uint32_t aWin = anchorToWindow[a];
+        if(aWin == noWindow) return false;
+        const uint32_t aNorm = normalizeW(aWin);
+        // Check outgoing.
+        for(auto oe = boost::out_edges(a, anchorGraph); oe.first != oe.second; ++oe.first) {
+            if(!anchorGraph[*oe.first].useForAssembly) continue;
+            const uint64_t tgt = uint64_t(boost::target(*oe.first, anchorGraph));
+            if(tgt < anchorCount) {
+                const uint32_t tgtWin = anchorToWindow[tgt];
+                if(tgtWin != noWindow && normalizeW(tgtWin) != aNorm)
+                    return true;
+            }
+        }
+        // Check incoming.
+        for(auto ie = boost::in_edges(a, anchorGraph); ie.first != ie.second; ++ie.first) {
+            if(!anchorGraph[*ie.first].useForAssembly) continue;
+            const uint64_t src = uint64_t(boost::source(*ie.first, anchorGraph));
+            if(src < anchorCount) {
+                const uint32_t srcWin = anchorToWindow[src];
+                if(srcWin != noWindow && normalizeW(srcWin) != aNorm)
+                    return true;
+            }
+        }
+        // Also check RC anchor.
+        const uint64_t rcA = a ^ 1ULL;
+        if(rcA < anchorCount) {
+            const uint32_t rcWin = anchorToWindow[rcA];
+            if(rcWin != noWindow) {
+                const uint32_t rcNorm = normalizeW(rcWin);
+                for(auto oe = boost::out_edges(rcA, anchorGraph); oe.first != oe.second; ++oe.first) {
+                    if(!anchorGraph[*oe.first].useForAssembly) continue;
+                    const uint64_t tgt = uint64_t(boost::target(*oe.first, anchorGraph));
+                    if(tgt < anchorCount) {
+                        const uint32_t tgtWin = anchorToWindow[tgt];
+                        if(tgtWin != noWindow && normalizeW(tgtWin) != rcNorm)
+                            return true;
+                    }
+                }
+                for(auto ie = boost::in_edges(rcA, anchorGraph); ie.first != ie.second; ++ie.first) {
+                    if(!anchorGraph[*ie.first].useForAssembly) continue;
+                    const uint64_t src = uint64_t(boost::source(*ie.first, anchorGraph));
+                    if(src < anchorCount) {
+                        const uint32_t srcWin = anchorToWindow[src];
+                        if(srcWin != noWindow && normalizeW(srcWin) != rcNorm)
+                            return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    // For each window, find the backbone index of the first and last anchor
+    // with an inter-window edge. These define the "entry" and "exit" points.
+    struct WindowBoundary {
+        uint64_t firstIdx = std::numeric_limits<uint64_t>::max(); // Index into positions
+        uint64_t lastIdx = 0;
+        bool valid = false;
+    };
+    vector<WindowBoundary> windowBoundaries(windowCount);
+
+    for(uint32_t w = 0; w < windowCount; w++) {
+        const auto& window = anchorWindows[w];
+        const auto journey = journeys[window.backboneOrientedReadId];
+
+        const vector<uint32_t>* positionsPtr;
+        static thread_local vector<uint32_t> allPositions;
+        if(!window.filteredBackbonePositions.empty()) {
+            positionsPtr = &window.filteredBackbonePositions;
+        } else {
+            allPositions.clear();
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                allPositions.push_back(pos);
+            }
+            positionsPtr = &allPositions;
+        }
+        const auto& positions = *positionsPtr;
+        if(positions.size() <= 1) continue;
+
+        WindowBoundary& boundary = windowBoundaries[w];
+        for(uint64_t i = 0; i < positions.size(); i++) {
+            const uint64_t aid = uint64_t(journey[positions[i]]);
+            if(anchorHasInterWindowEdge(aid)) {
+                if(!boundary.valid) {
+                    boundary.firstIdx = i;
+                    boundary.valid = true;
+                }
+                boundary.lastIdx = i;
+            }
+        }
+    }
+
+    // Build a map from anchorId -> (windowId, backbone index) for quick lookup.
+    // This tells us where an anchor sits on its window's backbone.
+    std::map<uint64_t, std::pair<uint32_t, uint64_t>> anchorToBackboneIndex;
+    for(uint32_t w = 0; w < windowCount; w++) {
+        const auto& window = anchorWindows[w];
+        const auto journey = journeys[window.backboneOrientedReadId];
+
+        const vector<uint32_t>* positionsPtr;
+        static thread_local vector<uint32_t> allPositions2;
+        if(!window.filteredBackbonePositions.empty()) {
+            positionsPtr = &window.filteredBackbonePositions;
+        } else {
+            allPositions2.clear();
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                allPositions2.push_back(pos);
+            }
+            positionsPtr = &allPositions2;
+        }
+        const auto& positions = *positionsPtr;
+        for(uint64_t i = 0; i < positions.size(); i++) {
+            const uint64_t aid = uint64_t(journey[positions[i]]);
+            anchorToBackboneIndex[aid] = {w, i};
+        }
+    }
+
+    // Find inter-window edges that land internally on the destination window.
+    // An edge is internal if the destination anchor's backbone index is
+    // strictly between the destination window's first and last inter-window
+    // connection indices.
+    uint64_t removedCount = 0;
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcWin = anchorToWindow[src];
+        const uint32_t dstWin = anchorToWindow[dst];
+        if(srcWin == noWindow || dstWin == noWindow) continue;
+        const uint32_t srcNorm = normalizeW(srcWin);
+        const uint32_t dstNorm = normalizeW(dstWin);
+        if(srcNorm == dstNorm) continue; // Intra-window edge.
+
+        // Check if the destination anchor lands internally on the destination window.
+        auto it = anchorToBackboneIndex.find(dst);
+        if(it == anchorToBackboneIndex.end()) continue;
+        const uint32_t dstWindowFromMap = it->second.first;
+        const uint64_t dstBackboneIdx = it->second.second;
+
+        if(dstWindowFromMap >= windowCount) continue;
+        const WindowBoundary& boundary = windowBoundaries[dstWindowFromMap];
+        if(!boundary.valid) continue;
+
+        // Internal: strictly between first and last inter-window connection.
+        if(dstBackboneIdx > boundary.firstIdx && dstBackboneIdx < boundary.lastIdx) {
+            disableEdge(e);
+            ++removedCount;
+        }
+    }
+
+    cout << "removeInternalConnections: removed " << removedCount
+         << " internal inter-window edges." << endl;
+    return removedCount;
+}
+
+
+
 uint64_t Shasta2AnchorGraph::trimBackbones(
     const vector<AnchorWindow>& anchorWindows,
     const Shasta2Journeys& journeys)

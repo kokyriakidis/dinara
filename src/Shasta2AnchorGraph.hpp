@@ -128,6 +128,14 @@ public:
         const vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
+    // Remove inter-window edges that land internally on a window's backbone
+    // (between the first and last inter-window connection points).
+    // For reads traversing internal connections, create bypass edges that
+    // skip the internal windows. Returns the number of edges removed.
+    uint64_t removeInternalConnections(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
+
     // Disable all edges of windows that have no active inter-window edges.
     // Returns the number of isolated windows removed.
     uint64_t removeIsolatedWindows(
