@@ -1262,6 +1262,43 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         ++removedCount;
     }
 
+    // Log remaining tips that were NOT removed (for debugging).
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        bool isDeadEnd = false;
+        bool forward = false;
+        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) >= 1) {
+            isDeadEnd = true; forward = true;
+        }
+        if(out_degree(v, assemblyGraph) == 0 && in_degree(v, assemblyGraph) >= 1) {
+            isDeadEnd = true; forward = false;
+        }
+        if(!isDeadEnd) continue;
+
+        vector<edge_descriptor> chainEdges;
+        vector<vertex_descriptor> chainVertices;
+        walkTipChain(v, forward, chainEdges, chainVertices);
+        if(chainEdges.empty()) continue;
+
+        uint64_t totalLength = 0;
+        vector<Shasta2AssemblyGraphEdge*> edgePtrs;
+        for(const edge_descriptor e : chainEdges) {
+            totalLength += assemblyGraph[e].length();
+            edgePtrs.push_back(&assemblyGraph[e]);
+        }
+        const uint32_t totalWindows = countDistinctWindows(edgePtrs);
+
+        cout << "  Remaining tip: vertex " << assemblyGraph[v].anchorId
+             << " direction=" << (forward ? "fwd" : "bwd")
+             << " edges=" << chainEdges.size()
+             << " windows=" << totalWindows
+             << " length=" << totalLength
+             << " edgeIds=";
+        for(const edge_descriptor e : chainEdges) {
+            cout << assemblyGraph[e].id << " ";
+        }
+        cout << endl;
+    }
+
     cout << "removeShortTips removed " << removedCount
          << " tips with <= " << maxTipWindows << " windows"
          << " and <= " << maxTipLength << " bp." << endl;
