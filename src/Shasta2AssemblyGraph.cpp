@@ -1117,18 +1117,14 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         }
 
         // Remove isolated vertices (forward and RC).
+        // Merge into a single set to avoid double-removal when a vertex
+        // is its own RC (self-complementary anchor).
+        allVertices.insert(rcVertices.begin(), rcVertices.end());
         for(const vertex_descriptor cv : allVertices) {
             if(in_degree(cv, assemblyGraph) == 0 && out_degree(cv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[cv].anchorId);
                 boost::remove_vertex(cv, assemblyGraph);
                 removedVertices.insert(cv);
-            }
-        }
-        for(const vertex_descriptor rv : rcVertices) {
-            if(in_degree(rv, assemblyGraph) == 0 && out_degree(rv, assemblyGraph) == 0) {
-                anchorToVertex.erase(assemblyGraph[rv].anchorId);
-                boost::remove_vertex(rv, assemblyGraph);
-                removedVertices.insert(rv);
             }
         }
     };
