@@ -146,13 +146,20 @@ void Shasta2AssemblyGraph::findSuperbubbles(vector<Shasta2Superbubble>& superbub
         options.findSuperbubblesMaxDistance * options.findSuperbubblesMaxDistance : 0;
 
     superbubbles.clear();
+    uint64_t branchVertexCount = 0;
     BGL_FORALL_VERTICES(vSource, assemblyGraph, Shasta2AssemblyGraph) {
+        if(out_degree(vSource, assemblyGraph) >= 2) {
+            ++branchVertexCount;
+        }
         const vertex_descriptor vTarget =
             findSuperbubbleOnodera(assemblyGraph, vSource, maxCount);
         if(vTarget != null_vertex()) {
             superbubbles.emplace_back(assemblyGraph, vSource, vTarget);
         }
     }
+    cout << "findSuperbubbles: " << branchVertexCount
+         << " vertices with out-degree >= 2, found "
+         << superbubbles.size() << " superbubbles." << endl;
 }
 
 // Pop superbubbles by removing low-coverage alternative paths.
