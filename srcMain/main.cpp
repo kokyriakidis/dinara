@@ -1619,11 +1619,39 @@ void dinara::main::assemble(
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
 
-    // Remove A->B->A triplet connections iteratively until convergence.
+    // Remove repeated window visits and trim backbones.
     shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
-    // Save the post-detangling anchor graph.
+    // Run detangling again after internal connection removal.
+    if(enableDetangling) {
+        std::vector<DetangleBypassEdge> bypassEdges2;
+        const uint64_t detangledCount2 = detangleWindowsGTest(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            anchorWindows,
+            bypassEdges2);
+
+        if(detangledCount2 > 0) {
+            cout << timestamp << "Rebuilding anchor graph after second detangling..." << endl;
+
+            assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+                *shasta2Anchors,
+                *shasta2Journeys,
+                anchorWindows,
+                minInterWindowCoverage,
+                threadCount,
+                &assembler.getReads(),
+                &bypassEdges2);
+            shasta2AnchorGraph = assembler.shasta2AnchorGraph;
+
+            // Remove internal connections and trim again after detangling.
+            shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
+            shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
+        }
+    }
+
+    // Save the cleaned anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
