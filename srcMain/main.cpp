@@ -1640,7 +1640,7 @@ void dinara::main::assemble(
 
     // Iterative tip removal + superbubble popping (like hifiasm's cleaning rounds).
     const uint32_t maxTipWindows = 3;
-    const uint64_t maxTipLength = maxTipWindows * averageReadLength;
+    const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
     for(uint64_t cleanRound = 0; ; cleanRound++) {
         uint64_t changeCount = 0;
 
