@@ -10,6 +10,7 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/vector.hpp>
+#include <limits>
 #include <mutex>
 
 #include "memory.hpp"
@@ -39,6 +40,10 @@ public:
     Shasta2AnchorId anchorId = invalid<Shasta2AnchorId>;
     uint64_t id = invalid<uint64_t>;
 
+    // Window that this anchor belongs to (noWindow if unmapped).
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    uint32_t windowId = noWindow;
+
     Shasta2AssemblyGraphVertex(Shasta2AnchorId anchorId, uint64_t id) :
         anchorId(anchorId),
         id(id)
@@ -49,6 +54,7 @@ public:
     {
         ar & anchorId;
         ar & id;
+        ar & windowId;
     }
 };
 
@@ -79,6 +85,21 @@ public:
     uint64_t id = invalid<uint64_t>;
     bool wasAssembled = false;
 
+    // Full chain of AnchorIds along this edge, like shasta2's Chain.
+    // Includes the source and target vertex anchors.
+    // anchorChain[0] == source vertex anchorId,
+    // anchorChain.back() == target vertex anchorId.
+    // For a single-step edge (one anchor pair A->B), anchorChain = {A, B}.
+    // For a multi-step edge, anchorChain = {A0, A1, ..., An} where
+    // step[i] connects anchorChain[i] to anchorChain[i+1].
+    vector<Shasta2AnchorId> anchorChain;
+
+    // Sequence of normalized window IDs traversed by this edge's anchor chain.
+    // Consecutive duplicates are removed. noWindow entries are omitted.
+    // This gives the window-level path of the edge.
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    vector<uint32_t> windowSequence;
+
     Shasta2AssemblyGraphEdge(uint64_t id = invalid<uint64_t>) :
         id(id)
     {}
@@ -108,6 +129,8 @@ public:
         ar & boost::serialization::base_object< vector<Shasta2AssemblyGraphEdgeStep> >(*this);
         ar & id;
         ar & wasAssembled;
+        ar & anchorChain;
+        ar & windowSequence;
     }
 };
 
@@ -143,6 +166,16 @@ public:
         const Shasta2Anchors&,
         const Shasta2Journeys&,
         const Shasta2AnchorGraph&,
+        const Shasta2AssemblyGraphOptions& = Shasta2AssemblyGraphOptions());
+
+    // Construct from anchor graph with window information.
+    // This stores the anchor-to-window mapping and populates
+    // anchorChain, windowSequence, and vertex windowId fields.
+    Shasta2AssemblyGraph(
+        const Shasta2Anchors&,
+        const Shasta2Journeys&,
+        const Shasta2AnchorGraph&,
+        const vector<AnchorWindow>& anchorWindows,
         const Shasta2AssemblyGraphOptions& = Shasta2AssemblyGraphOptions());
 
     Shasta2AssemblyGraph(
@@ -255,6 +288,38 @@ public:
     void findStrongComponents(vector< vector<vertex_descriptor> >&) const;
     void colorStrongComponents() const;
 
+    // Window-level information.
+    // Populated by the constructor that takes anchorWindows.
+
+    // Per-anchor window assignment (anchorId -> normalized windowId).
+    // noWindow means unmapped.
+    static constexpr uint32_t noWindow = std::numeric_limits<uint32_t>::max();
+    vector<uint32_t> anchorToWindow;
+    uint32_t windowCount = 0;
+
+    // Pointer to the anchor windows (not owned, must outlive this object).
+    const vector<AnchorWindow>* anchorWindowsPointer = nullptr;
+
+    // Populate anchorChain and windowSequence for all edges,
+    // and windowId for all vertices, using the current anchorToWindow mapping.
+    // Called automatically by the window-aware constructor.
+    // Can also be called after graph modifications (compress, etc.)
+    // to refresh the window annotations.
+    void populateWindowAnnotations();
+
+    // Get the normalized window ID for an anchor.
+    uint32_t getWindowId(Shasta2AnchorId anchorId) const
+    {
+        const uint64_t aid = uint64_t(anchorId);
+        if(aid >= anchorToWindow.size()) return noWindow;
+        const uint32_t w = anchorToWindow[aid];
+        if(w == noWindow) return noWindow;
+        return (w >= windowCount) ? (w - windowCount) : w;
+    }
+
+    // Check if window information is available.
+    bool hasWindowInfo() const { return windowCount > 0; }
+
     class PhaseSuperbubbleChainsData {
     public:
         shared_ptr< vector<Shasta2SuperbubbleChain> > superbubbleChains;
@@ -268,6 +333,8 @@ public:
         ar & boost::serialization::base_object<Shasta2AssemblyGraphBaseClass>(*this);
         ar & nextVertexId;
         ar & nextEdgeId;
+        ar & anchorToWindow;
+        ar & windowCount;
     }
     void save(ostream&) const;
     void load(istream&);
