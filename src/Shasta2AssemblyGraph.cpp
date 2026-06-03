@@ -1109,19 +1109,36 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
     };
 
     // Remove a chain (edges + isolated vertices) and its RC mirror.
-    // Like hifiasm's asg_seq_del which deletes v>>1 (both orientations).
+    // Like hifiasm's asg_seq_del which deletes the node (both orientations)
+    // and all arcs to/from it.
+    //
+    // The last vertex in chainVertices is the branch point — it is NOT
+    // an internal node and must not be fully cleared. Only internal
+    // vertices (dead end + middle nodes) get all their edges removed.
     auto removeChainAndRc = [&](
         const vector<edge_descriptor>& chainEdges,
         const vector<vertex_descriptor>& chainVertices)
     {
-        // Collect RC mirror vertex descriptors from the chain's anchor IDs.
-        set<vertex_descriptor> rcVertices;
-        for(const vertex_descriptor cv : chainVertices) {
+        // Internal vertices = all chain vertices except the last one
+        // (the branch point). These correspond to hifiasm's deleted nodes.
+        set<vertex_descriptor> internalVertices;
+        if(chainVertices.size() > 1) {
+            for(uint64_t i = 0; i + 1 < chainVertices.size(); i++) {
+                internalVertices.insert(chainVertices[i]);
+            }
+        } else if(chainVertices.size() == 1) {
+            // Single vertex tip — the vertex itself is internal.
+            internalVertices.insert(chainVertices[0]);
+        }
+
+        // Find RC mirror vertices for internal vertices.
+        set<vertex_descriptor> rcInternalVertices;
+        for(const vertex_descriptor cv : internalVertices) {
             const Shasta2AnchorId rcAnchorId =
                 Shasta2AnchorId(uint64_t(assemblyGraph[cv].anchorId) ^ 1ULL);
             auto it = anchorToVertex.find(rcAnchorId);
             if(it != anchorToVertex.end()) {
-                rcVertices.insert(it->second);
+                rcInternalVertices.insert(it->second);
             }
         }
 
@@ -1130,29 +1147,21 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
             boost::remove_edge(e, assemblyGraph);
         }
 
-        // Remove RC mirror edges: any edge between RC vertices.
-        vector<edge_descriptor> rcEdgesToRemove;
-        for(const vertex_descriptor rv : rcVertices) {
-            BGL_FORALL_OUTEDGES(rv, e, assemblyGraph, Shasta2AssemblyGraph) {
-                if(rcVertices.count(target(e, assemblyGraph))) {
-                    rcEdgesToRemove.push_back(e);
-                }
-            }
-        }
-        for(const edge_descriptor e : rcEdgesToRemove) {
-            boost::remove_edge(e, assemblyGraph);
+        // Clear all edges from RC internal vertices (like hifiasm's asg_seq_del).
+        for(const vertex_descriptor rv : rcInternalVertices) {
+            boost::clear_vertex(rv, assemblyGraph);
         }
 
-        // Remove isolated vertices (forward chain).
-        for(const vertex_descriptor cv : chainVertices) {
+        // Remove isolated forward internal vertices.
+        for(const vertex_descriptor cv : internalVertices) {
             if(in_degree(cv, assemblyGraph) == 0 && out_degree(cv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[cv].anchorId);
                 boost::remove_vertex(cv, assemblyGraph);
             }
         }
 
-        // Remove isolated RC vertices.
-        for(const vertex_descriptor rv : rcVertices) {
+        // Remove isolated RC internal vertices.
+        for(const vertex_descriptor rv : rcInternalVertices) {
             if(in_degree(rv, assemblyGraph) == 0 && out_degree(rv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[rv].anchorId);
                 boost::remove_vertex(rv, assemblyGraph);

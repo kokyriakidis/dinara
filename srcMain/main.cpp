@@ -1638,16 +1638,26 @@ void dinara::main::assemble(
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
 
-    // Remove short tips (like hifiasm: <= 3 windows and <= 3 * averageReadLength).
+    // Iterative tip removal + superbubble popping (like hifiasm's cleaning rounds).
     const uint32_t maxTipWindows = 3;
     const uint64_t maxTipLength = maxTipWindows * averageReadLength;
-    shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
-    shasta2AssemblyGraph->compress();
+    for(uint64_t cleanRound = 0; ; cleanRound++) {
+        uint64_t changeCount = 0;
 
-    // Pop superbubbles.
-    shasta2AssemblyGraph->popSuperbubbles();
-    shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-popped.gfa");
+        changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
+        shasta2AssemblyGraph->compress();
+        shasta2AssemblyGraph->writeGfa(
+            "Shasta2AssemblyGraph-tips-" + to_string(cleanRound) + ".gfa");
+
+        changeCount += shasta2AssemblyGraph->popSuperbubbles();
+        shasta2AssemblyGraph->compress();
+        shasta2AssemblyGraph->writeGfa(
+            "Shasta2AssemblyGraph-popped-" + to_string(cleanRound) + ".gfa");
+
+        cout << timestamp << "Clean round " << cleanRound
+             << ": " << changeCount << " changes." << endl;
+        if(changeCount == 0) break;
+    }
 
     return;
 
