@@ -139,11 +139,8 @@ void Shasta2AssemblyGraph::findSuperbubbles(vector<Shasta2Superbubble>& superbub
 
     // Use the Verkko/Onodera algorithm: from each vertex with out-degree >= 2,
     // find the superbubble exit by topological-order processing.
-    // No distance bound — the algorithm naturally terminates on cycles
-    // and dead-ends. Use findSuperbubblesMaxDistance as a vertex count limit
-    // to avoid exploring huge structures (0 = no limit).
-    const uint64_t maxCount = options.findSuperbubblesMaxDistance > 0 ?
-        options.findSuperbubblesMaxDistance * options.findSuperbubblesMaxDistance : 0;
+    // No vertex count limit — the algorithm naturally terminates on cycles
+    // and dead-ends (matching Verkko's find_bubble).
 
     superbubbles.clear();
     uint64_t branchVertexCount = 0;
@@ -169,7 +166,7 @@ void Shasta2AssemblyGraph::findSuperbubbles(vector<Shasta2Superbubble>& superbub
             }
         }
         const vertex_descriptor vTarget =
-            findSuperbubbleOnodera(assemblyGraph, vSource, maxCount);
+            findSuperbubbleOnodera(assemblyGraph, vSource);
         if(vTarget != null_vertex()) {
             superbubbles.emplace_back(assemblyGraph, vSource, vTarget);
         }
