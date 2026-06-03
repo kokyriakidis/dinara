@@ -245,6 +245,10 @@ public:
     void assembleAll();
     void writeIntermediateStageIfRequested(const string& stage);
 
+    // Export the assembly graph as a shasta2-compatible AnchorGraph.
+    // Each assembly graph edge step becomes one anchor graph edge.
+    void saveForShasta2(const string& fileName) const;
+
     bool hasSelfEdge(vertex_descriptor v) const
     {
         bool edgeExists = false;

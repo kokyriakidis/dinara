@@ -1660,6 +1660,9 @@ void dinara::main::assemble(
         if(changeCount == 0) break;
     }
 
+    // Export the cleaned assembly graph as a shasta2-compatible anchor graph.
+    shasta2AssemblyGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
+
     return;
 
 
