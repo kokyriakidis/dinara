@@ -740,6 +740,9 @@ void dinara::main::assemble(
     if(assembler.getReads().readCount() == 0) {
         throw runtime_error("There are no input reads.");
     }
+    const uint64_t averageReadLength =
+        assembler.getReads().getTotalBaseCount() / assembler.getReads().readCount();
+    cout << "Average read length: " << averageReadLength << " bp." << endl;
 
 
 
@@ -1635,8 +1638,10 @@ void dinara::main::assemble(
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
 
-    // Remove short tips (chains with length <= 20000 bp).
-    shasta2AssemblyGraph->removeShortTips(20000);
+    // Remove short tips (like hifiasm: <= 3 windows and <= 3 * averageReadLength).
+    const uint32_t maxTipWindows = 3;
+    const uint64_t maxTipLength = maxTipWindows * averageReadLength;
+    shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
     shasta2AssemblyGraph->compress();
 
     // Pop superbubbles.
