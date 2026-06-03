@@ -2678,95 +2678,10 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
     std::set<uint64_t> backboneReadIds;
     for(uint32_t w = 0; w < windowCount; w++) {
         backboneReadIds.insert(anchorWindows[w].backboneOrientedReadId.getValue());
-        // Also add the RC read.
-        const uint64_t rcReadId = anchorWindows[w].backboneOrientedReadId.getValue() ^ 1ULL;
-        backboneReadIds.insert(rcReadId);
+        backboneReadIds.insert(anchorWindows[w].backboneOrientedReadId.getValue() ^ 1ULL);
     }
 
-    // Build anchorId -> backbone position map for all windows.
-    vector<uint32_t> anchorToBbPos(anchorCount, std::numeric_limits<uint32_t>::max());
-    for(uint32_t w = 0; w < windowCount; w++) {
-        const auto& window = anchorWindows[w];
-        const auto journey = journeys[window.backboneOrientedReadId];
-        const auto& positions = window.filteredBackbonePositions;
-        if(!positions.empty()) {
-            for(uint64_t i = 0; i < positions.size(); i++) {
-                const uint64_t aid = uint64_t(journey[positions[i]]);
-                if(aid < anchorCount) anchorToBbPos[aid] = positions[i];
-            }
-        } else {
-            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-                const uint64_t aid = uint64_t(journey[pos]);
-                if(aid < anchorCount) anchorToBbPos[aid] = pos;
-            }
-        }
-    }
-
-    // For each window, compute the backbone position of the first and last
-    // anchor that participates in an inter-window edge. These define the
-    // "entry" and "exit" points.
-    struct WindowBoundary {
-        uint32_t firstPos = std::numeric_limits<uint32_t>::max();
-        uint32_t lastPos = 0;
-        bool valid = false;
-    };
-    vector<WindowBoundary> windowBoundaries(windowCount);
-
-    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
-        if(!anchorGraph[e].useForAssembly) continue;
-        const uint64_t src = uint64_t(source(e, anchorGraph));
-        const uint64_t dst = uint64_t(target(e, anchorGraph));
-        if(src >= anchorCount || dst >= anchorCount) continue;
-        const uint32_t srcWin = anchorToWindow[src];
-        const uint32_t dstWin = anchorToWindow[dst];
-        if(srcWin == noWindow || dstWin == noWindow) continue;
-        if(normalizeW(srcWin) == normalizeW(dstWin)) continue;
-
-        // src is a boundary anchor of its window.
-        const uint32_t srcNorm = normalizeW(srcWin);
-        if(srcNorm < windowCount) {
-            const uint32_t pos = anchorToBbPos[src];
-            if(pos != std::numeric_limits<uint32_t>::max()) {
-                auto& b = windowBoundaries[srcNorm];
-                if(!b.valid || pos < b.firstPos) b.firstPos = pos;
-                if(!b.valid || pos > b.lastPos) b.lastPos = pos;
-                b.valid = true;
-            }
-        }
-        // dst is a boundary anchor of its window.
-        const uint32_t dstNorm = normalizeW(dstWin);
-        if(dstNorm < windowCount) {
-            const uint32_t pos = anchorToBbPos[dst];
-            if(pos != std::numeric_limits<uint32_t>::max()) {
-                auto& b = windowBoundaries[dstNorm];
-                if(!b.valid || pos < b.firstPos) b.firstPos = pos;
-                if(!b.valid || pos > b.lastPos) b.lastPos = pos;
-                b.valid = true;
-            }
-        }
-    }
-
-    // Sort non-backbone reads by journey length (longest first).
-    struct ReadInfo {
-        OrientedReadId orientedReadId;
-        uint64_t journeyLength;
-    };
-    vector<ReadInfo> nonBackboneReads;
-    for(uint64_t readId = 0; readId < journeys.size(); readId++) {
-        if(backboneReadIds.count(readId)) continue;
-        const auto journey = journeys[OrientedReadId::fromValue(uint32_t(readId))];
-        if(journey.size() < 2) continue;
-        nonBackboneReads.push_back({
-            OrientedReadId::fromValue(uint32_t(readId)),
-            journey.size()
-        });
-    }
-    std::sort(nonBackboneReads.begin(), nonBackboneReads.end(),
-        [](const ReadInfo& a, const ReadInfo& b) {
-            return a.journeyLength > b.journeyLength;
-        });
-
-    // Build an index of inter-window edges by (srcWindow, dstWindow) pair.
+    // Build an index of inter-window edges by (srcNormWindow, dstNormWindow).
     using WindowPairKey = std::pair<uint32_t, uint32_t>;
     std::map<WindowPairKey, vector<edge_descriptor>> windowPairEdges;
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
@@ -2783,26 +2698,34 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
         windowPairEdges[{srcNorm, dstNorm}].push_back(e);
     }
 
-    cout << "removeInternalConnections: processing " << nonBackboneReads.size()
-         << " non-backbone reads (longest first)." << endl;
+    // Collect non-backbone reads.
+    vector<OrientedReadId> nonBackboneReads;
+    for(uint64_t readId = 0; readId < journeys.size(); readId++) {
+        if(backboneReadIds.count(readId)) continue;
+        const auto journey = journeys[OrientedReadId::fromValue(uint32_t(readId))];
+        if(journey.size() < 2) continue;
+        nonBackboneReads.push_back(OrientedReadId::fromValue(uint32_t(readId)));
+    }
 
-    // Track which (fromWindow, toWindow) bypass pairs have already been created
-    // to avoid duplicate bypass edges from different reads.
+    cout << "removeInternalConnections: processing " << nonBackboneReads.size()
+         << " non-backbone reads, looking for A->B->A triplets." << endl;
+
+    // Track which window pairs have already had edges removed or bypasses created.
+    std::set<WindowPairKey> removedPairs;
     std::set<WindowPairKey> createdBypasses;
 
-    // Process each non-backbone read.
     uint64_t removedCount = 0;
     uint64_t bypassCount = 0;
+    uint64_t tripletCount = 0;
 
-    for(const ReadInfo& readInfo : nonBackboneReads) {
-        const auto journey = journeys[readInfo.orientedReadId];
+    for(const OrientedReadId& orientedReadId : nonBackboneReads) {
+        const auto journey = journeys[orientedReadId];
 
         // Build the window sequence for this read's journey.
-        // Record the last anchor in each window visit (for edge creation).
         struct WindowVisit {
             uint32_t normWindow;
-            Shasta2AnchorId firstAnchor; // First anchor of this read in this window.
-            Shasta2AnchorId lastAnchor;  // Last anchor of this read in this window.
+            Shasta2AnchorId firstAnchor;
+            Shasta2AnchorId lastAnchor;
         };
         vector<WindowVisit> windowSequence;
         uint32_t prevNormWindow = noWindow;
@@ -2816,66 +2739,25 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 windowSequence.push_back({normW, journey[pos], journey[pos]});
                 prevNormWindow = normW;
             } else if(!windowSequence.empty()) {
-                // Update last anchor for current window.
                 windowSequence.back().lastAnchor = journey[pos];
             }
         }
 
-        if(windowSequence.size() < 2) continue;
+        if(windowSequence.size() < 3) continue;
 
-        // Walk the window sequence. For each intermediate window, check if
-        // the read enters it internally (between entry and exit points).
-        // If internal, skip it.
-        vector<uint64_t> keptIndices;
-        keptIndices.push_back(0); // Always keep the first window.
+        // Scan for A->B->A triplets.
+        for(uint64_t i = 0; i + 2 < windowSequence.size(); i++) {
+            const uint32_t wA = windowSequence[i].normWindow;
+            const uint32_t wB = windowSequence[i + 1].normWindow;
+            const uint32_t wA2 = windowSequence[i + 2].normWindow;
+            if(wA != wA2) continue;
 
-        for(uint64_t i = 1; i < windowSequence.size(); i++) {
-            const uint32_t w = windowSequence[i].normWindow;
-            if(w >= windowCount) {
-                keptIndices.push_back(i);
-                continue;
-            }
-            const WindowBoundary& boundary = windowBoundaries[w];
-            if(!boundary.valid) {
-                keptIndices.push_back(i);
-                continue;
-            }
+            ++tripletCount;
 
-            // Check where this read enters window w.
-            const uint64_t aid = uint64_t(windowSequence[i].firstAnchor);
-            const uint32_t bbPos = (aid < anchorCount) ?
-                anchorToBbPos[aid] : std::numeric_limits<uint32_t>::max();
-
-            if(bbPos == std::numeric_limits<uint32_t>::max()) {
-                keptIndices.push_back(i);
-                continue;
-            }
-
-            // Internal: the connection lands strictly between entry and exit.
-            if(bbPos > boundary.firstPos && bbPos < boundary.lastPos) {
-                continue; // Skip this window.
-            }
-
-            keptIndices.push_back(i);
-        }
-
-        if(keptIndices.size() == windowSequence.size()) continue;
-
-        // Disable edges for skipped windows and create bypass edges.
-        for(uint64_t k = 0; k + 1 < keptIndices.size(); k++) {
-            const uint64_t fromIdx = keptIndices[k];
-            const uint64_t toIdx = keptIndices[k + 1];
-
-            if(toIdx == fromIdx + 1) continue; // Adjacent, no skip.
-
-            // Disable ALL inter-window edges between consecutive windows
-            // along the skipped path.
-            for(uint64_t j = fromIdx; j < toIdx; j++) {
-                const uint32_t wFrom = windowSequence[j].normWindow;
-                const uint32_t wTo = windowSequence[j + 1].normWindow;
-                // Find and disable all edges from wFrom to wTo by
-                // iterating edges of the window pair.
-                auto it = windowPairEdges.find({wFrom, wTo});
+            // Disable all A->B edges.
+            if(!removedPairs.count({wA, wB})) {
+                removedPairs.insert({wA, wB});
+                auto it = windowPairEdges.find({wA, wB});
                 if(it != windowPairEdges.end()) {
                     for(const edge_descriptor e : it->second) {
                         if(anchorGraph[e].useForAssembly) {
@@ -2886,16 +2768,29 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 }
             }
 
-            // Create a bypass edge: last anchor in source window -> first anchor
-            // in target window. Skip if this bypass pair was already created.
-            const uint32_t bypassWFrom = windowSequence[fromIdx].normWindow;
-            const uint32_t bypassWTo = windowSequence[toIdx].normWindow;
-            if(createdBypasses.count({bypassWFrom, bypassWTo})) continue;
-            createdBypasses.insert({bypassWFrom, bypassWTo});
+            // Disable all B->A edges.
+            if(!removedPairs.count({wB, wA})) {
+                removedPairs.insert({wB, wA});
+                auto it = windowPairEdges.find({wB, wA});
+                if(it != windowPairEdges.end()) {
+                    for(const edge_descriptor e : it->second) {
+                        if(anchorGraph[e].useForAssembly) {
+                            disableEdge(e);
+                            ++removedCount;
+                        }
+                    }
+                }
+            }
 
-            const Shasta2AnchorId bypassFrom = windowSequence[fromIdx].lastAnchor;
-            const Shasta2AnchorId bypassTo = windowSequence[toIdx].firstAnchor;
+            // Create a bypass edge from A (last anchor of first visit)
+            // to A (first anchor of second visit).
+            if(createdBypasses.count({wA, wA})) continue;
+            createdBypasses.insert({wA, wA});
 
+            const Shasta2AnchorId bypassFrom = windowSequence[i].lastAnchor;
+            const Shasta2AnchorId bypassTo = windowSequence[i + 2].firstAnchor;
+
+            if(uint64_t(bypassFrom) == uint64_t(bypassTo)) continue;
             if(anchors.countCommon(bypassFrom, bypassTo) == 0) continue;
 
             Shasta2AnchorPair bypassPair(anchors, bypassFrom, bypassTo, false);
@@ -2931,7 +2826,8 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
         }
     }
 
-    cout << "removeInternalConnections: removed " << removedCount
+    cout << "removeInternalConnections: found " << tripletCount
+         << " A->B->A triplets, removed " << removedCount
          << " internal edges, created " << bypassCount
          << " bypass edges." << endl;
     return removedCount + bypassCount;
