@@ -1609,9 +1609,6 @@ void dinara::main::assemble(
         }
     }
 
-    // Pop superbubbles: choose a single path through each superbubble.
-    shasta2AnchorGraph->popSuperbubbles(anchorWindows, *shasta2Journeys);
-
     // Write external anchors.
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
@@ -1641,9 +1638,14 @@ void dinara::main::assemble(
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
 
-    // Compress linear chains.
+    // Remove short tips.
+    shasta2AssemblyGraph->removeShortTips(3);
     shasta2AssemblyGraph->compress();
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-compressed.gfa");
+
+    // Pop superbubbles.
+    shasta2AssemblyGraph->popSuperbubbles();
+    shasta2AssemblyGraph->compress();
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-popped.gfa");
 
     return;
 
