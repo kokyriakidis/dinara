@@ -516,6 +516,17 @@ void Assembler::buildSvMSA(
         // All DEL calls. Populated by all DEL emission sites.
         vector<DelCallRecord> allDelCalls;
 
+        // INS call record.
+        struct InsCallRecord {
+            uint32_t breakpointPos;
+            int64_t size;
+            uint32_t readCount;
+            string source;
+        };
+
+        // All INS calls. Populated by all INS emission sites.
+        vector<InsCallRecord> allInsCalls;
+
         // DEL calls from diagonal-shift and split-read analyses.
         vector<DelCallRecord> delCallRecords;
 
@@ -1214,19 +1225,12 @@ void Assembler::buildSvMSA(
                     if(insSize >= 50 && insSize <= 10000) {
                         const uint32_t bpPos =
                             (rClip.refPos + lClip.refPos) / 2;
-                        // cout << "    >>> INSERTION CALL"
-                             // << " (soft-clip assembly): size="
-                             // << insSize << "bp"
-                             // << ", breakpoint=" << bpPos
-                             // << ", Rclip=" << rClip.readCount
-                             // << "reads"
-                             // << " contig=" << rContigLen
-                             // << "bp"
-                             // << ", Lclip=" << lClip.readCount
-                             // << "reads"
-                             // << " contig=" << lContigLen
-                             // << "bp"
-                             // << endl;
+                        allInsCalls.push_back({
+                            bpPos,
+                            insSize,
+                            uint32_t(rClip.readCount
+                                + lClip.readCount),
+                            "soft-clip"});
                     }
                 }
             }
@@ -3523,15 +3527,12 @@ void Assembler::buildSvMSA(
                                          << ", breakpoint="
                                          << insBpPos << endl;
                                 } else {
-                                    // cout << "    >>> INSERTION CALL: "
-                                         // << "size=" << bestInsSz << "bp, "
-                                         // << "breakpoint=" << insBpPos << ", "
-                                         // << "leftEnds=" << lbp.endpointCount << ", "
-                                         // << "rightStarts=" << bestInsRbp->endpointCount << ", "
-                                         // << "hops=" << bestInsHops
-                                         // << " (pathDist=" << bestInsPathDist
-                                         // << " refGap=" << bestInsRefGap << ")"
-                                         // << endl;
+                                    allInsCalls.push_back({
+                                        insBpPos,
+                                        bestInsSz,
+                                        uint32_t(lbp.endpointCount
+                                            + bestInsRbp->endpointCount),
+                                        "read-graph"});
                                     insertionCallRegions.push_back({
                                         std::min(lbp.refPos, bestInsRbp->refPos),
                                         std::max(lbp.refPos, bestInsRbp->refPos)
@@ -3739,18 +3740,11 @@ void Assembler::buildSvMSA(
                                 // so the correct type can be scored.
                                 if(lbp.refPos > bestRbp->refPos
                                    && medianDel >= 50) {
-                                    // cout << "    >>> INSERTION CALL"
-                                         // << " (reversed-BP): size="
-                                         // << medianDel << "bp"
-                                         // << ", breakpoint="
-                                         // << breakpointPos
-                                         // << ", leftEnds="
-                                         // << lbp.endpointCount
-                                         // << ", rightStarts="
-                                         // << bestRbp->endpointCount
-                                         // << ", supportingReads="
-                                         // << delShifts.size()
-                                         // << endl;
+                                    allInsCalls.push_back({
+                                        breakpointPos,
+                                        medianDel,
+                                        uint32_t(delShifts.size()),
+                                        "reversed-BP"});
                                 }
                             }
                         }
@@ -4072,32 +4066,11 @@ void Assembler::buildSvMSA(
                             const uint32_t bpPos =
                                 (bestStrong->pos
                                  + bestPartner->pos) / 2;
-                            // cout << "    >>> INSERTION CALL"
-                                 // << " (large-ins): size="
-                                 // << estSize << "bp"
-                                 // << ", breakpoint=" << bpPos
-                                 // << ", leftEnds="
-                                 // << (bestStrong->isLeft
-                                     // ? bestStrong->count
-                                     // : bestPartner->count)
-                                 // << " (fold="
-                                 // << (bestStrong->isLeft
-                                     // ? bestStrong->fold
-                                     // : bestPartner->fold)
-                                 // << ")"
-                                 // << ", rightStarts="
-                                 // << (bestStrong->isLeft
-                                     // ? bestPartner->count
-                                     // : bestStrong->count)
-                                 // << " (fold="
-                                 // << (bestStrong->isLeft
-                                     // ? bestPartner->fold
-                                     // : bestStrong->fold)
-                                 // << ")"
-                                 // << ", internalReads="
-                                 // << indirectAlignedReads
-                                    // .size()
-                                 // << endl;
+                            allInsCalls.push_back({
+                                bpPos,
+                                estSize,
+                                uint32_t(indirectAlignedReads.size()),
+                                "large-ins"});
                             // Het-corrected estimate: for het
                             // insertions, indirectBases/coverage
                             // gives ~half the true size because
@@ -4114,15 +4087,11 @@ void Assembler::buildSvMSA(
                                && estSize >= 100) {
                                 const int64_t hetSize =
                                     estSize * 2;
-                                // cout << "    >>> INSERTION CALL"
-                                     // << " (large-ins-het):"
-                                     // << " size="
-                                     // << hetSize << "bp"
-                                     // << ", breakpoint="
-                                     // << bpPos
-                                     // << ", irCovRatio="
-                                     // << irCovRatio
-                                     // << endl;
+                                allInsCalls.push_back({
+                                    bpPos,
+                                    hetSize,
+                                    uint32_t(indirectAlignedReads.size()),
+                                    "large-ins-het"});
                             }
                             insertionCallRegions.push_back({
                                 std::min(bestStrong->pos,
@@ -4157,23 +4126,11 @@ void Assembler::buildSvMSA(
                                 }
                             }
                             if(!hasOppositeBP) {
-                                // cout << "    >>> INSERTION CALL"
-                                     // << " (large-ins): size="
-                                     // << estSize << "bp"
-                                     // << ", breakpoint="
-                                     // << bestStrong->pos
-                                     // << ", "
-                                     // << (bestStrong->isLeft
-                                         // ? "leftEnds="
-                                         // : "rightStarts=")
-                                     // << bestStrong->count
-                                     // << " (fold="
-                                     // << bestStrong->fold
-                                     // << ")"
-                                     // << ", internalReads="
-                                     // << indirectAlignedReads
-                                        // .size()
-                                     // << endl;
+                                allInsCalls.push_back({
+                                    bestStrong->pos,
+                                    estSize,
+                                    uint32_t(indirectAlignedReads.size()),
+                                    "large-ins-single"});
                                 // Het-corrected estimate.
                                 const double irCovRatio2 =
                                     double(indirectAlignedReads
@@ -4183,16 +4140,11 @@ void Assembler::buildSvMSA(
                                    && estSize >= 100) {
                                     const int64_t hetSize2 =
                                         estSize * 2;
-                                    // cout << "    >>> INSERTION"
-                                         // << " CALL"
-                                         // << " (large-ins-het):"
-                                         // << " size="
-                                         // << hetSize2 << "bp"
-                                         // << ", breakpoint="
-                                         // << bestStrong->pos
-                                         // << ", irCovRatio="
-                                         // << irCovRatio2
-                                         // << endl;
+                                    allInsCalls.push_back({
+                                        bestStrong->pos,
+                                        hetSize2,
+                                        uint32_t(indirectAlignedReads.size()),
+                                        "large-ins-single-het"});
                                 }
                                 insertionCallRegions.push_back({
                                     bestStrong->pos > 200
@@ -4450,12 +4402,11 @@ void Assembler::buildSvMSA(
                              << endl;
 
                         if(diagShifts.size() >= 2 && medianShift > 20) {
-                            // cout << "    >>> INSERTION CALL (hit-depth): "
-                                 // << "size=" << medianShift << "bp, "
-                                 // << "breakpoint=" << breakpointPos << ", "
-                                 // << "supportingReads=" << diagShifts.size()
-                                 // << ", minRatio=" << cluster.minRatio
-                                 // << endl;
+                            allInsCalls.push_back({
+                                breakpointPos,
+                                int64_t(medianShift),
+                                uint32_t(diagShifts.size()),
+                                "hit-depth"});
                         }
                     }
                 }
@@ -5501,21 +5452,13 @@ void Assembler::buildSvMSA(
                                     const int64_t insCallSize =
                                         std::max(flankShift,
                                                  int64_t(delSize));
-                                    // cout << "    >>> INSERTION CALL"
-                                         // << " (flank-gap): size="
-                                         // << insCallSize << "bp"
-                                         // << ", breakpoint="
-                                         // << bpPos
-                                         // << ", indirectReads="
-                                         // << indirectAlignedReads
-                                            // .size()
-                                         // << endl;
+                                    allInsCalls.push_back({
+                                        bpPos,
+                                        insCallSize,
+                                        uint32_t(indirectAlignedReads.size()),
+                                        "flank-gap"});
                                     // Also emit a repeat-unit-
-                                    // rounded estimate: the true
-                                    // insertion is likely a whole
-                                    // number of repeat units.
-                                    // Use floor to avoid over-
-                                    // estimating.
+                                    // rounded estimate.
                                     if(flankShift >= 30
                                        && delSize > flankShift) {
                                         const int64_t nUnits =
@@ -5528,20 +5471,11 @@ void Assembler::buildSvMSA(
                                             flankShift * nUnits;
                                         if(roundedSize != insCallSize
                                            && roundedSize >= 50) {
-                                            // cout << "    >>> "
-                                                 // << "INSERTION CALL"
-                                                 // << " (flank-gap"
-                                                 // << "-rounded):"
-                                                 // << " size="
-                                                 // << roundedSize
-                                                 // << "bp"
-                                                 // << ", breakpoint="
-                                                 // << bpPos
-                                                 // << ", repeatUnit="
-                                                 // << flankShift
-                                                 // << ", nUnits="
-                                                 // << nUnits
-                                                 // << endl;
+                                            allInsCalls.push_back({
+                                                bpPos,
+                                                roundedSize,
+                                                uint32_t(indirectAlignedReads.size()),
+                                                "flank-gap-rounded"});
                                         }
                                     }
                                     insertionCallRegions.push_back(
@@ -5991,16 +5925,11 @@ void Assembler::buildSvMSA(
                                && estInsSize <= 2000
                                && indirectAlignedReads.size()
                                   >= uint32_t(medianSpanning) / 3) {
-                                // cout << "    >>> INSERTION CALL"
-                                     // << " (covdrop-indirect):"
-                                     // << " size=" << estInsSize
-                                     // << "bp, breakpoint="
-                                     // << bpPos
-                                     // << ", indirectReads="
-                                     // << indirectAlignedReads
-                                        // .size()
-                                     // << ", markerDepleted=1"
-                                     // << endl;
+                                allInsCalls.push_back({
+                                    bpPos,
+                                    estInsSize,
+                                    uint32_t(indirectAlignedReads.size()),
+                                    "covdrop-indirect"});
                                 insertionCallRegions.push_back({
                                     cdc.startPos, cdc.endPos});
                                 refinedCall = true;
@@ -6044,15 +5973,32 @@ void Assembler::buildSvMSA(
                    && cdrSize <= ci.size * 6
                    && cdrSize >= 100
                    && cdrSize <= 2000) {
-                    // cout << "    >>> INSERTION CALL"
-                         // << " (CIGAR-covdrop): size="
-                         // << cdrSize << "bp"
-                         // << ", breakpoint=" << ci.refPos
-                         // << ", cigarReads=" << ci.readCount
-                         // << ", cigarSize=" << ci.size
-                         // << endl;
+                    allInsCalls.push_back({
+                        ci.refPos,
+                        int64_t(cdrSize),
+                        ci.readCount,
+                        "CIGAR-covdrop"});
                     break;
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Emit all INS calls.
+        // -----------------------------------------------------------------
+        if(!allInsCalls.empty()) {
+            // Sort by breakpoint position.
+            sort(allInsCalls.begin(), allInsCalls.end(),
+                [](const InsCallRecord& a, const InsCallRecord& b) {
+                    return a.breakpointPos < b.breakpointPos;
+                });
+            for(const auto& ic : allInsCalls) {
+                cout << "    >>> INSERTION CALL"
+                     << " (" << ic.source
+                     << "): size=" << ic.size << "bp"
+                     << ", breakpoint=" << ic.breakpointPos
+                     << ", reads=" << ic.readCount
+                     << endl;
             }
         }
 
