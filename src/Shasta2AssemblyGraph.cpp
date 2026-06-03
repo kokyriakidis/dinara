@@ -1086,14 +1086,16 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
     {
         // Collect all vertices involved (for cleanup).
         set<vertex_descriptor> allVertices(chainVertices.begin(), chainVertices.end());
-        set<vertex_descriptor> rcVertices;
 
-        // Remove forward chain edges and their RC mirrors.
+        // Collect all edges to remove: forward chain edges + RC mirrors.
+        // Use a set to deduplicate in case a chain edge is its own RC mirror.
+        set<edge_descriptor> edgesToRemove(chainEdges.begin(), chainEdges.end());
+
         for(const edge_descriptor e : chainEdges) {
             const vertex_descriptor v0 = source(e, assemblyGraph);
             const vertex_descriptor v1 = target(e, assemblyGraph);
 
-            // Find RC mirror vertices: rc(v1) -> rc(v0).
+            // Find RC mirror edge: rc(v1) -> rc(v0).
             const Shasta2AnchorId rcAnchorV0 =
                 Shasta2AnchorId(uint64_t(assemblyGraph[v0].anchorId) ^ 1ULL);
             const Shasta2AnchorId rcAnchorV1 =
@@ -1101,25 +1103,26 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
             auto itRcV0 = anchorToVertex.find(rcAnchorV0);
             auto itRcV1 = anchorToVertex.find(rcAnchorV1);
 
-            // Remove the RC mirror edge rc(v1) -> rc(v0).
             if(itRcV1 != anchorToVertex.end() && itRcV0 != anchorToVertex.end()) {
                 const vertex_descriptor rcV1 = itRcV1->second;
                 const vertex_descriptor rcV0 = itRcV0->second;
-                boost::remove_edge(rcV1, rcV0, assemblyGraph);
-                rcVertices.insert(rcV1);
-                rcVertices.insert(rcV0);
+                allVertices.insert(rcV1);
+                allVertices.insert(rcV0);
+                // Find the specific RC edge descriptor(s) from rcV1 to rcV0.
+                BGL_FORALL_OUTEDGES(rcV1, rcEdge, assemblyGraph, Shasta2AssemblyGraph) {
+                    if(target(rcEdge, assemblyGraph) == rcV0) {
+                        edgesToRemove.insert(rcEdge);
+                    }
+                }
             }
         }
 
-        // Remove forward chain edges.
-        for(const edge_descriptor e : chainEdges) {
+        // Remove all collected edges.
+        for(const edge_descriptor e : edgesToRemove) {
             boost::remove_edge(e, assemblyGraph);
         }
 
-        // Remove isolated vertices (forward and RC).
-        // Merge into a single set to avoid double-removal when a vertex
-        // is its own RC (self-complementary anchor).
-        allVertices.insert(rcVertices.begin(), rcVertices.end());
+        // Remove isolated vertices.
         for(const vertex_descriptor cv : allVertices) {
             if(in_degree(cv, assemblyGraph) == 0 && out_degree(cv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[cv].anchorId);
