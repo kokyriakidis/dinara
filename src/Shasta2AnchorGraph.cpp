@@ -2835,7 +2835,8 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
     }
 
     cout << "removeInternalConnections: found " << totalTriplets
-         << " A->B->A triplets, removed " << totalRemoved
+         << " A->B->A triplets across " << removedPairs.size()
+         << " window pairs, removed " << totalRemoved
          << " internal edges, created " << totalBypasses
          << " bypass edges." << endl;
     return totalRemoved + totalBypasses;
