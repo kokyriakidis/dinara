@@ -1262,6 +1262,27 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         ++removedCount;
     }
 
+    // Log all edges with their vertex degrees (for debugging).
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+        const vertex_descriptor v0 = source(e, assemblyGraph);
+        const vertex_descriptor v1 = target(e, assemblyGraph);
+        cout << "  Edge " << edge.id
+             << ": src=" << assemblyGraph[v0].anchorId
+             << "(in=" << in_degree(v0, assemblyGraph)
+             << ",out=" << out_degree(v0, assemblyGraph) << ")"
+             << " -> tgt=" << assemblyGraph[v1].anchorId
+             << "(in=" << in_degree(v1, assemblyGraph)
+             << ",out=" << out_degree(v1, assemblyGraph) << ")"
+             << " len=" << edge.length()
+             << " ws=[";
+        for(uint64_t i = 0; i < edge.windowSequence.size(); i++) {
+            if(i > 0) cout << ",";
+            cout << edge.windowSequence[i];
+        }
+        cout << "]" << endl;
+    }
+
     // Log remaining tips that were NOT removed (for debugging).
     BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
         bool isDeadEnd = false;
