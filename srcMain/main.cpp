@@ -1620,7 +1620,7 @@ void dinara::main::assemble(
          << externalAnchorsName << endl;
 
     // Remove inter-window edges that land internally on a window's backbone.
-    shasta2AnchorGraph->removeInternalConnections(anchorWindows, *shasta2Journeys);
+    shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
     // Save the post-detangling anchor graph.
