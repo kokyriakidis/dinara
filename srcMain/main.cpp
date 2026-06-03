@@ -1638,8 +1638,8 @@ void dinara::main::assemble(
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
 
-    // Remove short tips.
-    shasta2AssemblyGraph->removeShortTips(3);
+    // Remove short tips (chains with length <= 20000 bp).
+    shasta2AssemblyGraph->removeShortTips(20000);
     shasta2AssemblyGraph->compress();
 
     // Pop superbubbles.

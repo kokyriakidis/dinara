@@ -210,12 +210,12 @@ public:
     uint64_t cleanByCopyNumber(
         double estimatedAverageCoverage = 0.); // 0 means auto-estimate
 
-    // Remove short tip chains based on window count (like hifiasm's asg_arc_cut_tips).
-    // Walks from each dead-end vertex along the linear chain, counting
-    // the total number of windows. If the total is <= maxTipWindows,
-    // the entire chain is removed. Coverage is not considered.
+    // Remove short tip chains based on length in bp.
+    // Walks from each dead-end vertex along the linear chain, summing
+    // the total length. If the total is <= maxTipLength, the chain is removed.
+    // Coverage is not considered.
     // Shorter tips are processed first so their removal can expose longer ones.
-    uint64_t removeShortTips(uint32_t maxTipWindows = 3);
+    uint64_t removeShortTips(uint64_t maxTipLength = 20000);
 
     // Pop superbubbles by removing low-coverage alternative paths.
     // Follows Verkko's approach (pop_bubbles_coverage_based.py).
