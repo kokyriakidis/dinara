@@ -3071,11 +3071,13 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
     };
 
     // ---- Step 1: Build a window-level directed graph. ----
-    // Nodes are raw window IDs (forward and RC separate).
-    // Edges are inter-window connections from active anchor edges.
-    // Use adjacency_list with vecS so findSuperbubbleOnodera works.
-    //
-    // First, collect all raw window IDs and map them to dense indices.
+    // Nodes are normalized window IDs.
+    // Only include edges from FORWARD raw windows (srcW < windowCount)
+    // to avoid RC mirror edges creating reverse edges that form
+    // universal 2-cycles and prevent superbubble detection.
+    // The forward edges define the graph topology; the RC edges
+    // are the same topology in reverse and are handled implicitly
+    // by disableEdge's RC mirror support.
     std::map<uint32_t, std::set<uint32_t>> windowSuccessorsMap;
 
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
@@ -3086,35 +3088,38 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         const uint32_t srcW = anchorToWindow[src];
         const uint32_t dstW = anchorToWindow[dst];
         if(srcW == noWindow || dstW == noWindow) continue;
-        if(srcW == dstW) continue;
-        if(normalizeW(srcW) == normalizeW(dstW)) continue;
-        windowSuccessorsMap[srcW].insert(dstW);
+        // Only forward-strand edges.
+        if(srcW >= windowCount) continue;
+        const uint32_t srcNorm = normalizeW(srcW);
+        const uint32_t dstNorm = normalizeW(dstW);
+        if(srcNorm == dstNorm) continue;
+        windowSuccessorsMap[srcNorm].insert(dstNorm);
     }
 
-    // Collect all raw window IDs.
-    std::set<uint32_t> allRawWindows;
+    // Collect all normalized window IDs.
+    std::set<uint32_t> allNormWindows;
     for(const auto& [w, succs] : windowSuccessorsMap) {
-        allRawWindows.insert(w);
-        for(const uint32_t s : succs) allRawWindows.insert(s);
+        allNormWindows.insert(w);
+        for(const uint32_t s : succs) allNormWindows.insert(s);
     }
 
-    // Map raw window IDs to dense indices.
-    std::vector<uint32_t> indexToRawWindow(allRawWindows.begin(), allRawWindows.end());
-    std::map<uint32_t, uint32_t> rawWindowToIndex;
-    for(uint32_t i = 0; i < indexToRawWindow.size(); i++) {
-        rawWindowToIndex[indexToRawWindow[i]] = i;
+    // Map normalized window IDs to dense indices.
+    std::vector<uint32_t> indexToNormWindow(allNormWindows.begin(), allNormWindows.end());
+    std::map<uint32_t, uint32_t> normWindowToIndex;
+    for(uint32_t i = 0; i < indexToNormWindow.size(); i++) {
+        normWindowToIndex[indexToNormWindow[i]] = i;
     }
 
     // Build the window-level Boost graph.
     using WindowGraph = boost::adjacency_list<
         boost::vecS, boost::vecS, boost::bidirectionalS>;
-    const uint32_t nWindowNodes = uint32_t(indexToRawWindow.size());
+    const uint32_t nWindowNodes = uint32_t(indexToNormWindow.size());
     WindowGraph windowGraph(nWindowNodes);
 
     for(const auto& [srcW, succs] : windowSuccessorsMap) {
-        const uint32_t srcIdx = rawWindowToIndex[srcW];
+        const uint32_t srcIdx = normWindowToIndex[srcW];
         for(const uint32_t dstW : succs) {
-            const uint32_t dstIdx = rawWindowToIndex[dstW];
+            const uint32_t dstIdx = normWindowToIndex[dstW];
             boost::add_edge(srcIdx, dstIdx, windowGraph);
         }
     }
@@ -3125,10 +3130,12 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
     // ---- Step 2: Find and pop superbubbles in the window graph. ----
     std::set<uint32_t> poppedWindowIndices;
     uint64_t poppedCount = 0;
+    uint64_t candidateCount = 0;
 
     for(uint32_t vi = 0; vi < nWindowNodes; vi++) {
         if(out_degree(vi, windowGraph) < 2) continue;
         if(poppedWindowIndices.count(vi)) continue;
+        ++candidateCount;
 
         const auto viExit = findSuperbubbleOnodera(windowGraph, vi, maxSize);
         if(viExit == WindowGraph::null_vertex()) continue;
@@ -3194,9 +3201,8 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         // window's backbone chain (backboneNextWindow).
         // Walk the backbone chain from the source to build the set of
         // windows the backbone passes through.
-        const uint32_t sourceRawW = indexToRawWindow[vi];
-        const uint32_t sourceNormW = normalizeW(sourceRawW);
-        const uint32_t sinkNormW = normalizeW(indexToRawWindow[viExit]);
+        const uint32_t sourceNormW = indexToNormWindow[vi];
+        const uint32_t sinkNormW = indexToNormWindow[viExit];
 
         std::set<uint32_t> backboneChainNormWindows;
         {
@@ -3222,7 +3228,7 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
             uint64_t score = 0;
 
             for(const uint32_t wIdx : path) {
-                const uint32_t normW = normalizeW(indexToRawWindow[wIdx]);
+                const uint32_t normW = indexToNormWindow[wIdx];
 
                 // High score for windows on the backbone chain.
                 if(backboneChainNormWindows.count(normW)) {
@@ -3247,14 +3253,14 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         // Collect the set of normalized window IDs on the best path.
         std::set<uint32_t> bestPathNormWindows;
         for(const uint32_t wIdx : allPaths[bestPathIndex]) {
-            bestPathNormWindows.insert(normalizeW(indexToRawWindow[wIdx]));
+            bestPathNormWindows.insert(indexToNormWindow[wIdx]);
         }
 
         // Collect normalized window IDs on ALL paths.
         std::set<uint32_t> allPathNormWindows;
         for(const auto& path : allPaths) {
             for(const uint32_t wIdx : path) {
-                allPathNormWindows.insert(normalizeW(indexToRawWindow[wIdx]));
+                allPathNormWindows.insert(indexToNormWindow[wIdx]);
             }
         }
 
@@ -3264,7 +3270,7 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         for(const uint32_t normW : allPathNormWindows) {
             if(bestPathNormWindows.count(normW)) continue;
             if(normW == sourceNormW) continue;
-            if(normW == normalizeW(indexToRawWindow[viExit])) continue;
+            if(normW == sinkNormW) continue;
             windowsToDisable.insert(normW);
         }
 
@@ -3310,17 +3316,10 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
 
         // Remove disabled windows from the window graph so subsequent
         // superbubble detections see the correct topology.
-        // Map disabled normalized windows back to their raw window indices
-        // and clear all edges involving those indices.
         for(const uint32_t normW : windowsToDisable) {
-            const uint32_t fwdRaw = normW;
-            const uint32_t rcRaw = normW + windowCount;
-            for(const uint32_t rawW : {fwdRaw, rcRaw}) {
-                auto it = rawWindowToIndex.find(rawW);
-                if(it == rawWindowToIndex.end()) continue;
-                const uint32_t wIdx = it->second;
-                boost::clear_vertex(wIdx, windowGraph);
-            }
+            auto it = normWindowToIndex.find(normW);
+            if(it == normWindowToIndex.end()) continue;
+            boost::clear_vertex(it->second, windowGraph);
         }
 
         for(const uint32_t u : interiorIndices) {
@@ -3329,18 +3328,19 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
         ++poppedCount;
 
         cout << "  Superbubble popped: source=W" << sourceNormW
-             << " sink=W" << normalizeW(indexToRawWindow[viExit])
+             << " sink=W" << sinkNormW
              << " paths=" << allPaths.size()
              << " best=[";
         for(uint64_t i = 0; i < allPaths[bestPathIndex].size(); i++) {
             if(i > 0) cout << ",";
-            cout << "W" << normalizeW(indexToRawWindow[allPaths[bestPathIndex][i]]);
+            cout << "W" << indexToNormWindow[allPaths[bestPathIndex][i]];
         }
         cout << "] disabled=" << windowsToDisable.size()
              << " windows, " << disabledEdgeCount << " edges." << endl;
     }
 
-    cout << "popSuperbubbles: " << poppedCount << " superbubbles popped." << endl;
+    cout << "popSuperbubbles: " << candidateCount << " candidates (out-degree >= 2), "
+         << poppedCount << " superbubbles popped." << endl;
     return poppedCount;
 }
 
