@@ -108,6 +108,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     const Shasta2Journeys& journeys,
     const vector<AnchorWindow>& anchorWindows,
     uint64_t minInterWindowCoverage,
+    uint64_t minInterWindowEdgeCoverage,
     uint64_t threadCount,
     const Reads* reads,
     const vector<DetangleBypassEdge>* bypassEdges) :
@@ -512,6 +513,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 
     uint64_t interWindowZeroPairs = 0;
+    uint64_t interWindowLowEdgeCoverage = 0;
     uint64_t interWindowCreated = 0;
     struct InterWindowEdgeInfo {
         std::pair<uint32_t, uint32_t> windowPair;
@@ -620,6 +622,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             continue;
         }
 
+        // Skip edges with insufficient anchor pair coverage.
+        if(anchorPair.size() < minInterWindowEdgeCoverage) {
+            ++interWindowLowEdgeCoverage;
+            continue;
+        }
+
         const uint64_t sharedReads = countSharedReads(windowPair.first, windowPair.second);
         // Use average spans across all transitions for the edge attributes.
         uint64_t totalSpanA = 0, totalSpanB = 0;
@@ -634,6 +642,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     cout << "Inter-window edges: " << interWindowCreated << " created, "
          << interWindowLowCoverage << " rejected (< " << minInterWindowCoverage << " reads), "
+         << interWindowLowEdgeCoverage << " rejected (< " << minInterWindowEdgeCoverage << " edge coverage), "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
 
     // ========================================================================

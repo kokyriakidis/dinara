@@ -1562,6 +1562,8 @@ void dinara::main::assemble(
 
     const uint64_t minInterWindowCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
+    const uint64_t minInterWindowEdgeCoverage =
+        assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
 
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;
@@ -1570,6 +1572,7 @@ void dinara::main::assemble(
         *shasta2Journeys,
         anchorWindows,
         minInterWindowCoverage,
+        minInterWindowEdgeCoverage,
         threadCount,
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
@@ -1603,6 +1606,7 @@ void dinara::main::assemble(
                 *shasta2Journeys,
                 anchorWindows,
                 minInterWindowCoverage,
+                minInterWindowEdgeCoverage,
                 threadCount,
                 &assembler.getReads(),
                 &bypassEdges);
@@ -1641,6 +1645,7 @@ void dinara::main::assemble(
                 *shasta2Journeys,
                 anchorWindows,
                 minInterWindowCoverage,
+                minInterWindowEdgeCoverage,
                 threadCount,
                 &assembler.getReads(),
                 &bypassEdges2);

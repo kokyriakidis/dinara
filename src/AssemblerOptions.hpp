@@ -585,6 +585,10 @@ public:
     // Candidates with fewer shared reads are discarded.
     uint64_t minInterWindowCoverage;
 
+    // Minimum anchor pair coverage (common reads) for an inter-window edge.
+    // Edges whose anchor pair has fewer common reads are discarded.
+    uint64_t minInterWindowEdgeCoverage;
+
     // Minimum common reads between consecutive backbone anchors.
     // Backbone journeys are filtered to keep the longest subsequence
     // where every consecutive pair meets this threshold.
