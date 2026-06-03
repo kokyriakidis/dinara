@@ -3308,6 +3308,21 @@ uint64_t Shasta2AnchorGraph::popSuperbubbles(
             }
         }
 
+        // Remove disabled windows from the window graph so subsequent
+        // superbubble detections see the correct topology.
+        // Map disabled normalized windows back to their raw window indices
+        // and clear all edges involving those indices.
+        for(const uint32_t normW : windowsToDisable) {
+            const uint32_t fwdRaw = normW;
+            const uint32_t rcRaw = normW + windowCount;
+            for(const uint32_t rawW : {fwdRaw, rcRaw}) {
+                auto it = rawWindowToIndex.find(rawW);
+                if(it == rawWindowToIndex.end()) continue;
+                const uint32_t wIdx = it->second;
+                boost::clear_vertex(wIdx, windowGraph);
+            }
+        }
+
         for(const uint32_t u : interiorIndices) {
             poppedWindowIndices.insert(u);
         }
