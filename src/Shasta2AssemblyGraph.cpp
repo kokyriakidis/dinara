@@ -1045,96 +1045,49 @@ uint64_t Shasta2AssemblyGraph::compress()
 //   with coverage >= minSafeCoverage, going to a vertex other than v0.
 //
 // Symmetric logic for dead end at v1 (check v0's incoming edges).
-// Remove short tip chains based on length in bp.
-// Walk from each dead-end vertex along the linear chain, sum total
-// length. If <= maxTipLength, delete the chain. Process shortest first.
-uint64_t Shasta2AssemblyGraph::removeShortTips(uint64_t maxTipLength)
+// Remove short tip chains (like hifiasm's asg_arc_cut_tips).
+// A tip is removed if its total window count <= maxTipWindows
+// AND its total length <= maxTipLength bp. Process shortest first.
+// When a tip is removed, its RC mirror chain is also removed
+// (like hifiasm's asg_seq_del which deletes both orientations).
+uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t maxTipLength)
 {
     Shasta2AssemblyGraph& assemblyGraph = *this;
 
-    // Collect tip candidates.
-    struct TipCandidate {
-        uint64_t totalLength;
-        vertex_descriptor startVertex;
-        bool walkForward;
-    };
-    vector<TipCandidate> candidates;
-
+    // Build anchorId -> vertex_descriptor map for RC mirror lookup.
+    map<Shasta2AnchorId, vertex_descriptor> anchorToVertex;
     BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
-        // Dead end on incoming side (in-degree 0, out-degree >= 1).
-        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) >= 1) {
-            uint64_t totalLength = 0;
-            vertex_descriptor w = v;
-            bool hasEdges = false;
-
-            while(true) {
-                if(out_degree(w, assemblyGraph) != 1) break;
-                const edge_descriptor e = *out_edges(w, assemblyGraph).first;
-                hasEdges = true;
-                totalLength += assemblyGraph[e].length();
-                const vertex_descriptor next = target(e, assemblyGraph);
-                if(in_degree(next, assemblyGraph) != 1) break;
-                w = next;
-            }
-
-            if(hasEdges && totalLength <= maxTipLength) {
-                candidates.push_back({totalLength, v, true});
-            }
-        }
-
-        // Dead end on outgoing side (out-degree 0, in-degree >= 1).
-        if(out_degree(v, assemblyGraph) == 0 && in_degree(v, assemblyGraph) >= 1) {
-            uint64_t totalLength = 0;
-            vertex_descriptor w = v;
-            bool hasEdges = false;
-
-            while(true) {
-                if(in_degree(w, assemblyGraph) != 1) break;
-                const edge_descriptor e = *in_edges(w, assemblyGraph).first;
-                hasEdges = true;
-                totalLength += assemblyGraph[e].length();
-                const vertex_descriptor prev = source(e, assemblyGraph);
-                if(out_degree(prev, assemblyGraph) != 1) break;
-                w = prev;
-            }
-
-            if(hasEdges && totalLength <= maxTipLength) {
-                candidates.push_back({totalLength, v, false});
-            }
-        }
+        anchorToVertex[assemblyGraph[v].anchorId] = v;
     }
 
-    // Sort shortest first.
-    sort(candidates.begin(), candidates.end(),
-        [](const TipCandidate& a, const TipCandidate& b) {
-            return a.totalLength < b.totalLength;
-        });
-
-    // Process each candidate. Re-walk to verify it's still a tip.
-    uint64_t removedCount = 0;
-
-    for(const TipCandidate& candidate : candidates) {
-        const vertex_descriptor v = candidate.startVertex;
-
-        if(candidate.walkForward) {
-            if(in_degree(v, assemblyGraph) != 0 || out_degree(v, assemblyGraph) == 0) continue;
-        } else {
-            if(out_degree(v, assemblyGraph) != 0 || in_degree(v, assemblyGraph) == 0) continue;
+    // Count distinct windows across edges.
+    auto countDistinctWindows = [](const vector<Shasta2AssemblyGraphEdge*>& edges) -> uint32_t {
+        set<uint32_t> windows;
+        for(const auto* edge : edges) {
+            for(const uint32_t w : edge->windowSequence) {
+                windows.insert(w);
+            }
         }
+        return uint32_t(windows.size());
+    };
 
-        // Re-walk and re-check.
-        vector<edge_descriptor> chainEdges;
-        vector<vertex_descriptor> chainVertices;
-        uint64_t totalLength = 0;
+    // Walk a tip chain from a dead-end vertex. Returns the edges and vertices.
+    // walkForward=true: v has in-degree 0, walk via out-edges.
+    // walkForward=false: v has out-degree 0, walk via in-edges.
+    auto walkTipChain = [&](vertex_descriptor v, bool walkForward,
+        vector<edge_descriptor>& chainEdges,
+        vector<vertex_descriptor>& chainVertices)
+    {
+        chainEdges.clear();
+        chainVertices.clear();
 
-        if(candidate.walkForward) {
+        if(walkForward) {
             vertex_descriptor w = v;
             chainVertices.push_back(w);
             while(true) {
                 if(out_degree(w, assemblyGraph) != 1) break;
                 const edge_descriptor e = *out_edges(w, assemblyGraph).first;
                 chainEdges.push_back(e);
-                totalLength += assemblyGraph[e].length();
                 const vertex_descriptor next = target(e, assemblyGraph);
                 chainVertices.push_back(next);
                 if(in_degree(next, assemblyGraph) != 1) break;
@@ -1147,33 +1100,162 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint64_t maxTipLength)
                 if(in_degree(w, assemblyGraph) != 1) break;
                 const edge_descriptor e = *in_edges(w, assemblyGraph).first;
                 chainEdges.push_back(e);
-                totalLength += assemblyGraph[e].length();
                 const vertex_descriptor prev = source(e, assemblyGraph);
                 chainVertices.push_back(prev);
                 if(out_degree(prev, assemblyGraph) != 1) break;
                 w = prev;
             }
         }
+    };
 
-        if(chainEdges.empty() || totalLength > maxTipLength) continue;
+    // Remove a chain (edges + isolated vertices) and its RC mirror.
+    // Like hifiasm's asg_seq_del which deletes v>>1 (both orientations).
+    auto removeChainAndRc = [&](
+        const vector<edge_descriptor>& chainEdges,
+        const vector<vertex_descriptor>& chainVertices)
+    {
+        // Collect RC mirror vertex descriptors from the chain's anchor IDs.
+        set<vertex_descriptor> rcVertices;
+        for(const vertex_descriptor cv : chainVertices) {
+            const Shasta2AnchorId rcAnchorId =
+                Shasta2AnchorId(uint64_t(assemblyGraph[cv].anchorId) ^ 1ULL);
+            auto it = anchorToVertex.find(rcAnchorId);
+            if(it != anchorToVertex.end()) {
+                rcVertices.insert(it->second);
+            }
+        }
 
-        // Remove all edges in the chain.
+        // Remove forward chain edges.
         for(const edge_descriptor e : chainEdges) {
             boost::remove_edge(e, assemblyGraph);
         }
 
-        // Remove isolated vertices.
-        for(const vertex_descriptor w : chainVertices) {
-            if(in_degree(w, assemblyGraph) == 0 && out_degree(w, assemblyGraph) == 0) {
-                boost::remove_vertex(w, assemblyGraph);
+        // Remove RC mirror edges: any edge between RC vertices.
+        vector<edge_descriptor> rcEdgesToRemove;
+        for(const vertex_descriptor rv : rcVertices) {
+            BGL_FORALL_OUTEDGES(rv, e, assemblyGraph, Shasta2AssemblyGraph) {
+                if(rcVertices.count(target(e, assemblyGraph))) {
+                    rcEdgesToRemove.push_back(e);
+                }
+            }
+        }
+        for(const edge_descriptor e : rcEdgesToRemove) {
+            boost::remove_edge(e, assemblyGraph);
+        }
+
+        // Remove isolated vertices (forward chain).
+        for(const vertex_descriptor cv : chainVertices) {
+            if(in_degree(cv, assemblyGraph) == 0 && out_degree(cv, assemblyGraph) == 0) {
+                anchorToVertex.erase(assemblyGraph[cv].anchorId);
+                boost::remove_vertex(cv, assemblyGraph);
             }
         }
 
+        // Remove isolated RC vertices.
+        for(const vertex_descriptor rv : rcVertices) {
+            if(in_degree(rv, assemblyGraph) == 0 && out_degree(rv, assemblyGraph) == 0) {
+                anchorToVertex.erase(assemblyGraph[rv].anchorId);
+                boost::remove_vertex(rv, assemblyGraph);
+            }
+        }
+    };
+
+    // Collect tip candidates.
+    struct TipCandidate {
+        uint32_t totalWindows;
+        uint64_t totalLength;
+        vertex_descriptor startVertex;
+        bool walkForward;
+    };
+    vector<TipCandidate> candidates;
+
+    BGL_FORALL_VERTICES(v, assemblyGraph, Shasta2AssemblyGraph) {
+        // Dead end on incoming side (in-degree 0, out-degree >= 1).
+        if(in_degree(v, assemblyGraph) == 0 && out_degree(v, assemblyGraph) >= 1) {
+            vector<edge_descriptor> chainEdges;
+            vector<vertex_descriptor> chainVertices;
+            walkTipChain(v, true, chainEdges, chainVertices);
+
+            if(!chainEdges.empty()) {
+                uint64_t totalLength = 0;
+                vector<Shasta2AssemblyGraphEdge*> edgePtrs;
+                for(const edge_descriptor e : chainEdges) {
+                    totalLength += assemblyGraph[e].length();
+                    edgePtrs.push_back(&assemblyGraph[e]);
+                }
+                const uint32_t totalWindows = countDistinctWindows(edgePtrs);
+                if(totalWindows <= maxTipWindows && totalLength <= maxTipLength) {
+                    candidates.push_back({totalWindows, totalLength, v, true});
+                }
+            }
+        }
+
+        // Dead end on outgoing side (out-degree 0, in-degree >= 1).
+        if(out_degree(v, assemblyGraph) == 0 && in_degree(v, assemblyGraph) >= 1) {
+            vector<edge_descriptor> chainEdges;
+            vector<vertex_descriptor> chainVertices;
+            walkTipChain(v, false, chainEdges, chainVertices);
+
+            if(!chainEdges.empty()) {
+                uint64_t totalLength = 0;
+                vector<Shasta2AssemblyGraphEdge*> edgePtrs;
+                for(const edge_descriptor e : chainEdges) {
+                    totalLength += assemblyGraph[e].length();
+                    edgePtrs.push_back(&assemblyGraph[e]);
+                }
+                const uint32_t totalWindows = countDistinctWindows(edgePtrs);
+                if(totalWindows <= maxTipWindows && totalLength <= maxTipLength) {
+                    candidates.push_back({totalWindows, totalLength, v, false});
+                }
+            }
+        }
+    }
+
+    // Sort shortest first (like hifiasm's radix_sort_srt64).
+    sort(candidates.begin(), candidates.end(),
+        [](const TipCandidate& a, const TipCandidate& b) {
+            if(a.totalWindows != b.totalWindows) return a.totalWindows < b.totalWindows;
+            return a.totalLength < b.totalLength;
+        });
+
+    // Process each candidate. Re-walk to verify it's still a tip
+    // (earlier removals may have changed the graph).
+    uint64_t removedCount = 0;
+
+    for(const TipCandidate& candidate : candidates) {
+        const vertex_descriptor v = candidate.startVertex;
+
+        // Re-check dead-end condition.
+        if(candidate.walkForward) {
+            if(in_degree(v, assemblyGraph) != 0 || out_degree(v, assemblyGraph) == 0) continue;
+        } else {
+            if(out_degree(v, assemblyGraph) != 0 || in_degree(v, assemblyGraph) == 0) continue;
+        }
+
+        // Re-walk and re-check thresholds.
+        vector<edge_descriptor> chainEdges;
+        vector<vertex_descriptor> chainVertices;
+        walkTipChain(v, candidate.walkForward, chainEdges, chainVertices);
+
+        if(chainEdges.empty()) continue;
+
+        uint64_t totalLength = 0;
+        vector<Shasta2AssemblyGraphEdge*> edgePtrs;
+        for(const edge_descriptor e : chainEdges) {
+            totalLength += assemblyGraph[e].length();
+            edgePtrs.push_back(&assemblyGraph[e]);
+        }
+        const uint32_t totalWindows = countDistinctWindows(edgePtrs);
+        if(totalWindows > maxTipWindows || totalLength > maxTipLength) continue;
+
+        // Remove the tip chain and its RC mirror.
+        removeChainAndRc(chainEdges, chainVertices);
         ++removedCount;
     }
 
     cout << "removeShortTips removed " << removedCount
-         << " tips with length <= " << maxTipLength << " bp." << endl;
+         << " tips with <= " << maxTipWindows << " windows"
+         << " and <= " << maxTipLength << " bp." << endl;
     return removedCount;
 }
 
