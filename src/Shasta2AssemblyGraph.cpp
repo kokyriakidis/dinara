@@ -1071,6 +1071,10 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
         return uint32_t(windows.size());
     };
 
+    // Track removed vertices to avoid use-after-free on candidates
+    // whose dead-end vertex was removed by an earlier tip deletion.
+    set<vertex_descriptor> removedVertices;
+
     // Remove a tip chain and its RC mirror edges.
     // For each edge v0->v1 in the chain, the RC mirror edge is rc(v1)->rc(v0).
     // Only the specific RC mirror edges are removed — not all edges at
@@ -1117,12 +1121,14 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
             if(in_degree(cv, assemblyGraph) == 0 && out_degree(cv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[cv].anchorId);
                 boost::remove_vertex(cv, assemblyGraph);
+                removedVertices.insert(cv);
             }
         }
         for(const vertex_descriptor rv : rcVertices) {
             if(in_degree(rv, assemblyGraph) == 0 && out_degree(rv, assemblyGraph) == 0) {
                 anchorToVertex.erase(assemblyGraph[rv].anchorId);
                 boost::remove_vertex(rv, assemblyGraph);
+                removedVertices.insert(rv);
             }
         }
     };
@@ -1233,6 +1239,9 @@ uint64_t Shasta2AssemblyGraph::removeShortTips(uint32_t maxTipWindows, uint64_t 
 
     for(const TipCandidate& candidate : candidates) {
         const vertex_descriptor v = candidate.deadEndVertex;
+
+        // Skip if this vertex was already removed.
+        if(removedVertices.count(v)) continue;
 
         // Re-check dead-end condition.
         if(candidate.walkForward) {
