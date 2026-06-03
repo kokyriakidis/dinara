@@ -2766,6 +2766,23 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
             return a.journeyLength > b.journeyLength;
         });
 
+    // Build an index of inter-window edges by (srcWindow, dstWindow) pair.
+    using WindowPairKey = std::pair<uint32_t, uint32_t>;
+    std::map<WindowPairKey, vector<edge_descriptor>> windowPairEdges;
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcWin = anchorToWindow[src];
+        const uint32_t dstWin = anchorToWindow[dst];
+        if(srcWin == noWindow || dstWin == noWindow) continue;
+        const uint32_t srcNorm = normalizeW(srcWin);
+        const uint32_t dstNorm = normalizeW(dstWin);
+        if(srcNorm == dstNorm) continue;
+        windowPairEdges[{srcNorm, dstNorm}].push_back(e);
+    }
+
     cout << "removeInternalConnections: processing " << nonBackboneReads.size()
          << " non-backbone reads (longest first)." << endl;
 
@@ -2847,21 +2864,18 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
 
             if(toIdx == fromIdx + 1) continue; // Adjacent, no skip.
 
-            // Disable all inter-window edges along the skipped path.
+            // Disable ALL inter-window edges between consecutive windows
+            // along the skipped path.
             for(uint64_t j = fromIdx; j < toIdx; j++) {
                 const uint32_t wFrom = windowSequence[j].normWindow;
                 const uint32_t wTo = windowSequence[j + 1].normWindow;
-                // Find and disable edges between these two windows.
-                // Search from the last anchor of wFrom.
-                const uint64_t aFrom = uint64_t(windowSequence[j].lastAnchor);
-                for(auto oe = boost::out_edges(aFrom, anchorGraph);
-                    oe.first != oe.second; ++oe.first) {
-                    if(!anchorGraph[*oe.first].useForAssembly) continue;
-                    const uint64_t tgt = uint64_t(target(*oe.first, anchorGraph));
-                    if(tgt < anchorCount) {
-                        const uint32_t tgtWin = anchorToWindow[tgt];
-                        if(tgtWin != noWindow && normalizeW(tgtWin) == wTo) {
-                            disableEdge(*oe.first);
+                // Find and disable all edges from wFrom to wTo by
+                // iterating edges of the window pair.
+                auto it = windowPairEdges.find({wFrom, wTo});
+                if(it != windowPairEdges.end()) {
+                    for(const edge_descriptor e : it->second) {
+                        if(anchorGraph[e].useForAssembly) {
+                            disableEdge(e);
                             ++removedCount;
                         }
                     }
