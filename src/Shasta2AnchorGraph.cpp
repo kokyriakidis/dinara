@@ -593,17 +593,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             continue;
         }
 
-        // Pick the best transition: the one whose anchor pair has the
-        // highest coverage. This ensures both anchors come from the same
-        // read's transition, avoiding inconsistent anchor ordering.
+        // Pick the transition with the highest supporting span product.
         Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
         Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
-        uint64_t bestCoverage = 0;
+        uint64_t bestSpanProduct = transitions[0].supportingSpanProduct;
 
         for(const auto& t : transitions) {
-            const uint64_t cov = anchors.countCommon(t.lastAnchorInA, t.firstAnchorInB);
-            if(cov > bestCoverage) {
-                bestCoverage = cov;
+            if(t.supportingSpanProduct > bestSpanProduct) {
+                bestSpanProduct = t.supportingSpanProduct;
                 bestLastInA = t.lastAnchorInA;
                 bestFirstInB = t.firstAnchorInB;
             }
