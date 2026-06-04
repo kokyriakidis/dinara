@@ -593,25 +593,34 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             continue;
         }
 
-        // Pick the latest lastAnchorInA (highest backbone position in A),
-        // then use that transition's firstAnchorInB. This maximizes
-        // backbone retention in A while keeping the pair consistent.
-        Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
-        Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
-        uint32_t bestPosA = anchorToBackbonePos[uint64_t(bestLastInA)];
-
+        // Pick the latest lastAnchorInA (highest backbone position in A).
+        // This maximizes the number of reads in A that can reach the
+        // inter-window edge. Among transitions sharing that latest A
+        // anchor, pick the firstAnchorInB that yields the highest
+        // AnchorPair coverage.
+        uint32_t bestPosA = 0;
         for(const auto& t : transitions) {
             const uint32_t posA = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
             if(posA > bestPosA) {
                 bestPosA = posA;
-                bestLastInA = t.lastAnchorInA;
-                bestFirstInB = t.firstAnchorInB;
             }
         }
 
-        Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
-        anchorPair.assertNoNegativeOffsets(anchors);
-        if(anchorPair.size() == 0) {
+        // Collect all transitions at the best A position and pick the
+        // one whose (lastInA, firstInB) pair has the highest coverage.
+        Shasta2AnchorPair anchorPair;
+        uint64_t bestCoverage = 0;
+        for(const auto& t : transitions) {
+            if(anchorToBackbonePos[uint64_t(t.lastAnchorInA)] != bestPosA) continue;
+            Shasta2AnchorPair candidatePair(anchors, t.lastAnchorInA, t.firstAnchorInB, false);
+            candidatePair.assertNoNegativeOffsets(anchors);
+            if(candidatePair.size() > bestCoverage) {
+                bestCoverage = candidatePair.size();
+                anchorPair = std::move(candidatePair);
+            }
+        }
+
+        if(bestCoverage == 0) {
             ++interWindowZeroPairs;
             continue;
         }
