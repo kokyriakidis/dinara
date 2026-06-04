@@ -1611,7 +1611,7 @@ The benchmark runs ~36,000 independent cases across 4 datasets. Each case takes 
 
 - **Partition**: `batch_cpu` — 137 nodes, 64 CPUs / 348 GB RAM each
 - **QoS**: `3h` (max wall time 3 hours, more than enough)
-- **Concurrency**: `%500` suffix on `--array` limits to 500 simultaneous tasks (avoids scheduler overload)
+- **Concurrency**: no cap — the Slurm scheduler manages task scheduling across available nodes
 
 #### Case counts
 
@@ -1642,7 +1642,7 @@ SSH into ec-hub and create 4 scripts. All scripts share the same structure — o
 ```bash
 #!/bin/bash
 #SBATCH --job-name=v36X-ins
-#SBATCH --array=0-26100%500
+#SBATCH --array=0-26100
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
@@ -1682,25 +1682,23 @@ rm -rf "$tmpdir"
 ```
 
 **HG002 DEL** (`run_v36X_del.sh`) — same structure, change:
-- `--job-name=v36X-del`, `--array=0-10172%500`
+- `--job-name=v36X-del`, `--array=0-10172`
 - `BASE=.../full_del_eval`, case list `all_cases.txt`
 - `tmpdir=/tmp/dinara_v36X_del_${SLURM_ARRAY_TASK_ID}`
 
 **HG008-T INS** (`run_v36X_hg008t_ins.sh`) — same structure, change:
 - `--job-name=v36X-h8ins`, `--array=0-21`
 - `BASE=.../hg008t_ins_eval`, case list `ins_cases.txt`
-- No `%500` needed (only 22 cases)
 
 **HG008-T DEL** (`run_v36X_hg008t_del.sh`) — same structure, change:
 - `--job-name=v36X-h8del`, `--array=0-59`
 - `BASE=.../hg008t_del_eval`, case list `del_cases.txt`
-- No `%500` needed (only 60 cases)
 
 Key script features:
 - **Skip-if-done**: checks for `buildSvMSA completed` in existing log — safe to resubmit after partial failures
 - **`--threads 8`**: matches `--cpus-per-task=8` for intra-case parallelism
 - **`/tmp` for assemblyDirectory**: node-local disk, faster than shared filesystem. Each task gets a unique path via `$SLURM_ARRAY_TASK_ID`.
-- **`%500` concurrency cap**: prevents scheduler overload on large arrays
+- **No concurrency cap**: Slurm scheduler handles task distribution across available nodes
 
 #### Step 3: Submit all 4 jobs in parallel
 
@@ -1714,7 +1712,7 @@ ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/structural_variants && \
   sbatch hg008t_del_eval/run_v36X_hg008t_del.sh'
 ```
 
-All 4 jobs run concurrently. HG008-T jobs (22+60 cases) finish in seconds. HG002 jobs (~36K cases at 500 concurrent) finish in ~15 min.
+All 4 jobs run concurrently. HG008-T jobs (22+60 cases) finish in seconds. HG002 jobs (~36K cases) finish in ~5-15 min depending on cluster load.
 
 #### Step 4: Monitor progress
 
@@ -1840,7 +1838,7 @@ done
 |-------|-----------|-------|
 | Build + deploy | ~2 min | `make -j$(nproc)` + scp |
 | Create scripts | ~2 min | One-time per version |
-| Slurm execution | ~15 min | 500 concurrent tasks, ~0.7s/case median |
+| Slurm execution | ~5-15 min | Scheduler-managed concurrency, ~0.7s/case median |
 | VCF generation | ~5 min | Python log parsing + bcftools sort/bgzip |
 | Copy + truvari | ~5 min | 8 truvari runs, each <30s |
 | **Total** | **~30 min** | End-to-end from code change to results |
