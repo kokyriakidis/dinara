@@ -1605,88 +1605,167 @@ truvari bench \
 
 ### How to Run a Full Benchmark
 
-#### 1. Build and copy binary
+The benchmark runs ~36,000 independent cases across 4 datasets. Each case takes <1s (median ~0.7s). With 500 concurrent Slurm array tasks, the full benchmark completes in ~15 minutes wall time.
+
+#### Cluster resources
+
+- **Partition**: `batch_cpu` — 137 nodes, 64 CPUs / 348 GB RAM each
+- **QoS**: `3h` (max wall time 3 hours, more than enough)
+- **Concurrency**: `%500` suffix on `--array` limits to 500 simultaneous tasks (avoids scheduler overload)
+
+#### Case counts
+
+| Dataset | Cases | Case list file | Cases dir |
+|---------|-------|---------------|-----------|
+| HG002 INS | 26,101 | `full_ins_eval/case_list.txt` | `full_ins_eval/cases/` |
+| HG002 DEL | 10,173 | `full_del_eval/all_cases.txt` | `full_del_eval/cases/` |
+| HG008-T INS | 22 | `hg008t_ins_eval/ins_cases.txt` | `hg008t_ins_eval/cases/` |
+| HG008-T DEL | 60 | `hg008t_del_eval/del_cases.txt` | `hg008t_del_eval/cases/` |
+
+All paths relative to `/sc1/groups/sbx/workspace/kyriakik/structural_variants/`.
+
+#### Step 1: Build and deploy binary
 
 ```bash
-# Build locally
+# Build locally (in dev container)
 cd /workspaces/dinara/build_release && make -j$(nproc) -C Executable
 
-# Copy to cluster (via ec-hub jump host)
-scp build_release/Executable/dinara ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X_ins
+# Copy to cluster
+scp build_release/Executable/dinara ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X
 ```
 
-#### 2. Create Slurm array job scripts
+#### Step 2: Create Slurm array scripts on the cluster
 
-Scripts must use shared filesystem paths (not `/tmp`). Each task needs a unique `--assemblyDirectory` to avoid conflicts between concurrent jobs on the same node.
+SSH into ec-hub and create 4 scripts. All scripts share the same structure — only `BASE`, `CASE_LIST`, `JOB_NAME`, and `ARRAY_SIZE` differ.
 
+**HG002 INS** (`run_v36X_ins.sh`):
 ```bash
 #!/bin/bash
+#SBATCH --job-name=v36X-ins
+#SBATCH --array=0-26100%500
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=00:30:00
 #SBATCH --qos=3h
-#SBATCH -p batch_cpu
-#SBATCH -J v36X_ins
-#SBATCH -o /dev/null
-#SBATCH -e /dev/null
+#SBATCH --partition=batch_cpu
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 
+DINARA=/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X
 BASE=/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
-CASE_DIR=$(sed -n "${SLURM_ARRAY_TASK_ID}p" ${BASE}/ins_cases.txt)
-CASE_NAME=$(basename "$CASE_DIR")
-TMPDIR_JOB=$(mktemp -d)
-/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X_ins \
-  --command svanchors \
-  --input "${BASE}/${CASE_DIR}/reads.fa" \
-  --reference "${BASE}/${CASE_DIR}/reference.fa" \
-  --bam "${BASE}/${CASE_DIR}/region.bam" \
-  --assemblyDirectory "${TMPDIR_JOB}/run" \
-  --Kmers.k 10 --Kmers.minimizerW 6 \
-  > "${BASE}/results_v36X/${CASE_NAME}.log" 2>&1
-rm -rf "${TMPDIR_JOB}"
+RESULTS=$BASE/results_v36X
+
+mkdir -p $RESULTS
+name=$(sed -n "$(($SLURM_ARRAY_TASK_ID + 1))p" "$BASE/case_list.txt")
+[ -z "$name" ] && exit 0
+
+OUT="$RESULTS/${name}.log"
+[ -f "$OUT" ] && [ -s "$OUT" ] && grep -q "buildSvMSA completed" "$OUT" 2>/dev/null && exit 0
+
+casedir="$BASE/cases/$name"
+[ ! -f "$casedir/reads.fa" ] || [ ! -f "$casedir/reference.fa" ] || [ ! -f "$casedir/region.bam" ] && exit 1
+
+tmpdir=/tmp/dinara_v36X_${SLURM_ARRAY_TASK_ID}
+rm -rf "$tmpdir"
+
+"$DINARA" --command svanchors \
+    --reference "$casedir/reference.fa" \
+    --input "$casedir/reads.fa" \
+    --bam "$casedir/region.bam" \
+    --assemblyDirectory "$tmpdir" \
+    --Reads.minReadLength 50 --Kmers.k 10 --Kmers.minimizerW 6 \
+    --threads 8 \
+    > "$OUT" 2>&1 || true
+
+rm -rf "$tmpdir"
 ```
 
-Key flags:
-- `--command svanchors` — SV calling mode (not the default assembly mode)
-- `--bam region.bam` — provides CIGAR, depth, and SA-tag evidence (without this, most detection sources are missing)
-- `--Kmers.k 10 --Kmers.minimizerW 6` — marker parameters matching V36s baseline
-- `--assemblyDirectory` — unique temp dir per job to avoid `DinaraRun` conflicts
+**HG002 DEL** (`run_v36X_del.sh`) — same structure, change:
+- `--job-name=v36X-del`, `--array=0-10172%500`
+- `BASE=.../full_del_eval`, case list `all_cases.txt`
+- `tmpdir=/tmp/dinara_v36X_del_${SLURM_ARRAY_TASK_ID}`
 
-#### 3. Submit array jobs
+**HG008-T INS** (`run_v36X_hg008t_ins.sh`) — same structure, change:
+- `--job-name=v36X-h8ins`, `--array=0-21`
+- `BASE=.../hg008t_ins_eval`, case list `ins_cases.txt`
+- No `%500` needed (only 22 cases)
+
+**HG008-T DEL** (`run_v36X_hg008t_del.sh`) — same structure, change:
+- `--job-name=v36X-h8del`, `--array=0-59`
+- `BASE=.../hg008t_del_eval`, case list `del_cases.txt`
+- No `%500` needed (only 60 cases)
+
+Key script features:
+- **Skip-if-done**: checks for `buildSvMSA completed` in existing log — safe to resubmit after partial failures
+- **`--threads 8`**: matches `--cpus-per-task=8` for intra-case parallelism
+- **`/tmp` for assemblyDirectory**: node-local disk, faster than shared filesystem. Each task gets a unique path via `$SLURM_ARRAY_TASK_ID`.
+- **`%500` concurrency cap**: prevents scheduler overload on large arrays
+
+#### Step 3: Submit all 4 jobs in parallel
 
 ```bash
-mkdir -p ${BASE}/results_v36X
-sbatch --array=1-26101 /path/to/v36X_ins_array.sh   # INS
-sbatch --array=1-15472 /path/to/v36X_del_array.sh   # DEL
+ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/structural_variants && \
+  mkdir -p full_ins_eval/results_v36X full_del_eval/results_v36X \
+           hg008t_ins_eval/results_v36X hg008t_del_eval/results_v36X && \
+  sbatch full_ins_eval/run_v36X_ins.sh && \
+  sbatch full_del_eval/run_v36X_del.sh && \
+  sbatch hg008t_ins_eval/run_v36X_hg008t_ins.sh && \
+  sbatch hg008t_del_eval/run_v36X_hg008t_del.sh'
 ```
 
-Array scripts and case list files must be on the shared filesystem (`/sc1/...`), not `/tmp` (compute nodes have separate `/tmp`).
+All 4 jobs run concurrently. HG008-T jobs (22+60 cases) finish in seconds. HG002 jobs (~36K cases at 500 concurrent) finish in ~15 min.
 
-#### 4. Generate VCFs (submit as Slurm job — slow on login node)
+#### Step 4: Monitor progress
 
 ```bash
-# INS
-cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
-python3 ins_logs_to_vcf.py all_ins_positions.tsv results_v36X dinara_v36X_ins.vcf
+# Job status
+ssh ec-hub 'squeue -u kyriakik -o "%.10i %.12j %.8T %.10M %.4C %R" | head -20'
 
-# DEL
-cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval
-python3 logs_to_vcf.py cases results_v36X dinara_v36X_dels.vcf
+# Count completed cases
+ssh ec-hub 'echo "INS: $(grep -rl "buildSvMSA completed" /sc1/.../full_ins_eval/results_v36X/ 2>/dev/null | wc -l) / 26101"'
+ssh ec-hub 'echo "DEL: $(grep -rl "buildSvMSA completed" /sc1/.../full_del_eval/results_v36X/ 2>/dev/null | wc -l) / 10173"'
+
+# Find failed cases (no "buildSvMSA completed" marker)
+ssh ec-hub 'for f in /sc1/.../full_ins_eval/results_v36X/*.log; do grep -q "buildSvMSA completed" "$f" || echo "FAILED: $f"; done | head -10'
+
+# Resubmit (safe — skip-if-done logic prevents re-running completed cases)
+ssh ec-hub 'sbatch /sc1/.../full_ins_eval/run_v36X_ins.sh'
 ```
 
-#### 5. Sort, compress, index (needs BCFtools + HTSlib modules)
+#### Step 5: Generate VCFs, sort, compress, index
+
+Run on ec-hub (or submit as a Slurm job for large datasets):
 
 ```bash
-module load BCFtools/1.21-GCC-13.3.0
-module load HTSlib/1.21-GCC-13.3.0
-
-bcftools sort dinara_v36X_ins.vcf -o dinara_v36X_ins_sorted.vcf
-bgzip -c dinara_v36X_ins_sorted.vcf > dinara_v36X_ins_sorted.vcf.gz
-tabix -p vcf dinara_v36X_ins_sorted.vcf.gz
+ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/structural_variants && \
+  module load BCFtools/1.21-GCC-13.3.0 && \
+  module load HTSlib/1.21-GCC-13.3.0 && \
+  cd full_ins_eval && \
+  python3 ins_logs_to_vcf.py all_ins_positions.tsv results_v36X dinara_v36X_ins.vcf && \
+  bcftools sort dinara_v36X_ins.vcf -o dinara_v36X_ins_sorted.vcf && \
+  bgzip -c dinara_v36X_ins_sorted.vcf > dinara_v36X_ins_sorted.vcf.gz && \
+  tabix -p vcf dinara_v36X_ins_sorted.vcf.gz && \
+  cd ../full_del_eval && \
+  python3 logs_to_vcf.py cases results_v36X dinara_v36X_dels.vcf && \
+  bcftools sort dinara_v36X_dels.vcf -o dinara_v36X_dels_sorted.vcf && \
+  bgzip -c dinara_v36X_dels_sorted.vcf > dinara_v36X_dels_sorted.vcf.gz && \
+  tabix -p vcf dinara_v36X_dels_sorted.vcf.gz'
 ```
 
-#### 6. Run truvari (locally — truvari is at `/home/vscode/.local/bin/truvari`)
+#### Step 6: Copy VCFs locally and run truvari
+
+Truvari runs locally in the dev container (`/home/vscode/.local/bin/truvari`).
 
 ```bash
-# Copy VCFs and benchmark files locally
-scp ec-hub:/sc1/.../dinara_v36X_ins_sorted.vcf.gz /tmp/
-scp ec-hub:/sc1/.../data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed /tmp/
+# Copy result VCFs from cluster
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/dinara_v36X_ins_sorted.vcf.gz /tmp/
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/dinara_v36X_ins_sorted.vcf.gz.tbi /tmp/
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/dinara_v36X_dels_sorted.vcf.gz /tmp/
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/dinara_v36X_dels_sorted.vcf.gz.tbi /tmp/
+
+# Copy truth/benchmark files (if not already local)
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed /tmp/
 
 # HG002 germline INS benchmark (see Standardized Truvari Parameters for rationale)
 truvari bench -b /tmp/stvar_INS50.vcf.gz -c /tmp/dinara_v36X_ins_sorted.vcf.gz \
@@ -1748,9 +1827,23 @@ truvari bench -b /tmp/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.
   --sizemax -1 --passonly --pick multi --typeignore \
   -o /tmp/truvari_v36X/hg008t_del_ps07
 
-# Read results
-python3 -c "import json; d=json.load(open('/tmp/truvari_v36X/ins_ps0/summary.json')); print(f'TP={d[\"TP-comp\"]}, FN={d[\"FN\"]}, recall={d[\"recall\"]:.4f}')"
+# Read all results
+for d in ins_ps0 ins_ps07 del_ps0 del_ps07 hg008t_ins_ps0 hg008t_ins_ps07 hg008t_del_ps0 hg008t_del_ps07; do
+  [ -f "/tmp/truvari_v36X/$d/summary.json" ] && \
+  python3 -c "import json; d=json.load(open('/tmp/truvari_v36X/$d/summary.json')); print(f'$d: TP={d[\"TP-base\"]}, FN={d[\"FN\"]}, recall={d[\"recall\"]:.4f}')"
+done
 ```
+
+#### Timeline summary
+
+| Phase | Wall time | Notes |
+|-------|-----------|-------|
+| Build + deploy | ~2 min | `make -j$(nproc)` + scp |
+| Create scripts | ~2 min | One-time per version |
+| Slurm execution | ~15 min | 500 concurrent tasks, ~0.7s/case median |
+| VCF generation | ~5 min | Python log parsing + bcftools sort/bgzip |
+| Copy + truvari | ~5 min | 8 truvari runs, each <30s |
+| **Total** | **~30 min** | End-to-end from code change to results |
 
 ### Connecting to the Cluster
 
