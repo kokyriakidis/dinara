@@ -1058,7 +1058,7 @@ void dinara::main::assemble(
     // // are not dovetail overlaps but interior matches, typically from
     // // shared repeat elements. Also removes overlaps shorter than
     // // minOverlapLength. Uses the extended qs/qe/ts/te coordinates.
-    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
