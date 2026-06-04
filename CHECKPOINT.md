@@ -1437,16 +1437,84 @@ Improving size accuracy would require assembled contigs spanning the insertion, 
 - Truvari in-scope (after sizemax=50000 and pick=single dedup): 21,080 INS, 11,938 DEL
 - Duplicate case names (same chrom+pos+size, different het alleles): 1,400 INS, 2,090 DEL — these share the same extracted case directory since both alleles are at the same position.
 
-**V36u results** (default truvari: refdist=500, pctseq=0):
+**V36u results** (old truvari params: refdist=500, pctseq=0, no includebed):
 
 | Metric | pctsize=0 | pctsize=0.7 |
 |---|---|---|
 | **INS recall** | **88.29%** (TP=18,611, FN=2,469, total=21,080) | 40.63% (TP=8,564, FN=12,516) |
 | **DEL recall** | **99.97%** (TP=11,934, FN=4, total=11,938) | 97.94% (TP=11,692, FN=246) |
 
+## Dinara V36v — INS Size Estimation Fixes (June 2026)
+
+### Changes
+
+Three fixes to INS size estimation in `src/AssemblerSvAnchors.cpp`:
+
+1. **early-CIGAR: max instead of mean** — INS CIGAR clusters now report the maximum observation size instead of the mean. Partial alignments under-report insertion size; the largest CIGAR observation is closest to truth. DEL clusters still use the mean (deletions are consistently sized across reads).
+
+2. **indirect-covdrop: bounded by CIGAR/soft-clip evidence** — When CIGAR or soft-clip calls exist nearby, the `indirectBases/coverage` estimate is floored at the max observed size and capped at 3× to prevent gross over-estimation for small INS.
+
+3. **soft-clip: actual sequence overlap** — Replaced the hardcoded `k-1=20` overlap subtraction with actual suffix-prefix sequence overlap detection between right-clip and left-clip contigs. Added `assembleClipContig()` (returns the contig sequence) and `suffixPrefixOverlap()`. Applied to all 3 soft-clip sizing paths (main, zero-anchor, bad-segment).
+
+### V36v vs V36u vs sbx-assemble — HG002 Q100 v5.0q
+
+Truvari params: `refdist=2000, chunksize=5000, pctseq=0, pick=multi, passonly, includebed`.
+
+**pctsize=0 (position-only — "did we find it?"):**
+
+| Metric | V36v | V36u | sbx-assemble |
+|---|---|---|---|
+| **ALL recall** | **99.66%** | 99.60% | 94.94% |
+| INS recall | 99.47% | 99.37% | 94.45% |
+| DEL recall | **100.00%** | 100.00% | 95.82% |
+| ALL FN | 96 | 114 | 1,425 |
+
+**pctsize=0.7 (size-aware — "did we get the right size?"):**
+
+| Metric | V36v | V36u | Δ (v→u) | sbx-assemble |
+|---|---|---|---|---|
+| **ALL recall** | **70.68%** | 69.13% | **+1.6pp** | 86.88% |
+| **INS recall** | **54.41%** | 51.98% | **+2.4pp** | 85.09% |
+| DEL recall | 99.49% | 99.49% | 0 | 90.05% |
+| ALL FN | 8,268 | 8,706 | −438 | 3,698 |
+| INS FN | 8,208 | 8,650 | −442 | 2,688 |
+
+### Analysis of remaining INS sizing gap
+
+8,208 INS cases where V36v finds the right position but wrong size (ratio < 0.7). The gap to sbx-assemble (−30.7pp) is fundamental: 250bp reads can't span insertions >500bp, while assembly-based approaches produce full-length contigs.
+
+**Breakdown by best-matching source:**
+
+| Source | FN cases | Pattern |
+|---|---|---|
+| indirect-covdrop | ~47% | Small: over-estimates. Large: under-estimates |
+| read-graph | ~18% | BFS paths can't span large insertions |
+| soft-clip | ~14% | Max contig ~1kb (read length ceiling) |
+| early-CIGAR | ~11% | Partial alignments, improved by max fix |
+| large-ins-* | ~7% | Het calls under-estimate |
+
+**By truth size:**
+
+| Size range | FN cases | Issue |
+|---|---|---|
+| 50-99bp | ~25% | Over-estimation by indirect-covdrop |
+| 100-199bp | ~21% | Mixed over/under |
+| 200-499bp | ~18% | Transition zone |
+| 500-999bp | ~13% | Under-estimation begins |
+| 1000-4999bp | ~20% | All sources under-estimate |
+| 5000+bp | ~4% | Unfixable with short reads |
+
+### Cluster execution improvements
+
+- **Shuffled case lists** prevent slow cases (150s each in complex repeat regions) from clustering in one chunk
+- **Separate INS/DEL jobs** run fully in parallel instead of sequentially
+- **20 INS + 10 DEL jobs** (16 CPUs, 14 parallel each) complete the full 36K-case benchmark in ~5 minutes
+- Shuffled lists: `case_list_shuffled.txt`, `all_cases_shuffled.txt`
+- Use `mktemp -u` for `--assemblyDirectory` (generates unique name without creating the directory — dinara creates it internally)
+
 ### Cluster Paths and Binaries
 
-- **Binaries**: `dinara_v36{o,p,q,r,s,t,u}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
+- **Binaries**: `dinara_v36{o,p,q,r,s,t,u,v}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
 - **samtools**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/samtools` (v1.21, compiled from source)
 
 #### HG002 Case Extraction
@@ -1500,6 +1568,7 @@ Results are per-version log files in `results_v36{version}/` under each eval dir
 | V36s | `.../full_ins_eval/results_v36s/` | `.../full_del_eval/results_v36s/` |
 | V36t | `.../full_ins_eval/results_v36t/` | `.../full_del_eval/results_v36t/` |
 | V36u | `.../full_ins_eval/results_v36u/` | `.../full_del_eval/results_v36u/` |
+| V36v | `.../full_ins_eval/results_v36v/` | `.../full_del_eval/results_v36v/` |
 
 #### Supporting Files
 
@@ -1634,101 +1703,98 @@ cd /workspaces/dinara/build_release && make -j$(nproc) -C Executable
 scp build_release/Executable/dinara ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X
 ```
 
-#### Step 2: Create Slurm array scripts on the cluster
+#### Step 2: Create parallel Slurm scripts
 
-SSH into ec-hub and create 4 scripts. All scripts share the same structure — only `BASE`, `CASE_LIST`, `JOB_NAME`, and `ARRAY_SIZE` differ.
+Each script processes a chunk of the shuffled case list using `bash` background jobs (14 parallel per 16-CPU node). Use **shuffled** case lists to distribute slow cases (complex repeat regions, ~150s each) evenly across chunks. Submit INS and DEL as **separate** jobs so they run on different nodes in parallel.
 
-**HG002 INS** (`run_v36X_ins.sh`):
 ```bash
 #!/bin/bash
 #SBATCH --job-name=v36X-ins
-#SBATCH --array=0-26100
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
 #SBATCH --qos=3h
 #SBATCH --partition=batch_cpu
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
 
+set -uo pipefail
 DINARA=/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X
 BASE=/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
 RESULTS=$BASE/results_v36X
+CASE_LIST=$BASE/case_list_shuffled.txt
+NCHUNKS=20
+NCPU=14
+CHUNK=$SLURM_ARRAY_TASK_ID
 
-mkdir -p $RESULTS
-name=$(sed -n "$(($SLURM_ARRAY_TASK_ID + 1))p" "$BASE/case_list.txt")
-[ -z "$name" ] && exit 0
+total=$(wc -l < "$CASE_LIST")
+per_chunk=$(( (total + NCHUNKS - 1) / NCHUNKS ))
+start=$(( CHUNK * per_chunk + 1 ))
+end=$(( start + per_chunk - 1 ))
+[ $end -gt $total ] && end=$total
+[ $start -gt $total ] && exit 0
 
-OUT="$RESULTS/${name}.log"
-[ -f "$OUT" ] && [ -s "$OUT" ] && grep -q "buildSvMSA completed" "$OUT" 2>/dev/null && exit 0
-
-casedir="$BASE/cases/$name"
-[ ! -f "$casedir/reads.fa" ] || [ ! -f "$casedir/reference.fa" ] || [ ! -f "$casedir/region.bam" ] && exit 1
-
-tmpdir=/tmp/dinara_v36X_${SLURM_ARRAY_TASK_ID}
-rm -rf "$tmpdir"
-
-"$DINARA" --command svanchors \
-    --reference "$casedir/reference.fa" \
-    --input "$casedir/reads.fa" \
-    --bam "$casedir/region.bam" \
-    --assemblyDirectory "$tmpdir" \
-    --Reads.minReadLength 50 --Kmers.k 10 --Kmers.minimizerW 6 \
-    --threads 8 \
-    > "$OUT" 2>&1 || true
-
-rm -rf "$tmpdir"
+mkdir -p "$RESULTS"
+running=0
+while IFS= read -r name; do
+    outfile="$RESULTS/${name}.log"
+    casedir="$BASE/cases/$name"
+    [ -f "$outfile" ] && [ -s "$outfile" ] && grep -q "buildSvMSA completed" "$outfile" 2>/dev/null && continue
+    [ ! -f "$casedir/reads.fa" ] && continue
+    (
+        tmpdir=$(mktemp -u /tmp/dinara_v36X_XXXXXX)
+        "$DINARA" --command svanchors \
+            --reference "$casedir/reference.fa" \
+            --input "$casedir/reads.fa" \
+            --bam "$casedir/region.bam" \
+            --assemblyDirectory "$tmpdir" \
+            --Kmers.k 10 --Kmers.minimizerW 6 \
+            > "$outfile" 2>&1 || true
+        rm -rf "$tmpdir"
+    ) &
+    running=$((running + 1))
+    if [ $running -ge $NCPU ]; then
+        wait -n 2>/dev/null || true
+        running=$((running - 1))
+    fi
+done < <(sed -n "${start},${end}p" "$CASE_LIST")
+wait
 ```
 
-**HG002 DEL** (`run_v36X_del.sh`) — same structure, change:
-- `--job-name=v36X-del`, `--array=0-10172`
-- `BASE=.../full_del_eval`, case list `all_cases.txt`
-- `tmpdir=/tmp/dinara_v36X_del_${SLURM_ARRAY_TASK_ID}`
+Create variants for each dataset:
+- **HG002 INS**: `NCHUNKS=20`, `CASE_LIST=case_list_shuffled.txt`, `--array=0-19`
+- **HG002 DEL**: `NCHUNKS=10`, `CASE_LIST=all_cases_shuffled.txt`, `--array=0-9`
+- **HG008-T INS/DEL**: single job each (22/60 cases, no chunking needed)
 
-**HG008-T INS** (`run_v36X_hg008t_ins.sh`) — same structure, change:
-- `--job-name=v36X-h8ins`, `--array=0-21`
-- `BASE=.../hg008t_ins_eval`, case list `ins_cases.txt`
+Key design choices:
+- **`mktemp -u`** for `--assemblyDirectory`: generates a unique name **without** creating the directory. Dinara creates it internally and fails if it already exists.
+- **Shuffled case lists**: prevents slow cases from clustering in one chunk. Create with `shuf case_list.txt > case_list_shuffled.txt`.
+- **Skip-if-done**: checks for `buildSvMSA completed` in existing log — safe to resubmit after partial failures.
+- **Separate INS/DEL jobs**: run on different nodes in parallel instead of sequentially.
 
-**HG008-T DEL** (`run_v36X_hg008t_del.sh`) — same structure, change:
-- `--job-name=v36X-h8del`, `--array=0-59`
-- `BASE=.../hg008t_del_eval`, case list `del_cases.txt`
-
-Key script features:
-- **Skip-if-done**: checks for `buildSvMSA completed` in existing log — safe to resubmit after partial failures
-- **`--threads 8`**: matches `--cpus-per-task=8` for intra-case parallelism
-- **`/tmp` for assemblyDirectory**: node-local disk, faster than shared filesystem. Each task gets a unique path via `$SLURM_ARRAY_TASK_ID`.
-- **No concurrency cap**: Slurm scheduler handles task distribution across available nodes
-
-#### Step 3: Submit all 4 jobs in parallel
+#### Step 3: Submit all jobs
 
 ```bash
 ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/structural_variants && \
   mkdir -p full_ins_eval/results_v36X full_del_eval/results_v36X \
            hg008t_ins_eval/results_v36X hg008t_del_eval/results_v36X && \
-  sbatch full_ins_eval/run_v36X_ins.sh && \
-  sbatch full_del_eval/run_v36X_del.sh && \
-  sbatch hg008t_ins_eval/run_v36X_hg008t_ins.sh && \
-  sbatch hg008t_del_eval/run_v36X_hg008t_del.sh'
+  sbatch --array=0-19 full_ins_eval/run_v36X_ins.sh && \
+  sbatch --array=0-9  full_del_eval/run_v36X_del.sh'
 ```
 
-All 4 jobs run concurrently. HG008-T jobs (22+60 cases) finish in seconds. HG002 jobs (~36K cases) finish in ~5-15 min depending on cluster load.
+20 INS + 10 DEL jobs × 14 parallel cases each = ~420 concurrent cases. Full 36K-case benchmark completes in ~5 minutes.
 
 #### Step 4: Monitor progress
 
 ```bash
 # Job status
-ssh ec-hub 'squeue -u kyriakik -o "%.10i %.12j %.8T %.10M %.4C %R" | head -20'
+ssh ec-hub 'squeue -u kyriakik -o "%.10i %.12j %.8T %.10M %.4C" | head -20'
 
-# Count completed cases
-ssh ec-hub 'echo "INS: $(grep -rl "buildSvMSA completed" /sc1/.../full_ins_eval/results_v36X/ 2>/dev/null | wc -l) / 26101"'
-ssh ec-hub 'echo "DEL: $(grep -rl "buildSvMSA completed" /sc1/.../full_del_eval/results_v36X/ 2>/dev/null | wc -l) / 10173"'
+# Count completed files
+ssh ec-hub 'echo "INS: $(ls .../full_ins_eval/results_v36X/ | wc -l) / 26101"'
+ssh ec-hub 'echo "DEL: $(ls .../full_del_eval/results_v36X/ | wc -l) / 10173"'
 
-# Find failed cases (no "buildSvMSA completed" marker)
-ssh ec-hub 'for f in /sc1/.../full_ins_eval/results_v36X/*.log; do grep -q "buildSvMSA completed" "$f" || echo "FAILED: $f"; done | head -10'
-
-# Resubmit (safe — skip-if-done logic prevents re-running completed cases)
-ssh ec-hub 'sbatch /sc1/.../full_ins_eval/run_v36X_ins.sh'
+# Resubmit (safe — skip-if-done logic)
+ssh ec-hub 'sbatch --array=0-19 .../full_ins_eval/run_v36X_ins.sh'
 ```
 
 #### Step 5: Generate VCFs, sort, compress, index
@@ -1838,10 +1904,10 @@ done
 |-------|-----------|-------|
 | Build + deploy | ~2 min | `make -j$(nproc)` + scp |
 | Create scripts | ~2 min | One-time per version |
-| Slurm execution | ~5-15 min | Scheduler-managed concurrency, ~0.7s/case median |
+| Slurm execution | ~5 min | 30 jobs × 14 parallel, shuffled case lists |
 | VCF generation | ~5 min | Python log parsing + bcftools sort/bgzip |
 | Copy + truvari | ~5 min | 8 truvari runs, each <30s |
-| **Total** | **~30 min** | End-to-end from code change to results |
+| **Total** | **~20 min** | End-to-end from code change to results |
 
 ### Running sbx-assemble (Competitor Baseline)
 
