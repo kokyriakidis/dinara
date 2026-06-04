@@ -1324,20 +1324,23 @@ truvari bench -b truth_ins.vcf.gz -c calls.vcf.gz \
 
 ### Current State (V36s)
 
-**Truvari results (stvar v5.0q truth, 28,942 INS / 17,562 DEL ≥50bp):**
+**Truvari results (stvar v5.0q truth, all cases extracted):**
 
-| | pctsize=0 |
-|---|---|
-| INS TP-base | 20,793 |
-| INS FN | 287 |
-| INS recall | **98.64%** |
-| DEL TP-base | 10,198 |
-| DEL FN | 1,740 |
-| DEL recall | 85.42% |
+Truth set: HG002 Q100 v5.0q stvar — 28,942 INS ≥50bp (26,101 unique positions), 17,562 DEL ≥50bp (15,472 unique positions).
+Truvari params: `refdist=2000, chunksize=5000, sizemax=50000, passonly, pick=multi, pctseq=0`.
 
-Note: DEL recall is 85.42% because only 10,173 of 17,562 truth DELs have extracted cases. All extracted cases are detected (100% within-case recall). The 1,740 FN are truth entries without corresponding case extractions.
+| | pctsize=0 | pctsize=0.7 |
+|---|---|---|
+| INS TP-base | 20,793 | 10,668 |
+| INS FN | 287 | 10,412 |
+| INS recall | **98.64%** | 50.61% |
+| INS precision | 54.54% | 16.34% |
+| DEL TP-base | 11,936 | 11,811 |
+| DEL FN | 2 | 127 |
+| DEL recall | **99.98%** | **98.94%** |
+| DEL precision | 79.77% | 21.89% |
 
-Note: V36r recall was previously reported as 98.98% using a filtered truth subset (18,013 entries). With the full stvar truth (28,942 entries), V36r recall is 98.33% (353 FN). V36s improves to 98.64% (287 FN) — 66 fewer FN.
+Note: INS truth has 21,080 entries within truvari's matching scope at pctsize=0 (the rest are outside sizemax or unmatched). DEL truth has 11,938 entries in scope.
 
 ### Active INS Sources (in order of call volume)
 
