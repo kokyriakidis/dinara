@@ -1394,16 +1394,168 @@ Recall drops from 99.0% → 52.0% when requiring size match within 30% (pctsize=
 
 Improving size accuracy would require assembled contigs spanning the insertion, which is fundamentally limited by 2×250bp read lengths for large insertions.
 
+### Benchmark Results (V36u, default truvari: refdist=500, pctseq=0)
+
+| Metric | pctsize=0 | pctsize=0.7 |
+|---|---|---|
+| **INS recall** | **88.29%** (TP=18,611, FN=2,469, total=21,080) | 40.63% (TP=8,564, FN=12,516) |
+| **DEL recall** | **99.97%** (TP=11,934, FN=4, total=11,938) | 97.94% (TP=11,692, FN=246) |
+
+Truth set: HG002 Q100 v5.0q stvar, GRCh38. INS ≥50bp: 28,942 entries (23,086 unique positions). DEL ≥50bp: 17,562 entries (15,319 unique positions). Truvari in-scope (after sizemax=50000 and dedup): 21,080 INS, 11,938 DEL.
+
 ### Cluster Paths and Binaries
 
-- **Binaries**: `dinara_v36{o,p,q,r}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
-- **INS pilot cases** (100): `/sc1/groups/sbx/workspace/kyriakik/structural_variants/ins_pilot/cases/`
-- **INS pilot results**: `results_v36{o,p,q}/` in `.../ins_pilot/`
-- **Full INS cases** (26,101): `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/cases/`
-- **Full INS results**: `results_v36{q,r}/` in `.../full_ins_eval/`
-- **Full DEL results (regression)**: `results_v36{q,r}/` in `.../full_del_eval/`
-- **Analysis scripts**: `analyze_fast.py`, `ins_logs_to_vcf.py`, `analyze_fn.py`, `analyze_fn_deep.py` in `.../full_ins_eval/`
-- **Truth positions**: `all_ins_positions.tsv`, `case_list.txt` in `.../full_ins_eval/`
-- **Truvari run locally**: `/tmp/truvari_ins/` (truth_ins.vcf.gz, calls_v36r.vcf.gz, bench_v36r_p0/)
+- **Binaries**: `dinara_v36{o,p,q,r,s,t,u}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
 - **samtools**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/samtools` (v1.21, compiled from source)
+
+#### Case Extraction
+
+Each case is a ±2000bp region around a truth position, containing:
+- `reads.fa` — consensus reads overlapping the region
+- `reference.fa` — reference sequence for the region
+- `region.bam` + `region.bam.bai` — original BAM alignments for the region
+
+| Dataset | Cases | Path |
+|---|---|---|
+| **Full INS** | 26,101 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/cases/` |
+| **Full DEL** | 15,472 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/cases/` |
+| **INS pilot** | 100 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/ins_pilot/cases/` |
+
+Case naming: `{chrom}_{pos}_{type}{size}` (e.g., `chr1_100025966_INS51`, `chr10_100092115_DEL68`).
+
+#### Results
+
+Results are per-version log files in `results_v36{version}/` under each eval directory.
+
+| Version | INS results | DEL results |
+|---|---|---|
+| V36s | `.../full_ins_eval/results_v36s/` | `.../full_del_eval/results_v36s/` |
+| V36t | `.../full_ins_eval/results_v36t/` | `.../full_del_eval/results_v36t/` |
+| V36u | `.../full_ins_eval/results_v36u/` | `.../full_del_eval/results_v36u/` |
+
+#### Supporting Files
+
+- **Case lists** (for Slurm array jobs): `ins_cases.txt` in `.../full_ins_eval/`, `del_cases.txt` in `.../full_del_eval/`
+- **Truth positions**: `all_ins_positions.tsv` (28,942 entries) in `.../full_ins_eval/`
+- **VCF generation scripts**: `ins_logs_to_vcf.py` in `.../full_ins_eval/`, `logs_to_vcf.py` in `.../full_del_eval/`
+- **Analysis scripts**: `analyze_fast.py`, `analyze_fn.py`, `analyze_fn_deep.py` in `.../full_ins_eval/`
+- **Truth VCFs**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz`
+- **Filtered truth**: `stvar_INS50.vcf.gz`, `stvar_DEL50.vcf.gz` in `.../structural_variants/`
+
+### How to Run a Full Benchmark
+
+#### 1. Build and copy binary
+
+```bash
+# Build locally
+cd /workspaces/dinara/build_release && make -j$(nproc) -C Executable
+
+# Copy to cluster (via ec-hub jump host)
+scp build_release/Executable/dinara ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X_ins
+```
+
+#### 2. Create Slurm array job scripts
+
+Scripts must use shared filesystem paths (not `/tmp`). Each task needs a unique `--assemblyDirectory` to avoid conflicts between concurrent jobs on the same node.
+
+```bash
+#!/bin/bash
+#SBATCH --qos=3h
+#SBATCH -p batch_cpu
+#SBATCH -J v36X_ins
+#SBATCH -o /dev/null
+#SBATCH -e /dev/null
+
+BASE=/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
+CASE_DIR=$(sed -n "${SLURM_ARRAY_TASK_ID}p" ${BASE}/ins_cases.txt)
+CASE_NAME=$(basename "$CASE_DIR")
+TMPDIR_JOB=$(mktemp -d)
+/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X_ins \
+  --command svanchors \
+  --input "${BASE}/${CASE_DIR}/reads.fa" \
+  --reference "${BASE}/${CASE_DIR}/reference.fa" \
+  --bam "${BASE}/${CASE_DIR}/region.bam" \
+  --assemblyDirectory "${TMPDIR_JOB}/run" \
+  --Kmers.k 10 --Kmers.minimizerW 6 \
+  > "${BASE}/results_v36X/${CASE_NAME}.log" 2>&1
+rm -rf "${TMPDIR_JOB}"
+```
+
+Key flags:
+- `--command svanchors` — SV calling mode (not the default assembly mode)
+- `--bam region.bam` — provides CIGAR, depth, and SA-tag evidence (without this, most detection sources are missing)
+- `--Kmers.k 10 --Kmers.minimizerW 6` — marker parameters matching V36s baseline
+- `--assemblyDirectory` — unique temp dir per job to avoid `DinaraRun` conflicts
+
+#### 3. Submit array jobs
+
+```bash
+mkdir -p ${BASE}/results_v36X
+sbatch --array=1-26101 /path/to/v36X_ins_array.sh   # INS
+sbatch --array=1-15472 /path/to/v36X_del_array.sh   # DEL
+```
+
+Array scripts and case list files must be on the shared filesystem (`/sc1/...`), not `/tmp` (compute nodes have separate `/tmp`).
+
+#### 4. Generate VCFs (submit as Slurm job — slow on login node)
+
+```bash
+# INS
+cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
+python3 ins_logs_to_vcf.py all_ins_positions.tsv results_v36X dinara_v36X_ins.vcf
+
+# DEL
+cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval
+python3 logs_to_vcf.py cases results_v36X dinara_v36X_dels.vcf
+```
+
+#### 5. Sort, compress, index (needs BCFtools + HTSlib modules)
+
+```bash
+module load BCFtools/1.21-GCC-13.3.0
+module load HTSlib/1.21-GCC-13.3.0
+
+bcftools sort dinara_v36X_ins.vcf -o dinara_v36X_ins_sorted.vcf
+bgzip -c dinara_v36X_ins_sorted.vcf > dinara_v36X_ins_sorted.vcf.gz
+tabix -p vcf dinara_v36X_ins_sorted.vcf.gz
+```
+
+#### 6. Run truvari (locally — truvari is at `/home/vscode/.local/bin/truvari`)
+
+```bash
+# Copy VCFs locally
+scp ec-hub:/sc1/.../dinara_v36X_ins_sorted.vcf.gz /tmp/
+
+# INS benchmark
+truvari bench -b /tmp/stvar_INS50.vcf.gz -c /tmp/dinara_v36X_ins_sorted.vcf.gz \
+  -o /tmp/truvari_v36X/ins_ps0 --passonly --pctsize 0 --pctseq 0
+
+truvari bench -b /tmp/stvar_INS50.vcf.gz -c /tmp/dinara_v36X_ins_sorted.vcf.gz \
+  -o /tmp/truvari_v36X/ins_ps07 --passonly --pctsize 0.7 --pctseq 0
+
+# DEL benchmark
+truvari bench -b /tmp/stvar_DEL50.vcf.gz -c /tmp/dinara_v36X_dels_sorted.vcf.gz \
+  -o /tmp/truvari_v36X/del_ps0 --passonly --pctsize 0 --pctseq 0
+
+truvari bench -b /tmp/stvar_DEL50.vcf.gz -c /tmp/dinara_v36X_dels_sorted.vcf.gz \
+  -o /tmp/truvari_v36X/del_ps07 --passonly --pctsize 0.7 --pctseq 0
+
+# Read results
+python3 -c "import json; d=json.load(open('/tmp/truvari_v36X/ins_ps0/summary.json')); print(f'TP={d[\"TP-comp\"]}, FN={d[\"FN\"]}, recall={d[\"recall\"]:.4f}')"
+```
+
+### SSH Access to Cluster
+
+```
+Host ec-hub
+  Hostname ec-hub.sc1.science.roche.com
+  User kyriakik
+
+Host sc1
+  Hostname lb022dev.eth.rsshpc1.sc1.science.roche.com
+  ProxyJump ec-hub
+  User kyriakik
+```
+
+ec-hub has access to the shared filesystem (`/sc1/...`) and Slurm (`sbatch`). Direct SSH to sc1 (lb022dev) may fail — use ec-hub for all operations.
 
