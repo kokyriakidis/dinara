@@ -1419,6 +1419,115 @@ void Assembler::buildSvMSA(
 
         if(badSegment || segmentStrings.empty()) {
             detectSplitReadDels();
+
+            // Soft-clip INS detection for bad-segment cases.
+            // Same logic as the zero-anchor early-exit path:
+            // the MSA cannot be built, but soft-clip evidence
+            // may still indicate an insertion.
+            if(!softClipBPs.empty()) {
+                // Try paired first.
+                for(const auto& rClip : softClipBPs) {
+                    if(rClip.isLeftClip) continue;
+                    if(rClip.readCount < 3) continue;
+                    for(const auto& lClip : softClipBPs) {
+                        if(!lClip.isLeftClip) continue;
+                        if(lClip.readCount < 3) continue;
+                        const int64_t gap =
+                            int64_t(lClip.refPos)
+                            - int64_t(rClip.refPos);
+                        if(gap < -200 || gap > 200) continue;
+                        const uint32_t rContigLen =
+                            assembleClipSequences(
+                                rClip.clipSeqs);
+                        const uint32_t lContigLen =
+                            assembleClipSequences(
+                                lClip.clipSeqs);
+                        const int64_t insSize =
+                            int64_t(rContigLen)
+                            + int64_t(lContigLen);
+                        if(insSize >= 50) {
+                            const uint32_t bpPos =
+                                (rClip.refPos
+                                 + lClip.refPos) / 2;
+                            allInsCalls.push_back({
+                                bpPos, insSize,
+                                uint32_t(rClip.readCount
+                                    + lClip.readCount),
+                                "soft-clip"});
+                        }
+                    }
+                }
+                // Unpaired fallback.
+                if(allInsCalls.empty()) {
+                    const SoftClipBreakpoint* bestSc = nullptr;
+                    for(const auto& sc : softClipBPs) {
+                        if(sc.readCount >= 4
+                           && (!bestSc
+                               || sc.readCount
+                                  > bestSc->readCount)) {
+                            bestSc = &sc;
+                        }
+                    }
+                    if(bestSc != nullptr) {
+                        const SoftClipBreakpoint* partner =
+                            nullptr;
+                        for(const auto& sc : softClipBPs) {
+                            if(sc.isLeftClip
+                               == bestSc->isLeftClip)
+                                continue;
+                            if(sc.readCount >= 3
+                               && (!partner
+                                   || sc.readCount
+                                      > partner->readCount))
+                                partner = &sc;
+                        }
+                        if(partner != nullptr) {
+                            const uint32_t bpPos =
+                                (bestSc->refPos
+                                 + partner->refPos) / 2;
+                            int64_t insSize =
+                                int64_t(bestSc->avgClipLen)
+                                + int64_t(partner->avgClipLen);
+                            if(insSize >= 50) {
+                                allInsCalls.push_back({
+                                    bpPos, insSize,
+                                    uint32_t(bestSc->readCount
+                                        + partner->readCount),
+                                    "softclip-unpaired"});
+                            }
+                        } else {
+                            const int64_t insSize =
+                                int64_t(bestSc->avgClipLen);
+                            if(insSize >= 50) {
+                                allInsCalls.push_back({
+                                    bestSc->refPos, insSize,
+                                    uint32_t(bestSc->readCount),
+                                    "softclip-unpaired"});
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit INS calls from this bad-segment path.
+            if(!allInsCalls.empty()) {
+                sort(allInsCalls.begin(), allInsCalls.end(),
+                    [](const InsCallRecord& a,
+                       const InsCallRecord& b) {
+                        return a.breakpointPos
+                               < b.breakpointPos;
+                    });
+                for(const auto& ic : allInsCalls) {
+                    cout << "    >>> INSERTION CALL"
+                         << " (" << ic.source
+                         << "): size=" << ic.size << "bp"
+                         << ", breakpoint="
+                         << ic.breakpointPos
+                         << ", reads=" << ic.readCount
+                         << endl;
+                }
+            }
+
             emitDelCalls();
             continue;
         }
@@ -8818,8 +8927,12 @@ void Assembler::parseBamEvidence(
             const uint32_t count = uint32_t(j - i);
             if(count >= 3) {
                 uint32_t localPos = uint32_t(sumPos / count);
-                if(localPos >= refStart)
-                    localPos -= refStart;
+                if(localPos < refStart) {
+                    // Observation before region start — skip.
+                    i = j;
+                    continue;
+                }
+                localPos -= refStart;
                 softClipBPs.push_back({
                     localPos,
                     count,
@@ -8895,8 +9008,12 @@ void Assembler::parseBamEvidence(
                 if(count >= 2) {
                     uint32_t localPos =
                         uint32_t(sumPos / count);
-                    if(localPos >= refStart)
-                        localPos -= refStart;
+                    if(localPos < refStart) {
+                        // Observation before region start — skip.
+                        si = sj;
+                        continue;
+                    }
+                    localPos -= refStart;
                     cigarIndels.push_back({
                         isDel ? "DEL" : "INS",
                         sumSize / int64_t(count),
