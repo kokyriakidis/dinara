@@ -1249,15 +1249,33 @@ The ALL VCF has 72 DELs total:
 
 ### Truvari Command (GIAB-recommended for HG008-T)
 
+Two configurations recommended by the GIAB README (V0.5):
+
+**Position-only matching (pctsize=0):**
 ```bash
 truvari bench \
   -b GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
   -c {calls}.vcf.gz \
-  --reference GRCh38_GIABv3_...fasta \
+  --reference GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
   --includebed GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
-  --sizemax -1 --passonly --pick multi \
-  -o {output}
+  --refdist 1000 --pctseq 0 --pctsize 0 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o {output_ps0}
 ```
+
+**Size-aware matching (pctsize=0.7):**
+```bash
+truvari bench \
+  -b GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c {calls}.vcf.gz \
+  --reference GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0.7 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o {output_ps07}
+```
+
+Source: GIAB HG008-T V0.5 README — `--refdist 1000`, `--typeignore`, `--pick multi`, `--sizemax -1` (no upper limit), `--pctseq 0` (no sequence similarity). The README recommends two runs: pctsize=0 (position-only) and pctsize=0.7 (standard size matching).
 
 ---
 
@@ -1306,11 +1324,11 @@ python3 analyze.py cases results_<version>
 
 ### Truvari Parameters
 
-```
-truvari bench -b truth_ins.vcf.gz -c calls.vcf.gz \
-    --includebed benchmark.bed --passonly --pick multi \
-    -r 2000 --chunksize 5000 --sizemax 50000 -p 0 --pctsize {0,0.7}
-```
+See [Standardized Truvari Benchmark Parameters](#standardized-truvari-benchmark-parameters) for the GIAB-recommended commands.
+
+Parameters used for INS evaluation: `refdist=2000, chunksize=5000, sizemax=50000, passonly, pick=multi, pctseq=0, pctsize={0, 0.7}`.
+
+Note: The GIAB v5.0q README recommends `--pick ac` and `--refine`. Our runs use `--pick multi` and no `--refine` for simpler FN analysis. Results are comparable for recall measurement.
 
 ### Version History
 
@@ -1475,6 +1493,99 @@ Results are per-version log files in `results_v36{version}/` under each eval dir
 - **Truth VCFs**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz`
 - **Filtered truth**: `stvar_INS50.vcf.gz`, `stvar_DEL50.vcf.gz` in `.../structural_variants/`
 
+### Standardized Truvari Benchmark Parameters
+
+#### HG002 Germline — Q100 v5.0q (GIAB-recommended)
+
+Source: `NIST_HG002_v5.0q_variant-benchmarksets_README.md` on GIAB FTP.
+
+**GIAB-recommended command (with refine):**
+```bash
+truvari bench \
+  -b GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz \
+  -c {calls}.vcf.gz \
+  -f {reference.fasta} \
+  --includebed GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --pick ac --passonly \
+  -r 2000 -C 5000 \
+  --refine \
+  -o {output}
+```
+
+**Our evaluation command (without refine, for FN analysis):**
+```bash
+truvari bench \
+  -b /tmp/stvar_{INS,DEL}50.vcf.gz \
+  -c {calls}.vcf.gz \
+  --includebed /tmp/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --passonly --pick multi --pctseq 0 --pctsize {0,0.7} \
+  -r 2000 -C 5000 \
+  -o {output}
+```
+
+| Parameter | GIAB recommended | Our runs | Notes |
+|-----------|-----------------|----------|-------|
+| `--pick` | `ac` | `multi` | `ac` matches by allele count (diploid-aware); `multi` allows multiple matches per call. Both are valid for recall. |
+| `--refdist` | 2000 | 2000 | ✅ Matches |
+| `--chunksize` | 5000 | 5000 | ✅ Matches |
+| `--pctseq` | 0.7 (default) | 0 | We disable sequence similarity — our calls lack ALT sequences |
+| `--pctsize` | 0.7 (default) | 0 and 0.7 | We run both: pctsize=0 for position-only recall, pctsize=0.7 for size accuracy |
+| `--refine` | yes | no | Refine resolves complex representations but makes FN analysis harder |
+| `--includebed` | yes | yes | ✅ Matches |
+| `--passonly` | yes | yes | ✅ Matches |
+| `ALT=*` filter | yes (pre-filter VCF) | yes | `stvar.filt.vcf.gz` has `ALT="."` removed via `bcftools view -e 'ALT="."'` |
+
+**Pre-filtering note:** The v5.0q README warns that `ALT=*` variants cause incorrect truvari categorization. The truth VCF on the cluster (`GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz`) already has these filtered out. The per-type VCFs (`stvar_INS50.vcf.gz`, `stvar_DEL50.vcf.gz`) are extracted from the filtered file.
+
+#### HG008-T Somatic — V0.5 (GIAB-recommended)
+
+Source: `README.md` in HG008-T V0.5 truth set directory.
+
+**GIAB-recommended command (two pctsize configurations):**
+```bash
+# Position-only (pctsize=0)
+truvari bench \
+  -b GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c {calls}.vcf.gz \
+  --reference GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o {output_ps0}
+
+# Size-aware (pctsize=0.7)
+truvari bench \
+  -b GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c {calls}.vcf.gz \
+  --reference GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0.7 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o {output_ps07}
+```
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `--refdist` | 1000 | Somatic SVs have less precise breakpoints |
+| `--pctseq` | 0 | No sequence similarity |
+| `--pctsize` | 0 and 0.7 | Two runs recommended |
+| `--pctovl` | 0 | No reciprocal overlap required |
+| `--sizemax` | -1 | No upper size limit (somatic SVs can be very large) |
+| `--passonly` | yes | Only PASS variants in truth |
+| `--pick` | multi | Multiple matches allowed |
+| `--typeignore` | yes | Don't enforce type matching (DUP/INS/DEL interchangeable) |
+| `--reference` | GIAB GRCh38 | Required for BND comparison and symbolic variant resolution |
+| `--includebed` | clonal+subclonal BED | Restricts evaluation to benchmark regions |
+
+**Key differences from HG002 germline:**
+- `--typeignore` — somatic truth set has DUP/BND types that callers may represent differently
+- `--sizemax -1` — no upper limit (germline uses 50000)
+- `--refdist 1000` — tighter than germline's 2000 (somatic truth set is smaller, positions are well-characterized)
+- `--reference` required — needed for BND-to-BND comparison in truvari v5+
+- No `--refine` — not recommended for somatic benchmark
+
+---
+
 ### How to Run a Full Benchmark
 
 #### 1. Build and copy binary
@@ -1556,39 +1667,149 @@ tabix -p vcf dinara_v36X_ins_sorted.vcf.gz
 #### 6. Run truvari (locally — truvari is at `/home/vscode/.local/bin/truvari`)
 
 ```bash
-# Copy VCFs locally
+# Copy VCFs and benchmark files locally
 scp ec-hub:/sc1/.../dinara_v36X_ins_sorted.vcf.gz /tmp/
+scp ec-hub:/sc1/.../data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed /tmp/
 
-# INS benchmark
+# HG002 germline INS benchmark (see Standardized Truvari Parameters for rationale)
 truvari bench -b /tmp/stvar_INS50.vcf.gz -c /tmp/dinara_v36X_ins_sorted.vcf.gz \
-  -o /tmp/truvari_v36X/ins_ps0 --passonly --pctsize 0 --pctseq 0
+  --includebed /tmp/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --passonly --pick multi --pctseq 0 --pctsize 0 \
+  -r 2000 -C 5000 \
+  -o /tmp/truvari_v36X/ins_ps0
 
 truvari bench -b /tmp/stvar_INS50.vcf.gz -c /tmp/dinara_v36X_ins_sorted.vcf.gz \
-  -o /tmp/truvari_v36X/ins_ps07 --passonly --pctsize 0.7 --pctseq 0
+  --includebed /tmp/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --passonly --pick multi --pctseq 0 --pctsize 0.7 \
+  -r 2000 -C 5000 \
+  -o /tmp/truvari_v36X/ins_ps07
 
-# DEL benchmark
+# HG002 germline DEL benchmark
 truvari bench -b /tmp/stvar_DEL50.vcf.gz -c /tmp/dinara_v36X_dels_sorted.vcf.gz \
-  -o /tmp/truvari_v36X/del_ps0 --passonly --pctsize 0 --pctseq 0
+  --includebed /tmp/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --passonly --pick multi --pctseq 0 --pctsize 0 \
+  -r 2000 -C 5000 \
+  -o /tmp/truvari_v36X/del_ps0
 
 truvari bench -b /tmp/stvar_DEL50.vcf.gz -c /tmp/dinara_v36X_dels_sorted.vcf.gz \
-  -o /tmp/truvari_v36X/del_ps07 --passonly --pctsize 0.7 --pctseq 0
+  --includebed /tmp/GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed \
+  --passonly --pick multi --pctseq 0 --pctsize 0.7 \
+  -r 2000 -C 5000 \
+  -o /tmp/truvari_v36X/del_ps07
 
 # Read results
 python3 -c "import json; d=json.load(open('/tmp/truvari_v36X/ins_ps0/summary.json')); print(f'TP={d[\"TP-comp\"]}, FN={d[\"FN\"]}, recall={d[\"recall\"]:.4f}')"
 ```
 
-### SSH Access to Cluster
+### Connecting to the Cluster
+
+#### SSH Configuration
+
+The SSH config is at `~/.ssh/config` in the dev container. Key: `~/.ssh/id_ed25519` (label: `ona-dinara-agent`).
 
 ```
 Host ec-hub
   Hostname ec-hub.sc1.science.roche.com
   User kyriakik
+  IdentityFile ~/.ssh/id_ed25519
 
 Host sc1
   Hostname lb022dev.eth.rsshpc1.sc1.science.roche.com
   ProxyJump ec-hub
   User kyriakik
+  IdentityFile ~/.ssh/id_ed25519
+
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ForwardAgent yes
 ```
 
-ec-hub has access to the shared filesystem (`/sc1/...`) and Slurm (`sbatch`). Direct SSH to sc1 (lb022dev) may fail — use ec-hub for all operations.
+#### Which host to use
+
+- **ec-hub** — jump host with access to the shared filesystem (`/sc1/...`) and Slurm (`sbatch`, `squeue`, `scancel`). Use for all operations: running commands, submitting jobs, copying files.
+- **sc1** (lb022dev) — direct login node via ProxyJump through ec-hub. May be unreachable at times — prefer ec-hub.
+
+#### Common operations
+
+```bash
+# Interactive shell
+ssh ec-hub
+
+# Run a remote command
+ssh ec-hub 'ls /sc1/groups/sbx/workspace/kyriakik/data/tools/'
+
+# Copy files to cluster
+scp build_release/Executable/dinara ec-hub:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36X
+
+# Copy files from cluster
+scp ec-hub:/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/dinara_v36X_ins_sorted.vcf.gz /tmp/
+
+# Submit a Slurm job
+ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval && sbatch --array=1-26101 run_eval_v36X.sh'
+
+# Check job status
+ssh ec-hub 'squeue -u kyriakik'
+
+# Cancel jobs
+ssh ec-hub 'scancel -u kyriakik'
+```
+
+#### Available modules on ec-hub
+
+Load bioinformatics tools with `module load`:
+
+```bash
+module load BCFtools/1.21-GCC-13.3.0
+module load HTSlib/1.21-GCC-13.3.0    # provides bgzip, tabix
+module load SAMtools/1.21-GCC-13.3.0
+```
+
+These must also be loaded inside Slurm job scripts if the job uses `bcftools`, `bgzip`, etc.
+
+#### Filesystem layout
+
+All data lives on the shared filesystem under `/sc1/groups/sbx/workspace/kyriakik/`:
+
+```
+structural_variants/
+├── full_del_eval/          # HG002 germline DEL benchmark
+│   ├── cases/              # Extracted per-case dirs (reference.fa, reads.fa, region.bam)
+│   ├── results_v36{X}/     # Per-version log files
+│   ├── del_cases.txt       # Case list for Slurm array
+│   └── logs_to_vcf.py      # Log → VCF conversion
+├── full_ins_eval/          # HG002 germline INS benchmark
+│   ├── cases/
+│   ├── results_v36{X}/
+│   ├── ins_cases.txt
+│   ├── all_ins_positions.tsv
+│   └── ins_logs_to_vcf.py
+├── hg008t_del_eval/        # HG008-T somatic DEL benchmark
+│   ├── cases/
+│   └── del_cases.txt
+├── hg008t_ins_eval/        # HG008-T somatic INS benchmark
+│   ├── cases/
+│   └── ins_cases.txt
+├── somatic_hg008/          # Legacy somatic eval (pre-extraction)
+└── extract_hg008t_cases.py # Case extraction script
+data/
+├── tools/                  # Dinara binaries (dinara_v36{d..u}_*)
+└── truth/                  # Truth sets
+    ├── GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz      # HG002 germline (ALT=* filtered)
+    ├── GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed     # HG002 benchmark regions
+    └── HG008T_somatic_V0.5/                             # HG008-T somatic truth set
+        ├── GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz
+        ├── GRCh38_HG008-T-V0.5_somatic-stvar_ALL.draftbenchmark.vcf.gz
+        ├── GRCh38_HG008-T-V0.5_somatic-stvar-clonal.draftbenchmark.bed
+        ├── GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed
+        └── README.md
+```
+
+#### Troubleshooting
+
+- **"Permission denied (publickey)"**: The SSH key (`~/.ssh/id_ed25519`) must be registered on the cluster. Check with `ssh-keygen -l -f ~/.ssh/id_ed25519`.
+- **Hanging SSH**: ec-hub may be slow on first connect (host key verification). The config sets `StrictHostKeyChecking no` to avoid interactive prompts.
+- **"module not found"**: Use exact module names with version (e.g., `BCFtools/1.21-GCC-13.3.0`, not `bcftools`).
+- **Slurm job failures**: Check logs with `ssh ec-hub 'cat /sc1/.../results_v36X/{case}.log'`. Common issues: missing `--assemblyDirectory` (causes `DinaraRun` conflicts), `/tmp` not shared across nodes.
+- **scp slow**: Large VCF files (>100MB) may take minutes. Use `rsync` for resumable transfers: `rsync -avP ec-hub:/sc1/.../ /tmp/`.
 
