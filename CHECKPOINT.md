@@ -1394,21 +1394,27 @@ Recall drops from 99.0% → 52.0% when requiring size match within 30% (pctsize=
 
 Improving size accuracy would require assembled contigs spanning the insertion, which is fundamentally limited by 2×250bp read lengths for large insertions.
 
-### Benchmark Results (V36u, default truvari: refdist=500, pctseq=0)
+### HG002 Germline SV Benchmark
+
+**Truth set**: HG002 Q100 v5.0q stvar, GRCh38.
+- INS ≥50bp: 28,942 entries (23,086 unique positions, 26,101 unique case names)
+- DEL ≥50bp: 17,562 entries (15,319 unique positions, 15,472 unique case names)
+- Truvari in-scope (after sizemax=50000 and pick=single dedup): 21,080 INS, 11,938 DEL
+- Duplicate case names (same chrom+pos+size, different het alleles): 1,400 INS, 2,090 DEL — these share the same extracted case directory since both alleles are at the same position.
+
+**V36u results** (default truvari: refdist=500, pctseq=0):
 
 | Metric | pctsize=0 | pctsize=0.7 |
 |---|---|---|
 | **INS recall** | **88.29%** (TP=18,611, FN=2,469, total=21,080) | 40.63% (TP=8,564, FN=12,516) |
 | **DEL recall** | **99.97%** (TP=11,934, FN=4, total=11,938) | 97.94% (TP=11,692, FN=246) |
 
-Truth set: HG002 Q100 v5.0q stvar, GRCh38. INS ≥50bp: 28,942 entries (23,086 unique positions). DEL ≥50bp: 17,562 entries (15,319 unique positions). Truvari in-scope (after sizemax=50000 and dedup): 21,080 INS, 11,938 DEL.
-
 ### Cluster Paths and Binaries
 
 - **Binaries**: `dinara_v36{o,p,q,r,s,t,u}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
 - **samtools**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/samtools` (v1.21, compiled from source)
 
-#### Case Extraction
+#### HG002 Case Extraction
 
 Each case is a ±2000bp region around a truth position, containing:
 - `reads.fa` — consensus reads overlapping the region
@@ -1417,11 +1423,13 @@ Each case is a ±2000bp region around a truth position, containing:
 
 | Dataset | Cases | Path |
 |---|---|---|
-| **Full INS** | 26,101 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/cases/` |
-| **Full DEL** | 15,472 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/cases/` |
-| **INS pilot** | 100 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/ins_pilot/cases/` |
+| **HG002 Full INS** | 26,101 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/cases/` |
+| **HG002 Full DEL** | 15,472 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval/cases/` |
+| **HG002 INS pilot** | 100 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/ins_pilot/cases/` |
 
 Case naming: `{chrom}_{pos}_{type}{size}` (e.g., `chr1_100025966_INS51`, `chr10_100092115_DEL68`).
+
+The 28,942 INS truth entries map to 26,101 unique case names (1,400 positions have two het alleles with identical size → same case name). Similarly, 17,562 DEL entries map to 15,472 case names (2,090 duplicates). Both alleles share the same extracted region.
 
 #### Results
 
