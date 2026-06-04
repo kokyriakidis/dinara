@@ -53,13 +53,11 @@ Shasta2AnchorPair::Shasta2AnchorPair(
         DINARA_ASSERT(orientedReadId == itB->orientedReadId);
 
         if(adjacentInJourney) {
-            if(itB->positionInJourney == itA->positionInJourney + 1 &&
-               itB->position >= itA->position) {
+            if(itB->positionInJourney == itA->positionInJourney + 1) {
                 orientedReadIds.push_back(orientedReadId);
             }
         } else {
-            if(itB->positionInJourney > itA->positionInJourney &&
-               itB->position >= itA->position) {
+            if(itB->positionInJourney > itA->positionInJourney) {
                 orientedReadIds.push_back(orientedReadId);
             }
         }
@@ -183,16 +181,23 @@ void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) c
 {
     vector< pair<uint32_t, uint32_t> > anchorPositions;
     getAnchorPositions(anchors, anchorPositions);
+
+    vector< pair<uint32_t, uint32_t> > journeyPositions;
+    getPositionsInJourneys(anchors, journeyPositions);
+
     DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
+    DINARA_ASSERT(journeyPositions.size() == orientedReadIds.size());
 
     for(uint64_t i = 0; i < orientedReadIds.size(); i++) {
         const auto& p = anchorPositions[i];
+        const auto& jp = journeyPositions[i];
         if(p.second < p.first) {
             cout << "Negative base offset on edge "
                  << anchorIdA << " -> " << anchorIdB
                  << ": " << orientedReadIds[i]
                  << " basePos A=" << p.first << " B=" << p.second
                  << " (offset " << int64_t(p.second) - int64_t(p.first) << ")"
+                 << " journeyPos A=" << jp.first << " B=" << jp.second
                  << endl;
             DINARA_ASSERT(false);
         }
