@@ -2679,6 +2679,105 @@ void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
 }
 
 
+uint64_t Shasta2AnchorGraph::windowTransitiveReduction(uint64_t maxDistance)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Build a window-level adjacency list from active inter-window edges.
+    // Also collect all anchor-level edges per window pair.
+    using WindowPairKey = std::pair<uint32_t, uint32_t>;
+    std::set<WindowPairKey> windowEdges;
+    std::map<WindowPairKey, vector<edge_descriptor>> windowPairEdges;
+    std::map<uint32_t, std::set<uint32_t>> windowAdj; // adjacency list
+
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcWin = anchorToWindow[src];
+        const uint32_t dstWin = anchorToWindow[dst];
+        if(srcWin == noWindow || dstWin == noWindow) continue;
+        const uint32_t srcNorm = normalizeW(srcWin);
+        const uint32_t dstNorm = normalizeW(dstWin);
+        if(srcNorm == dstNorm) continue;
+        windowEdges.insert({srcNorm, dstNorm});
+        windowPairEdges[{srcNorm, dstNorm}].push_back(e);
+        windowAdj[srcNorm].insert(dstNorm);
+    }
+
+    // For each window edge A→C, BFS from A (excluding the direct A→C edge)
+    // to see if C is reachable within maxDistance hops.
+    std::set<WindowPairKey> redundant;
+
+    for(const auto& [wA, wC] : windowEdges) {
+        // BFS from wA, up to maxDistance steps, not using the direct A→C edge.
+        std::set<uint32_t> visited;
+        std::queue<std::pair<uint32_t, uint64_t>> bfsQueue;
+        visited.insert(wA);
+
+        // Seed with all neighbors of A except C.
+        auto itA = windowAdj.find(wA);
+        if(itA == windowAdj.end()) continue;
+        for(const uint32_t neighbor : itA->second) {
+            if(neighbor == wC) continue; // skip direct edge
+            if(visited.insert(neighbor).second) {
+                bfsQueue.push({neighbor, 1});
+            }
+        }
+
+        bool found = false;
+        while(!bfsQueue.empty() && !found) {
+            auto [current, dist] = bfsQueue.front();
+            bfsQueue.pop();
+
+            if(current == wC) {
+                found = true;
+                break;
+            }
+
+            if(dist >= maxDistance) continue;
+
+            auto itCur = windowAdj.find(current);
+            if(itCur == windowAdj.end()) continue;
+            for(const uint32_t next : itCur->second) {
+                if(visited.insert(next).second) {
+                    bfsQueue.push({next, dist + 1});
+                }
+            }
+        }
+
+        if(found) {
+            redundant.insert({wA, wC});
+        }
+    }
+
+    // Disable all anchor-level edges for redundant window pairs.
+    uint64_t removedCount = 0;
+    for(const auto& key : redundant) {
+        auto it = windowPairEdges.find(key);
+        if(it != windowPairEdges.end()) {
+            for(const edge_descriptor e : it->second) {
+                if(anchorGraph[e].useForAssembly) {
+                    disableEdge(e);
+                    ++removedCount;
+                }
+            }
+        }
+    }
+
+    cout << "windowTransitiveReduction: found " << redundant.size()
+         << " redundant window pairs (maxDistance=" << maxDistance
+         << "), removed " << removedCount << " edges." << endl;
+    return removedCount;
+}
+
+
 uint64_t Shasta2AnchorGraph::removeRcWindowConnections()
 {
     Shasta2AnchorGraph& anchorGraph = *this;
