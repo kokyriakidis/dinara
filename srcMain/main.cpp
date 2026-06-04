@@ -1589,7 +1589,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
 
-    const bool enableDetangling = true;
+    const bool enableDetangling = false;
     std::vector<DetangleBypassEdge> bypassEdges;
     if(enableDetangling) {
         const uint64_t detangledCount = detangleWindowsGTest(
@@ -1625,7 +1625,7 @@ void dinara::main::assemble(
 
     // Clean the anchor graph.
     shasta2AnchorGraph->removeRcWindowConnections();
-    shasta2AnchorGraph->windowTransitiveReduction();
+    // shasta2AnchorGraph->windowTransitiveReduction();
     shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
@@ -1654,7 +1654,7 @@ void dinara::main::assemble(
 
             // Clean again after detangling.
             shasta2AnchorGraph->removeRcWindowConnections();
-            shasta2AnchorGraph->windowTransitiveReduction();
+            // shasta2AnchorGraph->windowTransitiveReduction();
             shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
             shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
         }
