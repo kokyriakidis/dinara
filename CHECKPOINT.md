@@ -1697,6 +1697,40 @@ truvari bench -b /tmp/stvar_DEL50.vcf.gz -c /tmp/dinara_v36X_dels_sorted.vcf.gz 
   -r 2000 -C 5000 \
   -o /tmp/truvari_v36X/del_ps07
 
+# HG008-T somatic INS benchmark
+truvari bench -b /tmp/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c /tmp/dinara_v36X_hg008t_ins.vcf.gz \
+  --reference /tmp/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed /tmp/GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o /tmp/truvari_v36X/hg008t_ins_ps0
+
+truvari bench -b /tmp/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c /tmp/dinara_v36X_hg008t_ins.vcf.gz \
+  --reference /tmp/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed /tmp/GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0.7 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o /tmp/truvari_v36X/hg008t_ins_ps07
+
+# HG008-T somatic DEL benchmark
+truvari bench -b /tmp/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c /tmp/dinara_v36X_hg008t_dels.vcf.gz \
+  --reference /tmp/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed /tmp/GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o /tmp/truvari_v36X/hg008t_del_ps0
+
+truvari bench -b /tmp/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz \
+  -c /tmp/dinara_v36X_hg008t_dels.vcf.gz \
+  --reference /tmp/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta \
+  --includebed /tmp/GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed \
+  --refdist 1000 --pctseq 0 --pctsize 0.7 --pctovl 0 \
+  --sizemax -1 --passonly --pick multi --typeignore \
+  -o /tmp/truvari_v36X/hg008t_del_ps07
+
 # Read results
 python3 -c "import json; d=json.load(open('/tmp/truvari_v36X/ins_ps0/summary.json')); print(f'TP={d[\"TP-comp\"]}, FN={d[\"FN\"]}, recall={d[\"recall\"]:.4f}')"
 ```
