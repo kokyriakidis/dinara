@@ -79,7 +79,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(uint64_t i=0; i<children.size(); i++) {
             const Shasta2AnchorId anchorIdB = children[i];
             Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, true);
-            anchorPair.removeNegativeOffsets(anchors);
+            anchorPair.assertNoNegativeOffsets(anchors);
             if(anchorPair.orientedReadIds.empty()) {
                 continue;
             }
@@ -168,7 +168,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
-        anchorPair.removeNegativeOffsets(anchors);
+        anchorPair.assertNoNegativeOffsets(anchors);
         if(anchorPair.orientedReadIds.empty()) {
             return false;
         }
@@ -561,20 +561,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(!isSelfRcMirror &&
            uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
             Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
-            rcPair.removeNegativeOffsets(anchors);
-            if(rcPair.size() > 0) {
-                edge_descriptor eRc;
-                tie(eRc, ignore) = add_edge(
-                    rcB, rcA,
-                    Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
-                    anchorGraph);
-                anchorGraph[eRc].useForAssembly = true;
-                anchorGraph[eRc].supportingSpanPrev = spanNext;
-                anchorGraph[eRc].supportingSpanNext = spanPrev;
-                anchorGraph[eRc].sharedReadCount = sharedReads;
-                createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
-                ++interWindowCreated;
-            }
+            rcPair.assertNoNegativeOffsets(anchors);
+            DINARA_ASSERT(rcPair.size() > 0);
+            edge_descriptor eRc;
+            tie(eRc, ignore) = add_edge(
+                rcB, rcA,
+                Shasta2AnchorGraphEdge(rcPair, rcPair.getAverageOffset(anchors), nextEdgeId++),
+                anchorGraph);
+            anchorGraph[eRc].useForAssembly = true;
+            anchorGraph[eRc].supportingSpanPrev = spanNext;
+            anchorGraph[eRc].supportingSpanNext = spanPrev;
+            anchorGraph[eRc].sharedReadCount = sharedReads;
+            createdEdges.push_back({{rcSrc, rcDst}, rcB, rcA, sharedReads});
+            ++interWindowCreated;
         }
     };
 
@@ -617,7 +616,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
-        anchorPair.removeNegativeOffsets(anchors);
+        anchorPair.assertNoNegativeOffsets(anchors);
         if(anchorPair.size() == 0) {
             ++interWindowZeroPairs;
             continue;
@@ -3090,7 +3089,7 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 if(uint64_t(bypassFrom) != uint64_t(bypassTo) &&
                    anchors.countCommon(bypassFrom, bypassTo) > 0) {
                     Shasta2AnchorPair bypassPair(anchors, bypassFrom, bypassTo, false);
-                    bypassPair.removeNegativeOffsets(anchors);
+                    bypassPair.assertNoNegativeOffsets(anchors);
                     if(bypassPair.size() > 0) {
 
                         // Create forward edge.
@@ -3107,7 +3106,7 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                         const Shasta2AnchorId rcTo = Shasta2AnchorId(uint64_t(bypassTo) ^ 1ULL);
                         if(uint64_t(rcFrom) < anchorCount && uint64_t(rcTo) < anchorCount) {
                             Shasta2AnchorPair rcPair(anchors, rcTo, rcFrom, false);
-                            rcPair.removeNegativeOffsets(anchors);
+                            rcPair.assertNoNegativeOffsets(anchors);
                             if(rcPair.size() > 0) {
                                 edge_descriptor eRc;
                                 tie(eRc, ignore) = add_edge(
