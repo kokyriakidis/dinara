@@ -1843,6 +1843,152 @@ done
 | Copy + truvari | ~5 min | 8 truvari runs, each <30s |
 | **Total** | **~30 min** | End-to-end from code change to results |
 
+### Running sbx-assemble (Competitor Baseline)
+
+sbx-assemble is the competing assembly-based SV caller. It runs as a single whole-genome job (not per-case like dinara) with a 5-step pipeline: assemble → align contigs → call SVs (SVIM-asm) → truvari bench → truvari refine.
+
+#### Prerequisites
+
+- **Conda env**: `sv_bench` on the cluster (has truvari, svim-asm, pysam==0.22.1)
+- **Binaries**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/assemble` and `contig_aligner`
+- **Pipeline script**: `/sc1/groups/sbx/workspace/kyriakik/sbx-assemble/benchmark_full.sh`
+
+#### HG002 Germline Benchmark
+
+Single Slurm job, ~1-2 hours, 32 CPUs:
+
+```bash
+# Run on SBX-D (primary evaluation BAM)
+ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/sbx-assemble && \
+  sbatch benchmark_full.sh SBX-D'
+
+# Or run both BAMs in parallel
+ssh ec-hub 'cd /sc1/groups/sbx/workspace/kyriakik/sbx-assemble && \
+  sbatch benchmark_full.sh SBX-S && \
+  sbatch benchmark_full.sh SBX-D'
+```
+
+Output goes to `/sc1/groups/sbx/workspace/kyriakik/structural_variants/test_runs/bench_<timestamp>/SBX-D/`.
+
+The script runs truvari with: `--pick multi -p 0 -P 0 --passonly -r 2000 -C 5000 --includebed`. Then runs `truvari refine --use-original-vcfs --align=mafft`.
+
+#### HG008-T Somatic Benchmark
+
+sbx-assemble doesn't have a somatic benchmark script. To run it on HG008-T, modify the pipeline manually:
+
+```bash
+# On ec-hub: create a somatic benchmark script
+cat > /sc1/groups/sbx/workspace/kyriakik/sbx-assemble/benchmark_hg008t.sh << 'EOF'
+#!/bin/bash
+#SBATCH --job-name="sbx-hg008t"
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=60G
+#SBATCH --time=03:00:00
+#SBATCH --qos=3h
+
+set -euo pipefail
+
+DATA=/sc1/groups/sbx/workspace/kyriakik/data
+OUTDIR=/sc1/groups/sbx/workspace/kyriakik/structural_variants/test_runs/sbx_hg008t_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$OUTDIR"
+
+EXE=$DATA/tools/assemble
+ALIGNER=$DATA/tools/contig_aligner
+REF=$DATA/reference/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna
+BAM=/sc1/groups/sbx/workspace/eizengaj/structural_variants/somatic_mapping/dedupped_sorted/HG008_T.intra-consensus.personalized.dedup.sorted.bam
+TRUTH=$DATA/truth/HG008T_somatic_V0.5/GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz
+TRUTH_BED=$DATA/truth/HG008T_somatic_V0.5/GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed
+GIAB_REF=$DATA/reference/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta
+THREADS=32
+NAME="final_assemblies"
+
+module load GCC/13.3.0
+module load SAMtools/1.21-GCC-13.3.0
+module load Micromamba/2.0.7-0
+eval "$(micromamba shell hook --shell bash)"
+micromamba activate sv_bench
+
+exec > >(tee "$OUTDIR/benchmark.log") 2>&1
+
+# Step 1: Assembly
+$EXE -x "$REF" -i "$BAM" -t $THREADS -o "$OUTDIR"
+
+# Step 2: Align contigs
+"$ALIGNER" -t $THREADS "$REF" "$OUTDIR/$NAME.fa" \
+    | samtools sort -@ 4 -O BAM > "$OUTDIR/$NAME.GRCh38.bam"
+samtools index -@ $THREADS "$OUTDIR/$NAME.GRCh38.bam"
+
+# Step 3: Call SVs
+svim-asm haploid --min_mapq 0 --min_sv_size 30 \
+    --query_gap_tolerance 50000 --reference_gap_tolerance 50000 \
+    --query_overlap_tolerance 50000 --reference_overlap_tolerance 50000 \
+    "$OUTDIR" "$OUTDIR/$NAME.GRCh38.bam" "$REF" > /dev/null
+
+bcftools view -e 'ALT="." || TYPE="bnd"' \
+    -Oz -o "$OUTDIR/variants.filtered.vcf.gz" "$OUTDIR/variants.vcf"
+tabix -p vcf "$OUTDIR/variants.filtered.vcf.gz"
+
+# Step 4: Truvari bench (pctsize=0)
+truvari bench \
+    --base="$TRUTH" --comp="$OUTDIR/variants.filtered.vcf.gz" \
+    --reference "$GIAB_REF" \
+    --includebed "$TRUTH_BED" \
+    --refdist 1000 --pctseq 0 --pctsize 0 --pctovl 0 \
+    --sizemax -1 --passonly --pick multi --typeignore \
+    --output="$OUTDIR/truvari_ps0"
+
+# Step 5: Truvari bench (pctsize=0.7)
+truvari bench \
+    --base="$TRUTH" --comp="$OUTDIR/variants.filtered.vcf.gz" \
+    --reference "$GIAB_REF" \
+    --includebed "$TRUTH_BED" \
+    --refdist 1000 --pctseq 0 --pctsize 0.7 --pctovl 0 \
+    --sizemax -1 --passonly --pick multi --typeignore \
+    --output="$OUTDIR/truvari_ps07"
+
+# Results
+for d in truvari_ps0 truvari_ps07; do
+  echo "=== $d ==="
+  python3 -c "import json; s=json.load(open('$OUTDIR/$d/summary.json')); print(f'TP={s[\"TP-base\"]} FP={s[\"FP\"]} FN={s[\"FN\"]} P={s[\"precision\"]:.4f} R={s[\"recall\"]:.4f}')"
+done
+EOF
+```
+
+Submit with:
+```bash
+ssh ec-hub 'sbatch /sc1/groups/sbx/workspace/kyriakik/sbx-assemble/benchmark_hg008t.sh'
+```
+
+#### Reading sbx-assemble results
+
+```bash
+# HG002 germline (latest run)
+ssh ec-hub 'cat /sc1/groups/sbx/workspace/kyriakik/structural_variants/test_runs/bench_20260519_155309/SBX-D/truvari/summary.json' | python3 -c "
+import json, sys; s=json.load(sys.stdin)
+print(f'TP={s[\"TP-base\"]} FP={s[\"FP\"]} FN={s[\"FN\"]} P={s[\"precision\"]:.4f} R={s[\"recall\"]:.4f} F1={s[\"f1\"]:.4f}')
+"
+
+# HG008-T somatic (after running benchmark_hg008t.sh)
+ssh ec-hub 'cat /sc1/.../sbx_hg008t_*/truvari_ps0/summary.json' | python3 -c "
+import json, sys; s=json.load(sys.stdin)
+print(f'TP={s[\"TP-base\"]} FP={s[\"FP\"]} FN={s[\"FN\"]} P={s[\"precision\"]:.4f} R={s[\"recall\"]:.4f}')
+"
+```
+
+#### Key differences: dinara vs sbx-assemble
+
+| Aspect | dinara | sbx-assemble |
+|--------|--------|-------------|
+| Architecture | Per-case (36K independent jobs) | Whole-genome (single job) |
+| Wall time | ~5-15 min (massively parallel) | ~1-2 hours (single node) |
+| SV calling | Direct from reads (k-mer chaining + multi-source detection) | Assembly → contig alignment → SVIM-asm |
+| Dependencies | None (static binary) | conda env (truvari, svim-asm, pysam, mafft) |
+| Truvari refine | Not used | Used (resolves complex representations) |
+| GBZ database | Not needed | Required per sample type |
+
+---
+
 ### Connecting to the Cluster
 
 #### SSH Configuration
