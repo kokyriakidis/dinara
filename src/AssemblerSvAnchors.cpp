@@ -1247,6 +1247,115 @@ void Assembler::buildSvMSA(
 
         if(allRefOrdinals.size() < 2) {
             detectSplitReadDels();
+
+            // Soft-clip INS detection for zero-anchor cases.
+            // When no reference anchors are found, the MSA loop
+            // is skipped entirely. Check for paired or unpaired
+            // soft-clip breakpoints and emit INS calls.
+            if(!softClipBPs.empty()) {
+                // Try paired first.
+                for(const auto& rClip : softClipBPs) {
+                    if(rClip.isLeftClip) continue;
+                    if(rClip.readCount < 3) continue;
+                    for(const auto& lClip : softClipBPs) {
+                        if(!lClip.isLeftClip) continue;
+                        if(lClip.readCount < 3) continue;
+                        const int64_t gap =
+                            int64_t(lClip.refPos)
+                            - int64_t(rClip.refPos);
+                        if(gap < -200 || gap > 200) continue;
+                        const uint32_t rContigLen =
+                            assembleClipSequences(
+                                rClip.clipSeqs);
+                        const uint32_t lContigLen =
+                            assembleClipSequences(
+                                lClip.clipSeqs);
+                        const int64_t insSize =
+                            int64_t(rContigLen)
+                            + int64_t(lContigLen);
+                        if(insSize >= 50) {
+                            const uint32_t bpPos =
+                                (rClip.refPos
+                                 + lClip.refPos) / 2;
+                            allInsCalls.push_back({
+                                bpPos, insSize,
+                                uint32_t(rClip.readCount
+                                    + lClip.readCount),
+                                "soft-clip"});
+                        }
+                    }
+                }
+                // Unpaired fallback.
+                if(allInsCalls.empty()) {
+                    const SoftClipBreakpoint* bestSc = nullptr;
+                    for(const auto& sc : softClipBPs) {
+                        if(sc.readCount >= 4
+                           && (!bestSc
+                               || sc.readCount
+                                  > bestSc->readCount)) {
+                            bestSc = &sc;
+                        }
+                    }
+                    if(bestSc != nullptr) {
+                        const SoftClipBreakpoint* partner =
+                            nullptr;
+                        for(const auto& sc : softClipBPs) {
+                            if(sc.isLeftClip
+                               == bestSc->isLeftClip)
+                                continue;
+                            if(sc.readCount >= 3
+                               && (!partner
+                                   || sc.readCount
+                                      > partner->readCount))
+                                partner = &sc;
+                        }
+                        if(partner != nullptr) {
+                            const uint32_t bpPos =
+                                (bestSc->refPos
+                                 + partner->refPos) / 2;
+                            int64_t insSize =
+                                int64_t(bestSc->avgClipLen)
+                                + int64_t(partner->avgClipLen);
+                            if(insSize >= 50) {
+                                allInsCalls.push_back({
+                                    bpPos, insSize,
+                                    uint32_t(bestSc->readCount
+                                        + partner->readCount),
+                                    "softclip-unpaired"});
+                            }
+                        } else {
+                            const int64_t insSize =
+                                int64_t(bestSc->avgClipLen);
+                            if(insSize >= 50) {
+                                allInsCalls.push_back({
+                                    bestSc->refPos, insSize,
+                                    uint32_t(bestSc->readCount),
+                                    "softclip-unpaired"});
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit INS calls from this early-exit path.
+            if(!allInsCalls.empty()) {
+                sort(allInsCalls.begin(), allInsCalls.end(),
+                    [](const InsCallRecord& a,
+                       const InsCallRecord& b) {
+                        return a.breakpointPos
+                               < b.breakpointPos;
+                    });
+                for(const auto& ic : allInsCalls) {
+                    cout << "    >>> INSERTION CALL"
+                         << " (" << ic.source
+                         << "): size=" << ic.size << "bp"
+                         << ", breakpoint="
+                         << ic.breakpointPos
+                         << ", reads=" << ic.readCount
+                         << endl;
+                }
+            }
+
             emitDelCalls();
             continue;
         }
@@ -4150,11 +4259,11 @@ void Assembler::buildSvMSA(
                         }
                     }
 
-                    // Fallback: no strong breakpoint but many indirect
-                    // reads. Estimate INS size from indirect read bases
-                    // divided by coverage. Position from deepest
-                    // HitDepth drop or region center.
-                    if(bestStrong == nullptr) {
+                    // Fallback: many indirect reads but no INS call
+                    // was emitted. Estimate INS size from indirect
+                    // read bases / coverage. Position from soft-clip
+                    // midpoint, HitDepth drop, or region center.
+                    if(insertionCallRegions.empty()) {
                         const double coverage =
                             double(medianSpanning);
                         uint64_t indirectBases = 0;
