@@ -208,6 +208,7 @@ bool Shasta2AnchorPair::hasNegativeOffsets(const Shasta2Anchors& anchors) const
 }
 
 
+
 // Same as the above, but also returns compute the sequences.
 void Shasta2AnchorPair::get(
     const Shasta2Anchors& anchors,
