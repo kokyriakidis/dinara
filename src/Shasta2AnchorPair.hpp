@@ -113,12 +113,11 @@ public:
     // Count OrientedReadIds in common with another Shasta2AnchorPair.
     uint64_t countCommon(const Shasta2AnchorPair&) const;
 
-    // Remove from the Shasta2AnchorPair OrientedReadIds that have negative offsets.
-    void removeNegativeOffsets(const Shasta2Anchors&);
-
     // Assert that no reads have negative base offsets (anchorB position < anchorA position).
     void assertNoNegativeOffsets(const Shasta2Anchors&) const;
     bool hasNegativeOffsets(const Shasta2Anchors&) const;
+    // Remove reads with negative offsets from the anchor pair.
+    void removeNegativeOffsets(const Shasta2Anchors&);
 
     bool contains(OrientedReadId) const;
 

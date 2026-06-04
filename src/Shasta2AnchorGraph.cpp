@@ -79,10 +79,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         for(uint64_t i=0; i<children.size(); i++) {
             const Shasta2AnchorId anchorIdB = children[i];
             Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, true);
+            anchorPair.removeNegativeOffsets(anchors);
             if(anchorPair.orientedReadIds.empty()) {
-                continue;
-            }
-            if(anchorPair.hasNegativeOffsets(anchors)) {
                 continue;
             }
             DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
@@ -170,10 +168,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Helper to add an edge if the anchor pair has shared oriented reads.
     auto addEdgeIfValid = [&](Shasta2AnchorId anchorIdA, Shasta2AnchorId anchorIdB) -> bool {
         Shasta2AnchorPair anchorPair(anchors, anchorIdA, anchorIdB, false);
+        anchorPair.removeNegativeOffsets(anchors);
         if(anchorPair.orientedReadIds.empty()) {
-            return false;
-        }
-        if(anchorPair.hasNegativeOffsets(anchors)) {
             return false;
         }
         DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
@@ -565,7 +561,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         if(!isSelfRcMirror &&
            uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
             Shasta2AnchorPair rcPair(anchors, rcB, rcA, false);
-            if(rcPair.size() > 0 && !rcPair.hasNegativeOffsets(anchors)) {
+            rcPair.removeNegativeOffsets(anchors);
+            if(rcPair.size() > 0) {
                 edge_descriptor eRc;
                 tie(eRc, ignore) = add_edge(
                     rcB, rcA,
@@ -620,11 +617,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
+        anchorPair.removeNegativeOffsets(anchors);
         if(anchorPair.size() == 0) {
-            ++interWindowZeroPairs;
-            continue;
-        }
-        if(anchorPair.hasNegativeOffsets(anchors)) {
             ++interWindowZeroPairs;
             continue;
         }
@@ -3096,7 +3090,8 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                 if(uint64_t(bypassFrom) != uint64_t(bypassTo) &&
                    anchors.countCommon(bypassFrom, bypassTo) > 0) {
                     Shasta2AnchorPair bypassPair(anchors, bypassFrom, bypassTo, false);
-                    if(bypassPair.size() > 0 && !bypassPair.hasNegativeOffsets(anchors)) {
+                    bypassPair.removeNegativeOffsets(anchors);
+                    if(bypassPair.size() > 0) {
 
                         // Create forward edge.
                         edge_descriptor eBypass;
@@ -3112,7 +3107,8 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                         const Shasta2AnchorId rcTo = Shasta2AnchorId(uint64_t(bypassTo) ^ 1ULL);
                         if(uint64_t(rcFrom) < anchorCount && uint64_t(rcTo) < anchorCount) {
                             Shasta2AnchorPair rcPair(anchors, rcTo, rcFrom, false);
-                            if(rcPair.size() > 0 && !rcPair.hasNegativeOffsets(anchors)) {
+                            rcPair.removeNegativeOffsets(anchors);
+                            if(rcPair.size() > 0) {
                                 edge_descriptor eRc;
                                 tie(eRc, ignore) = add_edge(
                                     uint64_t(rcTo), uint64_t(rcFrom),
