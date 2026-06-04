@@ -1273,14 +1273,18 @@ truvari bench \
 
 ```bash
 # Build locally
-cd /workspaces/dinara/build && make -j$(nproc)
+cd /workspaces/dinara/build_release && make -j$(nproc) dinaraExecutable
 
 # Deploy to cluster
-scp build/Executable/dinara kyriakik@ec-hub.sc1.science.roche.com:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_<version>
+scp build_release/Executable/dinara kyriakik@ec-hub.sc1.science.roche.com:/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_<version>
 
-# Run eval (germline HG002)
+# Run eval (germline HG002 DEL)
 ssh kyriakik@ec-hub.sc1.science.roche.com
 cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_del_eval
+sbatch run_eval_<version>.sh
+
+# Run eval (germline HG002 INS)
+cd /sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval
 sbatch run_eval_<version>.sh
 
 # Run eval (somatic HG008-T)
@@ -1290,4 +1294,108 @@ sbatch run_depthscan.sh
 # Analyze
 python3 analyze.py cases results_<version>
 ```
+
+## Full INS Evaluation — HG002 Q100 v5.0q (June 2026)
+
+### Dataset
+
+- **Truth**: HG002 Q100 v5.0q stvar truthset, INS ≥50bp (28,942 entries, 26,101 unique cases after dedup by chr_pos_size)
+- **BAM**: SBX-D.30X.bam (Roche 2×250bp variable-length consensus reads, GRCh38)
+- **Benchmark BED**: GRCh38_HG2-T2TQ100-V1.1_stvar.benchmark.bed
+- **Region extraction**: ±2000bp around each truth position → reference.fa, reads.fa, region.bam per case
+
+### Truvari Parameters
+
+```
+truvari bench -b truth_ins.vcf.gz -c calls.vcf.gz \
+    --includebed benchmark.bed --passonly --pick multi \
+    -r 2000 --chunksize 5000 --sizemax 50000 -p 0 --pctsize {0,0.7}
+```
+
+### Version History
+
+| Version | Commit | INS recall (p=0) | INS FN | Key changes |
+|---------|--------|-----------------|--------|-------------|
+| V36o | — | ~52% (pilot) | — | Initial INS calling, read-graph + soft-clip + reversed-BP + large-ins + hit-depth + flank-gap + covdrop-indirect + CIGAR-covdrop |
+| V36p | `9dc0282` | ~78% (pilot) | — | Added early-CIGAR INS calls (≥3 reads, ≥30bp) and indirect-covdrop fallback |
+| V36q | `91e2134` | 96.6% | 606 | Widened soft-clip pairing gap [-200,200], improved indirect-covdrop position (soft-clip midpoint), added softclip-unpaired fallback |
+| V36r | `66ce950` | **98.98%** | **183** | Relaxed indirect-covdrop from bestStrong==nullptr to insertionCallRegions.empty(), added zero-anchor soft-clip INS detection |
+
+### Current State (V36r)
+
+**Truvari results:**
+
+| | pctsize=0 | pctsize=0.7 |
+|---|---|---|
+| INS TP-base | 17,830 | 9,370 |
+| INS FN | 183 | 8,643 |
+| INS recall | **98.98%** | 52.0% |
+| INS precision | 98.4% | 38.2% |
+| DEL recall | **100%** | 99.5% |
+| DEL FN | 0 | 52 |
+
+### Active INS Sources (in order of call volume)
+
+| Source | Calls | Description |
+|--------|-------|-------------|
+| soft-clip | 912,000+ | Paired soft-clip de Bruijn assembly; widened gap [-200,200] |
+| early-CIGAR | 15,800+ | CIGAR-based INS ≥30bp with ≥3 reads |
+| indirect-covdrop | 15,200+ | Fallback: indirect read bases / coverage when no INS call exists |
+| read-graph | 10,800+ | BFS path measurement through read graph |
+| reversed-BP | 2,900+ | Reversed breakpoint orientation detection |
+| CIGAR-covdrop | 1,800+ | CIGAR INS corroborated by coverage drop |
+| large-ins | 1,000+ | Strong breakpoint with partner, path-based sizing |
+| large-ins-single | 1,000+ | Single strong breakpoint, no partner |
+| large-ins-het | 850+ | Heterozygous large insertion |
+| large-ins-single-het | 900+ | Heterozygous single-BP large insertion |
+| softclip-unpaired | 580+ | Unpaired soft-clip fallback when no other INS source fires |
+| flank-gap | 400 | Flank gap measurement |
+| flank-gap-rounded | 390 | Rounded flank gap |
+| hit-depth | 110 | Hit-depth-only breakpoint |
+| covdrop-indirect | 9 | Coverage drop with indirect reads |
+
+### INS Detection Architecture
+
+1. **parseBamEvidence** — extracts soft-clip breakpoints and CIGAR indels from BAM reads
+2. **early-CIGAR** — emits INS calls from CIGAR clusters (≥3 reads, ≥30bp) before MSA
+3. **Zero-anchor early exit** — when allRefOrdinals < 2, checks paired/unpaired soft-clips before skipping MSA
+4. **MSA alignment + read classification** — classifies reads as REF/INS/DEL/UNK via diagonal analysis
+5. **Read-graph BFS** — finds insertion-internal reads via graph traversal
+6. **Breakpoint analysis** — coverage-drop, hit-depth, VNTR detection
+7. **Path-based INS sizing** — BFS paths through read graph for size estimation
+8. **indirect-covdrop fallback** — when no INS call exists but ≥10 indirect reads, estimates size from indirect bases / coverage; position from soft-clip midpoint > HitDepth drop > region center
+9. **softclip-unpaired fallback** — when allInsCalls is empty and strong soft-clip clusters exist
+
+### Key Design Decisions
+
+- **All-vs-all chaining** (`referenceReadCount = 0`): Required for INS read graph. Read-vs-ref-only chaining (used for DEL-only V36n) misses read-to-read connections needed for BFS path measurement.
+- **Soft-clip pairing gap [-200, 200]**: Widened from [-10, 50] to catch cases where L/R clips are further apart or in unexpected order due to insertion complexity.
+- **indirect-covdrop position hierarchy**: soft-clip midpoint > HitDepth drop > region center. Soft-clip positions are base-precise; HitDepth drops can be hundreds of bp off.
+- **insertionCallRegions.empty() guard**: The indirect-covdrop fallback fires whenever no INS call was emitted, regardless of whether a strong breakpoint was found. Previously, a false-positive strong BP at the region edge would block the fallback.
+
+### Remaining 183 FN (pctsize=0)
+
+Primarily cases with no detectable evidence in the reads — no soft-clips, no CIGAR indels, no indirect reads. The insertion sequence doesn't share k-mers with the reference, and reads spanning the insertion don't produce alignment artifacts detectable by the current pipeline.
+
+### Size Estimation Gap
+
+Recall drops from 99.0% → 52.0% when requiring size match within 30% (pctsize=0.7). Root causes:
+- **soft-clip**: clip length underestimates true insertion size (only captures the portion of the insertion that extends beyond the read alignment)
+- **indirect-covdrop**: size = indirect_bases / coverage is a rough estimate
+- **read-graph BFS**: limited by 250bp read length; can't span insertions >~500bp
+
+Improving size accuracy would require assembled contigs spanning the insertion, which is fundamentally limited by 2×250bp read lengths for large insertions.
+
+### Cluster Paths and Binaries
+
+- **Binaries**: `dinara_v36{o,p,q,r}_ins` in `/sc1/groups/sbx/workspace/kyriakik/data/tools/`
+- **INS pilot cases** (100): `/sc1/groups/sbx/workspace/kyriakik/structural_variants/ins_pilot/cases/`
+- **INS pilot results**: `results_v36{o,p,q}/` in `.../ins_pilot/`
+- **Full INS cases** (26,101): `/sc1/groups/sbx/workspace/kyriakik/structural_variants/full_ins_eval/cases/`
+- **Full INS results**: `results_v36{q,r}/` in `.../full_ins_eval/`
+- **Full DEL results (regression)**: `results_v36{q,r}/` in `.../full_del_eval/`
+- **Analysis scripts**: `analyze_fast.py`, `ins_logs_to_vcf.py`, `analyze_fn.py`, `analyze_fn_deep.py` in `.../full_ins_eval/`
+- **Truth positions**: `all_ins_positions.tsv`, `case_list.txt` in `.../full_ins_eval/`
+- **Truvari run locally**: `/tmp/truvari_ins/` (truth_ins.vcf.gz, calls_v36r.vcf.gz, bench_v36r_p0/)
+- **samtools**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/samtools` (v1.21, compiled from source)
 
