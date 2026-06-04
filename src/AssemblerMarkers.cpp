@@ -120,13 +120,19 @@ static size_t getSyncmerMarkersForRead(
         // Even k: positions are (k+1)-mer positions. Adjust to k-mer positions
         // based on canonicality of each (k+1)-mer.
         // Since k_scan is odd, palindromes are impossible.
-        uint32_t lastPosition = UINT32_MAX;
+        //
+        // The position++ adjustment for non-canonical (k+1)-mers can cause
+        // positions to become out-of-order. We first adjust all positions,
+        // then sort and deduplicate before processing.
+
+        // Adjust positions in-place in positionBuffer.
+        size_t adjustedCount = 0;
         for(size_t i = 0; i < uniqueCandidateCount; i++) {
             uint32_t position = positionBuffer[i];
             if(uint64_t(position) + uint64_t(k_scan) > baseCount) continue;
 
             // Efficient string-based canonicality check for (k+1)-mer.
-            // If canonical (forward < RC): take the prefix (position P). 
+            // If canonical (forward < RC): take the prefix (position P).
             // If non-canonical: take the suffix (position P+1).
             bool isCanonical = true;
             for(int j=0; j < k_scan; ++j) {
@@ -138,11 +144,19 @@ static size_t getSyncmerMarkersForRead(
             }
             if(!isCanonical) position++;
 
-            // Skip duplicate positions from the adjustment.
-            if(position == lastPosition) continue;
-            lastPosition = position;
-
             if(uint64_t(position) + uint64_t(k) > baseCount) continue;
+
+            positionBuffer[adjustedCount++] = position;
+        }
+
+        // Sort and deduplicate adjusted positions.
+        std::sort(positionBuffer.begin(), positionBuffer.begin() + adjustedCount);
+        adjustedCount = std::unique(positionBuffer.begin(),
+            positionBuffer.begin() + adjustedCount) - positionBuffer.begin();
+
+        // Now process the sorted, deduplicated positions.
+        for(size_t i = 0; i < adjustedCount; i++) {
+            const uint32_t position = positionBuffer[i];
 
             if(!kmerChecker) {
                 if(validMarkers) {
@@ -325,6 +339,12 @@ static size_t getMinimizerMarkersForRead(
         readSequence.size());
     positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
     free_minimizer_list(minimizerList);
+
+    // Sort and deduplicate positions to guarantee monotonic ordering.
+    std::sort(positionBuffer.begin(), positionBuffer.end());
+    positionBuffer.erase(
+        std::unique(positionBuffer.begin(), positionBuffer.end()),
+        positionBuffer.end());
 
     const size_t uniqueCandidateCount = positionBuffer.size();
 
