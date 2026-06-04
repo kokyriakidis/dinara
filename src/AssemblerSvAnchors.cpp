@@ -4388,13 +4388,107 @@ void Assembler::buildSvMSA(
                                       / coverage)
                             : 0;
                         if(estSize >= 50) {
-                            // Position: prefer soft-clip midpoint,
-                            // then HitDepth drop, then region center.
+                            // Position: prefer HitDepth cluster
+                            // center (most reliable for insertions),
+                            // then soft-clip midpoint near the
+                            // HitDepth cluster, then soft-clip
+                            // midpoint alone, then region center.
                             uint32_t bpPos =
                                 uint32_t(refLength / 2);
-                            bool posFromSoftClip = false;
-                            if(softClipBPs.size() >= 2) {
-                                // Use the two strongest clusters.
+                            bool posSet = false;
+
+                            // 1. HitDepth cluster center: group
+                            //    consecutive HitDepth breakpoints
+                            //    (within 100bp) and use the center
+                            //    of the largest cluster.
+                            if(!hitDepthBreakpoints.empty()) {
+                                // Sort by position.
+                                vector<uint32_t> hdPositions;
+                                hdPositions.reserve(
+                                    hitDepthBreakpoints.size());
+                                for(const auto& hbp :
+                                    hitDepthBreakpoints) {
+                                    hdPositions.push_back(
+                                        hbp.refPos);
+                                }
+                                sort(hdPositions.begin(),
+                                     hdPositions.end());
+
+                                // Cluster consecutive positions
+                                // (gap <= 100bp).
+                                uint32_t bestClusterStart = 0;
+                                uint32_t bestClusterEnd = 0;
+                                uint32_t bestClusterSize = 0;
+                                uint32_t curStart = hdPositions[0];
+                                uint32_t curEnd = hdPositions[0];
+                                uint32_t curSize = 1;
+                                for(size_t hi = 1;
+                                    hi < hdPositions.size(); ++hi) {
+                                    if(hdPositions[hi]
+                                       <= curEnd + 100) {
+                                        curEnd = hdPositions[hi];
+                                        ++curSize;
+                                    } else {
+                                        if(curSize
+                                           > bestClusterSize) {
+                                            bestClusterStart =
+                                                curStart;
+                                            bestClusterEnd = curEnd;
+                                            bestClusterSize =
+                                                curSize;
+                                        }
+                                        curStart = hdPositions[hi];
+                                        curEnd = hdPositions[hi];
+                                        curSize = 1;
+                                    }
+                                }
+                                if(curSize > bestClusterSize) {
+                                    bestClusterStart = curStart;
+                                    bestClusterEnd = curEnd;
+                                    bestClusterSize = curSize;
+                                }
+
+                                if(bestClusterSize >= 2) {
+                                    uint32_t hdCenter =
+                                        (bestClusterStart
+                                         + bestClusterEnd) / 2;
+
+                                    // Check if a soft-clip is near
+                                    // the HitDepth cluster (within
+                                    // 300bp). If so, prefer the
+                                    // soft-clip position (more
+                                    // precise).
+                                    const SoftClipBreakpoint*
+                                        nearestSc = nullptr;
+                                    uint32_t nearestScDist =
+                                        UINT32_MAX;
+                                    for(const auto& sc :
+                                        softClipBPs) {
+                                        if(sc.readCount < 3)
+                                            continue;
+                                        uint32_t d =
+                                            (sc.refPos > hdCenter)
+                                            ? sc.refPos - hdCenter
+                                            : hdCenter - sc.refPos;
+                                        if(d < nearestScDist) {
+                                            nearestScDist = d;
+                                            nearestSc = &sc;
+                                        }
+                                    }
+                                    if(nearestSc != nullptr
+                                       && nearestScDist <= 300) {
+                                        bpPos = nearestSc->refPos;
+                                    } else {
+                                        bpPos = hdCenter;
+                                    }
+                                    posSet = true;
+                                }
+                            }
+
+                            // 2. Soft-clip midpoint (fallback when
+                            //    no HitDepth cluster).
+                            if(!posSet
+                               && softClipBPs.size() >= 2) {
                                 uint32_t best1 = 0, best2 = 0;
                                 uint32_t pos1 = 0, pos2 = 0;
                                 for(const auto& sc : softClipBPs) {
@@ -4402,23 +4496,27 @@ void Assembler::buildSvMSA(
                                         best2 = best1; pos2 = pos1;
                                         best1 = sc.readCount;
                                         pos1 = sc.refPos;
-                                    } else if(sc.readCount > best2) {
+                                    } else if(sc.readCount
+                                              > best2) {
                                         best2 = sc.readCount;
                                         pos2 = sc.refPos;
                                     }
                                 }
                                 if(best2 >= 3) {
                                     bpPos = (pos1 + pos2) / 2;
-                                    posFromSoftClip = true;
+                                    posSet = true;
                                 }
                             }
-                            if(!posFromSoftClip
+                            if(!posSet
                                && softClipBPs.size() == 1
                                && softClipBPs[0].readCount >= 3) {
                                 bpPos = softClipBPs[0].refPos;
-                                posFromSoftClip = true;
+                                posSet = true;
                             }
-                            if(!posFromSoftClip
+
+                            // 3. Single HitDepth drop (last resort
+                            //    before region center).
+                            if(!posSet
                                && !hitDepthBreakpoints.empty()) {
                                 double bestDrop = 1.0;
                                 for(const auto& hbp :
@@ -4461,12 +4559,89 @@ void Assembler::buildSvMSA(
                         ? int64_t(double(indirectBases) / coverage)
                         : 0;
                     if(estSize >= 50) {
-                        // Position: prefer soft-clip midpoint,
-                        // then HitDepth drop, then region center.
+                        // Position: prefer HitDepth cluster center,
+                        // then soft-clip near cluster, then
+                        // soft-clip midpoint, then region center.
                         uint32_t bpPos =
                             uint32_t(refLength / 2);
-                        bool posFromSoftClip = false;
-                        if(softClipBPs.size() >= 2) {
+                        bool posSet = false;
+
+                        // 1. HitDepth cluster center.
+                        if(!hitDepthBreakpoints.empty()) {
+                            vector<uint32_t> hdPositions;
+                            hdPositions.reserve(
+                                hitDepthBreakpoints.size());
+                            for(const auto& hbp :
+                                hitDepthBreakpoints) {
+                                hdPositions.push_back(hbp.refPos);
+                            }
+                            sort(hdPositions.begin(),
+                                 hdPositions.end());
+
+                            uint32_t bestClusterStart = 0;
+                            uint32_t bestClusterEnd = 0;
+                            uint32_t bestClusterSize = 0;
+                            uint32_t curStart = hdPositions[0];
+                            uint32_t curEnd = hdPositions[0];
+                            uint32_t curSize = 1;
+                            for(size_t hi = 1;
+                                hi < hdPositions.size(); ++hi) {
+                                if(hdPositions[hi]
+                                   <= curEnd + 100) {
+                                    curEnd = hdPositions[hi];
+                                    ++curSize;
+                                } else {
+                                    if(curSize
+                                       > bestClusterSize) {
+                                        bestClusterStart =
+                                            curStart;
+                                        bestClusterEnd = curEnd;
+                                        bestClusterSize = curSize;
+                                    }
+                                    curStart = hdPositions[hi];
+                                    curEnd = hdPositions[hi];
+                                    curSize = 1;
+                                }
+                            }
+                            if(curSize > bestClusterSize) {
+                                bestClusterStart = curStart;
+                                bestClusterEnd = curEnd;
+                                bestClusterSize = curSize;
+                            }
+
+                            if(bestClusterSize >= 2) {
+                                uint32_t hdCenter =
+                                    (bestClusterStart
+                                     + bestClusterEnd) / 2;
+                                const SoftClipBreakpoint*
+                                    nearestSc = nullptr;
+                                uint32_t nearestScDist =
+                                    UINT32_MAX;
+                                for(const auto& sc :
+                                    softClipBPs) {
+                                    if(sc.readCount < 3) continue;
+                                    uint32_t d =
+                                        (sc.refPos > hdCenter)
+                                        ? sc.refPos - hdCenter
+                                        : hdCenter - sc.refPos;
+                                    if(d < nearestScDist) {
+                                        nearestScDist = d;
+                                        nearestSc = &sc;
+                                    }
+                                }
+                                if(nearestSc != nullptr
+                                   && nearestScDist <= 300) {
+                                    bpPos = nearestSc->refPos;
+                                } else {
+                                    bpPos = hdCenter;
+                                }
+                                posSet = true;
+                            }
+                        }
+
+                        // 2. Soft-clip midpoint fallback.
+                        if(!posSet
+                           && softClipBPs.size() >= 2) {
                             uint32_t best1 = 0, best2 = 0;
                             uint32_t pos1 = 0, pos2 = 0;
                             for(const auto& sc : softClipBPs) {
@@ -4481,16 +4656,18 @@ void Assembler::buildSvMSA(
                             }
                             if(best2 >= 3) {
                                 bpPos = (pos1 + pos2) / 2;
-                                posFromSoftClip = true;
+                                posSet = true;
                             }
                         }
-                        if(!posFromSoftClip
+                        if(!posSet
                            && softClipBPs.size() == 1
                            && softClipBPs[0].readCount >= 3) {
                             bpPos = softClipBPs[0].refPos;
-                            posFromSoftClip = true;
+                            posSet = true;
                         }
-                        if(!posFromSoftClip
+
+                        // 3. Single HitDepth drop.
+                        if(!posSet
                            && !hitDepthBreakpoints.empty()) {
                             double bestDrop = 1.0;
                             for(const auto& hbp :
