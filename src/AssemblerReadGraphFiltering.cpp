@@ -975,6 +975,110 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
     }
 }
 
+void Assembler::deleteInternalOverlapsExtended(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
+{
+    cout << timestamp << "Deleting internal overlaps with extended coordinates (maxHang=" << maxHang
+         << ", maxHangRate=" << maxHangRate << ", minOverlapLength=" << minOverlapLength << ")." << endl;
+
+    if (threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    hangingFilterMaxHang = maxHang;
+    hangingFilterMaxHangRate = maxHangRate;
+    hangingFilterMinOverlap = minOverlapLength;
+
+    uint64_t deletedBefore = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
+            ++deletedBefore;
+        }
+    }
+
+    setupLoadBalancing(alignmentData.size(), 10000);
+    runThreads(&Assembler::deleteInternalOverlapsExtendedThreadFunction, threadCount);
+
+    uint64_t deletedAfter = 0;
+    for (const auto& ad : alignmentData) {
+        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
+            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
+            ++deletedAfter;
+        }
+    }
+
+    cout << timestamp << "Internal overlaps (extended): " << (deletedAfter - deletedBefore) << " deleted ("
+         << deletedAfter << " total)." << endl;
+}
+
+void Assembler::deleteInternalOverlapsExtendedThreadFunction(size_t threadId)
+{
+    static_cast<void>(threadId);
+    uint64_t begin, end;
+    const uint64_t maxHang = this->hangingFilterMaxHang;
+    const double maxHangRate = this->hangingFilterMaxHangRate;
+    const uint64_t minOvlp = this->hangingFilterMinOverlap;
+
+    while (getNextBatch(begin, end)) {
+        for (uint64_t i = begin; i != end; i++) {
+            AlignmentData& ad = alignmentData[i];
+
+            if (!ad.keptByBothSides()) continue;
+
+            const ReadId queryId  = ad.readIds[0];
+            const ReadId targetId = ad.readIds[1];
+            const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
+            const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
+
+            // Start from stored CIGAR boundary positions.
+            uint32_t qs = ad.qs;
+            uint32_t qe = ad.qe;
+            uint32_t ts = ad.ts;
+            uint32_t te = ad.te;
+
+            // For RC overlaps, convert target forward coords to oriented
+            // (RC) coords before extension, then convert back after.
+            if (!ad.isSameStrand) {
+                auto p = dinara::rcIntervalToForward(targetLen, ts, te);
+                ts = p.first;
+                te = p.second;
+            }
+
+            // Extend toward read tips (hifiasm's append_inexact_overlap_region_alloc).
+            // Extend start: shorter overhang goes to 0.
+            if(qs <= ts) { ts -= qs; qs = 0; }
+            else         { qs -= ts; ts = 0; }
+
+            // Extend end: shorter remaining goes to read length.
+            const int64_t qr = int64_t(queryLen) - int64_t(qe);
+            const int64_t tr = int64_t(targetLen) - int64_t(te);
+            if(qr <= tr) { qe = queryLen; te += uint32_t(qr); }
+            else         { te = targetLen; qe += uint32_t(tr); }
+
+            // Convert target back to forward coords if RC.
+            if (!ad.isSameStrand) {
+                auto p = dinara::rcIntervalToForward(targetLen, ts, te);
+                ts = p.first;
+                te = p.second;
+            }
+
+            if (qe <= qs || te <= ts) continue;
+
+            const int classification = ma_hit2arc(
+                (int32_t)qs,  (int32_t)qe,  (int32_t)queryLen,
+                (int32_t)ts,  (int32_t)te,  (int32_t)targetLen,
+                !ad.isSameStrand,
+                (int32_t)maxHang,
+                maxHangRate,
+                (int32_t)minOvlp);
+
+            if (classification == MA_HT_INT || classification == MA_HT_SHORT_OVLP) {
+                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
+            }
+        }
+    }
+}
+
 /*
 filterHangingOverlapsThreadFunction: alternative thread function that uses
 coverage-trimmed read lengths (validReadIntervals) instead of raw lengths.
