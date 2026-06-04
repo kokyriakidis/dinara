@@ -1319,20 +1319,25 @@ truvari bench -b truth_ins.vcf.gz -c calls.vcf.gz \
 | V36o | — | ~52% (pilot) | — | Initial INS calling, read-graph + soft-clip + reversed-BP + large-ins + hit-depth + flank-gap + covdrop-indirect + CIGAR-covdrop |
 | V36p | `9dc0282` | ~78% (pilot) | — | Added early-CIGAR INS calls (≥3 reads, ≥30bp) and indirect-covdrop fallback |
 | V36q | `91e2134` | 96.6% | 606 | Widened soft-clip pairing gap [-200,200], improved indirect-covdrop position (soft-clip midpoint), added softclip-unpaired fallback |
-| V36r | `66ce950` | **98.98%** | **183** | Relaxed indirect-covdrop from bestStrong==nullptr to insertionCallRegions.empty(), added zero-anchor soft-clip INS detection |
+| V36r | `66ce950` | 98.33% | 353 | Relaxed indirect-covdrop from bestStrong==nullptr to insertionCallRegions.empty(), added zero-anchor soft-clip INS detection |
+| V36s | `4b396d0` | **98.64%** | **287** | Fixed bad-segment soft-clip INS detection, fixed parseBamEvidence genomic coordinate leak |
 
-### Current State (V36r)
+### Current State (V36s)
 
-**Truvari results:**
+**Truvari results (stvar v5.0q truth, 28,942 INS / 17,562 DEL ≥50bp):**
 
-| | pctsize=0 | pctsize=0.7 |
-|---|---|---|
-| INS TP-base | 17,830 | 9,370 |
-| INS FN | 183 | 8,643 |
-| INS recall | **98.98%** | 52.0% |
-| INS precision | 98.4% | 38.2% |
-| DEL recall | **100%** | 99.5% |
-| DEL FN | 0 | 52 |
+| | pctsize=0 |
+|---|---|
+| INS TP-base | 20,793 |
+| INS FN | 287 |
+| INS recall | **98.64%** |
+| DEL TP-base | 10,198 |
+| DEL FN | 1,740 |
+| DEL recall | 85.42% |
+
+Note: DEL recall is 85.42% because only 10,173 of 17,562 truth DELs have extracted cases. All extracted cases are detected (100% within-case recall). The 1,740 FN are truth entries without corresponding case extractions.
+
+Note: V36r recall was previously reported as 98.98% using a filtered truth subset (18,013 entries). With the full stvar truth (28,942 entries), V36r recall is 98.33% (353 FN). V36s improves to 98.64% (287 FN) — 66 fewer FN.
 
 ### Active INS Sources (in order of call volume)
 
