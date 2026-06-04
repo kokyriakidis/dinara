@@ -188,16 +188,29 @@ void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) c
     DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
     DINARA_ASSERT(journeyPositions.size() == orientedReadIds.size());
 
+    // Also get ordinals for diagnostic.
+    const Shasta2Anchor anchorA = anchors[anchorIdA];
+    const Shasta2Anchor anchorB = anchors[anchorIdB];
+
     for(uint64_t i = 0; i < orientedReadIds.size(); i++) {
         const auto& p = anchorPositions[i];
         const auto& jp = journeyPositions[i];
         if(p.second < p.first) {
+            // Find ordinals for this read in both anchors.
+            uint32_t ordA = 0, ordB = 0;
+            for(auto it = anchorA.begin(); it != anchorA.end(); ++it) {
+                if(it->orientedReadId == orientedReadIds[i]) { ordA = it->ordinal; break; }
+            }
+            for(auto it = anchorB.begin(); it != anchorB.end(); ++it) {
+                if(it->orientedReadId == orientedReadIds[i]) { ordB = it->ordinal; break; }
+            }
             cout << "Negative base offset on edge "
                  << anchorIdA << " -> " << anchorIdB
                  << ": " << orientedReadIds[i]
                  << " basePos A=" << p.first << " B=" << p.second
                  << " (offset " << int64_t(p.second) - int64_t(p.first) << ")"
                  << " journeyPos A=" << jp.first << " B=" << jp.second
+                 << " ordinal A=" << ordA << " B=" << ordB
                  << endl;
             DINARA_ASSERT(false);
         }
