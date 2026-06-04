@@ -1623,6 +1623,9 @@ void dinara::main::assemble(
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
 
+    // Dump detailed stats for the largest window's connections.
+    shasta2AnchorGraph->writeWindowConnectionStats(*shasta2Anchors, anchorWindows, *shasta2Journeys);
+
     // Clean the anchor graph.
     shasta2AnchorGraph->removeRcWindowConnections();
     // shasta2AnchorGraph->windowTransitiveReduction();
