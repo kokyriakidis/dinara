@@ -2679,6 +2679,162 @@ void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
 }
 
 
+void Shasta2AnchorGraph::writeWindowConnectionStats(
+    const Shasta2Anchors& anchors,
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys) const
+{
+    const Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Find the biggest window by baseSpan.
+    uint32_t biggestWindow = 0;
+    uint64_t biggestSpan = 0;
+    for(uint32_t w = 0; w < windowCount; w++) {
+        if(anchorWindows[w].baseSpan > biggestSpan) {
+            biggestSpan = anchorWindows[w].baseSpan;
+            biggestWindow = w;
+        }
+    }
+
+    const auto& window = anchorWindows[biggestWindow];
+    const uint32_t bbBegin = window.backboneBegin;
+    const uint32_t bbEnd = window.backboneEnd;
+    const uint32_t bbAnchors = bbEnd - bbBegin;
+
+    cout << "\n=== Window connection stats for window " << biggestWindow
+         << " (baseSpan=" << biggestSpan
+         << ", backboneAnchors=" << bbAnchors
+         << ", backbone=" << window.backboneOrientedReadId
+         << ", prevWindow=" << window.backbonePreviousWindow
+         << ", nextWindow=" << window.backboneNextWindow
+         << ") ===" << endl;
+
+    // Collect all inter-window edges involving this window.
+    struct NeighborEdgeInfo {
+        uint32_t neighborNormWindow;
+        bool isOutgoing; // true = this window is source
+        edge_descriptor e;
+        uint64_t coverage;
+        uint64_t offset;
+        uint64_t sharedReadCount;
+        uint64_t spanInThis;  // supportingSpan on this window's side
+        uint64_t spanInOther; // supportingSpan on neighbor's side
+        Shasta2AnchorId anchorInThis;
+        Shasta2AnchorId anchorInOther;
+    };
+    vector<NeighborEdgeInfo> edgeInfos;
+
+    BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
+        if(!anchorGraph[e].useForAssembly) continue;
+        const uint64_t src = uint64_t(source(e, anchorGraph));
+        const uint64_t dst = uint64_t(target(e, anchorGraph));
+        if(src >= anchorCount || dst >= anchorCount) continue;
+        const uint32_t srcWin = anchorToWindow[src];
+        const uint32_t dstWin = anchorToWindow[dst];
+        if(srcWin == noWindow || dstWin == noWindow) continue;
+        const uint32_t srcNorm = normalizeW(srcWin);
+        const uint32_t dstNorm = normalizeW(dstWin);
+        if(srcNorm == dstNorm) continue;
+
+        const auto& edge = anchorGraph[e];
+
+        if(srcNorm == biggestWindow) {
+            edgeInfos.push_back({
+                dstNorm, true, e,
+                edge.coverage(), edge.offset, edge.sharedReadCount,
+                edge.supportingSpanPrev, edge.supportingSpanNext,
+                Shasta2AnchorId(src), Shasta2AnchorId(dst)
+            });
+        } else if(dstNorm == biggestWindow) {
+            edgeInfos.push_back({
+                srcNorm, false, e,
+                edge.coverage(), edge.offset, edge.sharedReadCount,
+                edge.supportingSpanNext, edge.supportingSpanPrev,
+                Shasta2AnchorId(dst), Shasta2AnchorId(src)
+            });
+        }
+    }
+
+    // Group by neighbor window.
+    std::map<uint32_t, vector<const NeighborEdgeInfo*>> byNeighbor;
+    for(const auto& info : edgeInfos) {
+        byNeighbor[info.neighborNormWindow].push_back(&info);
+    }
+
+    cout << "Total inter-window edges: " << edgeInfos.size()
+         << " to " << byNeighbor.size() << " neighbor windows." << endl;
+
+    // For each neighbor, show details.
+    for(const auto& [neighborW, infos] : byNeighbor) {
+        const bool neighborIsBackbonePrev =
+            (window.backbonePreviousWindow != AnchorWindowReadInterval::noWindow &&
+             normalizeW(window.backbonePreviousWindow) == neighborW);
+        const bool neighborIsBackboneNext =
+            (window.backboneNextWindow != AnchorWindowReadInterval::noWindow &&
+             normalizeW(window.backboneNextWindow) == neighborW);
+
+        cout << "\n  Neighbor window " << neighborW
+             << " (baseSpan=" << anchorWindows[neighborW].baseSpan << ")";
+        if(neighborIsBackbonePrev) cout << " [BACKBONE-PREV]";
+        if(neighborIsBackboneNext) cout << " [BACKBONE-NEXT]";
+        cout << ":" << endl;
+
+        for(const auto* info : infos) {
+            const string dir = info->isOutgoing ? "OUT" : "IN";
+
+            // Find backbone position of the anchor in this window.
+            const uint64_t anchorInThisId = uint64_t(info->anchorInThis);
+            const auto bbJourney = journeys[window.backboneOrientedReadId];
+            uint32_t bbPos = std::numeric_limits<uint32_t>::max();
+            for(uint32_t p = bbBegin; p < bbEnd; p++) {
+                if(uint64_t(bbJourney[p]) == anchorInThisId) {
+                    bbPos = p;
+                    break;
+                }
+            }
+
+            // Position relative to backbone: how far from start/end.
+            const string posLabel = (bbPos != std::numeric_limits<uint32_t>::max())
+                ? ("bbPos=" + std::to_string(bbPos) +
+                   " fromStart=" + std::to_string(bbPos - bbBegin) +
+                   " fromEnd=" + std::to_string(bbEnd - 1 - bbPos))
+                : "bbPos=N/A";
+
+            cout << "    " << dir
+                 << " cov=" << info->coverage
+                 << " offset=" << info->offset
+                 << " sharedReads=" << info->sharedReadCount
+                 << " spanInThis=" << info->spanInThis
+                 << " spanInOther=" << info->spanInOther
+                 << " anchorInThis=" << anchorInThisId
+                 << " anchorInOther=" << uint64_t(info->anchorInOther)
+                 << " " << posLabel
+                 << endl;
+        }
+    }
+
+    // Show transition reads summary.
+    cout << "\n  Transition reads (from transitionReads map):" << endl;
+    for(const auto& [key, reads] : window.transitionReads) {
+        const uint32_t prev = key.first;
+        const uint32_t next = key.second;
+        const string prevStr = (prev == AnchorWindowReadInterval::noWindow)
+            ? "START" : std::to_string(normalizeW(prev));
+        const string nextStr = (next == AnchorWindowReadInterval::noWindow)
+            ? "END" : std::to_string(normalizeW(next));
+        cout << "    " << prevStr << " -> [" << biggestWindow << "] -> " << nextStr
+             << " : " << reads.size() << " reads" << endl;
+    }
+
+    cout << "=== End window " << biggestWindow << " stats ===\n" << endl;
+}
+
+
 uint64_t Shasta2AnchorGraph::windowTransitiveReduction()
 {
     Shasta2AnchorGraph& anchorGraph = *this;

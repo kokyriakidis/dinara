@@ -145,6 +145,12 @@ public:
     // remove A→C (the direct edge is redundant).
     uint64_t windowTransitiveReduction();
 
+    // Dump detailed connection statistics for the largest window.
+    void writeWindowConnectionStats(
+        const Shasta2Anchors& anchors,
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys) const;
+
     // Disable all edges of windows that have no active inter-window edges.
     // Returns the number of isolated windows removed.
     uint64_t removeIsolatedWindows(
