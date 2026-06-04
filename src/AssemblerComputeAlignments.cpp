@@ -12,6 +12,7 @@
 #include "ProjectedAlignment.hpp"
 #include "AlignedEvidenceStore.hpp"
 #include "Reads.hpp"
+#include "hifiasmCoordinateTransforms.hpp"
 #include "span.hpp"
 #include "timestamp.hpp"
 
@@ -487,18 +488,39 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
 
             AlignmentData thisAlignmentData(candidate, alignmentInfo);
             
-            // Store CIGAR boundary positions (marker-based, not extended).
-            // read0 is always strand 0 → forward coordinates.
-            thisAlignmentData.qs = projectedAlignment.cigarRead0Start;
-            thisAlignmentData.qe = projectedAlignment.cigarRead0End;
-            // read1 may be strand 1 → convert oriented coords to forward.
-            if (candidate.isSameStrand) {
-                thisAlignmentData.ts = projectedAlignment.cigarRead1Start;
-                thisAlignmentData.te = projectedAlignment.cigarRead1End;
-            } else {
-                const uint32_t tLen = uint32_t(sequenceViews[1].baseCount);
-                thisAlignmentData.ts = tLen - projectedAlignment.cigarRead1End;
-                thisAlignmentData.te = tLen - projectedAlignment.cigarRead1Start;
+            // Store extended overlap coordinates (hifiasm parity).
+            // Start from CIGAR boundary positions, then extend toward
+            // read tips so the shorter overhang side reaches 0 / readLen.
+            {
+                uint32_t qs = projectedAlignment.cigarRead0Start;
+                uint32_t qe = projectedAlignment.cigarRead0End;
+                uint32_t ts = projectedAlignment.cigarRead1Start;
+                uint32_t te = projectedAlignment.cigarRead1End;
+                const uint32_t len0 = uint32_t(sequenceViews[0].baseCount);
+                const uint32_t len1 = uint32_t(sequenceViews[1].baseCount);
+
+                // Extend start: shorter overhang goes to 0.
+                if(qs <= ts) { ts -= qs; qs = 0; }
+                else         { qs -= ts; ts = 0; }
+
+                // Extend end: shorter remaining goes to read length.
+                const int64_t qr = int64_t(len0) - int64_t(qe);
+                const int64_t tr = int64_t(len1) - int64_t(te);
+                if(qr <= tr) { qe = len0; te += uint32_t(qr); }
+                else         { te = len1; qe += uint32_t(tr); }
+
+                thisAlignmentData.qs = qs;
+                thisAlignmentData.qe = qe;
+
+                // Target coords are in oriented frame; convert to forward if RC.
+                if(!candidate.isSameStrand) {
+                    const auto p = dinara::rcIntervalToForward(len1, ts, te);
+                    thisAlignmentData.ts = p.first;
+                    thisAlignmentData.te = p.second;
+                } else {
+                    thisAlignmentData.ts = ts;
+                    thisAlignmentData.te = te;
+                }
             }
             
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
