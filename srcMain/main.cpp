@@ -1053,12 +1053,13 @@ void dinara::main::assemble(
     // // createMarkerGraphVertices, which skips chimeric reads.
     // assembler.detectChimericReads(threadCount);
 
-    // // Delete internal overlaps — overlaps where both reads extend
-    // // significantly beyond the aligned region on the same side. These
-    // // are not dovetail overlaps but interior matches, typically from
-    // // shared repeat elements. Also removes overlaps shorter than
-    // // minOverlapLength. Uses the extended qs/qe/ts/te coordinates.
-    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // Delete internal overlaps — overlaps where both reads extend
+    // significantly beyond the aligned region on the same side.
+    // Two variants:
+    //   deleteInternalOverlaps:         uses stored CIGAR boundary coords (stricter)
+    //   deleteInternalOverlapsExtended: extends coords toward read tips first (hifiasm parity)
+    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.deleteInternalOverlapsExtended(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
