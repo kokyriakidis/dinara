@@ -118,6 +118,7 @@ public:
 
     // Assert that no reads have negative base offsets (anchorB position < anchorA position).
     void assertNoNegativeOffsets(const Shasta2Anchors&) const;
+    bool hasNegativeOffsets(const Shasta2Anchors&) const;
 
     bool contains(OrientedReadId) const;
 

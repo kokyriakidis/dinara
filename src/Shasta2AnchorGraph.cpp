@@ -616,8 +616,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
 
         Shasta2AnchorPair anchorPair(anchors, bestLastInA, bestFirstInB, false);
-        anchorPair.assertNoNegativeOffsets(anchors);
         if(anchorPair.size() == 0) {
+            ++interWindowZeroPairs;
+            continue;
+        }
+        if(anchorPair.hasNegativeOffsets(anchors)) {
             ++interWindowZeroPairs;
             continue;
         }

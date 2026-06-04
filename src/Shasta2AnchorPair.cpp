@@ -197,6 +197,16 @@ void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) c
     }
 }
 
+bool Shasta2AnchorPair::hasNegativeOffsets(const Shasta2Anchors& anchors) const
+{
+    vector< pair<uint32_t, uint32_t> > anchorPositions;
+    getAnchorPositions(anchors, anchorPositions);
+    for(const auto& p : anchorPositions) {
+        if(p.second < p.first) return true;
+    }
+    return false;
+}
+
 
 // Same as the above, but also returns compute the sequences.
 void Shasta2AnchorPair::get(
