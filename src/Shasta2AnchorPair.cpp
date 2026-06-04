@@ -53,11 +53,13 @@ Shasta2AnchorPair::Shasta2AnchorPair(
         DINARA_ASSERT(orientedReadId == itB->orientedReadId);
 
         if(adjacentInJourney) {
-            if(itB->positionInJourney == itA->positionInJourney + 1) {
+            if(itB->positionInJourney == itA->positionInJourney + 1 &&
+               itB->position >= itA->position) {
                 orientedReadIds.push_back(orientedReadId);
             }
         } else {
-            if(itB->positionInJourney > itA->positionInJourney) {
+            if(itB->positionInJourney > itA->positionInJourney &&
+               itB->position >= itA->position) {
                 orientedReadIds.push_back(orientedReadId);
             }
         }
