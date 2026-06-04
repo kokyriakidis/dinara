@@ -2679,7 +2679,7 @@ void Shasta2AnchorGraph::disableEdge(edge_descriptor e)
 }
 
 
-uint64_t Shasta2AnchorGraph::windowTransitiveReduction(uint64_t maxDistance)
+uint64_t Shasta2AnchorGraph::windowTransitiveReduction()
 {
     Shasta2AnchorGraph& anchorGraph = *this;
     const uint64_t anchorCount = num_vertices(anchorGraph);
@@ -2688,12 +2688,11 @@ uint64_t Shasta2AnchorGraph::windowTransitiveReduction(uint64_t maxDistance)
         return (w >= windowCount) ? (w - windowCount) : w;
     };
 
-    // Build a window-level adjacency list from active inter-window edges.
-    // Also collect all anchor-level edges per window pair.
+    // Build a window-level adjacency list and edge index.
     using WindowPairKey = std::pair<uint32_t, uint32_t>;
     std::set<WindowPairKey> windowEdges;
     std::map<WindowPairKey, vector<edge_descriptor>> windowPairEdges;
-    std::map<uint32_t, std::set<uint32_t>> windowAdj; // adjacency list
+    std::map<uint32_t, std::set<uint32_t>> windowAdj;
 
     BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
         if(!anchorGraph[e].useForAssembly) continue;
@@ -2711,49 +2710,23 @@ uint64_t Shasta2AnchorGraph::windowTransitiveReduction(uint64_t maxDistance)
         windowAdj[srcNorm].insert(dstNorm);
     }
 
-    // For each window edge A→C, BFS from A (excluding the direct A→C edge)
-    // to see if C is reachable within maxDistance hops.
+    // For each window edge A→C, check if there exists a window B
+    // such that A→B and B→C both exist (two-hop path).
+    // If so, A→C is a transitive edge and can be removed.
     std::set<WindowPairKey> redundant;
 
     for(const auto& [wA, wC] : windowEdges) {
-        // BFS from wA, up to maxDistance steps, not using the direct A→C edge.
-        std::set<uint32_t> visited;
-        std::queue<std::pair<uint32_t, uint64_t>> bfsQueue;
-        visited.insert(wA);
-
-        // Seed with all neighbors of A except C.
         auto itA = windowAdj.find(wA);
         if(itA == windowAdj.end()) continue;
-        for(const uint32_t neighbor : itA->second) {
-            if(neighbor == wC) continue; // skip direct edge
-            if(visited.insert(neighbor).second) {
-                bfsQueue.push({neighbor, 1});
-            }
-        }
 
-        bool found = false;
-        while(!bfsQueue.empty() && !found) {
-            auto [current, dist] = bfsQueue.front();
-            bfsQueue.pop();
-
-            if(current == wC) {
-                found = true;
+        for(const uint32_t wB : itA->second) {
+            if(wB == wC) continue;
+            // Check if B→C exists.
+            auto itB = windowAdj.find(wB);
+            if(itB != windowAdj.end() && itB->second.count(wC)) {
+                redundant.insert({wA, wC});
                 break;
             }
-
-            if(dist >= maxDistance) continue;
-
-            auto itCur = windowAdj.find(current);
-            if(itCur == windowAdj.end()) continue;
-            for(const uint32_t next : itCur->second) {
-                if(visited.insert(next).second) {
-                    bfsQueue.push({next, dist + 1});
-                }
-            }
-        }
-
-        if(found) {
-            redundant.insert({wA, wC});
         }
     }
 
@@ -2772,8 +2745,8 @@ uint64_t Shasta2AnchorGraph::windowTransitiveReduction(uint64_t maxDistance)
     }
 
     cout << "windowTransitiveReduction: found " << redundant.size()
-         << " redundant window pairs (maxDistance=" << maxDistance
-         << "), removed " << removedCount << " edges." << endl;
+         << " redundant window pairs, removed "
+         << removedCount << " edges." << endl;
     return removedCount;
 }
 

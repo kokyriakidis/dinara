@@ -143,8 +143,7 @@ public:
 
     // Window-level transitive reduction: if A→B→C exists and A→C also exists,
     // remove A→C (the direct edge is redundant).
-    // maxDistance limits the BFS depth when searching for alternate paths.
-    uint64_t windowTransitiveReduction(uint64_t maxDistance = 3);
+    uint64_t windowTransitiveReduction();
 
     // Disable all edges of windows that have no active inter-window edges.
     // Returns the number of isolated windows removed.
