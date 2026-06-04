@@ -593,25 +593,19 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             continue;
         }
 
+        // Pick the best transition: the one whose anchor pair has the
+        // highest coverage. This ensures both anchors come from the same
+        // read's transition, avoiding inconsistent anchor ordering.
         Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
         Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
-        uint32_t bestPosA = anchorToBackbonePos[uint64_t(bestLastInA)];
-        uint32_t bestPosB = anchorToBackbonePos[uint64_t(bestFirstInB)];
+        uint64_t bestCoverage = 0;
 
         for(const auto& t : transitions) {
-            const uint32_t posA = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
-            const uint32_t posB = anchorToBackbonePos[uint64_t(t.firstAnchorInB)];
-
-            // Latest in A: highest backbone position.
-            if(posA > bestPosA) {
+            const uint64_t cov = anchors.countCommon(t.lastAnchorInA, t.firstAnchorInB);
+            if(cov > bestCoverage) {
+                bestCoverage = cov;
                 bestLastInA = t.lastAnchorInA;
-                bestPosA = posA;
-            }
-
-            // Earliest in B: lowest backbone position.
-            if(posB < bestPosB) {
                 bestFirstInB = t.firstAnchorInB;
-                bestPosB = posB;
             }
         }
 
