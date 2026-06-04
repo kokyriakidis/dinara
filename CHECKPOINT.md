@@ -349,12 +349,29 @@ Detects structural variants (insertions and deletions) from short reads aligned 
 
 ```bash
 dinara --command svanchors \
-  --reference reference.fa --input reads.fa \
+  --reference reference.fa \
+  --input reads.fa \
+  --bam region.bam \
   --assemblyDirectory outdir \
-  --Reads.minReadLength 50 --Kmers.k 10 --Kmers.minimizerW 6
+  --Kmers.k 10 --Kmers.minimizerW 6
 ```
 
-Test cases: `/tmp/sv_cases/` with insertion directories at top level and deletion directories under `DEL_medium_100_500bp/`.
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--command svanchors` | yes | SV calling mode (not the default assembly mode) |
+| `--reference` | yes | Local reference FASTA for the region |
+| `--input` | yes | Reads FASTA extracted for the region |
+| `--bam` | yes | Region BAM — provides CIGAR indels, depth, and SA-tag evidence. Without this, most detection sources (early-CIGAR, covdrop, depth-scan) are missing. |
+| `--assemblyDirectory` | yes | Output directory. Must be unique per concurrent run to avoid `DinaraRun` conflicts. |
+| `--Kmers.k 10` | yes | K-mer size for minimizer markers |
+| `--Kmers.minimizerW 6` | yes | Minimizer window size |
+
+Output is written to stdout/stderr. SV calls appear as lines matching `>>> {INS,DEL} CALL`. Parse with:
+```bash
+grep -E ">>> .* CALL" output.log
+```
+
+Test cases: `test_cases/` in the repo root, and on the cluster under `.../full_ins_eval/cases/` and `.../full_del_eval/cases/`.
 
 ### Pipeline Steps (in `srcMain/main.cpp`, svanchors section)
 
