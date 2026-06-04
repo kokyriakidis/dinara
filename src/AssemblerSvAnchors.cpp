@@ -4388,47 +4388,109 @@ void Assembler::buildSvMSA(
                                       / coverage)
                             : 0;
                         if(estSize >= 50) {
-                            // Position: prefer soft-clip midpoint,
-                            // then HitDepth drop, then region center.
+                            // Position estimation for indirect-covdrop.
+                            // Priority:
+                            // 1. HitDepth clusters: when multiple clusters
+                            //    exist, use the deepest drop in the cluster
+                            //    closest to refLength/2 (the expected
+                            //    insertion site). Single cluster: use its
+                            //    deepest drop.
+                            // 2. Soft-clip midpoint (two strongest clusters).
+                            // 3. Single soft-clip position.
+                            // 4. Region center (fallback).
                             uint32_t bpPos =
                                 uint32_t(refLength / 2);
-                            bool posFromSoftClip = false;
-                            if(softClipBPs.size() >= 2) {
-                                // Use the two strongest clusters.
-                                uint32_t best1 = 0, best2 = 0;
-                                uint32_t pos1 = 0, pos2 = 0;
-                                for(const auto& sc : softClipBPs) {
-                                    if(sc.readCount > best1) {
-                                        best2 = best1; pos2 = pos1;
-                                        best1 = sc.readCount;
-                                        pos1 = sc.refPos;
-                                    } else if(sc.readCount > best2) {
-                                        best2 = sc.readCount;
-                                        pos2 = sc.refPos;
+                            bool posSet = false;
+
+                            // Cluster HitDepth breakpoints (gap ≤2 windows).
+                            if(hitDepthBreakpoints.size() >= 2) {
+                                struct HdcInfo {
+                                    uint32_t startPos, endPos;
+                                    uint32_t startWin, endWin;
+                                    double minRatio;
+                                    uint32_t deepestPos;
+                                };
+                                vector<HdcInfo> hdcs;
+                                HdcInfo cur;
+                                cur.startPos = hitDepthBreakpoints[0].refPos;
+                                cur.endPos = hitDepthBreakpoints[0].refPos;
+                                cur.startWin = hitDepthBreakpoints[0].windowIdx;
+                                cur.endWin = hitDepthBreakpoints[0].windowIdx;
+                                cur.minRatio = hitDepthBreakpoints[0].dropRatio;
+                                cur.deepestPos = hitDepthBreakpoints[0].refPos;
+                                for(size_t hi = 1; hi < hitDepthBreakpoints.size(); ++hi) {
+                                    const auto& hbp = hitDepthBreakpoints[hi];
+                                    if(hbp.windowIdx <= cur.endWin + 2) {
+                                        cur.endPos = hbp.refPos;
+                                        cur.endWin = hbp.windowIdx;
+                                        if(hbp.dropRatio < cur.minRatio) {
+                                            cur.minRatio = hbp.dropRatio;
+                                            cur.deepestPos = hbp.refPos;
+                                        }
+                                    } else {
+                                        hdcs.push_back(cur);
+                                        cur.startPos = hbp.refPos;
+                                        cur.endPos = hbp.refPos;
+                                        cur.startWin = hbp.windowIdx;
+                                        cur.endWin = hbp.windowIdx;
+                                        cur.minRatio = hbp.dropRatio;
+                                        cur.deepestPos = hbp.refPos;
                                     }
                                 }
-                                if(best2 >= 3) {
-                                    bpPos = (pos1 + pos2) / 2;
-                                    posFromSoftClip = true;
-                                }
-                            }
-                            if(!posFromSoftClip
-                               && softClipBPs.size() == 1
-                               && softClipBPs[0].readCount >= 3) {
-                                bpPos = softClipBPs[0].refPos;
-                                posFromSoftClip = true;
-                            }
-                            if(!posFromSoftClip
-                               && !hitDepthBreakpoints.empty()) {
-                                double bestDrop = 1.0;
-                                for(const auto& hbp :
-                                    hitDepthBreakpoints) {
-                                    if(hbp.dropRatio < bestDrop) {
-                                        bestDrop = hbp.dropRatio;
-                                        bpPos = hbp.refPos;
+                                hdcs.push_back(cur);
+
+                                if(hdcs.size() >= 2) {
+                                    // Multiple clusters: pick the one
+                                    // closest to refLength/2.
+                                    const uint32_t regionCenter =
+                                        uint32_t(refLength / 2);
+                                    uint32_t bestDist = UINT32_MAX;
+                                    for(const auto& hdc : hdcs) {
+                                        const uint32_t cCenter =
+                                            (hdc.startPos + hdc.endPos) / 2;
+                                        const uint32_t d = (cCenter > regionCenter)
+                                            ? cCenter - regionCenter
+                                            : regionCenter - cCenter;
+                                        if(d < bestDist) {
+                                            bestDist = d;
+                                            bpPos = hdc.deepestPos;
+                                        }
                                     }
+                                    posSet = true;
+                                } else {
+                                    // Single cluster: use its deepest drop.
+                                    bpPos = hdcs[0].deepestPos;
+                                    posSet = true;
+                                }
+                            } else if(hitDepthBreakpoints.size() == 1) {
+                                bpPos = hitDepthBreakpoints[0].refPos;
+                                posSet = true;
+                            }
+
+                            // Soft-clip fallback when no HitDepth data.
+                            if(!posSet) {
+                                if(softClipBPs.size() >= 2) {
+                                    uint32_t best1 = 0, best2 = 0;
+                                    uint32_t pos1 = 0, pos2 = 0;
+                                    for(const auto& sc : softClipBPs) {
+                                        if(sc.readCount > best1) {
+                                            best2 = best1; pos2 = pos1;
+                                            best1 = sc.readCount;
+                                            pos1 = sc.refPos;
+                                        } else if(sc.readCount > best2) {
+                                            best2 = sc.readCount;
+                                            pos2 = sc.refPos;
+                                        }
+                                    }
+                                    if(best2 >= 3) {
+                                        bpPos = (pos1 + pos2) / 2;
+                                    }
+                                } else if(softClipBPs.size() == 1
+                                          && softClipBPs[0].readCount >= 3) {
+                                    bpPos = softClipBPs[0].refPos;
                                 }
                             }
+
                             allInsCalls.push_back({
                                 bpPos,
                                 estSize,
@@ -4461,46 +4523,95 @@ void Assembler::buildSvMSA(
                         ? int64_t(double(indirectBases) / coverage)
                         : 0;
                     if(estSize >= 50) {
-                        // Position: prefer soft-clip midpoint,
-                        // then HitDepth drop, then region center.
+                        // Same position logic as above.
                         uint32_t bpPos =
                             uint32_t(refLength / 2);
-                        bool posFromSoftClip = false;
-                        if(softClipBPs.size() >= 2) {
-                            uint32_t best1 = 0, best2 = 0;
-                            uint32_t pos1 = 0, pos2 = 0;
-                            for(const auto& sc : softClipBPs) {
-                                if(sc.readCount > best1) {
-                                    best2 = best1; pos2 = pos1;
-                                    best1 = sc.readCount;
-                                    pos1 = sc.refPos;
-                                } else if(sc.readCount > best2) {
-                                    best2 = sc.readCount;
-                                    pos2 = sc.refPos;
+                        bool posSet = false;
+
+                        if(hitDepthBreakpoints.size() >= 2) {
+                            struct HdcInfo {
+                                uint32_t startPos, endPos;
+                                uint32_t startWin, endWin;
+                                double minRatio;
+                                uint32_t deepestPos;
+                            };
+                            vector<HdcInfo> hdcs;
+                            HdcInfo cur;
+                            cur.startPos = hitDepthBreakpoints[0].refPos;
+                            cur.endPos = hitDepthBreakpoints[0].refPos;
+                            cur.startWin = hitDepthBreakpoints[0].windowIdx;
+                            cur.endWin = hitDepthBreakpoints[0].windowIdx;
+                            cur.minRatio = hitDepthBreakpoints[0].dropRatio;
+                            cur.deepestPos = hitDepthBreakpoints[0].refPos;
+                            for(size_t hi = 1; hi < hitDepthBreakpoints.size(); ++hi) {
+                                const auto& hbp = hitDepthBreakpoints[hi];
+                                if(hbp.windowIdx <= cur.endWin + 2) {
+                                    cur.endPos = hbp.refPos;
+                                    cur.endWin = hbp.windowIdx;
+                                    if(hbp.dropRatio < cur.minRatio) {
+                                        cur.minRatio = hbp.dropRatio;
+                                        cur.deepestPos = hbp.refPos;
+                                    }
+                                } else {
+                                    hdcs.push_back(cur);
+                                    cur.startPos = hbp.refPos;
+                                    cur.endPos = hbp.refPos;
+                                    cur.startWin = hbp.windowIdx;
+                                    cur.endWin = hbp.windowIdx;
+                                    cur.minRatio = hbp.dropRatio;
+                                    cur.deepestPos = hbp.refPos;
                                 }
                             }
-                            if(best2 >= 3) {
-                                bpPos = (pos1 + pos2) / 2;
-                                posFromSoftClip = true;
-                            }
-                        }
-                        if(!posFromSoftClip
-                           && softClipBPs.size() == 1
-                           && softClipBPs[0].readCount >= 3) {
-                            bpPos = softClipBPs[0].refPos;
-                            posFromSoftClip = true;
-                        }
-                        if(!posFromSoftClip
-                           && !hitDepthBreakpoints.empty()) {
-                            double bestDrop = 1.0;
-                            for(const auto& hbp :
-                                hitDepthBreakpoints) {
-                                if(hbp.dropRatio < bestDrop) {
-                                    bestDrop = hbp.dropRatio;
-                                    bpPos = hbp.refPos;
+                            hdcs.push_back(cur);
+
+                            if(hdcs.size() >= 2) {
+                                const uint32_t regionCenter =
+                                    uint32_t(refLength / 2);
+                                uint32_t bestDist = UINT32_MAX;
+                                for(const auto& hdc : hdcs) {
+                                    const uint32_t cCenter =
+                                        (hdc.startPos + hdc.endPos) / 2;
+                                    const uint32_t d = (cCenter > regionCenter)
+                                        ? cCenter - regionCenter
+                                        : regionCenter - cCenter;
+                                    if(d < bestDist) {
+                                        bestDist = d;
+                                        bpPos = hdc.deepestPos;
+                                    }
                                 }
+                                posSet = true;
+                            } else {
+                                bpPos = hdcs[0].deepestPos;
+                                posSet = true;
+                            }
+                        } else if(hitDepthBreakpoints.size() == 1) {
+                            bpPos = hitDepthBreakpoints[0].refPos;
+                            posSet = true;
+                        }
+
+                        if(!posSet) {
+                            if(softClipBPs.size() >= 2) {
+                                uint32_t best1 = 0, best2 = 0;
+                                uint32_t pos1 = 0, pos2 = 0;
+                                for(const auto& sc : softClipBPs) {
+                                    if(sc.readCount > best1) {
+                                        best2 = best1; pos2 = pos1;
+                                        best1 = sc.readCount;
+                                        pos1 = sc.refPos;
+                                    } else if(sc.readCount > best2) {
+                                        best2 = sc.readCount;
+                                        pos2 = sc.refPos;
+                                    }
+                                }
+                                if(best2 >= 3) {
+                                    bpPos = (pos1 + pos2) / 2;
+                                }
+                            } else if(softClipBPs.size() == 1
+                                      && softClipBPs[0].readCount >= 3) {
+                                bpPos = softClipBPs[0].refPos;
                             }
                         }
+
                         allInsCalls.push_back({
                             bpPos,
                             estSize,
