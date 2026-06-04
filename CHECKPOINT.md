@@ -1431,6 +1431,31 @@ Case naming: `{chrom}_{pos}_{type}{size}` (e.g., `chr1_100025966_INS51`, `chr10_
 
 The 28,942 INS truth entries map to 26,101 unique case names (1,400 positions have two het alleles with identical size → same case name). Similarly, 17,562 DEL entries map to 15,472 case names (2,090 duplicates). Both alleles share the same extracted region.
 
+### HG008-T Somatic SV Benchmark
+
+**Truth set**: HG008-T V0.5 Draft Somatic SV Benchmark, GRCh38.
+- Source: [GIAB FTP](https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data_somatic/HG008/Liss_lab/analysis/NIST_HG008-T_somatic-stvar-CNV_DraftBenchmark_V0.5-20260318/)
+- PASS variants: 210 total (22 INS, 60 DEL, 54 DUP, 74 BND)
+- All INS and DEL are ≥50bp (INS range: 60-4,775bp, DEL range: 54bp-6.3Mbp)
+- BAM: `/sc1/groups/sbx/workspace/eizengaj/structural_variants/somatic_mapping/dedupped_sorted/HG008_T.intra-consensus.personalized.dedup.sorted.bam`
+
+**Truth files on cluster**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/HG008T_somatic_V0.5/`
+- `GRCh38_HG008-T-V0.5_somatic-stvar_PASS.draftbenchmark.vcf.gz` — PASS variants (use for benchmarking)
+- `GRCh38_HG008-T-V0.5_somatic-stvar_ALL.draftbenchmark.vcf.gz` — all variants including filtered
+- `GRCh38_HG008-T-V0.5_somatic-stvar-clonal.draftbenchmark.bed` — clonal benchmark regions
+- `GRCh38_HG008-T-V0.5_somatic-stvar-clonal_and_subclonal.draftbenchmark.bed` — clonal + subclonal regions
+- `README.md` — benchmark description and truvari usage instructions
+
+#### HG008-T Case Extraction
+
+| Dataset | Cases | Path |
+|---|---|---|
+| **HG008-T INS** | 22 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/hg008t_ins_eval/cases/` |
+| **HG008-T DEL** | 60 | `/sc1/groups/sbx/workspace/kyriakik/structural_variants/hg008t_del_eval/cases/` |
+
+Case list files: `ins_cases.txt` in `.../hg008t_ins_eval/`, `del_cases.txt` in `.../hg008t_del_eval/`.
+Extraction script: `/sc1/groups/sbx/workspace/kyriakik/structural_variants/extract_hg008t_cases.py`.
+
 #### Results
 
 Results are per-version log files in `results_v36{version}/` under each eval directory.
