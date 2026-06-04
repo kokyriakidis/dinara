@@ -593,14 +593,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             continue;
         }
 
-        // Pick the transition with the highest supporting span product.
+        // Pick the latest lastAnchorInA (highest backbone position in A),
+        // then use that transition's firstAnchorInB. This maximizes
+        // backbone retention in A while keeping the pair consistent.
         Shasta2AnchorId bestLastInA = transitions[0].lastAnchorInA;
         Shasta2AnchorId bestFirstInB = transitions[0].firstAnchorInB;
-        uint64_t bestSpanProduct = transitions[0].supportingSpanProduct;
+        uint32_t bestPosA = anchorToBackbonePos[uint64_t(bestLastInA)];
 
         for(const auto& t : transitions) {
-            if(t.supportingSpanProduct > bestSpanProduct) {
-                bestSpanProduct = t.supportingSpanProduct;
+            const uint32_t posA = anchorToBackbonePos[uint64_t(t.lastAnchorInA)];
+            if(posA > bestPosA) {
+                bestPosA = posA;
                 bestLastInA = t.lastAnchorInA;
                 bestFirstInB = t.firstAnchorInB;
             }
