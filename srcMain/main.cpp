@@ -1669,6 +1669,11 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
 
+    // Convert to bidirected graph and write GFA/CSV.
+    auto bidirectedGraph = shasta2AnchorGraph->toBidirected();
+    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
+    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
+
     // Export in shasta2-native format for --external-anchor-graph-name.
     shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
 

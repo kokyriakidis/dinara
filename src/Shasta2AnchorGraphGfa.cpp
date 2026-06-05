@@ -160,3 +160,71 @@ void Shasta2AnchorGraph::writeBubbleFinderGraph(const string& fileName, bool use
         graphFile << source(e, *this) << " " << target(e, *this) << "\n";
     }
 }
+
+
+
+BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
+{
+    const uint64_t anchorCount = anchorToWindow.size();
+    const uint64_t bidirNodeCount = (anchorCount + 1) / 2;
+
+    BidirectedAnchorGraph bg;
+    bg.resize(bidirNodeCount);
+
+    auto normalize = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    // Set node window assignments. Use the forward anchor (even anchorId)
+    // to determine the window for each bidirected node.
+    for(uint64_t anchorId = 0; anchorId < anchorCount; anchorId += 2) {
+        const uint64_t nodeId = anchorId / 2;
+        if(anchorId < anchorToWindow.size()) {
+            const uint32_t wid = anchorToWindow[anchorId];
+            if(wid != noWindow) {
+                bg.setNodeWindow(nodeId, normalize(wid));
+            }
+        }
+    }
+
+    // Convert edges. For each directed edge A→B:
+    //   nodeA = A/2, forwardA = (A is even)
+    //   nodeB = B/2, forwardB = (B is even)
+    // addEdge handles RC mirror automatically, so we only need to
+    // process each canonical pair once. We skip edges where the
+    // source anchor is odd (RC) and the canonical form would have
+    // already been added from the even (forward) anchor's edge.
+    // But since addEdge deduplicates via the canonical key in the
+    // properties map, processing all edges is safe — duplicates
+    // just overwrite with the same data.
+    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
+        const auto& edge = (*this)[e];
+        if(!edge.useForAssembly) continue;
+
+        const uint64_t srcId = uint64_t(source(e, *this));
+        const uint64_t dstId = uint64_t(target(e, *this));
+
+        BidirectedAnchorGraph::OrientedNode from = {srcId / 2, (srcId & 1) == 0};
+        BidirectedAnchorGraph::OrientedNode to   = {dstId / 2, (dstId & 1) == 0};
+
+        // Check if this is the canonical direction to avoid double-adding.
+        auto key = BidirectedAnchorGraph::canon(from, to);
+        if(key.first != from || key.second != to) continue;
+
+        BidirectedAnchorGraph::EdgeProperties props;
+        props.coverage = edge.coverage();
+        props.supportingSpanPrev = uint32_t(edge.supportingSpanPrev);
+        props.supportingSpanNext = uint32_t(edge.supportingSpanNext);
+        props.sharedReadCount = uint32_t(edge.sharedReadCount);
+        props.isInterWindow = (edge.supportingSpanPrev > 0 || edge.supportingSpanNext > 0 || edge.sharedReadCount > 0);
+        props.useForAssembly = true;
+
+        bg.addEdge(from, to, props);
+    }
+
+    cout << "Converted to bidirected graph: "
+         << bg.numNodes() << " nodes, "
+         << bg.numEdges() << " edges." << endl;
+
+    return bg;
+}
