@@ -17,7 +17,7 @@ void BidirectedAnchorGraph::normalizeOrientations(const vector<bool>& swapOrient
 
     // Collect all canonical edges with their properties.
     struct EdgeRecord {
-        OrientedNode from, to;
+        OrientedAnchor from, to;
         EdgeProperties props;
     };
     vector<EdgeRecord> allEdges;
@@ -34,15 +34,14 @@ void BidirectedAnchorGraph::normalizeOrientations(const vector<bool>& swapOrient
 
     // Re-add all edges with adjusted orientations.
     for(const auto& rec : allEdges) {
-        OrientedNode from = rec.from;
-        OrientedNode to = rec.to;
+        OrientedAnchor from = rec.from;
+        OrientedAnchor to = rec.to;
 
-        if(swapOrientation[from.first]) from.second = !from.second;
-        if(swapOrientation[to.first]) to.second = !to.second;
+        if(swapOrientation[from.first.value()]) from.second = !from.second;
+        if(swapOrientation[to.first.value()]) to.second = !to.second;
 
-        // Add both traversal directions.
         addEdge(from, to, rec.props);
-        addTraversal(reverse(to), reverse(from));
+        addTraversal(reverseAnchor(to), reverseAnchor(from));
     }
 
     uint64_t flippedCount = 0;
@@ -60,63 +59,65 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
     }
     gfa << "H\tVN:Z:1.0\n";
 
-    // Collect links by walking adjacency. This preserves the actual
-    // traversal orientations (not the canonical form which may flip them).
-    // Deduplicate: for each link from->to, the RC mirror reverse(to)->reverse(from)
-    // also exists in adjacency. We emit only one by tracking emitted pairs.
+    // Collect links by walking adjacency (preserves actual traversal
+    // orientations). Deduplicate by tracking emitted pairs.
     struct LinkRecord {
-        OrientedNode from, to;
-        const EdgeProperties* props;
+        OrientedAnchor from, to;
+        EdgeProperties props;  // Direction-adjusted copy.
     };
     vector<LinkRecord> links;
-    set<pair<OrientedNode, OrientedNode>> emitted;
+    set<pair<OrientedAnchor, OrientedAnchor>> emitted;
     set<uint64_t> activeNodes;
 
-    for(uint64_t nodeId = 0; nodeId < nodeCount; nodeId++) {
+    for(uint64_t nodeIdx = 0; nodeIdx < nodeCount; nodeIdx++) {
         for(bool orient : {true, false}) {
-            auto dirIt = adjacency[nodeId].find(orient);
-            if(dirIt == adjacency[nodeId].end()) continue;
+            auto dirIt = adjacency[nodeIdx].find(orient);
+            if(dirIt == adjacency[nodeIdx].end()) continue;
             for(const auto& neighbor : dirIt->second) {
-                OrientedNode from = {nodeId, orient};
-                OrientedNode to = neighbor;
+                OrientedAnchor from = {BidirectedAnchorId(nodeIdx), orient};
+                OrientedAnchor to = neighbor;
 
-                // Skip if the RC mirror was already emitted.
-                auto rcPair = make_pair(reverse(to), reverse(from));
+                // Skip if RC mirror already emitted.
+                auto rcPair = make_pair(reverseAnchor(to), reverseAnchor(from));
                 if(emitted.count(rcPair)) continue;
 
-                const auto* props = getEdgeProperties(from, to);
-                if(!props || !props->useForAssembly) continue;
+                // Get direction-adjusted properties.
+                EdgeProperties props;
+                if(!getEdgeProperties(from, to, props)) continue;
+                if(!props.useForAssembly) continue;
 
                 emitted.insert(make_pair(from, to));
                 links.push_back({from, to, props});
-                activeNodes.insert(from.first);
-                activeNodes.insert(to.first);
+                activeNodes.insert(from.first.value());
+                activeNodes.insert(to.first.value());
             }
         }
     }
 
     // Write segments.
-    for(const auto nodeId : activeNodes) {
-        gfa << "S\t" << nodeId << "\t*\tLN:i:1";
-        if(nodeId < nodeProps.size() && nodeProps[nodeId].windowId != UINT32_MAX) {
-            gfa << "\twn:i:" << nodeProps[nodeId].windowId;
+    for(const auto nodeIdx : activeNodes) {
+        gfa << "S\t" << nodeIdx << "\t*\tLN:i:1";
+        if(nodeIdx < nodeProps.size() && nodeProps[nodeIdx].windowId != UINT32_MAX) {
+            gfa << "\twn:i:" << nodeProps[nodeIdx].windowId;
         }
         gfa << "\n";
     }
 
-    // Write links.
+    // Write links with direction-adjusted properties.
     for(const auto& link : links) {
-        gfa << "L\t" << link.from.first << "\t" << (link.from.second ? "+" : "-")
-            << "\t" << link.to.first << "\t" << (link.to.second ? "+" : "-")
+        gfa << "L\t" << link.from.first.value()
+            << "\t" << (link.from.second ? "+" : "-")
+            << "\t" << link.to.first.value()
+            << "\t" << (link.to.second ? "+" : "-")
             << "\t0M"
-            << "\tRC:i:" << link.props->coverage;
+            << "\tRC:i:" << link.props.coverage;
 
-        if(link.props->supportingSpanPrev > 0 || link.props->supportingSpanNext > 0) {
-            gfa << "\tsp:i:" << link.props->supportingSpanPrev
-                << "\tsn:i:" << link.props->supportingSpanNext;
+        if(link.props.supportingSpanPrev > 0 || link.props.supportingSpanNext > 0) {
+            gfa << "\tsp:i:" << link.props.supportingSpanPrev
+                << "\tsn:i:" << link.props.supportingSpanNext;
         }
-        if(link.props->sharedReadCount > 0) {
-            gfa << "\tsr:i:" << link.props->sharedReadCount;
+        if(link.props.sharedReadCount > 0) {
+            gfa << "\tsr:i:" << link.props.sharedReadCount;
         }
 
         gfa << "\n";
@@ -141,13 +142,13 @@ void BidirectedAnchorGraph::writeCsv(const string& fileName, uint32_t windowCoun
     set<uint64_t> activeNodes;
     for(const auto& [key, props] : edgeProperties) {
         if(!props.useForAssembly) continue;
-        activeNodes.insert(key.first.first);
-        activeNodes.insert(key.second.first);
+        activeNodes.insert(key.first.first.value());
+        activeNodes.insert(key.second.first.value());
     }
 
-    for(const auto nodeId : activeNodes) {
-        if(nodeId >= nodeProps.size()) continue;
-        const uint32_t wid = nodeProps[nodeId].windowId;
+    for(const auto nodeIdx : activeNodes) {
+        if(nodeIdx >= nodeProps.size()) continue;
+        const uint32_t wid = nodeProps[nodeIdx].windowId;
         if(wid == UINT32_MAX) continue;
 
         const double hue = (360.0 * wid) / windowCount;
@@ -167,7 +168,7 @@ void BidirectedAnchorGraph::writeCsv(const string& fileName, uint32_t windowCoun
         const int g = int((g1 + m) * 255);
         const int b = int((b1 + m) * 255);
 
-        csv << nodeId << ","
+        csv << nodeIdx << ","
             << "#" << hex << setfill('0')
             << setw(2) << r << setw(2) << g << setw(2) << b
             << dec << "\n";
