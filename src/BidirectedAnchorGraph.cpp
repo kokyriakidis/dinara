@@ -238,9 +238,13 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
             OrientedAnchor current = firstNeighbor;
             while(true) {
                 unitig.chain.push_back(current);
-                visited[current.first.value()] = true;
 
                 if(!isInternal(current.first)) break;
+
+                // Only mark internal nodes as visited. Branch/endpoint
+                // nodes at chain ends must remain unvisited so they can
+                // participate as endpoints of other chains.
+                visited[current.first.value()] = true;
 
                 // Exit from current on the traversal side (current.second).
                 auto nextNeighbors = getNeighbors({current.first, current.second});

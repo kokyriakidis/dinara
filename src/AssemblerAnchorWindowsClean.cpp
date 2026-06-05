@@ -351,15 +351,7 @@ void Assembler::computeAnchorWindowsClean(
             return; // Too few anchors.
         }
 
-        // Verify this covers the full journey.
         const auto fullJourney = (*shasta2Journeys)[backboneOid];
-        if(seedBegin != 0 || seedEnd != uint32_t(fullJourney.size())) {
-            cout << "WARNING: window " << anchorWindows.size()
-                 << " backbone " << backboneOid
-                 << " does NOT cover full journey: [" << seedBegin
-                 << ", " << seedEnd << ") vs journey size "
-                 << fullJourney.size() << endl;
-        }
 
         vector<uint32_t> filteredPositions;
         filteredPositions.reserve(n);
@@ -627,7 +619,7 @@ void Assembler::computeAnchorWindowsClean(
         pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
     }
 
-    // Process the heap.
+    // Phase 1: process the heap, accepting only full-journey candidates.
     while(!candidateHeap.empty()) {
         const CleanWindowCandidate candidate = candidateHeap.top();
         candidateHeap.pop();
@@ -658,8 +650,6 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         // Skip reads whose journey base span is below the threshold.
-        // A window with a tiny base span is noise — too few anchors
-        // spanning too little genomic sequence to be informative.
         if(minWindowBaseSpan > 0 && journey.size() >= 2) {
             const Shasta2AnchorId firstAnchor = journey[0];
             const Shasta2AnchorId lastAnchor = journey[journey.size() - 1];
@@ -674,6 +664,65 @@ void Assembler::computeAnchorWindowsClean(
         createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
     }
 
+    const uint64_t phase1Windows = anchorWindows.size();
+    uint64_t phase1ClaimedAnchors = claimedAnchors;
+    cout << timestamp << "Phase 1 complete: " << phase1Windows << " windows, "
+         << phase1ClaimedAnchors << " claimed anchors." << endl;
+
+    // Phase 2: re-seed the heap with unclaimed intervals from all reads,
+    // then process fragment candidates (not requiring full journey).
+    // Bump all generations to invalidate stale phase-1 entries.
+    for(uint64_t i = 0; i < readCount; i++) {
+        ++candidateGeneration[i];
+    }
+
+    for(const ReadId readId : readIdsSortedByLength) {
+        const OrientedReadId backboneOid(readId, 0);
+        pushCurrentUnclaimedIntervals(backboneOid);
+    }
+
+    while(!candidateHeap.empty()) {
+        const CleanWindowCandidate candidate = candidateHeap.top();
+        candidateHeap.pop();
+
+        const ReadId readId = candidate.backboneOrientedReadId.getReadId();
+        if(candidate.generation != candidateGeneration[uint64_t(readId)]) {
+            continue;
+        }
+        const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
+
+        // Check that the interval is still fully unclaimed.
+        bool isStillUnclaimed = true;
+        for(uint32_t position = candidate.begin; position < candidate.end; position++) {
+            if(anchorOwner[uint64_t(journey[position])] != anchorUnclaimed) {
+                isStillUnclaimed = false;
+                break;
+            }
+        }
+
+        if(!isStillUnclaimed) {
+            continue;
+        }
+
+        // Apply the same base span threshold.
+        if(minWindowBaseSpan > 0 && (candidate.end - candidate.begin) >= 2) {
+            const Shasta2AnchorId firstAnchor = journey[candidate.begin];
+            const Shasta2AnchorId lastAnchor = journey[candidate.end - 1];
+            const uint32_t firstPos = shasta2Anchors->getPosition(firstAnchor, candidate.backboneOrientedReadId);
+            const uint32_t lastPos = shasta2Anchors->getPosition(lastAnchor, candidate.backboneOrientedReadId);
+            const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
+            if(baseSpan < minWindowBaseSpan) {
+                continue;
+            }
+        }
+
+        createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
+    }
+
+    const uint64_t phase2Windows = anchorWindows.size() - phase1Windows;
+    cout << timestamp << "Phase 2 complete: " << phase2Windows << " additional windows, "
+         << (claimedAnchors - phase1ClaimedAnchors) << " additional claimed anchors." << endl;
+
     // Count unclaimed anchors.
     uint64_t unclaimedAnchorCount = 0;
     for(const uint32_t owner : anchorOwner) {
@@ -687,6 +736,7 @@ void Assembler::computeAnchorWindowsClean(
 
     cout << timestamp << "computeAnchorWindowsClean ends."
          << " windows=" << anchorWindows.size()
+         << " (phase1=" << phase1Windows << " phase2=" << phase2Windows << ")"
          << " anchors=" << anchorCount
          << " claimedAnchors=" << claimedAnchors
          << " unclaimedAnchors=" << unclaimedAnchorCount
