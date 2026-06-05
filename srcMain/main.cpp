@@ -1674,6 +1674,11 @@ void dinara::main::assemble(
     bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
     bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
 
+    // Unitigify the bidirected graph and write unitig GFA/CSV.
+    const auto unitigs = bidirectedGraph.unitigify();
+    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
+
     // Export in shasta2-native format for --external-anchor-graph-name.
     shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
 
