@@ -204,6 +204,7 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
 
         BidirectedAnchorGraph::EdgeProperties props;
         props.coverage = edge.coverage();
+        props.offset = edge.offset;
         props.supportingSpanPrev = uint32_t(edge.supportingSpanPrev);
         props.supportingSpanNext = uint32_t(edge.supportingSpanNext);
         props.sharedReadCount = uint32_t(edge.sharedReadCount);

@@ -10,6 +10,10 @@
 // Edge properties are stored once per canonical link (via canonAnchor()).
 // Directional fields are stored relative to the canonical direction.
 // getEdgeProperties() adjusts them for the query direction.
+//
+// Unitigification collapses linear chains of nodes into single segments,
+// producing a compressed graph where each segment tracks its constituent
+// anchors, window membership, and aggregate coverage.
 
 #include "BidirectedAnchorId.hpp"
 
@@ -29,6 +33,7 @@ public:
     struct EdgeProperties {
         // Symmetric fields.
         uint64_t coverage = 0;
+        uint64_t offset = 0;  // Base-level distance between the two anchors.
         uint32_t sharedReadCount = 0;
         bool isInterWindow = false;
         bool useForAssembly = true;
@@ -48,6 +53,27 @@ public:
 
     struct NodeProperties {
         uint32_t windowId = UINT32_MAX;
+    };
+
+    // A unitig (compressed segment) — a linear chain of oriented anchors.
+    struct Unitig {
+        // Ordered chain of oriented anchors in this unitig.
+        // For a single-node unitig, this has one entry.
+        std::vector<OrientedAnchor> chain;
+
+        // Window IDs traversed by this unitig (consecutive duplicates removed,
+        // noWindow entries omitted).
+        std::vector<uint32_t> windowSequence;
+
+        // Average edge coverage along the chain (0 for single-node unitigs).
+        double averageCoverage = 0.;
+
+        // Total base-level length (sum of edge offsets along the chain).
+        uint64_t totalOffset = 0;
+
+        uint64_t anchorCount() const { return chain.size(); }
+        OrientedAnchor front() const { return chain.front(); }
+        OrientedAnchor back() const { return chain.back(); }
     };
 
     uint64_t numNodes() const { return nodeCount; }
@@ -149,9 +175,35 @@ public:
         return d;
     }
 
+    // Number of neighbors reachable from a specific side of a node.
+    // sideDegree({v, true}) = number of edges leaving v+.
+    uint64_t sideDegree(OrientedAnchor oa) const {
+        auto idx = oa.first.value();
+        if(idx >= adjacency.size()) return 0;
+        auto it = adjacency[idx].find(oa.second);
+        if(it == adjacency[idx].end()) return 0;
+        return it->second.size();
+    }
+
     void normalizeOrientations(const std::vector<bool>& swapOrientation);
     void writeGfa(const std::string& fileName) const;
     void writeCsv(const std::string& fileName, uint32_t windowCount) const;
+
+    // Collapse linear chains into unitigs. Returns the list of unitigs.
+    // A node is internal to a chain when both sides have exactly one
+    // neighbor and those neighbors reciprocally have degree 1 on the
+    // entry side.
+    std::vector<Unitig> unitigify() const;
+
+    // Write unitig GFA where each segment is a unitig.
+    void writeUnitigGfa(const std::string& fileName,
+                        const std::vector<Unitig>& unitigs,
+                        uint32_t windowCount) const;
+
+    // Write unitig CSV for Bandage coloring.
+    void writeUnitigCsv(const std::string& fileName,
+                        const std::vector<Unitig>& unitigs,
+                        uint32_t windowCount) const;
 
 private:
     uint64_t nodeCount = 0;
