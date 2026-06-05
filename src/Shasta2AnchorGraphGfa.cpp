@@ -177,13 +177,18 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         return (w >= windowCount) ? (w - windowCount) : w;
     };
 
-    // Set node window assignments using the forward anchor (even).
+    // Set node window and backbone read assignments using the forward anchor (even).
     for(uint64_t anchorId = 0; anchorId < anchorCount; anchorId += 2) {
         const auto bid = BidirectedAnchorId::fromDirected(Shasta2AnchorId(anchorId));
         if(anchorId < anchorToWindow.size()) {
             const uint32_t wid = anchorToWindow[anchorId];
             if(wid != noWindow) {
-                bg.setNodeWindow(bid, normalizeWindow(wid));
+                const uint32_t normWid = normalizeWindow(wid);
+                bg.setNodeWindow(bid, normWid);
+                if(normWid < anchorWindows.size()) {
+                    bg.setNodeBackboneRead(bid,
+                        uint32_t(anchorWindows[normWid].backboneOrientedReadId.getReadId()));
+                }
             }
         }
     }

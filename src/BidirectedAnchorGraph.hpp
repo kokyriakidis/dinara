@@ -53,6 +53,7 @@ public:
 
     struct NodeProperties {
         uint32_t windowId = UINT32_MAX;
+        uint32_t backboneReadId = UINT32_MAX;  // ReadId of the backbone read that owns this window.
     };
 
     // A unitig (compressed segment) — a linear chain of oriented anchors.
@@ -87,6 +88,10 @@ public:
 
     void setNodeWindow(BidirectedAnchorId id, uint32_t windowId) {
         nodeProps[id.value()].windowId = windowId;
+    }
+
+    void setNodeBackboneRead(BidirectedAnchorId id, uint32_t readId) {
+        nodeProps[id.value()].backboneReadId = readId;
     }
 
     // Add a single directed traversal and store properties under
@@ -204,6 +209,13 @@ public:
     void writeUnitigCsv(const std::string& fileName,
                         const std::vector<Unitig>& unitigs,
                         uint32_t windowCount) const;
+
+    // Write CSV colored by backbone read ID (windows from the same read
+    // get the same color).
+    void writeCsvByRead(const std::string& fileName, uint32_t readCount) const;
+    void writeUnitigCsvByRead(const std::string& fileName,
+                              const std::vector<Unitig>& unitigs,
+                              uint32_t readCount) const;
 
 private:
     uint64_t nodeCount = 0;
