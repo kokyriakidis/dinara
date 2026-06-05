@@ -215,44 +215,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
-    // Alternate path edges: for each het window, add a chain
-    // anchorIdA -> intermediate[0] -> ... -> intermediate[N-1] -> anchorIdB.
-    // These form parallel paths (bubbles) at het sites.
-    // Only emit for windows with detected het SNPs.
-    // Also create RC mirror edges.
-    uint64_t alternatePathEdgeCount = 0;
-    for(const AnchorWindow& window : anchorWindows) {
-        if(window.cleanHetSnpCount == 0) continue;
-        for(const AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-            // Build the forward chain: A -> intermediates -> B.
-            Shasta2AnchorId prevAnchorId = altPath.anchorIdA;
-            vector<Shasta2AnchorId> forwardChain;
-            forwardChain.push_back(prevAnchorId);
-            for(const Shasta2AnchorId midAnchorId : altPath.intermediateAnchorIds) {
-                if(addEdgeIfValid(prevAnchorId, midAnchorId)) {
-                    ++alternatePathEdgeCount;
-                }
-                forwardChain.push_back(midAnchorId);
-                prevAnchorId = midAnchorId;
-            }
-            // Last edge: last intermediate -> anchorIdB.
-            if(addEdgeIfValid(prevAnchorId, altPath.anchorIdB)) {
-                ++alternatePathEdgeCount;
-            }
-            forwardChain.push_back(altPath.anchorIdB);
 
-            // RC mirror: reverse the chain and flip each anchor ID.
-            for(uint64_t i = forwardChain.size() - 1; i > 0; i--) {
-                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(forwardChain[i]) ^ 1ULL);
-                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(forwardChain[i-1]) ^ 1ULL);
-                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                    if(addEdgeIfValid(rcA, rcB)) {
-                        ++alternatePathEdgeCount;
-                    }
-                }
-            }
-        }
-    }
 
     // Per-read window transition tracking.
     // If computeWindowTransitions() was already called, transitionReads

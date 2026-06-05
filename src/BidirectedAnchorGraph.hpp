@@ -5,9 +5,8 @@
 // Verkko/MBG-style bidirected anchor graph. Each node represents an
 // anchor pair (anchorId / 2), collapsing forward and RC into one node.
 // Each node has two ends (forward = true, RC = false). Edges connect
-// oriented node ends. Adding an edge automatically adds its RC mirror,
-// so both traversal directions are stored, but they represent one
-// biological link.
+// oriented node ends. Like Verkko/MBG, the caller must add both
+// traversal directions explicitly (forward edge and RC mirror).
 
 #include "cstdint.hpp"
 
@@ -36,12 +35,17 @@ public:
     // Canonical form of a link. Ensures a consistent ordering so that
     // an edge and its RC mirror map to the same canonical key.
     // RC mirror of (A, fwA) -> (B, fwB) is (B, !fwB) -> (A, !fwA).
+    // Matches MBG/Verkko's canon() implementation.
     static std::pair<OrientedNode, OrientedNode> canon(
         OrientedNode from, OrientedNode to)
     {
-        auto fwd = std::make_pair(from, to);
-        auto rev = std::make_pair(reverse(to), reverse(from));
-        return std::min(fwd, rev);
+        if(to.first < from.first) {
+            return {reverse(to), reverse(from)};
+        }
+        if(to.first == from.first && !to.second && !from.second) {
+            return {reverse(to), reverse(from)};
+        }
+        return {from, to};
     }
 
     // Edge properties stored once per canonical link.
@@ -77,18 +81,29 @@ public:
         nodeProps[nodeId].windowId = windowId;
     }
 
-    // Add a bidirected edge. Stores both traversal directions and
-    // edge properties under the canonical key.
+    // Add a single directed traversal from→to and store edge properties
+    // under the canonical key. Like Verkko/MBG, the caller must add
+    // both directions explicitly:
+    //   addEdge(from, to, props);
+    //   addEdge(reverse(to), reverse(from), props);
+    // Edge properties are stored under the canonical key, so both
+    // calls write to the same property entry.
     void addEdge(OrientedNode from, OrientedNode to,
                  const EdgeProperties& props)
     {
-        // Store both traversal directions.
         adjacency[from.first][from.second].insert(to);
-        adjacency[to.first][!to.second].insert(reverse(from));
 
         // Store properties under canonical key.
         auto key = canon(from, to);
         edgeProperties[key] = props;
+    }
+
+    // Add a single directed traversal without setting properties.
+    // Used when the canonical direction has already set properties
+    // and we only need to add the RC mirror's adjacency entry.
+    void addTraversal(OrientedNode from, OrientedNode to)
+    {
+        adjacency[from.first][from.second].insert(to);
     }
 
     // Check if an edge exists.
@@ -126,21 +141,21 @@ public:
         return &it->second;
     }
 
-    // Remove an edge (both directions + properties).
+    // Remove a single directed traversal from→to. Like addEdge, the
+    // caller must remove both directions explicitly:
+    //   removeEdge(from, to);
+    //   removeEdge(reverse(to), reverse(from));
+    // Properties are removed on the first call (canonical key).
     void removeEdge(OrientedNode from, OrientedNode to) {
         if(from.first < adjacency.size()) {
             adjacency[from.first][from.second].erase(to);
-        }
-        auto revFrom = reverse(to);
-        auto revTo = reverse(from);
-        if(revFrom.first < adjacency.size()) {
-            adjacency[revFrom.first][revFrom.second].erase(revTo);
         }
         edgeProperties.erase(canon(from, to));
     }
 
     // In-degree + out-degree for a node (counting both orientations).
     uint64_t degree(uint64_t nodeId) const {
+        if(nodeId >= adjacency.size()) return 0;
         uint64_t d = 0;
         auto it = adjacency[nodeId].find(true);
         if(it != adjacency[nodeId].end()) d += it->second.size();

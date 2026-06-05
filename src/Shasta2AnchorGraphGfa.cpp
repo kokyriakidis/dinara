@@ -187,16 +187,15 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
         }
     }
 
-    // Convert edges. For each directed edge A→B:
-    //   nodeA = A/2, forwardA = (A is even)
-    //   nodeB = B/2, forwardB = (B is even)
-    // addEdge handles RC mirror automatically, so we only need to
-    // process each canonical pair once. We skip edges where the
-    // source anchor is odd (RC) and the canonical form would have
-    // already been added from the even (forward) anchor's edge.
-    // But since addEdge deduplicates via the canonical key in the
-    // properties map, processing all edges is safe — duplicates
-    // just overwrite with the same data.
+    // Convert edges. Each directed edge A→B in the directed graph maps
+    // to a bidirected traversal. The directed graph already has explicit
+    // RC mirror edges (B^1→A^1), so iterating all edges and adding each
+    // one gives us both traversal directions automatically — matching
+    // Verkko/MBG's pattern where the caller adds both directions.
+    //
+    // Edge properties (coverage, spans) are stored once under the
+    // canonical key. We only set properties from the canonical direction
+    // to avoid the RC mirror overwriting with swapped span values.
     BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
         const auto& edge = (*this)[e];
         if(!edge.useForAssembly) continue;
@@ -207,10 +206,7 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
         BidirectedAnchorGraph::OrientedNode from = {srcId / 2, (srcId & 1) == 0};
         BidirectedAnchorGraph::OrientedNode to   = {dstId / 2, (dstId & 1) == 0};
 
-        // Check if this is the canonical direction to avoid double-adding.
-        auto key = BidirectedAnchorGraph::canon(from, to);
-        if(key.first != from || key.second != to) continue;
-
+        // Build properties from this directed edge.
         BidirectedAnchorGraph::EdgeProperties props;
         props.coverage = edge.coverage();
         props.supportingSpanPrev = uint32_t(edge.supportingSpanPrev);
@@ -219,7 +215,19 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
         props.isInterWindow = (edge.supportingSpanPrev > 0 || edge.supportingSpanNext > 0 || edge.sharedReadCount > 0);
         props.useForAssembly = true;
 
-        bg.addEdge(from, to, props);
+        // Only set properties if this is the canonical direction, or if
+        // no properties have been set yet (self-RC-mirror edges where
+        // only one directed edge exists).
+        auto key = BidirectedAnchorGraph::canon(from, to);
+        const bool isCanonical = (key.first == from && key.second == to);
+
+        if(isCanonical || bg.getEdgeProperties(from, to) == nullptr) {
+            bg.addEdge(from, to, props);
+        } else {
+            // Non-canonical RC mirror with properties already set:
+            // add adjacency only to avoid overwriting with swapped spans.
+            bg.addTraversal(from, to);
+        }
     }
 
     cout << "Converted to bidirected graph: "
