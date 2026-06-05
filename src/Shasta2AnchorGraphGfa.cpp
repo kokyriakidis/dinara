@@ -173,42 +173,35 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
     BidirectedAnchorGraph bg;
     bg.resize(bidirNodeCount);
 
-    auto normalize = [&](uint32_t w) -> uint32_t {
+    auto normalizeWindow = [&](uint32_t w) -> uint32_t {
         return (w >= windowCount) ? (w - windowCount) : w;
     };
 
-    // Set node window assignments. Use the forward anchor (even anchorId)
-    // to determine the window for each bidirected node.
+    // Set node window assignments using the forward anchor (even).
     for(uint64_t anchorId = 0; anchorId < anchorCount; anchorId += 2) {
-        const uint64_t nodeId = anchorId / 2;
+        const auto bid = BidirectedAnchorId::fromDirected(Shasta2AnchorId(anchorId));
         if(anchorId < anchorToWindow.size()) {
             const uint32_t wid = anchorToWindow[anchorId];
             if(wid != noWindow) {
-                bg.setNodeWindow(nodeId, normalize(wid));
+                bg.setNodeWindow(bid, normalizeWindow(wid));
             }
         }
     }
 
-    // Convert edges. Each directed edge A→B in the directed graph maps
-    // to a bidirected traversal. The directed graph already has explicit
-    // RC mirror edges (B^1→A^1), so iterating all edges and adding each
-    // one gives us both traversal directions automatically — matching
-    // Verkko/MBG's pattern where the caller adds both directions.
-    //
-    // Edge properties (coverage, spans) are stored once under the
-    // canonical key. We only set properties from the canonical direction
-    // to avoid the RC mirror overwriting with swapped span values.
+    // Convert edges. Each directed edge maps to a bidirected traversal.
+    // The directed graph has explicit RC mirrors, so iterating all edges
+    // gives both traversal directions. Properties are stored under the
+    // canonical key; we only set them from the canonical direction.
     BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
         const auto& edge = (*this)[e];
         if(!edge.useForAssembly) continue;
 
-        const uint64_t srcId = uint64_t(source(e, *this));
-        const uint64_t dstId = uint64_t(target(e, *this));
+        const Shasta2AnchorId srcId = Shasta2AnchorId(uint64_t(source(e, *this)));
+        const Shasta2AnchorId dstId = Shasta2AnchorId(uint64_t(target(e, *this)));
 
-        BidirectedAnchorGraph::OrientedNode from = {srcId / 2, (srcId & 1) == 0};
-        BidirectedAnchorGraph::OrientedNode to   = {dstId / 2, (dstId & 1) == 0};
+        const OrientedAnchor from = toOrientedAnchor(srcId);
+        const OrientedAnchor to   = toOrientedAnchor(dstId);
 
-        // Build properties from this directed edge.
         BidirectedAnchorGraph::EdgeProperties props;
         props.coverage = edge.coverage();
         props.supportingSpanPrev = uint32_t(edge.supportingSpanPrev);
@@ -217,17 +210,10 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         props.isInterWindow = (edge.supportingSpanPrev > 0 || edge.supportingSpanNext > 0 || edge.sharedReadCount > 0);
         props.useForAssembly = true;
 
-        // Only set properties if this is the canonical direction, or if
-        // no properties have been set yet (self-RC-mirror edges where
-        // only one directed edge exists).
-        auto key = BidirectedAnchorGraph::canon(from, to);
-        const bool isCanonical = (key.first == from && key.second == to);
-
-        if(isCanonical || bg.getEdgeProperties(from, to) == nullptr) {
+        if(isCanonicalAnchorDirection(from, to) ||
+           bg.getEdgePropertiesCanonical(from, to) == nullptr) {
             bg.addEdge(from, to, props);
         } else {
-            // Non-canonical RC mirror with properties already set:
-            // add adjacency only to avoid overwriting with swapped spans.
             bg.addTraversal(from, to);
         }
     }
@@ -237,25 +223,7 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
          << bg.numEdges() << " edges." << endl;
 
     // Normalize orientations so backbone chains appear as +/+ links.
-    //
-    // canon() can flip link orientations based on node ID ordering,
-    // causing nodes in the same backbone chain to appear with mixed
-    // +/- orientations. We fix this by walking each backbone chain
-    // and determining which nodes need flipping.
-    //
-    // For each backbone chain, we want every node to appear as +.
-    // A directed edge a→b maps to bidirected (a/2, (a&1)==0) → (b/2, (b&1)==0).
-    // The canonical form may flip this. After normalization with
-    // swapOrientation, a node marked for swap has its orientation
-    // inverted in all links. We want the final orientation to be +
-    // for every backbone anchor.
-    //
-    // For anchor `aid`: its bidirected orientation is + if aid is even,
-    // - if aid is odd. To make it +, we flip if aid is odd.
-    // But canon() may have already flipped the link. The normalization
-    // flips the node's orientation in ALL links, which undoes canon()'s
-    // flip for this node. The net effect: the node appears as + in
-    // every link it participates in.
+    // Flip nodes whose backbone anchor is odd (strand-1 reads).
     vector<bool> swapOrientation(bidirNodeCount, false);
     for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
@@ -274,11 +242,11 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
             : window.filteredBackbonePositions;
 
         for(const uint32_t pos : positions) {
-            const uint64_t aid = uint64_t(backboneJourney[pos]);
-            const uint64_t nodeId = aid / 2;
-            if(nodeId >= bidirNodeCount) continue;
-            if(aid & 1) {
-                swapOrientation[nodeId] = true;
+            const Shasta2AnchorId aid = backboneJourney[pos];
+            const auto bid = BidirectedAnchorId::fromDirected(aid);
+            if(bid.value() >= bidirNodeCount) continue;
+            if(uint64_t(aid) & 1) {
+                swapOrientation[bid.value()] = true;
             }
         }
     }

@@ -2,193 +2,162 @@
 
 // BidirectedAnchorGraph.hpp
 //
-// Verkko/MBG-style bidirected anchor graph. Each node represents an
-// anchor pair (anchorId / 2), collapsing forward and RC into one node.
-// Each node has two ends (forward = true, RC = false). Edges connect
-// oriented node ends. Like Verkko/MBG, the caller must add both
-// traversal directions explicitly (forward edge and RC mirror).
+// Verkko/MBG-style bidirected anchor graph. Each node is a
+// BidirectedAnchorId (one per locus, collapsing forward and RC).
+// Edges connect OrientedAnchors. Like Verkko/MBG, the caller must
+// add both traversal directions explicitly.
+//
+// Edge properties are stored once per canonical link (via canonAnchor()).
+// Directional fields are stored relative to the canonical direction.
+// getEdgeProperties() adjusts them for the query direction.
 
-#include "cstdint.hpp"
+#include "BidirectedAnchorId.hpp"
 
 #include <iostream>
 #include <fstream>
 #include <map>
 #include <set>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace dinara {
 
 class BidirectedAnchorGraph {
 public:
-    // An oriented node: (nodeId, forward).
-    // forward=true means the node is traversed in the forward direction.
-    // forward=false means the node is traversed in the RC direction.
-    using OrientedNode = std::pair<uint64_t, bool>;
-
-    // Reverse an oriented node (flip orientation).
-    static OrientedNode reverse(OrientedNode node) {
-        return {node.first, !node.second};
-    }
-
-    // Canonical form of a link. Ensures a consistent ordering so that
-    // an edge and its RC mirror map to the same canonical key.
-    // RC mirror of (A, fwA) -> (B, fwB) is (B, !fwB) -> (A, !fwA).
-    // Matches MBG/Verkko's canon() implementation.
-    static std::pair<OrientedNode, OrientedNode> canon(
-        OrientedNode from, OrientedNode to)
-    {
-        if(to.first < from.first) {
-            return {reverse(to), reverse(from)};
-        }
-        if(to.first == from.first && !to.second && !from.second) {
-            return {reverse(to), reverse(from)};
-        }
-        return {from, to};
-    }
-
     // Edge properties stored once per canonical link.
+    // Directional fields are relative to the canonical direction.
     struct EdgeProperties {
+        // Symmetric fields.
         uint64_t coverage = 0;
-        uint32_t supportingSpanPrev = 0;
-        uint32_t supportingSpanNext = 0;
         uint32_t sharedReadCount = 0;
         bool isInterWindow = false;
         bool useForAssembly = true;
+
+        // Directional fields (relative to canonical direction).
+        // supportingSpanPrev = span at the canonical "from" anchor.
+        // supportingSpanNext = span at the canonical "to" anchor.
+        uint32_t supportingSpanPrev = 0;
+        uint32_t supportingSpanNext = 0;
+
+        EdgeProperties swapped() const {
+            EdgeProperties result = *this;
+            std::swap(result.supportingSpanPrev, result.supportingSpanNext);
+            return result;
+        }
     };
 
-    // Node properties.
     struct NodeProperties {
-        uint32_t windowId = UINT32_MAX;  // Normalized window ID (noWindow if unassigned).
+        uint32_t windowId = UINT32_MAX;
     };
 
-    // Number of nodes.
     uint64_t numNodes() const { return nodeCount; }
-
-    // Number of canonical edges (each link counted once).
     uint64_t numEdges() const { return edgeProperties.size(); }
 
-    // Resize to hold the given number of nodes.
     void resize(uint64_t n) {
         nodeCount = n;
         adjacency.resize(n);
         nodeProps.resize(n);
     }
 
-    // Set node properties.
-    void setNodeWindow(uint64_t nodeId, uint32_t windowId) {
-        nodeProps[nodeId].windowId = windowId;
+    void setNodeWindow(BidirectedAnchorId id, uint32_t windowId) {
+        nodeProps[id.value()].windowId = windowId;
     }
 
-    // Add a single directed traversal from→to and store edge properties
-    // under the canonical key. Like Verkko/MBG, the caller must add
-    // both directions explicitly:
-    //   addEdge(from, to, props);
-    //   addEdge(reverse(to), reverse(from), props);
-    // Edge properties are stored under the canonical key, so both
-    // calls write to the same property entry.
-    void addEdge(OrientedNode from, OrientedNode to,
+    // Add a single directed traversal and store properties under
+    // the canonical key. Caller must add both directions.
+    void addEdge(OrientedAnchor from, OrientedAnchor to,
                  const EdgeProperties& props)
     {
-        adjacency[from.first][from.second].insert(to);
-
-        // Store properties under canonical key.
-        auto key = canon(from, to);
+        adjacency[from.first.value()][from.second].insert(to);
+        auto key = canonAnchor(from, to);
         edgeProperties[key] = props;
     }
 
-    // Add a single directed traversal without setting properties.
-    // Used when the canonical direction has already set properties
-    // and we only need to add the RC mirror's adjacency entry.
-    void addTraversal(OrientedNode from, OrientedNode to)
+    // Add traversal without setting properties.
+    void addTraversal(OrientedAnchor from, OrientedAnchor to)
     {
-        adjacency[from.first][from.second].insert(to);
+        adjacency[from.first.value()][from.second].insert(to);
     }
 
-    // Check if an edge exists.
-    bool hasEdge(OrientedNode from, OrientedNode to) const {
-        if(from.first >= adjacency.size()) return false;
-        const auto& dirMap = adjacency[from.first];
-        auto it = dirMap.find(from.second);
-        if(it == dirMap.end()) return false;
+    bool hasEdge(OrientedAnchor from, OrientedAnchor to) const {
+        auto idx = from.first.value();
+        if(idx >= adjacency.size()) return false;
+        auto it = adjacency[idx].find(from.second);
+        if(it == adjacency[idx].end()) return false;
         return it->second.count(to) > 0;
     }
 
-    // Get neighbors of an oriented node.
-    std::vector<OrientedNode> getNeighbors(OrientedNode node) const {
-        std::vector<OrientedNode> result;
-        if(node.first >= adjacency.size()) return result;
-        const auto& dirMap = adjacency[node.first];
-        auto it = dirMap.find(node.second);
-        if(it == dirMap.end()) return result;
+    std::vector<OrientedAnchor> getNeighbors(OrientedAnchor node) const {
+        std::vector<OrientedAnchor> result;
+        auto idx = node.first.value();
+        if(idx >= adjacency.size()) return result;
+        auto it = adjacency[idx].find(node.second);
+        if(it == adjacency[idx].end()) return result;
         result.assign(it->second.begin(), it->second.end());
         return result;
     }
 
-    // Get edge properties (by canonical key).
-    const EdgeProperties* getEdgeProperties(OrientedNode from, OrientedNode to) const {
-        auto key = canon(from, to);
+    // Get edge properties adjusted for the query direction.
+    // Returns false if the edge doesn't exist.
+    bool getEdgeProperties(OrientedAnchor from, OrientedAnchor to,
+                           EdgeProperties& result) const
+    {
+        auto key = canonAnchor(from, to);
         auto it = edgeProperties.find(key);
-        if(it == edgeProperties.end()) return nullptr;
-        return &it->second;
-    }
-
-    EdgeProperties* getEdgeProperties(OrientedNode from, OrientedNode to) {
-        auto key = canon(from, to);
-        auto it = edgeProperties.find(key);
-        if(it == edgeProperties.end()) return nullptr;
-        return &it->second;
-    }
-
-    // Remove a single directed traversal from→to. Like addEdge, the
-    // caller must remove both directions explicitly:
-    //   removeEdge(from, to);
-    //   removeEdge(reverse(to), reverse(from));
-    // Properties are removed on the first call (canonical key).
-    void removeEdge(OrientedNode from, OrientedNode to) {
-        if(from.first < adjacency.size()) {
-            adjacency[from.first][from.second].erase(to);
+        if(it == edgeProperties.end()) return false;
+        if(isCanonicalAnchorDirection(from, to)) {
+            result = it->second;
+        } else {
+            result = it->second.swapped();
         }
-        edgeProperties.erase(canon(from, to));
+        return true;
     }
 
-    // In-degree + out-degree for a node (counting both orientations).
-    uint64_t degree(uint64_t nodeId) const {
-        if(nodeId >= adjacency.size()) return 0;
+    // Mutable pointer to canonical storage. Caller must be aware
+    // that directional fields are in the canonical direction.
+    EdgeProperties* getEdgePropertiesMutable(OrientedAnchor from, OrientedAnchor to) {
+        auto key = canonAnchor(from, to);
+        auto it = edgeProperties.find(key);
+        if(it == edgeProperties.end()) return nullptr;
+        return &it->second;
+    }
+
+    // Const pointer to canonical storage (for existence checks).
+    const EdgeProperties* getEdgePropertiesCanonical(OrientedAnchor from, OrientedAnchor to) const {
+        auto key = canonAnchor(from, to);
+        auto it = edgeProperties.find(key);
+        if(it == edgeProperties.end()) return nullptr;
+        return &it->second;
+    }
+
+    void removeEdge(OrientedAnchor from, OrientedAnchor to) {
+        auto idx = from.first.value();
+        if(idx < adjacency.size()) {
+            adjacency[idx][from.second].erase(to);
+        }
+        edgeProperties.erase(canonAnchor(from, to));
+    }
+
+    uint64_t degree(BidirectedAnchorId id) const {
+        auto idx = id.value();
+        if(idx >= adjacency.size()) return 0;
         uint64_t d = 0;
-        auto it = adjacency[nodeId].find(true);
-        if(it != adjacency[nodeId].end()) d += it->second.size();
-        it = adjacency[nodeId].find(false);
-        if(it != adjacency[nodeId].end()) d += it->second.size();
+        auto it = adjacency[idx].find(true);
+        if(it != adjacency[idx].end()) d += it->second.size();
+        it = adjacency[idx].find(false);
+        if(it != adjacency[idx].end()) d += it->second.size();
         return d;
     }
 
-    // Normalize node orientations so backbone chains appear as +/+.
-    // swapOrientation[nodeId] = true means the node should be flipped.
-    // After flipping, all edges involving that node have their
-    // orientation for that node inverted.
     void normalizeOrientations(const std::vector<bool>& swapOrientation);
-
-    // Write GFA with proper bidirected orientations.
     void writeGfa(const std::string& fileName) const;
-
-    // Write CSV with node colors by window.
     void writeCsv(const std::string& fileName, uint32_t windowCount) const;
 
 private:
     uint64_t nodeCount = 0;
-
-    // Adjacency: nodeId -> {orientation -> set of oriented neighbors}.
-    // adjacency[nodeId][true] = neighbors when traversing node forward.
-    // adjacency[nodeId][false] = neighbors when traversing node in RC.
-    std::vector<std::map<bool, std::set<OrientedNode>>> adjacency;
-
-    // Node properties indexed by nodeId.
+    std::vector<std::map<bool, std::set<OrientedAnchor>>> adjacency;
     std::vector<NodeProperties> nodeProps;
-
-    // Edge properties indexed by canonical (from, to) pair.
-    std::map<std::pair<OrientedNode, OrientedNode>, EdgeProperties> edgeProperties;
+    std::map<std::pair<OrientedAnchor, OrientedAnchor>, EdgeProperties> edgeProperties;
 };
 
 } // namespace dinara
