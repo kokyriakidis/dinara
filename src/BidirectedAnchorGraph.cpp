@@ -17,9 +17,10 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
     }
     gfa << "H\tVN:Z:1.0\n";
 
-    // Collect active nodes (nodes with at least one edge).
+    // Collect active nodes (nodes with at least one useForAssembly edge).
     set<uint64_t> activeNodes;
     for(const auto& [key, props] : edgeProperties) {
+        if(!props.useForAssembly) continue;
         activeNodes.insert(key.first.first);
         activeNodes.insert(key.second.first);
     }
@@ -57,9 +58,13 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
         gfa << "\n";
     }
 
+    uint64_t activeEdges = 0;
+    for(const auto& [key, props] : edgeProperties) {
+        if(props.useForAssembly) ++activeEdges;
+    }
     cout << "Wrote bidirected GFA to " << fileName
          << ": " << activeNodes.size() << " segments, "
-         << numEdges() << " links." << endl;
+         << activeEdges << " links." << endl;
 }
 
 
