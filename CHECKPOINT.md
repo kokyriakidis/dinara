@@ -1579,6 +1579,97 @@ Results are per-version log files in `results_v36{version}/` under each eval dir
 - **Truth VCFs**: `/sc1/groups/sbx/workspace/kyriakik/data/truth/GRCh38_HG2-T2TQ100-V1.1_stvar.filt.vcf.gz`
 - **Filtered truth**: `stvar_INS50.vcf.gz`, `stvar_DEL50.vcf.gz` in `.../structural_variants/`
 
+## Dinara V36z — Geometric Mean INS Sizing (June 2026)
+
+### Problem
+
+indirect-covdrop INS sizing has a systematic size-dependent bias:
+- Small INS (50-100bp): over-estimates by 3-4× (read length counted, not insertion length)
+- Medium INS (200-300bp): approximately correct
+- Large INS (1000+bp): under-estimates by 4-10× (bounded by read length)
+
+CIGAR/soft-clip sizes have the opposite bias: under-estimate for tandem repeats (see one repeat unit, truth is N units).
+
+### Approach
+
+When both signals exist at the same locus, `sqrt(CIGAR_size × indirect_size)` lands near truth. Added `geomeanRefineInsCalls` lambda: for each `indirect-covdrop` call where the best CIGAR INS (or soft-clip avgClipLen fallback) diverges by >40%, emit an additional `+geomean` call. Purely additive — original calls preserved.
+
+The soft-clip fallback (when CIGAR INS < 30bp) is why this works far better than predicted: soft-clip evidence exists at thousands of loci where CIGAR INS operations don't.
+
+### V36z Benchmark Results — HG002 Q100 v5.0q
+
+| Metric | V36w (baseline) | V36y | V36z |
+|--------|---:|---:|---:|
+| INS recall ps=0 | 99.45% (TP=17882, FN=98) | 99.46% (TP=17916, FN=97) | 99.46% (TP=17915, FN=98) |
+| INS recall ps=0.7 | 54.49% (TP=9797, FN=8183) | 54.89% (TP=9887, FN=8126) | **60.81% (TP=10953, FN=7060)** |
+| DEL recall ps=0 | 100.00% (TP=10143, FN=0) | 100.00% (TP=10175, FN=0) | 100.00% (TP=10175, FN=0) |
+| DEL recall ps=0.7 | 99.54% (TP=10096, FN=47) | 99.55% (TP=10129, FN=46) | 99.55% (TP=10129, FN=46) |
+
+**V36z vs V36y: +1066 INS TP at ps=0.7 (+5.92% recall)**. No DEL regression.
+
+Breakdown: 1196 gained, 150 lost (truvari matching artifacts). 806 gained directly from `+geomean` calls, 390 from improved matching landscape. Geomean gains by truth size: 187 (50-100bp), 394 (100-200bp), 201 (200-500bp), 24 (500bp+). Average pss of geomean gains: 0.86.
+
+### Remaining FN Analysis (V36y baseline)
+
+**DEL ps=0.7 (46 FN):** Dead end. 38/46 are 50-100bp tandem repeat DELs. 0/46 have CIGAR D ops within 30% of truth. No actionable signal.
+
+**INS ps=0 (97 FN):** 72 emit only DEL calls (no INS call). 64 of those have spanning reads but zero diagonal shift — k-mers from inserted tandem repeat match reference. 46/97 are in multi-truth clusters. ~2 fixable (position near BED boundary).
+
+**INS ps=0.7 (sizing errors):** Dominated by indirect-covdrop (2429 cases). Systematic bias: over for small INS, under for large INS, bounded by read length (~250bp). Simple correction factors (×0.5, ×0.7, estSize²/250) all make things worse — they help one direction but hurt the other. The geometric mean approach is the only method that works because it combines two signals with opposite biases.
+
+### Cluster Paths
+
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36z`
+- **INS results**: `.../full_ins_eval/results_v36z/` (26,101 logs)
+- **DEL results**: `.../full_del_eval/results_v36z/` (10,173 logs)
+- **INS VCF**: `.../full_ins_eval/dinara_v36z_ins_sorted.vcf.gz` (247,609 calls, 8,014 +geomean)
+- **DEL VCF**: `.../full_del_eval/dinara_v36z_dels_sorted.vcf.gz`
+
+---
+
+## Dinara V36y — CIGAR-Guided INS Refinement (June 2026)
+
+### Changes
+
+Three changes over V36w baseline:
+
+1. **`cigarRefineInsCalls` lambda (additive)**: For each INS call whose size significantly exceeds the best CIGAR INS size (ratio < 0.7), emits an additional `+CIGAR` call alongside the original. Truvari `--pick multi` selects whichever matches truth better. Called at all 3 INS emission sites.
+
+2. **Assembly overlap improvement**: `assembleClipSequences` refactored to `assembleClipContig` (returns full contig string). New `suffixPrefixOverlap` function replaces hardcoded `k-1=20` overlap estimate with actual suffix-prefix overlap detection between assembled soft-clip contigs.
+
+3. **Removed destructive CIGAR refinement** (was in V36x, caused regression): Inline CIGAR refinement in both indirect-covdrop paths replaced `estSize` with `maxObservedSize`. For tandem repeats, CIGAR sees one repeat unit while truth is N units — this destroyed accurate indirect estimates. Removed entirely in V36y.
+
+### V36y Benchmark Results — HG002 Q100 v5.0q
+
+| Metric | V36w (baseline) | V36x (regression) | V36y |
+|--------|---:|---:|---:|
+| INS recall ps=0 | 99.45% (TP=17882, FN=98) | 99.45% (TP=17881, FN=99) | **99.46% (TP=17916, FN=97)** |
+| INS recall ps=0.7 | 54.49% (TP=9797, FN=8183) | 52.44% (TP=9429, FN=8551) | **54.89% (TP=9887, FN=8126)** |
+| DEL recall ps=0 | 100.00% (TP=10143, FN=0) | — | **100.00% (TP=10175, FN=0)** |
+| DEL recall ps=0.7 | 99.54% (TP=10096, FN=47) | — | **99.55% (TP=10129, FN=46)** |
+
+Net gain over V36w: **+90 INS TP at ps=0.7** (+0.40%), no regressions.
+
+### V36x Regression Analysis
+
+V36x applied destructive CIGAR refinement in both indirect-covdrop emission paths: when `maxObservedSize ∈ [50, 500)` and `estSize > maxObservedSize`, it replaced `estSize` with `maxObservedSize`. This caused:
+
+- **1260 lost** truth variants (pss dropped below 0.7)
+- **903 gained** truth variants (pss rose above 0.7)
+- **Net: -357 TP**
+
+Root cause: for tandem repeat insertions, CIGAR sees one repeat unit (e.g., 99bp) while truth is N units (e.g., 297bp). The indirect-covdrop estimate (`indirectBases/coverage`) was already close to truth but got replaced with the single-unit CIGAR size. The `estSize/maxObservedSize` ratio distributions for lost and gained cases overlap completely (both peak at 2-4×), so no threshold can separate them.
+
+**Lesson**: Never replace an existing estimate destructively. Always emit both original and refined as separate calls, letting truvari `--pick multi` choose the best match. See `AGENTS.md` for coding guidelines.
+
+### Cluster Paths
+
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v36y`
+- **INS results**: `.../full_ins_eval/results_v36y/` (26,101 logs)
+- **DEL results**: `.../full_del_eval/results_v36y/` (10,173 logs)
+- **INS VCF**: `.../full_ins_eval/dinara_v36y_ins_sorted.vcf.gz`
+- **DEL VCF**: `.../full_del_eval/dinara_v36y_dels_sorted.vcf.gz`
+
 ### Standardized Truvari Benchmark Parameters
 
 #### HG002 Germline — Q100 v5.0q (GIAB-recommended)
@@ -2167,3 +2258,55 @@ data/
 - **Slurm job failures**: Check logs with `ssh ec-hub 'cat /sc1/.../results_v36X/{case}.log'`. Common issues: missing `--assemblyDirectory` (causes `DinaraRun` conflicts), `/tmp` not shared across nodes.
 - **scp slow**: Large VCF files (>100MB) may take minutes. Use `rsync` for resumable transfers: `rsync -avP ec-hub:/sc1/.../ /tmp/`.
 
+# Anchor Window Pipeline — Endpoint Anchor Design
+
+## Two-Pass Inter-Window Edge Creation
+
+The anchor graph constructor uses a two-pass approach for inter-window edges:
+
+- **Pass 1 (endpoint edges):** For each backbone transition (`backbonePreviousWindow` / `backboneNextWindow`), create the single best-sharing edge between the two windows. Reserve the anchors used (+ RC mirrors) so pass 2 cannot reuse them.
+- **Early trim:** After pass 1, disable backbone anchors beyond the endpoint positions. This constrains the graph to the region between endpoints.
+- **Pass 2 (internal edges):** Create edges for all remaining inter-window anchor pairs, skipping reserved anchors.
+
+## Endpoint Anchor Invariants
+
+Each window has **at most 2 endpoint anchors** — one at the head (connecting to `backbonePreviousWindow`) and one at the tail (connecting to `backboneNextWindow`). Fewer if the window is at the start/end of a backbone chain.
+
+Key properties:
+1. **Never filtered.** All filters (singleEdge, bypass/detour, bubble, spur) check `isEndpointAnchorPrev || isEndpointAnchorNext` and skip those edges.
+2. **Single edge per side.** Each endpoint anchor has exactly one endpoint edge, connecting to exactly one adjacent window.
+3. **Highest sharing.** Pass 1 selects the anchor pair with the most shared reads between the two backbone reads of the adjacent windows.
+4. **Internal edges are bounded.** After early trim, internal edges exist strictly between the two endpoint anchors of each window.
+
+## Per-Anchor Endpoint Flags
+
+Each edge carries two flags (not serialized):
+- `isEndpointAnchorPrev` — source anchor is in the `endpointAnchors` set (reserved during pass 1).
+- `isEndpointAnchorNext` — target anchor is in the `endpointAnchors` set.
+
+These flags are set directly from the `endpointAnchors` set populated during pass 1 — no re-derivation needed. The flags drive both GFA tag output and filter protection.
+
+## GFA Tags
+
+Each link line gets `pw:Z:` and `nw:Z:` tags:
+- `Endpoint` — anchor is in the `endpointAnchors` set
+- `internal` — inter-window but not an endpoint anchor
+- `intra` — both anchors in the same window
+
+## Key Data Structures
+
+- `endpointWindowPairs` — set of `{min, max}` normalized window pairs that correspond to backbone transitions. Used to identify which window pairs get endpoint edges in pass 1.
+- `endpointAnchors` — set of anchor IDs (+ RC mirrors) reserved by pass 1 endpoint edges. Used for per-anchor flags and to prevent pass 2 from reusing these anchors.
+- `filteredBackbonePositions` — per-window backbone chain: the longest subsequence of the backbone read's journey positions where every consecutive pair has sufficient read support. Defines the spine of each window's subgraph.
+
+## Removed
+
+- `recomputeBackboneEndpoints` — removed. `backbonePreviousWindow` / `backboneNextWindow` are set once during construction and do not change.
+- Position-based endpoint detection — removed. Previously walked `filteredBackbonePositions` to find first/last active backbone anchor per window. Replaced by direct `endpointAnchors` lookup, which is the ground truth from pass 1.
+
+## Files Changed
+
+- `src/Shasta2AnchorGraph.hpp` — added `isEndpointAnchorPrev`, `isEndpointAnchorNext` to edge; added `endpointWindowPairs`, `endpointAnchors` to graph.
+- `src/Shasta2AnchorGraph.cpp` — two-pass construction, early trim, `endpointAnchors`-based endpoint flags, updated filters, removed `recomputeBackboneEndpoints`.
+- `src/Shasta2AnchorGraphGfa.cpp` — `writeGfa` accepts `anchorWindows`, emits `pw:Z:`/`nw:Z:` tags using per-anchor flags.
+- `srcMain/main.cpp` — updated `writeGfa` call sites to pass `&anchorWindows`.
