@@ -42,11 +42,11 @@ using namespace std;
 // Returns the length of the longest assembled contig.
 // Uses a greedy extension approach: start from the most
 // frequent k-mer and extend in both directions.
-static uint32_t assembleClipSequences(
+static string assembleClipContig(
     const vector<string>& seqs,
     uint32_t k = 21)
 {
-    if(seqs.empty() || k < 11) return 0;
+    if(seqs.empty() || k < 11) return {};
 
     // Build k-mer count map.
     unordered_map<string, uint32_t> kmerCount;
@@ -57,7 +57,7 @@ static uint32_t assembleClipSequences(
         }
     }
 
-    if(kmerCount.empty()) return 0;
+    if(kmerCount.empty()) return {};
 
     // Find the most frequent k-mer as seed.
     string seed;
@@ -69,7 +69,7 @@ static uint32_t assembleClipSequences(
         }
     }
 
-    if(maxCount < 2) return 0;
+    if(maxCount < 2) return {};
 
     // Greedy extension: extend right, then left.
     string contig = seed;
@@ -119,7 +119,32 @@ static uint32_t assembleClipSequences(
         if(contig.size() > 5000) break;
     }
 
-    return uint32_t(contig.size());
+    return contig;
+}
+
+// Backward-compatible wrapper returning just the length.
+static uint32_t assembleClipSequences(
+    const vector<string>& seqs,
+    uint32_t k = 21)
+{
+    return uint32_t(assembleClipContig(seqs, k).size());
+}
+
+// Find the longest suffix of a that is a prefix of b.
+static uint32_t suffixPrefixOverlap(
+    const string& a, const string& b,
+    uint32_t minOverlap = 15)
+{
+    if(a.empty() || b.empty()) return 0;
+    const uint32_t maxOvl = uint32_t(
+        std::min(a.size(), b.size()));
+    for(uint32_t len = maxOvl; len >= minOverlap; --len) {
+        if(a.compare(a.size() - len, len,
+                     b, 0, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
 }
 
 
@@ -526,6 +551,114 @@ void Assembler::buildSvMSA(
 
         // All INS calls. Populated by all INS emission sites.
         vector<InsCallRecord> allInsCalls;
+
+        // Lambda: CIGAR-guided INS size refinement.
+        // For each INS call whose size significantly exceeds the
+        // best CIGAR INS size (ratio < 0.7), emit an additional
+        // call with the CIGAR size. This lets truvari --pick multi
+        // choose the better match. Only applies when CIGAR INS
+        // size >= 50bp.
+        auto cigarRefineInsCalls = [&]() {
+            if(allInsCalls.empty() || cigarIndels.empty()) return;
+            int64_t bestCigarInsSize = 0;
+            uint32_t bestCigarInsPos = 0;
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS"
+                   && ci.size > bestCigarInsSize) {
+                    bestCigarInsSize = ci.size;
+                    bestCigarInsPos = ci.refPos;
+                }
+            }
+            if(bestCigarInsSize < 50) return;
+            vector<InsCallRecord> refined;
+            for(const auto& ic : allInsCalls) {
+                if(ic.source == "early-CIGAR") continue;
+                if(ic.size <= bestCigarInsSize) continue;
+                const int64_t dist =
+                    int64_t(ic.breakpointPos)
+                    - int64_t(bestCigarInsPos);
+                if(std::abs(dist) > 500) continue;
+                const double ratio =
+                    double(bestCigarInsSize)
+                    / double(ic.size);
+                if(ratio >= 0.7) continue;
+                refined.push_back({
+                    ic.breakpointPos,
+                    bestCigarInsSize,
+                    ic.readCount,
+                    ic.source + "+CIGAR"});
+            }
+            for(auto& r : refined) {
+                allInsCalls.push_back(std::move(r));
+            }
+        };
+
+        // Lambda: geometric-mean INS size refinement.
+        // When both a CIGAR/soft-clip size and an indirect-covdrop
+        // size exist at the same locus, the CIGAR under-estimates
+        // (one tandem repeat unit) and indirect over-estimates
+        // (full read length counted). The geometric mean of the
+        // two lands near truth. Additive: emits a "+geomean" call
+        // alongside originals.
+        auto geomeanRefineInsCalls = [&]() {
+            if(allInsCalls.empty()) return;
+
+            // Best observed INS size from CIGAR.
+            int64_t bestCigarInsSize = 0;
+            for(const auto& ci : cigarIndels) {
+                if(ci.svType == "INS"
+                   && ci.size > bestCigarInsSize) {
+                    bestCigarInsSize = ci.size;
+                }
+            }
+            // Fall back to soft-clip avg length if no CIGAR INS.
+            if(bestCigarInsSize < 30) {
+                for(const auto& sc : softClipBPs) {
+                    if(sc.readCount >= 3) {
+                        const int64_t clipSize =
+                            int64_t(sc.avgClipLen);
+                        if(clipSize > bestCigarInsSize) {
+                            bestCigarInsSize = clipSize;
+                        }
+                    }
+                }
+            }
+            if(bestCigarInsSize < 30) return;
+
+            vector<InsCallRecord> refined;
+            for(const auto& ic : allInsCalls) {
+                // Only refine indirect-covdrop calls.
+                if(ic.source != "indirect-covdrop") continue;
+                if(ic.size < 50) continue;
+                // Sizes must diverge: indirect > CIGAR by > 40%.
+                if(ic.size <= bestCigarInsSize) continue;
+                const double ratio =
+                    double(bestCigarInsSize)
+                    / double(ic.size);
+                if(ratio >= 0.7) continue;
+                const int64_t geomean = int64_t(
+                    std::sqrt(double(bestCigarInsSize)
+                              * double(ic.size)));
+                if(geomean < 50) continue;
+                // Only emit if geomean differs meaningfully
+                // from both originals.
+                const double gRatioToCigar =
+                    double(bestCigarInsSize)
+                    / double(geomean);
+                const double gRatioToIndirect =
+                    double(geomean) / double(ic.size);
+                if(gRatioToCigar >= 0.7
+                   || gRatioToIndirect >= 0.7) continue;
+                refined.push_back({
+                    ic.breakpointPos,
+                    geomean,
+                    ic.readCount,
+                    ic.source + "+geomean"});
+            }
+            for(auto& r : refined) {
+                allInsCalls.push_back(std::move(r));
+            }
+        };
 
         // DEL calls from diagonal-shift and split-read analyses.
         vector<DelCallRecord> delCallRecords;
@@ -1182,26 +1315,44 @@ void Assembler::buildSvMSA(
                                       - int64_t(rClip.refPos);
                     if(gap < -200 || gap > 200) continue;
 
-                    // Assemble each side's clip sequences.
+                    // Assemble each side's clip sequences
+                    // into full contigs for overlap detection.
+                    const string rContig =
+                        assembleClipContig(rClip.clipSeqs);
+                    const string lContig =
+                        assembleClipContig(lClip.clipSeqs);
                     const uint32_t rContigLen =
-                        assembleClipSequences(rClip.clipSeqs);
+                        uint32_t(rContig.size());
                     const uint32_t lContigLen =
-                        assembleClipSequences(lClip.clipSeqs);
+                        uint32_t(lContig.size());
 
                     // Estimate insertion size.
-                    // If both sides assembled, the insertion is
-                    // at least as long as the longer contig.
-                    // If the contigs overlap (insertion < read
-                    // length), the true size is captured by the
-                    // overlap. For larger insertions, sum the
-                    // contig lengths minus estimated overlap.
+                    // Right-clip contig extends into the insertion
+                    // from the left breakpoint; left-clip contig
+                    // extends from the right breakpoint. If the
+                    // insertion is shorter than the read length,
+                    // the contigs overlap in the middle.
                     int64_t insSize;
                     if(rContigLen > 0 && lContigLen > 0) {
-                        // Use assembled contig lengths.
-                        // Subtract k-1 overlap estimate.
-                        insSize = int64_t(rContigLen)
-                                + int64_t(lContigLen) - 20;
-                        // But at least the max of the two.
+                        // Compute actual suffix-prefix overlap
+                        // between the two contigs. This replaces
+                        // the hardcoded k-1=20 estimate.
+                        const uint32_t overlap =
+                            suffixPrefixOverlap(rContig, lContig);
+                        if(overlap > 0) {
+                            // Contigs overlap: insertion is fully
+                            // spanned. Size = sum - overlap.
+                            insSize = int64_t(rContigLen)
+                                    + int64_t(lContigLen)
+                                    - int64_t(overlap);
+                        } else {
+                            // No overlap: insertion is larger than
+                            // what the contigs can span. Sum the
+                            // contig lengths (no subtraction).
+                            insSize = int64_t(rContigLen)
+                                    + int64_t(lContigLen);
+                        }
+                        // At least the max of the two.
                         insSize = std::max(insSize,
                             int64_t(std::max(
                                 rContigLen, lContigLen)));
@@ -1264,15 +1415,34 @@ void Assembler::buildSvMSA(
                             int64_t(lClip.refPos)
                             - int64_t(rClip.refPos);
                         if(gap < -200 || gap > 200) continue;
-                        const uint32_t rContigLen =
-                            assembleClipSequences(
+                        const string rContig =
+                            assembleClipContig(
                                 rClip.clipSeqs);
-                        const uint32_t lContigLen =
-                            assembleClipSequences(
+                        const string lContig =
+                            assembleClipContig(
                                 lClip.clipSeqs);
-                        const int64_t insSize =
-                            int64_t(rContigLen)
-                            + int64_t(lContigLen);
+                        const uint32_t rContigLen =
+                            uint32_t(rContig.size());
+                        const uint32_t lContigLen =
+                            uint32_t(lContig.size());
+                        int64_t insSize;
+                        if(rContigLen > 0 && lContigLen > 0) {
+                            const uint32_t overlap =
+                                suffixPrefixOverlap(
+                                    rContig, lContig);
+                            insSize = (overlap > 0)
+                                ? int64_t(rContigLen)
+                                  + int64_t(lContigLen)
+                                  - int64_t(overlap)
+                                : int64_t(rContigLen)
+                                  + int64_t(lContigLen);
+                            insSize = std::max(insSize,
+                                int64_t(std::max(
+                                    rContigLen, lContigLen)));
+                        } else {
+                            insSize = int64_t(std::max(
+                                rContigLen, lContigLen));
+                        }
                         if(insSize >= 50) {
                             const uint32_t bpPos =
                                 (rClip.refPos
@@ -1337,7 +1507,10 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            // Emit INS calls from this early-exit path.
+            // CIGAR-guided refinement and emit INS calls.
+            cigarRefineInsCalls();
+            geomeanRefineInsCalls();
+
             if(!allInsCalls.empty()) {
                 sort(allInsCalls.begin(), allInsCalls.end(),
                     [](const InsCallRecord& a,
@@ -1436,15 +1609,34 @@ void Assembler::buildSvMSA(
                             int64_t(lClip.refPos)
                             - int64_t(rClip.refPos);
                         if(gap < -200 || gap > 200) continue;
-                        const uint32_t rContigLen =
-                            assembleClipSequences(
+                        const string rContig =
+                            assembleClipContig(
                                 rClip.clipSeqs);
-                        const uint32_t lContigLen =
-                            assembleClipSequences(
+                        const string lContig =
+                            assembleClipContig(
                                 lClip.clipSeqs);
-                        const int64_t insSize =
-                            int64_t(rContigLen)
-                            + int64_t(lContigLen);
+                        const uint32_t rContigLen =
+                            uint32_t(rContig.size());
+                        const uint32_t lContigLen =
+                            uint32_t(lContig.size());
+                        int64_t insSize;
+                        if(rContigLen > 0 && lContigLen > 0) {
+                            const uint32_t overlap =
+                                suffixPrefixOverlap(
+                                    rContig, lContig);
+                            insSize = (overlap > 0)
+                                ? int64_t(rContigLen)
+                                  + int64_t(lContigLen)
+                                  - int64_t(overlap)
+                                : int64_t(rContigLen)
+                                  + int64_t(lContigLen);
+                            insSize = std::max(insSize,
+                                int64_t(std::max(
+                                    rContigLen, lContigLen)));
+                        } else {
+                            insSize = int64_t(std::max(
+                                rContigLen, lContigLen));
+                        }
                         if(insSize >= 50) {
                             const uint32_t bpPos =
                                 (rClip.refPos
@@ -1509,8 +1701,11 @@ void Assembler::buildSvMSA(
                 }
             }
 
-            // Emit INS calls from this bad-segment path.
+            // CIGAR-guided refinement and emit INS calls.
+            cigarRefineInsCalls();
+            geomeanRefineInsCalls();
             if(!allInsCalls.empty()) {
+
                 sort(allInsCalls.begin(), allInsCalls.end(),
                     [](const InsCallRecord& a,
                        const InsCallRecord& b) {
@@ -4382,11 +4577,12 @@ void Assembler::buildSvMSA(
                                 readsRef.getRead(ReadId(rid))
                                     .baseCount;
                         }
-                        const int64_t estSize =
+                        int64_t estSize =
                             (coverage > 0)
                             ? int64_t(double(indirectBases)
                                       / coverage)
                             : 0;
+
                         if(estSize >= 50) {
                             // Position estimation for indirect-covdrop.
                             // Priority:
@@ -4518,10 +4714,11 @@ void Assembler::buildSvMSA(
                         indirectBases +=
                             readsRef.getRead(ReadId(rid)).baseCount;
                     }
-                    const int64_t estSize =
+                    int64_t estSize =
                         (coverage > 0)
                         ? int64_t(double(indirectBases) / coverage)
                         : 0;
+
                     if(estSize >= 50) {
                         // Same position logic as above.
                         uint32_t bpPos =
@@ -6508,8 +6705,10 @@ void Assembler::buildSvMSA(
         }
 
         // -----------------------------------------------------------------
-        // Emit all INS calls.
+        // CIGAR-guided INS size refinement and emission.
         // -----------------------------------------------------------------
+        cigarRefineInsCalls();
+        geomeanRefineInsCalls();
         if(!allInsCalls.empty()) {
             // Sort by breakpoint position.
             sort(allInsCalls.begin(), allInsCalls.end(),
@@ -8176,11 +8375,14 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
     // Phase 2: For each read, compute weighted diagonal histogram.
     // Non-unique k-mers contribute with weight inversely
     // proportional to their multiplicity.
+    // Also collect unique-kmer signals (refMult=1, readMult=1)
+    // as a side channel for repeat-region sizing.
     struct DelSignal {
         double gapSize;
         uint32_t readIdx;
     };
     vector<DelSignal> allDelSignals;
+    vector<DelSignal> uqDelSignals;
 
     const uint32_t maxMult = 30;
 
@@ -8208,7 +8410,10 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         }
 
         // Compute weighted diagonal scores.
+        // Also track unique-kmer diagonals (refMult=1,
+        // readMult=1) for repeat-region sizing.
         std::unordered_map<int64_t, double> diagScore;
+        std::unordered_map<int64_t, double> uqDiagScore;
 
         for(const auto& [kmer, readPositions] : readKmerIdx) {
             auto it = refKmerIdx.find(kmer);
@@ -8220,6 +8425,17 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
                 uint32_t(refPositions.size());
             const uint32_t readMult =
                 uint32_t(readPositions.size());
+
+            // Unique k-mers: both ref and read multiplicity = 1.
+            if(refMult == 1 && readMult == 1) {
+                const double w =
+                    double(k) * double(k);
+                const int64_t d =
+                    int64_t(refPositions[0])
+                    - int64_t(readPositions[0]);
+                uqDiagScore[d] += w;
+            }
+
             if(refMult > maxMult || readMult > maxMult)
                 continue;
 
@@ -8280,7 +8496,6 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
 
         if(peaks.size() < 2) continue;
 
-        const double topDiag = peaks[0].center;
         const double topScore = peaks[0].score;
 
         // Emit pairwise gaps between all strong peaks.
@@ -8304,6 +8519,50 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
                 if(gap >= 20.0 && gap <= 2000.0) {
                     allDelSignals.push_back(
                         {gap, uint32_t(ri)});
+                }
+            }
+        }
+
+        // Unique-kmer gap: cluster unique diagonals into
+        // peaks and emit the gap between the top 2.
+        if(uqDiagScore.size() >= 2) {
+            vector<int64_t> uqSorted;
+            uqSorted.reserve(uqDiagScore.size());
+            for(const auto& [d, s] : uqDiagScore) {
+                uqSorted.push_back(d);
+            }
+            sort(uqSorted.begin(), uqSorted.end());
+
+            struct UqPeak { double center; double score; };
+            vector<UqPeak> uqPeaks;
+            for(size_t i = 0; i < uqSorted.size(); ) {
+                double sSum = 0, wSum = 0;
+                size_t j = i;
+                while(j < uqSorted.size()
+                      && (j == i
+                          || uqSorted[j]
+                             - uqSorted[j-1] <= 3)) {
+                    const double s =
+                        uqDiagScore[uqSorted[j]];
+                    sSum += s;
+                    wSum += double(uqSorted[j]) * s;
+                    ++j;
+                }
+                uqPeaks.push_back({wSum / sSum, sSum});
+                i = j;
+            }
+
+            if(uqPeaks.size() >= 2) {
+                sort(uqPeaks.begin(), uqPeaks.end(),
+                    [](const UqPeak& a, const UqPeak& b) {
+                        return a.score > b.score;
+                    });
+                const double uqGap =
+                    uqPeaks[0].center
+                    - uqPeaks[1].center;
+                if(uqGap >= 20.0 && uqGap <= 2000.0) {
+                    uqDelSignals.push_back(
+                        {uqGap, uint32_t(ri)});
                 }
             }
         }
@@ -8367,6 +8626,66 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
             const uint32_t bp =
                 (regionStart + regionEnd) / 2;
             result.push_back({bp, avgSize, readCount});
+        }
+    }
+
+    // Cluster unique-kmer signals and add as additional calls.
+    // These come from flanking-region k-mers and provide
+    // cleaner sizing in repeat regions.
+    if(uqDelSignals.size() >= 2) {
+        sort(uqDelSignals.begin(), uqDelSignals.end(),
+            [](const DelSignal& a, const DelSignal& b) {
+                return a.gapSize < b.gapSize;
+            });
+
+        vector<bool> uqUsed(uqDelSignals.size(), false);
+        for(size_t i = 0; i < uqDelSignals.size(); ++i) {
+            if(uqUsed[i]) continue;
+            vector<size_t> cl = {i};
+            for(size_t j = i + 1;
+                j < uqDelSignals.size(); ++j) {
+                if(uqUsed[j]) continue;
+                const double r =
+                    std::min(uqDelSignals[i].gapSize,
+                             uqDelSignals[j].gapSize)
+                    / std::max(uqDelSignals[i].gapSize,
+                               uqDelSignals[j].gapSize);
+                if(r >= 0.7) {
+                    cl.push_back(j);
+                    uqUsed[j] = true;
+                }
+            }
+            uqUsed[i] = true;
+
+            double sSum = 0;
+            std::set<uint32_t> uReads;
+            for(const size_t c : cl) {
+                sSum += uqDelSignals[c].gapSize;
+                uReads.insert(uqDelSignals[c].readIdx);
+            }
+            const int64_t aSize =
+                int64_t(sSum / double(cl.size()) + 0.5);
+            const uint32_t rCount =
+                uint32_t(uReads.size());
+
+            if(rCount < 2) continue;
+
+            // Only add if not a duplicate of existing.
+            bool dup = false;
+            for(const auto& ex : result) {
+                const double dr =
+                    double(std::min(ex.size, aSize))
+                    / double(std::max(ex.size, aSize));
+                if(dr > 0.9) {
+                    dup = true;
+                    break;
+                }
+            }
+            if(!dup) {
+                const uint32_t bp =
+                    (regionStart + regionEnd) / 2;
+                result.push_back({bp, aSize, rCount});
+            }
         }
     }
 
@@ -9096,6 +9415,7 @@ void Assembler::parseBamEvidence(
             size_t si = i;
             while(si < posEnd) {
                 int64_t sumSize = indelObs[si].size;
+                int64_t maxSize = indelObs[si].size;
                 uint64_t sumPos = indelObs[si].refPos;
                 string bestInsSeq = indelObs[si].insSeq;
                 size_t sj = si + 1;
@@ -9106,6 +9426,8 @@ void Assembler::parseBamEvidence(
                     if(indelObs[sj].size
                        <= meanSize * 3 / 2) {
                         sumSize += indelObs[sj].size;
+                        maxSize = std::max(maxSize,
+                            indelObs[sj].size);
                         sumPos += indelObs[sj].refPos;
                         if(indelObs[sj].insSeq.size()
                            > bestInsSeq.size())
@@ -9125,9 +9447,18 @@ void Assembler::parseBamEvidence(
                         continue;
                     }
                     localPos -= refStart;
+                    // For INS: use max observation size.
+                    // Partial alignments under-report insertion
+                    // size; the largest CIGAR observation is
+                    // closest to the true size.
+                    // For DEL: keep the mean (deletions are
+                    // consistently sized across reads).
+                    const int64_t reportedSize =
+                        isDel ? (sumSize / int64_t(count))
+                              : maxSize;
                     cigarIndels.push_back({
                         isDel ? "DEL" : "INS",
-                        sumSize / int64_t(count),
+                        reportedSize,
                         localPos,
                         count,
                         std::move(bestInsSeq)
