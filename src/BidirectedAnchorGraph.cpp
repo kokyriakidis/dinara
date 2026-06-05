@@ -480,3 +480,61 @@ void BidirectedAnchorGraph::writeUnitigCsv(
         csv << i << "," << hslToHex(hue, 0.7, 0.5) << "\n";
     }
 }
+
+
+void BidirectedAnchorGraph::writeCsvByRead(const string& fileName, uint32_t readCount) const
+{
+    ofstream csv(fileName);
+    if(!csv) {
+        throw runtime_error("Cannot open " + fileName + " for writing.");
+    }
+    csv << "Name,Color\n";
+
+    if(readCount == 0) return;
+
+    set<uint64_t> activeNodes;
+    for(const auto& [key, props] : edgeProperties) {
+        if(!props.useForAssembly) continue;
+        activeNodes.insert(key.first.first.value());
+        activeNodes.insert(key.second.first.value());
+    }
+
+    for(const auto nodeIdx : activeNodes) {
+        if(nodeIdx >= nodeProps.size()) continue;
+        const uint32_t rid = nodeProps[nodeIdx].backboneReadId;
+        if(rid == UINT32_MAX) continue;
+
+        // Golden angle spacing for perceptually distinct colors.
+        const double hue = fmod(double(rid) * 137.508, 360.0);
+        csv << nodeIdx << "," << hslToHex(hue, 0.7, 0.5) << "\n";
+    }
+}
+
+
+void BidirectedAnchorGraph::writeUnitigCsvByRead(
+    const string& fileName,
+    const vector<Unitig>& unitigs,
+    uint32_t readCount) const
+{
+    ofstream csv(fileName);
+    if(!csv) {
+        throw runtime_error("Cannot open " + fileName + " for writing.");
+    }
+    csv << "Name,Color\n";
+
+    if(readCount == 0) return;
+
+    for(uint64_t i = 0; i < unitigs.size(); i++) {
+        const auto& u = unitigs[i];
+        if(u.chain.empty()) continue;
+
+        const auto idx = u.chain.front().first.value();
+        if(idx >= nodeProps.size()) continue;
+        const uint32_t rid = nodeProps[idx].backboneReadId;
+        if(rid == UINT32_MAX) continue;
+
+        const double hue = fmod(double(rid) * 137.508, 360.0);
+        csv << i << "," << hslToHex(hue, 0.7, 0.5) << "\n";
+    }
+}
+
