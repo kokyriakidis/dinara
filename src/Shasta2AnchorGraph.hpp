@@ -202,7 +202,9 @@ public:
     // (anchorId / 2) becomes one node. RC mirror edges are collapsed
     // into single bidirected links. Only useForAssembly edges are included.
     // Normalizes orientations so backbone chains appear as +/+ links.
-    BidirectedAnchorGraph toBidirected() const;
+    BidirectedAnchorGraph toBidirected(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys) const;
 
     // classifying it as "intra", "endpoint", or "internal".
     void writeGfa(const string& fileName,
