@@ -164,6 +164,12 @@ public:
         return d;
     }
 
+    // Normalize node orientations so backbone chains appear as +/+.
+    // swapOrientation[nodeId] = true means the node should be flipped.
+    // After flipping, all edges involving that node have their
+    // orientation for that node inverted.
+    void normalizeOrientations(const std::vector<bool>& swapOrientation);
+
     // Write GFA with proper bidirected orientations.
     void writeGfa(const std::string& fileName) const;
 

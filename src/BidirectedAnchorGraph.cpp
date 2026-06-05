@@ -9,6 +9,49 @@ using namespace dinara;
 using namespace std;
 
 
+void BidirectedAnchorGraph::normalizeOrientations(const vector<bool>& swapOrientation)
+{
+    if(swapOrientation.size() != adjacency.size()) {
+        throw runtime_error("swapOrientation size mismatch");
+    }
+
+    // Collect all canonical edges with their properties.
+    struct EdgeRecord {
+        OrientedNode from, to;
+        EdgeProperties props;
+    };
+    vector<EdgeRecord> allEdges;
+    allEdges.reserve(edgeProperties.size());
+    for(const auto& [key, props] : edgeProperties) {
+        allEdges.push_back({key.first, key.second, props});
+    }
+
+    // Clear everything.
+    for(auto& dirMap : adjacency) {
+        dirMap.clear();
+    }
+    edgeProperties.clear();
+
+    // Re-add all edges with adjusted orientations.
+    for(const auto& rec : allEdges) {
+        OrientedNode from = rec.from;
+        OrientedNode to = rec.to;
+
+        if(swapOrientation[from.first]) from.second = !from.second;
+        if(swapOrientation[to.first]) to.second = !to.second;
+
+        // Add both traversal directions.
+        addEdge(from, to, rec.props);
+        addTraversal(reverse(to), reverse(from));
+    }
+
+    uint64_t flippedCount = 0;
+    for(bool b : swapOrientation) if(b) ++flippedCount;
+    cout << "Normalized orientations: flipped " << flippedCount
+         << " of " << swapOrientation.size() << " nodes." << endl;
+}
+
+
 void BidirectedAnchorGraph::writeGfa(const string& fileName) const
 {
     ofstream gfa(fileName);
@@ -17,12 +60,39 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
     }
     gfa << "H\tVN:Z:1.0\n";
 
-    // Collect active nodes (nodes with at least one useForAssembly edge).
+    // Collect links by walking adjacency. This preserves the actual
+    // traversal orientations (not the canonical form which may flip them).
+    // Deduplicate: for each link from->to, the RC mirror reverse(to)->reverse(from)
+    // also exists in adjacency. We emit only one by tracking emitted pairs.
+    struct LinkRecord {
+        OrientedNode from, to;
+        const EdgeProperties* props;
+    };
+    vector<LinkRecord> links;
+    set<pair<OrientedNode, OrientedNode>> emitted;
     set<uint64_t> activeNodes;
-    for(const auto& [key, props] : edgeProperties) {
-        if(!props.useForAssembly) continue;
-        activeNodes.insert(key.first.first);
-        activeNodes.insert(key.second.first);
+
+    for(uint64_t nodeId = 0; nodeId < nodeCount; nodeId++) {
+        for(bool orient : {true, false}) {
+            auto dirIt = adjacency[nodeId].find(orient);
+            if(dirIt == adjacency[nodeId].end()) continue;
+            for(const auto& neighbor : dirIt->second) {
+                OrientedNode from = {nodeId, orient};
+                OrientedNode to = neighbor;
+
+                // Skip if the RC mirror was already emitted.
+                auto rcPair = make_pair(reverse(to), reverse(from));
+                if(emitted.count(rcPair)) continue;
+
+                const auto* props = getEdgeProperties(from, to);
+                if(!props || !props->useForAssembly) continue;
+
+                emitted.insert(make_pair(from, to));
+                links.push_back({from, to, props});
+                activeNodes.insert(from.first);
+                activeNodes.insert(to.first);
+            }
+        }
     }
 
     // Write segments.
@@ -34,37 +104,27 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
         gfa << "\n";
     }
 
-    // Write links. edgeProperties is already keyed by canonical form,
-    // so each link is emitted exactly once.
-    for(const auto& [key, props] : edgeProperties) {
-        if(!props.useForAssembly) continue;
-
-        const auto& from = key.first;
-        const auto& to = key.second;
-
-        gfa << "L\t" << from.first << "\t" << (from.second ? "+" : "-")
-            << "\t" << to.first << "\t" << (to.second ? "+" : "-")
+    // Write links.
+    for(const auto& link : links) {
+        gfa << "L\t" << link.from.first << "\t" << (link.from.second ? "+" : "-")
+            << "\t" << link.to.first << "\t" << (link.to.second ? "+" : "-")
             << "\t0M"
-            << "\tRC:i:" << props.coverage;
+            << "\tRC:i:" << link.props->coverage;
 
-        if(props.supportingSpanPrev > 0 || props.supportingSpanNext > 0) {
-            gfa << "\tsp:i:" << props.supportingSpanPrev
-                << "\tsn:i:" << props.supportingSpanNext;
+        if(link.props->supportingSpanPrev > 0 || link.props->supportingSpanNext > 0) {
+            gfa << "\tsp:i:" << link.props->supportingSpanPrev
+                << "\tsn:i:" << link.props->supportingSpanNext;
         }
-        if(props.sharedReadCount > 0) {
-            gfa << "\tsr:i:" << props.sharedReadCount;
+        if(link.props->sharedReadCount > 0) {
+            gfa << "\tsr:i:" << link.props->sharedReadCount;
         }
 
         gfa << "\n";
     }
 
-    uint64_t activeEdges = 0;
-    for(const auto& [key, props] : edgeProperties) {
-        if(props.useForAssembly) ++activeEdges;
-    }
     cout << "Wrote bidirected GFA to " << fileName
          << ": " << activeNodes.size() << " segments, "
-         << activeEdges << " links." << endl;
+         << links.size() << " links." << endl;
 }
 
 

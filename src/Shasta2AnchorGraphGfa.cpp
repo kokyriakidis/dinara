@@ -163,7 +163,9 @@ void Shasta2AnchorGraph::writeBubbleFinderGraph(const string& fileName, bool use
 
 
 
-BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
+BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys) const
 {
     const uint64_t anchorCount = anchorToWindow.size();
     const uint64_t bidirNodeCount = (anchorCount + 1) / 2;
@@ -233,6 +235,54 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected() const
     cout << "Converted to bidirected graph: "
          << bg.numNodes() << " nodes, "
          << bg.numEdges() << " edges." << endl;
+
+    // Normalize orientations so backbone chains appear as +/+ links.
+    //
+    // canon() can flip link orientations based on node ID ordering,
+    // causing nodes in the same backbone chain to appear with mixed
+    // +/- orientations. We fix this by walking each backbone chain
+    // and determining which nodes need flipping.
+    //
+    // For each backbone chain, we want every node to appear as +.
+    // A directed edge a→b maps to bidirected (a/2, (a&1)==0) → (b/2, (b&1)==0).
+    // The canonical form may flip this. After normalization with
+    // swapOrientation, a node marked for swap has its orientation
+    // inverted in all links. We want the final orientation to be +
+    // for every backbone anchor.
+    //
+    // For anchor `aid`: its bidirected orientation is + if aid is even,
+    // - if aid is odd. To make it +, we flip if aid is odd.
+    // But canon() may have already flipped the link. The normalization
+    // flips the node's orientation in ALL links, which undoes canon()'s
+    // flip for this node. The net effect: the node appears as + in
+    // every link it participates in.
+    vector<bool> swapOrientation(bidirNodeCount, false);
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+
+        const auto& positions = window.filteredBackbonePositions.empty()
+            ? [&]() -> const vector<uint32_t>& {
+                static thread_local vector<uint32_t> allPositions;
+                allPositions.clear();
+                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                    allPositions.push_back(pos);
+                }
+                return allPositions;
+            }()
+            : window.filteredBackbonePositions;
+
+        for(const uint32_t pos : positions) {
+            const uint64_t aid = uint64_t(backboneJourney[pos]);
+            const uint64_t nodeId = aid / 2;
+            if(nodeId >= bidirNodeCount) continue;
+            if(aid & 1) {
+                swapOrientation[nodeId] = true;
+            }
+        }
+    }
+    bg.normalizeOrientations(swapOrientation);
 
     return bg;
 }
