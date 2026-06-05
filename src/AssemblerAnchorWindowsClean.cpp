@@ -619,67 +619,12 @@ void Assembler::computeAnchorWindowsClean(
         pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
     }
 
-    // Phase 1: process the heap, accepting only full-journey candidates.
-    while(!candidateHeap.empty()) {
-        const CleanWindowCandidate candidate = candidateHeap.top();
-        candidateHeap.pop();
-
-        const ReadId readId = candidate.backboneOrientedReadId.getReadId();
-        if(candidate.generation != candidateGeneration[uint64_t(readId)]) {
-            continue;
-        }
-        const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
-
-        // Only accept full-journey candidates. Fragment candidates
-        // (from pushCurrentUnclaimedIntervals) are discarded.
-        if(candidate.begin != 0 || candidate.end != uint32_t(journey.size())) {
-            continue;
-        }
-
-        // Check if the full journey is still unclaimed.
-        bool isStillUnclaimed = true;
-        for(uint32_t position = 0; position < uint32_t(journey.size()); position++) {
-            if(anchorOwner[uint64_t(journey[position])] != anchorUnclaimed) {
-                isStillUnclaimed = false;
-                break;
-            }
-        }
-
-        if(!isStillUnclaimed) {
-            continue;
-        }
-
-        // Skip reads whose journey base span is below the threshold.
-        if(minWindowBaseSpan > 0 && journey.size() >= 2) {
-            const Shasta2AnchorId firstAnchor = journey[0];
-            const Shasta2AnchorId lastAnchor = journey[journey.size() - 1];
-            const uint32_t firstPos = shasta2Anchors->getPosition(firstAnchor, candidate.backboneOrientedReadId);
-            const uint32_t lastPos = shasta2Anchors->getPosition(lastAnchor, candidate.backboneOrientedReadId);
-            const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
-            if(baseSpan < minWindowBaseSpan) {
-                continue;
-            }
-        }
-
-        createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
-    }
-
-    const uint64_t phase1Windows = anchorWindows.size();
-    uint64_t phase1ClaimedAnchors = claimedAnchors;
-    cout << timestamp << "Phase 1 complete: " << phase1Windows << " windows, "
-         << phase1ClaimedAnchors << " claimed anchors." << endl;
-
-    // Phase 2: re-seed the heap with unclaimed intervals from all reads,
-    // then process fragment candidates (not requiring full journey).
-    // Bump all generations to invalidate stale phase-1 entries.
-    for(uint64_t i = 0; i < readCount; i++) {
-        ++candidateGeneration[i];
-    }
-
-    for(const ReadId readId : readIdsSortedByLength) {
-        const OrientedReadId backboneOid(readId, 0);
-        pushCurrentUnclaimedIntervals(backboneOid);
-    }
+    // Process the heap. For each candidate (longest base span first):
+    // - If the full journey is unclaimed, create one window for the whole journey.
+    // - Otherwise, find contiguous unclaimed intervals within the journey
+    //   and create a separate window for each.
+    uint64_t fullJourneyWindows = 0;
+    uint64_t fragmentWindows = 0;
 
     while(!candidateHeap.empty()) {
         const CleanWindowCandidate candidate = candidateHeap.top();
@@ -691,37 +636,60 @@ void Assembler::computeAnchorWindowsClean(
         }
         const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
 
-        // Check that the interval is still fully unclaimed.
-        bool isStillUnclaimed = true;
-        for(uint32_t position = candidate.begin; position < candidate.end; position++) {
-            if(anchorOwner[uint64_t(journey[position])] != anchorUnclaimed) {
-                isStillUnclaimed = false;
-                break;
+        // Find contiguous unclaimed intervals within the full journey.
+        // We always scan the full journey regardless of candidate.begin/end,
+        // since claimed regions may have appeared since this candidate was pushed.
+        vector<pair<uint32_t, uint32_t>> unclaimedIntervals;
+        {
+            uint32_t pos = 0;
+            const uint32_t journeySize = uint32_t(journey.size());
+            while(pos < journeySize) {
+                while(pos < journeySize &&
+                      anchorOwner[uint64_t(journey[pos])] != anchorUnclaimed) {
+                    ++pos;
+                }
+                const uint32_t runBegin = pos;
+                while(pos < journeySize &&
+                      anchorOwner[uint64_t(journey[pos])] == anchorUnclaimed) {
+                    ++pos;
+                }
+                if(pos > runBegin && (pos - runBegin) >= minBackboneWindowAnchors) {
+                    unclaimedIntervals.push_back({runBegin, pos});
+                }
             }
         }
 
-        if(!isStillUnclaimed) {
-            continue;
-        }
+        if(unclaimedIntervals.empty()) continue;
 
-        // Apply the same base span threshold.
-        if(minWindowBaseSpan > 0 && (candidate.end - candidate.begin) >= 2) {
-            const Shasta2AnchorId firstAnchor = journey[candidate.begin];
-            const Shasta2AnchorId lastAnchor = journey[candidate.end - 1];
-            const uint32_t firstPos = shasta2Anchors->getPosition(firstAnchor, candidate.backboneOrientedReadId);
-            const uint32_t lastPos = shasta2Anchors->getPosition(lastAnchor, candidate.backboneOrientedReadId);
-            const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
-            if(baseSpan < minWindowBaseSpan) {
-                continue;
+        // Create a window for each unclaimed interval that passes the
+        // base span threshold.
+        const bool isFullJourney = (unclaimedIntervals.size() == 1 &&
+            unclaimedIntervals[0].first == 0 &&
+            unclaimedIntervals[0].second == uint32_t(journey.size()));
+
+        for(const auto& [intervalBegin, intervalEnd] : unclaimedIntervals) {
+            if(minWindowBaseSpan > 0 && (intervalEnd - intervalBegin) >= 2) {
+                const Shasta2AnchorId firstAnchor = journey[intervalBegin];
+                const Shasta2AnchorId lastAnchor = journey[intervalEnd - 1];
+                const uint32_t firstPos = shasta2Anchors->getPosition(
+                    firstAnchor, candidate.backboneOrientedReadId);
+                const uint32_t lastPos = shasta2Anchors->getPosition(
+                    lastAnchor, candidate.backboneOrientedReadId);
+                const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
+                if(baseSpan < minWindowBaseSpan) {
+                    continue;
+                }
+            }
+
+            createWindow(candidate.backboneOrientedReadId, intervalBegin, intervalEnd);
+
+            if(isFullJourney) {
+                ++fullJourneyWindows;
+            } else {
+                ++fragmentWindows;
             }
         }
-
-        createWindow(candidate.backboneOrientedReadId, candidate.begin, candidate.end);
     }
-
-    const uint64_t phase2Windows = anchorWindows.size() - phase1Windows;
-    cout << timestamp << "Phase 2 complete: " << phase2Windows << " additional windows, "
-         << (claimedAnchors - phase1ClaimedAnchors) << " additional claimed anchors." << endl;
 
     // Count unclaimed anchors.
     uint64_t unclaimedAnchorCount = 0;
@@ -736,7 +704,8 @@ void Assembler::computeAnchorWindowsClean(
 
     cout << timestamp << "computeAnchorWindowsClean ends."
          << " windows=" << anchorWindows.size()
-         << " (phase1=" << phase1Windows << " phase2=" << phase2Windows << ")"
+         << " (fullJourney=" << fullJourneyWindows
+         << " fragment=" << fragmentWindows << ")"
          << " anchors=" << anchorCount
          << " claimedAnchors=" << claimedAnchors
          << " unclaimedAnchors=" << unclaimedAnchorCount
