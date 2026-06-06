@@ -125,16 +125,21 @@ void Assembler::computeAnchorWindowsClean(
         return rightPosition > leftPosition ? rightPosition - leftPosition : uint64_t(end - begin);
     };
 
-    // Push a candidate interval onto the heap if it meets the minimum anchor count.
+    // Push a candidate interval onto the heap if it meets minimum anchor count
+    // and minimum base span.
     auto pushCandidate = [&](OrientedReadId oid, const auto& journey, uint32_t begin, uint32_t end) {
         if(end - begin < minBackboneWindowAnchors) {
+            return;
+        }
+        const uint64_t span = intervalBaseSpan(oid, journey, begin, end);
+        if(minWindowBaseSpan > 0 && span < minWindowBaseSpan) {
             return;
         }
         candidateHeap.push(CleanWindowCandidate{
             oid,
             begin,
             end,
-            intervalBaseSpan(oid, journey, begin, end),
+            span,
             reads->getReadRawSequenceLength(oid.getReadId()),
             candidateGeneration[uint64_t(oid.getReadId())]});
     };
