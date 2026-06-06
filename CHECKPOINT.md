@@ -1815,6 +1815,49 @@ DEL is at the practical recall ceiling (100% ps=0, 99.41% ps=0.7). The 60 FN are
 
 ---
 
+## Dinara V37c — multiKAnchorSizing Subsample (June 2026)
+
+### Problem
+
+`multiKAnchorSizing` processes every read with k-mer scans at 14 k-values. In repetitive regions with 100K+ reads (e.g., chr4:49M), this takes 240–280s per case — 86% of total `buildSvMSA` runtime. The p99 case runtime was 80s, max 314s.
+
+### Fix
+
+Stride-based subsampling: cap reads passed to `multiKAnchorSizing` at 500. A 4Kbp region at 30× has ~60 reads; at 600× (168K reads), 99.7% of reads are redundant for DEL sizing.
+
+### V37c Benchmark Results — HG002 Q100 v5.0q
+
+| Metric | V37b (before) | V37c (after) |
+|--------|---:|---:|
+| INS recall ps=0 | 99.28% (TP=17884, FN=129) | 99.27% (TP=17881, FN=132) |
+| INS recall ps=0.7 | 59.66% (TP=10746, FN=7267) | 59.87% (TP=10784, FN=7229) |
+| DEL recall ps=0 | 100.00% (TP=10175, FN=0) | 100.00% (TP=10175, FN=0) |
+| DEL recall ps=0.7 | 99.41% (TP=10115, FN=60) | 99.41% (TP=10115, FN=60) |
+
+INS ps=0.7: +38 TP over V37b. Subsampling produces cleaner size estimates in high-coverage repetitive regions. DEL unchanged.
+
+### Runtime Improvement
+
+| Percentile | V37b | V37c |
+|------------|---:|---:|
+| p50 | 0.9s | 1.0s |
+| p90 | 2.2s | 1.4s |
+| p95 | 5.8s | 1.7s |
+| p99 | 79.7s | 2.9s |
+| max | 314.2s | 49.5s |
+
+p99 dropped 27× (80s → 3s). Remaining max (49.5s) is from soft-clip de Bruijn assembly (`assembleClipContig`), a secondary bottleneck.
+
+### Cluster Paths
+
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v37c`
+- **INS results**: `.../full_ins_eval/results_v37c/`
+- **DEL results**: `.../full_del_eval/results_v37c/`
+- **INS VCF**: `.../full_ins_eval/dinara_v37c_ins_sorted.vcf.gz`
+- **DEL VCF**: `.../full_del_eval/dinara_v37c_dels_sorted.vcf.gz`
+
+---
+
 ## Dinara V36y — CIGAR-Guided INS Refinement (June 2026)
 
 ### Changes
