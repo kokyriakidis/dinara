@@ -284,8 +284,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Deduplicate by tracking which directed anchor pairs already have edges.
     std::set<std::pair<uint64_t, uint64_t>> createdPairs;
 
+    auto normalizeW = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
     auto addEdgeOnce = [&](Shasta2AnchorId a, Shasta2AnchorId b) {
-        auto key = std::make_pair(uint64_t(a), uint64_t(b));
+        // Only create edges where both anchors belong to the same window.
+        const uint64_t aidA = uint64_t(a);
+        const uint64_t aidB = uint64_t(b);
+        if(aidA >= anchorCount || aidB >= anchorCount) return;
+        const uint32_t wA = anchorToWindow[aidA];
+        const uint32_t wB = anchorToWindow[aidB];
+        if(wA == noWindow || wB == noWindow) return;
+        if(normalizeW(wA) != normalizeW(wB)) return;
+
+        auto key = std::make_pair(aidA, aidB);
         if(createdPairs.count(key)) return;
         if(addEdgeIfValid(a, b)) {
             createdPairs.insert(key);
