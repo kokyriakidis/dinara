@@ -1625,6 +1625,74 @@ Breakdown: 1196 gained, 150 lost (truvari matching artifacts). 806 gained direct
 - **INS VCF**: `.../full_ins_eval/dinara_v36z_ins_sorted.vcf.gz` (247,609 calls, 8,014 +geomean)
 - **DEL VCF**: `.../full_del_eval/dinara_v36z_dels_sorted.vcf.gz`
 
+### V36z Source Elimination Analysis (ps=0.7)
+
+Greedy elimination: at each step, remove the source with the fewest "sole contributions" (truth variants matched only by that source). Recall = TP-base / total_truth.
+
+**INS** — 22 sources, baseline 10,953 / 18,013 = 60.81% recall. 1,600 truth variants matched via multi-match (source unattributable, always survive).
+
+| Step | Removed Source | TP-base | Recall | Δ Recall | Sole |
+|------|----------------|---------|--------|----------|------|
+| base | (none) | 10953 | 60.81% | — | — |
+| 1 | large-ins-het+CIGAR | 10953 | 60.81% | +0.00 | 0 |
+| 2 | reversed-BP+CIGAR | 10953 | 60.81% | +0.00 | 0 |
+| 3 | large-ins-single-het+CIGAR | 10952 | 60.80% | −0.01 | 1 |
+| 4 | CIGAR-covdrop+CIGAR | 10950 | 60.79% | −0.01 | 2 |
+| 5 | large-ins+CIGAR | 10946 | 60.77% | −0.02 | 4 |
+| 6 | softclip-unpaired | 10937 | 60.72% | −0.05 | 9 |
+| 7 | large-ins-single+CIGAR | 10926 | 60.66% | −0.06 | 11 |
+| 8 | hit-depth | 10908 | 60.56% | −0.10 | 18 |
+| 9 | soft-clip+CIGAR | 10876 | 60.38% | −0.18 | 32 |
+| 10 | reversed-BP | 10842 | 60.19% | −0.19 | 34 |
+| 11 | large-ins-het | 10789 | 59.90% | −0.29 | 53 |
+| 12 | read-graph+CIGAR | 10732 | 59.58% | −0.32 | 57 |
+| 13 | large-ins | 10663 | 59.20% | −0.38 | 69 |
+| 14 | CIGAR-covdrop | 10582 | 58.75% | −0.45 | 81 |
+| 15 | large-ins-single-het | 10496 | 58.27% | −0.48 | 86 |
+| 16 | large-ins-single | 10374 | 57.59% | −0.68 | 122 |
+| 17 | indirect-covdrop+CIGAR | 10149 | 56.34% | −1.25 | 225 |
+| 18 | soft-clip | 9235 | 51.27% | −5.07 | 914 |
+| 19 | indirect-covdrop+geomean | 8141 | 45.20% | −6.07 | 1094 |
+| 20 | read-graph | 6826 | 37.89% | −7.30 | 1315 |
+| 21 | indirect-covdrop | 4717 | 26.19% | −11.71 | 2109 |
+| 22 | early-CIGAR | 1600 | 8.88% | −17.30 | 3117 |
+
+Essential 5 (carry 51.27% of 60.81%): `early-CIGAR`, `indirect-covdrop`, `read-graph`, `indirect-covdrop+geomean`, `soft-clip`.
+
+Zero-regression removals: `large-ins-het+CIGAR`, `reversed-BP+CIGAR`.
+
+<1% cumulative recall loss (steps 1–11): remove 11 sources, recall drops 60.81% → 59.90% (−0.91%).
+
+**DEL** — 18 sources, baseline 10,129 / 10,175 = 99.55% recall. 81 truth variants matched via multi-match (always survive).
+
+| Step | Removed Source | TP-base | Recall | Δ Recall | Sole |
+|------|----------------|---------|--------|----------|------|
+| base | (none) | 10129 | 99.55% | — | — |
+| 1 | depth-scan-sub | 10129 | 99.55% | +0.00 | 0 |
+| 2 | depth-scan-hom | 10128 | 99.54% | −0.01 | 1 |
+| 3 | depth-scan-het | 10126 | 99.52% | −0.02 | 2 |
+| 4 | path-based | 10123 | 99.49% | −0.03 | 3 |
+| 5 | split-read | 10117 | 99.43% | −0.06 | 6 |
+| 6 | cigar-covdrop | 10106 | 99.32% | −0.11 | 11 |
+| 7 | INV-cluster | 10092 | 99.18% | −0.14 | 14 |
+| 8 | depth-deficit-het | 10074 | 99.01% | −0.18 | 18 |
+| 9 | per-read-DEL | 10046 | 98.73% | −0.28 | 28 |
+| 10 | flank-gap | 10005 | 98.33% | −0.40 | 41 |
+| 11 | depth-deficit-hom | 9925 | 97.54% | −0.79 | 80 |
+| 12 | diagonal | 9771 | 96.03% | −1.51 | 154 |
+| 13 | kmer-journey | 9594 | 94.29% | −1.74 | 177 |
+| 14 | cluster | 9373 | 92.12% | −2.17 | 221 |
+| 15 | SA-tag | 9011 | 88.56% | −3.56 | 362 |
+| 16 | merged-clusters | 8338 | 81.95% | −6.61 | 673 |
+| 17 | early-CIGAR | 5756 | 56.57% | −25.38 | 2582 |
+| 18 | multi-k | 81 | 0.80% | −55.77 | 5675 |
+
+Essential 2 (carry 81.95% of 99.55%): `multi-k`, `early-CIGAR`.
+
+Zero-regression removal: `depth-scan-sub`.
+
+<1% cumulative recall loss (steps 1–9): remove 9 sources, recall drops 99.55% → 98.73% (−0.82%).
+
 ---
 
 ## Dinara V36y — CIGAR-Guided INS Refinement (June 2026)
