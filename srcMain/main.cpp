@@ -1578,6 +1578,22 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
+    // Convert to bidirected graph before any filtering.
+    auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
+    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-bypass.gfa");
+    bidirectedGraph.bypassDetourFilter(anchorWindows, *shasta2Journeys);
+    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
+    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
+        uint32_t(assembler.getReads().readCount()));
+
+    // Unitigify the bidirected graph and write unitig GFA/CSV.
+    const auto unitigs = bidirectedGraph.unitigify();
+    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
+        unitigs, uint32_t(assembler.getReads().readCount()));
+
     // Remove isolated windows (no inter-window edges).
     shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
 
@@ -1668,22 +1684,6 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
     shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
-
-    // Convert to bidirected graph and write GFA/CSV.
-    auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-bypass.gfa");
-    bidirectedGraph.bypassDetourFilter(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
-    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
-        uint32_t(assembler.getReads().readCount()));
-
-    // Unitigify the bidirected graph and write unitig GFA/CSV.
-    const auto unitigs = bidirectedGraph.unitigify();
-    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
-        unitigs, uint32_t(assembler.getReads().readCount()));
 
     // Export in shasta2-native format for --external-anchor-graph-name.
     shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");

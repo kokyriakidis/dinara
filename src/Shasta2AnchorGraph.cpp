@@ -978,32 +978,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     if(orphanedIndices.count(idx)) continue;
                     const uint64_t aid = bbAnchors[idx];
 
-                    auto disableIntraWindow = [&](uint64_t a) {
+                    // Disable all edges of the orphaned anchor (intra- and inter-window).
+                    auto disableAllEdgesOf = [&](uint64_t a) {
                         if(a >= anchorCount) return;
                         auto oe4 = boost::out_edges(a, anchorGraph);
                         for(auto it = oe4.first; it != oe4.second; ++it) {
-                            if(!anchorGraph[*it].useForAssembly) continue;
-                            const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
-                            if(tgt >= anchorCount) continue;
-                            const uint32_t tgtRaw = anchorToWindow[tgt];
-                            if(tgtRaw == noWindow) continue;
-                            if(normalize(tgtRaw) == w) {
+                            if(anchorGraph[*it].useForAssembly) {
                                 disableEdge(*it);
                             }
                         }
                         auto ie4 = boost::in_edges(a, anchorGraph);
                         for(auto it = ie4.first; it != ie4.second; ++it) {
-                            if(!anchorGraph[*it].useForAssembly) continue;
-                            const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
-                            if(src >= anchorCount) continue;
-                            const uint32_t srcRaw = anchorToWindow[src];
-                            if(srcRaw == noWindow) continue;
-                            if(normalize(srcRaw) == w) {
+                            if(anchorGraph[*it].useForAssembly) {
                                 disableEdge(*it);
                             }
                         }
                     };
-                    disableIntraWindow(aid);
+                    disableAllEdgesOf(aid);
+                    disableAllEdgesOf(aid ^ 1ULL);
 
                     orphanedIndices.insert(idx);
                     ++anchorsDisconnected;
