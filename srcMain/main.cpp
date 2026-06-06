@@ -1566,8 +1566,8 @@ void dinara::main::assemble(
     const uint64_t minInterWindowEdgeCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
 
-    // First pass: build anchor graph to detect detour window pairs.
-    cout << timestamp << "Creating Shasta2AnchorGraph (pass 1) from " << anchorWindows.size()
+    // Single-pass anchor graph construction (no detour suppression).
+    cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;
     assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
         *shasta2Anchors,
@@ -1577,25 +1577,6 @@ void dinara::main::assemble(
         minInterWindowEdgeCoverage,
         threadCount,
         &assembler.getReads());
-
-    // Find detour window pairs and rebuild with per-read detour suppression.
-    const auto detourPairs = assembler.shasta2AnchorGraph->findDetourWindowPairs(
-        anchorWindows, *shasta2Journeys);
-
-    if(!detourPairs.empty()) {
-        cout << timestamp << "Rebuilding Shasta2AnchorGraph (pass 2) with "
-             << detourPairs.size() << " detour window pairs..." << endl;
-        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            anchorWindows,
-            minInterWindowCoverage,
-            minInterWindowEdgeCoverage,
-            threadCount,
-            &assembler.getReads(),
-            nullptr,  // no bypass edges
-            &detourPairs);
-    }
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
     // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
