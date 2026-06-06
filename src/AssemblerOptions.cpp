@@ -1499,7 +1499,7 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.minWindowBaseSpan",
         value<uint64_t>(&assemblyOptions.mode3Options.minWindowBaseSpan)->
-        default_value(4000),
+        default_value(1000),
         "Minimum base span (first anchor to last anchor) for a read's "
         "journey to be accepted as a window backbone. Reads with shorter "
         "journey spans are skipped during window creation.")
