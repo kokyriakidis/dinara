@@ -132,6 +132,30 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
 }
 
 
+// HSL to hex color string.
+static string hslToHex(double hue, double s, double l)
+{
+    const double c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    const double x = c * (1.0 - abs(fmod(hue / 60.0, 2.0) - 1.0));
+    const double m = l - c / 2.0;
+    double r1, g1, b1;
+    if(hue < 60)       { r1 = c; g1 = x; b1 = 0; }
+    else if(hue < 120) { r1 = x; g1 = c; b1 = 0; }
+    else if(hue < 180) { r1 = 0; g1 = c; b1 = x; }
+    else if(hue < 240) { r1 = 0; g1 = x; b1 = c; }
+    else if(hue < 300) { r1 = x; g1 = 0; b1 = c; }
+    else               { r1 = c; g1 = 0; b1 = x; }
+    const int r = int((r1 + m) * 255);
+    const int g = int((g1 + m) * 255);
+    const int b = int((b1 + m) * 255);
+
+    ostringstream oss;
+    oss << "#" << hex << setfill('0')
+        << setw(2) << r << setw(2) << g << setw(2) << b;
+    return oss.str();
+}
+
+
 void BidirectedAnchorGraph::writeCsv(const string& fileName, uint32_t windowCount) const
 {
     ofstream csv(fileName);
@@ -154,27 +178,8 @@ void BidirectedAnchorGraph::writeCsv(const string& fileName, uint32_t windowCoun
         const uint32_t wid = nodeProps[nodeIdx].windowId;
         if(wid == UINT32_MAX) continue;
 
-        const double hue = (360.0 * wid) / windowCount;
-        const double s = 0.7;
-        const double l = 0.5;
-        const double c = (1.0 - std::abs(2.0 * l - 1.0)) * s;
-        const double x = c * (1.0 - std::abs(std::fmod(hue / 60.0, 2.0) - 1.0));
-        const double m = l - c / 2.0;
-        double r1, g1, b1;
-        if(hue < 60)       { r1 = c; g1 = x; b1 = 0; }
-        else if(hue < 120) { r1 = x; g1 = c; b1 = 0; }
-        else if(hue < 180) { r1 = 0; g1 = c; b1 = x; }
-        else if(hue < 240) { r1 = 0; g1 = x; b1 = c; }
-        else if(hue < 300) { r1 = x; g1 = 0; b1 = c; }
-        else               { r1 = c; g1 = 0; b1 = x; }
-        const int r = int((r1 + m) * 255);
-        const int g = int((g1 + m) * 255);
-        const int b = int((b1 + m) * 255);
-
-        csv << nodeIdx << ","
-            << "#" << hex << setfill('0')
-            << setw(2) << r << setw(2) << g << setw(2) << b
-            << dec << "\n";
+        const double hue = fmod(double(wid) * 137.508, 360.0);
+        csv << nodeIdx << "," << hslToHex(hue, 0.7, 0.5) << "\n";
     }
 }
 
@@ -363,30 +368,6 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
 }
 
 
-// HSL to hex color string.
-static string hslToHex(double hue, double s, double l)
-{
-    const double c = (1.0 - abs(2.0 * l - 1.0)) * s;
-    const double x = c * (1.0 - abs(fmod(hue / 60.0, 2.0) - 1.0));
-    const double m = l - c / 2.0;
-    double r1, g1, b1;
-    if(hue < 60)       { r1 = c; g1 = x; b1 = 0; }
-    else if(hue < 120) { r1 = x; g1 = c; b1 = 0; }
-    else if(hue < 180) { r1 = 0; g1 = c; b1 = x; }
-    else if(hue < 240) { r1 = 0; g1 = x; b1 = c; }
-    else if(hue < 300) { r1 = x; g1 = 0; b1 = c; }
-    else               { r1 = c; g1 = 0; b1 = x; }
-    const int r = int((r1 + m) * 255);
-    const int g = int((g1 + m) * 255);
-    const int b = int((b1 + m) * 255);
-
-    ostringstream oss;
-    oss << "#" << hex << setfill('0')
-        << setw(2) << r << setw(2) << g << setw(2) << b;
-    return oss.str();
-}
-
-
 // Write unitig GFA: each unitig is a segment, links connect unitig endpoints.
 void BidirectedAnchorGraph::writeUnitigGfa(
     const string& fileName,
@@ -534,7 +515,7 @@ void BidirectedAnchorGraph::writeUnitigCsv(
         if(u.windowSequence.empty()) continue;
 
         const uint32_t wid = u.windowSequence[0];
-        const double hue = (360.0 * wid) / windowCount;
+        const double hue = fmod(double(wid) * 137.508, 360.0);
         csv << i << "," << hslToHex(hue, 0.7, 0.5) << "\n";
     }
 }
