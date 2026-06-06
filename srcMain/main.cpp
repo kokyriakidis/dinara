@@ -1578,29 +1578,10 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    // Convert to bidirected graph before any filtering.
-    auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-bypass.gfa");
-    bidirectedGraph.bypassDetourFilter(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
-    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
-        uint32_t(assembler.getReads().readCount()));
-
-    // Unitigify the bidirected graph and write unitig GFA/CSV.
-    const auto unitigs = bidirectedGraph.unitigify();
-    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
-        unitigs, uint32_t(assembler.getReads().readCount()));
-
+    // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
+#if 0
     // Remove isolated windows (no inter-window edges).
     shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
-
-    // Remove short tip chains (dead-end linear chains of <= maxTipWindows windows).
-    // Long tips are kept as legitimate subregion ends.
-    // Disabled: needs further tuning.
-    // shasta2AnchorGraph->removeTipWindows(anchorWindows, *shasta2Journeys, 3);
 
     // G-test based detangling.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
@@ -1645,7 +1626,6 @@ void dinara::main::assemble(
 
     // Clean the anchor graph.
     shasta2AnchorGraph->removeRcWindowConnections();
-    // shasta2AnchorGraph->windowTransitiveReduction();
     shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
@@ -1674,7 +1654,6 @@ void dinara::main::assemble(
 
             // Clean again after detangling.
             shasta2AnchorGraph->removeRcWindowConnections();
-            // shasta2AnchorGraph->windowTransitiveReduction();
             shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
             shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
         }
@@ -1700,7 +1679,7 @@ void dinara::main::assemble(
     auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
 
-    // Iterative tip removal + superbubble popping (like hifiasm's cleaning rounds).
+    // Iterative tip removal + superbubble popping.
     const uint32_t maxTipWindows = 3;
     const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
     for(uint64_t cleanRound = 0; ; cleanRound++) {
@@ -1708,23 +1687,40 @@ void dinara::main::assemble(
 
         changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
         shasta2AssemblyGraph->compress();
+#endif
 
-        changeCount += shasta2AssemblyGraph->removeParallelEdges();
-        shasta2AssemblyGraph->compress();
+    // Convert to bidirected graph and write GFA/CSV.
+    auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
+    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-bypass.gfa");
+    bidirectedGraph.bypassDetourFilter(anchorWindows, *shasta2Journeys);
+    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
+    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
+        uint32_t(assembler.getReads().readCount()));
 
-        changeCount += shasta2AssemblyGraph->popSuperbubbles();
-        shasta2AssemblyGraph->compress();
+    // Unitigify the bidirected graph and write unitig GFA/CSV.
+    const auto unitigs = bidirectedGraph.unitigify();
+    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
+    bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
+        unitigs, uint32_t(assembler.getReads().readCount()));
 
-        shasta2AssemblyGraph->writeGfa(
-            "Shasta2AssemblyGraph-clean-" + to_string(cleanRound) + ".gfa");
+    //     changeCount += shasta2AssemblyGraph->removeParallelEdges();
+    //     shasta2AssemblyGraph->compress();
 
-        cout << timestamp << "Clean round " << cleanRound
-             << ": " << changeCount << " changes." << endl;
-        if(changeCount == 0) break;
-    }
+    //     changeCount += shasta2AssemblyGraph->popSuperbubbles();
+    //     shasta2AssemblyGraph->compress();
 
-    // Export the cleaned assembly graph as a shasta2-compatible anchor graph.
-    shasta2AssemblyGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
+    //     shasta2AssemblyGraph->writeGfa(
+    //         "Shasta2AssemblyGraph-clean-" + to_string(cleanRound) + ".gfa");
+
+    //     cout << timestamp << "Clean round " << cleanRound
+    //          << ": " << changeCount << " changes." << endl;
+    //     if(changeCount == 0) break;
+    // }
+
+    // // Export the cleaned assembly graph as a shasta2-compatible anchor graph.
+    // shasta2AssemblyGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
 
     return;
 
