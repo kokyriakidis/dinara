@@ -453,11 +453,6 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             << "\tRC:i:" << props.coverage << "\n";
     };
 
-    uint64_t debugNeighborCount = 0;
-    uint64_t debugNoProps = 0;
-    uint64_t debugNotInMap = 0;
-    uint64_t debugEmitted = 0;
-
     for(uint64_t i = 0; i < unitigs.size(); i++) {
         const auto& u = unitigs[i];
 
@@ -466,21 +461,14 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             const OrientedAnchor exitAnchor = u.chain.back();
             auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
             for(const auto& neighbor : neighbors) {
-                ++debugNeighborCount;
                 EdgeProperties props;
-                if(!getEdgeProperties(exitAnchor, neighbor, props)) {
-                    ++debugNoProps;
-                    continue;
-                }
+                if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
                 if(!props.useForAssembly) continue;
 
                 auto it = entryMap.find(neighbor);
                 if(it != entryMap.end()) {
                     emitLink(i, true, it->second.unitigIndex,
                              it->second.orientation, props);
-                    ++debugEmitted;
-                } else {
-                    ++debugNotInMap;
                 }
             }
         }
@@ -490,30 +478,18 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             const OrientedAnchor exitAnchor = reverseAnchor(u.chain.front());
             auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
             for(const auto& neighbor : neighbors) {
-                ++debugNeighborCount;
                 EdgeProperties props;
-                if(!getEdgeProperties(exitAnchor, neighbor, props)) {
-                    ++debugNoProps;
-                    continue;
-                }
+                if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
                 if(!props.useForAssembly) continue;
 
                 auto it = entryMap.find(neighbor);
                 if(it != entryMap.end()) {
                     emitLink(i, false, it->second.unitigIndex,
                              it->second.orientation, props);
-                    ++debugEmitted;
-                } else {
-                    ++debugNotInMap;
                 }
             }
         }
     }
-
-    cout << "Unitig link debug: " << debugNeighborCount << " neighbors checked, "
-         << debugNoProps << " no props, "
-         << debugNotInMap << " not in entry map, "
-         << debugEmitted << " emitted." << endl;
 
     cout << "Wrote unitig GFA to " << fileName
          << ": " << unitigs.size() << " segments, "
@@ -623,26 +599,15 @@ void BidirectedAnchorGraph::writeUnitigCsvByRead(
 // Edges to remove:
 //   Entry: {bb[i].node, !bb[i].orient} -> inE.xNeighbor (and RC mirror)
 //   Exit:  {bb[j].node,  bb[j].orient} -> outE.xNeighbor (and RC mirror)
-//
-// Returns the number of detours fixed.
-uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
+uint64_t BidirectedAnchorGraph::trimBackbones(
     const vector<AnchorWindow>& anchorWindows,
     const Shasta2Journeys& journeys)
 {
     const uint32_t windowCount = uint32_t(anchorWindows.size());
     static constexpr uint32_t noWindow = UINT32_MAX;
 
-    // For each directed window pair (W → X), collect all exit edges
-    // from W's backbone to X. Keep only the one at the last backbone
-    // position (closest to W's tail). Remove the rest.
-    // This does NOT touch edges in the opposite direction (X → W).
-    struct IWEdge {
-        OrientedAnchor from;
-        OrientedAnchor to;
-        uint32_t bbIdx;
-    };
-
-    uint64_t removedCount = 0;
+    uint64_t trimmedAnchors = 0;
+    uint64_t trimmedWindows = 0;
 
     for(uint32_t w = 0; w < windowCount; w++) {
         const auto& window = anchorWindows[w];
@@ -656,41 +621,77 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
             backbone.push_back(toOrientedAnchor(journey[pos]));
         }
 
-        // Collect exit edges grouped by target window.
-        map<uint32_t, vector<IWEdge>> exitByWindow;
-        for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
+        // Find the first and last backbone positions that have an
+        // inter-window neighbor (on either side).
+        auto hasInterWindowEdge = [&](uint32_t i) -> bool {
             const auto& bb = backbone[i];
+            // Check exit side.
             for(const auto& nbr : getNeighbors({bb.first, bb.second})) {
                 auto nIdx = nbr.first.value();
-                if(nIdx >= nodeProps.size()) continue;
-                uint32_t nWin = nodeProps[nIdx].windowId;
-                if(nWin == noWindow || nWin == w) continue;
-                exitByWindow[nWin].push_back(
-                    {{bb.first, bb.second}, nbr, i});
-            }
-        }
-
-        for(auto& [targetWin, edges] : exitByWindow) {
-            if(edges.size() <= 1) continue;
-            // Find the last backbone index.
-            uint32_t lastIdx = 0;
-            for(const auto& e : edges) {
-                if(e.bbIdx >= lastIdx) lastIdx = e.bbIdx;
-            }
-            // Remove all except those at lastIdx.
-            for(const auto& e : edges) {
-                if(e.bbIdx != lastIdx) {
-                    removeEdgeBothDirections(e.from, e.to);
-                    ++removedCount;
+                if(nIdx < nodeProps.size()) {
+                    uint32_t nWin = nodeProps[nIdx].windowId;
+                    if(nWin != noWindow && nWin != w) return true;
                 }
             }
+            // Check entry side.
+            for(const auto& nbr : getNeighbors({bb.first, !bb.second})) {
+                auto nIdx = nbr.first.value();
+                if(nIdx < nodeProps.size()) {
+                    uint32_t nWin = nodeProps[nIdx].windowId;
+                    if(nWin != noWindow && nWin != w) return true;
+                }
+            }
+            return false;
+        };
+
+        uint32_t firstIW = UINT32_MAX;
+        uint32_t lastIW = 0;
+        for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
+            if(hasInterWindowEdge(i)) {
+                if(firstIW == UINT32_MAX) firstIW = i;
+                lastIW = i;
+            }
         }
+
+        // No inter-window edges at all — skip (don't trim isolated windows).
+        if(firstIW == UINT32_MAX) continue;
+
+        // Remove all edges of backbone anchors before firstIW and after lastIW.
+        bool trimmed = false;
+        for(uint32_t i = 0; i < firstIW; i++) {
+            const auto& bb = backbone[i];
+            auto exitNbrs = getNeighbors({bb.first, bb.second});
+            for(const auto& nbr : exitNbrs) {
+                removeEdgeBothDirections({bb.first, bb.second}, nbr);
+            }
+            auto entryNbrs = getNeighbors({bb.first, !bb.second});
+            for(const auto& nbr : entryNbrs) {
+                removeEdgeBothDirections({bb.first, !bb.second}, nbr);
+            }
+            ++trimmedAnchors;
+            trimmed = true;
+        }
+        for(uint32_t i = lastIW + 1; i < uint32_t(backbone.size()); i++) {
+            const auto& bb = backbone[i];
+            auto exitNbrs = getNeighbors({bb.first, bb.second});
+            for(const auto& nbr : exitNbrs) {
+                removeEdgeBothDirections({bb.first, bb.second}, nbr);
+            }
+            auto entryNbrs = getNeighbors({bb.first, !bb.second});
+            for(const auto& nbr : entryNbrs) {
+                removeEdgeBothDirections({bb.first, !bb.second}, nbr);
+            }
+            ++trimmedAnchors;
+            trimmed = true;
+        }
+        if(trimmed) ++trimmedWindows;
     }
 
-    cout << "Inter-window edge filter (bidirected): removed "
-         << removedCount << " redundant inter-window edges." << endl;
+    cout << "Trim backbones (bidirected): " << trimmedWindows
+         << " windows trimmed, " << trimmedAnchors
+         << " anchors trimmed." << endl;
 
-    return removedCount;
+    return trimmedAnchors;
 }
 
 
