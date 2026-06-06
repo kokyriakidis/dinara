@@ -38,6 +38,83 @@ using namespace dinara;
 using namespace std;
 
 
+// Resolve a reference name to a BAM tid, trying with and without
+// "chr" prefix. Returns -1 if not found.
+static int resolveBamTid(sam_hdr_t* hdr, const string& refName)
+{
+    int tid = sam_hdr_name2tid(hdr, refName.c_str());
+    if(tid >= 0) return tid;
+    string altName;
+    if(refName.size() > 3 && refName.substr(0, 3) == "chr")
+        altName = refName.substr(3);
+    else
+        altName = "chr" + refName;
+    return sam_hdr_name2tid(hdr, altName.c_str());
+}
+
+
+// Compute per-base depth over a region using sweep-line.
+// O(n_reads) for events + O(region_length) prefix sum,
+// instead of O(total_aligned_bases) per-base increments.
+// Returns a vector of length (regionEnd - regionStart).
+static vector<uint32_t> sweepLineDepth(
+    htsFile* fp,
+    hts_idx_t* idx,
+    int tid,
+    uint32_t regionStart,
+    uint32_t regionEnd)
+{
+    const uint32_t spanLen = regionEnd - regionStart;
+    vector<int32_t> sweep(spanLen + 1, 0);
+
+    hts_itr_t* iter = sam_itr_queryi(
+        idx, tid, int(regionStart), int(regionEnd));
+    if(iter) {
+        bam1_t* aln = bam_init1();
+        while(sam_itr_next(fp, iter, aln) >= 0) {
+            if(aln->core.flag &
+               (BAM_FUNMAP | BAM_FSECONDARY | BAM_FDUP))
+                continue;
+
+            const uint32_t* cigar = bam_get_cigar(aln);
+            const int nCigar = aln->core.n_cigar;
+            int32_t rp = aln->core.pos;
+
+            for(int ci = 0; ci < nCigar; ++ci) {
+                const int op = bam_cigar_op(cigar[ci]);
+                const int len = bam_cigar_oplen(cigar[ci]);
+
+                if(op == BAM_CMATCH || op == BAM_CEQUAL
+                   || op == BAM_CDIFF) {
+                    const int32_t segStart = std::max(
+                        rp, int32_t(regionStart));
+                    const int32_t segEnd = std::min(
+                        rp + len, int32_t(regionEnd));
+                    if(segStart < segEnd) {
+                        ++sweep[segStart - regionStart];
+                        --sweep[segEnd - regionStart];
+                    }
+                    rp += len;
+                } else if(op == BAM_CDEL
+                          || op == BAM_CREF_SKIP) {
+                    rp += len;
+                }
+            }
+        }
+        bam_destroy1(aln);
+        hts_itr_destroy(iter);
+    }
+
+    vector<uint32_t> depth(spanLen, 0);
+    int32_t running = 0;
+    for(uint32_t i = 0; i < spanLen; ++i) {
+        running += sweep[i];
+        depth[i] = uint32_t(std::max(running, 0));
+    }
+    return depth;
+}
+
+
 // Simple de Bruijn graph assembly of soft-clip sequences.
 // Returns the length of the longest assembled contig.
 // Uses a greedy extension approach: start from the most
@@ -519,7 +596,7 @@ void Assembler::buildSvMSA(
 
         // Extract chromosome name and region offset from the
         // reference read name early, so they are available to
-        // the emitDelCalls lambda for depth/MAPQ filtering.
+        // the emitDelCalls lambda for DHFFC filtering.
         string refName;
         uint32_t regionStart = 0;
         {
@@ -542,7 +619,9 @@ void Assembler::buildSvMSA(
             }
         }
 
-        // Parse SA tag SV evidence from BAM if provided.
+        // Single-pass BAM evidence extraction: depth, SA-tag
+        // calls, soft-clip breakpoints, and CIGAR indels.
+        vector<uint32_t> regionDepth;
         vector<SaTagSvCall> saTagCalls;
         vector<SoftClipBreakpoint> softClipBPs;
         vector<CigarIndelCall> cigarIndels;
@@ -730,32 +809,26 @@ void Assembler::buildSvMSA(
         // the same locus with similar size, prefer the source
         // with higher empirical accuracy. Derived from V36i
         // "accuracy when disagreeing with winner" analysis.
+        static const std::unordered_map<string, int>
+            sourcePriorityMap = {
+            {"merged-clusters",  0}, {"diagonal",         1},
+            {"cigar-covdrop",    2}, {"early-CIGAR",      3},
+            {"SA-tag",           4}, {"split-read",       5},
+            {"cluster",          6}, {"flank-gap",        7},
+            {"kmer-journey",     8}, {"per-read-DEL",     9},
+            {"INV-cluster",     10}, {"path-based",      11},
+            {"depth-deficit-hom",12}, {"depth-deficit-het",13},
+            {"depth-scan-hom",  14}, {"depth-scan-het",  15},
+            {"depth-scan-sub",  16}, {"multi-k",         17},
+        };
         auto sourcePriority = [](const string& src) -> int {
-            if(src == "merged-clusters")    return 0;
-            if(src == "diagonal")           return 1;
-            if(src == "cigar-covdrop")      return 2;
-            if(src == "early-CIGAR")        return 3;
-            if(src == "SA-tag")             return 4;
-            if(src == "split-read")         return 5;
-            if(src == "cluster")            return 6;
-            if(src == "flank-gap")          return 7;
-            if(src == "kmer-journey")       return 8;
-            if(src == "per-read-DEL")       return 9;
-            if(src == "INV-cluster")        return 10;
-            if(src == "path-based")         return 11;
-            if(src == "depth-deficit-hom")  return 12;
-            if(src == "depth-deficit-het")  return 13;
-            if(src == "depth-scan-hom")     return 14;
-            if(src == "depth-scan-het")     return 15;
-            if(src == "depth-scan-sub")     return 16;
-            if(src == "multi-k")            return 17;
-            return 18;
+            auto it = sourcePriorityMap.find(src);
+            return it != sourcePriorityMap.end() ? it->second : 18;
         };
 
         // Lambda: merge delCallRecords into allDelCalls,
         // deduplicate near-identical calls, and emit.
-        // After deduplication, applies depth fold-change and
-        // MAPQ0 fraction filters inspired by Duphold/Delly/Manta.
+        // After deduplication, applies depth fold-change filter.
         auto emitDelCalls = [&]() {
             for(const auto& dc : delCallRecords) {
                 if(dc.size >= 50) {
@@ -798,256 +871,106 @@ void Assembler::buildSvMSA(
             }
 
             // ---------------------------------------------------------
-            // Post-dedup filters: depth fold-change and MAPQ0 fraction.
-            // Query the BAM once for all deduped calls.
+            // Post-dedup filter: depth fold-change (DHFFC).
             // ---------------------------------------------------------
             struct DepthFilterResult {
                 double dhffc;      // depth inside / depth flanking
-                double mapq0Frac;  // fraction of MAPQ=0 reads at breakpoint
                 bool computed;
             };
             vector<DepthFilterResult> filterResults(
-                deduped.size(), {1.0, 0.0, false});
+                deduped.size(), {1.0, false});
 
-            if(!bamFileName.empty() && !deduped.empty()) {
-                htsFile* fp = hts_open(bamFileName.c_str(), "r");
-                if(fp) {
-                    hts_set_threads(fp, 4);
-                    sam_hdr_t* hdr = sam_hdr_read(fp);
-                    if(hdr) {
-                        hts_idx_t* idx = sam_index_load(
-                            fp, bamFileName.c_str());
-                        if(idx) {
-                            // Resolve tid with chr prefix fallback.
-                            int tid = sam_hdr_name2tid(
-                                hdr, refName.c_str());
-                            if(tid < 0) {
-                                string altName;
-                                if(refName.size() > 3
-                                   && refName.substr(0, 3) == "chr")
-                                    altName = refName.substr(3);
-                                else
-                                    altName = "chr" + refName;
-                                tid = sam_hdr_name2tid(
-                                    hdr, altName.c_str());
-                            }
-                            if(tid >= 0) {
-                                for(size_t di = 0;
-                                    di < deduped.size(); ++di) {
-                                    const auto& dc = deduped[di];
-                                    // Absolute breakpoint position.
-                                    const uint32_t absBp =
-                                        regionStart + dc.breakpointPos;
+            if(!regionDepth.empty() && !deduped.empty()) {
+                const uint32_t rEnd =
+                    regionStart + uint32_t(regionDepth.size());
+                for(size_t di = 0;
+                    di < deduped.size(); ++di) {
+                    const auto& dc = deduped[di];
+                    const uint32_t absBp =
+                        regionStart + dc.breakpointPos;
 
-                                    // Scanning depth filter: scan
-                                    // breakpoint positions within
-                                    // ±scanRange of the predicted
-                                    // breakpoint to find the position
-                                    // that gives the lowest DHFFC.
-                                    // This handles breakpoint
-                                    // imprecision from multi-k.
-                                    const uint32_t flankSize = 500;
-                                    const uint32_t scanRange = 500;
-                                    const uint32_t scanStep = 10;
+                    const uint32_t flankSize = 500;
+                    const uint32_t scanRange = 500;
+                    const uint32_t scanStep = 10;
 
-                                    // Query region covers the full
-                                    // scan range plus flanks.
-                                    const uint32_t queryStart =
-                                        absBp > (scanRange + flankSize)
-                                        ? absBp - scanRange - flankSize
-                                        : 0;
-                                    const uint32_t queryEnd =
-                                        absBp + scanRange
-                                        + uint32_t(dc.size) + flankSize;
-                                    const uint32_t spanLen =
-                                        queryEnd - queryStart;
+                    // Scan breakpoint positions to
+                    // find the minimum DHFFC using
+                    // pre-computed regionDepth.
+                    double bestDhffc = 1.0;
+                    const int32_t scanLo =
+                        -int32_t(scanRange);
+                    const int32_t scanHi =
+                        int32_t(scanRange);
+                    for(int32_t offset = scanLo;
+                        offset <= scanHi;
+                        offset += int32_t(scanStep)) {
+                        const int32_t testBp =
+                            int32_t(absBp) + offset;
+                        if(testBp < 0) continue;
+                        const uint32_t testEnd =
+                            uint32_t(testBp)
+                            + uint32_t(dc.size);
 
-                                    // Per-base depth array.
-                                    vector<uint32_t> perBaseDepth(
-                                        spanLen, 0);
+                        const uint32_t lf =
+                            uint32_t(testBp)
+                            > flankSize
+                            ? uint32_t(testBp)
+                              - flankSize
+                            : 0;
+                        const uint32_t rf =
+                            testEnd + flankSize;
 
-                                    hts_itr_t* iter = sam_itr_queryi(
-                                        idx, tid,
-                                        int(queryStart),
-                                        int(queryEnd));
-                                    if(!iter) continue;
+                        if(lf < regionStart
+                           || rf > rEnd)
+                            continue;
 
-                                    uint64_t mapq0Count = 0;
-                                    uint64_t totalBpReads = 0;
-                                    const uint32_t mapqWin = 100;
-                                    const uint32_t mapqStart =
-                                        absBp > mapqWin
-                                        ? absBp - mapqWin : 0;
-                                    const uint32_t mapqEnd =
-                                        absBp + mapqWin;
+                        uint64_t sumIn = 0;
+                        uint32_t cntIn = 0;
+                        uint64_t sumFl = 0;
+                        uint32_t cntFl = 0;
 
-                                    bam1_t* aln = bam_init1();
-                                    while(sam_itr_next(
-                                        fp, iter, aln) >= 0) {
-                                        if(aln->core.flag &
-                                           (BAM_FUNMAP
-                                            | BAM_FSECONDARY
-                                            | BAM_FDUP))
-                                            continue;
-
-                                        const uint32_t* cigar =
-                                            bam_get_cigar(aln);
-                                        const int nCigar =
-                                            aln->core.n_cigar;
-                                        int32_t refPos =
-                                            aln->core.pos;
-
-                                        for(int ci = 0;
-                                            ci < nCigar; ++ci) {
-                                            const int op =
-                                                bam_cigar_op(
-                                                    cigar[ci]);
-                                            const int len =
-                                                bam_cigar_oplen(
-                                                    cigar[ci]);
-
-                                            if(op == BAM_CMATCH
-                                               || op == BAM_CEQUAL
-                                               || op == BAM_CDIFF) {
-                                                for(int j = 0;
-                                                    j < len; ++j) {
-                                                    const int32_t p =
-                                                        refPos + j;
-                                                    if(p >= int32_t(
-                                                           queryStart)
-                                                       && p < int32_t(
-                                                           queryEnd))
-                                                    {
-                                                        ++perBaseDepth[
-                                                            p
-                                                            - queryStart
-                                                        ];
-                                                    }
-                                                }
-                                                refPos += len;
-                                            } else if(
-                                                op == BAM_CDEL
-                                                || op == BAM_CREF_SKIP)
-                                            {
-                                                refPos += len;
-                                            } else if(
-                                                op == BAM_CINS
-                                                || op == BAM_CSOFT_CLIP)
-                                            {
-                                                // query only
-                                            } else if(
-                                                op == BAM_CHARD_CLIP
-                                                || op == BAM_CPAD)
-                                            {
-                                                // no consumption
-                                            }
-                                        }
-
-                                        const int32_t readEnd =
-                                            refPos;
-                                        const int32_t readStart =
-                                            aln->core.pos;
-                                        if(readStart < int32_t(mapqEnd)
-                                           && readEnd > int32_t(
-                                               mapqStart)) {
-                                            ++totalBpReads;
-                                            if(aln->core.qual == 0)
-                                                ++mapq0Count;
-                                        }
-                                    }
-                                    bam_destroy1(aln);
-                                    hts_itr_destroy(iter);
-
-                                    // Scan breakpoint positions to
-                                    // find the minimum DHFFC.
-                                    double bestDhffc = 1.0;
-                                    const int32_t scanLo =
-                                        -int32_t(scanRange);
-                                    const int32_t scanHi =
-                                        int32_t(scanRange);
-                                    for(int32_t offset = scanLo;
-                                        offset <= scanHi;
-                                        offset += int32_t(scanStep)) {
-                                        const int32_t testBp =
-                                            int32_t(absBp) + offset;
-                                        if(testBp < 0) continue;
-                                        const uint32_t testEnd =
-                                            uint32_t(testBp)
-                                            + uint32_t(dc.size);
-
-                                        const uint32_t lf =
-                                            uint32_t(testBp)
-                                            > flankSize
-                                            ? uint32_t(testBp)
-                                              - flankSize
-                                            : 0;
-                                        const uint32_t rf =
-                                            testEnd + flankSize;
-
-                                        if(lf < queryStart
-                                           || rf > queryEnd)
-                                            continue;
-
-                                        uint64_t sumIn = 0;
-                                        uint32_t cntIn = 0;
-                                        uint64_t sumFl = 0;
-                                        uint32_t cntFl = 0;
-
-                                        // Left flank.
-                                        for(uint32_t p = lf;
-                                            p < uint32_t(testBp);
-                                            ++p) {
-                                            sumFl += perBaseDepth[
-                                                p - queryStart];
-                                            ++cntFl;
-                                        }
-                                        // Inside.
-                                        for(uint32_t p =
-                                                uint32_t(testBp);
-                                            p < testEnd; ++p) {
-                                            sumIn += perBaseDepth[
-                                                p - queryStart];
-                                            ++cntIn;
-                                        }
-                                        // Right flank.
-                                        for(uint32_t p = testEnd;
-                                            p < rf; ++p) {
-                                            sumFl += perBaseDepth[
-                                                p - queryStart];
-                                            ++cntFl;
-                                        }
-
-                                        if(cntIn > 0 && cntFl > 0) {
-                                            const double mi =
-                                                double(sumIn)
-                                                / double(cntIn);
-                                            const double mf =
-                                                double(sumFl)
-                                                / double(cntFl);
-                                            if(mf > 0) {
-                                                const double d =
-                                                    mi / mf;
-                                                if(d < bestDhffc)
-                                                    bestDhffc = d;
-                                            }
-                                        }
-                                    }
-
-                                    double mq0frac = 0.0;
-                                    if(totalBpReads > 0) {
-                                        mq0frac = double(mapq0Count)
-                                            / double(totalBpReads);
-                                    }
-
-                                    filterResults[di] = {
-                                        bestDhffc, mq0frac, true};
-                                }
-                            }
-                            hts_idx_destroy(idx);
+                        // Left flank.
+                        for(uint32_t p = lf;
+                            p < uint32_t(testBp);
+                            ++p) {
+                            sumFl += regionDepth[
+                                p - regionStart];
+                            ++cntFl;
                         }
-                        sam_hdr_destroy(hdr);
+                        // Inside.
+                        for(uint32_t p =
+                                uint32_t(testBp);
+                            p < testEnd; ++p) {
+                            sumIn += regionDepth[
+                                p - regionStart];
+                            ++cntIn;
+                        }
+                        // Right flank.
+                        for(uint32_t p = testEnd;
+                            p < rf; ++p) {
+                            sumFl += regionDepth[
+                                p - regionStart];
+                            ++cntFl;
+                        }
+
+                        if(cntIn > 0 && cntFl > 0) {
+                            const double mi =
+                                double(sumIn)
+                                / double(cntIn);
+                            const double mf =
+                                double(sumFl)
+                                / double(cntFl);
+                            if(mf > 0) {
+                                const double d =
+                                    mi / mf;
+                                if(d < bestDhffc)
+                                    bestDhffc = d;
+                            }
+                        }
                     }
-                    hts_close(fp);
+
+                    filterResults[di] = {
+                        bestDhffc, true};
                 }
             }
 
@@ -1073,10 +996,7 @@ void Assembler::buildSvMSA(
                 if(fr.computed) {
                     cout << ", dhffc="
                          << std::fixed << std::setprecision(2)
-                         << fr.dhffc
-                         << ", mapq0="
-                         << std::fixed << std::setprecision(2)
-                         << fr.mapq0Frac;
+                         << fr.dhffc;
                 }
                 cout << endl;
             }
@@ -1243,18 +1163,18 @@ void Assembler::buildSvMSA(
         stepTimer("Step 2a: lambda defs + setup");
 
         if(!bamFileName.empty()) {
-            // refName and regionStart already parsed above.
-            saTagCalls = parseSaTagSvCalls(
+            // Single BAM pass: depth + SA-tag + soft-clip + CIGAR.
+            parseBamEvidence(
                 bamFileName, refName,
-                regionStart, regionStart + refLength);
-            // Convert breakpoint positions from absolute to
-            // relative to the reference subregion. Clamp
-            // positions outside the region to the boundary
-            // rather than discarding — SA-tag deletions
-            // often have breakpoints outside the extracted
-            // region because the aligner places the
-            // supplementary alignment in flanking unique
-            // sequence.
+                regionStart, regionStart + refLength,
+                regionDepth, saTagCalls,
+                softClipBPs, cigarIndels);
+            // Convert SA-tag breakpoint positions from absolute
+            // to relative. Clamp positions outside the region
+            // to the boundary rather than discarding — SA-tag
+            // deletions often have breakpoints outside the
+            // extracted region because the aligner places the
+            // supplementary alignment in flanking unique sequence.
             {
                 vector<SaTagSvCall> localCalls;
                 for(auto& sc : saTagCalls) {
@@ -1280,11 +1200,6 @@ void Assembler::buildSvMSA(
                          << endl;
                 }
             }
-            // Parse soft-clip breakpoints and CIGAR indels.
-            parseBamEvidence(
-                bamFileName, refName,
-                regionStart, regionStart + refLength,
-                softClipBPs, cigarIndels);
 
             if(!softClipBPs.empty()) {
                 cout << "    Soft-clip breakpoints ("
@@ -7897,19 +7812,22 @@ void Assembler::buildSvMSA(
                 struct JCluster {
                     vector<uint32_t> bps;
                     vector<int64_t> sizes;
+                    uint32_t medBp = 0;
+                    int64_t medSize = 0;
                 };
                 vector<JCluster> clusters;
 
+                // Votes are sorted by breakpointRefPos.
+                // Use running median approximation during
+                // merging to avoid O(n² log n) re-sorting.
+                // Each cluster tracks medBp/medSize which
+                // are updated via nth_element after each merge.
                 for(const auto& v : journeyVotes) {
                     bool merged = false;
                     for(auto& c : clusters) {
-                        sort(c.sizes.begin(),
-                             c.sizes.end());
-                        const int64_t cSize =
-                            c.sizes[c.sizes.size() / 2];
-                        sort(c.bps.begin(), c.bps.end());
-                        const uint32_t cBp =
-                            c.bps[c.bps.size() / 2];
+                        // Use cached median from last merge.
+                        const int64_t cSize = c.medSize;
+                        const uint32_t cBp = c.medBp;
                         if(abs(int64_t(v.breakpointRefPos)
                                - int64_t(cBp)) <= 100
                            && cSize > 0
@@ -7924,6 +7842,20 @@ void Assembler::buildSvMSA(
                                     v.breakpointRefPos);
                                 c.sizes.push_back(
                                     v.delSize);
+                                // Update running medians via
+                                // nth_element: O(n) not O(n log n).
+                                const size_t m2 =
+                                    c.sizes.size() / 2;
+                                std::nth_element(
+                                    c.sizes.begin(),
+                                    c.sizes.begin() + m2,
+                                    c.sizes.end());
+                                c.medSize = c.sizes[m2];
+                                std::nth_element(
+                                    c.bps.begin(),
+                                    c.bps.begin() + m2,
+                                    c.bps.end());
+                                c.medBp = c.bps[m2];
                                 merged = true;
                                 break;
                             }
@@ -7934,6 +7866,8 @@ void Assembler::buildSvMSA(
                         nc.bps.push_back(
                             v.breakpointRefPos);
                         nc.sizes.push_back(v.delSize);
+                        nc.medBp = v.breakpointRefPos;
+                        nc.medSize = v.delSize;
                         clusters.push_back(
                             std::move(nc));
                     }
@@ -7968,194 +7902,84 @@ void Assembler::buildSvMSA(
         // del_size = deficit / flank_depth       (hom)
         // del_size = deficit / (flank_depth / 2) (het)
         // -----------------------------------------------------------------
-        if(!bamFileName.empty() && refLength >= 500) {
-            htsFile* ddFp = hts_open(bamFileName.c_str(), "r");
-            if(ddFp) {
-                hts_set_threads(ddFp, 4);
-                sam_hdr_t* ddHdr = sam_hdr_read(ddFp);
-                if(ddHdr) {
-                    hts_idx_t* ddIdx = sam_index_load(
-                        ddFp, bamFileName.c_str());
-                    if(ddIdx) {
-                        int ddTid = sam_hdr_name2tid(
-                            ddHdr, refName.c_str());
-                        if(ddTid < 0) {
-                            string altName;
-                            if(refName.size() > 3
-                               && refName.substr(0, 3) == "chr")
-                                altName = refName.substr(3);
-                            else
-                                altName = "chr" + refName;
-                            ddTid = sam_hdr_name2tid(
-                                ddHdr, altName.c_str());
-                        }
-                        if(ddTid >= 0) {
-                            const uint32_t regionEnd =
-                                regionStart + refLength;
+        if(!regionDepth.empty() && refLength >= 500) {
+                // Try multiple flank sizes.
+                const uint32_t flankSizes[] =
+                    {200, 300, 500, 800};
 
-                            // Per-base depth across the full region.
-                            vector<uint32_t> regionDepth(
-                                refLength, 0);
+                for(uint32_t flankSz : flankSizes) {
+                    if(refLength < flankSz * 2 + 100)
+                        continue;
 
-                            hts_itr_t* ddIter = sam_itr_queryi(
-                                ddIdx, ddTid,
-                                int(regionStart),
-                                int(regionEnd));
-                            if(ddIter) {
-                                bam1_t* ddAln = bam_init1();
-                                while(sam_itr_next(
-                                    ddFp, ddIter, ddAln) >= 0) {
-                                    if(ddAln->core.flag &
-                                       (BAM_FUNMAP
-                                        | BAM_FSECONDARY
-                                        | BAM_FDUP))
-                                        continue;
+                    // Flanking depth: median of
+                    // left and right flanks.
+                    auto medianOf = [](
+                        const vector<uint32_t>& d,
+                        uint32_t from,
+                        uint32_t to) -> double {
+                        vector<uint32_t> v(
+                            d.begin() + from,
+                            d.begin() + to);
+                        sort(v.begin(), v.end());
+                        size_t n = v.size();
+                        if(n == 0) return 0;
+                        if(n % 2 == 0)
+                            return (v[n/2-1]
+                                    + v[n/2]) / 2.0;
+                        return v[n/2];
+                    };
 
-                                    const uint32_t* cigar =
-                                        bam_get_cigar(ddAln);
-                                    const int nCigar =
-                                        ddAln->core.n_cigar;
-                                    int32_t rp = ddAln->core.pos;
+                    double fl = medianOf(
+                        regionDepth, 0, flankSz);
+                    double fr = medianOf(
+                        regionDepth,
+                        refLength - flankSz,
+                        refLength);
+                    double flankDepth =
+                        (fl + fr) / 2.0;
 
-                                    for(int ci = 0;
-                                        ci < nCigar; ++ci) {
-                                        const int op =
-                                            bam_cigar_op(cigar[ci]);
-                                        const int len =
-                                            bam_cigar_oplen(cigar[ci]);
+                    if(flankDepth < 5.0) continue;
 
-                                        if(op == BAM_CMATCH
-                                           || op == BAM_CEQUAL
-                                           || op == BAM_CDIFF) {
-                                            for(int j = 0;
-                                                j < len; ++j) {
-                                                const int32_t p =
-                                                    rp + j;
-                                                if(p >= int32_t(
-                                                       regionStart)
-                                                   && p < int32_t(
-                                                       regionEnd))
-                                                {
-                                                    ++regionDepth[
-                                                        p
-                                                        - regionStart
-                                                    ];
-                                                }
-                                            }
-                                            rp += len;
-                                        } else if(
-                                            op == BAM_CDEL
-                                            || op == BAM_CREF_SKIP) {
-                                            rp += len;
-                                        }
-                                        // INS, SOFT_CLIP, HARD_CLIP,
-                                        // PAD: no ref consumption.
-                                    }
-                                }
-                                bam_destroy1(ddAln);
-                                hts_itr_destroy(ddIter);
+                    // Total observed depth.
+                    uint64_t totalObs = 0;
+                    for(uint32_t i = 0;
+                        i < refLength; ++i)
+                        totalObs += regionDepth[i];
 
-                                // Try multiple flank sizes.
-                                // Pick the one giving the best
-                                // match to any existing call size
-                                // (or just emit the best het/hom).
-                                const uint32_t flankSizes[] =
-                                    {200, 300, 500, 800};
+                    double expected =
+                        flankDepth * refLength;
+                    double deficit =
+                        expected - double(totalObs);
 
-                                for(uint32_t flankSz : flankSizes) {
-                                    if(refLength < flankSz * 2 + 100)
-                                        continue;
+                    if(deficit <= 0) continue;
 
-                                    // Flanking depth: median of
-                                    // left and right flanks.
-                                    // Use sorted middle for median.
-                                    auto medianOf = [](
-                                        const vector<uint32_t>& d,
-                                        uint32_t from,
-                                        uint32_t to) -> double {
-                                        vector<uint32_t> v(
-                                            d.begin() + from,
-                                            d.begin() + to);
-                                        sort(v.begin(), v.end());
-                                        size_t n = v.size();
-                                        if(n == 0) return 0;
-                                        if(n % 2 == 0)
-                                            return (v[n/2-1]
-                                                    + v[n/2]) / 2.0;
-                                        return v[n/2];
-                                    };
+                    double homDel =
+                        deficit / flankDepth;
+                    double hetDel =
+                        deficit / (flankDepth / 2.0);
 
-                                    double fl = medianOf(
-                                        regionDepth, 0, flankSz);
-                                    double fr = medianOf(
-                                        regionDepth,
-                                        refLength - flankSz,
-                                        refLength);
-                                    double flankDepth =
-                                        (fl + fr) / 2.0;
+                    uint32_t bp = refLength / 2;
 
-                                    if(flankDepth < 5.0) continue;
-
-                                    // Total observed depth.
-                                    uint64_t totalObs = 0;
-                                    for(uint32_t i = 0;
-                                        i < refLength; ++i)
-                                        totalObs += regionDepth[i];
-
-                                    double expected =
-                                        flankDepth * refLength;
-                                    double deficit =
-                                        expected - double(totalObs);
-
-                                    if(deficit <= 0) continue;
-
-                                    // Hom: del_size = deficit /
-                                    //                 flank_depth
-                                    double homDel =
-                                        deficit / flankDepth;
-                                    // Het: del_size = deficit /
-                                    //                 (flank_depth/2)
-                                    double hetDel =
-                                        deficit / (flankDepth / 2.0);
-
-                                    // Emit both if >= 50bp.
-                                    // Use midpoint of region as
-                                    // breakpoint (we can't localize
-                                    // it within the repeat).
-                                    uint32_t bp = refLength / 2;
-
-                                    if(homDel >= 50.0) {
-                                        allDelCalls.push_back(
-                                            {bp,
-                                             int64_t(round(homDel)),
-                                             1,
-                                             "depth-deficit-hom"});
-                                    }
-                                    // Het call is always 2× hom.
-                                    // Only emit if it rounds to a
-                                    // different size (avoids exact
-                                    // duplicate when hom is small).
-                                    int64_t homSz =
-                                        int64_t(round(homDel));
-                                    int64_t hetSz =
-                                        int64_t(round(hetDel));
-                                    if(hetDel >= 50.0
-                                       && hetSz != homSz) {
-                                        allDelCalls.push_back(
-                                            {bp,
-                                             hetSz,
-                                             1,
-                                             "depth-deficit-het"});
-                                    }
-                                }
-                            }
-                        }
-                        hts_idx_destroy(ddIdx);
+                    if(homDel >= 50.0) {
+                        allDelCalls.push_back(
+                            {bp,
+                             int64_t(round(homDel)),
+                             1,
+                             "depth-deficit-hom"});
                     }
-                    sam_hdr_destroy(ddHdr);
+                    int64_t homSz =
+                        int64_t(round(homDel));
+                    int64_t hetSz =
+                        int64_t(round(hetDel));
+                    if(hetDel >= 50.0
+                       && hetSz != homSz) {
+                        allDelCalls.push_back(
+                            {bp,
+                             hetSz,
+                             1,
+                             "depth-deficit-het"});
+                    }
                 }
-                hts_close(ddFp);
-            }
         }
 
         stepTimer("Depth-deficit DEL");
@@ -8250,18 +8074,7 @@ vector<Assembler::SaTagSvCall> Assembler::parseSaTagSvCalls(
         return result;
     }
 
-    // Try the reference name as-is, then with/without "chr" prefix.
-    int tid = sam_hdr_name2tid(hdr, refName.c_str());
-    if(tid < 0) {
-        string altName;
-        if(refName.size() > 3
-           && refName.substr(0, 3) == "chr") {
-            altName = refName.substr(3);
-        } else {
-            altName = "chr" + refName;
-        }
-        tid = sam_hdr_name2tid(hdr, altName.c_str());
-    }
+    int tid = resolveBamTid(hdr, refName);
     if(tid < 0) {
         hts_idx_destroy(idx);
         sam_hdr_destroy(hdr);
@@ -8482,16 +8295,47 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
 
     // Phase 1: Build reference k-mer index for all k values.
     // Include ALL k-mers (not just unique).
-    std::unordered_map<string, vector<uint32_t>> refKmerIdx;
+    // K-mers are packed into (uint64_t k_value, __uint128_t packed)
+    // to avoid heap-allocated string keys.
+    // For k<=64, each base uses 2 bits in a __uint128_t.
+    struct PackedKmer {
+        uint32_t k;
+        __uint128_t packed;
+        bool operator==(const PackedKmer& o) const {
+            return k == o.k && packed == o.packed;
+        }
+    };
+    struct PackedKmerHash {
+        size_t operator()(const PackedKmer& pk) const {
+            size_t h = std::hash<uint64_t>{}(
+                uint64_t(pk.packed));
+            h ^= std::hash<uint64_t>{}(
+                uint64_t(pk.packed >> 64)) + 0x9e3779b9
+                + (h << 6) + (h >> 2);
+            h ^= std::hash<uint32_t>{}(pk.k)
+                + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    auto packKmer = [](const vector<Base>& seq,
+                       uint32_t pos, uint32_t k)
+        -> __uint128_t {
+        __uint128_t packed = 0;
+        for(uint32_t j = 0; j < k; ++j) {
+            packed = (packed << 2)
+                | __uint128_t(seq[pos + j].value);
+        }
+        return packed;
+    };
+
+    std::unordered_map<PackedKmer, vector<uint32_t>,
+                       PackedKmerHash> refKmerIdx;
     for(const uint32_t k : kValues) {
         for(uint32_t p = regionStart;
             p + k <= regionEnd; ++p) {
-            string kmer;
-            kmer.reserve(k);
-            for(uint32_t j = 0; j < k; ++j) {
-                kmer.push_back(refSeq[p + j].character());
-            }
-            refKmerIdx[kmer].push_back(p);
+            refKmerIdx[{k, packKmer(refSeq, p, k)}]
+                .push_back(p);
         }
     }
 
@@ -8518,17 +8362,13 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         if(readLen < kValues.front()) continue;
 
         // Build read k-mer index for all k values.
-        std::unordered_map<string, vector<uint32_t>>
-            readKmerIdx;
+        std::unordered_map<PackedKmer, vector<uint32_t>,
+                           PackedKmerHash> readKmerIdx;
         for(const uint32_t k : kValues) {
             if(readLen < k) continue;
             for(uint32_t p = 0; p + k <= readLen; ++p) {
-                string kmer;
-                kmer.reserve(k);
-                for(uint32_t j = 0; j < k; ++j) {
-                    kmer.push_back(readSeq[p + j].character());
-                }
-                readKmerIdx[kmer].push_back(p);
+                readKmerIdx[{k, packKmer(readSeq, p, k)}]
+                    .push_back(p);
             }
         }
 
@@ -8538,11 +8378,11 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
         std::unordered_map<int64_t, double> diagScore;
         std::unordered_map<int64_t, double> uqDiagScore;
 
-        for(const auto& [kmer, readPositions] : readKmerIdx) {
-            auto it = refKmerIdx.find(kmer);
+        for(const auto& [pk, readPositions] : readKmerIdx) {
+            auto it = refKmerIdx.find(pk);
             if(it == refKmerIdx.end()) continue;
             const auto& refPositions = it->second;
-            const uint32_t k = uint32_t(kmer.size());
+            const uint32_t k = pk.k;
 
             const uint32_t refMult =
                 uint32_t(refPositions.size());
@@ -8840,15 +8680,7 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
     hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
     if(!idx) { sam_hdr_destroy(hdr); hts_close(fp); return result; }
 
-    int tid = sam_hdr_name2tid(hdr, refName.c_str());
-    if(tid < 0) {
-        string altName;
-        if(refName.size() > 3 && refName.substr(0, 3) == "chr")
-            altName = refName.substr(3);
-        else
-            altName = "chr" + refName;
-        tid = sam_hdr_name2tid(hdr, altName.c_str());
-    }
+    int tid = resolveBamTid(hdr, refName);
 
     if(tid >= 0) {
         // Per-base depth via sweep line: O(n_reads) for
@@ -8911,6 +8743,28 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
         // Free sweep memory.
         { vector<int32_t>().swap(sweep); }
 
+        // Delegate to the depth-based overload.
+        result = depthScanDelCalls(depth, refStart, refEnd);
+    }
+
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    hts_close(fp);
+    return result;
+}
+
+
+// Overload that uses pre-computed per-base depth.
+vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
+    const vector<uint32_t>& depth,
+    uint32_t refStart,
+    uint32_t refEnd) const
+{
+    vector<DepthScanDelCall> result;
+    const uint32_t regionLength = refEnd - refStart;
+    if(regionLength < 500 || depth.size() != regionLength)
+        return result;
+
         // Adaptive window size based on region length.
         uint32_t windowSize;
         if(regionLength > 50000)
@@ -8925,9 +8779,6 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
         // Aggregate into windows.
         const uint32_t nWindows = regionLength / windowSize;
         if(nWindows < 5) {
-            hts_idx_destroy(idx);
-            sam_hdr_destroy(hdr);
-            hts_close(fp);
             return result;
         }
 
@@ -9180,11 +9031,7 @@ vector<Assembler::DepthScanDelCall> Assembler::depthScanDelCalls(
                 }
             }
         }
-    }
 
-    hts_idx_destroy(idx);
-    sam_hdr_destroy(hdr);
-    hts_close(fp);
     return result;
 }
 
@@ -9197,36 +9044,36 @@ void Assembler::parseBamEvidence(
     const string& refName,
     uint32_t refStart,
     uint32_t refEnd,
+    vector<uint32_t>& regionDepth,
+    vector<SaTagSvCall>& saTagCalls,
     vector<SoftClipBreakpoint>& softClipBPs,
     vector<CigarIndelCall>& cigarIndels) const
 {
+    regionDepth.clear();
+    saTagCalls.clear();
     softClipBPs.clear();
     cigarIndels.clear();
     if(bamFileName.empty()) return;
 
     htsFile* fp = hts_open(bamFileName.c_str(), "r");
     if(!fp) return;
-    hts_set_threads(fp, 4);
+    const unsigned hwThreads = std::thread::hardware_concurrency();
+    hts_set_threads(fp, hwThreads > 0 ? int(hwThreads) : 4);
     sam_hdr_t* hdr = sam_hdr_read(fp);
     if(!hdr) { hts_close(fp); return; }
     hts_idx_t* idx = sam_index_load(fp, bamFileName.c_str());
     if(!idx) { sam_hdr_destroy(hdr); hts_close(fp); return; }
 
-    int tid = sam_hdr_name2tid(hdr, refName.c_str());
-    if(tid < 0) {
-        string altName;
-        if(refName.size() > 3 && refName.substr(0, 3) == "chr")
-            altName = refName.substr(3);
-        else
-            altName = "chr" + refName;
-        tid = sam_hdr_name2tid(hdr, altName.c_str());
-    }
+    int tid = resolveBamTid(hdr, refName);
     if(tid < 0) {
         hts_idx_destroy(idx);
         sam_hdr_destroy(hdr);
         hts_close(fp);
         return;
     }
+
+    // Chromosome name as it appears in the BAM header (for SA-tag matching).
+    const string bamChrName = sam_hdr_tid2name(hdr, tid);
 
     hts_itr_t* iter = sam_itr_queryi(
         idx, tid, int(refStart), int(refEnd));
@@ -9237,8 +9084,20 @@ void Assembler::parseBamEvidence(
         return;
     }
 
+    const uint32_t spanLen = refEnd - refStart;
     const uint32_t minClipLen = 20;
     const int64_t minIndelSize = 30;
+
+    // Depth sweep-line accumulator.
+    vector<int32_t> sweep(spanLen + 1, 0);
+
+    // SA-tag observations before clustering.
+    struct SaObs {
+        bool isDel;
+        int64_t size;
+        uint32_t bpPos;
+    };
+    vector<SaObs> saObs;
 
     // Raw observations before clustering.
     struct ClipObs {
@@ -9259,8 +9118,13 @@ void Assembler::parseBamEvidence(
     bam1_t* aln = bam_init1();
     while(sam_itr_next(fp, iter, aln) >= 0) {
         if(aln->core.flag &
-           (BAM_FSUPPLEMENTARY | BAM_FSECONDARY | BAM_FUNMAP))
+           (BAM_FSECONDARY | BAM_FUNMAP))
             continue;
+
+        const bool isSupplementary =
+            (aln->core.flag & BAM_FSUPPLEMENTARY) != 0;
+        const bool isDup =
+            (aln->core.flag & BAM_FDUP) != 0;
 
         const int32_t pos = aln->core.pos;
         const uint32_t* cigar = bam_get_cigar(aln);
@@ -9270,16 +9134,19 @@ void Assembler::parseBamEvidence(
 
         if(nCigar == 0) continue;
 
-        // Check left soft clip (first CIGAR op).
-        {
-            const int op = bam_cigar_op(cigar[0]);
-            const int len = bam_cigar_oplen(cigar[0]);
-            if(op == BAM_CSOFT_CLIP
-               && uint32_t(len) >= minClipLen) {
-                // Left clip: breakpoint is at alignment start.
+        // --- Single CIGAR walk: extract depth, ref-span,
+        // alignment end, soft-clip evidence, and indel
+        // observations in one pass.
+
+        // Left soft-clip: check first op before the walk.
+        const int firstOp = bam_cigar_op(cigar[0]);
+        const int firstLen = bam_cigar_oplen(cigar[0]);
+        int32_t queryPos = 0;
+        if(firstOp == BAM_CSOFT_CLIP) {
+            if(uint32_t(firstLen) >= minClipLen) {
                 string clipSeq;
-                clipSeq.reserve(len);
-                for(int i = 0; i < len; ++i) {
+                clipSeq.reserve(firstLen);
+                for(int i = 0; i < firstLen; ++i) {
                     static const char base[] = "=ACMGRSVTWYHKDBN";
                     clipSeq += base[bam_seqi(seq, i)];
                 }
@@ -9287,120 +9154,174 @@ void Assembler::parseBamEvidence(
                     uint32_t(pos), true, std::move(clipSeq)
                 });
             }
+            queryPos = firstLen;
         }
 
-        // Check right soft clip (last CIGAR op).
-        {
-            const int op = bam_cigar_op(cigar[nCigar - 1]);
-            const int len = bam_cigar_oplen(cigar[nCigar - 1]);
-            if(op == BAM_CSOFT_CLIP
-               && uint32_t(len) >= minClipLen) {
-                // Right clip: breakpoint is at alignment end.
-                // Compute alignment end position.
-                int64_t refPos = pos;
-                for(int ci = 0; ci < nCigar - 1; ++ci) {
-                    const int o = bam_cigar_op(cigar[ci]);
-                    const int l = bam_cigar_oplen(cigar[ci]);
-                    if(o == BAM_CMATCH || o == BAM_CDEL
-                       || o == BAM_CREF_SKIP || o == BAM_CEQUAL
-                       || o == BAM_CDIFF)
-                        refPos += l;
+        // Per-read indel tracking (only for non-supplementary).
+        struct DelOp {
+            uint32_t refPos;
+            int64_t  size;
+        };
+        vector<DelOp> readDels;
+        int64_t totalDel = 0;
+        int64_t totalIns = 0;
+        uint32_t largestDelPos = uint32_t(pos);
+        int64_t largestDelSize = 0;
+
+        int32_t rp = pos;
+        for(int ci = 0; ci < nCigar; ++ci) {
+            const int op = bam_cigar_op(cigar[ci]);
+            const int len = bam_cigar_oplen(cigar[ci]);
+
+            if(op == BAM_CMATCH || op == BAM_CEQUAL
+               || op == BAM_CDIFF) {
+                // Depth sweep (skip dups).
+                if(!isDup) {
+                    const int32_t segStart = std::max(
+                        rp, int32_t(refStart));
+                    const int32_t segEnd = std::min(
+                        rp + len, int32_t(refEnd));
+                    if(segStart < segEnd) {
+                        ++sweep[segStart - refStart];
+                        --sweep[segEnd - refStart];
+                    }
                 }
+                rp += len;
+                queryPos += len;
+            } else if(op == BAM_CDEL) {
+                // CIGAR indel tracking (non-supplementary only).
+                if(!isSupplementary) {
+                    totalDel += len;
+                    if(int64_t(len) > largestDelSize) {
+                        largestDelSize = int64_t(len);
+                        largestDelPos = uint32_t(rp);
+                    }
+                    if(len >= minIndelSize) {
+                        readDels.push_back({
+                            uint32_t(rp), int64_t(len)
+                        });
+                    }
+                }
+                rp += len;
+            } else if(op == BAM_CREF_SKIP) {
+                rp += len;
+            } else if(op == BAM_CINS) {
+                if(!isSupplementary) {
+                    totalIns += len;
+                    if(len >= minIndelSize) {
+                        string insSeq;
+                        insSeq.reserve(len);
+                        for(int i = queryPos;
+                            i < queryPos + len && i < seqLen;
+                            ++i) {
+                            static const char base[] =
+                                "=ACMGRSVTWYHKDBN";
+                            insSeq += base[bam_seqi(seq, i)];
+                        }
+                        indelObs.push_back({
+                            false, int64_t(len),
+                            uint32_t(rp), std::move(insSeq)
+                        });
+                    }
+                }
+                queryPos += len;
+            } else if(op == BAM_CSOFT_CLIP) {
+                queryPos += len;
+            }
+        }
+
+        // rp is now the alignment end position.
+        const int32_t alignEnd = rp;
+
+        // Right soft-clip: check last op.
+        {
+            const int lastOp = bam_cigar_op(cigar[nCigar - 1]);
+            const int lastLen = bam_cigar_oplen(cigar[nCigar - 1]);
+            if(lastOp == BAM_CSOFT_CLIP
+               && uint32_t(lastLen) >= minClipLen) {
                 string clipSeq;
-                const int clipStart = seqLen - len;
-                clipSeq.reserve(len);
+                const int clipStart = seqLen - lastLen;
+                clipSeq.reserve(lastLen);
                 for(int i = clipStart; i < seqLen; ++i) {
                     static const char base[] = "=ACMGRSVTWYHKDBN";
                     clipSeq += base[bam_seqi(seq, i)];
                 }
                 clipObs.push_back({
-                    uint32_t(refPos), false, std::move(clipSeq)
+                    uint32_t(alignEnd), false, std::move(clipSeq)
                 });
             }
         }
 
-        // Check CIGAR for large I/D operations.
-        // Collect per-read D operations first, then merge nearby
-        // ones into compound deletions (handles tandem repeat
-        // regions where the aligner splits one deletion into
-        // multiple D ops separated by short matches).
-        {
-            struct DelOp {
-                uint32_t refPos;
-                int64_t  size;
-            };
-            vector<DelOp> readDels;
+        // --- SA-tag evidence: primary alignments only.
+        if(!isSupplementary) {
+            uint8_t* saTag = bam_aux_get(aln, "SA");
+            if(saTag) {
+                const char* saStr = bam_aux2Z(saTag);
+                if(saStr) {
+                    // pEnd = alignEnd (already computed).
+                    const int64_t pEnd = int64_t(alignEnd);
 
-            int64_t refPos = pos;
-            int32_t queryPos = 0;
-            // Skip leading soft clip in query position.
-            if(nCigar > 0
-               && bam_cigar_op(cigar[0]) == BAM_CSOFT_CLIP) {
-                queryPos = bam_cigar_oplen(cigar[0]);
-            }
+                    string saString(saStr);
+                    size_t sStart = 0;
+                    while(sStart < saString.size()) {
+                        size_t sEnd = saString.find(';', sStart);
+                        if(sEnd == string::npos) sEnd = saString.size();
+                        string entry = saString.substr(
+                            sStart, sEnd - sStart);
+                        sStart = sEnd + 1;
+                        if(entry.empty()) continue;
 
-            // Also track net indel effect for this read
-            // (sum of all D minus sum of all I, regardless
-            // of individual op size).
-            int64_t totalDel = 0;
-            int64_t totalIns = 0;
-            // Track position of the largest D op (even if
-            // below minIndelSize) for net-CIGAR breakpoint.
-            uint32_t largestDelPos = uint32_t(pos);
-            int64_t largestDelSize = 0;
+                        vector<string> fields;
+                        size_t fStart = 0;
+                        while(fStart < entry.size()) {
+                            size_t fEnd = entry.find(',', fStart);
+                            if(fEnd == string::npos) fEnd = entry.size();
+                            fields.push_back(
+                                entry.substr(fStart, fEnd - fStart));
+                            fStart = fEnd + 1;
+                        }
+                        if(fields.size() < 4) continue;
+                        if(fields[0] != bamChrName) continue;
 
-            for(int ci = 0; ci < nCigar; ++ci) {
-                const int op = bam_cigar_op(cigar[ci]);
-                const int len = bam_cigar_oplen(cigar[ci]);
+                        const int64_t saPos = stoll(fields[1]) - 1;
+                        const string& saCigar = fields[3];
 
-                if(op == BAM_CDEL && len >= minIndelSize) {
-                    readDels.push_back({
-                        uint32_t(refPos), int64_t(len)
-                    });
-                }
-                if(op == BAM_CDEL) {
-                    totalDel += len;
-                    if(int64_t(len) > largestDelSize) {
-                        largestDelSize = int64_t(len);
-                        largestDelPos = uint32_t(refPos);
+                        int64_t sRefSpan = 0;
+                        int64_t num = 0;
+                        for(char c : saCigar) {
+                            if(c >= '0' && c <= '9') {
+                                num = num * 10 + (c - '0');
+                            } else {
+                                if(c == 'M' || c == 'D' || c == 'N'
+                                   || c == '=' || c == 'X')
+                                    sRefSpan += num;
+                                num = 0;
+                            }
+                        }
+
+                        int64_t refGap;
+                        uint32_t bpPos;
+                        if(int32_t(pos) <= saPos) {
+                            refGap = saPos - pEnd;
+                            bpPos = uint32_t(pEnd);
+                        } else {
+                            refGap = int32_t(pos) - (saPos + sRefSpan);
+                            bpPos = uint32_t(saPos + sRefSpan);
+                        }
+
+                        if(refGap >= 30) {
+                            saObs.push_back({true, refGap, bpPos});
+                        } else if(refGap <= -30) {
+                            saObs.push_back({false, -refGap, bpPos});
+                        }
                     }
                 }
-                if(op == BAM_CINS) totalIns += len;
-
-                if(op == BAM_CINS && len >= minIndelSize) {
-                    string insSeq;
-                    insSeq.reserve(len);
-                    for(int i = queryPos;
-                        i < queryPos + len && i < seqLen; ++i) {
-                        static const char base[] =
-                            "=ACMGRSVTWYHKDBN";
-                        insSeq += base[bam_seqi(seq, i)];
-                    }
-                    indelObs.push_back({
-                        false, int64_t(len),
-                        uint32_t(refPos), std::move(insSeq)
-                    });
-                }
-
-                // Advance positions.
-                if(op == BAM_CMATCH || op == BAM_CEQUAL
-                   || op == BAM_CDIFF) {
-                    refPos += len;
-                    queryPos += len;
-                } else if(op == BAM_CDEL
-                          || op == BAM_CREF_SKIP) {
-                    refPos += len;
-                } else if(op == BAM_CINS
-                          || op == BAM_CSOFT_CLIP) {
-                    queryPos += len;
-                }
             }
+        }
 
-            // Merge nearby D operations within this read.
-            // If two D ops are within 100bp on the reference,
-            // combine them into a single compound deletion.
-            // This handles tandem repeats where e.g. 35D + 55D
-            // should be reported as a single 90D.
+        // --- Merge and emit CIGAR indel observations.
+        if(!isSupplementary) {
+            // Merge nearby D operations into compound deletions.
             if(readDels.size() >= 2) {
                 size_t wi = 0;
                 for(size_t ri = 1; ri < readDels.size(); ++ri) {
@@ -9408,11 +9329,11 @@ void Assembler::parseBamEvidence(
                         readDels[ri].refPos
                         - readDels[wi].refPos
                         - uint32_t(readDels[wi].size);
-                    if(gap <= 100) {
-                        // Merge: sum deleted bases (not
-                        // reference span) so the size
-                        // matches truth-set conventions.
-                        readDels[wi].size += readDels[ri].size;
+                    if(gap < 20) {
+                        readDels[wi].size =
+                            int64_t(readDels[ri].refPos
+                                    + uint32_t(readDels[ri].size)
+                                    - readDels[wi].refPos);
                     } else {
                         ++wi;
                         readDels[wi] = readDels[ri];
@@ -9421,24 +9342,16 @@ void Assembler::parseBamEvidence(
                 readDels.resize(wi + 1);
             }
 
-            // Emit individual (possibly merged) D observations.
-            for(const auto& d : readDels) {
+            for(const auto& rd : readDels) {
                 indelObs.push_back({
-                    true, d.size, d.refPos, ""
+                    true, rd.size, rd.refPos, ""
                 });
             }
 
-            // Net-CIGAR deletion: if the read's total CIGAR
-            // deletions exceed insertions by >= 30bp, record
-            // a net-deletion observation. This catches STR
-            // regions where the aligner fragments the deletion
-            // into many small D ops below minIndelSize.
+            // Net-CIGAR deletion.
             const int64_t netDel = totalDel - totalIns;
             if(netDel >= minIndelSize
                && readDels.empty()) {
-                // Use position of the largest D operation as
-                // breakpoint (not alignment start), so reads
-                // seeing the same deletion cluster together.
                 indelObs.push_back({
                     true, netDel, largestDelPos, ""
                 });
@@ -9451,6 +9364,52 @@ void Assembler::parseBamEvidence(
     hts_idx_destroy(idx);
     sam_hdr_destroy(hdr);
     hts_close(fp);
+
+    // --- Produce regionDepth from sweep-line prefix sum.
+    regionDepth.resize(spanLen, 0);
+    {
+        int32_t running = 0;
+        for(uint32_t i = 0; i < spanLen; ++i) {
+            running += sweep[i];
+            regionDepth[i] = uint32_t(std::max(running, 0));
+        }
+    }
+    { vector<int32_t>().swap(sweep); }
+
+    // --- Cluster SA-tag observations by type and breakpoint (within 50bp).
+    sort(saObs.begin(), saObs.end(),
+         [](const SaObs& a, const SaObs& b) {
+             if(a.isDel != b.isDel) return a.isDel > b.isDel;
+             return a.bpPos < b.bpPos;
+         });
+    {
+        size_t i = 0;
+        while(i < saObs.size()) {
+            const bool isDel = saObs[i].isDel;
+            uint32_t clusterStart = saObs[i].bpPos;
+            int64_t sumSize = 0;
+            uint32_t sumPos = 0;
+            uint32_t count = 0;
+            size_t j = i;
+            while(j < saObs.size()
+                  && saObs[j].isDel == isDel
+                  && saObs[j].bpPos <= clusterStart + 50) {
+                sumSize += saObs[j].size;
+                sumPos += saObs[j].bpPos;
+                ++count;
+                ++j;
+            }
+            if(count >= 2) {
+                saTagCalls.push_back({
+                    isDel ? "DEL" : "INS",
+                    sumSize / int64_t(count),
+                    sumPos / count,
+                    count
+                });
+            }
+            i = j;
+        }
+    }
 
     // Cluster soft-clip observations by position (within 5bp).
     sort(clipObs.begin(), clipObs.end(),

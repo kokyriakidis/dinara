@@ -3612,6 +3612,8 @@ void dinara::main::svanchors(
                 }
             }
 
+            vector<uint32_t> regionDepth;
+            vector<Assembler::SaTagSvCall> saTagCalls;
             vector<Assembler::SoftClipBreakpoint> softClipBPs;
             vector<Assembler::CigarIndelCall> cigarIndels;
             {
@@ -3619,6 +3621,7 @@ void dinara::main::svanchors(
                 assembler.parseBamEvidence(
                     bamAbsolutePath, refName,
                     regionStart, regionStart + refLength,
+                    regionDepth, saTagCalls,
                     softClipBPs, cigarIndels);
                 const auto tBam1 = steady_clock::now();
                 cout << "    parseBamEvidence completed in "

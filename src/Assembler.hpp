@@ -2680,14 +2680,22 @@ public:
         uint32_t refStart,
         uint32_t refEnd) const;
 
-    // Parse soft-clip breakpoints and CIGAR indels from BAM.
-    // Returns soft-clip breakpoints and CIGAR indel calls in
-    // a single BAM pass for efficiency.
+    // Overload that uses pre-computed per-base depth.
+    vector<DepthScanDelCall> depthScanDelCalls(
+        const vector<uint32_t>& perBaseDepth,
+        uint32_t refStart,
+        uint32_t refEnd) const;
+
+    // Single-pass BAM evidence extraction: depth, SA-tag SV
+    // calls, soft-clip breakpoints, and CIGAR indels from one
+    // BAM open and one read iteration.
     void parseBamEvidence(
         const string& bamFileName,
         const string& refName,
         uint32_t refStart,
         uint32_t refEnd,
+        vector<uint32_t>& regionDepth,
+        vector<SaTagSvCall>& saTagCalls,
         vector<SoftClipBreakpoint>& softClipBPs,
         vector<CigarIndelCall>& cigarIndels) const;
 
