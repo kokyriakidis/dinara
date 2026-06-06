@@ -232,15 +232,30 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }()
             : window.filteredBackbonePositions;
 
+        // Map backbone anchors (these define backbone positions).
         for(const uint32_t pos : positions) {
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             anchorToWindow[aid] = windowId;
             anchorToBackbonePos[aid] = pos;
-            // Mirror RC window: map the RC anchor to windowId + windowCount.
             const uint64_t rcAid = aid ^ 1ULL;
             if(rcAid < anchorCount) {
                 anchorToWindow[rcAid] = windowId + windowCount;
                 anchorToBackbonePos[rcAid] = pos;
+            }
+        }
+
+        // Map all anchors from all participating reads' journeys.
+        for(const auto& ri : window.readIntervals) {
+            const auto riJourney = journeys[ri.orientedReadId];
+            for(uint32_t pos = ri.begin; pos < ri.end; pos++) {
+                const uint64_t aid = uint64_t(riJourney[pos]);
+                if(aid < anchorCount && anchorToWindow[aid] == noWindow) {
+                    anchorToWindow[aid] = windowId;
+                }
+                const uint64_t rcAid = aid ^ 1ULL;
+                if(rcAid < anchorCount && anchorToWindow[rcAid] == noWindow) {
+                    anchorToWindow[rcAid] = windowId + windowCount;
+                }
             }
         }
     }
@@ -263,34 +278,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return true;
     };
 
-    // Intra-window edges: consecutive filtered backbone anchor pairs,
-    // for both the original windows and their RC mirrors.
-    for(const AnchorWindow& window : anchorWindows) {
-        const OrientedReadId backboneOid = window.backboneOrientedReadId;
-        const auto backboneJourney = journeys[backboneOid];
+    // Intra-window edges: union of all reads' journey edges.
+    // For each window, walk every participating read's journey interval
+    // and create edges between consecutive anchors.
+    // Deduplicate by tracking which directed anchor pairs already have edges.
+    std::set<std::pair<uint64_t, uint64_t>> createdPairs;
 
-        // Collect the backbone anchor IDs for this window.
-        vector<Shasta2AnchorId> backboneAnchors;
-        const auto& positions = window.filteredBackbonePositions;
-        if(!positions.empty()) {
-            for(const uint32_t pos : positions) {
-                backboneAnchors.push_back(backboneJourney[pos]);
-            }
-        } else {
-            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
-                backboneAnchors.push_back(backboneJourney[pos]);
+    auto addEdgeOnce = [&](Shasta2AnchorId a, Shasta2AnchorId b) {
+        auto key = std::make_pair(uint64_t(a), uint64_t(b));
+        if(createdPairs.count(key)) return;
+        if(addEdgeIfValid(a, b)) {
+            createdPairs.insert(key);
+            // RC mirror edge.
+            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
+            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(b) ^ 1ULL);
+            auto rcKey = std::make_pair(uint64_t(rcB), uint64_t(rcA));
+            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount &&
+               !createdPairs.count(rcKey)) {
+                if(addEdgeIfValid(rcB, rcA)) {
+                    createdPairs.insert(rcKey);
+                }
             }
         }
+    };
 
-        if(backboneAnchors.size() < 2) continue;
-
-        for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
-            addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
-            // RC mirror edge.
-            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
-            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
-            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
-                addEdgeIfValid(rcB, rcA);
+    for(const AnchorWindow& window : anchorWindows) {
+        // Walk every read's journey interval and create edges.
+        for(const auto& ri : window.readIntervals) {
+            const auto journey = journeys[ri.orientedReadId];
+            if(ri.end <= ri.begin + 1) continue;
+            for(uint32_t pos = ri.begin; pos + 1 < ri.end; pos++) {
+                addEdgeOnce(journey[pos], journey[pos + 1]);
             }
         }
     }
