@@ -26,6 +26,9 @@
 
 namespace dinara {
 
+struct AnchorWindow;
+class Shasta2Journeys;
+
 class BidirectedAnchorGraph {
 public:
     // Edge properties stored once per canonical link.
@@ -190,6 +193,12 @@ public:
         return it->second.size();
     }
 
+    // Remove an edge in both traversal directions (forward and RC mirror).
+    void removeEdgeBothDirections(OrientedAnchor from, OrientedAnchor to) {
+        removeEdge(from, to);
+        removeEdge(reverseAnchor(to), reverseAnchor(from));
+    }
+
     void normalizeOrientations(const std::vector<bool>& swapOrientation);
     void writeGfa(const std::string& fileName) const;
     void writeCsv(const std::string& fileName, uint32_t windowCount) const;
@@ -216,6 +225,14 @@ public:
     void writeUnitigCsvByRead(const std::string& fileName,
                               const std::vector<Unitig>& unitigs,
                               uint32_t readCount) const;
+
+    // Bypass detour filter: when a neighbor window X enters window W at
+    // backbone position i and exits at position j > i, create a bypass
+    // edge connecting X's anchors on either side and remove the
+    // inter-window edges.
+    uint64_t bypassDetourFilter(
+        const std::vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
 
 private:
     uint64_t nodeCount = 0;
