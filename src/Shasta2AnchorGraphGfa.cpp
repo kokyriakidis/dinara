@@ -193,16 +193,49 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         }
     }
 
+    // Build the set of valid consecutive backbone anchor pairs.
+    // For intra-window edges, only these pairs are converted.
+    set<pair<uint64_t, uint64_t>> backbonePairs;
+    for(const auto& window : anchorWindows) {
+        const auto& positions = window.filteredBackbonePositions;
+        if(positions.size() < 2) continue;
+        const auto journey = journeys[window.backboneOrientedReadId];
+        for(uint32_t i = 0; i + 1 < uint32_t(positions.size()); i++) {
+            const uint64_t a = uint64_t(journey[positions[i]]);
+            const uint64_t b = uint64_t(journey[positions[i + 1]]);
+            backbonePairs.insert({a, b});
+            // Also insert RC mirror pair.
+            backbonePairs.insert({b ^ 1ULL, a ^ 1ULL});
+        }
+    }
+
     // Convert edges. Each directed edge maps to a bidirected traversal.
-    // The directed graph has explicit RC mirrors, so iterating all edges
-    // gives both traversal directions. Properties are stored under the
-    // canonical key; we only set them from the canonical direction.
+    // For intra-window edges, only consecutive backbone pairs are kept.
+    // Inter-window edges are always kept.
+    uint64_t skippedNonBackbone = 0;
     BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
         const auto& edge = (*this)[e];
         if(!edge.useForAssembly) continue;
 
-        const Shasta2AnchorId srcId = Shasta2AnchorId(uint64_t(source(e, *this)));
-        const Shasta2AnchorId dstId = Shasta2AnchorId(uint64_t(target(e, *this)));
+        const uint64_t srcRaw = uint64_t(source(e, *this));
+        const uint64_t dstRaw = uint64_t(target(e, *this));
+
+        // Check if this is an intra-window edge.
+        const uint32_t srcWin = (srcRaw < anchorToWindow.size()) ? anchorToWindow[srcRaw] : noWindow;
+        const uint32_t dstWin = (dstRaw < anchorToWindow.size()) ? anchorToWindow[dstRaw] : noWindow;
+        const bool isInterWindow = (srcWin == noWindow || dstWin == noWindow ||
+                                    normalizeWindow(srcWin) != normalizeWindow(dstWin));
+
+        // For intra-window edges, only keep consecutive backbone pairs.
+        if(!isInterWindow) {
+            if(backbonePairs.find({srcRaw, dstRaw}) == backbonePairs.end()) {
+                ++skippedNonBackbone;
+                continue;
+            }
+        }
+
+        const Shasta2AnchorId srcId = Shasta2AnchorId(srcRaw);
+        const Shasta2AnchorId dstId = Shasta2AnchorId(dstRaw);
 
         const OrientedAnchor from = toOrientedAnchor(srcId);
         const OrientedAnchor to   = toOrientedAnchor(dstId);
@@ -213,7 +246,7 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         props.supportingSpanPrev = uint32_t(edge.supportingSpanPrev);
         props.supportingSpanNext = uint32_t(edge.supportingSpanNext);
         props.sharedReadCount = uint32_t(edge.sharedReadCount);
-        props.isInterWindow = (edge.supportingSpanPrev > 0 || edge.supportingSpanNext > 0 || edge.sharedReadCount > 0);
+        props.isInterWindow = isInterWindow;
         props.useForAssembly = true;
 
         if(isCanonicalAnchorDirection(from, to) ||
@@ -222,6 +255,11 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         } else {
             bg.addTraversal(from, to);
         }
+    }
+
+    if(skippedNonBackbone > 0) {
+        cout << "toBidirected: skipped " << skippedNonBackbone
+             << " non-backbone intra-window edges." << endl;
     }
 
     cout << "Converted to bidirected graph: "
