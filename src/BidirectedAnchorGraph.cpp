@@ -656,8 +656,23 @@ uint64_t BidirectedAnchorGraph::trimBackbones(
             }
         }
 
-        // No inter-window edges at all — skip (don't trim isolated windows).
-        if(firstIW == UINT32_MAX) continue;
+        // No inter-window edges at all — remove all edges (isolated window).
+        if(firstIW == UINT32_MAX) {
+            for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
+                const auto& bb = backbone[i];
+                auto exitNbrs = getNeighbors({bb.first, bb.second});
+                for(const auto& nbr : exitNbrs) {
+                    removeEdgeBothDirections({bb.first, bb.second}, nbr);
+                }
+                auto entryNbrs = getNeighbors({bb.first, !bb.second});
+                for(const auto& nbr : entryNbrs) {
+                    removeEdgeBothDirections({bb.first, !bb.second}, nbr);
+                }
+                ++trimmedAnchors;
+            }
+            ++trimmedWindows;
+            continue;
+        }
 
         // Remove all edges of backbone anchors before firstIW and after lastIW.
         bool trimmed = false;
