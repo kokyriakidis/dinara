@@ -297,6 +297,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
 
 
+    // Inter-window edge discovery disabled — testing intra-window-only graph.
+#if 0
     // Per-read window transition tracking.
     // If computeWindowTransitions() was already called, transitionReads
     // are populated. Recompute unconditionally so the graph's own
@@ -833,6 +835,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowLowCoverage << " rejected (< " << minInterWindowCoverage << " reads), "
          << interWindowLowEdgeCoverage << " rejected (< " << minInterWindowEdgeCoverage << " edge coverage), "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
+#endif  // Inter-window edge discovery disabled
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
@@ -1931,6 +1934,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     removeDanglingWindowsIterative("post-filter");
 #endif
 
+    // Inter-window edge population and bypass edges disabled.
+#if 0
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
         const uint32_t srcW = edgeInfo.windowPair.first;
@@ -1964,6 +1969,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
+#endif
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
