@@ -1739,6 +1739,43 @@ DEL detection is at 100.00% recall at ps=0 (10,175 / 10,175, 0 FN) and 99.55% at
 
 ---
 
+## Dinara V37a — Source Elimination (June 2026)
+
+### Motivation
+
+Greedy elimination analysis on V36z identified sources with few or zero sole contributions to recall. Removing low-value sources reduces false positives and call volume without meaningful recall loss.
+
+### Eliminated Sources
+
+**INS (11 of 22 sources removed):** `large-ins-het+CIGAR`, `reversed-BP+CIGAR`, `large-ins-single-het+CIGAR`, `CIGAR-covdrop+CIGAR`, `large-ins+CIGAR`, `softclip-unpaired`, `large-ins-single+CIGAR`, `hit-depth`, `soft-clip+CIGAR`, `reversed-BP`, `large-ins-het`.
+
+**DEL (9 of 18 sources removed):** `depth-scan-sub`, `depth-scan-hom`, `depth-scan-het`, `path-based`, `split-read`, `cigar-covdrop`, `INV-cluster`, `depth-deficit-het`, `per-read-DEL`.
+
+Implementation: source-filtering lambdas in `AssemblerSvAnchors.cpp` erase disabled sources before output. Depth-scan call block in `main.cpp` disabled entirely (all 3 depth-scan sources removed).
+
+### V37a Benchmark Results — HG002 Q100 v5.0q
+
+| Metric | V36z (baseline) | V37a |
+|--------|---:|---:|
+| INS recall ps=0 | 99.46% (TP=17915, FN=98) | 99.27% (TP=17882, FN=131) |
+| INS recall ps=0.7 | 60.81% (TP=10953, FN=7060) | 59.62% (TP=10739, FN=7274) |
+| DEL recall ps=0 | 100.00% (TP=10175, FN=0) | 100.00% (TP=10175, FN=0) |
+| DEL recall ps=0.7 | 99.55% (TP=10129, FN=46) | 99.41% (TP=10115, FN=60) |
+
+INS ps=0.7: −214 TP (−1.19%), worse than predicted −0.91%. Source interactions during dedup cause non-additive losses. INS ps=0: −33 TP (−0.18%), not predicted by the ps=0.7 analysis. DEL ps=0: no regression. DEL ps=0.7: −14 TP (−0.14%).
+
+FP reduction: INS ps=0.7 −1,166 FP, DEL ps=0.7 −24,740 FP. Total call volume: INS 247K → 231K, DEL 173K → 143K.
+
+### Cluster Paths
+
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v37a`
+- **INS results**: `.../full_ins_eval/results_v37a/` (26,101 logs)
+- **DEL results**: `.../full_del_eval/results_v37a/` (10,173 logs)
+- **INS VCF**: `.../full_ins_eval/dinara_v37a_ins_sorted.vcf.gz` (230,911 calls)
+- **DEL VCF**: `.../full_del_eval/dinara_v37a_dels_sorted.vcf.gz` (144,700 calls)
+
+---
+
 ## Dinara V36y — CIGAR-Guided INS Refinement (June 2026)
 
 ### Changes
