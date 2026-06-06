@@ -241,11 +241,22 @@ public:
         const std::vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
+    // Convert a directed anchor ID to a post-normalization OrientedAnchor.
+    OrientedAnchor toNormalizedOrientedAnchor(Shasta2AnchorId directedId) const {
+        auto bid = BidirectedAnchorId::fromDirected(directedId);
+        bool orient = (uint64_t(directedId) & 1) == 0;  // pre-normalization
+        if(bid.value() < wasSwapped.size() && wasSwapped[bid.value()]) {
+            orient = !orient;
+        }
+        return {bid, orient};
+    }
+
 private:
     uint64_t nodeCount = 0;
     std::vector<std::map<bool, std::set<OrientedAnchor>>> adjacency;
     std::vector<NodeProperties> nodeProps;
     std::map<std::pair<OrientedAnchor, OrientedAnchor>, EdgeProperties> edgeProperties;
+    std::vector<bool> wasSwapped;  // normalization flags per node
 };
 
 } // namespace dinara
