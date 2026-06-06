@@ -1,6 +1,8 @@
 // BidirectedAnchorGraph.cpp
 
 #include "BidirectedAnchorGraph.hpp"
+#include "AnchorWindows.hpp"
+#include "Shasta2Journeys.hpp"
 
 #include <cmath>
 #include <iomanip>
@@ -538,3 +540,148 @@ void BidirectedAnchorGraph::writeUnitigCsvByRead(
     }
 }
 
+
+
+// Bypass detour filter for the bidirected anchor graph.
+//
+// For each window w, walk its backbone anchors in order. For each
+// neighbor window x that has edges both into and out of w's backbone,
+// find pairs where x enters at backbone position i and exits at
+// position j > i. Create a bypass edge connecting x's anchors on
+// either side of the detour, and remove the inter-window edges.
+//
+// In the bidirected graph, backbone[i] = (node_i, orient_i):
+// - Exit side (orient_i): getNeighbors gives nodes reachable going
+//   forward along the backbone. Inter-window neighbors here are
+//   "exits from w to x".
+// - Entry side (!orient_i): getNeighbors gives nodes reachable going
+//   backward. These are RC mirrors of edges arriving from x.
+//   The real x-side source is reverseAnchor(neighbor).
+//
+// Bypass edge: reverseAnchor(inE.xNeighbor) -> outE.xNeighbor
+// Edges to remove:
+//   Entry: {bb[i].node, !bb[i].orient} -> inE.xNeighbor (and RC mirror)
+//   Exit:  {bb[j].node,  bb[j].orient} -> outE.xNeighbor (and RC mirror)
+//
+// Returns the number of detours fixed.
+uint64_t BidirectedAnchorGraph::bypassDetourFilter(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys)
+{
+    const uint32_t windowCount = uint32_t(anchorWindows.size());
+    static constexpr uint32_t noWindow = UINT32_MAX;
+
+    uint64_t detoursFixed = 0;
+
+    for(uint32_t w = 0; w < windowCount; w++) {
+        const auto& window = anchorWindows[w];
+        const auto& positions = window.filteredBackbonePositions;
+        if(positions.size() < 2) continue;
+
+        const auto journey = journeys[window.backboneOrientedReadId];
+
+        // Build ordered backbone as OrientedAnchors.
+        vector<OrientedAnchor> backbone;
+        for(const uint32_t pos : positions) {
+            backbone.push_back(toOrientedAnchor(journey[pos]));
+        }
+
+        // Collect inter-window edges at each backbone position.
+        struct IWEdge {
+            OrientedAnchor xNeighbor;  // neighbor as returned by getNeighbors
+            OrientedAnchor wAnchor;    // the backbone anchor
+            uint32_t bbIdx;
+        };
+
+        // Group by neighbor window.
+        map<uint32_t, vector<IWEdge>> entryEdges;  // x enters w
+        map<uint32_t, vector<IWEdge>> exitEdges;   // w exits to x
+
+        for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
+            const auto& bb = backbone[i];
+
+            // Exit side: forward neighbors in other windows.
+            for(const auto& nbr : getNeighbors({bb.first, bb.second})) {
+                auto nIdx = nbr.first.value();
+                if(nIdx >= nodeProps.size()) continue;
+                uint32_t nWin = nodeProps[nIdx].windowId;
+                if(nWin == noWindow || nWin == w) continue;
+                exitEdges[nWin].push_back({nbr, bb, i});
+            }
+
+            // Entry side: backward neighbors in other windows.
+            // These are RC mirrors of edges arriving from x.
+            for(const auto& nbr : getNeighbors({bb.first, !bb.second})) {
+                auto nIdx = nbr.first.value();
+                if(nIdx >= nodeProps.size()) continue;
+                uint32_t nWin = nodeProps[nIdx].windowId;
+                if(nWin == noWindow || nWin == w) continue;
+                entryEdges[nWin].push_back({nbr, bb, i});
+            }
+        }
+
+        // For each neighbor window x with both entry and exit edges,
+        // find detour pairs (entry at i, exit at j > i).
+        for(const auto& [xWin, entries] : entryEdges) {
+            auto exitIt = exitEdges.find(xWin);
+            if(exitIt == exitEdges.end()) continue;
+            const auto& exits = exitIt->second;
+
+            // Sort exits by backbone index so we can find the closest
+            // exit after each entry.
+            auto sortedExits = exits;
+            sort(sortedExits.begin(), sortedExits.end(),
+                 [](const IWEdge& a, const IWEdge& b) {
+                     return a.bbIdx < b.bbIdx;
+                 });
+
+            for(const auto& inE : entries) {
+                // Find the closest bbIdx after this entry, then process
+                // all exits at that bbIdx (there may be multiple X nodes
+                // connecting at the same backbone position).
+                uint32_t closestBbIdx = UINT32_MAX;
+                for(const auto& outE : sortedExits) {
+                    if(outE.bbIdx <= inE.bbIdx) continue;
+                    closestBbIdx = outE.bbIdx;
+                    break;
+                }
+                if(closestBbIdx == UINT32_MAX) continue;
+
+                OrientedAnchor bypassFrom = reverseAnchor(inE.xNeighbor);
+
+                for(const auto& outE : sortedExits) {
+                    if(outE.bbIdx != closestBbIdx) continue;
+
+                    OrientedAnchor bypassTo = outE.xNeighbor;
+
+                    // Don't create self-loops.
+                    if(bypassFrom.first == bypassTo.first) continue;
+
+                    // Create bypass edge (both directions).
+                    if(!hasEdge(bypassFrom, bypassTo)) {
+                        EdgeProperties props;
+                        props.useForAssembly = true;
+                        addEdge(bypassFrom, bypassTo, props);
+                        addTraversal(reverseAnchor(bypassTo), reverseAnchor(bypassFrom));
+                    }
+
+                    // Remove the exit edge (idempotent).
+                    removeEdgeBothDirections(
+                        {outE.wAnchor.first, outE.wAnchor.second},
+                        outE.xNeighbor);
+                }
+
+                // Remove the entry edge.
+                removeEdgeBothDirections(
+                    {inE.wAnchor.first, !inE.wAnchor.second}, inE.xNeighbor);
+
+                ++detoursFixed;
+            }
+        }
+    }
+
+    cout << "Bypass detour filter (bidirected): " << detoursFixed
+         << " detours fixed." << endl;
+
+    return detoursFixed;
+}
