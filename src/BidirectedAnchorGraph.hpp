@@ -226,6 +226,13 @@ public:
                               const std::vector<Unitig>& unitigs,
                               uint32_t readCount) const;
 
+    // For each window pair, keep only the exit edge at the last backbone
+    // position and the entry edge at the first backbone position.
+    // Removes redundant inter-window edges that fragment backbones.
+    uint64_t filterInterWindowEdges(
+        const std::vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
+
     // Bypass detour filter: when a neighbor window X enters window W at
     // backbone position i and exits at position j > i, create a bypass
     // edge connecting X's anchors on either side and remove the
