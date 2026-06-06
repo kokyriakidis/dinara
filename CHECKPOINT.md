@@ -1627,7 +1627,7 @@ Breakdown: 1196 gained, 150 lost (truvari matching artifacts). 806 gained direct
 
 ### V36z DEL Recall Ceiling
 
-DEL detection at ps=0.7 is at 99.55% recall (10,129 / 10,175). The 46 FN are 50-100bp tandem repeat DELs with no actionable CIGAR signal — this is the practical recall ceiling for DEL.
+DEL detection is at 100.00% recall at ps=0 (10,175 / 10,175, 0 FN) and 99.55% at ps=0.7 (10,129 / 10,175). The 46 FN at ps=0.7 are 50-100bp tandem repeat DELs with no actionable CIGAR signal — this is the practical recall ceiling for DEL.
 
 ---
 
