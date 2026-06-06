@@ -552,6 +552,52 @@ void Assembler::buildSvMSA(
         // All INS calls. Populated by all INS emission sites.
         vector<InsCallRecord> allInsCalls;
 
+        // Sources disabled after elimination analysis (V36z).
+        // INS: 11 sources with <1% cumulative recall loss.
+        // DEL: 9 sources with <1% cumulative recall loss.
+        static const unordered_set<string> disabledInsSources = {
+            "large-ins-het+CIGAR",
+            "reversed-BP+CIGAR",
+            "large-ins-single-het+CIGAR",
+            "CIGAR-covdrop+CIGAR",
+            "large-ins+CIGAR",
+            "softclip-unpaired",
+            "large-ins-single+CIGAR",
+            "hit-depth",
+            "soft-clip+CIGAR",
+            "reversed-BP",
+            "large-ins-het"
+        };
+        static const unordered_set<string> disabledDelSources = {
+            "depth-scan-sub",
+            "depth-scan-hom",
+            "depth-scan-het",
+            "path-based",
+            "split-read",
+            "cigar-covdrop",
+            "INV-cluster",
+            "depth-deficit-het",
+            "per-read-DEL"
+        };
+
+        auto filterDisabledInsSources = [&]() {
+            allInsCalls.erase(
+                std::remove_if(allInsCalls.begin(), allInsCalls.end(),
+                    [](const InsCallRecord& ic) {
+                        return disabledInsSources.count(ic.source);
+                    }),
+                allInsCalls.end());
+        };
+
+        auto filterDisabledDelSources = [&]() {
+            allDelCalls.erase(
+                std::remove_if(allDelCalls.begin(), allDelCalls.end(),
+                    [](const DelCallRecord& dc) {
+                        return disabledDelSources.count(dc.source);
+                    }),
+                allDelCalls.end());
+        };
+
         // Lambda: CIGAR-guided INS size refinement.
         // For each INS call whose size significantly exceeds the
         // best CIGAR INS size (ratio < 0.7), emit an additional
@@ -630,11 +676,10 @@ void Assembler::buildSvMSA(
                 // Only refine indirect-covdrop calls.
                 if(ic.source != "indirect-covdrop") continue;
                 if(ic.size < 50) continue;
-                // Sizes must diverge: indirect > CIGAR by > 40%.
-                if(ic.size <= bestCigarInsSize) continue;
+                // Sizes must diverge by > 40% in either direction.
                 const double ratio =
-                    double(bestCigarInsSize)
-                    / double(ic.size);
+                    double(std::min(bestCigarInsSize, ic.size))
+                    / double(std::max(bestCigarInsSize, ic.size));
                 if(ratio >= 0.7) continue;
                 const int64_t geomean = int64_t(
                     std::sqrt(double(bestCigarInsSize)
@@ -643,10 +688,11 @@ void Assembler::buildSvMSA(
                 // Only emit if geomean differs meaningfully
                 // from both originals.
                 const double gRatioToCigar =
-                    double(bestCigarInsSize)
-                    / double(geomean);
+                    double(std::min(bestCigarInsSize, geomean))
+                    / double(std::max(bestCigarInsSize, geomean));
                 const double gRatioToIndirect =
-                    double(geomean) / double(ic.size);
+                    double(std::min(geomean, ic.size))
+                    / double(std::max(geomean, ic.size));
                 if(gRatioToCigar >= 0.7
                    || gRatioToIndirect >= 0.7) continue;
                 refined.push_back({
@@ -699,6 +745,8 @@ void Assembler::buildSvMSA(
                     allDelCalls.push_back(dc);
                 }
             }
+
+            filterDisabledDelSources();
 
             // Sort by source priority (best first), then by
             // read count descending as tiebreaker within the
@@ -1510,6 +1558,7 @@ void Assembler::buildSvMSA(
             // CIGAR-guided refinement and emit INS calls.
             cigarRefineInsCalls();
             geomeanRefineInsCalls();
+            filterDisabledInsSources();
 
             if(!allInsCalls.empty()) {
                 sort(allInsCalls.begin(), allInsCalls.end(),
@@ -1704,6 +1753,7 @@ void Assembler::buildSvMSA(
             // CIGAR-guided refinement and emit INS calls.
             cigarRefineInsCalls();
             geomeanRefineInsCalls();
+            filterDisabledInsSources();
             if(!allInsCalls.empty()) {
 
                 sort(allInsCalls.begin(), allInsCalls.end(),
@@ -5024,23 +5074,25 @@ void Assembler::buildSvMSA(
                                 // relocation needed — the normal
                                 // early-CIGAR call handles it).
                                 if(posDiff < 100) continue;
-                                cout << "      CIGAR-guided covdrop:"
-                                     << " cigarPos=" << ci.refPos
-                                     << " cigarSize=" << ci.size
-                                     << " hdPos=" << hdBp
-                                     << " posDiff=" << posDiff
-                                     << " cigarReads=" << ci.readCount
-                                     << endl;
-                                cout << "    >>> DELETION CALL"
-                                     << " (cigar-covdrop): size="
-                                     << ci.size << "bp"
-                                     << ", breakpoint=" << hdBp
-                                     << ", reads=" << ci.readCount
-                                     << endl;
-                                allDelCalls.push_back({
-                                    hdBp, ci.size,
-                                    ci.readCount,
-                                    "cigar-covdrop"});
+                                if(!disabledDelSources.count("cigar-covdrop")) {
+                                    cout << "      CIGAR-guided covdrop:"
+                                         << " cigarPos=" << ci.refPos
+                                         << " cigarSize=" << ci.size
+                                         << " hdPos=" << hdBp
+                                         << " posDiff=" << posDiff
+                                         << " cigarReads=" << ci.readCount
+                                         << endl;
+                                    cout << "    >>> DELETION CALL"
+                                         << " (cigar-covdrop): size="
+                                         << ci.size << "bp"
+                                         << ", breakpoint=" << hdBp
+                                         << ", reads=" << ci.readCount
+                                         << endl;
+                                    allDelCalls.push_back({
+                                        hdBp, ci.size,
+                                        ci.readCount,
+                                        "cigar-covdrop"});
+                                }
                                 emittedCigarCovdrop = true;
                                 break;
                             }
@@ -6709,6 +6761,7 @@ void Assembler::buildSvMSA(
         // -----------------------------------------------------------------
         cigarRefineInsCalls();
         geomeanRefineInsCalls();
+        filterDisabledInsSources();
         if(!allInsCalls.empty()) {
             // Sort by breakpoint position.
             sort(allInsCalls.begin(), allInsCalls.end(),
