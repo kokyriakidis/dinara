@@ -610,6 +610,94 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Best-neighbor filter: for each window, keep only the best incoming
+    // and best outgoing neighbor by total supportingSpanProduct.
+    {
+        auto normalize = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        // Compute total spanProduct per (normalized) window pair.
+        // A window pair (A, B) means A is the outgoing side, B is the incoming side.
+        struct PairScore {
+            uint64_t totalSpanProduct = 0;
+        };
+        // outScores[normA][normB] = total spanProduct for A→B
+        std::map<uint32_t, std::map<uint32_t, uint64_t>> outScores;
+
+        for(const auto& [wp, transitions] : windowPairTransitions) {
+            const uint32_t normA = normalize(wp.first);
+            const uint32_t normB = normalize(wp.second);
+            uint64_t totalSP = 0;
+            for(const auto& t : transitions) {
+                totalSP += t.supportingSpanProduct;
+            }
+            outScores[normA][normB] += totalSP;
+        }
+
+        // For each window, find the best outgoing and best incoming neighbor.
+        std::map<uint32_t, uint32_t> bestOutgoing;  // normW → best normB
+        std::map<uint32_t, uint32_t> bestIncoming;  // normW → best normA
+
+        for(const auto& [normA, neighbors] : outScores) {
+            uint64_t bestScore = 0;
+            uint32_t bestB = UINT32_MAX;
+            for(const auto& [normB, score] : neighbors) {
+                if(score > bestScore) {
+                    bestScore = score;
+                    bestB = normB;
+                }
+            }
+            if(bestB != UINT32_MAX) {
+                bestOutgoing[normA] = bestB;
+            }
+        }
+
+        // Build incoming scores from the same data.
+        std::map<uint32_t, std::map<uint32_t, uint64_t>> inScores;
+        for(const auto& [normA, neighbors] : outScores) {
+            for(const auto& [normB, score] : neighbors) {
+                inScores[normB][normA] += score;
+            }
+        }
+        for(const auto& [normB, neighbors] : inScores) {
+            uint64_t bestScore = 0;
+            uint32_t bestA = UINT32_MAX;
+            for(const auto& [normA, score] : neighbors) {
+                if(score > bestScore) {
+                    bestScore = score;
+                    bestA = normA;
+                }
+            }
+            if(bestA != UINT32_MAX) {
+                bestIncoming[normB] = bestA;
+            }
+        }
+
+        // Remove window pair transitions that are not the best outgoing
+        // or best incoming for either endpoint.
+        uint64_t removedPairs = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> keysToRemove;
+        for(const auto& [wp, transitions] : windowPairTransitions) {
+            const uint32_t normA = normalize(wp.first);
+            const uint32_t normB = normalize(wp.second);
+
+            bool isBestOut = (bestOutgoing.count(normA) && bestOutgoing[normA] == normB);
+            bool isBestIn = (bestIncoming.count(normB) && bestIncoming[normB] == normA);
+
+            if(!isBestOut && !isBestIn) {
+                keysToRemove.push_back(wp);
+            }
+        }
+        for(const auto& key : keysToRemove) {
+            windowPairTransitions.erase(key);
+            ++removedPairs;
+        }
+
+        cout << "Best-neighbor filter: kept " << windowPairTransitions.size()
+             << " window pairs, removed " << removedPairs << "." << endl;
+    }
+
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowLowEdgeCoverage = 0;
     uint64_t interWindowCreated = 0;
