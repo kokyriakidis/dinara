@@ -806,12 +806,31 @@ uint64_t BidirectedAnchorGraph::bypassDetourFilter(
                     // Don't create self-loops.
                     if(bypassFrom.first == bypassTo.first) continue;
 
-                    // Create bypass edge (both directions).
-                    if(!hasEdge(bypassFrom, bypassTo)) {
-                        EdgeProperties props;
-                        props.useForAssembly = true;
-                        addEdge(bypassFrom, bypassTo, props);
-                        addTraversal(reverseAnchor(bypassTo), reverseAnchor(bypassFrom));
+                    // Skip bypass creation when both endpoints are in the
+                    // same window — the backbone chain already connects them.
+                    // Creating a bypass here would add a non-linear shortcut
+                    // within the window, producing extra branching nodes.
+                    bool sameWindow = false;
+                    {
+                        auto fromIdx = bypassFrom.first.value();
+                        auto toIdx = bypassTo.first.value();
+                        if(fromIdx < nodeProps.size() && toIdx < nodeProps.size()) {
+                            uint32_t fromWin = nodeProps[fromIdx].windowId;
+                            uint32_t toWin = nodeProps[toIdx].windowId;
+                            if(fromWin != noWindow && fromWin == toWin) {
+                                sameWindow = true;
+                            }
+                        }
+                    }
+
+                    if(!sameWindow) {
+                        // Create bypass edge (both directions).
+                        if(!hasEdge(bypassFrom, bypassTo)) {
+                            EdgeProperties props;
+                            props.useForAssembly = true;
+                            addEdge(bypassFrom, bypassTo, props);
+                            addTraversal(reverseAnchor(bypassTo), reverseAnchor(bypassFrom));
+                        }
                     }
 
                     // Remove the exit edge (idempotent).
