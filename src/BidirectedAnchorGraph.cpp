@@ -632,19 +632,17 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
     const uint32_t windowCount = uint32_t(anchorWindows.size());
     static constexpr uint32_t noWindow = UINT32_MAX;
 
-    // Collect inter-window edges from the exit side only.
-    // Each inter-window edge appears exactly once per window as an
-    // exit edge. For unordered pair {A, B}, we see A's exit to B
-    // when processing A, and B's exit to A when processing B.
+    // For each directed window pair (W → X), collect all exit edges
+    // from W's backbone to X. Keep only the one at the last backbone
+    // position (closest to W's tail). Remove the rest.
+    // This does NOT touch edges in the opposite direction (X → W).
     struct IWEdge {
         OrientedAnchor from;
         OrientedAnchor to;
-        uint32_t fromWindow;
-        uint32_t toWindow;
         uint32_t bbIdx;
     };
 
-    map<pair<uint32_t, uint32_t>, vector<IWEdge>> edgesByPair;
+    uint64_t removedCount = 0;
 
     for(uint32_t w = 0; w < windowCount; w++) {
         const auto& window = anchorWindows[w];
@@ -658,6 +656,8 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
             backbone.push_back(toOrientedAnchor(journey[pos]));
         }
 
+        // Collect exit edges grouped by target window.
+        map<uint32_t, vector<IWEdge>> exitByWindow;
         for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
             const auto& bb = backbone[i];
             for(const auto& nbr : getNeighbors({bb.first, bb.second})) {
@@ -665,43 +665,25 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
                 if(nIdx >= nodeProps.size()) continue;
                 uint32_t nWin = nodeProps[nIdx].windowId;
                 if(nWin == noWindow || nWin == w) continue;
-                auto key = make_pair(min(w, nWin), max(w, nWin));
-                edgesByPair[key].push_back(
-                    {{bb.first, bb.second}, nbr, w, nWin, i});
+                exitByWindow[nWin].push_back(
+                    {{bb.first, bb.second}, nbr, i});
             }
         }
-    }
 
-    uint64_t removedCount = 0;
-
-    for(auto& [windowPair, edges] : edgesByPair) {
-        if(edges.size() <= 1) continue;
-
-        // Keep the exit edge at the latest backbone position in the
-        // lower-ID window. Among ties, prefer highest coverage.
-        const IWEdge* best = nullptr;
-        for(const auto& e : edges) {
-            if(!best) { best = &e; continue; }
-
-            bool eLowerExit = (e.fromWindow == windowPair.first);
-            bool bestLowerExit = (best->fromWindow == windowPair.first);
-            if(eLowerExit && !bestLowerExit) { best = &e; continue; }
-            if(!eLowerExit && bestLowerExit) continue;
-
-            if(e.bbIdx > best->bbIdx) { best = &e; continue; }
-            if(e.bbIdx < best->bbIdx) continue;
-
-            auto eProps = getEdgePropertiesCanonical(e.from, e.to);
-            auto bestProps = getEdgePropertiesCanonical(best->from, best->to);
-            uint64_t eCov = eProps ? eProps->coverage : 0;
-            uint64_t bestCov = bestProps ? bestProps->coverage : 0;
-            if(eCov > bestCov) best = &e;
-        }
-
-        for(const auto& e : edges) {
-            if(&e == best) continue;
-            removeEdgeBothDirections(e.from, e.to);
-            ++removedCount;
+        for(auto& [targetWin, edges] : exitByWindow) {
+            if(edges.size() <= 1) continue;
+            // Find the last backbone index.
+            uint32_t lastIdx = 0;
+            for(const auto& e : edges) {
+                if(e.bbIdx >= lastIdx) lastIdx = e.bbIdx;
+            }
+            // Remove all except those at lastIdx.
+            for(const auto& e : edges) {
+                if(e.bbIdx != lastIdx) {
+                    removeEdgeBothDirections(e.from, e.to);
+                    ++removedCount;
+                }
+            }
         }
     }
 
