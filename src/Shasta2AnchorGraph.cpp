@@ -387,6 +387,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         Shasta2AnchorId firstAnchorInA;
         Shasta2AnchorId lastAnchorInA;
         Shasta2AnchorId firstAnchorInB;
+        uint32_t firstJourneyPosInA;  // journey position of firstAnchorInA
         uint64_t supportingSpanProduct;
         uint64_t supportingSpanA;
         uint64_t supportingSpanB;
@@ -429,6 +430,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         struct WindowAnchor {
             uint32_t windowId;
             Shasta2AnchorId anchorId;
+            uint32_t journeyPos;
         };
         std::vector<WindowAnchor> claimedAnchors;
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
@@ -436,7 +438,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             if(uint64_t(anchorId) >= anchorCount) continue;
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
-            claimedAnchors.push_back({windowId, anchorId});
+            claimedAnchors.push_back({windowId, anchorId, pos});
         }
 
         // Build the effective window sequence, suppressing detour visits.
@@ -445,6 +447,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             uint32_t windowId;
             Shasta2AnchorId firstAnchor;
             Shasta2AnchorId lastAnchor;
+            uint32_t firstJourneyPos;
         };
         std::vector<WindowVisit> windowVisits;
 
@@ -473,7 +476,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 windowVisits.back().lastAnchor = ca.anchorId;
             } else {
                 // New window.
-                windowVisits.push_back({ca.windowId, ca.anchorId, ca.anchorId});
+                windowVisits.push_back({ca.windowId, ca.anchorId, ca.anchorId, ca.journeyPos});
             }
         }
 
@@ -508,7 +511,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const auto& prev = windowVisits[i - 1];
                 auto key = std::make_pair(prev.windowId, visit.windowId);
                 windowPairTransitions[key].push_back(
-                    {uint32_t(oidValue), prev.firstAnchor, prev.lastAnchor, visit.firstAnchor, 0, 0, 0});
+                    {uint32_t(oidValue), prev.firstAnchor, prev.lastAnchor, visit.firstAnchor,
+                     prev.firstJourneyPos, 0, 0, 0});
             }
         }
     }
@@ -554,9 +558,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     Shasta2AnchorId(uint64_t(t.firstAnchorInB) ^ 1ULL);
                 const Shasta2AnchorId newFirstInB =
                     Shasta2AnchorId(uint64_t(t.lastAnchorInA) ^ 1ULL);
+                // RC mirror: journey position not directly available,
+                // set to 0 (RC transitions don't use it for edge creation).
                 dstTransitions.push_back({
                     t.oidValue, newFirstInA, newLastInA, newFirstInB,
-                    t.supportingSpanProduct, t.supportingSpanB, t.supportingSpanA});
+                    0, t.supportingSpanProduct, t.supportingSpanB, t.supportingSpanA});
                 ++mergedTransitions;
             }
             windowPairTransitions.erase(key);
@@ -616,9 +622,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
-    // Create inter-window edges using firstAnchorInA → firstAnchorInB.
-    // For each window pair, pick the transition with the most anchor pair
-    // coverage at the earliest firstAnchorInA position.
+    // Create inter-window edges: find the read that supports the A→B
+    // transition earliest in window A, then connect its firstAnchorInA
+    // to the immediate next anchor in that read's journey (which is in B).
     {
         uint64_t interWindowCreated = 0;
         uint64_t interWindowSkipped = 0;
@@ -629,31 +635,37 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 continue;
             }
 
-            // Pick the transition whose (firstInA, firstInB) pair has the
-            // highest anchor pair coverage.
-            Shasta2AnchorPair bestPair;
-            uint64_t bestCoverage = 0;
+            // Find the transition with the earliest firstAnchorInA
+            // by backbone position in window A.
+            const ReadTransition* earliest = nullptr;
+            uint32_t earliestBbPos = UINT32_MAX;
             for(const auto& t : transitions) {
-                Shasta2AnchorPair candidatePair(
-                    anchors, t.firstAnchorInA, t.firstAnchorInB, false);
-                candidatePair.assertNoNegativeOffsets(anchors);
-                if(candidatePair.size() > bestCoverage) {
-                    bestCoverage = candidatePair.size();
-                    bestPair = std::move(candidatePair);
+                const uint64_t aid = uint64_t(t.firstAnchorInA);
+                if(aid >= anchorCount) continue;
+                const uint32_t bbPos = anchorToBackbonePos[aid];
+                if(bbPos < earliestBbPos) {
+                    earliestBbPos = bbPos;
+                    earliest = &t;
                 }
             }
 
-            if(bestCoverage == 0) continue;
-            if(bestCoverage < minInterWindowEdgeCoverage) continue;
+            if(!earliest) continue;
 
-            // Create the edge.
-            if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
+            // The edge: firstAnchorInA → next in that read's journey.
+            const OrientedReadId oid = OrientedReadId::fromValue(earliest->oidValue);
+            const auto readJourney = journeys[oid];
+            const uint32_t nextPos = earliest->firstJourneyPosInA + 1;
+            if(nextPos >= uint32_t(readJourney.size())) continue;
+            const Shasta2AnchorId edgeFrom = earliest->firstAnchorInA;
+            const Shasta2AnchorId edgeTo = readJourney[nextPos];
+
+            if(addEdgeIfValid(edgeFrom, edgeTo)) {
                 ++interWindowCreated;
                 // RC mirror edge.
                 const Shasta2AnchorId rcA =
-                    Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+                    Shasta2AnchorId(uint64_t(edgeFrom) ^ 1ULL);
                 const Shasta2AnchorId rcB =
-                    Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+                    Shasta2AnchorId(uint64_t(edgeTo) ^ 1ULL);
                 if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
                     addEdgeIfValid(rcB, rcA);
                 }
