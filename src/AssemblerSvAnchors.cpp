@@ -435,6 +435,21 @@ void Assembler::buildSvMSA(
     const auto tBegin = std::chrono::steady_clock::now();
     performanceLog << timestamp << "Building SV MSA." << endl;
 
+    // Step timing helper.
+    auto tPrev = tBegin;
+    auto stepTimer = [&](const string& label) {
+        const auto tNow = std::chrono::steady_clock::now();
+        const double elapsed = 1.e-9 * double(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tNow - tPrev).count());
+        if(elapsed > 0.5) {
+            cout << "    [timer] " << label << ": "
+                 << std::fixed << std::setprecision(2)
+                 << elapsed << " s" << endl;
+        }
+        tPrev = tNow;
+    };
+
     const auto& candidates = alignmentCandidates.candidates;
     const auto& alignments = alignmentCandidatesAlignmentsData.alignments;
     const uint64_t n = candidates.size();
@@ -485,6 +500,8 @@ void Assembler::buildSvMSA(
 
         chainsByRef[refId].push_back({i, refId, readId, cand.isSameStrand});
     }
+
+    stepTimer("Step 1: group chains by ref");
 
     // =========================================================================
     // Step 2: For each reference read, build MSA.
@@ -1223,6 +1240,8 @@ void Assembler::buildSvMSA(
             }
         };
 
+        stepTimer("Step 2a: lambda defs + setup");
+
         if(!bamFileName.empty()) {
             // refName and regionStart already parsed above.
             saTagCalls = parseSaTagSvCalls(
@@ -1297,6 +1316,8 @@ void Assembler::buildSvMSA(
                 }
             }
 
+            stepTimer("Step 2b: BAM parsing (SA + softclip + CIGAR)");
+
             // Emit CIGAR indel calls with sufficient support.
             // DEL: suppressed (redundant with early-CIGAR from main.cpp).
             // INS: emit as INS calls (early-CIGAR only handles DELs).
@@ -1311,6 +1332,8 @@ void Assembler::buildSvMSA(
                         "early-CIGAR"});
                 }
             }
+
+            stepTimer("Step 2c1: early-CIGAR emission");
 
             // Multi-k non-unique anchor deletion sizing.
             // Run on ALL reads using weighted diagonal histograms
@@ -1345,6 +1368,8 @@ void Assembler::buildSvMSA(
                     }
                 }
             }
+
+            stepTimer("Step 2c2: multi-k anchor sizing");
 
             // Paired soft-clip INS sizing with de Bruijn assembly.
             // Right-clip reads end at the left breakpoint; their
@@ -1428,6 +1453,8 @@ void Assembler::buildSvMSA(
                 }
             }
         }
+
+        stepTimer("Step 2c: early-CIGAR + softclip INS emission");
 
         // Collect all unique reference marker ordinals across all chains.
         vector<uint32_t> allRefOrdinals;
@@ -1606,6 +1633,8 @@ void Assembler::buildSvMSA(
         };
         vector<CovDropRegion> covDropRegions;
 
+        stepTimer("Step 2d: ordinal collection + early-exit path");
+
         // Step 3: Extract backbone segments from the reference.
         // -----------------------------------------------------------------
         // Each segment spans from the midpoint of marker at ordinal[i]
@@ -1777,6 +1806,8 @@ void Assembler::buildSvMSA(
             continue;
         }
 
+        stepTimer("Step 3: extract backbone segments");
+
         // -----------------------------------------------------------------
         // Step 4: Create TheseusMSA with multi-segment constructor.
         // -----------------------------------------------------------------
@@ -1792,6 +1823,7 @@ void Assembler::buildSvMSA(
         cerr << "Creating TheseusMSA with " << segmentViews.size() << " segments..." << endl;
         theseus::TheseusMSA aligner(penalties, heuristics, segmentViews, nodeIds, 1);
         cerr << "TheseusMSA created. nodeIds.size()=" << nodeIds.size() << endl;
+        stepTimer("Step 4: create TheseusMSA");
 
         // -----------------------------------------------------------------
         // Step 5: Group chains by read, classify SV type, sort, then align.
@@ -2087,6 +2119,8 @@ void Assembler::buildSvMSA(
             }
 
         }
+
+        stepTimer("Step 5: classify + align reads");
 
         // -----------------------------------------------------------------
         // Step 5b: Cluster SV-carrying reads by breakpoint position and
@@ -2401,6 +2435,8 @@ void Assembler::buildSvMSA(
             ++readGroupIdx;
         }
 
+        stepTimer("Step 5b: cluster SV reads");
+
         // -----------------------------------------------------------------
         // Phase 3: Indirect alignment of insertion-internal reads via
         // a read graph BFS.
@@ -2586,6 +2622,7 @@ void Assembler::buildSvMSA(
             cout << "    Phase 1/2 done: " << totalAlignedReads << " reads, "
                  << totalAlignedSegments << " segments aligned." << endl;
             cout << flush;
+            stepTimer("Phase 3: read graph BFS");
 
             // ---------------------------------------------------------
             // Phase 4: Detect insertions via reference-centric
@@ -6756,6 +6793,8 @@ void Assembler::buildSvMSA(
             }
         }
 
+        stepTimer("Phase 4: breakpoint detection + INS calls");
+
         // -----------------------------------------------------------------
         // CIGAR-guided INS size refinement and emission.
         // -----------------------------------------------------------------
@@ -6849,6 +6888,8 @@ void Assembler::buildSvMSA(
                 }
             }
         }
+
+        stepTimer("Step 6a: cluster summary output");
 
         // -----------------------------------------------------------------
         // Merge nearby per-read INS/DEL clusters with similar sizes.
@@ -7088,6 +7129,8 @@ void Assembler::buildSvMSA(
                 }
             }
         }
+
+        stepTimer("Merge + CIGAR-kmer clusters");
 
         // -----------------------------------------------------------------
         // SDUST-gated low-complexity SV detection.
@@ -7492,6 +7535,8 @@ void Assembler::buildSvMSA(
             }
         }
 
+        stepTimer("SDUST low-complexity detection");
+
         // -----------------------------------------------------------------
         // SA tag evidence integration.
         //
@@ -7542,6 +7587,8 @@ void Assembler::buildSvMSA(
                 }
             }
         }
+
+        stepTimer("SA tag evidence");
 
         // -----------------------------------------------------------------
         // K-mer journey DEL detection (top-down multi-resolution).
@@ -7912,6 +7959,8 @@ void Assembler::buildSvMSA(
             }
         }
 
+        stepTimer("K-mer journey DEL");
+
         // -----------------------------------------------------------------
         // Depth-deficit DEL source: infer deletion size from the
         // integrated depth deficit across the entire region.
@@ -8108,6 +8157,8 @@ void Assembler::buildSvMSA(
                 hts_close(ddFp);
             }
         }
+
+        stepTimer("Depth-deficit DEL");
 
         // -----------------------------------------------------------------
         // Deduplicate and emit all DEL calls.
@@ -8390,6 +8441,25 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
     vector<MultiKDelCall> result;
     if(readIds.empty()) return result;
 
+    // Subsample reads when count is excessive (e.g., 168K reads
+    // in a 4Kbp region). Processing all reads is O(n) per read
+    // and dominates runtime for high-coverage repetitive regions.
+    const uint32_t maxReadsForMultiK = 500;
+    const vector<ReadId>* readIdsPtr = &readIds;
+    vector<ReadId> subsampledReadIds;
+    if(readIds.size() > maxReadsForMultiK) {
+        subsampledReadIds.reserve(maxReadsForMultiK);
+        // Deterministic stride-based subsampling.
+        const double stride =
+            double(readIds.size()) / double(maxReadsForMultiK);
+        for(uint32_t i = 0; i < maxReadsForMultiK; ++i) {
+            subsampledReadIds.push_back(
+                readIds[uint32_t(double(i) * stride)]);
+        }
+        readIdsPtr = &subsampledReadIds;
+    }
+    const auto& activeReadIds = *readIdsPtr;
+
     const auto& readsRef = getReads();
     const uint32_t refSeqLen = uint32_t(
         readsRef.getRead(refId).baseCount);
@@ -8439,8 +8509,8 @@ vector<Assembler::MultiKDelCall> Assembler::multiKAnchorSizing(
 
     const uint32_t maxMult = 30;
 
-    for(size_t ri = 0; ri < readIds.size(); ++ri) {
-        const ReadId rid = readIds[ri];
+    for(size_t ri = 0; ri < activeReadIds.size(); ++ri) {
+        const ReadId rid = activeReadIds[ri];
         const vector<Base> readSeq =
             readsRef.getOrientedReadRawSequence(
                 OrientedReadId(rid, 0));
