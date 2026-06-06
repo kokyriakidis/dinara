@@ -453,6 +453,11 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             << "\tRC:i:" << props.coverage << "\n";
     };
 
+    uint64_t debugNeighborCount = 0;
+    uint64_t debugNoProps = 0;
+    uint64_t debugNotInMap = 0;
+    uint64_t debugEmitted = 0;
+
     for(uint64_t i = 0; i < unitigs.size(); i++) {
         const auto& u = unitigs[i];
 
@@ -461,14 +466,21 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             const OrientedAnchor exitAnchor = u.chain.back();
             auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
             for(const auto& neighbor : neighbors) {
+                ++debugNeighborCount;
                 EdgeProperties props;
-                if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
+                if(!getEdgeProperties(exitAnchor, neighbor, props)) {
+                    ++debugNoProps;
+                    continue;
+                }
                 if(!props.useForAssembly) continue;
 
                 auto it = entryMap.find(neighbor);
                 if(it != entryMap.end()) {
                     emitLink(i, true, it->second.unitigIndex,
                              it->second.orientation, props);
+                    ++debugEmitted;
+                } else {
+                    ++debugNotInMap;
                 }
             }
         }
@@ -478,18 +490,30 @@ void BidirectedAnchorGraph::writeUnitigGfa(
             const OrientedAnchor exitAnchor = reverseAnchor(u.chain.front());
             auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
             for(const auto& neighbor : neighbors) {
+                ++debugNeighborCount;
                 EdgeProperties props;
-                if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
+                if(!getEdgeProperties(exitAnchor, neighbor, props)) {
+                    ++debugNoProps;
+                    continue;
+                }
                 if(!props.useForAssembly) continue;
 
                 auto it = entryMap.find(neighbor);
                 if(it != entryMap.end()) {
                     emitLink(i, false, it->second.unitigIndex,
                              it->second.orientation, props);
+                    ++debugEmitted;
+                } else {
+                    ++debugNotInMap;
                 }
             }
         }
     }
+
+    cout << "Unitig link debug: " << debugNeighborCount << " neighbors checked, "
+         << debugNoProps << " no props, "
+         << debugNotInMap << " not in entry map, "
+         << debugEmitted << " emitted." << endl;
 
     cout << "Wrote unitig GFA to " << fileName
          << ": " << unitigs.size() << " segments, "
