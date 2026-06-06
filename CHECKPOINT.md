@@ -1776,6 +1776,45 @@ FP reduction: INS ps=0.7 −1,166 FP, DEL ps=0.7 −24,740 FP. Total call volume
 
 ---
 
+## Dinara V37b — Bidirectional Geomean + Emission Bug Fix (June 2026)
+
+### Changes
+
+1. **Bidirectional geomean**: `geomeanRefineInsCalls` now handles both directions — indirect-covdrop over-estimates (IC > CIGAR) and under-estimates (IC < CIGAR/soft-clip). Previously only the over-estimate direction was covered. The ratio and guard checks now use `min/max` to be symmetric.
+
+2. **Emission bug fix**: `cigar-covdrop` DEL calls had an inline `cout` before `filterDisabledDelSources()` ran, so they appeared in VCF output despite being disabled. Wrapped in `disabledDelSources.count()` check.
+
+### V37b Benchmark Results — HG002 Q100 v5.0q
+
+| Metric | V36z (baseline) | V37a | V37b |
+|--------|---:|---:|---:|
+| INS recall ps=0 | 99.46% (TP=17915, FN=98) | 99.27% (TP=17882, FN=131) | 99.28% (TP=17884, FN=129) |
+| INS recall ps=0.7 | 60.81% (TP=10953, FN=7060) | 59.62% (TP=10739, FN=7274) | 59.66% (TP=10746, FN=7267) |
+| DEL recall ps=0 | 100.00% (TP=10175, FN=0) | 100.00% (TP=10175, FN=0) | 100.00% (TP=10175, FN=0) |
+| DEL recall ps=0.7 | 99.55% (TP=10129, FN=46) | 99.41% (TP=10115, FN=60) | 99.41% (TP=10115, FN=60) |
+
+V37b vs V37a: +7 INS TP at ps=0.7, +2 at ps=0. The bidirectional geomean gained less than the predicted 61 because the analysis used soft-clip VCF call sizes, but the geomean lambda uses `softClipBPs.avgClipLen` from BAM parsing — these differ.
+
+### Source Analysis Summary
+
+INS FN at ps=0.7 (7,060 total): 6,962 are sizing misses (found at ps=0), only 98 are position misses. The dominant problem is size estimation, not detection.
+
+- 1,824 sizing misses have only `indirect-covdrop` — no CIGAR, no soft-clip, no second signal. No current path to fix these.
+- `indirect-covdrop` sizing bias: 3.5× over-estimate for 50-100bp truth, 0.19× under-estimate for 1000-5000bp truth.
+- Cross-source geomean could theoretically fix ~453 sizing misses, but most overlap with existing geomean and the net gain is small.
+
+DEL is at the practical recall ceiling (100% ps=0, 99.41% ps=0.7). The 60 FN are dominated by 50-100bp tandem repeat DELs.
+
+### Cluster Paths
+
+- **Binary**: `/sc1/groups/sbx/workspace/kyriakik/data/tools/dinara_v37b`
+- **INS results**: `.../full_ins_eval/results_v37b/` (26,101 logs)
+- **DEL results**: `.../full_del_eval/results_v37b/` (10,173 logs)
+- **INS VCF**: `.../full_ins_eval/dinara_v37b_ins_sorted.vcf.gz` (230,970 calls)
+- **DEL VCF**: `.../full_del_eval/dinara_v37b_dels_sorted.vcf.gz` (140,425 calls)
+
+---
+
 ## Dinara V36y — CIGAR-Guided INS Refinement (June 2026)
 
 ### Changes
