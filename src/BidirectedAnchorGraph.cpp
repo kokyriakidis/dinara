@@ -294,6 +294,55 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
         }
     }
 
+    // Deduplicate: a unitig and its RC mirror are the same.
+    // For each unitig, compute its canonical form (the lexicographically
+    // smaller of the chain and its RC mirror). Skip duplicates.
+    {
+        // Canonicalize a chain: return the lexicographically smaller of
+        // the chain and its RC mirror.
+        auto canonicalizeChain = [](const vector<OrientedAnchor>& chain)
+            -> vector<OrientedAnchor>
+        {
+            vector<OrientedAnchor> rc(chain.size());
+            for(uint64_t i = 0; i < chain.size(); i++) {
+                rc[chain.size() - 1 - i] = reverseAnchor(chain[i]);
+            }
+            return (chain <= rc) ? chain : rc;
+        };
+
+        set<vector<OrientedAnchor>> seen;
+        vector<Unitig> deduped;
+
+        for(auto& u : unitigs) {
+            auto canon = canonicalizeChain(u.chain);
+            if(!seen.insert(canon).second) continue;
+
+            // If the canonical form differs from the original, flip.
+            if(canon != u.chain) {
+                u.chain = std::move(canon);
+                // Recompute window sequence for the reversed chain.
+                u.windowSequence.clear();
+                static constexpr uint32_t noWindow = UINT32_MAX;
+                for(const auto& oa : u.chain) {
+                    auto idx = oa.first.value();
+                    if(idx < nodeProps.size()) {
+                        uint32_t wid = nodeProps[idx].windowId;
+                        if(wid != noWindow) {
+                            if(u.windowSequence.empty() ||
+                               u.windowSequence.back() != wid) {
+                                u.windowSequence.push_back(wid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            deduped.push_back(std::move(u));
+        }
+
+        unitigs = std::move(deduped);
+    }
+
     cout << "Unitigified: " << unitigs.size() << " unitigs from "
          << nodeCount << " nodes." << endl;
 
