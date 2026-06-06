@@ -1645,8 +1645,8 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeWindowConnectionStats(*shasta2Anchors, anchorWindows, *shasta2Journeys);
 
     // Clean the anchor graph.
-    shasta2AnchorGraph->removeRcWindowConnections();
-    shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
+    // shasta2AnchorGraph->removeRcWindowConnections();
+    // shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
     shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
 
     // Run detangling again after internal connection removal.
@@ -1673,8 +1673,8 @@ void dinara::main::assemble(
             shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
             // Clean again after detangling.
-            shasta2AnchorGraph->removeRcWindowConnections();
-            shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
+            // shasta2AnchorGraph->removeRcWindowConnections();
+            // shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
             shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
         }
     }
