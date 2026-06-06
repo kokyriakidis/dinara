@@ -95,10 +95,7 @@ void Assembler::computeAnchorWindowsClean(
     // Counters.
     uint64_t claimedAnchors = 0;
     uint64_t totalReadIntervals = 0;
-    uint64_t totalAltPathsBeforeFilter = 0;
-    uint64_t totalAltPathsAfterFilter = 0;
-    uint64_t totalIntermediatesConsidered = 0;
-    uint64_t totalIntermediatesKept = 0;
+
 
     // Compute the base span of a journey interval [begin, end).
     auto intervalBaseSpan = [&](OrientedReadId oid, const auto& journey, uint32_t begin, uint32_t end) {
@@ -175,42 +172,6 @@ void Assembler::computeAnchorWindowsClean(
     // return the indices (into the input) of the longest increasing subsequence.
     // Uses patience sorting (O(n log n)).
     // ========================================================================
-    auto longestIncreasingSubsequence = [](const vector<uint32_t>& seq) -> vector<uint32_t> {
-        const uint32_t n = uint32_t(seq.size());
-        if(n == 0) return {};
-
-        // tails[i] = smallest ending value of an increasing subsequence of length i+1
-        vector<uint32_t> tails;
-        // tailIdx[i] = index in seq of the element at tails[i]
-        vector<uint32_t> tailIdx;
-        // prev[i] = index in seq of the predecessor of seq[i] in the LIS
-        vector<int32_t> prev(n, -1);
-
-        for(uint32_t i = 0; i < n; i++) {
-            // Binary search for the position where seq[i] should go.
-            auto it = std::lower_bound(tails.begin(), tails.end(), seq[i]);
-            uint32_t pos = uint32_t(it - tails.begin());
-            if(pos == tails.size()) {
-                tails.push_back(seq[i]);
-                tailIdx.push_back(i);
-            } else {
-                tails[pos] = seq[i];
-                tailIdx[pos] = i;
-            }
-            if(pos > 0) {
-                prev[i] = int32_t(tailIdx[pos - 1]);
-            }
-        }
-
-        // Reconstruct the LIS.
-        vector<uint32_t> result(tails.size());
-        int32_t idx = int32_t(tailIdx.back());
-        for(int32_t k = int32_t(result.size()) - 1; k >= 0; k--) {
-            result[k] = uint32_t(idx);
-            idx = prev[idx];
-        }
-        return result;
-    };
 
     // Claim an anchor and its reverse complement.
     auto claimAnchor = [&](uint64_t anchorId, uint32_t windowId) {
@@ -225,8 +186,8 @@ void Assembler::computeAnchorWindowsClean(
 
     // ========================================================================
     // Create a window from a backbone interval.
-    // For each touched read, keep only anchors shared with the backbone,
-    // enforce backbone order via LIS, discard the rest.
+    // For each touched read, find first/last shared anchor with backbone
+    // and claim all anchors in between.
     // ========================================================================
     // Find k-mers that appear more than once in a journey interval.
     auto findDuplicateKmers = [&](const auto& journey, uint32_t begin, uint32_t end) {
@@ -472,15 +433,11 @@ void Assembler::computeAnchorWindowsClean(
 
             if(sharedReadPositions.empty()) continue;
 
-            // Step 3: LIS of backbone positions to enforce backbone order.
-            const auto lisIndices = longestIncreasingSubsequence(sharedBackbonePositions);
-
-            if(lisIndices.empty()) continue;
-
-            // Step 4: Record the span and the read interval.
-            uint32_t convergentCount = uint32_t(lisIndices.size());
-            uint32_t convergentBegin = sharedReadPositions[lisIndices.front()];
-            uint32_t convergentEnd = sharedReadPositions[lisIndices.back()] + 1;
+            // Use first and last shared positions to define the interval.
+            // Claim all anchors in between regardless of order.
+            const uint32_t convergentBegin = sharedReadPositions.front();
+            const uint32_t convergentEnd = sharedReadPositions.back() + 1;
+            const uint32_t convergentCount = uint32_t(sharedReadPositions.size());
 
             readSpans.push_back(ReadSpan{oid, convergentBegin, convergentEnd});
 
@@ -490,95 +447,6 @@ void Assembler::computeAnchorWindowsClean(
                 convergentEnd,
                 convergentCount});
 
-            // Step 5: For non-direct overlaps, extract alternate paths.
-            // Between consecutive LIS pillars, collect intermediate anchors
-            // from the read's journey, but only keep those that have at least
-            // one oriented read that is not a direct cis overlap of the backbone.
-            // This filters out anchors that merely echo the backbone haplotype.
-            if(!isDirectCis && lisIndices.size() >= 2) {
-                for(uint64_t li = 0; li + 1 < lisIndices.size(); li++) {
-                    const uint32_t readPosA = sharedReadPositions[lisIndices[li]];
-                    const uint32_t readPosB = sharedReadPositions[lisIndices[li + 1]];
-                    if(readPosB > readPosA + 1) {
-                        AnchorWindowAlternatePath altPath;
-                        altPath.anchorIdA = journey[readPosA];
-                        altPath.anchorIdB = journey[readPosB];
-                        for(uint32_t rp = readPosA + 1; rp < readPosB; rp++) {
-                            const Shasta2AnchorId midAnchorId = journey[rp];
-                            // Skip anchors with duplicate k-mers in this read.
-                            if(readDuplicates.count(uint64_t(midAnchorId))) continue;
-                            ++totalIntermediatesConsidered;
-                            // Keep only anchors that have at least one read
-                            // that is not the backbone and not a direct cis overlap.
-                            const auto anchor = (*shasta2Anchors)[midAnchorId];
-                            bool hasNonCisRead = false;
-                            for(const Shasta2AnchorMarkerInfo& ami : anchor) {
-                                const uint32_t readOidValue = ami.orientedReadId.getValue();
-                                if(readOidValue == backboneOid.getValue()) continue;
-                                if(directCisOverlapReads.find(readOidValue) == directCisOverlapReads.end()) {
-                                    hasNonCisRead = true;
-                                    break;
-                                }
-                            }
-                            if(hasNonCisRead) {
-                                altPath.intermediateAnchorIds.push_back(midAnchorId);
-                                ++totalIntermediatesKept;
-                            }
-                        }
-                        ++totalAltPathsBeforeFilter;
-                        if(!altPath.intermediateAnchorIds.empty()) {
-                            window.alternatePaths.push_back(std::move(altPath));
-                            ++totalAltPathsAfterFilter;
-                        }
-                    }
-                }
-            }
-        }
-
-        // TODO: revisit alternate path filtering:
-        // 1. The direct-cis filter removes intermediates that only have
-        //    direct-cis reads. This may be too aggressive or too lenient
-        //    depending on the phasing context.
-        // 2. The deduplication assigns each intermediate to one path
-        //    (furthest pillar B). This is arbitrary and may discard
-        //    valid alternate paths.
-        // 3. Paths with no surviving intermediates are dropped entirely.
-        // These heuristics should be revisited once phasing-aware
-        // alternate paths are working.
-
-        // Deduplicate alternate path intermediates: each intermediate anchor
-        // must appear in exactly one alternate path. If the same intermediate
-        // appears in multiple paths, assign it to the path with the furthest
-        // pillar B (highest backbone position). This maximizes forward
-        // connectivity for long-range phasing decisions.
-        {
-            auto pillarBPos = [&](const AnchorWindowAlternatePath& p) -> uint32_t {
-                auto it = backboneAnchorToPos.find(uint64_t(p.anchorIdB));
-                return (it != backboneAnchorToPos.end()) ? it->second : 0;
-            };
-
-            // Sort paths by pillar B position (furthest first).
-            std::sort(window.alternatePaths.begin(), window.alternatePaths.end(),
-                [&](const AnchorWindowAlternatePath& a, const AnchorWindowAlternatePath& b) {
-                    return pillarBPos(a) > pillarBPos(b);
-                });
-
-            // Assign each intermediate to the first (tightest) path that contains it.
-            std::unordered_set<uint64_t> claimedIntermediates;
-            vector<AnchorWindowAlternatePath> filteredPaths;
-            for(AnchorWindowAlternatePath& altPath : window.alternatePaths) {
-                vector<Shasta2AnchorId> filtered;
-                for(const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                    if(claimedIntermediates.insert(uint64_t(mid)).second) {
-                        filtered.push_back(mid);
-                    }
-                }
-                if(!filtered.empty()) {
-                    altPath.intermediateAnchorIds = std::move(filtered);
-                    filteredPaths.push_back(std::move(altPath));
-                }
-            }
-            window.alternatePaths = std::move(filteredPaths);
         }
 
         // Claim all anchors across all spans (backbone + touched reads) and their RC.
@@ -712,10 +580,4 @@ void Assembler::computeAnchorWindowsClean(
          << " readIntervals=" << totalReadIntervals
          << " seconds=" << std::fixed << std::setprecision(2) << elapsedSeconds
          << std::defaultfloat << endl;
-    cout << timestamp << "Alternate path filter:"
-         << " pathsBefore=" << totalAltPathsBeforeFilter
-         << " pathsAfter=" << totalAltPathsAfterFilter
-         << " intermediatesConsidered=" << totalIntermediatesConsidered
-         << " intermediatesKept=" << totalIntermediatesKept
-         << endl;
 }
