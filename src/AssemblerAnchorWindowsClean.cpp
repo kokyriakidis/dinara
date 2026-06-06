@@ -478,19 +478,16 @@ void Assembler::computeAnchorWindowsClean(
             if(lisIndices.empty()) continue;
 
             // Step 4: Record the span and the read interval.
-            // Claim the full journey of each participating read so the
-            // window truly represents all its reads. This prevents
-            // unclaimed gaps from becoming fragment windows.
             uint32_t convergentCount = uint32_t(lisIndices.size());
-            const uint32_t fullBegin = 0;
-            const uint32_t fullEnd = uint32_t(journey.size());
+            uint32_t convergentBegin = sharedReadPositions[lisIndices.front()];
+            uint32_t convergentEnd = sharedReadPositions[lisIndices.back()] + 1;
 
-            readSpans.push_back(ReadSpan{oid, fullBegin, fullEnd});
+            readSpans.push_back(ReadSpan{oid, convergentBegin, convergentEnd});
 
             window.readIntervals.push_back(AnchorWindowReadInterval{
                 oid,
-                fullBegin,
-                fullEnd,
+                convergentBegin,
+                convergentEnd,
                 convergentCount});
 
             // Step 5: For non-direct overlaps, extract alternate paths.

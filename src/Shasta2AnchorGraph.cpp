@@ -232,30 +232,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }()
             : window.filteredBackbonePositions;
 
-        // Map backbone anchors (these define backbone positions).
         for(const uint32_t pos : positions) {
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             anchorToWindow[aid] = windowId;
             anchorToBackbonePos[aid] = pos;
+            // Mirror RC window: map the RC anchor to windowId + windowCount.
             const uint64_t rcAid = aid ^ 1ULL;
             if(rcAid < anchorCount) {
                 anchorToWindow[rcAid] = windowId + windowCount;
                 anchorToBackbonePos[rcAid] = pos;
-            }
-        }
-
-        // Map all anchors from all participating reads' journeys.
-        for(const auto& ri : window.readIntervals) {
-            const auto riJourney = journeys[ri.orientedReadId];
-            for(uint32_t pos = ri.begin; pos < ri.end; pos++) {
-                const uint64_t aid = uint64_t(riJourney[pos]);
-                if(aid < anchorCount && anchorToWindow[aid] == noWindow) {
-                    anchorToWindow[aid] = windowId;
-                }
-                const uint64_t rcAid = aid ^ 1ULL;
-                if(rcAid < anchorCount && anchorToWindow[rcAid] == noWindow) {
-                    anchorToWindow[rcAid] = windowId + windowCount;
-                }
             }
         }
     }
@@ -278,43 +263,40 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         return true;
     };
 
-    // Intra-window edges: union of all reads' journey edges.
-    // Each window creates edges from all its reads' full journeys.
-    // No anchorToWindow filtering — edges belong to the window whose
-    // loop we're in. Reads' journeys stay intact within their window.
-    // Deduplication is global (same anchor pair won't get a second BGL edge).
-    std::set<std::pair<uint64_t, uint64_t>> createdPairs;
-
+    // Intra-window edges: consecutive filtered backbone anchor pairs,
+    // for both the original windows and their RC mirrors.
     for(const AnchorWindow& window : anchorWindows) {
-        for(const auto& ri : window.readIntervals) {
-            const auto journey = journeys[ri.orientedReadId];
-            if(ri.end <= ri.begin + 1) continue;
-            for(uint32_t pos = ri.begin; pos + 1 < ri.end; pos++) {
-                const Shasta2AnchorId a = journey[pos];
-                const Shasta2AnchorId b = journey[pos + 1];
-                auto key = std::make_pair(uint64_t(a), uint64_t(b));
-                if(createdPairs.count(key)) continue;
-                if(addEdgeIfValid(a, b)) {
-                    createdPairs.insert(key);
-                    // RC mirror edge.
-                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
-                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(b) ^ 1ULL);
-                    auto rcKey = std::make_pair(uint64_t(rcB), uint64_t(rcA));
-                    if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount &&
-                       !createdPairs.count(rcKey)) {
-                        if(addEdgeIfValid(rcB, rcA)) {
-                            createdPairs.insert(rcKey);
-                        }
-                    }
-                }
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+
+        // Collect the backbone anchor IDs for this window.
+        vector<Shasta2AnchorId> backboneAnchors;
+        const auto& positions = window.filteredBackbonePositions;
+        if(!positions.empty()) {
+            for(const uint32_t pos : positions) {
+                backboneAnchors.push_back(backboneJourney[pos]);
+            }
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++) {
+                backboneAnchors.push_back(backboneJourney[pos]);
+            }
+        }
+
+        if(backboneAnchors.size() < 2) continue;
+
+        for(uint64_t i = 0; i + 1 < backboneAnchors.size(); i++) {
+            addEdgeIfValid(backboneAnchors[i], backboneAnchors[i + 1]);
+            // RC mirror edge.
+            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(backboneAnchors[i]) ^ 1ULL);
+            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(backboneAnchors[i + 1]) ^ 1ULL);
+            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                addEdgeIfValid(rcB, rcA);
             }
         }
     }
 
 
 
-    // Inter-window edge discovery disabled — testing intra-window-only graph.
-#if 0
     // Per-read window transition tracking.
     // If computeWindowTransitions() was already called, transitionReads
     // are populated. Recompute unconditionally so the graph's own
@@ -851,7 +833,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << interWindowLowCoverage << " rejected (< " << minInterWindowCoverage << " reads), "
          << interWindowLowEdgeCoverage << " rejected (< " << minInterWindowEdgeCoverage << " edge coverage), "
          << interWindowZeroPairs << " rejected (no valid anchor pair)." << endl;
-#endif  // Inter-window edge discovery disabled
 
     // ========================================================================
     // Filter lambdas (defined here, called in order below).
@@ -1950,8 +1931,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     removeDanglingWindowsIterative("post-filter");
 #endif
 
-    // Inter-window edge population and bypass edges disabled.
-#if 0
     // Populate per-window outEdges/inEdges from createdEdges.
     for(const auto& edgeInfo : createdEdges) {
         const uint32_t srcW = edgeInfo.windowPair.first;
@@ -1985,7 +1964,6 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                  << bypassEdges->size() << " candidates." << endl;
         }
     }
-#endif
 
     // ========================================================================
     // Detangle Case 2: 2x2 tangle matrix for internal inter-window edges.
