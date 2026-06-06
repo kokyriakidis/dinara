@@ -623,7 +623,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
          << " window pairs found." << endl;
 
     // Create inter-window edges: for each A→B window pair, evaluate
-    // (firstAnchorInA, firstAnchorInB) for every supporting read and
+    // (lastAnchorInA, firstAnchorInB) for every supporting read and
     // pick the pair with the highest anchor pair coverage.
     {
         uint64_t interWindowCreated = 0;
@@ -639,7 +639,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             uint64_t bestCoverage = 0;
             for(const auto& t : transitions) {
                 Shasta2AnchorPair candidatePair(
-                    anchors, t.firstAnchorInA, t.firstAnchorInB, false);
+                    anchors, t.lastAnchorInA, t.firstAnchorInB, false);
                 candidatePair.assertNoNegativeOffsets(anchors);
                 if(candidatePair.size() > bestCoverage) {
                     bestCoverage = candidatePair.size();
