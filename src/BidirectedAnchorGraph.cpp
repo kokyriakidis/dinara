@@ -47,6 +47,9 @@ void BidirectedAnchorGraph::normalizeOrientations(const vector<bool>& swapOrient
         addTraversal(reverseAnchor(to), reverseAnchor(from));
     }
 
+    // Store swap flags for post-normalization anchor lookups.
+    wasSwapped = swapOrientation;
+
     uint64_t flippedCount = 0;
     for(bool b : swapOrientation) if(b) ++flippedCount;
     cout << "Normalized orientations: flipped " << flippedCount
@@ -618,7 +621,7 @@ uint64_t BidirectedAnchorGraph::trimBackbones(
 
         vector<OrientedAnchor> backbone;
         for(const uint32_t pos : positions) {
-            backbone.push_back(toOrientedAnchor(journey[pos]));
+            backbone.push_back(toNormalizedOrientedAnchor(journey[pos]));
         }
 
         // Find the first and last backbone positions that have an
@@ -711,10 +714,10 @@ uint64_t BidirectedAnchorGraph::bypassDetourFilter(
 
         const auto journey = journeys[window.backboneOrientedReadId];
 
-        // Build ordered backbone as OrientedAnchors.
+        // Build ordered backbone as OrientedAnchors (post-normalization).
         vector<OrientedAnchor> backbone;
         for(const uint32_t pos : positions) {
-            backbone.push_back(toOrientedAnchor(journey[pos]));
+            backbone.push_back(toNormalizedOrientedAnchor(journey[pos]));
         }
 
         // Collect inter-window edges at each backbone position.
