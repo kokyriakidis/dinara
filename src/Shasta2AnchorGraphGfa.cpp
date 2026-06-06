@@ -97,7 +97,7 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
         activeVertices.insert(target(e, *this));
     }
 
-    // One unique color per window. Distribute hue evenly across windowCount.
+    // One unique color per window. Golden angle spacing for distinct colors.
     for(const auto v : activeVertices) {
         if(uint64_t(v) >= anchorToWindow.size()) continue;
 
@@ -106,7 +106,7 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
 
         const uint32_t fwdWid = normalize(wid);
 
-        const double hue = (360.0 * fwdWid) / windowCount;
+        const double hue = fmod(double(fwdWid) * 137.508, 360.0);
         const double s = 0.7;
         const double l = 0.5;
         const double c = (1.0 - std::abs(2.0 * l - 1.0)) * s;
