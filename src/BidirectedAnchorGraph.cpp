@@ -632,19 +632,18 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
     const uint32_t windowCount = uint32_t(anchorWindows.size());
     static constexpr uint32_t noWindow = UINT32_MAX;
 
-    // Collect all inter-window edges, keyed by (window of source anchor,
-    // window of target anchor, backbone index in source window).
+    // Collect inter-window edges from the exit side only.
+    // Each inter-window edge appears exactly once per window as an
+    // exit edge. For unordered pair {A, B}, we see A's exit to B
+    // when processing A, and B's exit to A when processing B.
     struct IWEdge {
         OrientedAnchor from;
         OrientedAnchor to;
         uint32_t fromWindow;
         uint32_t toWindow;
-        uint32_t bbIdx;  // backbone index in fromWindow
+        uint32_t bbIdx;
     };
 
-    // For each unordered window pair {A, B}, collect all inter-window
-    // edges from both directions. Then keep only one: the exit edge
-    // from the lower-ID window at its last backbone position.
     map<pair<uint32_t, uint32_t>, vector<IWEdge>> edgesByPair;
 
     for(uint32_t w = 0; w < windowCount; w++) {
@@ -659,7 +658,6 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
             backbone.push_back(toOrientedAnchor(journey[pos]));
         }
 
-        // Exit side edges.
         for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
             const auto& bb = backbone[i];
             for(const auto& nbr : getNeighbors({bb.first, bb.second})) {
@@ -672,20 +670,6 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
                     {{bb.first, bb.second}, nbr, w, nWin, i});
             }
         }
-
-        // Entry side edges.
-        for(uint32_t i = 0; i < uint32_t(backbone.size()); i++) {
-            const auto& bb = backbone[i];
-            for(const auto& nbr : getNeighbors({bb.first, !bb.second})) {
-                auto nIdx = nbr.first.value();
-                if(nIdx >= nodeProps.size()) continue;
-                uint32_t nWin = nodeProps[nIdx].windowId;
-                if(nWin == noWindow || nWin == w) continue;
-                auto key = make_pair(min(w, nWin), max(w, nWin));
-                edgesByPair[key].push_back(
-                    {{bb.first, !bb.second}, nbr, w, nWin, i});
-            }
-        }
     }
 
     uint64_t removedCount = 0;
@@ -693,24 +677,20 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
     for(auto& [windowPair, edges] : edgesByPair) {
         if(edges.size() <= 1) continue;
 
-        // Pick the best edge: prefer exit edges from the lower-ID window
-        // at the latest backbone position. Among ties, pick highest coverage.
+        // Keep the exit edge at the latest backbone position in the
+        // lower-ID window. Among ties, prefer highest coverage.
         const IWEdge* best = nullptr;
         for(const auto& e : edges) {
             if(!best) { best = &e; continue; }
 
-            // Prefer exit from lower-ID window (fromWindow == windowPair.first
-            // and the edge is on the exit side, i.e., fromWindow < toWindow).
             bool eLowerExit = (e.fromWindow == windowPair.first);
             bool bestLowerExit = (best->fromWindow == windowPair.first);
             if(eLowerExit && !bestLowerExit) { best = &e; continue; }
             if(!eLowerExit && bestLowerExit) continue;
 
-            // Same direction: prefer later backbone index.
             if(e.bbIdx > best->bbIdx) { best = &e; continue; }
             if(e.bbIdx < best->bbIdx) continue;
 
-            // Same position: prefer higher coverage.
             auto eProps = getEdgePropertiesCanonical(e.from, e.to);
             auto bestProps = getEdgePropertiesCanonical(best->from, best->to);
             uint64_t eCov = eProps ? eProps->coverage : 0;
@@ -718,7 +698,6 @@ uint64_t BidirectedAnchorGraph::filterInterWindowEdges(
             if(eCov > bestCov) best = &e;
         }
 
-        // Remove all edges except the best.
         for(const auto& e : edges) {
             if(&e == best) continue;
             removeEdgeBothDirections(e.from, e.to);
