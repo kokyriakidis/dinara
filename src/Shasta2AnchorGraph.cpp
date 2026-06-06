@@ -384,6 +384,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Per-read transition: which anchor pair the read uses at the boundary.
     struct ReadTransition {
         uint32_t oidValue;
+        Shasta2AnchorId firstAnchorInA;
         Shasta2AnchorId lastAnchorInA;
         Shasta2AnchorId firstAnchorInB;
         uint64_t supportingSpanProduct;
@@ -507,7 +508,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const auto& prev = windowVisits[i - 1];
                 auto key = std::make_pair(prev.windowId, visit.windowId);
                 windowPairTransitions[key].push_back(
-                    {uint32_t(oidValue), prev.lastAnchor, visit.firstAnchor, 0, 0, 0});
+                    {uint32_t(oidValue), prev.firstAnchor, prev.lastAnchor, visit.firstAnchor, 0, 0, 0});
             }
         }
     }
@@ -547,12 +548,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             auto& srcTransitions = windowPairTransitions[key];
             auto& dstTransitions = windowPairTransitions[canonicalKey];
             for(auto& t : srcTransitions) {
+                const Shasta2AnchorId newFirstInA =
+                    Shasta2AnchorId(uint64_t(t.firstAnchorInB) ^ 1ULL);
                 const Shasta2AnchorId newLastInA =
                     Shasta2AnchorId(uint64_t(t.firstAnchorInB) ^ 1ULL);
                 const Shasta2AnchorId newFirstInB =
                     Shasta2AnchorId(uint64_t(t.lastAnchorInA) ^ 1ULL);
                 dstTransitions.push_back({
-                    t.oidValue, newLastInA, newFirstInB,
+                    t.oidValue, newFirstInA, newLastInA, newFirstInB,
                     t.supportingSpanProduct, t.supportingSpanB, t.supportingSpanA});
                 ++mergedTransitions;
             }
@@ -613,7 +616,56 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
-    // Inter-window edge creation disabled — discovery/filtering above still runs.
+    // Create inter-window edges using firstAnchorInA → firstAnchorInB.
+    // For each window pair, pick the transition with the most anchor pair
+    // coverage at the earliest firstAnchorInA position.
+    {
+        uint64_t interWindowCreated = 0;
+        uint64_t interWindowSkipped = 0;
+
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            if(transitions.size() < minInterWindowCoverage) {
+                ++interWindowSkipped;
+                continue;
+            }
+
+            // Pick the transition whose (firstInA, firstInB) pair has the
+            // highest anchor pair coverage.
+            Shasta2AnchorPair bestPair;
+            uint64_t bestCoverage = 0;
+            for(const auto& t : transitions) {
+                Shasta2AnchorPair candidatePair(
+                    anchors, t.firstAnchorInA, t.firstAnchorInB, false);
+                candidatePair.assertNoNegativeOffsets(anchors);
+                if(candidatePair.size() > bestCoverage) {
+                    bestCoverage = candidatePair.size();
+                    bestPair = std::move(candidatePair);
+                }
+            }
+
+            if(bestCoverage == 0) continue;
+            if(bestCoverage < minInterWindowEdgeCoverage) continue;
+
+            // Create the edge.
+            if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
+                ++interWindowCreated;
+                // RC mirror edge.
+                const Shasta2AnchorId rcA =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+                const Shasta2AnchorId rcB =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    addEdgeIfValid(rcB, rcA);
+                }
+            }
+        }
+
+        cout << "Inter-window edges: " << interWindowCreated << " created, "
+             << interWindowSkipped << " skipped (< " << minInterWindowCoverage
+             << " reads)." << endl;
+    }
+
+    // Old inter-window edge creation (disabled).
 #if 0
     uint64_t interWindowZeroPairs = 0;
     uint64_t interWindowLowEdgeCoverage = 0;
