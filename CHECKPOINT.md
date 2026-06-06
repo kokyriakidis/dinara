@@ -336,7 +336,7 @@ Key modifications in the fork:
 
 ## Bidirected Anchor Graph
 
-After the directed `Shasta2AnchorGraph` is built and filtered, it is converted to a bidirected graph (`BidirectedAnchorGraph`) matching MBG/Verkko's design. This collapses each anchor and its RC mirror into a single bidirected node.
+The directed `Shasta2AnchorGraph` is converted to a bidirected graph (`BidirectedAnchorGraph`) matching MBG/Verkko's design. Each anchor and its RC mirror collapse into a single bidirected node.
 
 ### Core Types
 
@@ -356,23 +356,38 @@ An edge `(u, s) → (v, t)` means: leave node `u` on side `s`, arrive at node `v
 - `NodeProperties`: `windowId`, `backboneReadId`.
 - `EdgeProperties`: `useForAssembly`, `offset` (base-pair distance between anchors).
 
+### Two-Pass Graph Construction with Detour Suppression
+
+The `Shasta2AnchorGraph` is built in two passes (`main.cpp`):
+
+**Pass 1**: Build the anchor graph normally. Then call `findDetourWindowPairs()` to detect (W, X) pairs where window X enters W at backbone position i and exits at j > i (X detours through W's backbone).
+
+**Pass 2**: Rebuild the anchor graph with per-read detour suppression. For each read's journey:
+1. Collect all claimed anchors into a `windowVisits` sequence
+2. Scan for W→X→W patterns matching known detour pairs
+3. Remove the X visit and merge the two W visits
+4. Emit transitions from the filtered sequence
+
+This prevents spurious W→X and X→W inter-window edges without affecting reads that legitimately traverse X.
+
+### Best-Neighbor Filter
+
+After inter-window transitions are collected and RC-mirror pairs merged, a best-neighbor filter runs. For each normalized window, it computes the total `supportingSpanProduct` (sum of `spanA * spanB` across all read transitions) for every neighbor. A window pair (A, B) is kept if it is the best outgoing for A OR the best incoming for B. All other window pair transitions are removed before edge creation.
+
 ### Conversion from Directed Graph
 
 `Shasta2AnchorGraph::toBidirected()` in `src/Shasta2AnchorGraphGfa.cpp`:
 1. Creates one bidirected node per anchor pair, transfers `windowId` and `backboneReadId`.
 2. Converts each directed edge `A → B` to bidirected edge with proper orientation, transfers `offset`.
 3. Only edges with `useForAssembly=true` are converted.
+4. Intra-window edges are filtered by `backbonePairs` — only consecutive backbone anchor pairs are converted.
 
 ### Bypass Detour Filter (Bidirected)
 
-`BidirectedAnchorGraph::bypassDetourFilter()` runs on the bidirected graph before unitigification. Same concept as the directed-graph `runBypassDetourFilter()` but operates on bidirected edges.
-
-For each window `w`, walks the backbone anchors and collects inter-window edges grouped by neighbor window. For each neighbor window X that enters `w` at backbone position `i` and exits at position `j > i`:
-1. Finds the closest exit after each entry (may be multiple exits at the same backbone index).
+`BidirectedAnchorGraph::bypassDetourFilter()` runs on the bidirected graph after conversion. For each window `w`, walks the backbone anchors and collects inter-window edges grouped by neighbor window. For each neighbor window X that enters `w` at backbone position `i` and exits at position `j > i`:
+1. Finds the closest exit after each entry.
 2. Creates a bypass edge `reverseAnchor(inE.xNeighbor) → outE.xNeighbor` in X.
 3. Removes the entry and exit inter-window edges.
-
-Output: `Shasta2AnchorGraph-bidirected-pre-bypass.gfa` (before) and `Shasta2AnchorGraph-bidirected.gfa` (after).
 
 ### Unitigification
 
@@ -412,16 +427,21 @@ Links are deduplicated: each link and its RC mirror are the same, so only the ca
 ### Pipeline Order (in `main.cpp`)
 
 ```cpp
-auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
+// Pass 1: build graph, detect detour window pairs.
+auto graph1 = Shasta2AnchorGraph(...);
+auto detourPairs = graph1.findDetourWindowPairs(anchorWindows, journeys);
+
+// Pass 2: rebuild with per-read detour suppression.
+auto graph2 = Shasta2AnchorGraph(..., &detourPairs);
+// Inside constructor: best-neighbor filter on windowPairTransitions.
+
+// Bidirected pipeline.
+auto bidirectedGraph = graph2.toBidirected(anchorWindows, journeys);
 bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-bypass.gfa");
-bidirectedGraph.bypassDetourFilter(anchorWindows, *shasta2Journeys);
+bidirectedGraph.bypassDetourFilter(anchorWindows, journeys);
+bidirectedGraph.trimBackbones(anchorWindows, journeys);
 bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
-bidirectedGraph.writeCsv(...);
-bidirectedGraph.writeCsvByRead(...);
-const auto unitigs = bidirectedGraph.unitigify();
-bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, ...);
-bidirectedGraph.writeUnitigCsv(...);
-bidirectedGraph.writeUnitigCsvByRead(...);
+// CSV outputs, unitigify, unitig GFA/CSV...
 ```
 
 ### Key Files
@@ -429,20 +449,21 @@ bidirectedGraph.writeUnitigCsvByRead(...);
 | File | Purpose |
 |---|---|
 | `src/BidirectedAnchorGraph.hpp` | Class declaration, `Unitig` struct, `OrientedAnchor`, `BidirectedAnchorId` |
-| `src/BidirectedAnchorGraph.cpp` | `unitigify()`, `writeUnitigGfa()`, `bypassDetourFilter()`, GFA/CSV writers |
+| `src/BidirectedAnchorGraph.cpp` | `unitigify()`, `writeUnitigGfa()`, `bypassDetourFilter()`, `trimBackbones()`, GFA/CSV writers |
+| `src/Shasta2AnchorGraph.hpp` | `findDetourWindowPairs()`, constructor with `detourWindowPairs` parameter |
+| `src/Shasta2AnchorGraph.cpp` | Detour detection, per-read detour suppression, best-neighbor filter, directed graph construction and filters |
 | `src/Shasta2AnchorGraphGfa.cpp` | `toBidirected()` conversion, directed-graph `writeGfa()`/`writeCsv()` |
 
 ## Current State (Anchor Windows)
 
-- Inter-window edge filter pipeline is active: shortcut, parallel, cross-window filters using backbone endpoints, with trimBackbones and recomputeBackboneEndpoints between each step
+- Two-pass graph construction: pass 1 detects detour window pairs, pass 2 rebuilds with per-read detour suppression in journey walks
+- Best-neighbor filter keeps only the best incoming/outgoing neighbor per window by total `spanA * spanB`
+- Directed-graph filter pipeline is disabled (`#if 0` in `main.cpp`)
+- Bidirected pipeline: toBidirected → bypassDetourFilter → trimBackbones → unitigify
 - All edge disabling uses `disableEdge()` member function for RC mirror symmetry
-- Bypass edges and Case 2 detangle are disabled (`#if 0`)
-- Detangling splits tangled windows by through-flow paths (through-flows only; start/end reads not yet assigned)
 - `removeNegativeOffsets` is called at all 3 edge construction sites
 - Edge verification runs after graph construction (0 backward edges expected)
 - Export to shasta2 format is working with round-trip verification
-- Shasta2 assembly completes successfully with dinara's exported anchors and graph
-- Bidirected graph conversion, bypass detour filter, unitigification, and RC-mirror deduplication are active
 - Post-graph steps (transitive reduction, assembly graph, etc.) are disabled via `return;` in main.cpp
 
 ---
