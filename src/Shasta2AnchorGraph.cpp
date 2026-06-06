@@ -2184,8 +2184,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     }
 
     // Trim backbone ends that extend beyond inter-window connection points.
-    // This prevents dangling stubs in the assembly graph.
-    trimBackbones(anchorWindows, journeys);
+    // Disabled: the bidirected pipeline handles this differently.
+    // trimBackbones(anchorWindows, journeys);
 }
 
 
