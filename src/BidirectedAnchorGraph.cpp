@@ -431,13 +431,28 @@ void BidirectedAnchorGraph::writeUnitigGfa(
     }
 
     // Map oriented anchors to unitig entry points.
-    // If neighbor == chain[0] of unitig j, we enter j from its front (j+).
-    // If neighbor == reverseAnchor(chain.back()) of unitig j, we enter j
-    // from its back in reverse (j-).
-    map<OrientedAnchor, uint64_t> frontEntry, backEntry;
+    // Since RC-mirror unitigs were deduplicated, we register four
+    // entry points per unitig (the unitig's own front/back plus
+    // the RC mirror's front/back):
+    //
+    //   front                → i+  (enter unitig forward from left)
+    //   reverseAnchor(back)  → i-  (enter unitig reversed from right)
+    //   reverseAnchor(front) → i-  (RC mirror's back entry)
+    //   back                 → i+  (RC mirror's front entry)
+    struct UnitigEntryPoint {
+        uint64_t unitigIndex;
+        bool orientation;  // true = +, false = -
+    };
+    map<OrientedAnchor, UnitigEntryPoint> entryMap;
+
     for(uint64_t i = 0; i < unitigs.size(); i++) {
-        frontEntry[unitigs[i].chain.front()] = i;
-        backEntry[reverseAnchor(unitigs[i].chain.back())] = i;
+        const auto& front = unitigs[i].chain.front();
+        const auto& back = unitigs[i].chain.back();
+
+        entryMap[front] = {i, true};
+        entryMap[reverseAnchor(back)] = {i, false};
+        entryMap[reverseAnchor(front)] = {i, false};
+        entryMap[back] = {i, true};
     }
 
     // Deduplicate links (each link and its RC mirror are the same).
@@ -469,14 +484,10 @@ void BidirectedAnchorGraph::writeUnitigGfa(
                 if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
                 if(!props.useForAssembly) continue;
 
-                auto itFront = frontEntry.find(neighbor);
-                if(itFront != frontEntry.end()) {
-                    emitLink(i, true, itFront->second, true, props);
-                    continue;
-                }
-                auto itBack = backEntry.find(neighbor);
-                if(itBack != backEntry.end()) {
-                    emitLink(i, true, itBack->second, false, props);
+                auto it = entryMap.find(neighbor);
+                if(it != entryMap.end()) {
+                    emitLink(i, true, it->second.unitigIndex,
+                             it->second.orientation, props);
                 }
             }
         }
@@ -490,14 +501,10 @@ void BidirectedAnchorGraph::writeUnitigGfa(
                 if(!getEdgeProperties(exitAnchor, neighbor, props)) continue;
                 if(!props.useForAssembly) continue;
 
-                auto itFront = frontEntry.find(neighbor);
-                if(itFront != frontEntry.end()) {
-                    emitLink(i, false, itFront->second, true, props);
-                    continue;
-                }
-                auto itBack = backEntry.find(neighbor);
-                if(itBack != backEntry.end()) {
-                    emitLink(i, false, itBack->second, false, props);
+                auto it = entryMap.find(neighbor);
+                if(it != entryMap.end()) {
+                    emitLink(i, false, it->second.unitigIndex,
+                             it->second.orientation, props);
                 }
             }
         }
