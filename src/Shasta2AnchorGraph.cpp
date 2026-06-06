@@ -622,9 +622,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
-    // Create inter-window edges: find the read that supports the A→B
-    // transition earliest in window A, then connect its firstAnchorInA
-    // to the immediate next anchor in that read's journey (which is in B).
+    // Create inter-window edges: for each A→B window pair, evaluate
+    // (firstAnchorInA, firstAnchorInB) for every supporting read and
+    // pick the pair with the highest anchor pair coverage.
     {
         uint64_t interWindowCreated = 0;
         uint64_t interWindowSkipped = 0;
@@ -635,37 +635,28 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 continue;
             }
 
-            // Find the transition with the earliest firstAnchorInA
-            // by backbone position in window A.
-            const ReadTransition* earliest = nullptr;
-            uint32_t earliestBbPos = UINT32_MAX;
+            Shasta2AnchorPair bestPair;
+            uint64_t bestCoverage = 0;
             for(const auto& t : transitions) {
-                const uint64_t aid = uint64_t(t.firstAnchorInA);
-                if(aid >= anchorCount) continue;
-                const uint32_t bbPos = anchorToBackbonePos[aid];
-                if(bbPos < earliestBbPos) {
-                    earliestBbPos = bbPos;
-                    earliest = &t;
+                Shasta2AnchorPair candidatePair(
+                    anchors, t.firstAnchorInA, t.firstAnchorInB, false);
+                candidatePair.assertNoNegativeOffsets(anchors);
+                if(candidatePair.size() > bestCoverage) {
+                    bestCoverage = candidatePair.size();
+                    bestPair = std::move(candidatePair);
                 }
             }
 
-            if(!earliest) continue;
+            if(bestCoverage == 0) continue;
+            if(bestCoverage < minInterWindowEdgeCoverage) continue;
 
-            // The edge: firstAnchorInA → next in that read's journey.
-            const OrientedReadId oid = OrientedReadId::fromValue(earliest->oidValue);
-            const auto readJourney = journeys[oid];
-            const uint32_t nextPos = earliest->firstJourneyPosInA + 1;
-            if(nextPos >= uint32_t(readJourney.size())) continue;
-            const Shasta2AnchorId edgeFrom = earliest->firstAnchorInA;
-            const Shasta2AnchorId edgeTo = readJourney[nextPos];
-
-            if(addEdgeIfValid(edgeFrom, edgeTo)) {
+            if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
                 ++interWindowCreated;
                 // RC mirror edge.
                 const Shasta2AnchorId rcA =
-                    Shasta2AnchorId(uint64_t(edgeFrom) ^ 1ULL);
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
                 const Shasta2AnchorId rcB =
-                    Shasta2AnchorId(uint64_t(edgeTo) ^ 1ULL);
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
                 if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
                     addEdgeIfValid(rcB, rcA);
                 }
