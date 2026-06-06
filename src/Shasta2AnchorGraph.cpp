@@ -279,49 +279,34 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     };
 
     // Intra-window edges: union of all reads' journey edges.
-    // For each window, walk every participating read's journey interval
-    // and create edges between consecutive anchors.
-    // Deduplicate by tracking which directed anchor pairs already have edges.
+    // Each window creates edges from all its reads' full journeys.
+    // No anchorToWindow filtering — edges belong to the window whose
+    // loop we're in. Reads' journeys stay intact within their window.
+    // Deduplication is global (same anchor pair won't get a second BGL edge).
     std::set<std::pair<uint64_t, uint64_t>> createdPairs;
 
-    auto normalizeW = [&](uint32_t w) -> uint32_t {
-        return (w >= windowCount) ? (w - windowCount) : w;
-    };
-
-    auto addEdgeOnce = [&](Shasta2AnchorId a, Shasta2AnchorId b) {
-        // Only create edges where both anchors belong to the same window.
-        const uint64_t aidA = uint64_t(a);
-        const uint64_t aidB = uint64_t(b);
-        if(aidA >= anchorCount || aidB >= anchorCount) return;
-        const uint32_t wA = anchorToWindow[aidA];
-        const uint32_t wB = anchorToWindow[aidB];
-        if(wA == noWindow || wB == noWindow) return;
-        if(normalizeW(wA) != normalizeW(wB)) return;
-
-        auto key = std::make_pair(aidA, aidB);
-        if(createdPairs.count(key)) return;
-        if(addEdgeIfValid(a, b)) {
-            createdPairs.insert(key);
-            // RC mirror edge.
-            const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
-            const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(b) ^ 1ULL);
-            auto rcKey = std::make_pair(uint64_t(rcB), uint64_t(rcA));
-            if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount &&
-               !createdPairs.count(rcKey)) {
-                if(addEdgeIfValid(rcB, rcA)) {
-                    createdPairs.insert(rcKey);
-                }
-            }
-        }
-    };
-
     for(const AnchorWindow& window : anchorWindows) {
-        // Walk every read's journey interval and create edges.
         for(const auto& ri : window.readIntervals) {
             const auto journey = journeys[ri.orientedReadId];
             if(ri.end <= ri.begin + 1) continue;
             for(uint32_t pos = ri.begin; pos + 1 < ri.end; pos++) {
-                addEdgeOnce(journey[pos], journey[pos + 1]);
+                const Shasta2AnchorId a = journey[pos];
+                const Shasta2AnchorId b = journey[pos + 1];
+                auto key = std::make_pair(uint64_t(a), uint64_t(b));
+                if(createdPairs.count(key)) continue;
+                if(addEdgeIfValid(a, b)) {
+                    createdPairs.insert(key);
+                    // RC mirror edge.
+                    const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
+                    const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(b) ^ 1ULL);
+                    auto rcKey = std::make_pair(uint64_t(rcB), uint64_t(rcA));
+                    if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount &&
+                       !createdPairs.count(rcKey)) {
+                        if(addEdgeIfValid(rcB, rcA)) {
+                            createdPairs.insert(rcKey);
+                        }
+                    }
+                }
             }
         }
     }
