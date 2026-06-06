@@ -100,6 +100,85 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
 
 
+// Find detour window pairs.
+// A detour occurs when window X has inter-window edges entering window W
+// at backbone position i and exiting at position j > i. Returns the set
+// of (W, X) pairs where this pattern exists. Used to suppress W→X→W
+// transitions per-read during journey walks.
+std::set<std::pair<uint32_t, uint32_t>> Shasta2AnchorGraph::findDetourWindowPairs(
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys) const
+{
+    const Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+    std::set<std::pair<uint32_t, uint32_t>> detourPairs;
+
+    auto normalize = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : w;
+    };
+
+    for(uint32_t w = 0; w < windowCount; w++) {
+        const auto& window = anchorWindows[w];
+        const auto& positions = window.filteredBackbonePositions;
+        if(positions.size() < 2) continue;
+        const auto journey = journeys[window.backboneOrientedReadId];
+
+        // Collect inter-window edges at each backbone position.
+        std::map<uint32_t, std::vector<uint32_t>> incomingBbIdx;  // xWindow → [bbIdx...]
+        std::map<uint32_t, std::vector<uint32_t>> outgoingBbIdx;  // xWindow → [bbIdx...]
+
+        for(uint32_t pi = 0; pi < positions.size(); pi++) {
+            const uint64_t aid = uint64_t(journey[positions[pi]]);
+            if(aid >= anchorCount) continue;
+
+            auto ie = boost::in_edges(aid, anchorGraph);
+            for(auto it = ie.first; it != ie.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t src = uint64_t(boost::source(*it, anchorGraph));
+                if(src >= anchorCount) continue;
+                const uint32_t srcRaw = anchorToWindow[src];
+                if(srcRaw == noWindow) continue;
+                const uint32_t srcW = normalize(srcRaw);
+                if(srcW == w) continue;
+                incomingBbIdx[srcW].push_back(pi);
+            }
+
+            auto oe = boost::out_edges(aid, anchorGraph);
+            for(auto it = oe.first; it != oe.second; ++it) {
+                if(!anchorGraph[*it].useForAssembly) continue;
+                const uint64_t tgt = uint64_t(boost::target(*it, anchorGraph));
+                if(tgt >= anchorCount) continue;
+                const uint32_t tgtRaw = anchorToWindow[tgt];
+                if(tgtRaw == noWindow) continue;
+                const uint32_t tgtW = normalize(tgtRaw);
+                if(tgtW == w) continue;
+                outgoingBbIdx[tgtW].push_back(pi);
+            }
+        }
+
+        // For each neighbor window X with both entry and exit,
+        // check if any entry is at an earlier position than any exit.
+        for(const auto& [xWindow, inIdxs] : incomingBbIdx) {
+            auto outIt = outgoingBbIdx.find(xWindow);
+            if(outIt == outgoingBbIdx.end()) continue;
+            const auto& outIdxs = outIt->second;
+
+            uint32_t minIn = *std::min_element(inIdxs.begin(), inIdxs.end());
+            uint32_t maxOut = *std::max_element(outIdxs.begin(), outIdxs.end());
+
+            if(maxOut > minIn) {
+                // X detours through W.
+                detourPairs.insert({w, xWindow});
+            }
+        }
+    }
+
+    cout << "findDetourWindowPairs: found " << detourPairs.size()
+         << " detour window pairs." << endl;
+    return detourPairs;
+}
+
+
 // Construct from anchor windows.
 // Each window becomes a chain of its backbone anchors.
 // Inter-window edges are discovered by walking read journeys.
@@ -111,7 +190,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     uint64_t minInterWindowEdgeCoverage,
     uint64_t threadCount,
     const Reads* reads,
-    const vector<DetangleBypassEdge>* bypassEdges) :
+    const vector<DetangleBypassEdge>* bypassEdges,
+    const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
@@ -338,41 +418,96 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        uint32_t currentWindow = noWindow;
-        Shasta2AnchorId lastAnchorInCurrentWindow = 0;
+        // Per-read journey walk with detour suppression.
+        // When detourWindowPairs is provided and a read transitions from
+        // window W to window X where (W, X) is a detour pair, we buffer
+        // the transition. If the read returns to W, we discard the buffer
+        // (the read was detouring through X). Otherwise we commit it.
 
+        // First pass: collect (windowId, anchorId) for claimed anchors.
+        struct WindowAnchor {
+            uint32_t windowId;
+            Shasta2AnchorId anchorId;
+        };
+        std::vector<WindowAnchor> claimedAnchors;
         for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
             const Shasta2AnchorId anchorId = journey[pos];
             if(uint64_t(anchorId) >= anchorCount) continue;
             const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
             if(windowId == noWindow) continue;
+            claimedAnchors.push_back({windowId, anchorId});
+        }
 
-            const uint32_t normalizedWin = (windowId >= windowCount) ? (windowId - windowCount) : windowId;
+        // Build the effective window sequence, suppressing detour visits.
+        // Each entry: (windowId, lastAnchorInWindow).
+        struct WindowVisit {
+            uint32_t windowId;
+            Shasta2AnchorId firstAnchor;
+            Shasta2AnchorId lastAnchor;
+        };
+        std::vector<WindowVisit> windowVisits;
+
+        auto normalizeW = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+
+        for(const auto& ca : claimedAnchors) {
+            const uint32_t normalizedWin = normalizeW(ca.windowId);
             windowReads[normalizedWin].insert(uint32_t(oidValue));
 
-            const uint32_t basePos = anchors.getPosition(anchorId, oid);
+            const uint32_t basePos = anchors.getPosition(ca.anchorId, oid);
             if(basePos != invalid<uint32_t>) {
                 auto& spanMap = readWindowSpans[oidValue];
-                auto spanIt = spanMap.find(windowId);
+                auto spanIt = spanMap.find(ca.windowId);
                 if(spanIt == spanMap.end()) {
-                    spanMap[windowId] = {basePos, basePos};
+                    spanMap[ca.windowId] = {basePos, basePos};
                 } else {
                     spanIt->second.firstBasePos = std::min(spanIt->second.firstBasePos, basePos);
                     spanIt->second.lastBasePos = std::max(spanIt->second.lastBasePos, basePos);
                 }
             }
 
-            if(windowId == currentWindow) {
-                lastAnchorInCurrentWindow = anchorId;
+            if(!windowVisits.empty() && windowVisits.back().windowId == ca.windowId) {
+                // Same window — extend.
+                windowVisits.back().lastAnchor = ca.anchorId;
             } else {
-                readWindows[uint32_t(oidValue)].push_back(windowId);
-                if(currentWindow != noWindow) {
-                    auto key = std::make_pair(currentWindow, windowId);
-                    windowPairTransitions[key].push_back(
-                        {uint32_t(oidValue), lastAnchorInCurrentWindow, anchorId, 0, 0, 0});
+                // New window.
+                windowVisits.push_back({ca.windowId, ca.anchorId, ca.anchorId});
+            }
+        }
+
+        // Suppress detour visits: scan for W→X→W patterns where (W, X)
+        // is a detour pair. Remove the X visit and merge the two W visits.
+        if(detourWindowPairs && !detourWindowPairs->empty()) {
+            bool changed = true;
+            while(changed) {
+                changed = false;
+                for(uint64_t i = 0; i + 2 < windowVisits.size(); i++) {
+                    const uint32_t wNorm = normalizeW(windowVisits[i].windowId);
+                    const uint32_t xNorm = normalizeW(windowVisits[i + 1].windowId);
+                    const uint32_t w2Norm = normalizeW(windowVisits[i + 2].windowId);
+                    if(wNorm != w2Norm) continue;
+                    if(!detourWindowPairs->count({wNorm, xNorm})) continue;
+
+                    // Suppress: merge W visits, remove X.
+                    windowVisits[i].lastAnchor = windowVisits[i + 2].lastAnchor;
+                    windowVisits.erase(windowVisits.begin() + int64_t(i + 1),
+                                       windowVisits.begin() + int64_t(i + 3));
+                    changed = true;
+                    break;  // restart scan
                 }
-                currentWindow = windowId;
-                lastAnchorInCurrentWindow = anchorId;
+            }
+        }
+
+        // Emit transitions from the (possibly filtered) window sequence.
+        for(uint64_t i = 0; i < windowVisits.size(); i++) {
+            const auto& visit = windowVisits[i];
+            readWindows[uint32_t(oidValue)].push_back(visit.windowId);
+            if(i > 0) {
+                const auto& prev = windowVisits[i - 1];
+                auto key = std::make_pair(prev.windowId, visit.windowId);
+                windowPairTransitions[key].push_back(
+                    {uint32_t(oidValue), prev.lastAnchor, visit.firstAnchor, 0, 0, 0});
             }
         }
     }

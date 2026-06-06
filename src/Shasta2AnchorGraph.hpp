@@ -18,6 +18,7 @@
 
 // Standard library.
 #include <map>
+#include <set>
 #include "utility.hpp"
 #include "vector.hpp"
 
@@ -105,7 +106,8 @@ public:
         uint64_t minInterWindowEdgeCoverage,
         uint64_t threadCount,
         const Reads* reads = nullptr,
-        const vector<DetangleBypassEdge>* bypassEdges = nullptr);
+        const vector<DetangleBypassEdge>* bypassEdges = nullptr,
+        const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs = nullptr);
 
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}
@@ -123,6 +125,13 @@ public:
         uint64_t maxTipReadCount);
     // Disable an edge and its RC mirror (dst^1 -> src^1).
     void disableEdge(edge_descriptor e);
+
+    // Find detour window pairs: (W, X) where window X enters W at
+    // backbone position i and exits at position j > i. These pairs
+    // are used during journey walks to suppress W→X→W transitions.
+    std::set<std::pair<uint32_t, uint32_t>> findDetourWindowPairs(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys) const;
 
     // Trim dangling backbone ends beyond outermost inter-window edges.
     // Returns the number of trimmed vertices.
