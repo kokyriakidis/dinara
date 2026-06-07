@@ -1571,6 +1571,7 @@ void dinara::main::assemble(
             if(changeCount == 0) break;
         }
     }
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
 
     // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
 #if 0
