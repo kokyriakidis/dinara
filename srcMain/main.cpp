@@ -1540,6 +1540,38 @@ void dinara::main::assemble(
         &assembler.getReads());
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
+    // Save the anchor graph.
+    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
+    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
+    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
+
+    // Export in shasta2-native format for --external-anchor-graph-name.
+    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
+
+    // Create the AssemblyGraph with window info.
+    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
+    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        *shasta2AnchorGraph,
+        anchorWindows,
+        shasta2AssemblyGraphOptions);
+    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
+
+    // Iterative tip removal + superbubble popping.
+    {
+        const uint32_t maxTipWindows = 3;
+        const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
+        for(uint64_t cleanRound = 0; ; cleanRound++) {
+            uint64_t changeCount = 0;
+            changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
+            shasta2AssemblyGraph->compress();
+            if(changeCount == 0) break;
+        }
+    }
+
     // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
 #if 0
     // Remove isolated windows (no inter-window edges).
@@ -1649,6 +1681,7 @@ void dinara::main::assemble(
 
         changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
         shasta2AssemblyGraph->compress();
+    }
 #endif
 
     // Convert to bidirected graph and write GFA/CSV.
