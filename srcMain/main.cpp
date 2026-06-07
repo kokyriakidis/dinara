@@ -1152,6 +1152,15 @@ void dinara::main::assemble(
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
 
+    // Write external anchors.
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
+
     // Compute journeys.
     cout << timestamp << "Creating Shasta2Journeys..." << endl;
     assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
