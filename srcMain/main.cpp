@@ -1692,8 +1692,6 @@ void dinara::main::assemble(
 
     // Convert to bidirected graph and write GFA/CSV.
     auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected-pre-tips.gfa");
-    bidirectedGraph.removeTips();
     bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
     bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
     bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
