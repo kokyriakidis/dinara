@@ -249,9 +249,15 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         props.isInterWindow = isInterWindow;
         props.useForAssembly = true;
 
-        if(isCanonicalAnchorDirection(from, to) ||
-           bg.getEdgePropertiesCanonical(from, to) == nullptr) {
-            bg.addEdge(from, to, props);
+        // Store properties under the canonical key. If this traversal
+        // is non-canonical, swap directional fields so they are relative
+        // to the canonical from/to.
+        if(bg.getEdgePropertiesCanonical(from, to) == nullptr) {
+            if(isCanonicalAnchorDirection(from, to)) {
+                bg.addEdge(from, to, props);
+            } else {
+                bg.addEdge(from, to, props.swapped());
+            }
         } else {
             bg.addTraversal(from, to);
         }
@@ -295,6 +301,9 @@ BidirectedAnchorGraph Shasta2AnchorGraph::toBidirected(
         }
     }
     bg.normalizeOrientations(swapOrientation);
+
+    // Build bidirected journeys from directed journeys.
+    bg.buildBidirectedJourneys(journeys);
 
     return bg;
 }

@@ -227,11 +227,12 @@ public:
                               uint32_t readCount) const;
 
     // Remove tip unitigs from the bidirected graph.
-    // A tip is a unitig with no links on one side and whose length
-    // (totalOffset) is below maxTipLength. Removes all edges of
-    // tip anchors from the bidirected graph. Returns the number of
-    // tips removed. Call unitigify() again after this.
-    uint64_t removeTips(uint64_t maxTipLength = 10000);
+    // Remove short tips from the unitig graph.
+    // A tip is a linear chain of unitigs dangling on one side.
+    // Removes tips with at most maxTipUnitigs unitigs and at most
+    // maxTipLength total base offset. Processes shortest first,
+    // re-unitigifies between batches. Returns number of tips removed.
+    uint64_t removeTips(uint64_t maxTipUnitigs = 3, uint64_t maxTipLength = 90000);
 
     // Pop superbubbles on the unitig graph.
     // Builds a doubled directed graph from unitigs (Verkko convention),
@@ -265,12 +266,31 @@ public:
         return {bid, orient};
     }
 
+    // Bidirected journeys: one per physical read, indexed by ReadId.
+    // Each journey is a sequence of OrientedAnchors derived from the
+    // strand-0 directed journey. The strand-1 journey is the RC mirror
+    // (reversed, orientations flipped) and is not stored.
+    using BidirectedJourney = std::vector<OrientedAnchor>;
+
+    // Build bidirected journeys from directed journeys.
+    void buildBidirectedJourneys(const Shasta2Journeys& journeys);
+
+    // Access a bidirected journey by physical read ID.
+    const BidirectedJourney& getBidirectedJourney(ReadId readId) const {
+        return bidirectedJourneys[readId];
+    }
+
+    uint64_t bidirectedJourneyCount() const {
+        return bidirectedJourneys.size();
+    }
+
 private:
     uint64_t nodeCount = 0;
     std::vector<std::map<bool, std::set<OrientedAnchor>>> adjacency;
     std::vector<NodeProperties> nodeProps;
     std::map<std::pair<OrientedAnchor, OrientedAnchor>, EdgeProperties> edgeProperties;
     std::vector<bool> wasSwapped;  // normalization flags per node
+    std::vector<BidirectedJourney> bidirectedJourneys;
 };
 
 } // namespace dinara
