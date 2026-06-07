@@ -978,62 +978,14 @@ void dinara::main::assemble(
     // Same-strand and opposite-strand overlaps are deduped independently,
     // matching hifiasm's separate paf/reverse_paf storage.
     // Runs after phasing so that only cis and unclassified overlaps compete.
-    // assembler.dedupChainsPrePhasing(threadCount);
+    assembler.dedupChainsPrePhasing(threadCount);
 
-    // For each read pair, if there are multiple chains on the same strand,
-    // delete all of them. A legitimate overlap produces one chain per strand.
-    // Multiple chains indicate the reads overlap in a repeat region where
-    // the chainer found multiple plausible paths. Keeping any of them risks
-    // merging distinct repeat copies during transitive collapse.
-    assembler.removeMultiChainAlignments(threadCount);
-
-    // Count read pairs that have alignments on both strands.
-    {
-        const auto& alignmentTable = assembler.getAlignmentTable();
-        const auto& alignmentData = assembler.alignmentData;
-        const uint64_t readCount = assembler.getReads().readCount();
-        uint64_t bothStrandsPairCount = 0;
-        uint64_t bothStrandsAlignmentCount = 0;
-
-        for (ReadId r0 = ReadId(0); r0 < ReadId(readCount); ++r0) {
-            const OrientedReadId orientedR0(r0, 0);
-            const auto table = alignmentTable[orientedR0.getValue()];
-
-            // Group by partner ReadId, track which strands are present.
-            std::map<ReadId, std::pair<bool, bool>> partnerStrands;  // {hasSame, hasOpposite}
-            for (uint64_t i = 0; i < table.size(); ++i) {
-                const uint32_t alignmentId = table[i];
-                const auto& ad = alignmentData[alignmentId];
-                if (ad.readIds[0] != r0) continue;
-                if (ad.deleteReasons0 || ad.deleteReasons1) continue;
-                const ReadId partner = ad.readIds[1];
-                auto& strands = partnerStrands[partner];
-                if (ad.isSameStrand)
-                    strands.first = true;
-                else
-                    strands.second = true;
-            }
-
-            for (const auto& [partner, strands] : partnerStrands) {
-                if (strands.first && strands.second) {
-                    bothStrandsPairCount++;
-                    // Count alignments for this pair.
-                    for (uint64_t i = 0; i < table.size(); ++i) {
-                        const uint32_t alignmentId = table[i];
-                        const auto& ad = alignmentData[alignmentId];
-                        if (ad.readIds[0] != r0) continue;
-                        if (ad.readIds[1] != partner) continue;
-                        if (ad.deleteReasons0 || ad.deleteReasons1) continue;
-                        bothStrandsAlignmentCount++;
-                    }
-                }
-            }
-        }
-
-        cout << timestamp << "Read pairs with alignments on both strands: "
-             << bothStrandsPairCount << " pairs, "
-             << bothStrandsAlignmentCount << " alignments." << endl;
-    }
+    // // For each read pair, if there are multiple chains on the same strand,
+    // // delete all of them. A legitimate overlap produces one chain per strand.
+    // // Multiple chains indicate the reads overlap in a repeat region where
+    // // the chainer found multiple plausible paths. Keeping any of them risks
+    // // merging distinct repeat copies during transitive collapse.
+    // assembler.removeMultiChainAlignments(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);
 
