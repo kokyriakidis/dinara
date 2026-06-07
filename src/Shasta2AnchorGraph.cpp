@@ -630,7 +630,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t interWindowSkipped = 0;
 
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            if(transitions.size() < minInterWindowCoverage) {
+            // Count distinct physical reads (deduplicate by read ID).
+            std::set<uint32_t> physicalReads;
+            for(const auto& t : transitions) {
+                physicalReads.insert(t.oidValue / 2);
+            }
+            if(physicalReads.size() < minInterWindowCoverage) {
                 ++interWindowSkipped;
                 continue;
             }
