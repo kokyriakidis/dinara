@@ -2608,6 +2608,57 @@ public:
         uint32_t markerCount;  // markers in this window
     };
 
+    // Per-chain entry grouping a chain with its reference and read IDs.
+    struct ChainEntry {
+        uint64_t chainIndex;
+        ReadId refId;
+        ReadId readId;
+        bool isSameStrand;
+    };
+
+    // DEL call record accumulated across pipeline steps.
+    struct DelCallRecord {
+        uint32_t breakpointPos;
+        int64_t size;
+        uint32_t readCount;
+        string source;
+    };
+
+    // INS call record accumulated across pipeline steps.
+    struct InsCallRecord {
+        uint32_t breakpointPos;
+        int64_t size;
+        uint32_t readCount;
+        string source;
+    };
+
+    // Coverage-drop region detected during per-segment processing.
+    struct CovDropRegion {
+        uint32_t startPos;
+        uint32_t endPos;
+        bool markerDepleted;
+    };
+
+    // SV type classification for reads.
+    enum class SvType { Deletion = 0, Inversion = 1, Insertion = 2, ReferenceLike = 3 };
+
+    // Per-read SV classification from MSA alignment.
+    struct ReadGroup {
+        ReadId readId;
+        SvType svType;
+        int64_t svSize;
+        uint32_t breakpointRefPos;
+        int32_t clusterId;
+        vector<size_t> chainIndicesInRef;
+    };
+
+    // Read graph edge for indirect alignment via BFS (local to SV pipeline).
+    struct SvReadGraphEdge {
+        uint32_t neighborReadId;
+        uint64_t chainIndex;
+        bool iAmReadA;
+    };
+
     void buildSvMSA(
         uint64_t referenceReadCount,
         const string& outputPrefix,
@@ -2698,6 +2749,50 @@ public:
         vector<SaTagSvCall>& saTagCalls,
         vector<SoftClipBreakpoint>& softClipBPs,
         vector<CigarIndelCall>& cigarIndels) const;
+
+    // P4: per-cluster breakpoint detection.
+    void buildSvMSA_detectBreakpoints(
+        ReadId refId,
+        const vector<ChainEntry>& chainsForRef,
+        span<const CompressedMarker> refMarkers,
+        uint32_t refLength,
+        uint32_t regionStart,
+        uint64_t k,
+        const vector<SoftClipBreakpoint>& softClipBPs,
+        const vector<CigarIndelCall>& cigarIndels,
+        const vector<SaTagSvCall>& saTagCalls,
+        const vector<RefHitDepthWindow>& refHitDepth,
+        bool suppressSaTagDel,
+        const vector<ReadGroup>& readGroups,
+        const std::unordered_set<uint32_t>& indirectAlignedReads,
+        const std::unordered_map<uint32_t, vector<SvReadGraphEdge>>& readGraph,
+        vector<DelCallRecord>& allDelCalls,
+        vector<InsCallRecord>& allInsCalls,
+        vector<DelCallRecord>& delCallRecords,
+        vector<CovDropRegion>& covDropRegions);
+
+    // Module 3 (S6): cluster summary, merge, CIGAR/covdrop corroboration.
+    void buildSvMSA_mergeClusters(
+        ReadId refId,
+        const string& outputPrefix,
+        const vector<ReadGroup>& readGroups,
+        int32_t totalClusters,
+        const vector<CigarIndelCall>& cigarIndels,
+        const vector<CovDropRegion>& covDropRegions,
+        vector<DelCallRecord>& allDelCalls);
+
+    // Module 4 (S7-9): SDUST, SA-tag, kmer-journey, depth-deficit DEL.
+    void buildSvMSA_postProcess(
+        ReadId refId,
+        const vector<ChainEntry>& chainsForRef,
+        span<const CompressedMarker> refMarkers,
+        uint32_t refLength,
+        const vector<uint32_t>& regionDepth,
+        const vector<SaTagSvCall>& saTagCalls,
+        bool suppressSaTagDel,
+        const std::unordered_set<uint32_t>& indirectAlignedReads,
+        vector<DelCallRecord>& allDelCalls,
+        vector<DelCallRecord>& delCallRecords);
 
     void classifySplitAlignments(
         uint64_t referenceReadCount,
