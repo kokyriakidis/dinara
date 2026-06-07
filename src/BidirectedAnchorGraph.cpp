@@ -650,51 +650,64 @@ uint64_t BidirectedAnchorGraph::popSuperbubbles(uint64_t maxBubbleSize)
 
     // Onodera et al. 2013 superbubble finder (inline, no BGL macros).
     // Uses remainingIncoming counting like findSuperbubbleOnoderaGfa.
+    // Onodera et al. 2013, matching Verkko's find_bubble exactly.
+    // Uses has_nonvisited_parent check instead of remainingIncoming counting.
     auto findBubble = [&](dvertex vStart) -> dvertex {
         if(out_degree(vStart, dg) < 2) return DGraph::null_vertex();
 
         std::unordered_set<dvertex> visited;
-        std::unordered_map<dvertex, uint64_t> remainingIncoming;
-        vector<dvertex> ready;
-        uint64_t notReadyCount = 0;
+        std::unordered_set<dvertex> seen;
+        vector<dvertex> S;
 
-        ready.push_back(vStart);
-        remainingIncoming[vStart] = 0;
+        S.push_back(vStart);
+        seen.insert(vStart);
 
-        while(!ready.empty()) {
-            if(maxBubbleSize > 0 && visited.size() + notReadyCount > maxBubbleSize) {
+        while(!S.empty()) {
+            if(maxBubbleSize > 0 && (visited.size() + seen.size()) > maxBubbleSize) {
                 return DGraph::null_vertex();
             }
 
-            dvertex v = ready.back();
-            ready.pop_back();
+            dvertex v = S.back();
+            S.pop_back();
+            seen.erase(v);
             visited.insert(v);
 
             if(out_degree(v, dg) == 0) return DGraph::null_vertex();
 
             auto [oeBegin, oeEnd] = out_edges(v, dg);
             for(auto oeIt = oeBegin; oeIt != oeEnd; ++oeIt) {
-                dvertex w = boost::target(*oeIt, dg);
+                dvertex u = boost::target(*oeIt, dg);
 
-                if(w == v) return DGraph::null_vertex();
-                if(w == vStart) return DGraph::null_vertex();
+                // Self-edge.
+                if(u == v) return DGraph::null_vertex();
+                // RC of u already visited (bidirected check).
+                // In the doubled directed graph, RC of vertex 2*i is 2*i+1 and vice versa.
+                dvertex rcU = (u ^ 1);
+                if(visited.count(rcU)) return DGraph::null_vertex();
+                // Back to start.
+                if(u == vStart) return DGraph::null_vertex();
+                // Already visited (back-edge).
+                if(visited.count(u)) return DGraph::null_vertex();
 
-                if(remainingIncoming.find(w) == remainingIncoming.end()) {
-                    notReadyCount++;
-                    remainingIncoming[w] = in_degree(w, dg);
+                seen.insert(u);
+
+                // Check if all parents of u have been visited.
+                bool hasNonvisitedParent = false;
+                auto [ieBegin, ieEnd] = in_edges(u, dg);
+                for(auto ieIt = ieBegin; ieIt != ieEnd; ++ieIt) {
+                    dvertex parent = boost::source(*ieIt, dg);
+                    if(!visited.count(parent)) {
+                        hasNonvisitedParent = true;
+                        break;
+                    }
                 }
-
-                auto& rem = remainingIncoming[w];
-                rem--;
-
-                if(rem == 0) {
-                    ready.push_back(w);
-                    notReadyCount--;
+                if(!hasNonvisitedParent) {
+                    S.push_back(u);
                 }
             }
 
-            if(ready.size() == 1 && notReadyCount == 0) {
-                dvertex t = ready.back();
+            if(S.size() == 1 && seen.size() == 1 && S[0] == *seen.begin()) {
+                dvertex t = S[0];
                 // Reject if exit has edge back to start.
                 auto [teBegin, teEnd] = out_edges(t, dg);
                 for(auto teIt = teBegin; teIt != teEnd; ++teIt) {
@@ -716,15 +729,18 @@ uint64_t BidirectedAnchorGraph::popSuperbubbles(uint64_t maxBubbleSize)
     };
     vector<Superbubble> superbubbles;
 
+    uint64_t branchCount = 0;
     for(dvertex v = 0; v < num_vertices(dg); v++) {
         if(out_degree(v, dg) < 2) continue;
+        ++branchCount;
         dvertex t = findBubble(v);
         if(t != DGraph::null_vertex()) {
             superbubbles.push_back({v, t});
         }
     }
 
-    cout << "popSuperbubbles: found " << superbubbles.size() << " superbubbles." << endl;
+    cout << "popSuperbubbles: " << branchCount << " branch vertices, found "
+         << superbubbles.size() << " superbubbles." << endl;
 
     if(superbubbles.empty()) return 0;
 
