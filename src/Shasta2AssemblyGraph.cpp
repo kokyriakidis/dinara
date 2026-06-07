@@ -2974,7 +2974,9 @@ BidirectedAnchorGraph Shasta2AssemblyGraph::toBidirected(
         }
     }
 
-    // Convert edges.
+    // Convert edges. For each directed edge, add both the forward
+    // traversal and the RC mirror traversal. Store properties once
+    // under the canonical key.
     BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
         const auto& edge = assemblyGraph[e];
         const auto srcId = assemblyGraph[source(e, assemblyGraph)].anchorId;
@@ -2994,8 +2996,8 @@ BidirectedAnchorGraph Shasta2AssemblyGraph::toBidirected(
             } else {
                 bg.addEdge(from, to, props.swapped());
             }
-        } else {
-            bg.addTraversal(from, to);
+            // Add RC mirror traversal.
+            bg.addTraversal(reverseAnchor(to), reverseAnchor(from));
         }
     }
 
