@@ -31,6 +31,9 @@ class Shasta2Journeys;
 
 class BidirectedAnchorGraph {
 public:
+    // Construct from a node-centric bidirected GFA file
+    // (the format produced by writeGfa).
+    static BidirectedAnchorGraph fromGfa(const std::string& fileName);
     // Edge properties stored once per canonical link.
     // Directional fields are relative to the canonical direction.
     struct EdgeProperties {

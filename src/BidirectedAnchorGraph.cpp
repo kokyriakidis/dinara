@@ -16,6 +16,137 @@ using namespace dinara;
 using namespace std;
 
 
+BidirectedAnchorGraph BidirectedAnchorGraph::fromGfa(const string& fileName)
+{
+    ifstream gfa(fileName);
+    if(!gfa) {
+        throw runtime_error("Cannot open " + fileName + " for reading.");
+    }
+
+    // First pass: parse S lines to find max node ID and collect node properties.
+    struct NodeInfo {
+        uint64_t nodeIdx;
+        uint32_t windowId = UINT32_MAX;
+    };
+    vector<NodeInfo> nodes;
+    uint64_t maxNodeIdx = 0;
+
+    struct LinkInfo {
+        uint64_t fromNode;
+        bool fromOrient;
+        uint64_t toNode;
+        bool toOrient;
+        uint64_t coverage = 0;
+        uint64_t offset = 0;
+        uint32_t supportingSpanPrev = 0;
+        uint32_t supportingSpanNext = 0;
+        uint32_t sharedReadCount = 0;
+    };
+    vector<LinkInfo> links;
+
+    string line;
+    while(getline(gfa, line)) {
+        if(line.empty()) continue;
+
+        if(line[0] == 'S') {
+            istringstream iss(line);
+            string recordType, segName, sequence;
+            iss >> recordType >> segName >> sequence;
+
+            NodeInfo node;
+            node.nodeIdx = stoull(segName);
+            maxNodeIdx = max(maxNodeIdx, node.nodeIdx);
+
+            string tag;
+            while(iss >> tag) {
+                if(tag.substr(0, 5) == "wn:i:") {
+                    node.windowId = uint32_t(stoull(tag.substr(5)));
+                }
+            }
+            nodes.push_back(node);
+
+        } else if(line[0] == 'L') {
+            istringstream iss(line);
+            string recordType, fromName, fromOrientStr, toName, toOrientStr, overlap;
+            iss >> recordType >> fromName >> fromOrientStr >> toName >> toOrientStr >> overlap;
+
+            LinkInfo link;
+            link.fromNode = stoull(fromName);
+            link.fromOrient = (fromOrientStr == "+");
+            link.toNode = stoull(toName);
+            link.toOrient = (toOrientStr == "+");
+
+            string tag;
+            while(iss >> tag) {
+                if(tag.substr(0, 5) == "RC:i:") {
+                    link.coverage = stoull(tag.substr(5));
+                } else if(tag.substr(0, 5) == "of:i:") {
+                    link.offset = stoull(tag.substr(5));
+                } else if(tag.substr(0, 5) == "sp:i:") {
+                    link.supportingSpanPrev = uint32_t(stoull(tag.substr(5)));
+                } else if(tag.substr(0, 5) == "sn:i:") {
+                    link.supportingSpanNext = uint32_t(stoull(tag.substr(5)));
+                } else if(tag.substr(0, 5) == "sr:i:") {
+                    link.sharedReadCount = uint32_t(stoull(tag.substr(5)));
+                }
+            }
+            links.push_back(link);
+        }
+    }
+
+    const uint64_t bidirNodeCount = maxNodeIdx + 1;
+
+    BidirectedAnchorGraph bg;
+    bg.resize(bidirNodeCount);
+
+    // Set node properties.
+    for(const auto& node : nodes) {
+        if(node.windowId != UINT32_MAX) {
+            bg.setNodeWindow(BidirectedAnchorId(node.nodeIdx), node.windowId);
+        }
+    }
+
+    // Add edges from links. Each L line is one traversal direction;
+    // we add both the forward and RC mirror traversal, storing
+    // properties under the canonical key.
+    for(const auto& link : links) {
+        OrientedAnchor from = {BidirectedAnchorId(link.fromNode), link.fromOrient};
+        OrientedAnchor to = {BidirectedAnchorId(link.toNode), link.toOrient};
+
+        EdgeProperties props;
+        props.coverage = link.coverage;
+        props.offset = link.offset;
+        props.sharedReadCount = link.sharedReadCount;
+        props.useForAssembly = true;
+
+        // The GFA L line stores direction-adjusted properties
+        // (from writeGfa's getEdgeProperties call). Convert back
+        // to canonical storage.
+        props.supportingSpanPrev = link.supportingSpanPrev;
+        props.supportingSpanNext = link.supportingSpanNext;
+        if(!isCanonicalAnchorDirection(from, to)) {
+            swap(props.supportingSpanPrev, props.supportingSpanNext);
+        }
+
+        // Add forward traversal + properties (if not already added by RC mirror).
+        if(bg.getEdgePropertiesCanonical(from, to) == nullptr) {
+            bg.addEdge(from, to, props);
+        } else {
+            bg.addTraversal(from, to);
+        }
+        // Add RC mirror traversal.
+        bg.addTraversal(reverseAnchor(to), reverseAnchor(from));
+    }
+
+    cout << "BidirectedAnchorGraph::fromGfa: read " << nodes.size()
+         << " nodes, " << links.size() << " links from " << fileName
+         << " -> " << bidirNodeCount << " bidirected nodes, "
+         << bg.numEdges() << " canonical edges." << endl;
+
+    return bg;
+}
+
+
 void BidirectedAnchorGraph::buildBidirectedJourneys(const Shasta2Journeys& journeys)
 {
     const uint64_t orientedReadCount = journeys.size();
@@ -147,7 +278,8 @@ void BidirectedAnchorGraph::writeGfa(const string& fileName) const
             << "\t" << link.to.first.value()
             << "\t" << (link.to.second ? "+" : "-")
             << "\t0M"
-            << "\tRC:i:" << link.props.coverage;
+            << "\tRC:i:" << link.props.coverage
+            << "\tof:i:" << link.props.offset;
 
         if(link.props.supportingSpanPrev > 0 || link.props.supportingSpanNext > 0) {
             gfa << "\tsp:i:" << link.props.supportingSpanPrev

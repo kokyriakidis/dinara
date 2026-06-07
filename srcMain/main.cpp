@@ -25,6 +25,7 @@
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AssemblyGraph.hpp"
+#include "BidirectedAnchorGraph.hpp"
 #include "DinaraDetangle.hpp"
 #include "WindowTransitions.hpp"
 #include "performanceLog.hpp"
@@ -1685,7 +1686,7 @@ void dinara::main::assemble(
     }
 #endif
 
-    // Convert the cleaned assembly graph to bidirected and write GFA/CSV.
+    // Convert the cleaned assembly graph to bidirected.
     auto bidirectedGraph = shasta2AssemblyGraph->toBidirected(anchorWindows, *shasta2Journeys);
     bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
     bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
