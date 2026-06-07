@@ -1684,25 +1684,25 @@ void dinara::main::assemble(
     }
 #endif
 
-    // Convert to bidirected graph and write GFA/CSV.
-    auto bidirectedGraph = shasta2AnchorGraph->toBidirected(anchorWindows, *shasta2Journeys);
+    // Convert the cleaned assembly graph to bidirected and write GFA/CSV.
+    auto bidirectedGraph = shasta2AssemblyGraph->toBidirected(anchorWindows, *shasta2Journeys);
     bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
     bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
     bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
         uint32_t(assembler.getReads().readCount()));
 
-    // Unitigify the bidirected graph and write unitig GFA/CSV.
-    const auto unitigs = bidirectedGraph.unitigify();
-    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
-        unitigs, uint32_t(assembler.getReads().readCount()));
+    // // Unitigify the bidirected graph and write unitig GFA/CSV.
+    // const auto unitigs = bidirectedGraph.unitigify();
+    // bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
+    // bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
+    // bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
+    //     unitigs, uint32_t(assembler.getReads().readCount()));
 
-    // Remove short dangling unitigs and write cleaned unitig GFA.
-    bidirectedGraph.removeTips(unitigs);
-    const auto cleanedUnitigs = bidirectedGraph.unitigify();
-    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs-cleaned.gfa",
-        cleanedUnitigs, shasta2AnchorGraph->windowCount);
+    // // Remove short dangling unitigs and write cleaned unitig GFA.
+    // bidirectedGraph.removeTips(unitigs);
+    // const auto cleanedUnitigs = bidirectedGraph.unitigify();
+    // bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs-cleaned.gfa",
+    //     cleanedUnitigs, shasta2AnchorGraph->windowCount);
 
     //     changeCount += shasta2AssemblyGraph->removeParallelEdges();
     //     shasta2AssemblyGraph->compress();
