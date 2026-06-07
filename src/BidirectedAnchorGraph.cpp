@@ -410,29 +410,25 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify(bool quie
 // re-walk after each removal.
 uint64_t BidirectedAnchorGraph::removeTips(const vector<Unitig>& unitigs, uint64_t maxTipLength)
 {
-    struct UnitigEntry {
-        uint64_t unitigIndex;
-        bool orientation;
-    };
-    std::map<OrientedAnchor, UnitigEntry> entryMap;
+    // Build set of all oriented anchors that belong to each unitig,
+    // so we can distinguish intra-unitig edges from inter-unitig edges.
+    std::map<OrientedAnchor, uint64_t> anchorToUnitig;
     for(uint64_t i = 0; i < unitigs.size(); i++) {
-        const auto& front = unitigs[i].chain.front();
-        const auto& back = unitigs[i].chain.back();
-        entryMap[front]               = {i, true};
-        entryMap[reverseAnchor(back)]  = {i, false};
-        entryMap[reverseAnchor(front)] = {i, false};
-        entryMap[back]                 = {i, true};
+        for(const auto& oa : unitigs[i].chain) {
+            anchorToUnitig[oa] = i;
+            anchorToUnitig[reverseAnchor(oa)] = i;
+        }
     }
 
-    auto sideHasLinks = [&](uint64_t i, bool backSide) -> bool {
+    auto sideHasExternalLinks = [&](uint64_t i, bool backSide) -> bool {
         const auto& u = unitigs[i];
         OrientedAnchor exitAnchor = backSide
             ? u.chain.back()
             : reverseAnchor(u.chain.front());
         auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
         for(const auto& nbr : neighbors) {
-            auto it = entryMap.find(nbr);
-            if(it != entryMap.end() && it->second.unitigIndex != i) {
+            auto it = anchorToUnitig.find(nbr);
+            if(it != anchorToUnitig.end() && it->second != i) {
                 return true;
             }
         }
@@ -440,28 +436,39 @@ uint64_t BidirectedAnchorGraph::removeTips(const vector<Unitig>& unitigs, uint64
     };
 
     // Remove dangling unitigs shorter than maxTipLength.
+    // Only remove intra-unitig edges (between consecutive anchors in
+    // the chain) and the inter-unitig edges at the connected side.
+    // Do NOT remove edges at the junction that connect to other unitigs.
     uint64_t removedCount = 0;
     for(uint64_t i = 0; i < unitigs.size(); i++) {
         if(unitigs[i].totalOffset > maxTipLength) continue;
 
-        bool hasFront = sideHasLinks(i, false);
-        bool hasBack = sideHasLinks(i, true);
+        bool hasFront = sideHasExternalLinks(i, false);
+        bool hasBack = sideHasExternalLinks(i, true);
 
         // Must be dangling on exactly one side.
         if(hasFront == hasBack) continue;
 
-        // Remove all edges of this unitig.
         const auto& u = unitigs[i];
-        for(const auto& oa : u.chain) {
-            auto fwdNeighbors = getNeighbors(oa);
-            for(const auto& nbr : fwdNeighbors) {
-                removeEdgeBothDirections(oa, nbr);
-            }
-            auto revNeighbors = getNeighbors(reverseAnchor(oa));
-            for(const auto& nbr : revNeighbors) {
-                removeEdgeBothDirections(reverseAnchor(oa), nbr);
+
+        // Remove intra-unitig edges (between consecutive anchors in chain).
+        for(uint64_t j = 0; j + 1 < u.chain.size(); j++) {
+            removeEdgeBothDirections(u.chain[j], u.chain[j + 1]);
+        }
+
+        // Remove inter-unitig edges at the connected side only.
+        // Connected side: back if hasBack, front if hasFront.
+        OrientedAnchor exitAnchor = hasBack
+            ? u.chain.back()
+            : reverseAnchor(u.chain.front());
+        auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
+        for(const auto& nbr : neighbors) {
+            auto it = anchorToUnitig.find(nbr);
+            if(it != anchorToUnitig.end() && it->second != i) {
+                removeEdgeBothDirections(exitAnchor, nbr);
             }
         }
+
         ++removedCount;
     }
 
