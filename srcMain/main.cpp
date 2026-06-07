@@ -1665,16 +1665,11 @@ void dinara::main::assemble(
     bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
         unitigs, uint32_t(assembler.getReads().readCount()));
 
-    // Iterative tip removal + superbubble popping on the unitig graph.
-    for(uint64_t cleanRound = 0; ; cleanRound++) {
-        auto cleanUnitigs = bidirectedGraph.unitigify(/*quiet=*/true);
-        uint64_t changeCount = 0;
-        changeCount += bidirectedGraph.removeTips(cleanUnitigs);
-        changeCount += bidirectedGraph.popSuperbubbles();
-        cout << timestamp << "Bidirected graph cleaning round " << cleanRound
-             << ": " << changeCount << " changes." << endl;
-        if(changeCount == 0) break;
-    }
+    // Remove short dangling unitigs and write cleaned unitig GFA.
+    bidirectedGraph.removeTips(unitigs);
+    const auto cleanedUnitigs = bidirectedGraph.unitigify();
+    bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs-cleaned.gfa",
+        cleanedUnitigs, shasta2AnchorGraph->windowCount);
 
     //     changeCount += shasta2AssemblyGraph->removeParallelEdges();
     //     shasta2AssemblyGraph->compress();
