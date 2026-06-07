@@ -233,6 +233,13 @@ public:
     // tips removed. Call unitigify() again after this.
     uint64_t removeTips(uint64_t maxTipLength = 10000);
 
+    // Pop superbubbles on the unitig graph.
+    // Builds a doubled directed graph from unitigs (Verkko convention),
+    // finds superbubbles using Onodera, keeps the widest path (highest
+    // min coverage), removes edges on non-kept paths.
+    // Returns the number of edges removed from the bidirected graph.
+    uint64_t popSuperbubbles(uint64_t maxBubbleSize = 10);
+
     // Bypass detour filter: when a neighbor window X enters window W at
     // backbone position i and exits at position j > i, create a bypass
     // edge connecting X's anchors on either side and remove the

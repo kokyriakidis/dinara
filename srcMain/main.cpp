@@ -1697,6 +1697,9 @@ void dinara::main::assemble(
     bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
         uint32_t(assembler.getReads().readCount()));
 
+    // Pop superbubbles on the unitig graph.
+    bidirectedGraph.popSuperbubbles();
+
     // Unitigify the bidirected graph and write unitig GFA/CSV.
     const auto unitigs = bidirectedGraph.unitigify();
     bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);

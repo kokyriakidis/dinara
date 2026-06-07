@@ -4,9 +4,13 @@
 #include "AnchorWindows.hpp"
 #include "Shasta2Journeys.hpp"
 
+#include <boost/graph/adjacency_list.hpp>
+
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace dinara;
 using namespace std;
@@ -520,6 +524,321 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
          << totalUnitigsRemoved << " unitigs, maxTipLength="
          << maxTipLength << ")." << endl;
     return totalChainsRemoved;
+}
+
+
+uint64_t BidirectedAnchorGraph::popSuperbubbles(uint64_t maxBubbleSize)
+{
+    // Doubled directed graph: each unitig i becomes two vertices
+    // 2*i (i+) and 2*i+1 (i-). Edges follow Verkko's convention.
+
+    using DGraph = boost::adjacency_list<
+        boost::vecS, boost::vecS, boost::bidirectionalS>;
+    using dvertex = DGraph::vertex_descriptor;
+    using dedge = pair<uint64_t, uint64_t>;
+
+    auto unitigs = unitigify(/*quiet=*/true);
+    const uint64_t n = unitigs.size();
+
+    if(n == 0) {
+        cout << "popSuperbubbles: no unitigs." << endl;
+        return 0;
+    }
+
+    // Build entry map (same as writeUnitigGfa).
+    struct UnitigEntryPoint {
+        uint64_t unitigIndex;
+        bool orientation;  // true = +, false = -
+    };
+    map<OrientedAnchor, UnitigEntryPoint> entryMap;
+    for(uint64_t i = 0; i < n; i++) {
+        const auto& front = unitigs[i].chain.front();
+        const auto& back = unitigs[i].chain.back();
+        entryMap[front]               = {i, true};
+        entryMap[reverseAnchor(back)]  = {i, false};
+        entryMap[reverseAnchor(front)] = {i, false};
+        entryMap[back]                 = {i, true};
+    }
+
+    // Directed vertex index: unitig i, orientation + -> 2*i, orientation - -> 2*i+1.
+    auto dv = [](uint64_t unitigIdx, bool orient) -> uint64_t {
+        return 2 * unitigIdx + (orient ? 0 : 1);
+    };
+
+    // Build directed graph.
+    DGraph dg(2 * n);
+
+    // Map directed edges back to bidirected anchor-level edges.
+    struct AnchorEdge {
+        OrientedAnchor exitAnchor;
+        OrientedAnchor neighborAnchor;
+    };
+    map<dedge, AnchorEdge> directedToAnchor;
+    map<dedge, double> directedEdgeCoverage;
+    set<dedge> addedEdges;
+
+    for(uint64_t i = 0; i < n; i++) {
+        const auto& u = unitigs[i];
+
+        // Links from back of unitig i (i+).
+        {
+            const OrientedAnchor exitAnchor = u.chain.back();
+            auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
+            for(const auto& nbr : neighbors) {
+                EdgeProperties props;
+                if(!getEdgeProperties(exitAnchor, nbr, props)) continue;
+                if(!props.useForAssembly) continue;
+
+                auto it = entryMap.find(nbr);
+                if(it == entryMap.end()) continue;
+
+                uint64_t from = dv(i, true);
+                uint64_t to = dv(it->second.unitigIndex, it->second.orientation);
+                if(addedEdges.insert({from, to}).second) {
+                    boost::add_edge(from, to, dg);
+                    directedToAnchor[{from, to}] = {exitAnchor, nbr};
+                    directedEdgeCoverage[{from, to}] = double(props.coverage);
+                }
+
+                // RC mirror.
+                uint64_t rcFrom = dv(it->second.unitigIndex, !it->second.orientation);
+                uint64_t rcTo = dv(i, false);
+                if(addedEdges.insert({rcFrom, rcTo}).second) {
+                    boost::add_edge(rcFrom, rcTo, dg);
+                    directedToAnchor[{rcFrom, rcTo}] = {
+                        reverseAnchor(nbr), reverseAnchor(exitAnchor)};
+                    directedEdgeCoverage[{rcFrom, rcTo}] = double(props.coverage);
+                }
+            }
+        }
+
+        // Links from front of unitig i (i-).
+        {
+            const OrientedAnchor exitAnchor = reverseAnchor(u.chain.front());
+            auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
+            for(const auto& nbr : neighbors) {
+                EdgeProperties props;
+                if(!getEdgeProperties(exitAnchor, nbr, props)) continue;
+                if(!props.useForAssembly) continue;
+
+                auto it = entryMap.find(nbr);
+                if(it == entryMap.end()) continue;
+
+                uint64_t from = dv(i, false);
+                uint64_t to = dv(it->second.unitigIndex, it->second.orientation);
+                if(addedEdges.insert({from, to}).second) {
+                    boost::add_edge(from, to, dg);
+                    directedToAnchor[{from, to}] = {exitAnchor, nbr};
+                    directedEdgeCoverage[{from, to}] = double(props.coverage);
+                }
+
+                uint64_t rcFrom = dv(it->second.unitigIndex, !it->second.orientation);
+                uint64_t rcTo = dv(i, true);
+                if(addedEdges.insert({rcFrom, rcTo}).second) {
+                    boost::add_edge(rcFrom, rcTo, dg);
+                    directedToAnchor[{rcFrom, rcTo}] = {
+                        reverseAnchor(nbr), reverseAnchor(exitAnchor)};
+                    directedEdgeCoverage[{rcFrom, rcTo}] = double(props.coverage);
+                }
+            }
+        }
+    }
+
+    cout << "popSuperbubbles: directed graph: " << num_vertices(dg)
+         << " vertices, " << num_edges(dg) << " edges from "
+         << n << " unitigs." << endl;
+
+    // Onodera et al. 2013 superbubble finder (inline, no BGL macros).
+    // Uses remainingIncoming counting like findSuperbubbleOnoderaGfa.
+    auto findBubble = [&](dvertex vStart) -> dvertex {
+        if(out_degree(vStart, dg) < 2) return DGraph::null_vertex();
+
+        std::unordered_set<dvertex> visited;
+        std::unordered_map<dvertex, uint64_t> remainingIncoming;
+        vector<dvertex> ready;
+        uint64_t notReadyCount = 0;
+
+        ready.push_back(vStart);
+        remainingIncoming[vStart] = 0;
+
+        while(!ready.empty()) {
+            if(maxBubbleSize > 0 && visited.size() + notReadyCount > maxBubbleSize) {
+                return DGraph::null_vertex();
+            }
+
+            dvertex v = ready.back();
+            ready.pop_back();
+            visited.insert(v);
+
+            if(out_degree(v, dg) == 0) return DGraph::null_vertex();
+
+            auto [oeBegin, oeEnd] = out_edges(v, dg);
+            for(auto oeIt = oeBegin; oeIt != oeEnd; ++oeIt) {
+                dvertex w = boost::target(*oeIt, dg);
+
+                if(w == v) return DGraph::null_vertex();
+                if(w == vStart) return DGraph::null_vertex();
+
+                if(remainingIncoming.find(w) == remainingIncoming.end()) {
+                    notReadyCount++;
+                    remainingIncoming[w] = in_degree(w, dg);
+                }
+
+                auto& rem = remainingIncoming[w];
+                rem--;
+
+                if(rem == 0) {
+                    ready.push_back(w);
+                    notReadyCount--;
+                }
+            }
+
+            if(ready.size() == 1 && notReadyCount == 0) {
+                dvertex t = ready.back();
+                // Reject if exit has edge back to start.
+                auto [teBegin, teEnd] = out_edges(t, dg);
+                for(auto teIt = teBegin; teIt != teEnd; ++teIt) {
+                    if(boost::target(*teIt, dg) == vStart) {
+                        return DGraph::null_vertex();
+                    }
+                }
+                return t;
+            }
+        }
+
+        return DGraph::null_vertex();
+    };
+
+    // Find all superbubbles.
+    struct Superbubble {
+        dvertex source;
+        dvertex target;
+    };
+    vector<Superbubble> superbubbles;
+
+    for(dvertex v = 0; v < num_vertices(dg); v++) {
+        if(out_degree(v, dg) < 2) continue;
+        dvertex t = findBubble(v);
+        if(t != DGraph::null_vertex()) {
+            superbubbles.push_back({v, t});
+        }
+    }
+
+    cout << "popSuperbubbles: found " << superbubbles.size() << " superbubbles." << endl;
+
+    if(superbubbles.empty()) return 0;
+
+    // For each superbubble, enumerate paths, keep widest, mark non-kept edges.
+    set<dedge> globalKeptEdges;
+    set<dedge> candidatesForRemoval;
+
+    for(const auto& bubble : superbubbles) {
+        // Collect bubble vertices via BFS from source.
+        set<dvertex> bubbleVertices;
+        {
+            vector<dvertex> stack = {bubble.source};
+            while(!stack.empty()) {
+                dvertex v = stack.back();
+                stack.pop_back();
+                if(!bubbleVertices.insert(v).second) continue;
+                if(v == bubble.target) continue;
+                auto [oeBegin, oeEnd] = out_edges(v, dg);
+                for(auto oeIt = oeBegin; oeIt != oeEnd; ++oeIt) {
+                    dvertex w = boost::target(*oeIt, dg);
+                    if(!bubbleVertices.count(w)) {
+                        stack.push_back(w);
+                    }
+                }
+            }
+        }
+
+        // Enumerate all paths from source to target via DFS.
+        vector<vector<dedge>> allPaths;
+        {
+            struct Frame {
+                dvertex vertex;
+                vector<dedge> path;
+            };
+            vector<Frame> stack;
+            stack.push_back({bubble.source, {}});
+
+            while(!stack.empty()) {
+                auto [v, path] = std::move(stack.back());
+                stack.pop_back();
+
+                if(v == bubble.target) {
+                    allPaths.push_back(std::move(path));
+                    continue;
+                }
+
+                auto [oeBegin, oeEnd] = out_edges(v, dg);
+                for(auto oeIt = oeBegin; oeIt != oeEnd; ++oeIt) {
+                    dvertex w = boost::target(*oeIt, dg);
+                    if(w == bubble.target || bubbleVertices.count(w)) {
+                        vector<dedge> newPath = path;
+                        newPath.push_back({uint64_t(v), uint64_t(w)});
+                        stack.push_back({w, std::move(newPath)});
+                    }
+                }
+            }
+        }
+
+        if(allPaths.empty()) continue;
+
+        // Find widest path (highest minimum edge coverage).
+        uint64_t bestIdx = 0;
+        double bestMinCov = 0.;
+        for(uint64_t i = 0; i < allPaths.size(); i++) {
+            double minCov = std::numeric_limits<double>::max();
+            for(const auto& de : allPaths[i]) {
+                auto it = directedEdgeCoverage.find(de);
+                if(it != directedEdgeCoverage.end()) {
+                    minCov = std::min(minCov, it->second);
+                } else {
+                    minCov = 0.;
+                }
+            }
+            if(minCov > bestMinCov) {
+                bestMinCov = minCov;
+                bestIdx = i;
+            }
+        }
+
+        for(const auto& de : allPaths[bestIdx]) {
+            globalKeptEdges.insert(de);
+        }
+        for(uint64_t i = 0; i < allPaths.size(); i++) {
+            if(i == bestIdx) continue;
+            for(const auto& de : allPaths[i]) {
+                candidatesForRemoval.insert(de);
+            }
+        }
+    }
+
+    // Remove edges not on any best path.
+    set<dedge> edgesToRemove;
+    for(const auto& de : candidatesForRemoval) {
+        if(!globalKeptEdges.count(de)) {
+            edgesToRemove.insert(de);
+        }
+    }
+
+    // Map back to bidirected graph and remove.
+    uint64_t removedCount = 0;
+    for(const auto& de : edgesToRemove) {
+        auto it = directedToAnchor.find(de);
+        if(it == directedToAnchor.end()) continue;
+        const auto& ae = it->second;
+        if(hasEdge(ae.exitAnchor, ae.neighborAnchor)) {
+            removeEdgeBothDirections(ae.exitAnchor, ae.neighborAnchor);
+            ++removedCount;
+        }
+    }
+
+    cout << "popSuperbubbles: popped " << superbubbles.size()
+         << " superbubbles, removed " << removedCount
+         << " edges." << endl;
+    return removedCount;
 }
 
 
