@@ -451,13 +451,9 @@ uint64_t BidirectedAnchorGraph::removeTips(const vector<Unitig>& unitigs, uint64
 
         const auto& u = unitigs[i];
 
-        // Remove intra-unitig edges (between consecutive anchors in chain).
-        for(uint64_t j = 0; j + 1 < u.chain.size(); j++) {
-            removeEdgeBothDirections(u.chain[j], u.chain[j + 1]);
-        }
-
-        // Remove inter-unitig edges at the connected side only.
-        // Connected side: back if hasBack, front if hasFront.
+        // Only sever the inter-unitig edge at the connected side.
+        // The tip becomes isolated but internal edges are untouched
+        // (their RC mirrors may belong to other unitigs).
         OrientedAnchor exitAnchor = hasBack
             ? u.chain.back()
             : reverseAnchor(u.chain.front());
