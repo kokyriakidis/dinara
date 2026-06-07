@@ -1658,22 +1658,23 @@ void dinara::main::assemble(
     bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
         uint32_t(assembler.getReads().readCount()));
 
-    // Iterative tip removal + superbubble popping on the unitig graph.
-    for(uint64_t cleanRound = 0; ; cleanRound++) {
-        uint64_t changeCount = 0;
-        changeCount += bidirectedGraph.removeTips();
-        changeCount += bidirectedGraph.popSuperbubbles();
-        cout << timestamp << "Bidirected graph cleaning round " << cleanRound
-             << ": " << changeCount << " changes." << endl;
-        if(changeCount == 0) break;
-    }
-
     // Unitigify the bidirected graph and write unitig GFA/CSV.
     const auto unitigs = bidirectedGraph.unitigify();
     bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
     bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
     bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
         unitigs, uint32_t(assembler.getReads().readCount()));
+
+    // Iterative tip removal + superbubble popping on the unitig graph.
+    for(uint64_t cleanRound = 0; ; cleanRound++) {
+        auto cleanUnitigs = bidirectedGraph.unitigify(/*quiet=*/true);
+        uint64_t changeCount = 0;
+        changeCount += bidirectedGraph.removeTips(cleanUnitigs);
+        changeCount += bidirectedGraph.popSuperbubbles();
+        cout << timestamp << "Bidirected graph cleaning round " << cleanRound
+             << ": " << changeCount << " changes." << endl;
+        if(changeCount == 0) break;
+    }
 
     //     changeCount += shasta2AssemblyGraph->removeParallelEdges();
     //     shasta2AssemblyGraph->compress();

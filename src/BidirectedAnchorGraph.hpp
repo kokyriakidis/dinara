@@ -227,12 +227,10 @@ public:
                               uint32_t readCount) const;
 
     // Remove tip unitigs from the bidirected graph.
-    // Remove short tips from the unitig graph.
-    // A tip is a linear chain of unitigs dangling on one side.
-    // Removes tips with at most maxTipUnitigs unitigs and at most
-    // maxTipLength total base offset. Processes shortest first,
-    // re-unitigifies between batches. Returns number of tips removed.
-    uint64_t removeTips(uint64_t maxTipUnitigs = 3, uint64_t maxTipLength = 90000);
+    // Remove short dangling unitigs (dead-end on one side, totalOffset
+    // below maxTipLength). Operates on pre-computed unitigs.
+    // Returns number of unitigs removed.
+    uint64_t removeTips(const std::vector<Unitig>& unitigs, uint64_t maxTipLength = 100000);
 
     // Pop superbubbles on the unitig graph.
     // Builds a doubled directed graph from unitigs (Verkko convention),
