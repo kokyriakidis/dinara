@@ -226,6 +226,13 @@ public:
                               const std::vector<Unitig>& unitigs,
                               uint32_t readCount) const;
 
+    // Remove tip unitigs from the bidirected graph.
+    // A tip is a unitig with no links on one side and whose length
+    // (totalOffset) is below maxTipLength. Removes all edges of
+    // tip anchors from the bidirected graph. Returns the number of
+    // tips removed. Call unitigify() again after this.
+    uint64_t removeTips(uint64_t maxTipLength = 10000);
+
     // Bypass detour filter: when a neighbor window X enters window W at
     // backbone position i and exits at position j > i, create a bypass
     // edge connecting X's anchors on either side and remove the
