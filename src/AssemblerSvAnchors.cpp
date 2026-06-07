@@ -3129,6 +3129,30 @@ void Assembler::buildSvMSA_mergeClusters(
     // -----------------------------------------------------------------
     // Step 6a: Output per-cluster SV summary.
     // -----------------------------------------------------------------
+
+    // Build per-cluster aggregates in a single pass over readGroups,
+    // replacing the previous O(totalClusters * readGroups.size()) loops.
+    struct ClusterAgg {
+        uint32_t count = 0;
+        int64_t sumSize = 0;
+        int64_t minSize = INT64_MAX;
+        int64_t maxSize = INT64_MIN;
+        uint64_t sumPos = 0;
+        SvType type = SvType::ReferenceLike;
+    };
+    vector<ClusterAgg> clusterAggs(totalClusters);
+
+    for(const auto& rg : readGroups) {
+        if(rg.clusterId < 0 || rg.clusterId >= totalClusters) continue;
+        auto& a = clusterAggs[rg.clusterId];
+        ++a.count;
+        a.sumSize += rg.svSize;
+        a.sumPos += rg.breakpointRefPos;
+        a.minSize = std::min(a.minSize, rg.svSize);
+        a.maxSize = std::max(a.maxSize, rg.svSize);
+        a.type = rg.svType;
+    }
+
     if(totalClusters > 0) {
         const string clusterFileName = outputPrefix + "_ref"
             + to_string(uint32_t(refId)) + ".sv_clusters.tsv";
@@ -3138,27 +3162,11 @@ void Assembler::buildSvMSA_mergeClusters(
                        << "mean_sv_size\tmin_sv_size\tmax_sv_size\n";
 
             for(int32_t cid = 0; cid < totalClusters; ++cid) {
-                uint32_t count = 0;
-                int64_t sumSize = 0;
-                int64_t minSize = INT64_MAX;
-                int64_t maxSize = INT64_MIN;
-                uint64_t sumPos = 0;
-                SvType cType = SvType::ReferenceLike;
-
-                for(const auto& rg : readGroups) {
-                    if(rg.clusterId != cid) continue;
-                    ++count;
-                    sumSize += rg.svSize;
-                    sumPos += rg.breakpointRefPos;
-                    minSize = std::min(minSize, rg.svSize);
-                    maxSize = std::max(maxSize, rg.svSize);
-                    cType = rg.svType;
-                }
-
-                if(count == 0) continue;
+                const auto& a = clusterAggs[cid];
+                if(a.count == 0) continue;
 
                 const char* typeStr = "UNKNOWN";
-                switch(cType) {
+                switch(a.type) {
                     case SvType::Deletion:  typeStr = "DEL"; break;
                     case SvType::Inversion: typeStr = "INV"; break;
                     case SvType::Insertion: typeStr = "INS"; break;
@@ -3167,27 +3175,19 @@ void Assembler::buildSvMSA_mergeClusters(
 
                 clusterOut << cid << "\t"
                            << typeStr << "\t"
-                           << count << "\t"
-                           << (sumPos / count) << "\t"
-                           << (sumSize / int64_t(count)) << "\t"
-                           << minSize << "\t"
-                           << maxSize << "\n";
+                           << a.count << "\t"
+                           << (a.sumPos / a.count) << "\t"
+                           << (a.sumSize / int64_t(a.count)) << "\t"
+                           << a.minSize << "\t"
+                           << a.maxSize << "\n";
 
-                // cout << "    >>> " << typeStr << " CLUSTER: "
-                     // << "id=" << cid << ", "
-                     // << "size=" << (sumSize / int64_t(count)) << "bp, "
-                     // << "breakpoint=" << (sumPos / count) << ", "
-                     // << "reads=" << count
-                     // << endl;
-                if(typeStr == "DEL"
-                   && (sumSize / int64_t(count)) >= 20) {
+                if(a.type == SvType::Deletion
+                   && (a.sumSize / int64_t(a.count)) >= 20) {
                     allDelCalls.push_back({
-                        uint32_t(sumPos / count),
-                        sumSize / int64_t(count),
-                        count, "cluster"});
+                        uint32_t(a.sumPos / a.count),
+                        a.sumSize / int64_t(a.count),
+                        a.count, "cluster"});
                 }
-
-
             }
         }
     }
@@ -3212,24 +3212,13 @@ void Assembler::buildSvMSA_mergeClusters(
         vector<ClusterInfo> allClusters;
 
         for(int32_t cid = 0; cid < totalClusters; ++cid) {
-            uint32_t count = 0;
-            int64_t sumSize = 0;
-            uint64_t sumPos = 0;
-            SvType cType = SvType::ReferenceLike;
-
-            for(const auto& rg : readGroups) {
-                if(rg.clusterId != cid) continue;
-                ++count;
-                sumSize += rg.svSize;
-                sumPos += rg.breakpointRefPos;
-                cType = rg.svType;
-            }
-            if(count == 0) continue;
+            const auto& a = clusterAggs[cid];
+            if(a.count == 0) continue;
             allClusters.push_back({
-                sumSize / int64_t(count),
-                sumPos / count,
-                count,
-                cType
+                a.sumSize / int64_t(a.count),
+                a.sumPos / a.count,
+                a.count,
+                a.type
             });
         }
 
@@ -3277,19 +3266,8 @@ void Assembler::buildSvMSA_mergeClusters(
                     weightedSize / int64_t(totalReads);
                 const uint64_t mergedPos =
                     weightedPos / uint64_t(totalReads);
-                const char* typeStr =
-                    (base.type == SvType::Insertion) ? "INS" : "DEL";
 
                 if(mergedSize >= 50) {
-                    // cout << "    >>> "
-                         // << (base.type == SvType::Insertion
-                             // ? "INSERTION" : "DELETION")
-                         // << " CALL (merged-clusters): "
-                         // << "size=" << mergedSize << "bp, "
-                         // << "breakpoint=" << mergedPos << ", "
-                         // << "clusters=" << (j - i) << ", "
-                         // << "reads=" << totalReads
-                         // << endl;
                     if(base.type != SvType::Insertion) {
                         allDelCalls.push_back({
                             uint32_t(mergedPos), mergedSize,
