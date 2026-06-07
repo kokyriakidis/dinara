@@ -207,7 +207,7 @@ public:
     // A node is internal to a chain when both sides have exactly one
     // neighbor and those neighbors reciprocally have degree 1 on the
     // entry side.
-    std::vector<Unitig> unitigify() const;
+    std::vector<Unitig> unitigify(bool quiet = false) const;
 
     // Write unitig GFA where each segment is a unitig.
     void writeUnitigGfa(const std::string& fileName,

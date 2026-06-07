@@ -197,7 +197,7 @@ void BidirectedAnchorGraph::writeCsv(const string& fileName, uint32_t windowCoun
 //
 // The algorithm walks from non-internal nodes along chains of internal
 // nodes, collecting oriented anchors.
-vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
+vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify(bool quiet) const
 {
     auto isInternal = [&](BidirectedAnchorId id) -> bool {
         if(sideDegree({id, true}) != 1) return false;
@@ -351,20 +351,22 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
         unitigs = std::move(deduped);
     }
 
-    cout << "Unitigified: " << unitigs.size() << " unitigs from "
-         << nodeCount << " nodes." << endl;
+    if(!quiet) {
+        cout << "Unitigified: " << unitigs.size() << " unitigs from "
+             << nodeCount << " nodes." << endl;
 
-    uint64_t totalAnchors = 0;
-    uint64_t maxAnchors = 0;
-    for(const auto& u : unitigs) {
-        totalAnchors += u.anchorCount();
-        maxAnchors = max(maxAnchors, u.anchorCount());
-    }
-    cout << "  Total anchors in unitigs: " << totalAnchors << endl;
-    cout << "  Max anchors in a unitig: " << maxAnchors << endl;
-    if(!unitigs.empty()) {
-        cout << "  Average anchors per unitig: "
-             << double(totalAnchors) / double(unitigs.size()) << endl;
+        uint64_t totalAnchors = 0;
+        uint64_t maxAnchors = 0;
+        for(const auto& u : unitigs) {
+            totalAnchors += u.anchorCount();
+            maxAnchors = max(maxAnchors, u.anchorCount());
+        }
+        cout << "  Total anchors in unitigs: " << totalAnchors << endl;
+        cout << "  Max anchors in a unitig: " << maxAnchors << endl;
+        if(!unitigs.empty()) {
+            cout << "  Average anchors per unitig: "
+                 << double(totalAnchors) / double(unitigs.size()) << endl;
+        }
     }
 
     return unitigs;
@@ -377,23 +379,21 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
 // re-walk after each removal.
 uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
 {
-    // Iterate: unitigify, find and remove the shortest tip, repeat.
-    // Each removal changes the underlying edge set, which can merge
-    // unitigs or expose new dead-ends, so we must re-unitigify.
+    // Iterate: unitigify, collect all tip chains sorted shortest-first,
+    // remove non-overlapping tips in batch, repeat until none remain.
 
     struct UnitigEntry {
         uint64_t unitigIndex;
         bool orientation;  // true = +, false = -
     };
 
-    uint64_t totalRemoved = 0;
+    uint64_t totalChainsRemoved = 0;
     uint64_t totalUnitigsRemoved = 0;
-    uint64_t iteration = 0;
 
     while(true) {
-        auto unitigs = unitigify();
+        auto unitigs = unitigify(/*quiet=*/true);
 
-        // Build entry map: oriented anchor → (unitig index, orientation).
+        // Build entry map.
         std::map<OrientedAnchor, UnitigEntry> entryMap;
         for(uint64_t i = 0; i < unitigs.size(); i++) {
             const auto& front = unitigs[i].chain.front();
@@ -404,7 +404,6 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
             entryMap[back]                 = {i, true};
         }
 
-        // Find unitig-level neighbors on a given side.
         auto getUnitigLinks = [&](uint64_t i, bool backSide) -> std::vector<UnitigEntry>
         {
             const auto& u = unitigs[i];
@@ -429,19 +428,16 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
             return distinct.size();
         };
 
-        // Find the shortest tip chain across all unitigs.
-        // A tip starts at a unitig dangling on exactly one side.
-        uint64_t bestLen = UINT64_MAX;
-        std::vector<uint64_t> bestChain;
+        // Collect all tip chains, sorted shortest-first.
+        // Each entry: (totalLen, chain of unitig indices).
+        std::vector<std::pair<uint64_t, std::vector<uint64_t>>> candidates;
 
         for(uint64_t i = 0; i < unitigs.size(); i++) {
             uint64_t frontCount = sideNeighborCount(i, false);
             uint64_t backCount = sideNeighborCount(i, true);
-
             if((frontCount == 0) == (backCount == 0)) continue;
 
             bool exitBack = (backCount > 0);
-
             std::vector<uint64_t> chain;
             chain.push_back(i);
             uint64_t current = i;
@@ -460,18 +456,14 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
                 if(distinctNeighbors.size() != 1) break;
 
                 uint64_t next = nextEntry.unitigIndex;
-
-                // Cycle check.
                 bool cycle = false;
                 for(uint64_t c : chain) {
                     if(c == next) { cycle = true; break; }
                 }
                 if(cycle) break;
 
-                // Entry + → exit back. Entry - → exit front.
                 bool nextExitBack = nextEntry.orientation;
-                bool nextEntrySide = !nextExitBack;
-                if(sideNeighborCount(next, nextEntrySide) != 1) break;
+                if(sideNeighborCount(next, !nextExitBack) != 1) break;
 
                 chain.push_back(next);
                 totalLen += unitigs[next].totalOffset;
@@ -479,38 +471,55 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
                 currentExitBack = nextExitBack;
             }
 
-            if(totalLen > maxTipLength) continue;
-            if(totalLen < bestLen) {
-                bestLen = totalLen;
-                bestChain = std::move(chain);
+            if(totalLen <= maxTipLength) {
+                candidates.push_back({totalLen, std::move(chain)});
             }
         }
 
-        if(bestChain.empty()) break;
+        if(candidates.empty()) break;
 
-        // Remove all edges of all anchors in the tip chain.
-        for(uint64_t idx : bestChain) {
-            const auto& u = unitigs[idx];
-            for(const auto& oa : u.chain) {
-                auto fwdNeighbors = getNeighbors(oa);
-                for(const auto& nbr : fwdNeighbors) {
-                    removeEdgeBothDirections(oa, nbr);
-                }
-                auto revNeighbors = getNeighbors(reverseAnchor(oa));
-                for(const auto& nbr : revNeighbors) {
-                    removeEdgeBothDirections(reverseAnchor(oa), nbr);
+        // Sort shortest-first.
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        // Remove non-overlapping tips in batch.
+        std::set<uint64_t> removedThisRound;
+        uint64_t chainsThisRound = 0;
+
+        for(const auto& [len, chain] : candidates) {
+            // Skip if any unitig in this chain was already removed.
+            bool overlap = false;
+            for(uint64_t idx : chain) {
+                if(removedThisRound.count(idx)) { overlap = true; break; }
+            }
+            if(overlap) continue;
+
+            // Remove all edges of all anchors in the chain.
+            for(uint64_t idx : chain) {
+                removedThisRound.insert(idx);
+                const auto& u = unitigs[idx];
+                for(const auto& oa : u.chain) {
+                    auto fwdNeighbors = getNeighbors(oa);
+                    for(const auto& nbr : fwdNeighbors) {
+                        removeEdgeBothDirections(oa, nbr);
+                    }
+                    auto revNeighbors = getNeighbors(reverseAnchor(oa));
+                    for(const auto& nbr : revNeighbors) {
+                        removeEdgeBothDirections(reverseAnchor(oa), nbr);
+                    }
                 }
             }
-            ++totalUnitigsRemoved;
+            ++chainsThisRound;
         }
-        ++totalRemoved;
-        ++iteration;
+
+        totalChainsRemoved += chainsThisRound;
+        totalUnitigsRemoved += removedThisRound.size();
     }
 
-    cout << "removeTips: removed " << totalRemoved << " tip chains ("
-         << totalUnitigsRemoved << " unitigs) in " << iteration
-         << " iterations (maxTipLength=" << maxTipLength << ")." << endl;
-    return totalRemoved;
+    cout << "removeTips: removed " << totalChainsRemoved << " tip chains ("
+         << totalUnitigsRemoved << " unitigs, maxTipLength="
+         << maxTipLength << ")." << endl;
+    return totalChainsRemoved;
 }
 
 
