@@ -377,19 +377,23 @@ vector<BidirectedAnchorGraph::Unitig> BidirectedAnchorGraph::unitigify() const
 // re-walk after each removal.
 uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
 {
-    // Entry point: an oriented anchor that enters a unitig, tagged with
-    // the unitig index and the orientation (+ or -) of that entry.
-    // Matches the writeUnitigGfa convention:
-    //   front              → (i, +)   enter unitig i forward from the left
-    //   reverseAnchor(back)→ (i, -)   enter unitig i reversed from the right
-    //   back               → (i, +)   RC mirror front entry
-    //   reverseAnchor(front)→(i, -)   RC mirror back entry
+    // Iterate: unitigify, find and remove the shortest tip, repeat.
+    // Each removal changes the underlying edge set, which can merge
+    // unitigs or expose new dead-ends, so we must re-unitigify.
+
     struct UnitigEntry {
         uint64_t unitigIndex;
         bool orientation;  // true = +, false = -
     };
 
-    auto buildEntryMap = [&](const vector<Unitig>& unitigs) {
+    uint64_t totalRemoved = 0;
+    uint64_t totalUnitigsRemoved = 0;
+    uint64_t iteration = 0;
+
+    while(true) {
+        auto unitigs = unitigify();
+
+        // Build entry map: oriented anchor → (unitig index, orientation).
         std::map<OrientedAnchor, UnitigEntry> entryMap;
         for(uint64_t i = 0; i < unitigs.size(); i++) {
             const auto& front = unitigs[i].chain.front();
@@ -399,136 +403,93 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
             entryMap[reverseAnchor(front)] = {i, false};
             entryMap[back]                 = {i, true};
         }
-        return entryMap;
-    };
 
-    // Find unitig-level neighbors on a given side of unitig i.
-    // backSide=true: exit from back (i+), query neighbors of back().
-    // backSide=false: exit from front (i-), query neighbors of reverseAnchor(front()).
-    // Returns set of (unitigIndex, entryOrientation) pairs.
-    auto getUnitigLinks = [&](
-        const vector<Unitig>& unitigs,
-        const std::map<OrientedAnchor, UnitigEntry>& entryMap,
-        uint64_t i, bool backSide) -> std::vector<UnitigEntry>
-    {
-        const auto& u = unitigs[i];
-        OrientedAnchor exitAnchor = backSide
-            ? u.chain.back()
-            : reverseAnchor(u.chain.front());
-        auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
-        std::vector<UnitigEntry> result;
-        for(const auto& nbr : neighbors) {
-            auto it = entryMap.find(nbr);
-            if(it != entryMap.end() && it->second.unitigIndex != i) {
-                result.push_back(it->second);
-            }
-        }
-        return result;
-    };
-
-    // Count distinct neighbor unitigs on a given side.
-    auto sideNeighborCount = [&](
-        const vector<Unitig>& unitigs,
-        const std::map<OrientedAnchor, UnitigEntry>& entryMap,
-        uint64_t i, bool backSide) -> uint64_t
-    {
-        auto links = getUnitigLinks(unitigs, entryMap, i, backSide);
-        std::set<uint64_t> distinct;
-        for(const auto& e : links) distinct.insert(e.unitigIndex);
-        return distinct.size();
-    };
-
-    // Phase 1: unitigify and build entry map.
-    auto unitigs = unitigify();
-    auto entryMap = buildEntryMap(unitigs);
-
-    // Walk a tip chain from a dead-end unitig.
-    // A tip starts at a unitig that is dangling on exactly one side.
-    // We walk the connected side, following linear chains (each next
-    // unitig has degree 1 on the entry side).
-    auto walkTipChain = [&](uint64_t startIdx) -> std::vector<uint64_t> {
-        uint64_t frontCount = sideNeighborCount(unitigs, entryMap, startIdx, false);
-        uint64_t backCount = sideNeighborCount(unitigs, entryMap, startIdx, true);
-
-        // Must be dangling on exactly one side.
-        if((frontCount == 0) == (backCount == 0)) return {};
-
-        // Walk from the connected side.
-        bool exitBack = (backCount > 0);
-
-        std::vector<uint64_t> chain;
-        chain.push_back(startIdx);
-        uint64_t current = startIdx;
-        bool currentExitBack = exitBack;
-        uint64_t totalLen = unitigs[startIdx].totalOffset;
-
-        while(totalLen <= maxTipLength) {
-            auto links = getUnitigLinks(unitigs, entryMap, current, currentExitBack);
-            // Deduplicate by unitig index.
-            std::set<uint64_t> distinctNeighbors;
-            UnitigEntry nextEntry = {0, false};
-            for(const auto& e : links) {
-                if(distinctNeighbors.insert(e.unitigIndex).second) {
-                    nextEntry = e;
+        // Find unitig-level neighbors on a given side.
+        auto getUnitigLinks = [&](uint64_t i, bool backSide) -> std::vector<UnitigEntry>
+        {
+            const auto& u = unitigs[i];
+            OrientedAnchor exitAnchor = backSide
+                ? u.chain.back()
+                : reverseAnchor(u.chain.front());
+            auto neighbors = getNeighbors({exitAnchor.first, exitAnchor.second});
+            std::vector<UnitigEntry> result;
+            for(const auto& nbr : neighbors) {
+                auto it = entryMap.find(nbr);
+                if(it != entryMap.end() && it->second.unitigIndex != i) {
+                    result.push_back(it->second);
                 }
             }
-            if(distinctNeighbors.size() != 1) break;
+            return result;
+        };
 
-            uint64_t next = nextEntry.unitigIndex;
+        auto sideNeighborCount = [&](uint64_t i, bool backSide) -> uint64_t {
+            auto links = getUnitigLinks(i, backSide);
+            std::set<uint64_t> distinct;
+            for(const auto& e : links) distinct.insert(e.unitigIndex);
+            return distinct.size();
+        };
 
-            // Cycle check.
-            for(uint64_t c : chain) {
-                if(c == next) return chain;
+        // Find the shortest tip chain across all unitigs.
+        // A tip starts at a unitig dangling on exactly one side.
+        uint64_t bestLen = UINT64_MAX;
+        std::vector<uint64_t> bestChain;
+
+        for(uint64_t i = 0; i < unitigs.size(); i++) {
+            uint64_t frontCount = sideNeighborCount(i, false);
+            uint64_t backCount = sideNeighborCount(i, true);
+
+            if((frontCount == 0) == (backCount == 0)) continue;
+
+            bool exitBack = (backCount > 0);
+
+            std::vector<uint64_t> chain;
+            chain.push_back(i);
+            uint64_t current = i;
+            bool currentExitBack = exitBack;
+            uint64_t totalLen = unitigs[i].totalOffset;
+
+            while(totalLen <= maxTipLength) {
+                auto links = getUnitigLinks(current, currentExitBack);
+                std::set<uint64_t> distinctNeighbors;
+                UnitigEntry nextEntry = {0, false};
+                for(const auto& e : links) {
+                    if(distinctNeighbors.insert(e.unitigIndex).second) {
+                        nextEntry = e;
+                    }
+                }
+                if(distinctNeighbors.size() != 1) break;
+
+                uint64_t next = nextEntry.unitigIndex;
+
+                // Cycle check.
+                bool cycle = false;
+                for(uint64_t c : chain) {
+                    if(c == next) { cycle = true; break; }
+                }
+                if(cycle) break;
+
+                // Entry + → exit back. Entry - → exit front.
+                bool nextExitBack = nextEntry.orientation;
+                bool nextEntrySide = !nextExitBack;
+                if(sideNeighborCount(next, nextEntrySide) != 1) break;
+
+                chain.push_back(next);
+                totalLen += unitigs[next].totalOffset;
+                current = next;
+                currentExitBack = nextExitBack;
             }
 
-            // Determine which side of 'next' we entered.
-            // Entry orientation + means we entered from the front (left).
-            // To continue the chain, we exit from the opposite side.
-            // Entry + → entered front → exit back (true).
-            // Entry - → entered back  → exit front (false).
-            bool nextExitBack = nextEntry.orientation;
-
-            // Linearity: the entry side of 'next' must have degree 1.
-            // Entry side is the opposite of exit side.
-            bool nextEntrySide = !nextExitBack;
-            if(sideNeighborCount(unitigs, entryMap, next, nextEntrySide) != 1) break;
-
-            chain.push_back(next);
-            totalLen += unitigs[next].totalOffset;
-            current = next;
-            currentExitBack = nextExitBack;
+            if(totalLen > maxTipLength) continue;
+            if(totalLen < bestLen) {
+                bestLen = totalLen;
+                bestChain = std::move(chain);
+            }
         }
 
-        if(totalLen <= maxTipLength) return chain;
-        return {};
-    };
+        if(bestChain.empty()) break;
 
-    // Collect candidates sorted by total length (shortest first).
-    std::vector<std::pair<uint64_t, uint64_t>> candidates;  // (totalLen, startIdx)
-    for(uint64_t i = 0; i < unitigs.size(); i++) {
-        auto chain = walkTipChain(i);
-        if(!chain.empty()) {
-            uint64_t totalLen = 0;
-            for(uint64_t idx : chain) totalLen += unitigs[idx].totalOffset;
-            candidates.push_back({totalLen, i});
-        }
-    }
-    std::sort(candidates.begin(), candidates.end());
-
-    // Phase 2: process shortest-first, re-walk after each removal.
-    std::set<uint64_t> removedUnitigs;
-    uint64_t removedCount = 0;
-
-    for(const auto& [totalLen, startIdx] : candidates) {
-        if(removedUnitigs.count(startIdx)) continue;
-
-        // Re-walk to account for topology changes.
-        auto chain = walkTipChain(startIdx);
-        if(chain.empty()) continue;
-
-        // Remove all edges of all anchors in the chain.
-        for(uint64_t idx : chain) {
-            if(!removedUnitigs.insert(idx).second) continue;
+        // Remove all edges of all anchors in the tip chain.
+        for(uint64_t idx : bestChain) {
             const auto& u = unitigs[idx];
             for(const auto& oa : u.chain) {
                 auto fwdNeighbors = getNeighbors(oa);
@@ -540,14 +501,16 @@ uint64_t BidirectedAnchorGraph::removeTips(uint64_t maxTipLength)
                     removeEdgeBothDirections(reverseAnchor(oa), nbr);
                 }
             }
+            ++totalUnitigsRemoved;
         }
-        ++removedCount;
+        ++totalRemoved;
+        ++iteration;
     }
 
-    cout << "removeTips: removed " << removedCount << " tip chains ("
-         << removedUnitigs.size() << " unitigs, maxTipLength="
-         << maxTipLength << ") from " << unitigs.size() << " total unitigs." << endl;
-    return removedCount;
+    cout << "removeTips: removed " << totalRemoved << " tip chains ("
+         << totalUnitigsRemoved << " unitigs) in " << iteration
+         << " iterations (maxTipLength=" << maxTipLength << ")." << endl;
+    return totalRemoved;
 }
 
 
