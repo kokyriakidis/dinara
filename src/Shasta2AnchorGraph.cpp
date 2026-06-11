@@ -3394,39 +3394,25 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
         if(positions.size() <= 1) continue;
         const auto journey = journeys[window.backboneOrientedReadId];
 
-        // The backbone is oriented (position 0 -> N-1). To preserve a
-        // consistent strand, the head must only connect to tails of other
-        // windows (incoming edges) and the tail must only connect to heads
-        // of other windows (outgoing edges). An outgoing edge at the head
-        // (or an incoming edge at the tail) is a strand-mixed connection;
-        // such anchors are trimmed away.
-
-        // Head trim: remove anchors before the first one with an INCOMING
-        // inter-window edge. If there is no incoming edge, this is a
-        // start-of-contig window — keep the head (headTrim = 0).
+        // Head trim: remove anchors before the first one with any
+        // inter-window edge (incoming or outgoing).
         uint64_t headTrim = 0;
-        {
-            uint64_t firstIncoming = positions.size();
-            for(uint64_t i = 0; i < positions.size(); i++) {
-                const uint64_t aid = uint64_t(journey[positions[i]]);
-                if(hasIncomingInterWindowEdge(aid)) { firstIncoming = i; break; }
-            }
-            if(firstIncoming != positions.size()) headTrim = firstIncoming;
+        for(uint64_t i = 0; i < positions.size(); i++) {
+            const uint64_t aid = uint64_t(journey[positions[i]]);
+            if(hasIncomingInterWindowEdge(aid) || hasOutgoingInterWindowEdge(aid)) break;
+            ++headTrim;
         }
+        // No anchor has any inter-window edge — window is isolated.
+        // Don't trim (leave for the isolated-window filter).
+        if(headTrim >= positions.size()) continue;
 
-        // Tail trim: remove anchors after the last one with an OUTGOING
-        // inter-window edge. If there is no outgoing edge, this is an
-        // end-of-contig window — keep the tail (tailTrim = 0).
+        // Tail trim: remove anchors after the last one with any
+        // inter-window edge (incoming or outgoing).
         uint64_t tailTrim = 0;
-        {
-            int64_t lastOutgoing = -1;
-            for(int64_t i = int64_t(positions.size()) - 1; i >= int64_t(headTrim); i--) {
-                const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
-                if(hasOutgoingInterWindowEdge(aid)) { lastOutgoing = i; break; }
-            }
-            if(lastOutgoing >= 0) {
-                tailTrim = positions.size() - 1 - uint64_t(lastOutgoing);
-            }
+        for(int64_t i = int64_t(positions.size()) - 1; i > int64_t(headTrim); i--) {
+            const uint64_t aid = uint64_t(journey[positions[uint64_t(i)]]);
+            if(hasIncomingInterWindowEdge(aid) || hasOutgoingInterWindowEdge(aid)) break;
+            ++tailTrim;
         }
 
         if(headTrim == 0 && tailTrim == 0) continue;
