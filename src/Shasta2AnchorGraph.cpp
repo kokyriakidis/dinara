@@ -3394,6 +3394,17 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
         if(positions.size() <= 1) continue;
         const auto journey = journeys[window.backboneOrientedReadId];
 
+        // The trim criterion is intentionally direction-agnostic: it stops at
+        // the first/last anchor carrying ANY inter-window edge, not just an
+        // incoming (head) or outgoing (tail) one. An inverted repeat folds the
+        // sequence back on itself, producing a fold-back connection that looks
+        // like an outgoing edge at the head (or incoming at the tail). A
+        // directional criterion would walk past such an edge and disable it,
+        // destroying real inverted-repeat structure. Stopping at any
+        // inter-window edge preserves it; residual strand-mix at the ends is
+        // pruned later by coverage-aware tip removal. Do not make this
+        // directional.
+
         // Head trim: remove anchors before the first one with any
         // inter-window edge (incoming or outgoing).
         uint64_t headTrim = 0;
