@@ -622,46 +622,91 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
-    // Create inter-window edges, gated by window degree:
-    // an edge A→B is created only if A has exactly one outgoing neighbor
-    // window AND B has exactly one incoming neighbor window (both counted
-    // over coverage-passing window pairs). This builds only the unambiguous
-    // linear backbone; branch/tangle windows are left unconnected for now.
+    // Stage A: length-weighted reciprocal-best inter-window edges.
+    //
+    // Start from all windows as nodes with no inter-window edges, then connect
+    // A->B only when, scoring each window pair by the lengths of the distinct
+    // reads that span it, B is A's best outgoing neighbor AND A is B's best
+    // incoming neighbor (reciprocal best). This yields a clean linear local
+    // backbone (degree <= 1 per side) without destructively dropping branches:
+    // non-reciprocal pairs are simply deferred to Stage B (long-read bridging
+    // across the mess), not deleted. "No single read may seed a backbone" is
+    // honored by requiring at least minInterWindowCoverage distinct reads.
+    //
+    // Scoring uses summed spanning-read length, so longer reads carry more
+    // weight (trust reads by length). windowPairTransitions is canonicalized
+    // (mirror pairs merged and erased) while edge creation emits both the
+    // forward and the RC mirror edge, so best-in/best-out is accumulated over
+    // both the forward pair (A,B) and its mirror (rcWindow(B), rcWindow(A)).
     {
-        // First pass: per-window out/in degree over coverage-passing pairs.
-        // windowPairTransitions is canonicalized (mirror pairs were merged and
-        // erased), but edge creation emits BOTH the forward edge and its RC
-        // mirror. So degree must count both the forward pair (A,B) and its
-        // mirror (rcWindow(B), rcWindow(A)) to reflect the real graph.
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
         };
-        std::map<uint32_t, uint32_t> outDegree;  // source window -> # distinct dest windows
-        std::map<uint32_t, uint32_t> inDegree;   // dest window   -> # distinct source windows
+        auto readLengthOf = [&](uint32_t oidValue) -> uint64_t {
+            if(reads == nullptr) return 1;  // fall back to unit weight (=count)
+            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+            const ReadId readId = oid.getReadId();
+            if(readId >= reads->readCount()) return 1;
+            return reads->getReadRawSequenceLength(readId);
+        };
+
+        // Per-pair: distinct spanning physical reads and summed read length.
+        struct PairScore {
+            uint64_t readCount = 0;
+            uint64_t lengthScore = 0;
+        };
+        std::map<std::pair<uint32_t, uint32_t>, PairScore> pairScore;
+
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            // Distinct physical reads and their summed length.
             std::set<uint32_t> physicalReads;
+            uint64_t lengthSum = 0;
             for(const auto& t : transitions) {
-                physicalReads.insert(t.oidValue / 2);
+                if(physicalReads.insert(t.oidValue / 2).second) {
+                    lengthSum += readLengthOf(t.oidValue);
+                }
             }
             if(physicalReads.size() < minInterWindowCoverage) continue;
-            // Forward pair.
-            ++outDegree[windowPair.first];
-            ++inDegree[windowPair.second];
-            // RC mirror pair (also created as an edge). Skip if self-mirror
-            // (palindromic pair), where forward and mirror are the same edge.
-            const bool selfMirror = (windowPair.first == rcWindow(windowPair.second));
-            if(!selfMirror) {
-                ++outDegree[rcWindow(windowPair.second)];
-                ++inDegree[rcWindow(windowPair.first)];
+
+            const PairScore s{physicalReads.size(), lengthSum};
+            pairScore[windowPair] = s;
+            // RC mirror pair carries the same score (mirror edge is created too).
+            const std::pair<uint32_t, uint32_t> mirror(
+                rcWindow(windowPair.second), rcWindow(windowPair.first));
+            if(mirror != windowPair) {
+                pairScore[mirror] = s;
+            }
+        }
+
+        // Best outgoing per source window and best incoming per dest window,
+        // by length score (ties broken by read count then smaller window id).
+        std::map<uint32_t, std::pair<uint32_t, PairScore>> bestOut; // src -> (dst, score)
+        std::map<uint32_t, std::pair<uint32_t, PairScore>> bestIn;  // dst -> (src, score)
+        auto better = [](const PairScore& x, uint32_t xId,
+                         const PairScore& y, uint32_t yId) -> bool {
+            if(x.lengthScore != y.lengthScore) return x.lengthScore > y.lengthScore;
+            if(x.readCount != y.readCount) return x.readCount > y.readCount;
+            return xId < yId;
+        };
+        for(const auto& [pair, s] : pairScore) {
+            const uint32_t src = pair.first, dst = pair.second;
+            auto itO = bestOut.find(src);
+            if(itO == bestOut.end() ||
+               better(s, dst, itO->second.second, itO->second.first)) {
+                bestOut[src] = {dst, s};
+            }
+            auto itI = bestIn.find(dst);
+            if(itI == bestIn.end() ||
+               better(s, src, itI->second.second, itI->second.first)) {
+                bestIn[dst] = {src, s};
             }
         }
 
         uint64_t interWindowCreated = 0;
         uint64_t interWindowSkipped = 0;
-        uint64_t interWindowAmbiguous = 0;
+        uint64_t interWindowNotReciprocal = 0;
 
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            // Count distinct physical reads (deduplicate by read ID).
             std::set<uint32_t> physicalReads;
             for(const auto& t : transitions) {
                 physicalReads.insert(t.oidValue / 2);
@@ -671,9 +716,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 continue;
             }
 
-            // Degree gate: only unambiguous (1 out, 1 in) connections.
-            if(outDegree[windowPair.first] != 1 || inDegree[windowPair.second] != 1) {
-                ++interWindowAmbiguous;
+            // Reciprocal-best gate: B is A's best out AND A is B's best in.
+            const uint32_t A = windowPair.first, B = windowPair.second;
+            auto itO = bestOut.find(A);
+            auto itI = bestIn.find(B);
+            const bool reciprocal =
+                itO != bestOut.end() && itO->second.first == B &&
+                itI != bestIn.end()  && itI->second.first == A;
+            if(!reciprocal) {
+                ++interWindowNotReciprocal;
                 continue;
             }
 
@@ -705,15 +756,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        cout << "Inter-window edges: " << interWindowCreated << " created, "
+        cout << "Inter-window edges (Stage A, length-weighted reciprocal-best): "
+             << interWindowCreated << " created, "
              << interWindowSkipped << " skipped (< " << minInterWindowCoverage
-             << " reads), " << interWindowAmbiguous
-             << " skipped (window degree != 1 in/out)." << endl;
+             << " reads), " << interWindowNotReciprocal
+             << " deferred (not reciprocal-best)." << endl;
     }
 
     // All-edge construction (disabled): created one edge per coverage-passing
-    // window pair regardless of degree. Replaced by the degree-gated block
-    // above to build only the unambiguous linear backbone first.
+    // window pair regardless of score. Replaced by the Stage A length-weighted
+    // reciprocal-best block above to build a clean linear backbone first.
 #if 0
     {
         uint64_t interWindowCreated = 0;
