@@ -2879,9 +2879,27 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
     // with only tangle-interior (non-endpoint) windows between, is one bridge
     // A->B witnessed by this read. Support is counted by distinct physical
     // reads (oidValue/2), which also deduplicates fw/rc twins of one molecule.
-    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
-
+    //
+    // Longest-first seeding with lock (mirrors addConfidentBridges): reads are
+    // processed longest journey first; the first read to exit a tail locks that
+    // tail's target, the first to enter a head locks that head's source. Later
+    // shorter reads only confirm or contradict, never re-point. This makes the
+    // "confident bridges" prediction below match what Stage B.2 will add.
+    vector<std::pair<uint64_t, uint32_t>> readOrder; // (journeyLength, oidValue)
+    readOrder.reserve(readWindows.size());
     for(const auto& [oidValue, windows] : readWindows) {
+        readOrder.push_back({windows.size(), oidValue});
+    }
+    std::sort(readOrder.begin(), readOrder.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
+    std::map<uint64_t, uint64_t> tailLock; // tail seg -> locked target head seg
+    std::map<uint64_t, uint64_t> headLock; // head seg -> locked source tail seg
+
+    for(const auto& [journeyLength, oidValue] : readOrder) {
+        (void)journeyLength;
+        const auto& windows = readWindows.at(oidValue);
         const uint32_t physicalRead = oidValue / 2;
         vector<uint64_t> lastTailSegs;
         for(const uint32_t w : windows) {
@@ -2893,6 +2911,8 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
                     for(const uint64_t b : hIt->second) {
                         if(t != b) {
                             bridgeReads[std::make_pair(t, b)].insert(physicalRead);
+                            tailLock.emplace(t, b);
+                            headLock.emplace(b, t);
                         }
                     }
                 }
@@ -2940,22 +2960,25 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
     // reads going elsewhere = totalExit - support(best). Symmetric "incoming
     // contradiction" is computed per head B (reads entering B from a tail other
     // than its best source).
+    // "Best" target/source is the LOCKED one (set by the longest read), not the
+    // max-support one; its support is tested against the contradicting reads
+    // (total - lockSupport). This matches addConfidentBridges.
     std::map<uint64_t, uint64_t> tailExitTotal;   // tail -> total exit reads
-    std::map<uint64_t, uint64_t> tailBestSupport; // tail -> max support to one target
+    std::map<uint64_t, uint64_t> tailBestSupport; // tail -> support of locked target
     std::map<uint64_t, uint64_t> headEnterTotal;  // head -> total enter reads
-    std::map<uint64_t, uint64_t> headBestSupport; // head -> max support from one source
-    std::map<uint64_t, uint64_t> tailBestTarget;  // tail -> its best target head
-    std::map<uint64_t, uint64_t> headBestSource;  // head -> its best source tail
+    std::map<uint64_t, uint64_t> headBestSupport; // head -> support of locked source
+    std::map<uint64_t, uint64_t> tailBestTarget;  // tail -> its locked target head
+    std::map<uint64_t, uint64_t> headBestSource;  // head -> its locked source tail
     for(const auto& [pair, reads] : bridgeReads) {
         const uint64_t s = reads.size();
         const uint64_t tail = pair.first, head = pair.second;
         tailExitTotal[tail] += s;
-        if(s > tailBestSupport[tail]) {
+        headEnterTotal[head] += s;
+        if(tailLock.count(tail) && tailLock[tail] == head) {
             tailBestSupport[tail] = s;
             tailBestTarget[tail] = head;
         }
-        headEnterTotal[head] += s;
-        if(s > headBestSupport[head]) {
+        if(headLock.count(head) && headLock[head] == tail) {
             headBestSupport[head] = s;
             headBestSource[head] = tail;
         }
@@ -3075,10 +3098,31 @@ uint64_t Shasta2AssemblyGraph::addConfidentBridges(
         segmentEdge[edge.id] = e;
     }
 
-    // Accumulate bridge support: read exits segment A (tail window) then enters
-    // segment B (head window), distinct physical reads, same as the diagnostic.
-    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
+    // Longest-first seeding with lock. Process reads from longest journey to
+    // shortest (single-window reads contribute nothing, so this is effectively
+    // multi-window reads, longest first). The first read to exit a tail LOCKS
+    // that tail's target; the first to enter a head LOCKS that head's source.
+    // Later (shorter) reads can only CONFIRM a lock (add support) or CONTRADICT
+    // it (counted against), never re-point it. The longest reads resolve the
+    // layout; short reads vote but cannot overrule. The non-ambiguity gate
+    // below still rejects a locked bridge that the majority contradicts, so a
+    // single chimeric long read cannot force a join (additive, not destructive).
+    vector<std::pair<uint64_t, uint32_t>> readOrder; // (journeyLength, oidValue)
+    readOrder.reserve(readWindows.size());
     for(const auto& [oidValue, windows] : readWindows) {
+        readOrder.push_back({windows.size(), oidValue});
+    }
+    std::sort(readOrder.begin(), readOrder.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    // Per bridge, the set of distinct physical reads witnessing it (support).
+    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
+    // Locks set by the longest read to reach each endpoint.
+    std::map<uint64_t, uint64_t> tailLock; // tail seg -> locked target head seg
+    std::map<uint64_t, uint64_t> headLock; // head seg -> locked source tail seg
+    for(const auto& [journeyLength, oidValue] : readOrder) {
+        (void)journeyLength;
+        const auto& windows = readWindows.at(oidValue);
         const uint32_t physicalRead = oidValue / 2;
         vector<uint64_t> lastTailSegs;
         for(const uint32_t w : windows) {
@@ -3088,6 +3132,9 @@ uint64_t Shasta2AssemblyGraph::addConfidentBridges(
                     for(const uint64_t b : hIt->second) {
                         if(t != b) {
                             bridgeReads[std::make_pair(t, b)].insert(physicalRead);
+                            // First (longest) read to touch each endpoint locks it.
+                            tailLock.emplace(t, b);
+                            headLock.emplace(b, t);
                         }
                     }
                 }
@@ -3100,17 +3147,27 @@ uint64_t Shasta2AssemblyGraph::addConfidentBridges(
         }
     }
 
-    // Per-tail best target and per-head best source, with totals for the
-    // non-ambiguity test (best > contradiction, or contradiction == 0).
+    // Per-tail / per-head totals (distinct reads). A read exits a tail toward
+    // exactly one head (lastTailSegs is cleared at the first head reached), so
+    // per-endpoint read sets across targets are disjoint and total = sum of
+    // supports. The "best" target/source is the LOCKED one (longest read),
+    // not the max-support one; support of the lock is tested against the
+    // contradicting reads (total - lockSupport).
     std::map<uint64_t, uint64_t> tailExitTotal, tailBestSupport, tailBestTarget;
     std::map<uint64_t, uint64_t> headEnterTotal, headBestSupport, headBestSource;
     for(const auto& [pair, reads] : bridgeReads) {
         const uint64_t s = reads.size();
         const uint64_t tail = pair.first, head = pair.second;
         tailExitTotal[tail] += s;
-        if(s > tailBestSupport[tail]) { tailBestSupport[tail] = s; tailBestTarget[tail] = head; }
         headEnterTotal[head] += s;
-        if(s > headBestSupport[head]) { headBestSupport[head] = s; headBestSource[head] = tail; }
+        if(tailLock.count(tail) && tailLock[tail] == head) {
+            tailBestSupport[tail] = s;
+            tailBestTarget[tail] = head;
+        }
+        if(headLock.count(head) && headLock[head] == tail) {
+            headBestSupport[head] = s;
+            headBestSource[head] = tail;
+        }
     }
     auto notAmbiguous = [](uint64_t total, uint64_t best) -> bool {
         const uint64_t contradiction = total - best;
