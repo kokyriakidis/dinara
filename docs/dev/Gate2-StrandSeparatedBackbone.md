@@ -2,11 +2,35 @@
 
 ## Goal
 
-Build the inter-window backbone so that a single bad/chimeric alignment cannot
-collapse a locus with its own reverse complement, and ambiguous loci are
-identified and deferred rather than guessed. Construction is **incremental and
+Build the inter-window backbone so that marker-graph collapse artifacts cannot
+fuse a locus with its own reverse complement, and ambiguous loci are identified
+and deferred rather than guessed. Construction is **incremental and
 evidence-gated**: contract what is unambiguous first, corroborate the rest, defer
 the hard cases.
+
+### What collapse actually is (verified in code)
+
+Marker-graph vertices are k-mers. An alignment matches two markers only when they
+share a `kmerId` (`src/AlignmentGraph.cpp:183-191`), and the marker graph unites
+exactly those aligned pairs (`src/AssemblerMarkerGraph.cpp:~608`). So **every
+disjoint set is k-mer-pure by construction** — collapse is k-mer identity plus an
+alignment licensing each specific merge (more conservative than MBG, which merges
+all occurrences of an identical k-mer regardless of alignment).
+
+Source-side filters already remove the easy artifact classes: chimeric reads,
+strand-crossing edges, and inconsistent alignments are skipped before `unite`
+(`src/AssemblerMarkerGraph.cpp:~581-594`), and sets with two markers from one
+read (within-read false fusion) are flagged bad
+(`src/AssemblerMarkerGraph.cpp:~744`).
+
+The residual artifact is **cross-read transitive fusion**: two distinct genomic
+loci that share k-mer X are chained into one vertex because a spurious alignment
+linked an X-occurrence at locus 1 to an X-occurrence at locus 2, with no single
+read spanning both. It is k-mer-pure (purity cannot detect it) and has no local
+signal — it only surfaces as **cross-read contradiction** once reads are threaded
+as journeys. This is why resolution is downstream (journey/transition space, the
+N/T corroboration gate), not at the collapse step: the deciding information does
+not exist at `unite`.
 
 Phase 1 builds the clean backbone and **collects** (does not resolve) the
 difficult places for Phase 2.
