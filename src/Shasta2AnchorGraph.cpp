@@ -622,9 +622,99 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
-    // Create inter-window edges: for each A→B window pair, evaluate
-    // (lastAnchorInA, firstAnchorInB) for every supporting read and
-    // pick the pair with the highest anchor pair coverage.
+    // Create inter-window edges, gated by window degree:
+    // an edge A→B is created only if A has exactly one outgoing neighbor
+    // window AND B has exactly one incoming neighbor window (both counted
+    // over coverage-passing window pairs). This builds only the unambiguous
+    // linear backbone; branch/tangle windows are left unconnected for now.
+    {
+        // First pass: per-window out/in degree over coverage-passing pairs.
+        // windowPairTransitions is canonicalized (mirror pairs were merged and
+        // erased), but edge creation emits BOTH the forward edge and its RC
+        // mirror. So degree must count both the forward pair (A,B) and its
+        // mirror (rcWindow(B), rcWindow(A)) to reflect the real graph.
+        auto rcWindow = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
+        std::map<uint32_t, uint32_t> outDegree;  // source window -> # distinct dest windows
+        std::map<uint32_t, uint32_t> inDegree;   // dest window   -> # distinct source windows
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            std::set<uint32_t> physicalReads;
+            for(const auto& t : transitions) {
+                physicalReads.insert(t.oidValue / 2);
+            }
+            if(physicalReads.size() < minInterWindowCoverage) continue;
+            // Forward pair.
+            ++outDegree[windowPair.first];
+            ++inDegree[windowPair.second];
+            // RC mirror pair (also created as an edge). Skip if self-mirror
+            // (palindromic pair), where forward and mirror are the same edge.
+            const bool selfMirror = (windowPair.first == rcWindow(windowPair.second));
+            if(!selfMirror) {
+                ++outDegree[rcWindow(windowPair.second)];
+                ++inDegree[rcWindow(windowPair.first)];
+            }
+        }
+
+        uint64_t interWindowCreated = 0;
+        uint64_t interWindowSkipped = 0;
+        uint64_t interWindowAmbiguous = 0;
+
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            // Count distinct physical reads (deduplicate by read ID).
+            std::set<uint32_t> physicalReads;
+            for(const auto& t : transitions) {
+                physicalReads.insert(t.oidValue / 2);
+            }
+            if(physicalReads.size() < minInterWindowCoverage) {
+                ++interWindowSkipped;
+                continue;
+            }
+
+            // Degree gate: only unambiguous (1 out, 1 in) connections.
+            if(outDegree[windowPair.first] != 1 || inDegree[windowPair.second] != 1) {
+                ++interWindowAmbiguous;
+                continue;
+            }
+
+            Shasta2AnchorPair bestPair;
+            uint64_t bestCoverage = 0;
+            for(const auto& t : transitions) {
+                Shasta2AnchorPair candidatePair(
+                    anchors, t.lastAnchorInA, t.firstAnchorInB, false);
+                candidatePair.assertNoNegativeOffsets(anchors);
+                if(candidatePair.size() > bestCoverage) {
+                    bestCoverage = candidatePair.size();
+                    bestPair = std::move(candidatePair);
+                }
+            }
+
+            if(bestCoverage == 0) continue;
+            if(bestCoverage < minInterWindowEdgeCoverage) continue;
+
+            if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
+                ++interWindowCreated;
+                // RC mirror edge.
+                const Shasta2AnchorId rcA =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+                const Shasta2AnchorId rcB =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    addEdgeIfValid(rcB, rcA);
+                }
+            }
+        }
+
+        cout << "Inter-window edges: " << interWindowCreated << " created, "
+             << interWindowSkipped << " skipped (< " << minInterWindowCoverage
+             << " reads), " << interWindowAmbiguous
+             << " skipped (window degree != 1 in/out)." << endl;
+    }
+
+    // All-edge construction (disabled): created one edge per coverage-passing
+    // window pair regardless of degree. Replaced by the degree-gated block
+    // above to build only the unambiguous linear backbone first.
+#if 0
     {
         uint64_t interWindowCreated = 0;
         uint64_t interWindowSkipped = 0;
@@ -672,6 +762,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << interWindowSkipped << " skipped (< " << minInterWindowCoverage
              << " reads)." << endl;
     }
+#endif
 
     // Old inter-window edge creation (disabled).
 #if 0
