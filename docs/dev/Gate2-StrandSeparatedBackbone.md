@@ -223,7 +223,7 @@ Directed pipeline; intra-window backbone untouched.
 
 ## Verification (structural, no truth set)
 
-`--command assemble` -> `scripts/Gate1AnchorGraphCollapseStats.pl` on
+`--command assemble` -> `scripts/Gate1AnchorGraphCollapseStats.py` on
 `Shasta2AnchorGraph.gfa`, before vs after:
 - strand-strand (fw↔rc) edges -> drop toward ≈ #real IRs
 - hairpin windows -> drop
