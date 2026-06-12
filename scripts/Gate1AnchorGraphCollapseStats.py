@@ -64,6 +64,11 @@ def main():
     edges = []          # (srcWin, srcStrand, dstWin, dstStrand)
     span_products = []   # sp*sn per inter-window edge that carries sp/sn
     shared_reads = []    # sr per inter-window edge that carries sr
+    # Directed inter-window edges with span, for best-edge simulation.
+    # Keyed by (srcWin, dstWin) -> max span-product seen (aggregate parallel
+    # edges between the same window pair to their strongest span).
+    inter_edge_span = {}     # (sw, dw) -> max product
+    inter_edge_crossesStrand = {}  # (sw, dw) -> True if any fw<->rc
 
     re_wn = re.compile(r"\bwn:i:(\d+)")
     re_ws = re.compile(r"\bws:Z:(fw|rc)")
@@ -129,6 +134,12 @@ def main():
                             csv_out.write("%s,%s,%s,%s,%d,%d,%d,%s\n" % (
                                 sw, ss, dw, ds, sp, sn, prod,
                                 ("" if sr is None else str(sr))))
+
+                        key = (sw, dw)
+                        if prod > inter_edge_span.get(key, -1):
+                            inter_edge_span[key] = prod
+                        if ss != ds:
+                            inter_edge_crossesStrand[key] = True
 
     if csv_out:
         csv_out.close()
@@ -250,6 +261,61 @@ def main():
         print("  sr=1 edges are single-read joins (chimera-prone, count<2).")
     else:
         print("  (no inter-window edges carried sr tags)")
+
+    # ---- Best-edge ("keep only biggest-span in/out") simulation ----
+    # Simulates the destructive proposal: for each window keep only its single
+    # biggest-span incoming and biggest-span outgoing inter-window edge, drop
+    # the rest. Reports what that would DELETE — especially cross-strand
+    # (IR fold-back) edges and edges at branch windows — so we can decide
+    # whether the destructive form is safe vs the additive reciprocal-best form.
+    print("\n-- Best-edge simulation (keep only biggest-span in/out per window) --")
+    print("    (evaluates the destructive 'keep biggest, drop rest' proposal)")
+    if inter_edge_span:
+        # Best outgoing per source window, best incoming per dest window.
+        best_out = {}  # sw -> (dw, span)
+        best_in = {}   # dw -> (sw, span)
+        for (sw, dw), span in inter_edge_span.items():
+            if sw not in best_out or span > best_out[sw][1]:
+                best_out[sw] = (dw, span)
+            if dw not in best_in or span > best_in[dw][1]:
+                best_in[dw] = (sw, span)
+
+        total_edges = len(inter_edge_span)
+        kept = set()
+        for sw, (dw, _) in best_out.items():
+            kept.add((sw, dw))
+        for dw, (sw, _) in best_in.items():
+            kept.add((sw, dw))
+
+        dropped = [e for e in inter_edge_span if e not in kept]
+        n_dropped = len(dropped)
+
+        # How many dropped edges are cross-strand (IR fold-back risk)?
+        cross_total = sum(1 for e in inter_edge_span if inter_edge_crossesStrand.get(e))
+        cross_dropped = sum(1 for e in dropped if inter_edge_crossesStrand.get(e))
+
+        # Reciprocal-best edges (the additive, safe skeleton).
+        reciprocal = 0
+        for sw, (dw, _) in best_out.items():
+            if best_in.get(dw, (None,))[0] == sw:
+                reciprocal += 1
+
+        print("distinct directed window-pair edges:  %d" % total_edges)
+        print("kept by best-in/best-out:             %d  (%.1f%%)"
+              % (len(kept), 100.0 * len(kept) / total_edges))
+        print("DROPPED:                              %d  (%.1f%%)"
+              % (n_dropped, 100.0 * n_dropped / total_edges))
+        print("  of which cross-strand (IR risk):    %d   <- destructive form would delete these"
+              % cross_dropped)
+        print("cross-strand edges total:             %d" % cross_total)
+        if cross_total:
+            print("  cross-strand edges DROPPED:         %.1f%%   <- IR loss if destructive"
+                  % (100.0 * cross_dropped / cross_total))
+        print("reciprocal-best edges (safe skeleton): %d  (%.1f%% of edges)"
+              % (reciprocal, 100.0 * reciprocal / total_edges))
+        print("  -> additive form tags these and keeps everything else (no IR loss).")
+    else:
+        print("  (no inter-window edges with span tags to simulate)")
 
     if csv_path is not None:
         print("\nPer-edge CSV written to: %s" % csv_path)
