@@ -177,6 +177,30 @@ Verkko splits; we simply decline to fuse (the split already exists). Both 1a
 mirror-union and 1b resolution unions are subject to this guard; edge admission
 is not.
 
+### Decision: strand work stays in directed space; fold last
+
+We keep all Phase 1 strand work in **directed space** (fw and rc as separate
+nodes) and let the existing `Shasta2AssemblyGraph::toBidirected` perform the
+natural fold **at the end of the pipeline**, after read support has decided what
+is a real IR and what is a collapse artifact. Rationale:
+
+- The graph model does NOT discriminate IR vs collapse — both are strand-strand
+  contacts. **Read support** discriminates, and counting it requires fw and rc to
+  be separate, countable nodes. Directed space preserves that; folding first
+  destroys it.
+- Folding (bidirected) merges `A` and `A'` into one node, collapsing a real IR
+  and a collapse artifact into the *same* hairpin *before* the read-support gate
+  runs. Verkko's `resolve_hairpins` exists precisely to un-fold (split back) what
+  the bidirected model folded too eagerly — evidence that the fold belongs at the
+  end, not the start.
+- A bidirected migration is a large, risky rewrite of working machinery
+  (`windowPairTransitions`, `readWindows`, mirror window IDs) that does NOT solve
+  the core problem. The legitimate fold we want already exists at the right place
+  (`toBidirected`, end of pipeline).
+
+Ordering: **discriminate in directed space (Phase 1), then fold at
+`toBidirected`** — never fold-then-guess.
+
 ## Data available (verified)
 
 - `windowPairTransitions: map<pair<uint32_t,uint32_t>, vector<ReadTransition>>`,
