@@ -2927,6 +2927,53 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
         ++supportHist[s >= 4 ? 4 : s];
     }
 
+    // Contradiction: for each tail segment A, how many reads exit A toward its
+    // BEST target B* versus toward some other head (the contradicting reads).
+    // A read exits A toward exactly one head (the accumulator is cleared on the
+    // first head it reaches), so per-tail read sets across targets are disjoint
+    // and the total exit reads = sum of supports. A clean linear join has all
+    // exit reads agreeing on one B* (contradiction 0); a false-fusion / branch
+    // tangle scatters them (high contradiction). This is the signal that
+    // separates a real cross-mess join from a tangle to defer.
+    //
+    // support(best) = max reads to any single target; contradiction = exit
+    // reads going elsewhere = totalExit - support(best). Symmetric "incoming
+    // contradiction" is computed per head B (reads entering B from a tail other
+    // than its best source).
+    std::map<uint64_t, uint64_t> tailExitTotal;   // tail -> total exit reads
+    std::map<uint64_t, uint64_t> tailBestSupport; // tail -> max support to one target
+    std::map<uint64_t, uint64_t> headEnterTotal;  // head -> total enter reads
+    std::map<uint64_t, uint64_t> headBestSupport; // head -> max support from one source
+    for(const auto& [pair, reads] : bridgeReads) {
+        const uint64_t s = reads.size();
+        const uint64_t tail = pair.first, head = pair.second;
+        tailExitTotal[tail] += s;
+        if(s > tailBestSupport[tail]) tailBestSupport[tail] = s;
+        headEnterTotal[head] += s;
+        if(s > headBestSupport[head]) headBestSupport[head] = s;
+    }
+
+    // Classify each bridging tail by its best target's cleanliness.
+    // clean      : contradiction == 0 (all exit reads agree on one target)
+    // dominant   : best > contradiction (a clear winner, some disagreement)
+    // ambiguous  : best <= contradiction (no clear winner; defer)
+    uint64_t cleanTails = 0, dominantTails = 0, ambiguousTails = 0;
+    for(const auto& [tail, total] : tailExitTotal) {
+        const uint64_t best = tailBestSupport[tail];
+        const uint64_t contradiction = total - best;
+        if(contradiction == 0)        ++cleanTails;
+        else if(best > contradiction) ++dominantTails;
+        else                          ++ambiguousTails;
+    }
+    uint64_t cleanHeads = 0, dominantHeads = 0, ambiguousHeads = 0;
+    for(const auto& [head, total] : headEnterTotal) {
+        const uint64_t best = headBestSupport[head];
+        const uint64_t contradiction = total - best;
+        if(contradiction == 0)        ++cleanHeads;
+        else if(best > contradiction) ++dominantHeads;
+        else                          ++ambiguousHeads;
+    }
+
     cout << "\n=== Segment-bridge diagnostic (most-read-supported, read-only) ===\n";
     cout << "Segments (edges with window sequence): " << segmentCount << "\n";
     cout << "Distinct bridge pairs (tail->head):    " << bridgeReads.size() << "\n";
@@ -2948,6 +2995,20 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
              << " read(s): " << it->second << " bridge(s)"
              << (s == 1 ? "   <- single-read (chimera-prone)" : "") << "\n";
     }
+
+    cout << "-- Bridge contradiction (does the best target dominate?) --\n";
+    cout << "   per tail (best target B* vs reads exiting elsewhere):\n";
+    cout << "     clean (no contradiction):     " << cleanTails << "\n";
+    cout << "     dominant (best > contra):      " << dominantTails << "\n";
+    cout << "     ambiguous (best <= contra):    " << ambiguousTails
+         << "   <- defer (no clear winner)\n";
+    cout << "   per head (best source vs reads entering elsewhere):\n";
+    cout << "     clean (no contradiction):     " << cleanHeads << "\n";
+    cout << "     dominant (best > contra):      " << dominantHeads << "\n";
+    cout << "     ambiguous (best <= contra):    " << ambiguousHeads
+         << "   <- defer (no clear winner)\n";
+    cout << "   A bridge is a confident join only if BOTH its tail and head are\n";
+    cout << "   clean/dominant; clean-clean pairs are the safest Stage B edges.\n";
     cout << "=== end segment-bridge diagnostic ===\n" << endl;
 }
 
