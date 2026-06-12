@@ -2853,6 +2853,104 @@ void Shasta2AssemblyGraph::writeCsv(ostream& csv) const
     }
 }
 
+void Shasta2AssemblyGraph::reportSegmentBridges(
+    const std::map<uint32_t, std::set<uint32_t>>& /* windowReads */,
+    const std::map<uint32_t, vector<uint32_t>>& readWindows) const
+{
+    const Shasta2AssemblyGraph& assemblyGraph = *this;
+
+    // Map each segment-endpoint window to the segments it is the head/tail of.
+    // A segment is an edge; its endpoint windows are windowSequence.front()
+    // (head) and windowSequence.back() (tail). Window IDs are raw (fw and rc),
+    // matching the readWindows space.
+    std::map<uint32_t, vector<uint64_t>> headWindowSegments; // window -> segment ids
+    std::map<uint32_t, vector<uint64_t>> tailWindowSegments;
+    uint64_t segmentCount = 0;
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+        if(edge.windowSequence.empty()) continue;
+        ++segmentCount;
+        headWindowSegments[edge.windowSequence.front()].push_back(edge.id);
+        tailWindowSegments[edge.windowSequence.back()].push_back(edge.id);
+    }
+
+    // Accumulate bridges: for each read, walk its window path. A transition
+    // from a tail-window of segment A to a head-window of segment B (A != B),
+    // with only tangle-interior (non-endpoint) windows between, is one bridge
+    // A->B witnessed by this read. Support is counted by distinct physical
+    // reads (oidValue/2), which also deduplicates fw/rc twins of one molecule.
+    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
+
+    for(const auto& [oidValue, windows] : readWindows) {
+        const uint32_t physicalRead = oidValue / 2;
+        vector<uint64_t> lastTailSegs;
+        for(const uint32_t w : windows) {
+            // Head check first (so a single-window segment, where head==tail,
+            // can both close an incoming bridge and open as a new tail).
+            auto hIt = headWindowSegments.find(w);
+            if(hIt != headWindowSegments.end() && !lastTailSegs.empty()) {
+                for(const uint64_t t : lastTailSegs) {
+                    for(const uint64_t b : hIt->second) {
+                        if(t != b) {
+                            bridgeReads[std::make_pair(t, b)].insert(physicalRead);
+                        }
+                    }
+                }
+                lastTailSegs.clear();
+            }
+            auto tIt = tailWindowSegments.find(w);
+            if(tIt != tailWindowSegments.end()) {
+                lastTailSegs = tIt->second;
+            }
+        }
+    }
+
+    // Per-tail target multiplicity: how many distinct target segments each
+    // bridging tail segment reaches.
+    std::map<uint64_t, std::set<uint64_t>> targetsPerTail;
+    for(const auto& [pair, reads] : bridgeReads) {
+        (void)reads;
+        targetsPerTail[pair.first].insert(pair.second);
+    }
+    std::map<uint64_t, uint64_t> multiplicityHist; // #targets -> count of tails
+    for(const auto& [tail, targets] : targetsPerTail) {
+        (void)tail;
+        const uint64_t m = targets.size();
+        ++multiplicityHist[m >= 4 ? 4 : m];
+    }
+
+    // Support distribution: distinct physical reads per bridge.
+    std::map<uint64_t, uint64_t> supportHist; // #reads -> count of bridges
+    for(const auto& [pair, reads] : bridgeReads) {
+        (void)pair;
+        const uint64_t s = reads.size();
+        ++supportHist[s >= 4 ? 4 : s];
+    }
+
+    cout << "\n=== Segment-bridge diagnostic (most-read-supported, read-only) ===\n";
+    cout << "Segments (edges with window sequence): " << segmentCount << "\n";
+    cout << "Distinct bridge pairs (tail->head):    " << bridgeReads.size() << "\n";
+    cout << "Bridging tail segments:                " << targetsPerTail.size() << "\n";
+
+    cout << "-- Per-tail target multiplicity (how many segments a tail bridges to) --\n";
+    for(uint64_t m = 1; m <= 4; m++) {
+        auto it = multiplicityHist.find(m);
+        if(it == multiplicityHist.end()) continue;
+        cout << "  " << (m >= 4 ? "4+" : std::to_string(m))
+             << " target(s): " << it->second << " tail segment(s)\n";
+    }
+
+    cout << "-- Bridge support (distinct physical reads per bridge) --\n";
+    for(uint64_t s = 1; s <= 4; s++) {
+        auto it = supportHist.find(s);
+        if(it == supportHist.end()) continue;
+        cout << "  " << (s >= 4 ? "4+" : std::to_string(s))
+             << " read(s): " << it->second << " bridge(s)"
+             << (s == 1 ? "   <- single-read (chimera-prone)" : "") << "\n";
+    }
+    cout << "=== end segment-bridge diagnostic ===\n" << endl;
+}
+
 void Shasta2AssemblyGraph::check() const
 {
     const Shasta2AssemblyGraph& assemblyGraph = *this;

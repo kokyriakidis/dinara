@@ -1578,6 +1578,11 @@ void dinara::main::assemble(
     }
     shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
 
+    // Diagnostic (read-only): report candidate bridges between maximal 1-1
+    // linear segments, using read window-paths. Adds no edges.
+    shasta2AssemblyGraph->reportSegmentBridges(
+        shasta2AnchorGraph->windowReads, shasta2AnchorGraph->readWindows);
+
     // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
 #if 0
     // Remove isolated windows (no inter-window edges).

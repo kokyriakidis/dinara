@@ -301,6 +301,20 @@ public:
     void writeGraphviz(ostream&) const;
     void writeCsv(const string& fileName) const;
     void writeCsv(ostream&) const;
+
+    // Diagnostic (read-only): report candidate bridges between maximal 1-1
+    // linear segments, using read window-paths. A segment is an edge of this
+    // graph; its endpoint windows are the head (windowSequence.front()) and
+    // tail (windowSequence.back()). For each read, walk its window path
+    // (readWindows, raw window IDs) and record every transition from one
+    // segment's tail window to another segment's head window, accumulating
+    // distinct physical-read support. Reports how many segment pairs reads
+    // bridge and the per-tail target multiplicity (1 target vs many). Adds no
+    // edges. windowReads/readWindows come from the source Shasta2AnchorGraph.
+    void reportSegmentBridges(
+        const std::map<uint32_t, std::set<uint32_t>>& windowReads,
+        const std::map<uint32_t, vector<uint32_t>>& readWindows) const;
+
     void write(const string& stage);
     void check() const;
     void clearSequence();
