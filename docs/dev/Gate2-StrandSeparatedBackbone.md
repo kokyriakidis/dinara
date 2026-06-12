@@ -152,6 +152,33 @@ New counters to emit: candidates, 1a-contracted, 1b-unioned, difficult by reason
 Success = strand-strand/hairpin/collapse fall sharply with no loss of legitimate
 backbone connectivity.
 
+## Cross-check against Verkko (resolve_triplets_kmerify.py)
+
+Verkko's ONT resolution stage independently arrives at the same structure,
+validating this design and suggesting refinements:
+
+- `add_safe_unitig` / `get_safe_unitigs_and_edges`: walks one-in/one-out linear
+  runs and marks them **safe** — this is our 1a. Refinement: safe unitigs are
+  **protected** from the low-coverage pruning that governs junctions. Adopt:
+  the 1a backbone should be immune to the 1b corroboration gate.
+- `get_valid_triplets`: collects `(prev, node, next)` triplets from crossing read
+  paths; a triplet is **solid** iff path count >= `min_edge_support` (our count N).
+  A node is resolvable iff **every** significant incident edge is covered by a
+  solid triplet, else it is NOT resolved (-> difficult). Refinement: adopt
+  **all-or-nothing resolvability** — do not partially resolve a junction.
+  Difference: Verkko uses path **count** only; we additionally require span
+  product T (more signal). Keep T as our addition.
+- `resolve_hairpins`: dedicated routine for `>node -> <node` fold-backs, tried
+  BEFORE generic triplet resolution; resolves only if all incident edges covered
+  by solid resolutions; **skips double-hairpins and disconnected hairpins** as
+  spurious/too-hard. Confirms deferring fw/rc-same-read & self-fold windows to a
+  dedicated phase (our Phase 2), with the same all-edges-covered rule.
+- `resolve` driver: heap of nodes by unitig length, **shortest first**,
+  length-stepped with a `max_resolve_length` cap, re-unitigify and re-push after
+  each resolution; outer loop over increasing `resolve_steps`. Consider adopting
+  shortest-first + iterate (vs our longest-read-first) to avoid over-committing
+  to large joins before small ambiguities are cleared.
+
 ## Scope boundaries
 
 - Phase 1 (1a + 1b) only. No IR resolution, no interior-attachment bypass/split,
