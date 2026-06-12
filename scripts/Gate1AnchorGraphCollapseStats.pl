@@ -12,8 +12,12 @@
 #   - per-window predecessor/successor counts (tangle windows)
 #   - strand-strand edges (fw<->rc of same window: hairpin/collapse signature)
 #   - hairpin windows (connect to their own normalized window)
+#   - span-product (sp*sn) distribution + log2 histogram (drives T threshold)
+#   - shared-read (sr) distribution (drives N threshold)
 #
-# Usage: perl Gate1AnchorGraphCollapseStats.pl Shasta2AnchorGraph.gfa
+# Usage: perl Gate1AnchorGraphCollapseStats.pl Shasta2AnchorGraph.gfa [edges.csv]
+#   If edges.csv is given, a per-edge dump of sp,sn,product,sr is written there
+#   so T can be re-derived later without re-running.
 
 use strict;
 use warnings;
@@ -36,6 +40,16 @@ my $interDiffWin = 0;
 
 my @edges; # [srcWin, srcStrand, dstWin, dstStrand]
 
+# Inter-window support evidence (drives N and T thresholds).
+my @spanProducts;  # sp*sn per inter-window edge that carries sp/sn
+my @sharedReads;   # sr per inter-window edge that carries sr
+my $csvOut;        # optional per-edge CSV dump
+my $csvName = $ARGV[1];
+if (defined $csvName) {
+    open($csvOut, '>', $csvName) or die "Cannot open $csvName for writing: $!\n";
+    print $csvOut "srcWin,srcStrand,dstWin,dstStrand,sp,sn,product,sr\n";
+}
+
 while (my $line = <$fh>) {
     if ($line =~ /^S\t(\S+)\t/) {
         $sLines++;
@@ -55,6 +69,11 @@ while (my $line = <$fh>) {
         my $dw = $vWindow{$dst}; my $ds = $vStrand{$dst};
         push @edges, [$sw, $ss, $dw, $ds];
 
+        # Support tags (present only on inter-window edges).
+        my ($sp) = $line =~ /\bsp:i:(\d+)/;
+        my ($sn) = $line =~ /\bsn:i:(\d+)/;
+        my ($sr) = $line =~ /\bsr:i:(\d+)/;
+
         if ($sw == $dw) {
             if ($ss eq $ds) { $intra++; }
             else            { $interSameWinDiffStrand++; }
@@ -62,10 +81,22 @@ while (my $line = <$fh>) {
             $interDiffWin++;
             $succ{$sw}{$dw}++;
             $pred{$dw}{$sw}++;
+
+            if (defined $sp && defined $sn) {
+                my $prod = $sp * $sn;
+                push @spanProducts, $prod;
+                push @sharedReads, $sr if defined $sr;
+                if ($csvOut) {
+                    printf $csvOut "%s,%s,%s,%s,%d,%d,%d,%s\n",
+                        $sw, $ss, $dw, $ds, $sp, $sn, $prod,
+                        (defined $sr ? $sr : '');
+                }
+            }
         }
     }
 }
 close($fh);
+close($csvOut) if $csvOut;
 
 # Distinct windows.
 my %allWins;
@@ -139,4 +170,83 @@ printf ">1 successor:                     %d\n", $multiSucc;
 printf ">1 pred AND >1 succ:              %d\n", $multiBoth;
 printf "Tangle (>1 pred OR >1 succ):      %d  (%.1f%% of windows)\n",
     $tangleWins, ($nWins ? 100.0*$tangleWins/$nWins : 0);
-printf "Hairpin windows (self fw<->rc):   %d   <- strand-strand contacts\n", $nHairpin;
+printf "Hairpin windows (self fw<->rc):   %d   <- strand-strand contacts\n\n", $nHairpin;
+
+# ---- Support-evidence distributions (drive N and T thresholds) ----
+
+sub pct {
+    my ($aref, $q) = @_;
+    my $n = scalar @$aref;
+    return 0 unless $n;
+    my $i = int($q * ($n - 1) + 0.5);
+    $i = 0 if $i < 0; $i = $n - 1 if $i >= $n;
+    return $aref->[$i];
+}
+
+sub log2bucket {
+    my ($v) = @_;
+    return '0' if $v <= 0;
+    my $b = 0;
+    my $lo = 1;
+    while ($lo * 2 <= $v) { $lo *= 2; $b++; }
+    my $hi = $lo * 2;
+    return sprintf("%d-%d", $lo, $hi - 1);  # e.g. 1-1, 2-3, 4-7, 8-15
+}
+
+printf "-- Span-product (sp*sn) distribution on inter-window edges --\n";
+printf "    (T = span-product threshold is read from here)\n";
+my $nSP = scalar @spanProducts;
+if ($nSP) {
+    my @sp = sort { $a <=> $b } @spanProducts;
+    my $sum = 0; $sum += $_ for @sp;
+    printf "edges with sp/sn:                 %d\n", $nSP;
+    printf "min / p10 / p25 / median:         %d / %d / %d / %d\n",
+        $sp[0], pct(\@sp, 0.10), pct(\@sp, 0.25), pct(\@sp, 0.50);
+    printf "p75 / p90 / p95 / p99 / max:      %d / %d / %d / %d / %d\n",
+        pct(\@sp, 0.75), pct(\@sp, 0.90), pct(\@sp, 0.95), pct(\@sp, 0.99), $sp[-1];
+    printf "mean:                             %.1f\n", $sum / $nSP;
+
+    # Log-scale histogram (power-of-2 buckets), ordered by bucket low edge.
+    my %hist;
+    $hist{ log2bucket($_) }++ for @sp;
+    my %lowOf;
+    for my $b (keys %hist) {
+        my ($lo) = $b =~ /^(\d+)/;
+        $lowOf{$b} = $lo;
+    }
+    printf "  span-product histogram (log2 buckets):\n";
+    for my $b (sort { $lowOf{$a} <=> $lowOf{$b} } keys %hist) {
+        my $c = $hist{$b};
+        my $bar = '#' x int(60 * $c / $nSP + 0.5);
+        printf "    %-12s %8d  %s\n", $b, $c, $bar;
+    }
+} else {
+    printf "  (no inter-window edges carried sp/sn tags)\n";
+}
+printf "\n";
+
+printf "-- Shared-read count (sr) distribution on inter-window edges --\n";
+printf "    (N = minimum corroborating-read count is read from here)\n";
+my $nSR = scalar @sharedReads;
+if ($nSR) {
+    my @sr = sort { $a <=> $b } @sharedReads;
+    my %srHist;
+    for my $v (@sr) {
+        my $k = $v >= 4 ? '4+' : "$v";
+        $srHist{$k}++;
+    }
+    for my $k ('1', '2', '3', '4+') {
+        next unless exists $srHist{$k};
+        my $c = $srHist{$k};
+        my $bar = '#' x int(60 * $c / $nSR + 0.5);
+        printf "    sr=%-3s %8d  (%.1f%%)  %s\n",
+            $k, $c, 100.0 * $c / $nSR, $bar;
+    }
+    printf "  sr=1 edges are single-read joins (chimera-prone, count<2).\n";
+} else {
+    printf "  (no inter-window edges carried sr tags)\n";
+}
+
+if (defined $csvName) {
+    printf "\nPer-edge CSV written to: %s\n", $csvName;
+}
