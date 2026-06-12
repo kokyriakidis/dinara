@@ -189,11 +189,33 @@ validating this design and suggesting refinements:
   **all-or-nothing resolvability** — do not partially resolve a junction.
   Difference: Verkko uses path **count** only; we additionally require span
   product T (more signal). Keep T as our addition.
-- `resolve_hairpins`: dedicated routine for `>node -> <node` fold-backs, tried
-  BEFORE generic triplet resolution; resolves only if all incident edges covered
-  by solid resolutions; **skips double-hairpins and disconnected hairpins** as
-  spurious/too-hard. Confirms deferring fw/rc-same-read & self-fold windows to a
-  dedicated phase (our Phase 2), with the same all-edges-covered rule.
+- `resolve_hairpins` / `is_hairpin`: Verkko's term for a strand-strand contact is
+  a **hairpin** = a node whose forward end connects to its own reverse end
+  (`>node -> <node`). Handling (Phase 2 should mirror this exactly):
+  - **Detect** three categories: clean hairpin (`>node` has exactly one edge, to
+    `<node`); `unresolvable_hairpin` (fold-back PLUS other branches,
+    `len(edges)>=2 and <node in edges`); double hairpin (`revnode(node)` also a
+    hairpin, folds at both ends).
+  - **Resolve only if read-supported, all-or-nothing**: gather read paths that
+    physically execute the fold-back (`...prev, node, revnode(node), next...`),
+    count per `canon(prev,next)` resolution; a resolution is solid iff
+    count >= min_edge_support; resolve ONLY if every incident edge is covered by a
+    solid resolution, else leave in place.
+  - **Resolution = NODE SPLIT, not delete**: split the node into separate fw/bw
+    copies (`node+hairpinN+fw/bw`), route each read's supported fold-back through
+    its own copy, remove the original. This physically separates the two strands
+    into two nodes connected only via the supported fold path. Verkko does NOT
+    delete strand-strand contacts — it splits the read-supported ones and leaves
+    the rest. Directly supports our inverted-repeat requirement: a real IR
+    fold-back is read-supported -> split into clean separate strands, never
+    destroyed.
+  - **Quarantine rules (adopt)**: skip double hairpins ("too hard"); skip
+    disconnected hairpins (`len(edges[revnode])==0`, "spurious"); skip
+    unresolvable hairpins; and do NOT resolve normal nodes ADJACENT to an
+    unresolved hairpin (Verkko removes hairpin-bordering nodes from
+    maybe_resolvable).
+  Phase 1 defers all fw/rc-same-read & self-fold windows to Phase 2, which applies
+  the split + quarantine rules above.
 - `resolve` driver: heap of nodes by unitig length, **shortest first**,
   length-stepped with a `max_resolve_length` cap, re-unitigify and re-push after
   each resolution; outer loop over increasing `resolve_steps`. ADOPTED: 1b uses
