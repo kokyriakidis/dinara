@@ -315,6 +315,18 @@ public:
         const std::map<uint32_t, std::set<uint32_t>>& windowReads,
         const std::map<uint32_t, vector<uint32_t>>& readWindows) const;
 
+    // Stage B.2: add confident bridge edges between maximal 1-1 segments.
+    // A bridge tail(segA)->head(segB) is added as a single-step edge from
+    // segA's target vertex to segB's source vertex when it is mutually-best
+    // (segA's best target is segB AND segB's best source is segA), both
+    // endpoints are non-ambiguous (best support > contradicting reads, or no
+    // contradiction), and support >= 2 (no single-read seed). The RC mirror
+    // bridge is added too. Direct link over the mess: the interior tangle is
+    // not materialized (no consensus sequence until assembleAll), connectivity
+    // only. Returns the number of bridge edges created (including mirrors).
+    uint64_t addConfidentBridges(
+        const std::map<uint32_t, vector<uint32_t>>& readWindows);
+
     void write(const string& stage);
     void check() const;
     void clearSequence();

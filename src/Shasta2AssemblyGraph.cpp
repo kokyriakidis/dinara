@@ -3051,6 +3051,152 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
     cout << "=== end segment-bridge diagnostic ===\n" << endl;
 }
 
+uint64_t Shasta2AssemblyGraph::addConfidentBridges(
+    const std::map<uint32_t, vector<uint32_t>>& readWindows)
+{
+    Shasta2AssemblyGraph& assemblyGraph = *this;
+    const Shasta2Anchors* anchors = getAnchorsPointer();
+    if(anchors == nullptr) {
+        cout << "addConfidentBridges: no anchors pointer; skipping." << endl;
+        return 0;
+    }
+
+    // Map each segment-endpoint window to the segments it heads/tails, and keep
+    // each segment's edge descriptor and endpoint windows. Same head/tail model
+    // as reportSegmentBridges (windowSequence.front()=head, back()=tail).
+    std::map<uint32_t, vector<uint64_t>> headWindowSegments; // window -> seg ids
+    std::map<uint32_t, vector<uint64_t>> tailWindowSegments;
+    std::map<uint64_t, edge_descriptor> segmentEdge;          // seg id -> edge
+    BGL_FORALL_EDGES(e, assemblyGraph, Shasta2AssemblyGraph) {
+        const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
+        if(edge.windowSequence.empty()) continue;
+        headWindowSegments[edge.windowSequence.front()].push_back(edge.id);
+        tailWindowSegments[edge.windowSequence.back()].push_back(edge.id);
+        segmentEdge[edge.id] = e;
+    }
+
+    // Accumulate bridge support: read exits segment A (tail window) then enters
+    // segment B (head window), distinct physical reads, same as the diagnostic.
+    std::map<std::pair<uint64_t, uint64_t>, std::set<uint32_t>> bridgeReads;
+    for(const auto& [oidValue, windows] : readWindows) {
+        const uint32_t physicalRead = oidValue / 2;
+        vector<uint64_t> lastTailSegs;
+        for(const uint32_t w : windows) {
+            auto hIt = headWindowSegments.find(w);
+            if(hIt != headWindowSegments.end() && !lastTailSegs.empty()) {
+                for(const uint64_t t : lastTailSegs) {
+                    for(const uint64_t b : hIt->second) {
+                        if(t != b) {
+                            bridgeReads[std::make_pair(t, b)].insert(physicalRead);
+                        }
+                    }
+                }
+                lastTailSegs.clear();
+            }
+            auto tIt = tailWindowSegments.find(w);
+            if(tIt != tailWindowSegments.end()) {
+                lastTailSegs = tIt->second;
+            }
+        }
+    }
+
+    // Per-tail best target and per-head best source, with totals for the
+    // non-ambiguity test (best > contradiction, or contradiction == 0).
+    std::map<uint64_t, uint64_t> tailExitTotal, tailBestSupport, tailBestTarget;
+    std::map<uint64_t, uint64_t> headEnterTotal, headBestSupport, headBestSource;
+    for(const auto& [pair, reads] : bridgeReads) {
+        const uint64_t s = reads.size();
+        const uint64_t tail = pair.first, head = pair.second;
+        tailExitTotal[tail] += s;
+        if(s > tailBestSupport[tail]) { tailBestSupport[tail] = s; tailBestTarget[tail] = head; }
+        headEnterTotal[head] += s;
+        if(s > headBestSupport[head]) { headBestSupport[head] = s; headBestSource[head] = tail; }
+    }
+    auto notAmbiguous = [](uint64_t total, uint64_t best) -> bool {
+        const uint64_t contradiction = total - best;
+        return contradiction == 0 || best > contradiction;
+    };
+
+    // rcWindow on raw window IDs, to add the mirror bridge.
+    auto rcWindow = [&](uint32_t w) -> uint32_t {
+        return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+    };
+
+    // Add a single-step bridge edge from segA's target vertex to segB's source
+    // vertex. Returns true if an edge was created.
+    auto addBridgeEdge = [&](uint64_t segA, uint64_t segB) -> bool {
+        auto itA = segmentEdge.find(segA);
+        auto itB = segmentEdge.find(segB);
+        if(itA == segmentEdge.end() || itB == segmentEdge.end()) return false;
+        const vertex_descriptor v0 = target(itA->second, assemblyGraph);
+        const vertex_descriptor v1 = source(itB->second, assemblyGraph);
+        const Shasta2AnchorId anchorId0 = assemblyGraph[v0].anchorId;
+        const Shasta2AnchorId anchorId1 = assemblyGraph[v1].anchorId;
+        if(anchorId0 == invalid<Shasta2AnchorId> ||
+           anchorId1 == invalid<Shasta2AnchorId>) return false;
+
+        // Reads spanning anchorId0 -> anchorId1 across the mess (not adjacent).
+        Shasta2AnchorPair anchorPair(*anchors, anchorId0, anchorId1, false);
+        if(anchorPair.size() == 0) return false;
+        const uint32_t offset = anchorPair.getAverageOffset(*anchors);
+
+        edge_descriptor eNew;
+        bool added = false;
+        tie(eNew, added) = add_edge(v0, v1,
+            Shasta2AssemblyGraphEdge(nextEdgeId++), assemblyGraph);
+        if(!added) return false;
+        Shasta2AssemblyGraphEdge& bridge = assemblyGraph[eNew];
+        bridge.emplace_back(anchorPair, offset);
+        return true;
+    };
+
+    // Select confident bridges and add them (plus RC mirror). Dedup by the
+    // unordered segment pair so the forward bridge is created once; the mirror
+    // is added separately at the window level.
+    uint64_t created = 0;
+    uint64_t confident = 0;
+    for(const auto& [pair, reads] : bridgeReads) {
+        const uint64_t tail = pair.first, head = pair.second;
+        const bool mutual =
+            tailBestTarget.count(tail) && tailBestTarget[tail] == head &&
+            headBestSource.count(head) && headBestSource[head] == tail;
+        if(!mutual) continue;
+        if(reads.size() < 2) continue;
+        if(!notAmbiguous(tailExitTotal[tail], tailBestSupport[tail])) continue;
+        if(!notAmbiguous(headEnterTotal[head], headBestSupport[head])) continue;
+        ++confident;
+
+        // Forward bridge: segment tail -> segment head.
+        if(addBridgeEdge(tail, head)) ++created;
+
+        // RC mirror bridge. The mirror of tail->head connects the segments
+        // whose tail/head windows are the rc of head's head-window and tail's
+        // tail-window respectively. Find them via the rc windows.
+        const Shasta2AssemblyGraphEdge& tailEdge =
+            assemblyGraph[segmentEdge[tail]];
+        const Shasta2AssemblyGraphEdge& headEdge =
+            assemblyGraph[segmentEdge[head]];
+        const uint32_t rcTailHeadWindow = rcWindow(headEdge.windowSequence.front());
+        const uint32_t rcHeadTailWindow = rcWindow(tailEdge.windowSequence.back());
+        // mirror tail segment: the one whose tail window is rcTailHeadWindow.
+        auto mtIt = tailWindowSegments.find(rcTailHeadWindow);
+        auto mhIt = headWindowSegments.find(rcHeadTailWindow);
+        if(mtIt != tailWindowSegments.end() && mhIt != headWindowSegments.end()) {
+            for(const uint64_t mTail : mtIt->second) {
+                for(const uint64_t mHead : mhIt->second) {
+                    if(mTail == tail && mHead == head) continue; // self-mirror
+                    if(addBridgeEdge(mTail, mHead)) ++created;
+                }
+            }
+        }
+    }
+
+    cout << "addConfidentBridges: " << confident
+         << " confident bridges, " << created
+         << " bridge edges created (including RC mirrors)." << endl;
+    return created;
+}
+
 void Shasta2AssemblyGraph::check() const
 {
     const Shasta2AssemblyGraph& assemblyGraph = *this;
