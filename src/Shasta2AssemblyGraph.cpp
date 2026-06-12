@@ -2944,13 +2944,21 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
     std::map<uint64_t, uint64_t> tailBestSupport; // tail -> max support to one target
     std::map<uint64_t, uint64_t> headEnterTotal;  // head -> total enter reads
     std::map<uint64_t, uint64_t> headBestSupport; // head -> max support from one source
+    std::map<uint64_t, uint64_t> tailBestTarget;  // tail -> its best target head
+    std::map<uint64_t, uint64_t> headBestSource;  // head -> its best source tail
     for(const auto& [pair, reads] : bridgeReads) {
         const uint64_t s = reads.size();
         const uint64_t tail = pair.first, head = pair.second;
         tailExitTotal[tail] += s;
-        if(s > tailBestSupport[tail]) tailBestSupport[tail] = s;
+        if(s > tailBestSupport[tail]) {
+            tailBestSupport[tail] = s;
+            tailBestTarget[tail] = head;
+        }
         headEnterTotal[head] += s;
-        if(s > headBestSupport[head]) headBestSupport[head] = s;
+        if(s > headBestSupport[head]) {
+            headBestSupport[head] = s;
+            headBestSource[head] = tail;
+        }
     }
 
     // Classify each bridging tail by its best target's cleanliness.
@@ -2972,6 +2980,31 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
         if(contradiction == 0)        ++cleanHeads;
         else if(best > contradiction) ++dominantHeads;
         else                          ++ambiguousHeads;
+    }
+
+    // Confident bridges = exactly what Stage B.2 would add. A bridge tail->head
+    // qualifies if it is mutually-best (tail's best target is head AND head's
+    // best source is tail), BOTH endpoints are non-ambiguous (best > contra, or
+    // contra == 0), and support >= 2 (no single-read seed). Counted per
+    // direction; the RC mirror would double this in the actual graph.
+    auto notAmbiguous = [](uint64_t total, uint64_t best) -> bool {
+        const uint64_t contradiction = total - best;
+        return contradiction == 0 || best > contradiction;
+    };
+    uint64_t confidentBridges = 0;
+    uint64_t mutuallyBest = 0;
+    for(const auto& [pair, reads] : bridgeReads) {
+        const uint64_t tail = pair.first, head = pair.second;
+        const bool mutual =
+            tailBestTarget.count(tail) && tailBestTarget[tail] == head &&
+            headBestSource.count(head) && headBestSource[head] == tail;
+        if(!mutual) continue;
+        ++mutuallyBest;
+        const bool tailOk = notAmbiguous(tailExitTotal[tail], tailBestSupport[tail]);
+        const bool headOk = notAmbiguous(headEnterTotal[head], headBestSupport[head]);
+        if(tailOk && headOk && reads.size() >= 2) {
+            ++confidentBridges;
+        }
     }
 
     cout << "\n=== Segment-bridge diagnostic (most-read-supported, read-only) ===\n";
@@ -3009,6 +3042,12 @@ void Shasta2AssemblyGraph::reportSegmentBridges(
          << "   <- defer (no clear winner)\n";
     cout << "   A bridge is a confident join only if BOTH its tail and head are\n";
     cout << "   clean/dominant; clean-clean pairs are the safest Stage B edges.\n";
+
+    cout << "-- Confident bridges (what Stage B.2 would add) --\n";
+    cout << "   mutually-best pairs:           " << mutuallyBest << "\n";
+    cout << "   confident (mutual + both non-ambiguous + support>=2): "
+         << confidentBridges << "\n";
+    cout << "   (RC mirror doubles this in the actual graph.)\n";
     cout << "=== end segment-bridge diagnostic ===\n" << endl;
 }
 
