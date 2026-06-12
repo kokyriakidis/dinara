@@ -146,6 +146,37 @@ Units are `(window, strand)` = raw window IDs `[0, 2*windowCount)`, IDs ≥
 graphs as exact reverse complements; "parity conflict" surfaces as
 `find(X) == find(complement(Y))`. Reuses `dset64`.
 
+### Bidirected vs explicit-mirror: where the parity guard fires
+
+Verkko uses a bidirected graph (one node per locus, strand is an edge property),
+so a strand-strand contact is a hairpin `>node -> <node` on a single node id, and
+its resolution is to **split** that node into fw/bw copies. We use a directed
+graph with **explicit RC mirror windows** — strand is a node identity, two nodes
+(`w`, `complement(w)`) per locus. The mirror split Verkko performs at resolution
+time is therefore **already done at construction** for us; Verkko's "split" maps
+to a **no-op** here, and its read-support gate ports unchanged (it is the real
+engine in both systems).
+
+Consequence — **the parity guard must fire on UNITE/contraction, never on edge
+admission.** Because strands are separate nodes, a *real inverted-repeat
+fold-back is an edge from a fw-window to an rc-window* (`A -> A'`), and for any
+fold-back `complement(A') == A`, so `find(A) == find(complement(A'))` fires
+trivially. Applying the parity test at edge admission would delete every genuine
+IR. The correct rule:
+
+- **Admit** a corroborated fw->rc edge — it is a legitimate edge between two
+  distinct nodes (component-of-`A` and component-of-`A'`).
+- **Forbid only the UNITE** that would merge a component with its own mirror
+  (`union` whose two sides satisfy `find(X) == find(complement(Y))`). Fusing a
+  component into its mirror is the marker-graph collapse signature; edges
+  *between* mirror components are fine, *fusing* them is the violation.
+
+So the discriminator between "real IR" and "collapse artifact" is the same as
+Verkko's — read support — and the only model-dependent difference is the verdict:
+Verkko splits; we simply decline to fuse (the split already exists). Both 1a
+mirror-union and 1b resolution unions are subject to this guard; edge admission
+is not.
+
 ## Data available (verified)
 
 - `windowPairTransitions: map<pair<uint32_t,uint32_t>, vector<ReadTransition>>`,
@@ -156,10 +187,15 @@ graphs as exact reverse complements; "parity conflict" surfaces as
 
 ## Where it plugs in
 
-`Shasta2AnchorGraph` constructor inter-window edge creation
-(`src/Shasta2AnchorGraph.cpp` ~626–672). Replaces admission: build candidates,
-run 1a then 1b, create edges only for unioned connections (reuse existing
-best-pair + `addEdgeIfValid`). Intra-window backbone untouched. Directed pipeline.
+**Separate post-pass, NOT constructor surgery.** The working constructor
+(`src/Shasta2AnchorGraph.cpp`) builds the full directed graph (including the
+inter-window edges at ~626–672) unchanged. Phase 1 runs as a new method invoked
+*after* construction, consuming `windowPairTransitions` and the built edge set,
+and rewriting edges in place: it contracts (1a), resolves (1b), and then keeps
+only edges backed by a union; un-unioned edges are disabled via the existing
+`disableEdge` (RC-mirror aware). This isolates the new logic from the proven
+build path — if the post-pass is a no-op, the graph is identical to today's.
+Directed pipeline; intra-window backbone untouched.
 
 ## Verification (structural, no truth set)
 
