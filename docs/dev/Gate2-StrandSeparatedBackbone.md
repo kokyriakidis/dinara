@@ -76,33 +76,54 @@ A (1,1) window is NOT contracted (diverted to the difficult set) if either:
   physical read among its supporting reads (self-fold / palindrome / collapse
   signature). Detected per window before contraction.
 
-## Phase 1b — Join across junctions (corroborated, strand-guarded)
+## Phase 1b — Resolve junctions (corroborated, strand-guarded, shortest-first)
 
-Reads are sorted **longest first** (exploration order = maximal total span; this
-is the span metric realized at journey granularity). No chimera pre-screen —
-corroboration does the screening.
+Adopts Verkko's control flow: NO single read seeds the backbone (a long chimeric
+read must never be a seed). Support is accumulated from ALL read paths
+(order-independent), then nodes are resolved **shortest-first**, length-stepped,
+re-contracting safe unitigs after each round and iterating at increasing length.
+This resolves the easiest (short, well-spanned) ambiguities first and simplifies
+larger structure before attempting it.
+
+**Triplet** = `(prevWindow, window, nextWindow)` from a read path crossing the
+window. A triplet is **solid** iff count >= N AND span product >= T. A junction is
+**resolvable** iff EVERY significant incident edge is covered by a solid triplet
+(all-or-nothing, per Verkko); otherwise the whole node is deferred.
 
 ```
-# Accumulate corroboration over ALL reads first.
+# 1. Accumulate triplet support from ALL read paths (order-independent).
 for each read R:
     project journey -> window chain w0..wk
-    for consecutive (wi, wi+1):
-        support[(wi,wi+1)].count += 1
-        support[(wi,wi+1)].spanProduct += this transition's supportingSpanProduct
+    for each interior wi (with prev wi-1, next wi+1):
+        triplet[(wi-1, wi, wi+1)].count += 1
+        triplet[(wi-1, wi, wi+1)].spanProduct += transition supportingSpanProduct
 
-# Lay junctions, longest read first, union only corroborated + strand-safe steps.
-for each read R (longest first):
-    for consecutive (wi, wi+1):
-        s = support[(wi,wi+1)]
-        if s.count < N or s.spanProduct < T:          -> uncorroborated -> difficult
-        elif find(wi) == find(complement(wi+1)):       -> strand conflict -> difficult
-        elif wi or wi+1 is fw/rc-same-read window:      -> difficult
-        else: union(wi, wi+1); mirror-union complements
+# 2. Resolve shortest-first, length-stepped, iterate.
+heap = windows not in safe unitigs, keyed by window length (SHORTEST first)
+while heap not empty and currentLength <= maxResolveLength:
+    for each window W at this length:
+        if W is hairpin / fw-rc-same-read: defer (Phase 2); continue
+        incident = significant incident edges of W
+        if every edge in incident is covered by a solid triplet
+           AND all implied unions are strand-safe
+           (find(side) != find(complement(otherSide))):
+              for each solid triplet through W:
+                  union(prev, W); union(W, next); mirror-union complements
+        else:
+              defer W (difficult, reason = uncorroborated/strand/partial)
+    re-contract safe (1,1) unitigs; re-push affected windows
+    advance currentLength
+
+A chimeric read contributes count 1 to its false triplet; no other read
+corroborates -> never solid -> never unioned. The chimera screens itself out, and
+because no read seeds the backbone, a long chimera cannot anchor a false join.
 ```
 
-A chimeric read contributes to `support` for its false step, but that step stays
-at count 1 (no other read corroborates) -> never unioned. The chimera screens
-itself out.
+### Safe-unitig immunity (per Verkko)
+
+Windows contracted into safe (1,1) unitigs in 1a are **protected**: they are not
+subject to the corroboration gate or deferral in 1b. Only non-safe (junction)
+windows are resolved or deferred.
 
 ## Difficult set (Phase 2 input — preserved, never discarded)
 
@@ -175,9 +196,11 @@ validating this design and suggesting refinements:
   dedicated phase (our Phase 2), with the same all-edges-covered rule.
 - `resolve` driver: heap of nodes by unitig length, **shortest first**,
   length-stepped with a `max_resolve_length` cap, re-unitigify and re-push after
-  each resolution; outer loop over increasing `resolve_steps`. Consider adopting
-  shortest-first + iterate (vs our longest-read-first) to avoid over-committing
-  to large joins before small ambiguities are cleared.
+  each resolution; outer loop over increasing `resolve_steps`. ADOPTED: 1b uses
+  shortest-first, length-stepped, iterate (replacing the earlier
+  longest-read-first seeding, which is unnecessary and risks a long chimera
+  seeding a false join). Support is accumulated from all read paths
+  order-independently; no single read seeds the backbone.
 
 ## Scope boundaries
 
