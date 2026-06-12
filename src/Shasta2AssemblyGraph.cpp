@@ -3179,23 +3179,56 @@ uint64_t Shasta2AssemblyGraph::addConfidentBridges(
         return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
     };
 
-    // Add a single-step bridge edge from segA's target vertex to segB's source
-    // vertex. Returns true if an edge was created.
+    // Add a bridge edge from segA's target vertex to segB's source vertex.
+    // The bridge spans the inter-segment "mess": a read crosses segA's tail
+    // WINDOW to segB's head WINDOW, but almost never traverses the two specific
+    // endpoint backbone anchors directly, so a single AnchorPair(anchorId0,
+    // anchorId1) has zero coverage. Instead, build a restricted anchor graph
+    // over the tangle and find the optimal multi-step path anchorId0 ->
+    // anchorId1, emplacing each step (this is the proven pattern used by the
+    // detangle path). The resulting edge starts at anchorId0 and ends at
+    // anchorId1 (satisfying check()) while every step is read-supported.
+    // Returns true if an edge was created.
+    const Shasta2Journeys* journeys = getJourneysPointer();
     auto addBridgeEdge = [&](uint64_t segA, uint64_t segB) -> bool {
+        if(journeys == nullptr) return false;
         auto itA = segmentEdge.find(segA);
         auto itB = segmentEdge.find(segB);
         if(itA == segmentEdge.end() || itB == segmentEdge.end()) return false;
-        const vertex_descriptor v0 = target(itA->second, assemblyGraph);
-        const vertex_descriptor v1 = source(itB->second, assemblyGraph);
+        const edge_descriptor e0 = itA->second;
+        const edge_descriptor e1 = itB->second;
+        const vertex_descriptor v0 = target(e0, assemblyGraph);
+        const vertex_descriptor v1 = source(e1, assemblyGraph);
+        if(v0 == v1) return false;
         const Shasta2AnchorId anchorId0 = assemblyGraph[v0].anchorId;
         const Shasta2AnchorId anchorId1 = assemblyGraph[v1].anchorId;
         if(anchorId0 == invalid<Shasta2AnchorId> ||
            anchorId1 == invalid<Shasta2AnchorId>) return false;
+        if(anchorId0 == anchorId1) return false;
 
-        // Reads spanning anchorId0 -> anchorId1 across the mess (not adjacent).
-        Shasta2AnchorPair anchorPair(*anchors, anchorId0, anchorId1, false);
-        if(anchorPair.size() == 0) return false;
-        const uint32_t offset = anchorPair.getAverageOffset(*anchors);
+        // Find the optimal read-supported path through the tangle.
+        ostream html(0);
+        vector<std::pair<Shasta2AnchorPair, uint64_t>> steps; // (anchorPair, offset)
+        vector<Shasta2AnchorId> chain;
+        try {
+            const Shasta2TangleMatrix1 tangleMatrix(assemblyGraph, {e0}, {e1}, html);
+            Shasta2RestrictedAnchorGraph restrictedAnchorGraph(
+                *anchors, *journeys, tangleMatrix, 0, 0, html);
+            vector<Shasta2RestrictedAnchorGraph::edge_descriptor> path;
+            restrictedAnchorGraph.findOptimalPath(anchorId0, anchorId1, path);
+            if(path.empty()) return false;
+            for(const Shasta2RestrictedAnchorGraph::edge_descriptor re: path) {
+                const auto& rEdge = restrictedAnchorGraph[re];
+                if(rEdge.anchorPair.size() == 0) return false;
+                steps.push_back({rEdge.anchorPair, rEdge.offset});
+                chain.push_back(rEdge.anchorPair.anchorIdA);
+            }
+            chain.push_back(steps.back().first.anchorIdB);
+        } catch(const std::exception&) {
+            return false;
+        }
+        // The path must start at anchorId0 and end at anchorId1 for check().
+        if(chain.front() != anchorId0 || chain.back() != anchorId1) return false;
 
         edge_descriptor eNew;
         bool added = false;
@@ -3203,7 +3236,10 @@ uint64_t Shasta2AssemblyGraph::addConfidentBridges(
             Shasta2AssemblyGraphEdge(nextEdgeId++), assemblyGraph);
         if(!added) return false;
         Shasta2AssemblyGraphEdge& bridge = assemblyGraph[eNew];
-        bridge.emplace_back(anchorPair, offset);
+        for(const auto& [ap, off] : steps) {
+            bridge.emplace_back(ap, off);
+        }
+        bridge.anchorChain = chain;
         return true;
     };
 
