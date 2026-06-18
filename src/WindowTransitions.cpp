@@ -766,6 +766,98 @@ void dinara::computeWindowTransitions(
                      << unitigCount << " unitigs), longest "
                      << longestCanonical << " windows; "
                      << orientConflicts << " orientation conflicts)." << endl;
+
+                // ------------------------------------------------------------
+                // Read-threading resolution check (proof that branches split).
+                //
+                // A branch window W is resolvable into per-copy chains when its
+                // incoming arcs (X -> W) pair one-to-one with its outgoing arcs
+                // (W -> Y) by shared reads: a read entering via X->W and leaving
+                // via W->Y threads the copy X -> W -> Y. We compute, per window,
+                // a greedy maximum read-shared matching between in- and out-arcs
+                // and report whether every incident arc is matched (cleanly
+                // resolvable) or some arc has no read-sharing partner (a true
+                // tip/branch end). This validates the split rule for step 2
+                // without mutating any real structure.
+                //
+                // Incoming arcs per vertex.
+                vector<vector<uint32_t>> inAdjV(vertexCount);
+                for(uint32_t a = 0; a < vertexCount; a++) {
+                    for(const auto& [b, w] : outAdj[a]) { (void)w; inAdjV[b].push_back(a); }
+                }
+
+                auto sharedReads =
+                    [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) -> uint64_t {
+                        auto i1 = arcReads.find({a, b});
+                        auto i2 = arcReads.find({c, d});
+                        if(i1 == arcReads.end() || i2 == arcReads.end()) return 0;
+                        vector<uint32_t> x = i1->second, y = i2->second;
+                        std::sort(x.begin(), x.end());
+                        x.erase(std::unique(x.begin(), x.end()), x.end());
+                        std::sort(y.begin(), y.end());
+                        y.erase(std::unique(y.begin(), y.end()), y.end());
+                        uint64_t inter = 0, i = 0, j = 0;
+                        while(i < x.size() && j < y.size()) {
+                            if(x[i] == y[j]) { inter++; i++; j++; }
+                            else if(x[i] < y[j]) i++; else j++;
+                        }
+                        return inter;
+                    };
+
+                ofstream threadCsv("WindowThreading.csv");
+                threadCsv << "Window,InDeg,OutDeg,MatchedPairs,"
+                             "UnmatchedIn,UnmatchedOut,CopiesNeeded,Resolved\n";
+
+                uint64_t windowsThreaded = 0, windowsClean = 0;
+                uint64_t totalUnmatched = 0;
+                for(uint32_t W = 0; W < windowCount; W++) {
+                    const uint32_t v = vid(W, false);
+                    const auto& outs = outAdj[v];
+                    const auto& ins  = inAdjV[v];
+                    if(ins.empty() && outs.empty()) continue;   // unplaced
+                    windowsThreaded++;
+
+                    // Greedy max-shared one-to-one matching of in-arc -> out-arc.
+                    vector<uint8_t> outUsed(outs.size(), 0);
+                    uint64_t matched = 0;
+                    for(uint32_t xi = 0; xi < ins.size(); xi++) {
+                        const uint32_t X = ins[xi];
+                        int64_t bestY = -1; uint64_t bestS = 0;
+                        for(uint32_t yi = 0; yi < outs.size(); yi++) {
+                            if(outUsed[yi]) continue;
+                            const uint64_t s = sharedReads(X, v, v, outs[yi].first);
+                            if(s > bestS) { bestS = s; bestY = int64_t(yi); }
+                        }
+                        if(bestY >= 0 && bestS > 0) {
+                            outUsed[bestY] = 1;
+                            matched++;
+                        }
+                    }
+                    const uint64_t unmatchedIn  = ins.size()  - matched;
+                    const uint64_t unmatchedOut = outs.size() - matched;
+                    // Copies needed = matched through-paths + dangling ends.
+                    const uint64_t copies =
+                        std::max<uint64_t>({matched, ins.size(), outs.size()});
+                    // "Resolved" if all interior degree is accounted for by a
+                    // matching: every in pairs to an out except genuine ends.
+                    const bool resolved =
+                        (unmatchedIn == 0 || ins.empty()) &&
+                        (unmatchedOut == 0 || outs.empty());
+                    if(resolved) windowsClean++;
+                    totalUnmatched += unmatchedIn + unmatchedOut;
+
+                    threadCsv << W << ',' << ins.size() << ',' << outs.size()
+                              << ',' << matched << ',' << unmatchedIn << ','
+                              << unmatchedOut << ',' << copies << ','
+                              << (resolved ? 1 : 0) << '\n';
+                }
+                threadCsv.close();
+
+                cout << timestamp << "Read-threading resolution written to "
+                        "WindowThreading.csv (" << windowsThreaded
+                     << " placed windows; " << windowsClean
+                     << " cleanly threaded, " << totalUnmatched
+                     << " unmatched arc ends = contig tips)." << endl;
             }
 
             // Per-window node report. For each window, record both strands'
