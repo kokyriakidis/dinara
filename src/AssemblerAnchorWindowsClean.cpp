@@ -59,6 +59,19 @@ struct CleanWindowCandidateLess {
 // exclusive cores; this exclusive toggle is kept off pending that halo work.
 constexpr bool claimWholeJourneyDovetails = false;
 
+// Full-journey-only window seeding. When true, a read seeds a window ONLY if
+// its entire journey is still unclaimed (one window = one whole read journey).
+// Partially-claimed reads are skipped entirely, so no "fragment" windows are
+// produced from leftover unclaimed runs. This yields pristine disjoint cores
+// (each core is a complete read) and leaves the dovetail/overlap seams between
+// cores unclaimed, to be reconnected by the Stage B.2 bridge mechanism rather
+// than by fragment windows. When false, the original behavior is used: each
+// contiguous unclaimed run of a read's journey seeds its own window.
+//
+// NOTE: this raises the unclaimed-anchor fraction (seams are not tiled by
+// fragments). See the unclaimedAnchors count logged at the end.
+constexpr bool fullJourneyWindowsOnly = true;
+
 } // anonymous namespace
 
 
@@ -593,6 +606,10 @@ void Assembler::computeAnchorWindowsClean(
         const bool isFullJourney = (unclaimedIntervals.size() == 1 &&
             unclaimedIntervals[0].first == 0 &&
             unclaimedIntervals[0].second == uint32_t(journey.size()));
+
+        // Full-journey-only: skip reads that are not entirely unclaimed, so no
+        // fragment windows are seeded from leftover unclaimed runs.
+        if(fullJourneyWindowsOnly && !isFullJourney) continue;
 
         for(const auto& [intervalBegin, intervalEnd] : unclaimedIntervals) {
             if(minWindowBaseSpan > 0 && (intervalEnd - intervalBegin) >= 2) {
