@@ -214,6 +214,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Stage A length-weighted reciprocal-best inter-window backbone.
     constexpr bool edgelessWindows = true;
 
+    // Strict 1-to-1 window connection. When true, connect a window pair A->B
+    // with an edge only when A has exactly one outgoing window neighbor AND B
+    // has exactly one incoming window neighbor (degree counted over read-
+    // supported transitions, both forward and RC-mirror). This adds only the
+    // unambiguous linear links between disjoint cores, leaving forks/joins for
+    // the bridge stage. Independent of edgelessWindows (which only controls the
+    // Stage A reciprocal-best block).
+    constexpr bool connectOneToOneWindows = true;
+
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
     // (windowId + windowCount) whose backbone anchors are the RC (anchorId ^ 1)
@@ -662,6 +671,82 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     if(edgelessWindows) {
         cout << "Edgeless-windows: skipping inter-window edge creation; "
              << "windows remain disjoint anchor sets." << endl;
+    }
+
+    // Strict 1-to-1 window connection. Connect A->B only when A has exactly one
+    // outgoing window neighbor AND B has exactly one incoming window neighbor.
+    // Degree is counted over ALL read-supported transitions (support >= 1),
+    // including the RC mirror pair so degrees are strand-symmetric. This adds
+    // only unambiguous linear links between disjoint cores; forks (outdeg > 1)
+    // and joins (indeg > 1) are left for the bridge stage.
+    if(connectOneToOneWindows) {
+        auto rcWindow = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
+        };
+
+        // Distinct out-neighbors per source window and in-neighbors per dest
+        // window, over forward and RC-mirror pairs (any support >= 1 counts).
+        std::map<uint32_t, std::set<uint32_t>> outNeighbors;
+        std::map<uint32_t, std::set<uint32_t>> inNeighbors;
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            if(transitions.empty()) continue;
+            const uint32_t A = windowPair.first, B = windowPair.second;
+            outNeighbors[A].insert(B);
+            inNeighbors[B].insert(A);
+            // RC mirror: rcWindow(B) -> rcWindow(A).
+            const uint32_t mA = rcWindow(B), mB = rcWindow(A);
+            outNeighbors[mA].insert(mB);
+            inNeighbors[mB].insert(mA);
+        }
+
+        uint64_t oneToOneCreated = 0;
+        uint64_t oneToOneSkipped = 0;
+        for(const auto& [windowPair, transitions] : windowPairTransitions) {
+            if(transitions.empty()) continue;
+            const uint32_t A = windowPair.first, B = windowPair.second;
+
+            // Strict 1-to-1 gate: A's only out-neighbor is B and B's only
+            // in-neighbor is A.
+            auto itO = outNeighbors.find(A);
+            auto itI = inNeighbors.find(B);
+            const bool oneToOne =
+                itO != outNeighbors.end() && itO->second.size() == 1 &&
+                itI != inNeighbors.end()  && itI->second.size() == 1;
+            if(!oneToOne) {
+                ++oneToOneSkipped;
+                continue;
+            }
+
+            // Pick the highest-coverage anchor pair among this pair's reads.
+            Shasta2AnchorPair bestPair;
+            uint64_t bestCoverage = 0;
+            for(const auto& t : transitions) {
+                Shasta2AnchorPair candidatePair(
+                    anchors, t.lastAnchorInA, t.firstAnchorInB, false);
+                candidatePair.assertNoNegativeOffsets(anchors);
+                if(candidatePair.size() > bestCoverage) {
+                    bestCoverage = candidatePair.size();
+                    bestPair = std::move(candidatePair);
+                }
+            }
+            if(bestCoverage == 0) continue;
+
+            if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
+                ++oneToOneCreated;
+                // RC mirror edge.
+                const Shasta2AnchorId rcA =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdA) ^ 1ULL);
+                const Shasta2AnchorId rcB =
+                    Shasta2AnchorId(uint64_t(bestPair.anchorIdB) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    addEdgeIfValid(rcB, rcA);
+                }
+            }
+        }
+
+        cout << "Inter-window edges (strict 1-to-1): " << oneToOneCreated
+             << " created, " << oneToOneSkipped
+             << " skipped (not 1-to-1)." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.
