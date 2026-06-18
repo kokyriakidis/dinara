@@ -3878,12 +3878,7 @@ public:
         uint64_t minCommonForBackbone = 2,
         uint64_t maxSkipForBackbone = 10,
         uint64_t minWindowBaseSpan = 4000,
-        vector<uint32_t>* anchorDovetailWindow = nullptr,
-        // windowHalos (optional output): per-window forward-oriented anchor set
-        // of backbone + all touchers' whole journeys. Multi-owner across
-        // windows; the intersection of two windows' halos is their overlap.
-        // Read-only diagnostic; does not affect claiming or topology.
-        vector<vector<uint32_t>>* windowHalos = nullptr);
+        vector<uint32_t>* anchorDovetailWindow = nullptr);
 
     // Detect clean het SNPs in an anchor window using Theseus MSA.
     // Returns the number of SNPs passing strand bias and repeat filtering.

@@ -207,6 +207,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     nextEdgeId = 0;
 
+    // Edgeless-windows toggle. When true, inter-window edges are not created:
+    // each window remains a bare anchor set (its intra-window backbone chain
+    // is still built, but windows are not connected to each other). Downstream
+    // stages still run on the resulting graph. Set to false to restore the
+    // Stage A length-weighted reciprocal-best inter-window backbone.
+    constexpr bool edgelessWindows = true;
+
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
     // (windowId + windowCount) whose backbone anchors are the RC (anchorId ^ 1)
@@ -650,6 +657,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
 
+    // Edgeless-windows: skip all inter-window edge creation. Windows stay as
+    // bare anchor sets (intra-window backbone chains above are kept).
+    if(edgelessWindows) {
+        cout << "Edgeless-windows: skipping inter-window edge creation; "
+             << "windows remain disjoint anchor sets." << endl;
+    }
+
     // Stage A: length-weighted reciprocal-best inter-window edges.
     //
     // Start from all windows as nodes with no inter-window edges, then connect
@@ -666,6 +680,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // (mirror pairs merged and erased) while edge creation emits both the
     // forward and the RC mirror edge, so best-in/best-out is accumulated over
     // both the forward pair (A,B) and its mirror (rcWindow(B), rcWindow(A)).
+    //
+    // Gated by edgelessWindows: when edgeless, this entire inter-window edge
+    // construction is skipped (kept here, not deleted, for easy restoration).
+    if(!edgelessWindows)
     {
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);

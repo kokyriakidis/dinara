@@ -59,15 +59,6 @@ struct CleanWindowCandidateLess {
 // exclusive cores; this exclusive toggle is kept off pending that halo work.
 constexpr bool claimWholeJourneyDovetails = false;
 
-// Shared dovetail halo (read-only model). Independent of claiming/ownership:
-// each window's halo is the set of forward-oriented anchors from its backbone
-// plus the WHOLE journeys of all reads touching the backbone. Halos are
-// MULTI-OWNER (a connecting read's journey lands in both neighbors' halos), so
-// the intersection of two windows' halos is the overlap that should register
-// their connection. This is collected for diagnostics only; it does not affect
-// claiming, anchorToWindow, or topology. The exclusive core stays disjoint.
-constexpr bool buildWindowHalo = true;
-
 } // anonymous namespace
 
 
@@ -81,8 +72,7 @@ void Assembler::computeAnchorWindowsClean(
     uint64_t minCommonForBackbone,
     uint64_t maxSkipForBackbone,
     uint64_t minWindowBaseSpan,
-    vector<uint32_t>* anchorDovetailWindow,
-    vector<vector<uint32_t>>* windowHalos)
+    vector<uint32_t>* anchorDovetailWindow)
 {
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
@@ -121,14 +111,6 @@ void Assembler::computeAnchorWindowsClean(
         if(claimWholeJourneyDovetails) {
             anchorDovetailWindow->assign(anchorCount, dovetailNoWindow);
         }
-    }
-
-    // Shared dovetail halo (read-only). Per window, the forward-oriented anchor
-    // set of backbone + all touchers' whole journeys. Multi-owner across
-    // windows; collected only when requested.
-    const bool recordHalo = (windowHalos != nullptr) && buildWindowHalo;
-    if(windowHalos != nullptr) {
-        windowHalos->clear();
     }
 
     // Per-oriented-read scratch for tracking which reads touch the current backbone.
@@ -536,33 +518,6 @@ void Assembler::computeAnchorWindowsClean(
                     }
                 }
             }
-        }
-
-        // Collect this window's shared halo: forward-oriented anchors from the
-        // WHOLE journeys of backbone + all touchers (readSpans), independent of
-        // claiming. Multi-owner across windows; read-only for diagnostics.
-        if(recordHalo) {
-            std::unordered_set<uint64_t> haloSet;
-            for(const ReadSpan& span : readSpans) {
-                const auto journey = (*shasta2Journeys)[span.oid];
-                const bool readIsStrand1 = (span.oid.getStrand() == 1);
-                for(uint32_t readPos = 0; readPos < uint32_t(journey.size()); readPos++) {
-                    const uint64_t anchorId = uint64_t(journey[readPos]);
-                    const uint64_t forwardAid =
-                        readIsStrand1 ? (anchorId ^ 1ULL) : anchorId;
-                    if(forwardAid < anchorCount) {
-                        haloSet.insert(forwardAid);
-                    }
-                }
-            }
-            vector<uint32_t> halo;
-            halo.reserve(haloSet.size());
-            for(const uint64_t aid : haloSet) {
-                halo.push_back(uint32_t(aid));
-            }
-            // windowId equals current anchorWindows.size(); halos are pushed in
-            // the same order, so index alignment is maintained.
-            windowHalos->push_back(std::move(halo));
         }
 
         // Now that claiming is done, bump generations and re-push unclaimed

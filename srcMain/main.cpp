@@ -28,7 +28,6 @@
 #include "BidirectedAnchorGraph.hpp"
 #include "DinaraDetangle.hpp"
 #include "WindowTransitions.hpp"
-#include "WindowHaloOverlap.hpp"
 #include "performanceLog.hpp"
 #include "Reads.hpp"
 #include "Tee.hpp"
@@ -1135,7 +1134,6 @@ void dinara::main::assemble(
     cout << timestamp << "Computing anchor windows..." << endl;
     vector<AnchorWindow> anchorWindows;
     vector<uint32_t> anchorDovetailWindow;
-    vector<vector<uint32_t>> windowHalos;
     const uint64_t minCommonForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
@@ -1149,14 +1147,7 @@ void dinara::main::assemble(
         minCommonForBackbone,
         maxSkipForBackbone,
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
-        &anchorDovetailWindow,
-        &windowHalos);
-
-    // Read-only: validate the shared dovetail-halo premise by measuring how
-    // much neighboring windows' halos overlap. Holds before any overlap-based
-    // connectivity (registration solver) is built.
-    reportWindowHaloOverlaps(windowHalos,
-        assembler.shasta2Anchors->size());
+        &anchorDovetailWindow);
 
     // // CIGAR-based het SNP detection per window.
     // {
