@@ -1559,7 +1559,7 @@ void dinara::main::assemble(
     // edge near the far end and disable the entire window interior, destroying
     // total length and shrinking windows below minWindowBaseSpan. With full-
     // read disjoint cores we want the full backbone preserved.
-    constexpr bool trimBackbonesEnabled = false;
+    constexpr bool trimBackbonesEnabled = true;
     if(trimBackbonesEnabled) {
         shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
     }
