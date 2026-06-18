@@ -853,15 +853,19 @@ def installShasta2():
                  runCommand(f"find {installTmpDir} -name '*.a'")
 
         
-        # Install shasta2 headers
+        # Install shasta2 headers.
+        # dinara includes shasta2's INTERNAL src/ headers (e.g.
+        # shasta2/CycleAvoider.hpp, SimpleMap.hpp, algorithm.hpp), but shasta2's
+        # CMake has no header-install rule, so install_tmp/include (when it
+        # exists) is an incomplete subset. Always copy from src/ (which contains
+        # every header dinara needs), then overlay install_tmp/include if present
+        # for any generated headers.
         if not os.path.exists(installPath):
             os.makedirs(installPath, exist_ok=True)
-        # Check install_tmp first, then src
+        runCommand("cp -r ../src/* " + installPath)
         tmpInclude = os.path.join(installTmpDir, "include")
         if os.path.exists(tmpInclude):
              runCommand(f"cp -r {tmpInclude}/* {installPath}")
-        else:
-             runCommand("cp -r ../src/* " + installPath)
         
         os.chdir(oldDirectory)
 
