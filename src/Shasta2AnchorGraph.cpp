@@ -708,9 +708,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
         uint64_t oneToOneCreated = 0;
         uint64_t oneToOneSkipped = 0;
+        uint64_t selfRcSkipped = 0;
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
             if(transitions.empty()) continue;
             const uint32_t A = windowPair.first, B = windowPair.second;
+
+            // Hard strand separation: skip self-RC edges, where A and B are the
+            // forward and RC mirror of the same locus (normalize(A)==normalize(B)).
+            // Such an edge crosses from the forward strand into the RC strand at
+            // one window; forbidding it keeps the forward and RC lattices as two
+            // disjoint parallel copies. (Drops inverted-repeat fold-backs, which
+            // is the intended trade for guaranteed strand separation.)
+            {
+                const uint32_t normA = (A >= windowCount) ? (A - windowCount) : A;
+                const uint32_t normB = (B >= windowCount) ? (B - windowCount) : B;
+                if(normA == normB) {
+                    ++selfRcSkipped;
+                    continue;
+                }
+            }
 
             // Strict 1-to-1 gate: A's only out-neighbor is B and B's only
             // in-neighbor is A. Bypassed when connectAllWindows is set.
@@ -754,7 +770,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "Inter-window edges ("
              << (connectAllWindows ? "all pairs" : "strict 1-to-1") << "): "
              << oneToOneCreated << " created, " << oneToOneSkipped
-             << " skipped (not 1-to-1)." << endl;
+             << " skipped (not 1-to-1), " << selfRcSkipped
+             << " skipped (self-RC, strand separation)." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.
