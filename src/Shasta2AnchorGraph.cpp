@@ -223,6 +223,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Stage A reciprocal-best block).
     constexpr bool connectOneToOneWindows = true;
 
+    // Connect ALL inter-window pairs (diagnostic). When true, the strict
+    // 1-to-1 gate is bypassed and an edge is created for every read-supported
+    // window pair (support >= 1), forward and RC-mirror. Use to visualize the
+    // full inter-window connectivity. Requires connectOneToOneWindows = true
+    // (this overrides the degree gate inside that block).
+    constexpr bool connectAllWindows = true;
+
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
     // (windowId + windowCount) whose backbone anchors are the RC (anchorId ^ 1)
@@ -706,13 +713,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             const uint32_t A = windowPair.first, B = windowPair.second;
 
             // Strict 1-to-1 gate: A's only out-neighbor is B and B's only
-            // in-neighbor is A.
+            // in-neighbor is A. Bypassed when connectAllWindows is set.
             auto itO = outNeighbors.find(A);
             auto itI = inNeighbors.find(B);
             const bool oneToOne =
                 itO != outNeighbors.end() && itO->second.size() == 1 &&
                 itI != inNeighbors.end()  && itI->second.size() == 1;
-            if(!oneToOne) {
+            if(!connectAllWindows && !oneToOne) {
                 ++oneToOneSkipped;
                 continue;
             }
@@ -744,8 +751,9 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
-        cout << "Inter-window edges (strict 1-to-1): " << oneToOneCreated
-             << " created, " << oneToOneSkipped
+        cout << "Inter-window edges ("
+             << (connectAllWindows ? "all pairs" : "strict 1-to-1") << "): "
+             << oneToOneCreated << " created, " << oneToOneSkipped
              << " skipped (not 1-to-1)." << endl;
     }
 
