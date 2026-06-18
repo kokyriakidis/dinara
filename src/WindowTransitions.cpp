@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <set>
 #include <vector>
 
 using namespace dinara;
@@ -625,11 +626,12 @@ void dinara::computeWindowTransitions(
             };
 
             vector<uint8_t> visited(vertexCount, 0);
-            uint64_t unitigCount = 0, branchVertices = 0, tipVertices = 0;
+            uint64_t branchVertices = 0, tipVertices = 0;
             uint64_t longestUnitig = 0;
 
-            ofstream unitigsCsv("WindowUnitigs.csv");
-            unitigsCsv << "UnitigId,WindowCount,WindowPath\n";
+            // Collect all unitig paths (as oriented vertex sequences) first, so
+            // we can twin-dedup before emitting canonical linear paths.
+            vector<vector<uint32_t>> unitigPaths;
 
             for(uint32_t start = 0; start < vertexCount; start++) {
                 if(outDeg[start] > 1) branchVertices++;
@@ -653,18 +655,118 @@ void dinara::computeWindowTransitions(
                 }
                 if(path.empty()) continue;
 
-                unitigCount++;
                 longestUnitig = std::max(longestUnitig, uint64_t(path.size()));
-                std::string pathStr;
-                for(uint64_t i = 0; i < path.size(); i++) {
-                    if(i) pathStr += ' ';
-                    pathStr += std::to_string(vWindow(path[i]));
-                    pathStr += vStrandChar(path[i]);
-                }
-                unitigsCsv << unitigCount << ',' << path.size() << ','
-                           << pathStr << '\n';
+                unitigPaths.push_back(std::move(path));
             }
-            unitigsCsv.close();
+            const uint64_t unitigCount = unitigPaths.size();
+
+            // Emit raw unitigs (both strands) for inspection.
+            {
+                ofstream unitigsCsv("WindowUnitigs.csv");
+                unitigsCsv << "UnitigId,WindowCount,WindowPath\n";
+                for(uint64_t u = 0; u < unitigPaths.size(); u++) {
+                    const auto& path = unitigPaths[u];
+                    std::string pathStr;
+                    for(uint64_t i = 0; i < path.size(); i++) {
+                        if(i) pathStr += ' ';
+                        pathStr += std::to_string(vWindow(path[i]));
+                        pathStr += vStrandChar(path[i]);
+                    }
+                    unitigsCsv << (u + 1) << ',' << path.size() << ','
+                               << pathStr << '\n';
+                }
+                unitigsCsv.close();
+            }
+
+            // ----------------------------------------------------------------
+            // Canonical linearization: every contig appears twice in the
+            // doubled graph (a path and its reverse-complement twin). The RC of
+            // path [v0, v1, ..., vk] is [vk^1, ..., v1^1, v0^1]. Keep one
+            // representative per twin pair; the survivor fixes each window's
+            // orientation (the +/- it carries) and drops its RC duplicate. This
+            // is the fw/rc separation: after dedup, each window appears in
+            // exactly one orientation across the canonical paths, connected
+            // linearly with no strand contacts.
+            // ----------------------------------------------------------------
+            {
+                auto rcPath = [&](const vector<uint32_t>& p) {
+                    vector<uint32_t> r(p.size());
+                    for(uint64_t i = 0; i < p.size(); i++) {
+                        r[p.size() - 1 - i] = p[i] ^ 1u;
+                    }
+                    return r;
+                };
+                // Canonical key: lexicographically smaller of (path, rcPath).
+                auto canonicalKey = [&](const vector<uint32_t>& p) {
+                    const vector<uint32_t> r = rcPath(p);
+                    return (p <= r) ? p : r;
+                };
+
+                std::set<vector<uint32_t>> seen;
+                vector<vector<uint32_t>> canonical;
+                for(const auto& p : unitigPaths) {
+                    auto key = canonicalKey(p);
+                    if(seen.insert(key).second) {
+                        canonical.push_back(key);
+                    }
+                }
+
+                // Orientation assignment per window from the canonical paths.
+                // -1 = unset, 0 = forward, 1 = RC, 2 = conflict (window appears
+                // in both orientations across distinct canonical paths).
+                vector<int8_t> windowOrient(windowCount, -1);
+                uint64_t orientConflicts = 0;
+                for(const auto& p : canonical) {
+                    for(const uint32_t vtx : p) {
+                        const uint32_t wid = vWindow(vtx);
+                        const int8_t s = int8_t(vtx & 1u);
+                        if(windowOrient[wid] == -1) windowOrient[wid] = s;
+                        else if(windowOrient[wid] != s && windowOrient[wid] != 2) {
+                            windowOrient[wid] = 2;
+                            orientConflicts++;
+                        }
+                    }
+                }
+
+                ofstream linCsv("WindowLinearPaths.csv");
+                linCsv << "PathId,WindowCount,OrientedWindowPath\n";
+                uint64_t longestCanonical = 0;
+                for(uint64_t u = 0; u < canonical.size(); u++) {
+                    const auto& p = canonical[u];
+                    longestCanonical = std::max(longestCanonical,
+                                                uint64_t(p.size()));
+                    std::string pathStr;
+                    for(uint64_t i = 0; i < p.size(); i++) {
+                        if(i) pathStr += ' ';
+                        pathStr += std::to_string(vWindow(p[i]));
+                        pathStr += vStrandChar(p[i]);
+                    }
+                    linCsv << (u + 1) << ',' << p.size() << ',' << pathStr
+                           << '\n';
+                }
+                linCsv.close();
+
+                // Per-window chosen orientation.
+                {
+                    ofstream orientCsv("WindowOrientation.csv");
+                    orientCsv << "WindowId,Orientation\n";
+                    for(uint32_t wid = 0; wid < windowCount; wid++) {
+                        const char* o =
+                            (windowOrient[wid] == 0) ? "+" :
+                            (windowOrient[wid] == 1) ? "-" :
+                            (windowOrient[wid] == 2) ? "conflict" : "unplaced";
+                        orientCsv << wid << ',' << o << '\n';
+                    }
+                    orientCsv.close();
+                }
+
+                cout << timestamp << "Canonical linearization written to "
+                        "WindowLinearPaths.csv / WindowOrientation.csv ("
+                     << canonical.size() << " canonical paths (from "
+                     << unitigCount << " unitigs), longest "
+                     << longestCanonical << " windows; "
+                     << orientConflicts << " orientation conflicts)." << endl;
+            }
 
             // Per-window node report. For each window, record both strands'
             // degrees and classify it. The forward (+) and RC (-) vertices of a
