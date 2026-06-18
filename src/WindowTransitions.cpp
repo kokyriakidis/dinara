@@ -620,6 +620,64 @@ void dinara::computeWindowTransitions(
             }
             unitigsCsv.close();
 
+            // Per-window node report. For each window, record both strands'
+            // degrees and classify it. The forward (+) and RC (-) vertices of a
+            // window have mirror-symmetric degree by construction:
+            //   outDeg(W+) == inDeg(W-)  and  inDeg(W+) == outDeg(W-).
+            // So a window's actionable shape is fully described by its forward
+            // vertex: leftDeg = inDeg(W+) (connections on the - side after
+            // mirroring), rightDeg = outDeg(W+). Classes:
+            //   linear : leftDeg <= 1 and rightDeg <= 1 (no ambiguity)
+            //   branch : leftDeg > 1 or rightDeg > 1 (needs intra-window split)
+            //   tip    : a side with degree 0 (assembly end)
+            //   selfRC : window connects to its own mirror (inverted-repeat
+            //            boundary); flagged because it breaks tip twin-pairing.
+            uint64_t branchWindows = 0, tipWindows = 0, selfRcWindows = 0;
+            uint64_t linearWindows = 0;
+            {
+                // Detect self-RC adjacency: an arc whose endpoints are the same
+                // window in opposite strands.
+                vector<uint8_t> selfRc(windowCount, 0);
+                for(const auto& [key, w] : arcWeight) {
+                    if(w < minArcReads) continue;
+                    if(vWindow(key.first) == vWindow(key.second) &&
+                       (key.first ^ 1u) == key.second) {
+                        selfRc[vWindow(key.first)] = 1;
+                    }
+                }
+
+                ofstream nodesCsv("WindowNodes.csv");
+                nodesCsv << "WindowId,BackboneOrientedReadId,"
+                            "LeftDeg,RightDeg,SelfRC,Class\n";
+                for(uint32_t wid = 0; wid < windowCount; wid++) {
+                    const uint32_t fwd = vid(wid, false);
+                    const uint32_t leftDeg = inDeg[fwd];
+                    const uint32_t rightDeg = outDeg[fwd];
+                    const bool isSelfRc = selfRc[wid] != 0;
+
+                    std::string cls;
+                    if(isSelfRc) {
+                        cls = "selfRC";
+                        selfRcWindows++;
+                    } else if(leftDeg > 1 || rightDeg > 1) {
+                        cls = "branch";
+                        branchWindows++;
+                    } else if(leftDeg == 0 || rightDeg == 0) {
+                        cls = "tip";
+                        tipWindows++;
+                    } else {
+                        cls = "linear";
+                        linearWindows++;
+                    }
+
+                    nodesCsv << wid << ','
+                             << anchorWindows[wid].backboneOrientedReadId.getValue()
+                             << ',' << leftDeg << ',' << rightDeg << ','
+                             << (isSelfRc ? 1 : 0) << ',' << cls << '\n';
+                }
+                nodesCsv.close();
+            }
+
             // Strand-contact / symmetry sanity: every used arc must have its
             // twin present. By construction it does; report any violation.
             uint64_t arcsUsed = 0, twinMissing = 0;
@@ -643,6 +701,11 @@ void dinara::computeWindowTransitions(
                  << tipVertices << " tips; "
                  << twinMissing << " twin-missing (strand-contact) arcs)."
                  << endl;
+            cout << timestamp << "Window nodes written to WindowNodes.csv ("
+                 << linearWindows << " linear, "
+                 << branchWindows << " branch, "
+                 << tipWindows << " tip, "
+                 << selfRcWindows << " self-RC windows)." << endl;
         }
     }
 }
