@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -485,6 +486,10 @@ void dinara::computeWindowTransitions(
             // Key: (fromVertex, toVertex). Orientation is encoded in the
             // vertex ids, so each key is already strand-resolved.
             map<pair<uint32_t, uint32_t>, uint64_t> arcWeight;
+            // Per-arc supporting read set (by oriented read value), used by the
+            // branch analyzer to measure how cleanly competing branches at a
+            // branch window separate by read membership.
+            map<pair<uint32_t, uint32_t>, vector<uint32_t>> arcReads;
 
             for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
                 const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
@@ -514,6 +519,8 @@ void dinara::computeWindowTransitions(
                     if(a == b) continue;
                     arcWeight[{a, b}]++;
                     arcWeight[{b ^ 1u, a ^ 1u}]++;   // reverse-complement twin
+                    arcReads[{a, b}].push_back(uint32_t(oidValue));
+                    arcReads[{b ^ 1u, a ^ 1u}].push_back(uint32_t(oidValue));
                 }
             }
 
@@ -676,6 +683,97 @@ void dinara::computeWindowTransitions(
                              << (isSelfRc ? 1 : 0) << ',' << cls << '\n';
                 }
                 nodesCsv.close();
+            }
+
+            // Branch analyzer. For each branch side (a vertex with >1 outgoing
+            // arcs), measure how cleanly the competing branches separate by
+            // supporting read set. In the current pipeline per-window
+            // readClusters / alternatePaths are not populated when this runs, so
+            // read-set separation is the available signal for whether a branch
+            // is a resolvable haplotype/context split (disjoint reads) or a
+            // genuine shared locus / repeat (heavily shared reads).
+            //
+            // For a vertex v with outgoing targets {b1, b2, ...}, we report the
+            // maximum pairwise Jaccard overlap of their read sets. Low max
+            // Jaccard => branches are read-disjoint => splittable. High =>
+            // branches share reads => not separable by read partition alone.
+            {
+                ofstream branchCsv("WindowBranches.csv");
+                branchCsv << "Window,Strand,Side,Degree,Targets,"
+                             "MaxPairJaccard,MinPairShared,Verdict\n";
+
+                auto readsForArc =
+                    [&](uint32_t a, uint32_t b) -> const vector<uint32_t>& {
+                        static const vector<uint32_t> empty;
+                        auto it = arcReads.find({a, b});
+                        return (it != arcReads.end()) ? it->second : empty;
+                    };
+                // Jaccard over two sorted-unique-able read lists.
+                auto jaccard = [&](vector<uint32_t> x, vector<uint32_t> y,
+                                   uint64_t& shared) -> double {
+                    std::sort(x.begin(), x.end());
+                    x.erase(std::unique(x.begin(), x.end()), x.end());
+                    std::sort(y.begin(), y.end());
+                    y.erase(std::unique(y.begin(), y.end()), y.end());
+                    uint64_t inter = 0;
+                    uint64_t i = 0, j = 0;
+                    while(i < x.size() && j < y.size()) {
+                        if(x[i] == y[j]) { inter++; i++; j++; }
+                        else if(x[i] < y[j]) i++;
+                        else j++;
+                    }
+                    shared = inter;
+                    const uint64_t uni = x.size() + y.size() - inter;
+                    return uni ? double(inter) / double(uni) : 0.0;
+                };
+
+                uint64_t splittable = 0, sharedLocus = 0;
+                // Iterate the "outgoing" side of every vertex (forward branch).
+                for(uint32_t v = 0; v < vertexCount; v++) {
+                    if(outDeg[v] <= 1) continue;
+                    const auto& targets = outAdj[v];
+
+                    double maxJ = 0.0;
+                    uint64_t minShared = std::numeric_limits<uint64_t>::max();
+                    for(uint64_t i = 0; i < targets.size(); i++) {
+                        for(uint64_t j = i + 1; j < targets.size(); j++) {
+                            uint64_t shared = 0;
+                            const double jc = jaccard(
+                                readsForArc(v, targets[i].first),
+                                readsForArc(v, targets[j].first),
+                                shared);
+                            maxJ = std::max(maxJ, jc);
+                            minShared = std::min(minShared, shared);
+                        }
+                    }
+                    if(minShared == std::numeric_limits<uint64_t>::max())
+                        minShared = 0;
+
+                    // Verdict: read-disjoint branches (no shared reads, low
+                    // Jaccard) are splittable; otherwise a shared locus.
+                    const bool isSplittable = (minShared == 0 && maxJ < 0.1);
+                    if(isSplittable) splittable++; else sharedLocus++;
+
+                    std::string tgtStr;
+                    for(uint64_t i = 0; i < targets.size(); i++) {
+                        if(i) tgtStr += ' ';
+                        tgtStr += std::to_string(vWindow(targets[i].first));
+                        tgtStr += vStrandChar(targets[i].first);
+                    }
+
+                    branchCsv << vWindow(v) << ',' << vStrandChar(v) << ','
+                              << "out," << outDeg[v] << ',' << tgtStr << ','
+                              << maxJ << ',' << minShared << ','
+                              << (isSplittable ? "splittable" : "sharedLocus")
+                              << '\n';
+                }
+                branchCsv.close();
+
+                cout << timestamp << "Window branches written to "
+                        "WindowBranches.csv ("
+                     << (splittable + sharedLocus) << " branch sides: "
+                     << splittable << " read-disjoint (splittable), "
+                     << sharedLocus << " read-sharing (shared locus)." << endl;
             }
 
             // Strand-contact / symmetry sanity: every used arc must have its
