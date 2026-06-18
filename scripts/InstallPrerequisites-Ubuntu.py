@@ -737,8 +737,13 @@ def installShasta2():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
         
-        # Clone repo
-        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
+        # Clone repo.
+        # Use the kokyriakidis fork of shasta2: it keeps Anchors::anchorInfos
+        # public, which dinara's populateAnchors* functions need to construct
+        # Anchors from external mode3 data. Upstream paoloshasta/shasta2 made
+        # that member private. The fork tracks upstream otherwise (including the
+        # upstream theseus API that theseusWrapper.cpp expects).
+        runCommand("git clone https://github.com/kokyriakidis/shasta2.git")
         
         # Cleanup existing build directory to prevent BuildAbpoa.py failure
         home = os.path.expanduser("~")
