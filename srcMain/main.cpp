@@ -1547,9 +1547,22 @@ void dinara::main::assemble(
         &anchorDovetailWindow);
     auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
 
-    // Trim excess backbone sequence dangling beyond the outermost
-    // inter-window connections.
-    shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
+    // Trim excess backbone sequence dangling beyond the outermost inter-window
+    // connections.
+    //
+    // Disabled for the disjoint-core model. trimBackbones deletes backbone
+    // anchors before the first and after the last anchor that carries an
+    // inter-window edge. That made sense under the old dense Stage A model
+    // (windows had edges near both ends, so only small overhangs were shaved).
+    // With sparse strict 1-to-1 connection a window typically connects at only
+    // one end, so head-trim would walk from the start all the way to the lone
+    // edge near the far end and disable the entire window interior, destroying
+    // total length and shrinking windows below minWindowBaseSpan. With full-
+    // read disjoint cores we want the full backbone preserved.
+    constexpr bool trimBackbonesEnabled = false;
+    if(trimBackbonesEnabled) {
+        shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
+    }
 
     // Save the anchor graph.
     shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
