@@ -5,6 +5,7 @@
 #include "WindowTransitions.hpp"
 #include "timestamp.hpp"
 
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -13,6 +14,7 @@ using namespace dinara;
 using std::cout;
 using std::endl;
 using std::map;
+using std::ofstream;
 using std::pair;
 using std::vector;
 
@@ -177,4 +179,152 @@ void dinara::computeWindowTransitions(
          << fullTripletEntries << " full triplets), "
          << totalTransitionReads << " total read-transitions ("
          << fullTripletReads << " in full triplets)." << endl;
+
+    // ========================================================================
+    // Window reach diagnostic (read-only).
+    //
+    // For each window W, in W's backbone orientation, find how far reads reach
+    // to its left and right. Window IDs are creation order (not positional) and
+    // strand reverses journeys, so reach is measured by BASE OFFSET along the
+    // reads, in W's backbone frame, not by window-ID magnitude or step count:
+    //
+    //   - A read traverses W either forward (it visits W's forward anchors) or
+    //     reversed (it visits W's RC mirror). The mirror flag tells us which.
+    //   - Each window visit gets a base position from the read's anchor marker
+    //     (anchors.getPosition). A neighbor at a LOWER base position than W (in
+    //     W's backbone frame) is "left"; HIGHER is "right". For a read
+    //     traversing W reversed, left/right are swapped (and base axis flips).
+    //
+    // Aggregated per window (option B: immediate + furthest):
+    //   - immediate left/right: nearest neighbor window most reads agree on
+    //     (consensus over reads, matching backbonePrev/Next semantics)
+    //   - furthest left/right: the extreme neighbor any read reaches on that
+    //     side, with the reach distance reported in BASES
+    //
+    // Output: WindowReach.csv. No graph or struct mutation.
+    // ========================================================================
+    {
+        constexpr bool windowReachDiagnostic = true;
+        if(windowReachDiagnostic) {
+            // Immediate-neighbor votes: window -> (neighborWindow -> read count).
+            vector<map<uint32_t, uint64_t>> leftImmediateVotes(windowCount);
+            vector<map<uint32_t, uint64_t>> rightImmediateVotes(windowCount);
+            // Furthest reach: window -> (neighborWindow, baseDistance).
+            struct Reach { uint32_t window = noW; uint64_t bases = 0; };
+            vector<Reach> leftFurthest(windowCount);
+            vector<Reach> rightFurthest(windowCount);
+
+            // Re-walk journeys, keeping orientation and a base position per visit.
+            // basePos is the read-base position of the visit's first anchor.
+            struct Visit { uint32_t normW; bool isMirror; uint32_t basePos; };
+            for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
+                const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+                const auto journey = journeys[oid];
+                if(journey.empty()) continue;
+
+                // Distinct window visits with orientation and base position.
+                vector<Visit> visits;
+                for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                    const Shasta2AnchorId anchorId = journey[pos];
+                    if(uint64_t(anchorId) >= anchorCount) continue;
+                    const uint32_t rawW = anchorToWindow[uint64_t(anchorId)];
+                    if(rawW == noW) continue;
+                    const uint32_t normW = normalize(rawW);
+                    const bool isMirror = (rawW >= windowCount);
+                    if(visits.empty() ||
+                       visits.back().normW != normW ||
+                       visits.back().isMirror != isMirror) {
+                        const uint32_t basePos = anchors.getPosition(anchorId, oid);
+                        visits.push_back({normW, isMirror, basePos});
+                    }
+                }
+
+                // For each visited window, look at its neighbors in this read's
+                // journey, mapped into the window's backbone frame, and measure
+                // base-offset reach.
+                for(uint64_t i = 0; i < visits.size(); i++) {
+                    const uint32_t wid = visits[i].normW;
+                    if(wid >= windowCount) continue;
+                    const uint32_t wBase = visits[i].basePos;
+                    const bool mirror = visits[i].isMirror;
+
+                    // Journey-order neighbors mapped to W's backbone frame: a
+                    // read traversing W via its RC mirror runs opposite to W's
+                    // backbone, so journey-before is W's right and journey-after
+                    // is W's left. Otherwise as-is.
+                    const uint32_t beforeW = (i > 0) ? visits[i - 1].normW : noW;
+                    const uint32_t afterW =
+                        (i + 1 < visits.size()) ? visits[i + 1].normW : noW;
+                    const uint32_t leftW = mirror ? afterW : beforeW;
+                    const uint32_t rightW = mirror ? beforeW : afterW;
+
+                    // Base distance helper (clamped to >= 0). Invalid positions
+                    // (invalid<uint32_t>) yield 0.
+                    auto baseDist = [&](uint32_t a, uint32_t b) -> uint64_t {
+                        if(a == invalid<uint32_t> || b == invalid<uint32_t>) return 0;
+                        return (a >= b) ? uint64_t(a - b) : uint64_t(b - a);
+                    };
+
+                    if(leftW != noW) {
+                        leftImmediateVotes[wid][leftW]++;
+                        // Furthest-left journey end (extreme on W's left side).
+                        const uint64_t endIdx = mirror ? (visits.size() - 1) : 0;
+                        const uint32_t endW = visits[endIdx].normW;
+                        const uint64_t bases = baseDist(visits[endIdx].basePos, wBase);
+                        if(endW != noW && endW < windowCount &&
+                           bases >= leftFurthest[wid].bases) {
+                            leftFurthest[wid] = {endW, bases};
+                        }
+                    }
+                    if(rightW != noW) {
+                        rightImmediateVotes[wid][rightW]++;
+                        const uint64_t endIdx = mirror ? 0 : (visits.size() - 1);
+                        const uint32_t endW = visits[endIdx].normW;
+                        const uint64_t bases = baseDist(visits[endIdx].basePos, wBase);
+                        if(endW != noW && endW < windowCount &&
+                           bases >= rightFurthest[wid].bases) {
+                            rightFurthest[wid] = {endW, bases};
+                        }
+                    }
+                }
+            }
+
+            // Consensus immediate neighbor = most-voted, ties broken by smaller id.
+            auto consensus = [&](const map<uint32_t, uint64_t>& votes,
+                                 uint64_t& bestCount) -> uint32_t {
+                uint32_t best = noW;
+                bestCount = 0;
+                for(const auto& [w, c] : votes) {
+                    if(c > bestCount) { bestCount = c; best = w; }
+                }
+                return best;
+            };
+
+            ofstream csv("WindowReach.csv");
+            csv << "WindowId,BackboneOrientedReadId,"
+                   "ImmediateLeft,ImmediateLeftReads,"
+                   "ImmediateRight,ImmediateRightReads,"
+                   "FurthestLeft,FurthestLeftBases,"
+                   "FurthestRight,FurthestRightBases\n";
+            auto wstr = [&](uint32_t w) -> std::string {
+                return (w == noW) ? std::string("none") : std::to_string(w);
+            };
+            for(uint32_t wid = 0; wid < windowCount; wid++) {
+                uint64_t lCount = 0, rCount = 0;
+                const uint32_t il = consensus(leftImmediateVotes[wid], lCount);
+                const uint32_t ir = consensus(rightImmediateVotes[wid], rCount);
+                csv << wid << ','
+                    << anchorWindows[wid].backboneOrientedReadId.getValue() << ','
+                    << wstr(il) << ',' << lCount << ','
+                    << wstr(ir) << ',' << rCount << ','
+                    << wstr(leftFurthest[wid].window) << ','
+                    << leftFurthest[wid].bases << ','
+                    << wstr(rightFurthest[wid].window) << ','
+                    << rightFurthest[wid].bases << '\n';
+            }
+            csv.close();
+            cout << timestamp << "Window reach diagnostic written to "
+                    "WindowReach.csv (" << windowCount << " windows)." << endl;
+        }
+    }
 }
