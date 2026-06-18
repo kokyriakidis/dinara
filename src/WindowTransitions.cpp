@@ -37,7 +37,12 @@ void dinara::computeWindowTransitions(
     // Build anchorToWindow map from backbone positions (same logic as
     // the anchor graph constructor). Forward windows get their windowId,
     // RC mirrors get windowId + windowCount.
+    // Also record each anchor's local index within its window's backbone order
+    // (anchorLocalPos) and each window's backbone anchor count (windowAnchorLen)
+    // so the branch analyzer can tell where along a window its neighbors attach.
     vector<uint32_t> anchorToWindow(anchorCount, noW);
+    vector<uint32_t> anchorLocalPos(anchorCount, noW);
+    vector<uint32_t> windowAnchorLen(windowCount, 0);
     for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
         const AnchorWindow& window = anchorWindows[windowId];
         const auto backboneJourney = journeys[window.backboneOrientedReadId];
@@ -53,15 +58,32 @@ void dinara::computeWindowTransitions(
             }()
             : window.filteredBackbonePositions;
 
+        windowAnchorLen[windowId] = uint32_t(positions.size());
+        uint32_t localIdx = 0;
         for(const uint32_t pos : positions) {
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             if(aid < anchorCount) {
                 anchorToWindow[aid] = windowId;
+                anchorLocalPos[aid] = localIdx;
             }
             const uint64_t rcAid = aid ^ 1ULL;
             if(rcAid < anchorCount) {
                 anchorToWindow[rcAid] = windowId + windowCount;
+                // RC mirror: local index is reversed (last backbone anchor
+                // becomes first in the mirror frame).
+                anchorLocalPos[rcAid] = localIdx;  // reversed below once len known
             }
+            localIdx++;
+        }
+    }
+    // Fix up RC-mirror local positions to reversed frame: pos' = len-1-pos.
+    for(uint64_t aid = 0; aid < anchorCount; aid++) {
+        const uint32_t raw = anchorToWindow[aid];
+        if(raw == noW || raw < windowCount) continue;  // only mirrors
+        const uint32_t wid = raw - windowCount;
+        const uint32_t len = windowAnchorLen[wid];
+        if(len > 0 && anchorLocalPos[aid] != noW) {
+            anchorLocalPos[aid] = len - 1u - anchorLocalPos[aid];
         }
     }
 
@@ -490,14 +512,24 @@ void dinara::computeWindowTransitions(
             // branch analyzer to measure how cleanly competing branches at a
             // branch window separate by read membership.
             map<pair<uint32_t, uint32_t>, vector<uint32_t>> arcReads;
+            // Per-arc exit attachment: the local index (within the from-window's
+            // backbone order) of the last anchor the read occupied before
+            // crossing to the next window. Normalized later by windowAnchorLen.
+            // Spread of these values across a branch window's outgoing arcs
+            // distinguishes a too-big window (exits spread along its length =>
+            // positional split) from a true fan (exits clustered at the end =>
+            // read-set split).
+            map<pair<uint32_t, uint32_t>, vector<uint32_t>> arcExitLocal;
 
             for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
                 const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
                 const auto journey = journeys[oid];
                 if(journey.empty()) continue;
 
-                // Distinct consecutive oriented window visits.
-                vector<uint32_t> visits;  // oriented vertex ids
+                // Distinct consecutive oriented window visits, recording the
+                // local index of the last anchor in each visit (the exit point).
+                vector<uint32_t> visits;       // oriented vertex ids
+                vector<uint32_t> exitLocal;    // last local index per visit
                 for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
                     const Shasta2AnchorId anchorId = journey[pos];
                     if(uint64_t(anchorId) >= anchorCount) continue;
@@ -506,8 +538,12 @@ void dinara::computeWindowTransitions(
                     const uint32_t normW = normalize(rawW);
                     const bool isMirror = (rawW >= windowCount);
                     const uint32_t v = vid(normW, isMirror);
+                    const uint32_t lp = anchorLocalPos[uint64_t(anchorId)];
                     if(visits.empty() || visits.back() != v) {
                         visits.push_back(v);
+                        exitLocal.push_back(lp);
+                    } else {
+                        exitLocal.back() = lp;  // advance to latest anchor in v
                     }
                 }
 
@@ -521,6 +557,9 @@ void dinara::computeWindowTransitions(
                     arcWeight[{b ^ 1u, a ^ 1u}]++;   // reverse-complement twin
                     arcReads[{a, b}].push_back(uint32_t(oidValue));
                     arcReads[{b ^ 1u, a ^ 1u}].push_back(uint32_t(oidValue));
+                    if(exitLocal[i] != noW) {
+                        arcExitLocal[{a, b}].push_back(exitLocal[i]);
+                    }
                 }
             }
 
@@ -700,7 +739,9 @@ void dinara::computeWindowTransitions(
             {
                 ofstream branchCsv("WindowBranches.csv");
                 branchCsv << "Window,Strand,Side,Degree,Targets,"
-                             "MaxPairJaccard,MinPairShared,Verdict\n";
+                             "MaxPairJaccard,MinPairShared,"
+                             "ExitMinFrac,ExitMaxFrac,ExitSpreadFrac,"
+                             "Verdict,SplitKind\n";
 
                 auto readsForArc =
                     [&](uint32_t a, uint32_t b) -> const vector<uint32_t>& {
@@ -727,7 +768,23 @@ void dinara::computeWindowTransitions(
                     return uni ? double(inter) / double(uni) : 0.0;
                 };
 
+                // Median exit fraction of an arc (where along the from-window
+                // its reads leave, 0=window start .. 1=window end).
+                auto arcExitMedianFrac =
+                    [&](uint32_t a, uint32_t b) -> double {
+                        auto it = arcExitLocal.find({a, b});
+                        if(it == arcExitLocal.end() || it->second.empty())
+                            return -1.0;
+                        const uint32_t len = windowAnchorLen[vWindow(a)];
+                        if(len <= 1) return 1.0;
+                        vector<uint32_t> v = it->second;
+                        std::sort(v.begin(), v.end());
+                        const uint32_t med = v[v.size() / 2];
+                        return double(med) / double(len - 1u);
+                    };
+
                 uint64_t splittable = 0, sharedLocus = 0;
+                uint64_t positionalSplits = 0, readSetSplits = 0;
                 // Iterate the "outgoing" side of every vertex (forward branch).
                 for(uint32_t v = 0; v < vertexCount; v++) {
                     if(outDeg[v] <= 1) continue;
@@ -749,10 +806,32 @@ void dinara::computeWindowTransitions(
                     if(minShared == std::numeric_limits<uint64_t>::max())
                         minShared = 0;
 
+                    // Exit-attachment spread across the branch's arcs.
+                    double exitMin = 2.0, exitMax = -1.0;
+                    for(const auto& [tgt, w] : targets) {
+                        (void)w;
+                        const double f = arcExitMedianFrac(v, tgt);
+                        if(f < 0.0) continue;
+                        exitMin = std::min(exitMin, f);
+                        exitMax = std::max(exitMax, f);
+                    }
+                    if(exitMax < 0.0) { exitMin = 0.0; exitMax = 0.0; }
+                    const double exitSpread = exitMax - exitMin;
+
                     // Verdict: read-disjoint branches (no shared reads, low
                     // Jaccard) are splittable; otherwise a shared locus.
                     const bool isSplittable = (minShared == 0 && maxJ < 0.1);
                     if(isSplittable) splittable++; else sharedLocus++;
+
+                    // Split kind: exits spread along the window length => the
+                    // window absorbed sub-loci (positional split). Exits
+                    // clustered (small spread) => a true fan (read-set split).
+                    const char* splitKind =
+                        (exitSpread > 0.25) ? "positional" : "readSet";
+                    if(isSplittable) {
+                        if(exitSpread > 0.25) positionalSplits++;
+                        else                  readSetSplits++;
+                    }
 
                     std::string tgtStr;
                     for(uint64_t i = 0; i < targets.size(); i++) {
@@ -764,8 +843,9 @@ void dinara::computeWindowTransitions(
                     branchCsv << vWindow(v) << ',' << vStrandChar(v) << ','
                               << "out," << outDeg[v] << ',' << tgtStr << ','
                               << maxJ << ',' << minShared << ','
-                              << (isSplittable ? "splittable" : "sharedLocus")
-                              << '\n';
+                              << exitMin << ',' << exitMax << ',' << exitSpread
+                              << ',' << (isSplittable ? "splittable" : "sharedLocus")
+                              << ',' << splitKind << '\n';
                 }
                 branchCsv.close();
 
@@ -773,7 +853,9 @@ void dinara::computeWindowTransitions(
                         "WindowBranches.csv ("
                      << (splittable + sharedLocus) << " branch sides: "
                      << splittable << " read-disjoint (splittable), "
-                     << sharedLocus << " read-sharing (shared locus)." << endl;
+                     << sharedLocus << " read-sharing (shared locus); "
+                     << positionalSplits << " positional, "
+                     << readSetSplits << " read-set split kind)." << endl;
             }
 
             // Strand-contact / symmetry sanity: every used arc must have its
