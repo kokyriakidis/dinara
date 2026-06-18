@@ -58,6 +58,14 @@ list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
+# Theseus disabled: these files use fork-only theseus APIs (align_from,
+# multi-segment constructor) that upstream theseus-lib does not provide.
+# Excluded from the build until theseus usage is reworked. Callers are stubbed.
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 
 # Find required libraries
 find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)

@@ -871,14 +871,17 @@ def installShasta2():
 
 
 def installTheseusLib():
-    # Our fork of theseus-lib, pericles branch. Includes the upstream pericles
-    # features (weights, ends-free, ostream) plus multi-segment constructor
-    # and align_from for sub-region MSA alignment.
-    # See https://github.com/kokyriakidis/theseus-lib-multi-segment/tree/pericles
+    # Upstream theseus-lib, pericles branch — the same source shasta2 itself
+    # uses (see shasta2/scripts/BuildTheseus.py). This provides the API that
+    # shasta2's theseusWrapper.cpp expects: default Heuristics() and the 6-arg
+    # align(seq, weight, reverse, ends_free, density_drop, lag_pruning).
     #
-    # Always clone and build: each run pulls the current tip (shallow clone)
-    # so installs stay up to date without tracking a commit hash here.
-    print("Installing theseus-lib (kokyriakidis fork, pericles branch, latest)...")
+    # We deliberately do NOT use the kokyriakidis fork: its tip diverged
+    # (removed the default Heuristics ctor and the 6-arg align), which broke the
+    # shasta2 build. dinara's own theseus code relied on fork-only features
+    # (align_from + multi-segment constructor); that code is now disabled (its
+    # source files are excluded from the build), so upstream is sufficient.
+    print("Installing theseus-lib (albertjimenezbl upstream, pericles branch)...")
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building theseus-lib using temporary directory", temporaryDirectory)
@@ -886,12 +889,12 @@ def installTheseusLib():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
 
-        # Shallow clone of current branch tip — enough to build; fresh each run.
+        # Shallow clone of the upstream pericles branch.
         runCommand(
             "git clone -b pericles --depth 1 "
-            "https://github.com/kokyriakidis/theseus-lib-multi-segment.git"
+            "https://github.com/albertjimenezbl/theseus-lib.git"
         )
-        os.chdir("theseus-lib-multi-segment")
+        os.chdir("theseus-lib")
 
         # Legacy main-branch layout put print_as_gfa in graph.h with empty vtx.name
         # for POA graphs. Pericles emits GFA segment names as numeric node ids from

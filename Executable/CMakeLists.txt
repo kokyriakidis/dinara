@@ -40,6 +40,14 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
+# Theseus disabled: these files use fork-only theseus APIs (align_from,
+# multi-segment constructor) that upstream theseus-lib does not provide.
+# Excluded from the build until theseus usage is reworked. Callers are stubbed.
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
@@ -90,13 +98,17 @@ if(NOT SHASTA2_LIB)
     message(FATAL_ERROR "shasta2 library not found. Please install it.")
 endif()
 
-# Find theseus library (optional — enables journey MSA experiment)
+# Find theseus library. Still linked because shasta2 depends on its symbols,
+# but dinara's own theseus code is DISABLED: we do NOT define DINARA_HAVE_THESEUS.
+# dinara's theseus usage relied on fork-only APIs (align_from, multi-segment
+# constructor) incompatible with the upstream theseus that shasta2 requires.
+# Guarded files (AssemblerSvAnchors, AssemblerMSAHetSites) compile to throw/no-op
+# stubs; unguarded theseus files are excluded from the build above.
 find_library(THESEUS_LIB theseus)
 if(THESEUS_LIB)
-    add_definitions(-DDINARA_HAVE_THESEUS)
-    message(STATUS "theseus found: journey MSA experiment enabled.")
+    message(STATUS "theseus found (linked for shasta2; dinara theseus code disabled).")
 else()
-    message(WARNING "theseus library not found. Run InstallPrerequisites to enable journey MSA experiment.")
+    message(WARNING "theseus library not found. Run InstallPrerequisites.")
     set(THESEUS_LIB "")
 endif()
 

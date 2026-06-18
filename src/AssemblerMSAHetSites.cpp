@@ -20,8 +20,7 @@
 #include "Shasta2Journeys.hpp"
 #include "timestamp.hpp"
 #include "abpoa/abpoa.h"
-#include <theseus/theseus_msa_aligner.h>
-#include <theseus/penalties.h>
+// Theseus disabled: headers removed; this file does not use any theseus symbols.
 
 #include <algorithm>
 #include <chrono>

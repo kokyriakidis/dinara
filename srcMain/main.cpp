@@ -2082,18 +2082,17 @@ void dinara::main::assemble(
     assembler.testAnchorWindowsCleanLongestRead(threadCount,
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage);
 
-    // Test multi-segment MSA on one window.
-    assembler.testMultiSegmentMSA(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        anchorWindows);
-
-    // Diagnostic prototype: partition Shasta2 anchor journeys into windows, then later
-    // run one Theseus MSA per anchor-window interval.
-    assembler.computeTheseusReadWindowMSAPrototype(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        threadCount);
+    // Theseus disabled: testMultiSegmentMSA and computeTheseusReadWindowMSAPrototype
+    // are defined in source files excluded from the build (they use fork-only
+    // theseus APIs). Calls stubbed out until theseus usage is reworked.
+    // assembler.testMultiSegmentMSA(
+    //     assembler.shasta2Anchors,
+    //     assembler.shasta2Journeys,
+    //     anchorWindows);
+    // assembler.computeTheseusReadWindowMSAPrototype(
+    //     assembler.shasta2Anchors,
+    //     assembler.shasta2Journeys,
+    //     threadCount);
     // assembler.computeTheseusMarkerGraphMSAPrototype(
     //     std::numeric_limits<uint64_t>::max(),    // maxAnchorPairs
     //     std::numeric_limits<uint64_t>::max(),    // maxReadsPerPair
