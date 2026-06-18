@@ -744,6 +744,8 @@ def installShasta2():
         # that member private. The fork tracks upstream otherwise (including the
         # upstream theseus API that theseusWrapper.cpp expects).
         runCommand("git clone https://github.com/kokyriakidis/shasta2.git")
+        # Pin to an exact commit for reproducible builds.
+        runCommand("git -C shasta2 checkout 277d537d1c9841bc1308e6e9a2c54acbb7ae241b")
         
         # Cleanup existing build directory to prevent BuildAbpoa.py failure
         home = os.path.expanduser("~")
@@ -894,12 +896,14 @@ def installTheseusLib():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
 
-        # Shallow clone of the upstream pericles branch.
+        # Clone the upstream pericles branch, then pin to an exact commit
+        # for reproducible builds.
         runCommand(
-            "git clone -b pericles --depth 1 "
+            "git clone -b pericles "
             "https://github.com/albertjimenezbl/theseus-lib.git"
         )
         os.chdir("theseus-lib")
+        runCommand("git checkout 1654decead209bf7ae852a2895e6d0e1ecc0de35")
 
         # Legacy main-branch layout put print_as_gfa in graph.h with empty vtx.name
         # for POA graphs. Pericles emits GFA segment names as numeric node ids from
