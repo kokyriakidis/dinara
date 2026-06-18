@@ -5,6 +5,7 @@
 #include "WindowTransitions.hpp"
 #include "timestamp.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -325,6 +326,113 @@ void dinara::computeWindowTransitions(
             csv.close();
             cout << timestamp << "Window reach diagnostic written to "
                     "WindowReach.csv (" << windowCount << " windows)." << endl;
+        }
+    }
+
+    // ========================================================================
+    // Window (prev, next) class diagnostic (read-only).
+    //
+    // Quantifies how many path copies each window would spawn under the
+    // window-decomposition rewrite (docs/WindowDecompositionPlan.md). For each
+    // window W, W.transitionReads groups reads by their (previousWindow,
+    // nextWindow) route; every such class becomes one prev-next path under the
+    // "support >= 1" rule. Partial classes (prev==noWindow or next==noWindow)
+    // are the candidates for folding into full paths or becoming terminal tips.
+    //
+    // Two CSVs:
+    //   - WindowClasses.csv: per-window summary (class counts + read totals,
+    //     split into full / left-partial / right-partial / isolated).
+    //   - WindowClassDetail.csv: one row per (window, prev, next) class with its
+    //     read count and a kind label. Use to inspect individual routes.
+    //
+    // No graph or struct mutation.
+    // ========================================================================
+    {
+        constexpr bool windowClassDiagnostic = true;
+        if(windowClassDiagnostic) {
+            auto wstr = [&](uint32_t w) -> std::string {
+                return (w == noW) ? std::string("none") : std::to_string(w);
+            };
+
+            ofstream summary("WindowClasses.csv");
+            summary << "WindowId,BackboneOrientedReadId,"
+                       "TotalClasses,TotalReads,"
+                       "FullClasses,FullReads,"
+                       "LeftPartialClasses,LeftPartialReads,"
+                       "RightPartialClasses,RightPartialReads,"
+                       "IsolatedClasses,IsolatedReads,"
+                       "MaxFullClassReads\n";
+
+            ofstream detail("WindowClassDetail.csv");
+            detail << "WindowId,Prev,Next,Kind,Reads\n";
+
+            // Aggregate totals across all windows.
+            uint64_t totFull = 0, totLeftPartial = 0;
+            uint64_t totRightPartial = 0, totIsolated = 0;
+
+            for(uint32_t wid = 0; wid < windowCount; wid++) {
+                const auto& window = anchorWindows[wid];
+
+                uint64_t fullClasses = 0, fullReads = 0;
+                uint64_t leftPartialClasses = 0, leftPartialReads = 0;
+                uint64_t rightPartialClasses = 0, rightPartialReads = 0;
+                uint64_t isolatedClasses = 0, isolatedReads = 0;
+                uint64_t maxFullClassReads = 0;
+                uint64_t totalClasses = 0, totalReads = 0;
+
+                for(const auto& [key, reads] : window.transitionReads) {
+                    const uint32_t prev = key.first;
+                    const uint32_t next = key.second;
+                    const uint64_t n = reads.size();
+                    totalClasses++;
+                    totalReads += n;
+
+                    const bool prevNone = (prev == noW);
+                    const bool nextNone = (next == noW);
+                    std::string kind;
+                    if(!prevNone && !nextNone) {
+                        kind = "full";
+                        fullClasses++; fullReads += n;
+                        maxFullClassReads = std::max(maxFullClassReads, n);
+                    } else if(prevNone && !nextNone) {
+                        kind = "leftPartial";
+                        leftPartialClasses++; leftPartialReads += n;
+                    } else if(!prevNone && nextNone) {
+                        kind = "rightPartial";
+                        rightPartialClasses++; rightPartialReads += n;
+                    } else {
+                        kind = "isolated";
+                        isolatedClasses++; isolatedReads += n;
+                    }
+
+                    detail << wid << ',' << wstr(prev) << ',' << wstr(next)
+                           << ',' << kind << ',' << n << '\n';
+                }
+
+                totFull += fullClasses;
+                totLeftPartial += leftPartialClasses;
+                totRightPartial += rightPartialClasses;
+                totIsolated += isolatedClasses;
+
+                summary << wid << ','
+                        << window.backboneOrientedReadId.getValue() << ','
+                        << totalClasses << ',' << totalReads << ','
+                        << fullClasses << ',' << fullReads << ','
+                        << leftPartialClasses << ',' << leftPartialReads << ','
+                        << rightPartialClasses << ',' << rightPartialReads << ','
+                        << isolatedClasses << ',' << isolatedReads << ','
+                        << maxFullClassReads << '\n';
+            }
+            summary.close();
+            detail.close();
+
+            cout << timestamp << "Window class diagnostic written to "
+                    "WindowClasses.csv / WindowClassDetail.csv ("
+                 << windowCount << " windows; "
+                 << totFull << " full, "
+                 << totLeftPartial << " left-partial, "
+                 << totRightPartial << " right-partial, "
+                 << totIsolated << " isolated classes)." << endl;
         }
     }
 }
