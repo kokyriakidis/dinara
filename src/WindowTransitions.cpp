@@ -435,4 +435,214 @@ void dinara::computeWindowTransitions(
                  << totIsolated << " isolated classes)." << endl;
         }
     }
+
+    // ========================================================================
+    // Doubled-vertex window arc diagnostic (read-only).
+    //
+    // Models the windows as a hifiasm-style doubled-vertex string graph, where
+    // strand consistency is an invariant of the representation rather than a
+    // cleanup step (see docs/WindowDecompositionPlan.md).
+    //
+    //   - Each window W becomes two oriented vertices:
+    //         v = (W << 1) | strand,   strand 0 = forward, 1 = RC mirror.
+    //         twin(v) = v ^ 1.
+    //     This is exactly the forward window / RC-mirror pair already tracked
+    //     in anchorToWindow (windowId vs windowId + windowCount).
+    //   - A read that visits oriented window (W, sW) then (X, sX) emits a
+    //     directed arc  vertex(W,sW) -> vertex(X,sX)  and its reverse-complement
+    //     twin  vertex(X,sX)^1 -> vertex(W,sW)^1. Both are stored, so the graph
+    //     is symmetric by construction and a +/- "strand contact" is not
+    //     representable: orientation lives in the vertex id, not on the edge.
+    //
+    // Linearization = unitig extension over this doubled graph (the analogue of
+    // asg_extend / stringGraphExtend): follow a vertex forward while it has a
+    // unique outgoing arc whose target has a unique incoming arc. RC-chosen
+    // windows are emitted from their strand-1 vertex (anchorId ^ 1 anchors).
+    //
+    // Outputs:
+    //   - WindowArcs.csv: one row per directed arc (From, To with +/- strand,
+    //     read support, and whether/how strongly its twin is present).
+    //   - WindowUnitigs.csv: one row per maximal unitig (linear run), listing
+    //     its oriented window path.
+    // No graph or struct mutation.
+    // ========================================================================
+    {
+        constexpr bool windowArcDiagnostic = true;
+        if(windowArcDiagnostic) {
+            // Minimum read support for an arc to be used (toggle).
+            constexpr uint64_t minArcReads = 1;
+
+            const uint32_t vertexCount = windowCount * 2u;
+            auto vid = [&](uint32_t w, bool mirror) -> uint32_t {
+                return (w << 1u) | (mirror ? 1u : 0u);
+            };
+            auto vWindow = [&](uint32_t v) -> uint32_t { return v >> 1u; };
+            auto vStrandChar = [&](uint32_t v) -> char {
+                return (v & 1u) ? '-' : '+';
+            };
+
+            // Accumulate directed arc weights (read counts) over journeys.
+            // Key: (fromVertex, toVertex). Orientation is encoded in the
+            // vertex ids, so each key is already strand-resolved.
+            map<pair<uint32_t, uint32_t>, uint64_t> arcWeight;
+
+            for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
+                const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+                const auto journey = journeys[oid];
+                if(journey.empty()) continue;
+
+                // Distinct consecutive oriented window visits.
+                vector<uint32_t> visits;  // oriented vertex ids
+                for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
+                    const Shasta2AnchorId anchorId = journey[pos];
+                    if(uint64_t(anchorId) >= anchorCount) continue;
+                    const uint32_t rawW = anchorToWindow[uint64_t(anchorId)];
+                    if(rawW == noW) continue;
+                    const uint32_t normW = normalize(rawW);
+                    const bool isMirror = (rawW >= windowCount);
+                    const uint32_t v = vid(normW, isMirror);
+                    if(visits.empty() || visits.back() != v) {
+                        visits.push_back(v);
+                    }
+                }
+
+                // Emit an arc per consecutive pair; the twin is added so the
+                // graph is symmetric by construction (hifiasm arcId ^ 1 rule).
+                for(uint64_t i = 0; i + 1 < visits.size(); i++) {
+                    const uint32_t a = visits[i];
+                    const uint32_t b = visits[i + 1];
+                    if(a == b) continue;
+                    arcWeight[{a, b}]++;
+                    arcWeight[{b ^ 1u, a ^ 1u}]++;   // reverse-complement twin
+                }
+            }
+
+            // Build filtered adjacency (degree-counted) for unitig extension.
+            vector<vector<pair<uint32_t, uint64_t>>> outAdj(vertexCount);
+            vector<uint32_t> outDeg(vertexCount, 0);
+            vector<uint32_t> inDeg(vertexCount, 0);
+            for(const auto& [key, w] : arcWeight) {
+                if(w < minArcReads) continue;
+                const uint32_t a = key.first;
+                const uint32_t b = key.second;
+                outAdj[a].push_back({b, w});
+                outDeg[a]++;
+                inDeg[b]++;
+            }
+
+            // Write the arc list (with twin support) to CSV.
+            {
+                ofstream arcsCsv("WindowArcs.csv");
+                arcsCsv << "FromWindow,FromStrand,ToWindow,ToStrand,Reads,"
+                           "TwinReads,TwinPresent\n";
+                for(const auto& [key, w] : arcWeight) {
+                    if(w < minArcReads) continue;
+                    const uint32_t a = key.first;
+                    const uint32_t b = key.second;
+                    const auto twinIt = arcWeight.find({b ^ 1u, a ^ 1u});
+                    const uint64_t twinW =
+                        (twinIt != arcWeight.end()) ? twinIt->second : 0;
+                    arcsCsv << vWindow(a) << ',' << vStrandChar(a) << ','
+                            << vWindow(b) << ',' << vStrandChar(b) << ','
+                            << w << ',' << twinW << ','
+                            << ((twinW >= minArcReads) ? 1 : 0) << '\n';
+                }
+                arcsCsv.close();
+            }
+
+            // Unitig extension: a step a -> b is "mergeable" iff a has exactly
+            // one outgoing arc and b has exactly one incoming arc. A unitig
+            // starts at any vertex that is not such an unambiguous continuation
+            // of a predecessor (in-degree != 1, or its sole predecessor
+            // branches), as long as it has outgoing reach.
+            auto uniqueOut = [&](uint32_t v, uint32_t& to) -> bool {
+                if(outDeg[v] != 1) return false;
+                to = outAdj[v].front().first;
+                return true;
+            };
+
+            // Identify the unique predecessor of a vertex (only meaningful when
+            // inDeg == 1). Built lazily from outAdj.
+            vector<int64_t> solePred(vertexCount, -1);
+            for(uint32_t a = 0; a < vertexCount; a++) {
+                for(const auto& [b, w] : outAdj[a]) {
+                    (void)w;
+                    solePred[b] = (solePred[b] == -1) ? int64_t(a) : -2;
+                }
+            }
+            auto isUnitigInterior = [&](uint32_t v) -> bool {
+                // Continues a unitig iff in-degree 1 and that predecessor has
+                // out-degree 1 (so the join is unambiguous on both sides).
+                if(inDeg[v] != 1) return false;
+                if(solePred[v] < 0) return false;
+                return outDeg[uint32_t(solePred[v])] == 1;
+            };
+
+            vector<uint8_t> visited(vertexCount, 0);
+            uint64_t unitigCount = 0, branchVertices = 0, tipVertices = 0;
+            uint64_t longestUnitig = 0;
+
+            ofstream unitigsCsv("WindowUnitigs.csv");
+            unitigsCsv << "UnitigId,WindowCount,WindowPath\n";
+
+            for(uint32_t start = 0; start < vertexCount; start++) {
+                if(outDeg[start] > 1) branchVertices++;
+                if(outDeg[start] == 0 && inDeg[start] == 0) continue;
+                if(inDeg[start] == 0) tipVertices++;
+                if(visited[start]) continue;
+                if(isUnitigInterior(start)) continue;  // not a start
+
+                // Walk forward.
+                vector<uint32_t> path;
+                uint32_t v = start;
+                while(true) {
+                    if(visited[v]) break;
+                    visited[v] = 1;
+                    path.push_back(v);
+                    uint32_t to;
+                    if(!uniqueOut(v, to)) break;
+                    if(inDeg[to] != 1) break;       // target join is ambiguous
+                    if(visited[to]) break;
+                    v = to;
+                }
+                if(path.empty()) continue;
+
+                unitigCount++;
+                longestUnitig = std::max(longestUnitig, uint64_t(path.size()));
+                std::string pathStr;
+                for(uint64_t i = 0; i < path.size(); i++) {
+                    if(i) pathStr += ' ';
+                    pathStr += std::to_string(vWindow(path[i]));
+                    pathStr += vStrandChar(path[i]);
+                }
+                unitigsCsv << unitigCount << ',' << path.size() << ','
+                           << pathStr << '\n';
+            }
+            unitigsCsv.close();
+
+            // Strand-contact / symmetry sanity: every used arc must have its
+            // twin present. By construction it does; report any violation.
+            uint64_t arcsUsed = 0, twinMissing = 0;
+            for(const auto& [key, w] : arcWeight) {
+                if(w < minArcReads) continue;
+                arcsUsed++;
+                const auto twinIt =
+                    arcWeight.find({key.second ^ 1u, key.first ^ 1u});
+                if(twinIt == arcWeight.end() || twinIt->second < minArcReads) {
+                    twinMissing++;
+                }
+            }
+
+            cout << timestamp << "Window arc diagnostic written to "
+                    "WindowArcs.csv / WindowUnitigs.csv ("
+                 << vertexCount << " oriented vertices, "
+                 << arcsUsed << " arcs, "
+                 << unitigCount << " unitigs, longest "
+                 << longestUnitig << " windows; "
+                 << branchVertices << " branch vertices, "
+                 << tipVertices << " tips; "
+                 << twinMissing << " twin-missing (strand-contact) arcs)."
+                 << endl;
+        }
+    }
 }

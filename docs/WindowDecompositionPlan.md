@@ -1,157 +1,156 @@
-# Window Decomposition into Prev-Next Paths
+# Window Layout as a Doubled-Vertex String Graph
 
-## Motivation
+## What changed and why
 
-In the disjoint-core model each window `W` is a single backbone anchor chain,
-shared by every read that passes through it. But reads enter `W` from different
-previous windows and leave to different next windows. Collapsing all of them
-into one chain merges distinct genomic contexts (haplotypes, repeat copies,
-strands) into a single shared segment, which is exactly where the graph tangles.
+An earlier version of this plan proposed splitting each window by its
+`(prev, next)` traversal context ("prev-next paths"). Diagnostics on the test
+assembly showed that premise does not hold for the current window model:
 
-**Decomposition** replaces each window with one anchor path *per traversal
-context*. A read group that enters from `A` and exits to `B` gets its own copy
-of the window's interior, supported by that group's reads. Read-coherent threads
-are kept separate instead of being forced through a shared bottleneck.
+- **Full triplets are nearly absent.** In `WindowClasses.csv`, most windows have
+  `FullClasses = 0`; the best window reaches `MaxFullClassReads = 5`. Reads do
+  not pass *through* windows often enough to define `(prev, next)` contexts.
+- **Isolated reads dominate.** The single `(noWindow, noWindow)` class holds the
+  majority of reads in nearly every window (e.g. 65-80%).
+- **Connectivity is pairwise, not path-shaped.** What reads *do* provide is
+  window-to-window adjacency: "W is next to X." Left- and right-partial classes
+  are symmetric per window (`LeftPartial == RightPartial`), which is the
+  forward/RC mirror of the *same* physical connection.
 
-This subsumes strand separation: because reads are oriented, forward and RC
-traffic fall into different `(prev, next)` classes automatically, so the two
-strands separate as a *consequence* of following reads — no special-case guard.
+The reason is by design: `computeAnchorWindowsClean` is greedy on base span, so a
+large window claims a long backbone interval and **absorbs the very bridge
+spans** that smaller windows would have used to pass reads through. The merged
+genomic contexts the old plan wanted to separate are therefore *inside* each
+window already - captured by per-window `readClusters` (MSA phasing) and
+`alternatePaths` - not strung across windows as triplets.
 
-## The Existing Substrate
+So the open problem is not intra-window decomposition. It is **layout**: connect
+the windows into a linear order, mirror the reverse-complement ones, and never
+create a strand contact (an edge joining the `+` end of one locus to the `-` end
+of another).
 
-All inputs are already computed, independently of inter-window edges:
+## The model: borrow hifiasm's invariant
 
-- **`AnchorWindow::transitionReads`** — `map<(prev,next), vector<OrientedReadId>>`
-  (populated in `WindowTransitions.cpp:141`). For window `W`, every observed
-  `(previousWindow, nextWindow)` route and the reads that follow it. `noWindow`
-  marks a read that starts/ends inside `W`.
-- **`Shasta2AnchorGraph::readWindows`** — `map<read, vector<windowId>>`, each
-  read's ordered window path (the trace to follow).
-- **`AnchorWindow::readIntervals`** + the `windowReadIndex` lookup
-  (`WindowTransitions.cpp:97`) — for a `(window, read)` pair, the read's
-  `[begin, end)` journey interval inside the window.
-- **`AnchorWindow::backboneOrientedReadId` / `filteredBackbonePositions`** — the
-  window's canonical anchor chain and ordering frame.
+hifiasm does not *resolve* strand contacts on its string graph - it makes them
+**unrepresentable**. Strand consistency is a property of the data structure, not
+a cleanup pass. Dinara already mirrors this for reads in `StringGraph`
+(`src/StringGraph.hpp`, `src/AssemblerStringGraph.cpp`). We apply the same model
+to windows.
 
-Decomposition is therefore a **rewrite of window→graph construction**, not new
-data collection.
+### Doubled vertices
 
-## Core Model
-
-For each window `W`, for each `(prev, next)` class in `W.transitionReads`:
-
-1. Gather the reads in that class.
-2. Within `W`, reconstruct the ordered anchor sub-path those reads traverse
-   (their agreed sequence of `W`'s anchors, in backbone order).
-3. Emit that sub-path as a distinct chain — a **prev-next path** `P(W, prev, next)`.
-4. Stitch paths across windows: the tail of `P(W, prev, next)` connects to the
-   head of `P(next, W, nextnext)` for reads that continue, and the head of
-   `P(W, prev, next)` connects to the tail of `P(prev, prevprev, W)`.
-
-The result is a graph woven from read-coherent threads. A locus that is
-traversed in multiple contexts gets multiple copies (one per context) rather
-than one collapsed window.
-
-## Decisions (resolved)
-
-- **Support threshold: any support >= 1.** Every observed `(prev, next)` class
-  becomes a path; a single full-triplet read is enough to instantiate one.
-- **Partial reads (`prev==noWindow` or `next==noWindow`): fold into matching
-  full paths, fall back to terminal paths.**
-  - A `(noWindow, B)` read started inside `W` only because of where the read
-    begins, not biology. It is real evidence for the `W→B` exit and is
-    compatible with any full `(X, B)` path that shares its sub-path through `W`.
-  - **Rule:** a partial folds into (contributes coverage to) any anchor-compatible
-    full path. Only if *no* full path matches does it become its own terminal
-    path — which is then a genuine contig end (true assembly tip), not a
-    per-read artifact.
-  - Discriminator: "does any read carry a full triplet through this side of
-    `W`?" Yes → absorb partials; No → the partial is the boundary.
-
-## Algorithm Sketch
+Every window `W` becomes two oriented vertices:
 
 ```
-for each window W:
-    classes = W.transitionReads                      # (prev,next) -> reads
-    fullClasses = { (p,n): reads | p != noW and n != noW }
-    leftPartials  = { (noW,n): reads }
-    rightPartials = { (p,noW): reads }
-
-    # 1. Build a path per full class.
-    paths = []
-    for (prev, next), reads in fullClasses:
-        subpath = agreedAnchorSubpath(W, reads)      # ordered W anchors
-        paths.append(Path(W, prev, next, subpath, reads))
-
-    # 2. Fold partials into compatible full paths; else make terminals.
-    for (noW, n), reads in leftPartials:
-        matches = [p for p in paths if p.next == n and compatible(p, reads)]
-        if matches: addCoverage(best(matches), reads)
-        else:       paths.append(Path(W, noW, n, agreedAnchorSubpath(W,reads), reads))
-    # symmetric for rightPartials
-
-    emit(paths)
-
-# 3. Stitch across windows by shared (window, boundary-window) endpoints.
-for each read r:
-    seq = readWindows[r]                              # ordered windows
-    for consecutive (W, X) in seq:
-        connect tail of P(W, ?, X)  ->  head of P(X, W, ?)
-        choosing the path copies whose prev/next match r's actual neighbors
+v         = (W << 1) | strand       strand 0 = forward, 1 = RC mirror
+window(v) = v >> 1
+twin(v)   = v ^ 1                    same window, opposite orientation
 ```
 
-`agreedAnchorSubpath(W, reads)` reuses the within-window ordering already used
-for the backbone chain (`filteredBackbonePositions` / backbone-position order),
-intersected with the anchors the class's reads actually carry.
+This is exactly the forward / RC-mirror pair already tracked in
+`anchorToWindow`: a forward window is `windowId`, its RC mirror is
+`windowId + windowCount`. The strand bit *is* the orientation; there is no
+separate edge attribute to get wrong.
 
-## Anchor Ownership Question (open)
+### Twin arcs
 
-Today an anchor belongs to exactly one window (`anchorToWindow`), and the graph
-is built over global `anchorId` vertices. Decomposition wants the *same* locus
-to appear in multiple path copies. Two options:
+A read that visits oriented window `(W, sW)` then `(X, sX)` emits **two** arcs:
 
-- **(D1) Shared anchor vertices, multiple edges.** Keep one vertex per anchor;
-  each path copy is a distinct *edge route* over shared vertices. Simpler graph,
-  but copies of a locus still share a vertex — partial separation only.
-- **(D2) Path-local anchor instances.** Give each path copy its own vertices
-  (anchor instance = `(anchorId, pathId)`). True separation; larger graph; needs
-  an instance→anchor map for sequence/consensus and for `check()`.
+```
+arc:   vertex(W,sW) -> vertex(X,sX)
+twin:  vertex(X,sX)^1 -> vertex(W,sW)^1
+```
 
-Recommendation: prototype with **D1** (cheap, reuses `addEdgeIfValid` and the
-existing bidirected fold), measure how much tangling remains, then move to **D2**
-only if shared vertices still merge contexts.
+The twin is the same connection read in the opposite direction. Storing both
+makes the graph symmetric by construction and accounts for the observed
+left/right partial symmetry directly. A `+`-to-`-` strand contact cannot be
+written down: orientation is carried by the vertex id, and the RC of any walk
+`v0 -> ... -> vk` is the guaranteed-present twin walk `vk^1 -> ... -> v0^1`.
 
-## Implementation Plan
+### Linearization = unitig extension
 
-1. **Diagnostic (read-only, behind a toggle).** Per window, report: number of
-   `(prev,next)` classes, reads per class, full vs partial split, and whether
-   each class's reads agree on a sub-path. Validates the premise (do classes
-   actually carve clean threads?) before any graph change. Output to CSV.
-2. **D1 construction (behind a toggle).** Replace single intra-window chain +
-   inter-window edges with per-class path emission and cross-window stitching,
-   over shared anchor vertices. Keep the current path available via toggle.
-3. **Verify** on the test assembly: total length preserved, strands separated
-   (no self-RC crossings), tangles reduced vs. the shared-window graph.
-4. **D2 (only if needed).** Path-local anchor instances for full separation.
+With the doubled graph in place, layout is unitig construction - the analogue of
+hifiasm's `asg_extend` (Dinara: `stringGraphExtend`,
+`src/AssemblerStringGraphClean.cpp:79`). A step `a -> b` is *mergeable* iff `a`
+has a unique outgoing arc and `b` has a unique incoming arc. Follow mergeable
+steps to grow a maximal linear run. A window chosen RC is emitted from its
+strand-1 vertex, i.e. with `anchorId ^ 1` anchors in reversed backbone order -
+which the existing `anchorToWindow` mirror convention already encodes.
 
-## Risks / Open Questions
+No spanning-tree + BFS orientation pass is needed. That technique is for an
+undirected *signed* graph; the doubled representation removes the sign entirely.
 
-- **Sub-path agreement.** Reads in a class may not perfectly agree on `W`'s
-  interior (indels, missed anchors). Need a consensus/LIS step like the existing
-  backbone filtering; "agreed sub-path" must be defined precisely.
-- **Stitching ambiguity.** When `W` has multiple copies for boundary `X`,
-  choosing which copy a read's `W→X` transition connects to requires matching
-  the read's *full* neighbor context, not just the adjacent window.
-- **Coverage fragmentation at support 1.** Support >= 1 maximizes separation but
-  admits noise; the diagnostic (step 1) should quantify how many singleton
-  classes exist before committing.
-- **Downstream contracts.** `addConfidentBridges`, `toBidirected`, and `check()`
-  assume one-vertex-per-anchor; D2 would require touching those.
+## Existing substrate (no new data collection)
 
-## Files Touched (anticipated)
+- **`anchorToWindow`** (`WindowTransitions.cpp`) - forward windows as
+  `windowId`, RC mirrors as `windowId + windowCount`. This is the doubled
+  vertex set.
+- **`Shasta2Journeys`** - per-oriented-read ordered anchor sequences. Walking a
+  journey and reading each anchor's `anchorToWindow` entry yields the oriented
+  window visit sequence, hence the arcs.
+- **`AnchorWindow::backboneOrientedReadId` / `filteredBackbonePositions`** - the
+  per-window anchor chain to emit once orientation is chosen.
+- **Per-window `readClusters` / `alternatePaths`** - already hold the
+  intra-window haplotype structure; layout is orthogonal to them.
 
-- `src/WindowTransitions.cpp` / `.hpp` — already produces `transitionReads`;
-  may add the diagnostic here.
-- `src/Shasta2AnchorGraph.cpp` — construction rewrite (steps 2/4), behind toggle.
-- `src/AnchorWindows.hpp` — possible per-path/per-instance structures (D2).
-- `srcMain/main.cpp` — wire the diagnostic and the toggle.
+## Diagnostic (implemented, read-only)
+
+`computeWindowTransitions` (`src/WindowTransitions.cpp`) now emits, behind
+`windowArcDiagnostic`:
+
+- **`WindowArcs.csv`** - one row per directed arc:
+  `FromWindow, FromStrand(+/-), ToWindow, ToStrand(+/-), Reads, TwinReads,
+  TwinPresent`. Lets you confirm twin symmetry and inspect edge support.
+- **`WindowUnitigs.csv`** - one row per maximal unitig:
+  `UnitigId, WindowCount, WindowPath` (oriented windows, e.g. `12+ 7- 31+`).
+- **Console summary** - oriented vertex count, used arcs, unitig count, longest
+  unitig (in windows), branch vertices, tips, and `twin-missing` arcs. The
+  `twin-missing` count is the strand-contact check: it must be 0 by
+  construction.
+
+Read these to answer, before any graph rewrite:
+
+1. **How linear is the layout?** longest unitig / total windows, and the number
+   of branch vertices. Few branches and long unitigs mean the windows already
+   lay out as near-linear contigs.
+2. **Is the representation sound?** `twin-missing` must be 0.
+3. **Where are the tangles?** branch vertices are the windows that need
+   intra-window separation (`readClusters` / `alternatePaths`) before they can
+   be laid out unambiguously.
+
+## Implementation plan
+
+1. **Diagnostic (done).** Doubled-vertex arc list + unitig extension, read-only,
+   behind a toggle in `WindowTransitions.cpp`.
+2. **Construction (behind a toggle).** Build the doubled window string graph as a
+   first-class structure and run hifiasm-style cleanup on it: symmetric arc
+   deletion, tip cutting, and unitig assembly - reusing the existing
+   `StringGraph` machinery with windows as vertices instead of reads.
+3. **Emit oriented window paths.** For each unitig, concatenate each window's
+   backbone chain in the chosen orientation (forward anchors, or `anchorId ^ 1`
+   reversed for RC), stitched at the boundaries.
+4. **Verify** on the test assembly: `twin-missing == 0`, total length preserved,
+   no self-RC crossings, unitig count and N50 vs. the current graph.
+
+## Risks / open questions
+
+- **Branch resolution.** Where a window has out-degree > 1, layout is ambiguous.
+  This is exactly where intra-window structure (`readClusters`,
+  `alternatePaths`) must split the window into per-haplotype copies *before*
+  layout. Sequencing: separate inside, then lay out.
+- **Arc support threshold.** `minArcReads` (currently 1) trades connectivity for
+  noise. The diagnostic reports arc support so the threshold can be chosen from
+  data.
+- **Cycles.** Repeats can make the window graph non-acyclic; unitig extension
+  stops at revisits (handled), but contig extraction across cycles needs the
+  same tip/bubble handling hifiasm applies to reads.
+- **Coordinate with detangling.** `findDetourWindowPairs`
+  (`src/Shasta2AnchorGraph.cpp`) already reasons about cross-window detours;
+  the doubled-vertex layout should subsume or feed it, not duplicate it.
+
+## Files touched
+
+- `src/WindowTransitions.cpp` - diagnostic (done); doubled-graph builder (step 2).
+- `src/Shasta2AnchorGraph.cpp` - consume oriented unitig paths in construction
+  (steps 2/3), behind toggle; reconcile with `findDetourWindowPairs`.
+- Reuse `src/StringGraph.*` / `src/AssemblerStringGraphClean.cpp` cleanup
+  helpers with windows as vertices where practical.
