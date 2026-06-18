@@ -107,7 +107,8 @@ public:
         uint64_t threadCount,
         const Reads* reads = nullptr,
         const vector<DetangleBypassEdge>* bypassEdges = nullptr,
-        const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs = nullptr);
+        const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs = nullptr,
+        const vector<uint32_t>* anchorDovetailWindow = nullptr);
 
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}

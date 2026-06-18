@@ -42,6 +42,32 @@ struct CleanWindowCandidateLess {
     }
 };
 
+// Whole-journey window claiming (one hop). When true, a window claims not just
+// the backbone-overlapping span of each touching read, but the read's ENTIRE
+// journey (clamped only by what is still unclaimed, since ownership is
+// exclusive). This pulls each window's left/right dovetails fully into the
+// window instead of leaving them as the inter-window "mess", so downstream
+// path-finding can be done inside the window. The toucher's readInterval (used
+// for per-window MSA/consensus) stays at the backbone-overlapping span; only
+// the ANCHOR CLAIMING span (which drives window membership / topology) is
+// extended. When false, the original convergent-span claiming is used.
+//
+// NOTE: exclusive ownership + whole-journey claiming disconnects neighbors
+// (connecting reads get fully absorbed by whichever window claims first) and
+// assigns dovetails by an arbitrary claim-race. The intended model is a SHARED
+// dovetail halo (a separate multi-owner structure) layered on disjoint
+// exclusive cores; this exclusive toggle is kept off pending that halo work.
+constexpr bool claimWholeJourneyDovetails = false;
+
+// Shared dovetail halo (read-only model). Independent of claiming/ownership:
+// each window's halo is the set of forward-oriented anchors from its backbone
+// plus the WHOLE journeys of all reads touching the backbone. Halos are
+// MULTI-OWNER (a connecting read's journey lands in both neighbors' halos), so
+// the intersection of two windows' halos is the overlap that should register
+// their connection. This is collected for diagnostics only; it does not affect
+// claiming, anchorToWindow, or topology. The exclusive core stays disjoint.
+constexpr bool buildWindowHalo = true;
+
 } // anonymous namespace
 
 
@@ -54,7 +80,9 @@ void Assembler::computeAnchorWindowsClean(
     uint64_t threadCount,
     uint64_t minCommonForBackbone,
     uint64_t maxSkipForBackbone,
-    uint64_t minWindowBaseSpan)
+    uint64_t minWindowBaseSpan,
+    vector<uint32_t>* anchorDovetailWindow,
+    vector<vector<uint32_t>>* windowHalos)
 {
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
@@ -79,6 +107,29 @@ void Assembler::computeAnchorWindowsClean(
 
     vector<uint32_t> anchorOwner(anchorCount, anchorUnclaimed);
     anchorWindows.clear();
+
+    // Forward-oriented dovetail window membership, persisted to the caller so
+    // the anchor graph can map claimed dovetail anchors to their owning window
+    // (anchorOwner alone is local scratch and orientation-collapsed). Sized
+    // only when whole-journey claiming is enabled and the caller requested it;
+    // otherwise left empty so the old behavior is byte-identical downstream.
+    constexpr uint32_t dovetailNoWindow = std::numeric_limits<uint32_t>::max();
+    const bool recordDovetails =
+        (anchorDovetailWindow != nullptr) && claimWholeJourneyDovetails;
+    if(anchorDovetailWindow != nullptr) {
+        anchorDovetailWindow->clear();
+        if(claimWholeJourneyDovetails) {
+            anchorDovetailWindow->assign(anchorCount, dovetailNoWindow);
+        }
+    }
+
+    // Shared dovetail halo (read-only). Per window, the forward-oriented anchor
+    // set of backbone + all touchers' whole journeys. Multi-owner across
+    // windows; collected only when requested.
+    const bool recordHalo = (windowHalos != nullptr) && buildWindowHalo;
+    if(windowHalos != nullptr) {
+        windowHalos->clear();
+    }
 
     // Per-oriented-read scratch for tracking which reads touch the current backbone.
     vector<uint32_t> touchedEpoch(orientedReadCount, 0);
@@ -444,7 +495,15 @@ void Assembler::computeAnchorWindowsClean(
             const uint32_t convergentEnd = sharedReadPositions.back() + 1;
             const uint32_t convergentCount = uint32_t(sharedReadPositions.size());
 
-            readSpans.push_back(ReadSpan{oid, convergentBegin, convergentEnd});
+            // Claiming span: whole journey (one hop) when enabled, so the
+            // window absorbs this toucher's left/right dovetails. The
+            // readInterval below (for MSA/consensus) stays at the convergent
+            // backbone-overlapping span regardless.
+            const uint32_t claimBegin = claimWholeJourneyDovetails ?
+                0u : convergentBegin;
+            const uint32_t claimEnd = claimWholeJourneyDovetails ?
+                uint32_t(journey.size()) : convergentEnd;
+            readSpans.push_back(ReadSpan{oid, claimBegin, claimEnd});
 
             window.readIntervals.push_back(AnchorWindowReadInterval{
                 oid,
@@ -457,13 +516,53 @@ void Assembler::computeAnchorWindowsClean(
         // Claim all anchors across all spans (backbone + touched reads) and their RC.
         for(const ReadSpan& span : readSpans) {
             const auto journey = (*shasta2Journeys)[span.oid];
+            // Forward orientation of this read relative to the strand-0 backbone:
+            // a strand-1 toucher's journey holds RC anchors, so the forward
+            // anchor is anchorId^1. Used to record window membership in the
+            // backbone-forward frame (matching anchorToWindow's convention).
+            const bool readIsStrand1 = (span.oid.getStrand() == 1);
             for(uint32_t readPos = span.begin; readPos < span.end; readPos++) {
                 const uint64_t anchorId = uint64_t(journey[readPos]);
                 if(anchorOwner[anchorId] == anchorUnclaimed) {
                     claimAnchor(anchorId, windowId);
                     ++window.claimedAnchorCount;
+                    // Record forward-oriented dovetail membership (toggle only).
+                    if(recordDovetails) {
+                        const uint64_t forwardAid =
+                            readIsStrand1 ? (anchorId ^ 1ULL) : anchorId;
+                        if(forwardAid < anchorCount) {
+                            (*anchorDovetailWindow)[forwardAid] = windowId;
+                        }
+                    }
                 }
             }
+        }
+
+        // Collect this window's shared halo: forward-oriented anchors from the
+        // WHOLE journeys of backbone + all touchers (readSpans), independent of
+        // claiming. Multi-owner across windows; read-only for diagnostics.
+        if(recordHalo) {
+            std::unordered_set<uint64_t> haloSet;
+            for(const ReadSpan& span : readSpans) {
+                const auto journey = (*shasta2Journeys)[span.oid];
+                const bool readIsStrand1 = (span.oid.getStrand() == 1);
+                for(uint32_t readPos = 0; readPos < uint32_t(journey.size()); readPos++) {
+                    const uint64_t anchorId = uint64_t(journey[readPos]);
+                    const uint64_t forwardAid =
+                        readIsStrand1 ? (anchorId ^ 1ULL) : anchorId;
+                    if(forwardAid < anchorCount) {
+                        haloSet.insert(forwardAid);
+                    }
+                }
+            }
+            vector<uint32_t> halo;
+            halo.reserve(haloSet.size());
+            for(const uint64_t aid : haloSet) {
+                halo.push_back(uint32_t(aid));
+            }
+            // windowId equals current anchorWindows.size(); halos are pushed in
+            // the same order, so index alignment is maintained.
+            windowHalos->push_back(std::move(halo));
         }
 
         // Now that claiming is done, bump generations and re-push unclaimed

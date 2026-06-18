@@ -21,7 +21,8 @@ using std::vector;
 void dinara::computeWindowTransitions(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
-    vector<AnchorWindow>& anchorWindows)
+    vector<AnchorWindow>& anchorWindows,
+    const vector<uint32_t>* anchorDovetailWindow)
 {
     cout << timestamp << "computeWindowTransitions begins." << endl;
 
@@ -55,6 +56,24 @@ void dinara::computeWindowTransitions(
             }
             const uint64_t rcAid = aid ^ 1ULL;
             if(rcAid < anchorCount) {
+                anchorToWindow[rcAid] = windowId + windowCount;
+            }
+        }
+    }
+
+    // Whole-journey dovetail membership (additive; matches the anchor graph
+    // constructor). Backbone fill above is authoritative; dovetails only fill
+    // anchors still unmapped. RC twin -> mirror window.
+    if(anchorDovetailWindow != nullptr && !anchorDovetailWindow->empty() &&
+       anchorDovetailWindow->size() == anchorCount) {
+        for(uint64_t aid = 0; aid < anchorCount; aid++) {
+            const uint32_t windowId = (*anchorDovetailWindow)[aid];
+            if(windowId == noW) continue;
+            if(anchorToWindow[aid] == noW) {
+                anchorToWindow[aid] = windowId;
+            }
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount && anchorToWindow[rcAid] == noW) {
                 anchorToWindow[rcAid] = windowId + windowCount;
             }
         }

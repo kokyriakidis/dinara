@@ -191,7 +191,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     uint64_t threadCount,
     const Reads* reads,
     const vector<DetangleBypassEdge>* bypassEdges,
-    const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs) :
+    const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs,
+    const vector<uint32_t>* anchorDovetailWindow) :
     MappedMemoryOwner(anchors),
     MultithreadedObject<Shasta2AnchorGraph>(*this)
 {
@@ -243,6 +244,33 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 anchorToBackbonePos[rcAid] = pos;
             }
         }
+    }
+
+    // Whole-journey dovetail membership (additive). anchorDovetailWindow maps
+    // forward-oriented claimed dovetail anchors to their owning window. The
+    // backbone fill above is authoritative (it uses filteredBackbonePositions),
+    // so dovetails are only added where the anchor is still noWindow. This makes
+    // each window's left/right dovetails part of the window for path-finding,
+    // with the RC twin mapped to the mirror window. anchorToBackbonePos is left
+    // at 0 for dovetails (they have no backbone position); transition selection
+    // (which uses it) is expected to shift, as topology intentionally changes.
+    if(anchorDovetailWindow != nullptr && !anchorDovetailWindow->empty()) {
+        DINARA_ASSERT(anchorDovetailWindow->size() == anchorCount);
+        uint64_t dovetailMapped = 0;
+        for(uint64_t aid = 0; aid < anchorCount; aid++) {
+            const uint32_t windowId = (*anchorDovetailWindow)[aid];
+            if(windowId == noWindow) continue;
+            if(anchorToWindow[aid] == noWindow) {
+                anchorToWindow[aid] = windowId;
+                ++dovetailMapped;
+            }
+            const uint64_t rcAid = aid ^ 1ULL;
+            if(rcAid < anchorCount && anchorToWindow[rcAid] == noWindow) {
+                anchorToWindow[rcAid] = windowId + windowCount;
+            }
+        }
+        cout << "Shasta2AnchorGraph: mapped " << dovetailMapped
+             << " dovetail anchors into windows." << endl;
     }
 
     // Helper to add an edge if the anchor pair has shared oriented reads.

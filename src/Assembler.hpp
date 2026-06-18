@@ -3865,6 +3865,10 @@ public:
     // the backbone (by anchor ID), enforces backbone order via LIS, and
     // discards non-shared and out-of-order anchors. Guarantees strand-consistent
     // edges in the resulting AnchorGraph.
+    // anchorDovetailWindow (optional output): when non-null, receives the
+    // forward-oriented anchorId -> owning windowId map for claimed dovetail
+    // anchors (empty when whole-journey claiming is disabled). Lets the anchor
+    // graph treat dovetails as part of the window for path-finding.
     void computeAnchorWindowsClean(
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
@@ -3873,7 +3877,13 @@ public:
         uint64_t threadCount,
         uint64_t minCommonForBackbone = 2,
         uint64_t maxSkipForBackbone = 10,
-        uint64_t minWindowBaseSpan = 4000);
+        uint64_t minWindowBaseSpan = 4000,
+        vector<uint32_t>* anchorDovetailWindow = nullptr,
+        // windowHalos (optional output): per-window forward-oriented anchor set
+        // of backbone + all touchers' whole journeys. Multi-owner across
+        // windows; the intersection of two windows' halos is their overlap.
+        // Read-only diagnostic; does not affect claiming or topology.
+        vector<vector<uint32_t>>* windowHalos = nullptr);
 
     // Detect clean het SNPs in an anchor window using Theseus MSA.
     // Returns the number of SNPs passing strand bias and repeat filtering.

@@ -20,9 +20,14 @@ namespace dinara {
 //   - AnchorWindow::transitionReads[(prev, next)] -> read list
 //   - AnchorWindowReadInterval::previousWindow / nextWindow
 //   - AnchorWindow::backbonePreviousWindow / backboneNextWindow
+// anchorDovetailWindow (optional): forward-oriented anchorId -> owning windowId
+// for claimed dovetail anchors. When provided and non-empty, dovetails are
+// added to anchorToWindow (additive, backbone stays authoritative) so they are
+// treated as part of their window for transition counting.
 void computeWindowTransitions(
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
-    std::vector<AnchorWindow>& anchorWindows);
+    std::vector<AnchorWindow>& anchorWindows,
+    const std::vector<uint32_t>* anchorDovetailWindow = nullptr);
 
 } // namespace dinara
