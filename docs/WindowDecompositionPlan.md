@@ -28,6 +28,65 @@ the windows into a linear order, mirror the reverse-complement ones, and never
 create a strand contact (an edge joining the `+` end of one locus to the `-` end
 of another).
 
+## Findings from the doubled-graph diagnostics
+
+Running the diagnostics (below) on the test assembly (69 windows) established:
+
+- **Layout already linearizes cleanly.** Twin-dedup of the doubled-vertex
+  unitigs yields **11 canonical oriented paths from 22 unitigs, 0 orientation
+  conflicts, 0 strand contacts** (`WindowLinearPaths.csv`,
+  `WindowOrientation.csv`). The fw/rc separation works: each window resolves to a
+  single orientation. This is the answer to "connect windows linearly, mirror
+  RC, no contacts."
+- **57 / 69 windows are linear**; the residual fragmentation into 11 paths is
+  caused entirely by **8 branch windows** (+ 4 genuine tips: windows 28, 50, 67
+  and one more).
+- **Read-threading does not work and is not needed.** Almost no read spans a
+  window (14 full triplets total), so matching a window's in-arc to its out-arc
+  by shared reads fails on nearly every window, *including trivially linear
+  ones* (`WindowThreading.csv`: only 4/68 thread). Linearization succeeds anyway
+  because it relies on **adjacency uniqueness** (in-deg/out-deg == 1), not on
+  any single read spanning the window. Threading is a dead end; do not use it.
+
+### The branch windows are one root cause, not two
+
+`WindowBranches.csv` classifies each branch by where its exits attach along the
+window (`ExitSpreadFrac`):
+
+- **Positional branches** (spread large): windows **0** (sides 0.92 / 0.97),
+  **19+** (0.99), **5+** (0.66), **13+** (0.44). Their exits are spread along the
+  whole window length - the window **absorbed multiple sub-loci** (greedy
+  over-claiming).
+- **read-set branches** (spread ~0): windows 9+, 19-, 31-, 37+, 41+. Every one of
+  these attaches at fraction ~1.0 **into window 0 or window 19** (targets `0-`,
+  `19-`).
+
+These are not independent. The read-set "forks" are other windows connecting to
+**different internal positions of the over-sized windows 0 and 19**. From a small
+window's view, "connects to 0- or 67+" looks like a fork at its end, but it is
+really that small window attaching to one sub-locus of window 0 while another
+window continues from a different sub-locus.
+
+**Consequence:** splitting the over-claimed windows (0, 19, and likely 5, 13)
+*positionally* at their exit-attachment points resolves the read-set branches
+too - the single hub becomes a chain `0a -> 0b -> 0c`, and each former fork now
+targets a distinct sub-window. One fix, not two.
+
+### Fix location
+
+The true root cause is upstream: `computeAnchorWindowsClean` over-claims base
+span when building the largest windows. Two options:
+
+1. **Upstream** - cap window span / break at coverage discontinuities in the
+   partitioner. Cleaner but riskier (the partitioner feeds everything).
+2. **Post-hoc positional split** - split the few positional windows at their
+   attachment fractions before linearization. Localized, reversible, behind a
+   toggle.
+
+Recommendation: prototype with **(2)** to confirm positional splitting collapses
+the 11 paths toward the expected ~2-4 contigs, then fold the logic upstream into
+**(1)**.
+
 ## The model: borrow hifiasm's invariant
 
 hifiasm does not *resolve* strand contacts on its string graph - it makes them
