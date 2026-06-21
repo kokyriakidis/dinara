@@ -1132,6 +1132,11 @@ void dinara::main::assemble(
 
     // Compute anchor windows and run CIGAR-based SNP detection.
     cout << timestamp << "Computing anchor windows..." << endl;
+    // ========================================================================
+    // PHASE 1: Window creation.
+    // Partitions anchors into disjoint windows (one whole read journey each).
+    // Produces `anchorWindows` only — no inter-window edges, no transitions.
+    // ========================================================================
     vector<AnchorWindow> anchorWindows;
     vector<uint32_t> anchorDovetailWindow;
     const uint64_t minCommonForBackbone =
@@ -1518,11 +1523,23 @@ void dinara::main::assemble(
         }
     }
 
-    // Compute window transitions from journeys before graph construction.
-    // This populates transitionReads, per-read previousWindow/nextWindow,
-    // and backbonePreviousWindow/backboneNextWindow on each AnchorWindow.
-    // Detangling uses these; the graph constructor recomputes them from
-    // its own anchorToWindow (which may differ after detangling modifies anchors).
+    // ========================================================================
+    // PER-WINDOW PROCESSING HOOK.
+    // Runs after windows exist (Phase 1) but before any inter-window edges are
+    // derived (Phase 2). Each window is self-contained here (its readIntervals,
+    // backbone, etc.), so per-window work (consensus, phasing, splitting,
+    // filtering) belongs here and can be done independently per window.
+    // Intentionally empty for now.
+    // ========================================================================
+
+    // ========================================================================
+    // PHASE 2: Edge derivation.
+    // Derives inter-window adjacency from journeys and records it on the
+    // windows (transitionReads, per-read previous/next window,
+    // backbonePreviousWindow/backboneNextWindow). Produces edges-as-data only;
+    // does not build the graph. Phase 3 (the Shasta2AnchorGraph constructor)
+    // consumes these fields directly instead of recomputing them.
+    // ========================================================================
     computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
         &anchorDovetailWindow);
 
@@ -1531,6 +1548,10 @@ void dinara::main::assemble(
     const uint64_t minInterWindowEdgeCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
 
+    // ========================================================================
+    // PHASE 3: Graph assembly.
+    // Builds Shasta2AnchorGraph from windows (Phase 1) + transitions (Phase 2).
+    // ========================================================================
     // Single-pass anchor graph construction (no detour suppression).
     cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
          << " anchor windows..." << endl;

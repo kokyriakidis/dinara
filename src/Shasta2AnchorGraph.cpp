@@ -348,89 +348,20 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
 
 
-    // Per-read window transition tracking.
-    // If computeWindowTransitions() was already called, transitionReads
-    // are populated. Recompute unconditionally so the graph's own
-    // anchorToWindow (which may differ after detangling) is authoritative.
-    {
-        auto normalize = [&](uint32_t w) -> uint32_t {
-            return (w >= windowCount) ? (w - windowCount) : w;
-        };
-        const uint32_t noW = AnchorWindowReadInterval::noWindow;
-
-        // Clear any pre-existing transition data to avoid duplicates.
-        for(uint32_t wid = 0; wid < windowCount; wid++) {
-            auto& w = const_cast<AnchorWindow&>(anchorWindows[wid]);
-            w.transitionReads.clear();
-            w.backbonePreviousWindow = noW;
-            w.backboneNextWindow = noW;
-            for(auto& ri : w.readIntervals) {
-                ri.previousWindow = noW;
-                ri.nextWindow = noW;
-            }
-        }
-
-        // Build lookup: (windowId, orientedReadId) -> index in readIntervals.
-        std::map<std::pair<uint32_t, uint32_t>, uint64_t> windowReadIndex;
-        for(uint32_t wid = 0; wid < windowCount; wid++) {
-            auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
-            for(uint64_t ri = 0; ri < window.readIntervals.size(); ri++) {
-                windowReadIndex[{wid, window.readIntervals[ri].orientedReadId.getValue()}] = ri;
-            }
-        }
-
-        const uint64_t journeyCount = journeys.size();
-        for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
-            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
-            const auto journey = journeys[oid];
-            if(journey.empty()) continue;
-
-            // Collect the sequence of distinct normalized windows this read visits.
-            std::vector<uint32_t> windowSequence;
-            for(uint32_t pos = 0; pos < uint32_t(journey.size()); pos++) {
-                const Shasta2AnchorId anchorId = journey[pos];
-                if(uint64_t(anchorId) >= anchorCount) continue;
-                const uint32_t windowId = anchorToWindow[uint64_t(anchorId)];
-                if(windowId == noWindow) continue;
-                const uint32_t normW = normalize(windowId);
-                if(windowSequence.empty() || windowSequence.back() != normW) {
-                    windowSequence.push_back(normW);
-                }
-            }
-
-            // For each window in the sequence, update per-read fields and transition map.
-            for(uint64_t i = 0; i < windowSequence.size(); i++) {
-                const uint32_t wid = windowSequence[i];
-                const uint32_t prev = (i > 0) ? windowSequence[i - 1] : noW;
-                const uint32_t next = (i + 1 < windowSequence.size()) ? windowSequence[i + 1] : noW;
-
-                auto it = windowReadIndex.find({wid, oidValue});
-                if(it != windowReadIndex.end()) {
-                    auto& interval = const_cast<AnchorWindow&>(anchorWindows[wid]).readIntervals[it->second];
-                    interval.previousWindow = prev;
-                    interval.nextWindow = next;
-                }
-
-                // Always add to transitionReads (even if read isn't in readIntervals,
-                // it still provides transition evidence).
-                auto& w = const_cast<AnchorWindow&>(anchorWindows[wid]);
-                w.transitionReads[{prev, next}].push_back(oid);
-            }
-        }
-    }
-
-    // Populate backbonePreviousWindow / backboneNextWindow for each window.
-    for(uint32_t wid = 0; wid < windowCount; wid++) {
-        auto& window = const_cast<AnchorWindow&>(anchorWindows[wid]);
-        const uint32_t bbOid = window.backboneOrientedReadId.getValue();
-        for(const auto& ri : window.readIntervals) {
-            if(ri.orientedReadId.getValue() == bbOid) {
-                window.backbonePreviousWindow = ri.previousWindow;
-                window.backboneNextWindow = ri.nextWindow;
-                break;
-            }
-        }
-    }
+    // Per-window transition tracking (transitionReads, per-read
+    // previousWindow/nextWindow, backbonePreviousWindow/backboneNextWindow)
+    // is computed in Phase 2 by computeWindowTransitions(), which runs before
+    // this constructor and writes those fields directly into the AnchorWindow
+    // structs. We consume that output here instead of recomputing it.
+    //
+    // This is valid as long as Phase 2 and this constructor build the same
+    // anchorToWindow map. They do: both fill it from filteredBackbonePositions
+    // (backbone -> windowId, RC twin -> windowId + windowCount) and then apply
+    // anchorDovetailWindow identically. The old per-strand detangling path that
+    // could mutate anchorToWindow after Phase 2 is disabled (bypassEdges and
+    // detourWindowPairs are null at the call site). If that path is restored
+    // and it changes anchorToWindow, the transition fields would need to be
+    // recomputed here against the mutated map.
 
     // Per-read transition: which anchor pair the read uses at the boundary.
     struct ReadTransition {
