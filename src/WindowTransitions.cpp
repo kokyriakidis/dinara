@@ -6,6 +6,7 @@
 #include "timestamp.hpp"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -595,6 +596,88 @@ void dinara::computeWindowTransitions(
                             << ((twinW >= minArcReads) ? 1 : 0) << '\n';
                 }
                 arcsCsv.close();
+            }
+
+            // ----------------------------------------------------------------
+            // Strand-contact diagnostic (read-only).
+            //
+            // Two questions about how windows touch the opposite strand:
+            //
+            //  (1) Self-RC contacts: does a window W connect to its own RC twin
+            //      (an arc W±  ->  W∓, i.e. normalize(from) == normalize(to))?
+            //      These are inverted-repeat fold-backs; the anchor-graph ctor
+            //      already drops them ("self-RC, strand separation"). Reported
+            //      here so we know how many exist and on which windows.
+            //
+            //  (2) Both-strand contacts: does a source vertex reach some other
+            //      window X on BOTH its forward (X+) and its RC (X-) vertex?
+            //      That means W is adjacent to a locus and that locus's reverse
+            //      complement at once — a genuine strand ambiguity that a clean
+            //      orientation cannot satisfy. Counted per source vertex.
+            //
+            // Pure read-only: derived from arcWeight (the same arcs used for
+            // layout), filtered by minArcReads. No graph or struct mutation.
+            // ----------------------------------------------------------------
+            {
+                // (1) Self-RC arcs.
+                ofstream selfRcCsv("WindowSelfRcContacts.csv");
+                selfRcCsv << "Window,FromStrand,ToStrand,Reads,TwinReads\n";
+                uint64_t selfRcArcs = 0;
+                std::set<uint32_t> selfRcWindows;
+                for(const auto& [key, w] : arcWeight) {
+                    if(w < minArcReads) continue;
+                    const uint32_t a = key.first;
+                    const uint32_t b = key.second;
+                    if(vWindow(a) != vWindow(b)) continue;  // not self-RC
+                    // a == b is already filtered during arc emission; this is
+                    // the b == a^1 case (forward<->its own mirror).
+                    ++selfRcArcs;
+                    selfRcWindows.insert(vWindow(a));
+                    const auto twinIt = arcWeight.find({b ^ 1u, a ^ 1u});
+                    const uint64_t twinW =
+                        (twinIt != arcWeight.end()) ? twinIt->second : 0;
+                    selfRcCsv << vWindow(a) << ',' << vStrandChar(a) << ','
+                              << vStrandChar(b) << ',' << w << ',' << twinW << '\n';
+                }
+                selfRcCsv.close();
+
+                // (2) Both-strand contacts: per source vertex, group its out-
+                // neighbors by normalized window and flag any target window the
+                // source reaches on both strands.
+                ofstream bothCsv("WindowBothStrandContacts.csv");
+                bothCsv << "FromWindow,FromStrand,TargetWindow,"
+                           "PlusReads,MinusReads\n";
+                // source vertex -> (target window -> [plusReads, minusReads]).
+                map<uint32_t, map<uint32_t, std::array<uint64_t, 2>>> bySource;
+                for(const auto& [key, w] : arcWeight) {
+                    if(w < minArcReads) continue;
+                    const uint32_t a = key.first;
+                    const uint32_t b = key.second;
+                    if(vWindow(a) == vWindow(b)) continue;  // skip self-RC here
+                    const uint32_t strandIdx = (b & 1u);    // 0 = X+, 1 = X-
+                    bySource[a][vWindow(b)][strandIdx] += w;
+                }
+                uint64_t bothStrandPairs = 0;     // (source, target) on both strands
+                std::set<uint32_t> bothStrandSources;
+                for(const auto& [src, targets] : bySource) {
+                    for(const auto& [tgtWin, counts] : targets) {
+                        if(counts[0] > 0 && counts[1] > 0) {
+                            ++bothStrandPairs;
+                            bothStrandSources.insert(src);
+                            bothCsv << vWindow(src) << ',' << vStrandChar(src) << ','
+                                    << tgtWin << ',' << counts[0] << ','
+                                    << counts[1] << '\n';
+                        }
+                    }
+                }
+                bothCsv.close();
+
+                cout << timestamp << "Strand-contact diagnostic: "
+                     << selfRcArcs << " self-RC arcs over "
+                     << selfRcWindows.size() << " windows (WindowSelfRcContacts.csv); "
+                     << bothStrandPairs << " both-strand (source,target) pairs over "
+                     << bothStrandSources.size()
+                     << " source vertices (WindowBothStrandContacts.csv)." << endl;
             }
 
             // Unitig extension: a step a -> b is "mergeable" iff a has exactly
