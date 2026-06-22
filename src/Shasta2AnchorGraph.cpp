@@ -638,44 +638,59 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             inNeighbors[mB].insert(mA);
         }
 
-        // Global strand-consistent edge selection (parity union-find).
+        // Global strand-consistent edge selection with twin routing.
         //
-        // Generalizes the local both-strand rule to a global one: instead of
-        // only forbidding a single source from reaching X+ and X-, we maintain
-        // a consistent strand orientation for every window across the whole
-        // chain it belongs to, and reject any edge that would contradict the
-        // orientations already fixed by stronger edges.
+        // Maintains a consistent strand orientation for every window across the
+        // whole chain it belongs to (via a parity union-find), and processes
+        // candidate edges strongest-support-first so confident adjacencies
+        // build and orient the chains. When a weaker edge contradicts the
+        // orientation already fixed for windows in its chain it is a strand
+        // contact; rather than drop it (which would break the graph), we try to
+        // ROUTE it to the strand-consistent twin and only keep the raw contact
+        // when routing is impossible. No candidate edge is ever dropped, so
+        // connectivity is preserved.
         //
         // Model: each window locus (normalized id in [0, windowCount)) has an
         // orientation relative to its component root. A canonical pair (A, B)
         // with strands sA, sB (0 = forward, 1 = RC) imposes the constraint
         //     orient(a) XOR orient(b) == sA XOR sB,   a = norm(A), b = norm(B).
-        // A parity union-find tracks each locus's parity to its root:
-        //   - different components -> merge, fixing their relative orientation;
-        //   - same component       -> accept iff the already-fixed relative
-        //                             orientation matches; else it is a strand
-        //                             contact and the edge is rejected.
         //
-        // Edges are considered strongest-first (most distinct spanning reads),
-        // so high-confidence adjacencies build the chains and orient the
-        // windows; weaker edges that disagree with that established orientation
-        // are dropped. This subsumes both earlier rules:
-        //   - both-strand: S->X+ then S->X- is a same-component parity clash;
-        //   - self-RC:     A->B with norm(A)==norm(B), sA!=sB is parity 1 on a
-        //                  single node (parity 0), always a clash.
-        // Because the constraint is symmetric under RC, the forward pair and its
-        // mirror impose the same constraint, so processing canonical pairs once
-        // is sufficient and keeps the two strand lattices consistent.
+        // On a same-chain conflict for edge (A, B):
+        //   - Twin routing: the consistent connection is (A, rcWindow(B)) (B's
+        //     opposite-strand copy of the SAME window). If that pair has its own
+        //     read support (a genuine both-strand contact, both strands are
+        //     observed), the routed edge is created independently, so window B
+        //     stays connected through its twin and we drop the raw contact.
+        //   - Otherwise no read supports the twin edge (it cannot be synthesized
+        //     from this edge's reads, since firstInB and firstInB^1 are opposite
+        //     strands of one locus and never co-occur on a read). Dropping would
+        //     break the graph, so we KEEP the edge as a residual strand contact.
+        //
+        // Self-RC pairs (norm(A)==norm(B)) connect a window to its own RC and
+        // are always dropped (a window cannot be its own twin).
         auto normalizeW = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
+        // rcWindow is defined above in this block.
         auto strandOf = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? 1u : 0u;
         };
-        std::set<std::pair<uint32_t, uint32_t>> strandRejectPairs;
+        std::set<std::pair<uint32_t, uint32_t>> strandRejectPairs;  // routed-away.
         uint64_t selfRcSkipped = 0;
-        uint64_t strandContactSkipped = 0;
+        uint64_t strandContactRouted = 0;   // dropped, connectivity kept via twin.
+        uint64_t strandContactKept = 0;     // residual contact kept (no twin).
         {
+            // Directed window pairs that have read support (forward + mirror of
+            // each canonical pair, since both edges are created). Used to decide
+            // whether a conflict can be routed to its twin.
+            std::set<std::pair<uint32_t, uint32_t>> supportedDirected;
+            for(const auto& [windowPair, transitions] : windowPairTransitions) {
+                if(transitions.empty()) continue;
+                const uint32_t A = windowPair.first, B = windowPair.second;
+                supportedDirected.insert({A, B});
+                supportedDirected.insert({rcWindow(B), rcWindow(A)});
+            }
+
             // Parity union-find over loci [0, windowCount).
             std::vector<uint32_t> ufParent(windowCount);
             std::vector<uint8_t> ufRank(windowCount, 0);
@@ -693,11 +708,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             // Collect candidate canonical pairs with distinct-read support.
             // Exclude self-RC pairs (handled explicitly below) so they do not
-            // pollute the union-find or the strand-contact count.
+            // pollute the union-find.
             struct Cand {
                 uint32_t a, b;        // loci.
                 uint8_t constraint;   // sA XOR sB.
-                uint32_t A, B;        // original window ids (for reject set).
+                uint32_t A, B;        // original window ids.
                 uint64_t support;
             };
             std::vector<Cand> candidates;
@@ -728,10 +743,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 auto [ra, pa] = ufFind(c.a);
                 auto [rb, pb] = ufFind(c.b);
                 if(ra == rb) {
-                    // Same chain: accept only if orientation already agrees.
-                    if(uint8_t(pa ^ pb) != c.constraint) {
+                    // Same chain.
+                    if(uint8_t(pa ^ pb) == c.constraint) {
+                        continue;  // orientation agrees: accept as-is.
+                    }
+                    // Strand contact. Try to route to the twin (A, rcWindow(B)).
+                    if(supportedDirected.count({c.A, rcWindow(c.B)})) {
+                        // Twin connection has its own read support and is created
+                        // independently; drop this raw contact (connectivity of
+                        // window B preserved via its twin vertex).
                         strandRejectPairs.insert({c.A, c.B});
-                        ++strandContactSkipped;
+                        ++strandContactRouted;
+                    } else {
+                        // No twin support: keep the edge to avoid a break. It is
+                        // a residual strand contact (not added to the reject set).
+                        ++strandContactKept;
                     }
                     continue;
                 }
@@ -751,24 +777,25 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
 
-            if(strandContactSkipped > 0 || selfRcSkipped > 0) {
-                cout << "Strand-consistent edge selection: " << strandContactSkipped
-                     << " strand-contact edge(s) and " << selfRcSkipped
-                     << " self-RC edge(s) rejected (strongest-support-first "
-                        "parity union-find)." << endl;
+            if(strandContactRouted > 0 || strandContactKept > 0 || selfRcSkipped > 0) {
+                cout << "Strand-consistent edge selection: " << strandContactRouted
+                     << " contact(s) routed to twin, " << strandContactKept
+                     << " residual contact(s) kept (no twin support), "
+                     << selfRcSkipped << " self-RC edge(s) dropped "
+                        "(strongest-support-first parity union-find)." << endl;
             }
         }
 
         uint64_t oneToOneCreated = 0;
         uint64_t oneToOneSkipped = 0;
+        uint64_t strandContactSkipped = strandContactRouted;
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
             if(transitions.empty()) continue;
             const uint32_t A = windowPair.first, B = windowPair.second;
 
-            // Reject edges that would break global strand consistency: self-RC
-            // (window to its own RC) or a strand contact with an already-fixed
-            // chain orientation. Determined by the parity union-find above
-            // (counts already tallied there; skip silently here).
+            // Drop only edges routed away to a twin (or self-RC); residual
+            // contacts that could not be routed are kept to avoid breaks.
+            // Determined by the parity union-find above (counts tallied there).
             if(strandRejectPairs.count({A, B})) {
                 continue;
             }
@@ -817,7 +844,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << oneToOneCreated << " created, " << oneToOneSkipped
              << " skipped (not 1-to-1), " << selfRcSkipped
              << " skipped (self-RC), " << strandContactSkipped
-             << " skipped (strand contact, global parity)." << endl;
+             << " routed to twin." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.
