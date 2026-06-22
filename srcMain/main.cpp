@@ -1626,8 +1626,13 @@ void dinara::main::assemble(
     // Stage B.2: add confident bridge edges (mutually-best, non-ambiguous,
     // support >= 2) between maximal 1-1 segments, plus RC mirrors. Then write
     // a GFA so the bridged graph can be truth-mapped.
-    shasta2AssemblyGraph->addConfidentBridges(shasta2AnchorGraph->readWindows);
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-bridged.gfa");
+    //
+    // Disabled: addConfidentBridges adds edges computed independently from the
+    // anchor graph and does not enforce the both-strand contact rule, so it
+    // can re-introduce a window -> X / window -> X^1 contact that edge creation
+    // forbade. Kept here (not deleted) for easy restoration.
+    // shasta2AssemblyGraph->addConfidentBridges(shasta2AnchorGraph->readWindows);
+    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-bridged.gfa");
 
     // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
 #if 0
