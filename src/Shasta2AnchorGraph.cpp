@@ -31,6 +31,7 @@ string anchorIdToString(Shasta2AnchorId anchorId)
 
 // Standard library.
 #include <algorithm>
+#include <functional>
 #include "fstream.hpp"
 #include <limits>
 #include <map>
@@ -637,105 +638,138 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             inNeighbors[mB].insert(mA);
         }
 
-        // Resolve both-strand contacts before creating edges.
+        // Global strand-consistent edge selection (parity union-find).
         //
-        // A source window vertex must not connect to the same target window on
-        // both strands (S -> X+ and S -> X-): that is a strand ambiguity no
-        // clean orientation can satisfy. Build the directed arcs that would be
-        // created (each forward pair plus its RC mirror), group them by source
-        // vertex and normalized target window, and for any group reached on
-        // both strands keep the best-supported arc (max distinct physical
-        // reads; ties broken by smaller target id) and mark the weaker as a
-        // loser. The skip set is then closed under the twin relation (the RC
-        // mirror of every loser is also skipped) so the forward and RC lattices
-        // stay symmetric: an arc is created iff neither it nor its twin lost.
+        // Generalizes the local both-strand rule to a global one: instead of
+        // only forbidding a single source from reaching X+ and X-, we maintain
+        // a consistent strand orientation for every window across the whole
+        // chain it belongs to, and reject any edge that would contradict the
+        // orientations already fixed by stronger edges.
+        //
+        // Model: each window locus (normalized id in [0, windowCount)) has an
+        // orientation relative to its component root. A canonical pair (A, B)
+        // with strands sA, sB (0 = forward, 1 = RC) imposes the constraint
+        //     orient(a) XOR orient(b) == sA XOR sB,   a = norm(A), b = norm(B).
+        // A parity union-find tracks each locus's parity to its root:
+        //   - different components -> merge, fixing their relative orientation;
+        //   - same component       -> accept iff the already-fixed relative
+        //                             orientation matches; else it is a strand
+        //                             contact and the edge is rejected.
+        //
+        // Edges are considered strongest-first (most distinct spanning reads),
+        // so high-confidence adjacencies build the chains and orient the
+        // windows; weaker edges that disagree with that established orientation
+        // are dropped. This subsumes both earlier rules:
+        //   - both-strand: S->X+ then S->X- is a same-component parity clash;
+        //   - self-RC:     A->B with norm(A)==norm(B), sA!=sB is parity 1 on a
+        //                  single node (parity 0), always a clash.
+        // Because the constraint is symmetric under RC, the forward pair and its
+        // mirror impose the same constraint, so processing canonical pairs once
+        // is sufficient and keeps the two strand lattices consistent.
         auto normalizeW = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
-        std::set<std::pair<uint32_t, uint32_t>> bothStrandSkip;
+        auto strandOf = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? 1u : 0u;
+        };
+        std::set<std::pair<uint32_t, uint32_t>> strandRejectPairs;
+        uint64_t selfRcSkipped = 0;
+        uint64_t strandContactSkipped = 0;
         {
-            // Support per directed arc that creation would emit.
-            std::map<std::pair<uint32_t, uint32_t>, uint64_t> arcSupport;
-            auto addArc = [&](uint32_t s, uint32_t d, uint64_t w) {
-                auto it = arcSupport.find({s, d});
-                if(it == arcSupport.end() || w > it->second) {
-                    arcSupport[{s, d}] = w;
-                }
+            // Parity union-find over loci [0, windowCount).
+            std::vector<uint32_t> ufParent(windowCount);
+            std::vector<uint8_t> ufRank(windowCount, 0);
+            std::vector<uint8_t> ufParity(windowCount, 0);  // parity to parent.
+            for(uint32_t i = 0; i < windowCount; i++) ufParent[i] = i;
+            // Returns {root, parityToRoot} with path compression.
+            std::function<std::pair<uint32_t, uint8_t>(uint32_t)> ufFind =
+                [&](uint32_t x) -> std::pair<uint32_t, uint8_t> {
+                    if(ufParent[x] == x) return {x, 0};
+                    auto [root, par] = ufFind(ufParent[x]);
+                    ufParity[x] ^= par;          // accumulate parity to root.
+                    ufParent[x] = root;          // compress.
+                    return {root, ufParity[x]};
+                };
+
+            // Collect candidate canonical pairs with distinct-read support.
+            // Exclude self-RC pairs (handled explicitly below) so they do not
+            // pollute the union-find or the strand-contact count.
+            struct Cand {
+                uint32_t a, b;        // loci.
+                uint8_t constraint;   // sA XOR sB.
+                uint32_t A, B;        // original window ids (for reject set).
+                uint64_t support;
             };
+            std::vector<Cand> candidates;
             for(const auto& [windowPair, transitions] : windowPairTransitions) {
                 if(transitions.empty()) continue;
+                const uint32_t A = windowPair.first, B = windowPair.second;
+                const uint32_t a = normalizeW(A), b = normalizeW(B);
+                if(a == b) {           // self-RC: never connect a window to its RC.
+                    ++selfRcSkipped;
+                    strandRejectPairs.insert({A, B});
+                    continue;
+                }
                 std::set<uint32_t> physicalReads;
                 for(const auto& t : transitions) physicalReads.insert(t.oidValue / 2);
-                const uint64_t support = physicalReads.size();
-                const uint32_t A = windowPair.first, B = windowPair.second;
-                addArc(A, B, support);
-                addArc(rcWindow(B), rcWindow(A), support);  // RC mirror arc
+                const uint8_t c = uint8_t(strandOf(A) ^ strandOf(B));
+                candidates.push_back({a, b, c, A, B, physicalReads.size()});
             }
 
-            // Per source vertex, group out-arcs by normalized target window.
-            std::map<uint32_t, std::map<uint32_t,
-                std::vector<std::pair<uint32_t, uint64_t>>>> bySrc;
-            for(const auto& [arc, w] : arcSupport) {
-                bySrc[arc.first][normalizeW(arc.second)].push_back({arc.second, w});
-            }
+            // Strongest support first; deterministic tie-break.
+            std::sort(candidates.begin(), candidates.end(),
+                [](const Cand& x, const Cand& y) {
+                    if(x.support != y.support) return x.support > y.support;
+                    if(x.A != y.A) return x.A < y.A;
+                    return x.B < y.B;
+                });
 
-            // Find losers: in any group reached on both strands, all but the
-            // best-supported arc lose. Close the skip set under twin.
-            uint64_t bothStrandPairs = 0;
-            for(const auto& [src, targets] : bySrc) {
-                for(const auto& [tgtWin, arcs] : targets) {
-                    if(arcs.size() < 2) continue;  // only one strand reached
-                    uint32_t bestDst = arcs.front().first;
-                    uint64_t bestW = arcs.front().second;
-                    for(const auto& [dst, w] : arcs) {
-                        if(w > bestW || (w == bestW && dst < bestDst)) {
-                            bestW = w;
-                            bestDst = dst;
-                        }
+            for(const auto& c : candidates) {
+                auto [ra, pa] = ufFind(c.a);
+                auto [rb, pb] = ufFind(c.b);
+                if(ra == rb) {
+                    // Same chain: accept only if orientation already agrees.
+                    if(uint8_t(pa ^ pb) != c.constraint) {
+                        strandRejectPairs.insert({c.A, c.B});
+                        ++strandContactSkipped;
                     }
-                    for(const auto& [dst, w] : arcs) {
-                        if(dst == bestDst) continue;
-                        bothStrandSkip.insert({src, dst});
-                        bothStrandSkip.insert({rcWindow(dst), rcWindow(src)});  // twin
-                        ++bothStrandPairs;
-                    }
+                    continue;
+                }
+                // Different chains: merge, fixing relative orientation so the
+                // constraint holds: parity(ra->rb) = pa XOR pb XOR constraint.
+                const uint8_t linkParity = uint8_t(pa ^ pb ^ c.constraint);
+                if(ufRank[ra] < ufRank[rb]) {
+                    ufParent[ra] = rb;
+                    ufParity[ra] = linkParity;
+                } else if(ufRank[ra] > ufRank[rb]) {
+                    ufParent[rb] = ra;
+                    ufParity[rb] = linkParity;
+                } else {
+                    ufParent[rb] = ra;
+                    ufParity[rb] = linkParity;
+                    ufRank[ra]++;
                 }
             }
-            if(bothStrandPairs > 0) {
-                cout << "Both-strand window contacts: resolved " << bothStrandPairs
-                     << " (kept best-supported strand + its RC twin, dropped the "
-                        "weaker strand and its twin)." << endl;
+
+            if(strandContactSkipped > 0 || selfRcSkipped > 0) {
+                cout << "Strand-consistent edge selection: " << strandContactSkipped
+                     << " strand-contact edge(s) and " << selfRcSkipped
+                     << " self-RC edge(s) rejected (strongest-support-first "
+                        "parity union-find)." << endl;
             }
         }
 
         uint64_t oneToOneCreated = 0;
         uint64_t oneToOneSkipped = 0;
-        uint64_t selfRcSkipped = 0;
-        uint64_t bothStrandSkipped = 0;
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
             if(transitions.empty()) continue;
             const uint32_t A = windowPair.first, B = windowPair.second;
 
-            // Hard strand separation: skip self-RC edges, where A and B are the
-            // forward and RC mirror of the same locus (normalize(A)==normalize(B)).
-            // Such an edge crosses from the forward strand into the RC strand at
-            // one window; forbidding it keeps the forward and RC lattices as two
-            // disjoint parallel copies. (Drops inverted-repeat fold-backs, which
-            // is the intended trade for guaranteed strand separation.)
-            {
-                const uint32_t normA = (A >= windowCount) ? (A - windowCount) : A;
-                const uint32_t normB = (B >= windowCount) ? (B - windowCount) : B;
-                if(normA == normB) {
-                    ++selfRcSkipped;
-                    continue;
-                }
-            }
-
-            // Both-strand contact: this source already keeps a better-supported
-            // edge to the same target window on the opposite strand (or this arc
-            // is the RC twin of such a loser). Skipping keeps strand symmetry.
-            if(bothStrandSkip.count({A, B})) {
-                ++bothStrandSkipped;
+            // Reject edges that would break global strand consistency: self-RC
+            // (window to its own RC) or a strand contact with an already-fixed
+            // chain orientation. Determined by the parity union-find above
+            // (counts already tallied there; skip silently here).
+            if(strandRejectPairs.count({A, B})) {
                 continue;
             }
 
@@ -782,8 +816,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << (connectAllWindows ? "all pairs" : "strict 1-to-1") << "): "
              << oneToOneCreated << " created, " << oneToOneSkipped
              << " skipped (not 1-to-1), " << selfRcSkipped
-             << " skipped (self-RC, strand separation), " << bothStrandSkipped
-             << " skipped (both-strand contact)." << endl;
+             << " skipped (self-RC), " << strandContactSkipped
+             << " skipped (strand contact, global parity)." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.
