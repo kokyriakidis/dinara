@@ -637,9 +637,81 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             inNeighbors[mB].insert(mA);
         }
 
+        // Resolve both-strand contacts before creating edges.
+        //
+        // A source window vertex must not connect to the same target window on
+        // both strands (S -> X+ and S -> X-): that is a strand ambiguity no
+        // clean orientation can satisfy. Build the directed arcs that would be
+        // created (each forward pair plus its RC mirror), group them by source
+        // vertex and normalized target window, and for any group reached on
+        // both strands keep the best-supported arc (max distinct physical
+        // reads; ties broken by smaller target id) and mark the weaker as a
+        // loser. The skip set is then closed under the twin relation (the RC
+        // mirror of every loser is also skipped) so the forward and RC lattices
+        // stay symmetric: an arc is created iff neither it nor its twin lost.
+        auto normalizeW = [&](uint32_t w) -> uint32_t {
+            return (w >= windowCount) ? (w - windowCount) : w;
+        };
+        std::set<std::pair<uint32_t, uint32_t>> bothStrandSkip;
+        {
+            // Support per directed arc that creation would emit.
+            std::map<std::pair<uint32_t, uint32_t>, uint64_t> arcSupport;
+            auto addArc = [&](uint32_t s, uint32_t d, uint64_t w) {
+                auto it = arcSupport.find({s, d});
+                if(it == arcSupport.end() || w > it->second) {
+                    arcSupport[{s, d}] = w;
+                }
+            };
+            for(const auto& [windowPair, transitions] : windowPairTransitions) {
+                if(transitions.empty()) continue;
+                std::set<uint32_t> physicalReads;
+                for(const auto& t : transitions) physicalReads.insert(t.oidValue / 2);
+                const uint64_t support = physicalReads.size();
+                const uint32_t A = windowPair.first, B = windowPair.second;
+                addArc(A, B, support);
+                addArc(rcWindow(B), rcWindow(A), support);  // RC mirror arc
+            }
+
+            // Per source vertex, group out-arcs by normalized target window.
+            std::map<uint32_t, std::map<uint32_t,
+                std::vector<std::pair<uint32_t, uint64_t>>>> bySrc;
+            for(const auto& [arc, w] : arcSupport) {
+                bySrc[arc.first][normalizeW(arc.second)].push_back({arc.second, w});
+            }
+
+            // Find losers: in any group reached on both strands, all but the
+            // best-supported arc lose. Close the skip set under twin.
+            uint64_t bothStrandPairs = 0;
+            for(const auto& [src, targets] : bySrc) {
+                for(const auto& [tgtWin, arcs] : targets) {
+                    if(arcs.size() < 2) continue;  // only one strand reached
+                    uint32_t bestDst = arcs.front().first;
+                    uint64_t bestW = arcs.front().second;
+                    for(const auto& [dst, w] : arcs) {
+                        if(w > bestW || (w == bestW && dst < bestDst)) {
+                            bestW = w;
+                            bestDst = dst;
+                        }
+                    }
+                    for(const auto& [dst, w] : arcs) {
+                        if(dst == bestDst) continue;
+                        bothStrandSkip.insert({src, dst});
+                        bothStrandSkip.insert({rcWindow(dst), rcWindow(src)});  // twin
+                        ++bothStrandPairs;
+                    }
+                }
+            }
+            if(bothStrandPairs > 0) {
+                cout << "Both-strand window contacts: resolved " << bothStrandPairs
+                     << " (kept best-supported strand + its RC twin, dropped the "
+                        "weaker strand and its twin)." << endl;
+            }
+        }
+
         uint64_t oneToOneCreated = 0;
         uint64_t oneToOneSkipped = 0;
         uint64_t selfRcSkipped = 0;
+        uint64_t bothStrandSkipped = 0;
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
             if(transitions.empty()) continue;
             const uint32_t A = windowPair.first, B = windowPair.second;
@@ -657,6 +729,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     ++selfRcSkipped;
                     continue;
                 }
+            }
+
+            // Both-strand contact: this source already keeps a better-supported
+            // edge to the same target window on the opposite strand (or this arc
+            // is the RC twin of such a loser). Skipping keeps strand symmetry.
+            if(bothStrandSkip.count({A, B})) {
+                ++bothStrandSkipped;
+                continue;
             }
 
             // Strict 1-to-1 gate: A's only out-neighbor is B and B's only
@@ -702,7 +782,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << (connectAllWindows ? "all pairs" : "strict 1-to-1") << "): "
              << oneToOneCreated << " created, " << oneToOneSkipped
              << " skipped (not 1-to-1), " << selfRcSkipped
-             << " skipped (self-RC, strand separation)." << endl;
+             << " skipped (self-RC, strand separation), " << bothStrandSkipped
+             << " skipped (both-strand contact)." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.

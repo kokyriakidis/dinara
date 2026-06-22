@@ -565,6 +565,70 @@ void dinara::computeWindowTransitions(
                 }
             }
 
+            // ----------------------------------------------------------------
+            // Resolve both-strand contacts.
+            //
+            // A window must not connect to both another window X and its RC X^1
+            // at the same time: that is a strand ambiguity no clean orientation
+            // can satisfy. For each source vertex that reaches some target
+            // window on both strands (X+ and X-), keep only the best-supported
+            // arc (max read weight; ties broken by smaller target vertex id)
+            // and drop the weaker one. The dropped arc's RC twin
+            // (b^1 -> a^1) is removed too, so the doubled graph stays symmetric
+            // by construction and the surviving connection still carries its RC
+            // edge. arcReads / arcExitLocal are pruned in lockstep so the
+            // downstream branch analyzer sees the same arc set.
+            // ----------------------------------------------------------------
+            {
+                // source vertex -> target window -> [(toVertex, weight), ...].
+                map<uint32_t, map<uint32_t, vector<pair<uint32_t, uint64_t>>>>
+                    bySrcTgt;
+                for(const auto& [key, w] : arcWeight) {
+                    if(w < minArcReads) continue;
+                    const uint32_t a = key.first;
+                    const uint32_t b = key.second;
+                    if(vWindow(a) == vWindow(b)) continue;  // self-RC: separate
+                    bySrcTgt[a][vWindow(b)].push_back({b, w});
+                }
+
+                std::set<pair<uint32_t, uint32_t>> toErase;
+                uint64_t resolved = 0;
+                for(const auto& [src, targets] : bySrcTgt) {
+                    for(const auto& [tgtWin, arcs] : targets) {
+                        if(arcs.size() < 2) continue;  // only one strand reached
+                        // Pick the best-supported arc to keep.
+                        uint32_t bestTo = arcs.front().first;
+                        uint64_t bestW = arcs.front().second;
+                        for(const auto& [to, w] : arcs) {
+                            if(w > bestW || (w == bestW && to < bestTo)) {
+                                bestW = w;
+                                bestTo = to;
+                            }
+                        }
+                        // Drop the others (and their RC twins).
+                        for(const auto& [to, w] : arcs) {
+                            if(to == bestTo) continue;
+                            toErase.insert({src, to});
+                            toErase.insert({to ^ 1u, src ^ 1u});  // RC twin
+                            ++resolved;
+                        }
+                    }
+                }
+
+                for(const auto& key : toErase) {
+                    arcWeight.erase(key);
+                    arcReads.erase(key);
+                    arcExitLocal.erase(key);
+                }
+
+                if(resolved > 0) {
+                    cout << timestamp << "Resolved " << resolved
+                         << " both-strand window contact(s): kept best-supported "
+                            "arc + its RC twin, dropped the weaker strand "
+                            "(and its twin)." << endl;
+                }
+            }
+
             // Build filtered adjacency (degree-counted) for unitig extension.
             vector<vector<pair<uint32_t, uint64_t>>> outAdj(vertexCount);
             vector<uint32_t> outDeg(vertexCount, 0);
@@ -613,10 +677,14 @@ void dinara::computeWindowTransitions(
             //      window X on BOTH its forward (X+) and its RC (X-) vertex?
             //      That means W is adjacent to a locus and that locus's reverse
             //      complement at once — a genuine strand ambiguity that a clean
-            //      orientation cannot satisfy. Counted per source vertex.
+            //      orientation cannot satisfy.
             //
-            // Pure read-only: derived from arcWeight (the same arcs used for
-            // layout), filtered by minArcReads. No graph or struct mutation.
+            // Runs AFTER the both-strand resolution above, so (2) is now a
+            // verification: WindowBothStrandContacts.csv should be empty / the
+            // count 0. Self-RC arcs are not resolved (they are dropped later by
+            // the anchor-graph ctor), so (1) still reports them.
+            //
+            // Read-only: derived from arcWeight, filtered by minArcReads.
             // ----------------------------------------------------------------
             {
                 // (1) Self-RC arcs.
