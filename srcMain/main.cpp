@@ -1130,7 +1130,7 @@ void dinara::main::assemble(
     cout << timestamp << "Flagging contained reads..." << endl;
     assembler.flagContainedReads(1000, 0.8, 0, threadCount);
 
-    // Compute anchor windows and run CIGAR-based SNP detection.
+    // Compute anchor windows.
     cout << timestamp << "Computing anchor windows..." << endl;
     // ========================================================================
     // PHASE 1: Window creation.
