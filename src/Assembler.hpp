@@ -3869,7 +3869,27 @@ public:
     // forward-oriented anchorId -> owning windowId map for claimed dovetail
     // anchors (empty when whole-journey claiming is disabled). Lets the anchor
     // graph treat dovetails as part of the window for path-finding.
+    // tileUnclaimedIntervals (optional): when true, after the first pass that
+    // seeds pristine full-journey cores, run a second priority-queue pass that
+    // tiles the leftover unclaimed intervals into fragment windows (longest
+    // base span first). When false (default), only full-journey cores are
+    // created and the seams between them are left unclaimed.
     void computeAnchorWindowsClean(
+        shared_ptr<Shasta2Anchors> shasta2Anchors,
+        shared_ptr<Shasta2Journeys> shasta2Journeys,
+        const vector<ReadId>& readIdsSortedByLength,
+        vector<AnchorWindow>& anchorWindows,
+        uint64_t threadCount,
+        uint64_t minCommonForBackbone = 2,
+        uint64_t maxSkipForBackbone = 10,
+        uint64_t minWindowBaseSpan = 4000,
+        vector<uint32_t>* anchorDovetailWindow = nullptr,
+        bool tileUnclaimedIntervals = false);
+
+    // Convenience wrapper: compute disjoint full-journey cores, then tile the
+    // leftover unclaimed intervals into fragment windows (longest first).
+    // Equivalent to computeAnchorWindowsClean(..., tileUnclaimedIntervals=true).
+    void computeAnchorWindowsWithUnclaimed(
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
         const vector<ReadId>& readIdsSortedByLength,

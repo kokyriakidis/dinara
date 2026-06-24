@@ -59,18 +59,12 @@ struct CleanWindowCandidateLess {
 // exclusive cores; this exclusive toggle is kept off pending that halo work.
 constexpr bool claimWholeJourneyDovetails = false;
 
-// Full-journey-only window seeding. When true, a read seeds a window ONLY if
-// its entire journey is still unclaimed (one window = one whole read journey).
-// Partially-claimed reads are skipped entirely, so no "fragment" windows are
-// produced from leftover unclaimed runs. This yields pristine disjoint cores
-// (each core is a complete read) and leaves the dovetail/overlap seams between
-// cores unclaimed, to be reconnected by the Stage B.2 bridge mechanism rather
-// than by fragment windows. When false, the original behavior is used: each
-// contiguous unclaimed run of a read's journey seeds its own window.
-//
-// NOTE: this raises the unclaimed-anchor fraction (seams are not tiled by
-// fragments). See the unclaimedAnchors count logged at the end.
-constexpr bool fullJourneyWindowsOnly = true;
+// Window seeding now runs in two priority-queue passes (see runPqPass in
+// computeAnchorWindowsClean): a first pass that seeds pristine full-journey
+// cores only (one window = one whole read journey), and an optional second
+// pass (tileUnclaimedIntervals) that tiles the leftover unclaimed runs into
+// fragment windows, longest base span first. The second pass is off by default,
+// so the single-pass full-journey-only behavior is the default.
 
 } // anonymous namespace
 
@@ -85,7 +79,8 @@ void Assembler::computeAnchorWindowsClean(
     uint64_t minCommonForBackbone,
     uint64_t maxSkipForBackbone,
     uint64_t minWindowBaseSpan,
-    vector<uint32_t>* anchorDovetailWindow)
+    vector<uint32_t>* anchorDovetailWindow,
+    bool tileUnclaimedIntervals)
 {
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
@@ -561,78 +556,110 @@ void Assembler::computeAnchorWindowsClean(
 
     // Process the heap. For each candidate (longest base span first):
     // - If the full journey is unclaimed, create one window for the whole journey.
-    // - Otherwise, find contiguous unclaimed intervals within the journey
-    //   and create a separate window for each.
+    // - Otherwise (only when fragments are allowed), find contiguous unclaimed
+    //   intervals within the journey and create a separate window for each.
+    //
+    // The loop body is factored into runPqPass so it can be run twice: a first
+    // pass that seeds pristine full-journey cores only, and an optional second
+    // pass (see computeAnchorWindowsUnclaimed) that tiles the leftover
+    // unclaimed intervals into fragment windows, again longest-span first.
     uint64_t fullJourneyWindows = 0;
     uint64_t fragmentWindows = 0;
 
-    while(!candidateHeap.empty()) {
-        const CleanWindowCandidate candidate = candidateHeap.top();
-        candidateHeap.pop();
+    auto runPqPass = [&](bool allowFragments) {
+        while(!candidateHeap.empty()) {
+            const CleanWindowCandidate candidate = candidateHeap.top();
+            candidateHeap.pop();
 
-        const ReadId readId = candidate.backboneOrientedReadId.getReadId();
-        if(candidate.generation != candidateGeneration[uint64_t(readId)]) {
-            continue;
-        }
-        const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
-
-        // Find contiguous unclaimed intervals within the full journey.
-        // We always scan the full journey regardless of candidate.begin/end,
-        // since claimed regions may have appeared since this candidate was pushed.
-        vector<pair<uint32_t, uint32_t>> unclaimedIntervals;
-        {
-            uint32_t pos = 0;
-            const uint32_t journeySize = uint32_t(journey.size());
-            while(pos < journeySize) {
-                while(pos < journeySize &&
-                      anchorOwner[uint64_t(journey[pos])] != anchorUnclaimed) {
-                    ++pos;
-                }
-                const uint32_t runBegin = pos;
-                while(pos < journeySize &&
-                      anchorOwner[uint64_t(journey[pos])] == anchorUnclaimed) {
-                    ++pos;
-                }
-                if(pos > runBegin && (pos - runBegin) >= minBackboneWindowAnchors) {
-                    unclaimedIntervals.push_back({runBegin, pos});
-                }
+            const ReadId readId = candidate.backboneOrientedReadId.getReadId();
+            if(candidate.generation != candidateGeneration[uint64_t(readId)]) {
+                continue;
             }
-        }
+            const auto journey = (*shasta2Journeys)[candidate.backboneOrientedReadId];
 
-        if(unclaimedIntervals.empty()) continue;
-
-        // Create a window for each unclaimed interval that passes the
-        // base span threshold.
-        const bool isFullJourney = (unclaimedIntervals.size() == 1 &&
-            unclaimedIntervals[0].first == 0 &&
-            unclaimedIntervals[0].second == uint32_t(journey.size()));
-
-        // Full-journey-only: skip reads that are not entirely unclaimed, so no
-        // fragment windows are seeded from leftover unclaimed runs.
-        if(fullJourneyWindowsOnly && !isFullJourney) continue;
-
-        for(const auto& [intervalBegin, intervalEnd] : unclaimedIntervals) {
-            if(minWindowBaseSpan > 0 && (intervalEnd - intervalBegin) >= 2) {
-                const Shasta2AnchorId firstAnchor = journey[intervalBegin];
-                const Shasta2AnchorId lastAnchor = journey[intervalEnd - 1];
-                const uint32_t firstPos = shasta2Anchors->getPosition(
-                    firstAnchor, candidate.backboneOrientedReadId);
-                const uint32_t lastPos = shasta2Anchors->getPosition(
-                    lastAnchor, candidate.backboneOrientedReadId);
-                const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
-                if(baseSpan < minWindowBaseSpan) {
-                    continue;
+            // Find contiguous unclaimed intervals within the full journey.
+            // We always scan the full journey regardless of candidate.begin/end,
+            // since claimed regions may have appeared since this candidate was pushed.
+            vector<pair<uint32_t, uint32_t>> unclaimedIntervals;
+            {
+                uint32_t pos = 0;
+                const uint32_t journeySize = uint32_t(journey.size());
+                while(pos < journeySize) {
+                    while(pos < journeySize &&
+                          anchorOwner[uint64_t(journey[pos])] != anchorUnclaimed) {
+                        ++pos;
+                    }
+                    const uint32_t runBegin = pos;
+                    while(pos < journeySize &&
+                          anchorOwner[uint64_t(journey[pos])] == anchorUnclaimed) {
+                        ++pos;
+                    }
+                    if(pos > runBegin && (pos - runBegin) >= minBackboneWindowAnchors) {
+                        unclaimedIntervals.push_back({runBegin, pos});
+                    }
                 }
             }
 
-            createWindow(candidate.backboneOrientedReadId, intervalBegin, intervalEnd);
+            if(unclaimedIntervals.empty()) continue;
 
-            if(isFullJourney) {
-                ++fullJourneyWindows;
-            } else {
-                ++fragmentWindows;
+            // Create a window for each unclaimed interval that passes the
+            // base span threshold.
+            const bool isFullJourney = (unclaimedIntervals.size() == 1 &&
+                unclaimedIntervals[0].first == 0 &&
+                unclaimedIntervals[0].second == uint32_t(journey.size()));
+
+            // First pass (allowFragments == false): only seed reads whose entire
+            // journey is still unclaimed, producing pristine disjoint cores. The
+            // second pass (allowFragments == true) tiles the leftover unclaimed
+            // runs into fragment windows.
+            if(!allowFragments && !isFullJourney) continue;
+
+            for(const auto& [intervalBegin, intervalEnd] : unclaimedIntervals) {
+                if(minWindowBaseSpan > 0 && (intervalEnd - intervalBegin) >= 2) {
+                    const Shasta2AnchorId firstAnchor = journey[intervalBegin];
+                    const Shasta2AnchorId lastAnchor = journey[intervalEnd - 1];
+                    const uint32_t firstPos = shasta2Anchors->getPosition(
+                        firstAnchor, candidate.backboneOrientedReadId);
+                    const uint32_t lastPos = shasta2Anchors->getPosition(
+                        lastAnchor, candidate.backboneOrientedReadId);
+                    const uint64_t baseSpan = (lastPos >= firstPos) ? (lastPos - firstPos) : 0;
+                    if(baseSpan < minWindowBaseSpan) {
+                        continue;
+                    }
+                }
+
+                createWindow(candidate.backboneOrientedReadId, intervalBegin, intervalEnd);
+
+                if(isFullJourney) {
+                    ++fullJourneyWindows;
+                } else {
+                    ++fragmentWindows;
+                }
             }
         }
+    };
+
+    // First pass: pristine full-journey cores only.
+    runPqPass(false);
+
+    // Optional second pass: tile the leftover unclaimed intervals into fragment
+    // windows, longest-span first. Re-seed the heap from every read's current
+    // unclaimed runs (the first pass drained it), then run with fragments
+    // allowed. Disabled by default so the single-pass behavior is unchanged.
+    if(tileUnclaimedIntervals) {
+        const uint64_t windowsBefore = anchorWindows.size();
+        for(const ReadId readId : readIdsSortedByLength) {
+            const OrientedReadId backboneOid(readId, 0);
+            if(backboneOid.getValue() >= shasta2Journeys->size()) continue;
+            const auto journey = (*shasta2Journeys)[backboneOid];
+            if(journey.empty()) continue;
+            ++candidateGeneration[uint64_t(readId)];  // invalidate stale entries.
+            pushCurrentUnclaimedIntervals(backboneOid);
+        }
+        runPqPass(true);
+        cout << timestamp << "Unclaimed-interval pass added "
+             << (anchorWindows.size() - windowsBefore)
+             << " fragment window(s)." << endl;
     }
 
     // Count unclaimed anchors.
@@ -656,4 +683,32 @@ void Assembler::computeAnchorWindowsClean(
          << " readIntervals=" << totalReadIntervals
          << " seconds=" << std::fixed << std::setprecision(2) << elapsedSeconds
          << std::defaultfloat << endl;
+}
+
+
+
+// Convenience wrapper: disjoint full-journey cores, then a second pass that
+// tiles the leftover unclaimed intervals into fragment windows (longest first).
+void Assembler::computeAnchorWindowsWithUnclaimed(
+    shared_ptr<Shasta2Anchors> shasta2Anchors,
+    shared_ptr<Shasta2Journeys> shasta2Journeys,
+    const vector<ReadId>& readIdsSortedByLength,
+    vector<AnchorWindow>& anchorWindows,
+    uint64_t threadCount,
+    uint64_t minCommonForBackbone,
+    uint64_t maxSkipForBackbone,
+    uint64_t minWindowBaseSpan,
+    vector<uint32_t>* anchorDovetailWindow)
+{
+    computeAnchorWindowsClean(
+        shasta2Anchors,
+        shasta2Journeys,
+        readIdsSortedByLength,
+        anchorWindows,
+        threadCount,
+        minCommonForBackbone,
+        maxSkipForBackbone,
+        minWindowBaseSpan,
+        anchorDovetailWindow,
+        /* tileUnclaimedIntervals = */ true);
 }
