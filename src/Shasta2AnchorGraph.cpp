@@ -668,18 +668,24 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         //
         // Self-RC pairs (norm(A)==norm(B)) connect a window to its own RC and
         // are always dropped (a window cannot be its own twin).
-        auto normalizeW = [&](uint32_t w) -> uint32_t {
+        [[maybe_unused]] auto normalizeW = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : w;
         };
         // rcWindow is defined above in this block.
-        auto strandOf = [&](uint32_t w) -> uint32_t {
+        [[maybe_unused]] auto strandOf = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? 1u : 0u;
         };
         std::set<std::pair<uint32_t, uint32_t>> strandRejectPairs;  // routed-away.
         uint64_t selfRcSkipped = 0;
         uint64_t strandContactRouted = 0;   // dropped, connectivity kept via twin.
         uint64_t strandContactKept = 0;     // residual contact kept (no twin).
-        {
+        // Disable strand-consistent edge selection: when false, the parity
+        // union-find below is skipped and strandRejectPairs stays empty, so
+        // every read-supported pair (including self-RC and both-strand
+        // contacts) becomes an edge. Kept for experimentation; flip to true to
+        // restore strand-consistent selection with twin routing.
+        constexpr bool strandConsistentEdgeSelection = false;
+        if(strandConsistentEdgeSelection) {
             // Directed window pairs that have read support (forward + mirror of
             // each canonical pair, since both edges are created). Used to decide
             // whether a conflict can be routed to its twin.
