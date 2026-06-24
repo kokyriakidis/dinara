@@ -66,6 +66,17 @@ constexpr bool claimWholeJourneyDovetails = false;
 // fragment windows, longest base span first. The second pass is off by default,
 // so the single-pass full-journey-only behavior is the default.
 
+// Full-journey-only window seeding (legacy toggle). When true, a read seeds a
+// window ONLY if its entire journey is still unclaimed (one window = one whole
+// read journey); partially-claimed reads are skipped, leaving the dovetail/
+// overlap seams between cores unclaimed. When false, the original behavior was
+// used: each contiguous unclaimed run of a read's journey seeds its own window.
+//
+// Superseded by the two-pass scheme above (pass 1 == this flag true, pass 2 ==
+// tiling the seams). Kept (currently unused) so the single-pass gate can be
+// restored quickly while window construction is still being experimented with.
+[[maybe_unused]] constexpr bool fullJourneyWindowsOnly = true;
+
 } // anonymous namespace
 
 
