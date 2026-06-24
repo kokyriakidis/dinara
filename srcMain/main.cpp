@@ -1143,7 +1143,9 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
-    assembler.computeAnchorWindowsClean(
+    // Two-pass: disjoint full-journey cores, then tile leftover unclaimed
+    // intervals into fragment windows (longest first).
+    assembler.computeAnchorWindowsWithUnclaimed(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         readIdsSortedByLength,
