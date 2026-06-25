@@ -795,6 +795,8 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t oneToOneCreated = 0;
         uint64_t oneToOneSkipped = 0;
         uint64_t strandContactSkipped = strandContactRouted;
+        uint64_t interWindowLowCoverageSkipped = 0;
+        uint64_t interWindowLowEdgeCoverageSkipped = 0;
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
             if(transitions.empty()) continue;
             const uint32_t A = windowPair.first, B = windowPair.second;
@@ -818,6 +820,22 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 continue;
             }
 
+            // Coverage filter on the active path. When enabled, require the
+            // window pair to be supported by at least minInterWindowCoverage
+            // distinct physical reads (oidValue/2 collapses the two strands of
+            // a read), and the chosen anchor pair to have at least
+            // minInterWindowEdgeCoverage coverage. Off by default so the
+            // current all-pairs behavior is unchanged.
+            constexpr bool applyInterWindowCoverageFilter = true;
+            if(applyInterWindowCoverageFilter && minInterWindowCoverage > 1) {
+                std::set<uint32_t> physicalReads;
+                for(const auto& t : transitions) physicalReads.insert(t.oidValue / 2);
+                if(physicalReads.size() < minInterWindowCoverage) {
+                    ++interWindowLowCoverageSkipped;
+                    continue;
+                }
+            }
+
             // Pick the highest-coverage anchor pair among this pair's reads.
             Shasta2AnchorPair bestPair;
             uint64_t bestCoverage = 0;
@@ -831,6 +849,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
             if(bestCoverage == 0) continue;
+
+            if(applyInterWindowCoverageFilter &&
+               bestCoverage < minInterWindowEdgeCoverage) {
+                ++interWindowLowEdgeCoverageSkipped;
+                continue;
+            }
 
             if(addEdgeIfValid(bestPair.anchorIdA, bestPair.anchorIdB)) {
                 ++oneToOneCreated;
@@ -850,7 +874,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
              << oneToOneCreated << " created, " << oneToOneSkipped
              << " skipped (not 1-to-1), " << selfRcSkipped
              << " skipped (self-RC), " << strandContactSkipped
-             << " routed to twin." << endl;
+             << " routed to twin, " << interWindowLowCoverageSkipped
+             << " skipped (< " << minInterWindowCoverage << " reads), "
+             << interWindowLowEdgeCoverageSkipped
+             << " skipped (< " << minInterWindowEdgeCoverage
+             << " edge coverage)." << endl;
     }
 
     // Stage A: length-weighted reciprocal-best inter-window edges.
