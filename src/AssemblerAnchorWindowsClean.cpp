@@ -650,27 +650,38 @@ void Assembler::computeAnchorWindowsClean(
         }
     };
 
-    // First pass: pristine full-journey cores only.
-    runPqPass(false);
-
-    // Optional second pass: tile the leftover unclaimed intervals into fragment
-    // windows, longest-span first. Re-seed the heap from every read's current
-    // unclaimed runs (the first pass drained it), then run with fragments
-    // allowed. Disabled by default so the single-pass behavior is unchanged.
-    if(tileUnclaimedIntervals) {
-        const uint64_t windowsBefore = anchorWindows.size();
-        for(const ReadId readId : readIdsSortedByLength) {
-            const OrientedReadId backboneOid(readId, 0);
-            if(backboneOid.getValue() >= shasta2Journeys->size()) continue;
-            const auto journey = (*shasta2Journeys)[backboneOid];
-            if(journey.empty()) continue;
-            ++candidateGeneration[uint64_t(readId)];  // invalidate stale entries.
-            pushCurrentUnclaimedIntervals(backboneOid);
-        }
+    // Pure priority-queue mode (legacy/original behavior). When true, run a
+    // single PQ pass with fragments allowed from the start: each contiguous
+    // unclaimed run of a read's journey seeds its own window, longest base span
+    // first, with no preceding full-journey-cores pass. Experimental toggle;
+    // when false, the two-pass scheme (cores, then optional tiling) runs.
+    constexpr bool purePriorityQueue = true;
+    if(purePriorityQueue) {
         runPqPass(true);
-        cout << timestamp << "Unclaimed-interval pass added "
-             << (anchorWindows.size() - windowsBefore)
-             << " fragment window(s)." << endl;
+    } else {
+        // First pass: pristine full-journey cores only.
+        runPqPass(false);
+
+        // Optional second pass: tile the leftover unclaimed intervals into
+        // fragment windows, longest-span first. Re-seed the heap from every
+        // read's current unclaimed runs (the first pass drained it), then run
+        // with fragments allowed. Disabled by default so the single-pass
+        // behavior is unchanged.
+        if(tileUnclaimedIntervals) {
+            const uint64_t windowsBefore = anchorWindows.size();
+            for(const ReadId readId : readIdsSortedByLength) {
+                const OrientedReadId backboneOid(readId, 0);
+                if(backboneOid.getValue() >= shasta2Journeys->size()) continue;
+                const auto journey = (*shasta2Journeys)[backboneOid];
+                if(journey.empty()) continue;
+                ++candidateGeneration[uint64_t(readId)];  // invalidate stale.
+                pushCurrentUnclaimedIntervals(backboneOid);
+            }
+            runPqPass(true);
+            cout << timestamp << "Unclaimed-interval pass added "
+                 << (anchorWindows.size() - windowsBefore)
+                 << " fragment window(s)." << endl;
+        }
     }
 
     // Count unclaimed anchors.
