@@ -975,18 +975,18 @@ void dinara::main::assemble(
     // assembler.phaseOverlaps(threadCount);
     // assembler.phaseOverlapsKmeans(threadCount);
 
-    // Keep one best chain per read pair per strand (hifiasm dedup port).
-    // Same-strand and opposite-strand overlaps are deduped independently,
-    // matching hifiasm's separate paf/reverse_paf storage.
-    // Runs after phasing so that only cis and unclassified overlaps compete.
-    assembler.dedupChainsPrePhasing(threadCount);
+    // // Keep one best chain per read pair per strand (hifiasm dedup port).
+    // // Same-strand and opposite-strand overlaps are deduped independently,
+    // // matching hifiasm's separate paf/reverse_paf storage.
+    // // Runs after phasing so that only cis and unclassified overlaps compete.
+    // assembler.dedupChainsPrePhasing(threadCount);
 
-    // // For each read pair, if there are multiple chains on the same strand,
-    // // delete all of them. A legitimate overlap produces one chain per strand.
-    // // Multiple chains indicate the reads overlap in a repeat region where
-    // // the chainer found multiple plausible paths. Keeping any of them risks
-    // // merging distinct repeat copies during transitive collapse.
-    // assembler.removeMultiChainAlignments(threadCount);
+    // For each read pair, if there are multiple chains on the same strand,
+    // delete all of them. A legitimate overlap produces one chain per strand.
+    // Multiple chains indicate the reads overlap in a repeat region where
+    // the chainer found multiple plausible paths. Keeping any of them risks
+    // merging distinct repeat copies during transitive collapse.
+    assembler.removeMultiChainAlignments(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);
 
@@ -1008,13 +1008,22 @@ void dinara::main::assemble(
 
     // Delete internal overlaps — overlaps where both reads extend
     // significantly beyond the aligned region on the same side.
+    //
+    // ad.qs/qe/ts/te are already extended to read tips by
+    // hifiasm_push_ovlp_chain_qgen (the port of push_ovlp_chain_qgen /
+    // append_inexact_overlap_region_alloc), matching the coordinates
+    // hifiasm stores in ma_hit_t and feeds to ma_hit2arc.
+    //
     // Two variants:
-    //   deleteInternalOverlaps:         uses stored CIGAR boundary coords (stricter)
-    //   deleteInternalOverlapsExtended: extends coords toward read tips first (hifiasm parity)
+    //   deleteInternalOverlaps:         feeds the already-extended coords
+    //                                   straight to ma_hit2arc (hifiasm parity).
+    //   deleteInternalOverlapsExtended: extends a SECOND time on top of the
+    //                                   already-extended coords (more aggressive,
+    //                                   diverges from hifiasm).
     assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
     // assembler.deleteInternalOverlapsExtended(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
-    assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
 
