@@ -12,12 +12,27 @@
 
 namespace dinara {
 
+// A single anchor a member read shares with the backbone (a "pin").
+// Stored as journey positions, which is what window construction already has;
+// consumers derive marker ordinals / base positions via getOrdinal as needed.
+// Pins for one read are stored in backbone order (ascending backboneJourneyPos).
+struct AnchorWindowSharedPin {
+    uint32_t readJourneyPos = 0;     // Position in the member's oriented journey.
+    uint32_t backboneJourneyPos = 0; // Position in the backbone's journey.
+};
+
 // A read's interval within an anchor window, expressed as journey positions.
 struct AnchorWindowReadInterval {
     OrientedReadId orientedReadId;
     uint32_t begin = 0; // Inclusive position in the oriented read journey.
     uint32_t end = 0;   // Exclusive position in the oriented read journey.
     uint32_t touchedAnchorCount = 0; // Anchors shared with the backbone in this interval.
+
+    // Backbone anchors this read shares with the backbone (its pins), in
+    // backbone order. Populated during window construction so downstream passes
+    // (per-segment abPOA MSA, het-site detection) reuse them instead of
+    // re-intersecting journeys. Consecutive pins delimit inter-anchor segments.
+    std::vector<AnchorWindowSharedPin> sharedPins;
 
     // Window transitions: which window this read came from and goes to.
     // noWindow means the read starts/ends here (no adjacent window).

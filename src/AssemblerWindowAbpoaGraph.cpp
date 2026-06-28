@@ -1,24 +1,32 @@
 // AssemblerWindowAbpoaGraph.cpp
 //
-// Per-window progressive abPOA graph construction.
+// Per-window, per-segment (inter-anchor) abPOA MSA construction.
 //
-// For each anchor window:
-//   1. Seed an abPOA graph with the backbone read's base sequence (the
-//      sequence spanning the window's backbone anchors). The backbone is
-//      always sequence 0, so it becomes the spine of the POA graph.
-//   2. For every other member read in the window, find the backbone anchors
-//      it shares with the backbone. The first and last shared anchor define
-//      the read's "anchor interval" with the backbone. The read is then
-//      aligned only to the backbone subgraph spanning that interval (via
-//      abpoa_align_sequence_to_subgraph), and added progressively.
-//   3. Write the resulting graph as GFA (one file per window) for diagnostics.
+// For each anchor window we build ONE abPOA graph:
+//   1. Seed the graph with the backbone read's base sequence spanning the
+//      window's backbone anchors. The backbone is sequence 0 (the spine);
+//      backbone base position p maps to graph node id p + 2. Seeding an empty
+//      graph does no DP, so the backbone may be arbitrarily long.
+//   2. For every other member read, find the backbone anchors it shares with
+//      the backbone (its "pins"). Between each pair of CONSECUTIVE shared
+//      anchors, align only that inter-anchor segment of the read to the
+//      backbone subgraph spanning the same two anchors. All segments of one
+//      member use the same abPOA read_id, so the member occupies a single MSA
+//      row that threads through its shared anchors.
+//   3. After all members are added, extract the row-column MSA matrix
+//      (abc->msa_base) and write it as a CSV per window.
 //
-// The abPOA graph / MSA produced here is the substrate for later het-site
-// detection (a separate pass can read the GFA or re-run with MSA output).
+// Why per-segment: abPOA's global alignment DP is O(graph_span x query_len).
+// Aligning a whole long-read window in one shot makes a span x span matrix
+// (~150k x 150k => ~128 GiB) and aborts. Splitting at shared anchors bounds
+// each DP to the (small) inter-anchor gap, so there is NO size cap and no
+// member is dropped for size.
 //
-// This mirrors the verified progressive-subgraph pattern in
-// PhasingKmeansAlign.cpp::abpoaMsaRun and the shared-anchor derivation in
-// AssemblerAnchorWindowsClean.cpp::createWindow.
+// Intervals are computed per OrientedReadId (read + strand), never per ReadId;
+// a read's two strands are distinct OrientedReadIds with distinct pins.
+//
+// Anchor/sequence handling mirrors AssemblerAnchorWindowsClean.cpp::createWindow
+// and PhasingKmeansAlign.cpp::abpoaMsaRun.
 
 #include "Assembler.hpp"
 #include "AnchorWindows.hpp"
@@ -39,7 +47,6 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 using namespace dinara;
@@ -47,24 +54,17 @@ using namespace std;
 
 namespace {
 
-// The interval a single ORIENTED read (read + strand, never just a ReadId)
-// shares with the window backbone. The same physical read in its two
-// orientations is two distinct OrientedReadIds and yields two distinct
-// intervals here.
-//
-// The interval is expressed in two coordinate spaces, both derived from the
-// same set of shared anchors:
-//   - Backbone space (base coords relative to the backbone sequence start):
-//     [backboneBegin, backboneEnd). Selects the abPOA graph slice.
-//   - Read space (this oriented read's marker ordinals):
-//     [readOrdinalBegin, readOrdinalEnd). Selects the bases to extract.
-struct OrientedReadInterval {
+// A shared backbone anchor for one oriented member read.
+struct AnchorPin {
+    int backbonePos;       // 0-based base position into the backbone sequence.
+    uint32_t readOrdinal;  // Marker ordinal of this anchor on the member read.
+};
+
+// A member oriented read and its shared-anchor pins (in backbone order).
+struct OrientedReadMember {
     OrientedReadId orientedReadId;
-    int backboneBegin = 0;       // Inclusive backbone base position of first shared anchor.
-    int backboneEnd = 0;         // Exclusive backbone base position past last shared anchor.
-    uint32_t readOrdinalBegin = 0; // First shared-anchor marker ordinal on this oriented read.
-    uint32_t readOrdinalEnd = 0;   // Last shared-anchor marker ordinal on this oriented read.
-    vector<uint8_t> seq;         // Read bases over [readOrdinalBegin, readOrdinalEnd) (0123).
+    vector<AnchorPin> pins;   // Sorted ascending by backbonePos.
+    int backboneSpan = 0;     // pins.back - pins.front; used for add order.
 };
 
 inline uint8_t baseToInt(char c) {
@@ -73,7 +73,19 @@ inline uint8_t baseToInt(char c) {
         case 'C': case 'c': return 1;
         case 'G': case 'g': return 2;
         case 'T': case 't': return 3;
-        default: return 0;
+        default: return 4; // N
+    }
+}
+
+// abPOA encodes bases 0..3 = ACGT, 4 = N, and the gap value equals abpt->m.
+inline char intToBaseOrGap(uint8_t v, int gapValue) {
+    if(int(v) == gapValue) return '-';
+    switch(v) {
+        case 0: return 'A';
+        case 1: return 'C';
+        case 2: return 'G';
+        case 3: return 'T';
+        default: return 'N';
     }
 }
 
@@ -105,11 +117,13 @@ void Assembler::computeWindowAbpoaGraphs(
     std::atomic<uint64_t> nextWindow{0};
     std::atomic<uint64_t> windowsWritten{0};
     std::atomic<uint64_t> windowsSkipped{0};
-    std::atomic<uint64_t> readsAligned{0};
+    std::atomic<uint64_t> membersAligned{0};
+    std::atomic<uint64_t> segmentsAligned{0};
+    std::atomic<uint64_t> segmentsSkipped{0};
 
-    // Extract the base sequence of an oriented read between two marker
-    // ordinals (midpoint to midpoint), encoded as 0123. Mirrors
-    // PhasingKmeansAlign.cpp::extractSegmentSeq0123.
+    // Extract the base sequence of an oriented read between two marker ordinals
+    // (midpoint to midpoint), encoded as 0123/4. Mirrors the extraction used in
+    // PhasingKmeansAlign.cpp / createWindow.
     const auto extractSeq0123 = [&](OrientedReadId oid, uint32_t ordA, uint32_t ordB) -> vector<uint8_t> {
         vector<uint8_t> seq;
         if(ordA >= ordB) return seq;
@@ -148,7 +162,7 @@ void Assembler::computeWindowAbpoaGraphs(
             }
 
             // Backbone base coordinates: midpoint of first and last backbone
-            // anchor. The backbone sequence spans [firstMid, lastMid).
+            // anchor. The backbone sequence spans [bbStartBase, bbEndBase).
             const uint32_t firstOrdinal = anchors.getOrdinal(
                 backboneJourney[bbPositions.front()], backboneOid);
             const uint32_t lastOrdinal = anchors.getOrdinal(
@@ -165,7 +179,7 @@ void Assembler::computeWindowAbpoaGraphs(
                 continue;
             }
 
-            // Backbone sequence (0123).
+            // Backbone sequence (0123/4).
             vector<uint8_t> backboneSeq;
             backboneSeq.reserve(bbEndBase - bbStartBase);
             for(uint32_t pos = bbStartBase; pos < bbEndBase; pos++) {
@@ -177,105 +191,80 @@ void Assembler::computeWindowAbpoaGraphs(
                 continue;
             }
 
-            // Map backbone anchorId -> base position relative to backbone start.
-            // Only positions that lie within [bbStartBase, bbEndBase] map to a
-            // valid backbone node (0-based into backboneSeq).
-            std::unordered_map<uint64_t, int> backboneAnchorToBasePos;
-            backboneAnchorToBasePos.reserve(bbPositions.size() * 2);
-            for(const uint32_t pos : bbPositions) {
-                const Shasta2AnchorId aid = backboneJourney[pos];
-                const uint32_t ord = anchors.getOrdinal(aid, backboneOid);
-                if(ord >= bbMarkers.size()) continue;
-                const uint32_t mid = bbMarkers[ord].position + kHalf;
-                if(mid < bbStartBase || mid > bbEndBase) continue;
-                backboneAnchorToBasePos[uint64_t(aid)] = int(mid - bbStartBase);
-            }
-
-            // Compute the oriented read interval for each non-backbone member:
-            // find its shared backbone anchors -> backbone-space interval +
-            // read-space ordinal interval + extracted read sequence. Keyed by
-            // OrientedReadId, so a read's two strands produce two intervals.
-            vector<OrientedReadInterval> members;
+            // Consume the shared-anchor pins persisted on each member during
+            // window construction (readJourneyPos, backboneJourneyPos), and
+            // convert them to (backbone base position, read marker ordinal).
+            // No journey re-intersection here — that work was done once in
+            // createWindow.
+            vector<OrientedReadMember> members;
             members.reserve(window.readIntervals.size());
 
             for(const AnchorWindowReadInterval& ri : window.readIntervals) {
                 const OrientedReadId oid = ri.orientedReadId;
                 if(oid == backboneOid) continue;
                 if(oid.getValue() >= journeys.size()) continue;
-                const auto journey = journeys[oid];
-                if(journey.empty()) continue;
+                if(ri.sharedPins.size() < 2) continue;
+                const auto readMarkers = (*markers)[oid.getValue()];
 
-                // Shared backbone anchors, recording read ordinal + backbone
-                // base position, in this oriented read's journey order.
-                int backboneBegin = -1, backboneEnd = -1;
-                uint32_t readOrdinalBegin = UINT32_MAX, readOrdinalEnd = 0;
-                bool any = false;
-                for(uint32_t readPos = 0; readPos < uint32_t(journey.size()); readPos++) {
-                    const uint64_t aid = uint64_t(journey[readPos]);
-                    auto it = backboneAnchorToBasePos.find(aid);
-                    if(it == backboneAnchorToBasePos.end()) continue;
-                    const int bbBase = it->second;
-                    const uint32_t readOrd = anchors.getOrdinal(Shasta2AnchorId(aid), oid);
-                    if(!any) {
-                        backboneBegin = bbBase;
-                        backboneEnd = bbBase;
-                        readOrdinalBegin = readOrd;
-                        readOrdinalEnd = readOrd;
-                        any = true;
-                    } else {
-                        backboneBegin = std::min(backboneBegin, bbBase);
-                        backboneEnd = std::max(backboneEnd, bbBase);
-                        readOrdinalBegin = std::min(readOrdinalBegin, readOrd);
-                        readOrdinalEnd = std::max(readOrdinalEnd, readOrd);
-                    }
+                vector<AnchorPin> pins;
+                pins.reserve(ri.sharedPins.size());
+                for(const AnchorWindowSharedPin& sp : ri.sharedPins) {
+                    // Backbone base position: midpoint of the anchor on the
+                    // backbone, relative to backbone sequence start. Must lie
+                    // within the seeded backbone span.
+                    if(sp.backboneJourneyPos >= uint32_t(backboneJourney.size())) continue;
+                    const Shasta2AnchorId aid = backboneJourney[sp.backboneJourneyPos];
+                    const uint32_t bbOrd = anchors.getOrdinal(aid, backboneOid);
+                    if(bbOrd >= bbMarkers.size()) continue;
+                    const uint32_t bbMid = bbMarkers[bbOrd].position + kHalf;
+                    if(bbMid < bbStartBase || bbMid >= bbEndBase) continue;
+                    const int backbonePos = int(bbMid - bbStartBase);
+
+                    // Read marker ordinal of the same anchor on this oriented read.
+                    const uint32_t readOrd = anchors.getOrdinal(aid, oid);
+                    if(readOrd >= readMarkers.size()) continue;
+
+                    pins.push_back(AnchorPin{backbonePos, readOrd});
                 }
-                if(!any || readOrdinalBegin >= readOrdinalEnd) continue;
+                if(pins.size() < 2) continue;
 
-                OrientedReadInterval interval;
-                interval.orientedReadId = oid;
-                interval.backboneBegin = backboneBegin;
-                // Exclusive right bound; clamp to backbone length.
-                interval.backboneEnd = std::min(backboneEnd + 1, backboneLen);
-                interval.readOrdinalBegin = readOrdinalBegin;
-                interval.readOrdinalEnd = readOrdinalEnd;
-                if(interval.backboneBegin >= interval.backboneEnd) continue;
-                interval.seq = extractSeq0123(oid, readOrdinalBegin, readOrdinalEnd);
-                if(interval.seq.size() < 2) continue;
-                members.push_back(std::move(interval));
+                // Pins arrive in backbone order from construction; re-sort
+                // defensively in case any were dropped above.
+                std::sort(pins.begin(), pins.end(),
+                    [](const AnchorPin& a, const AnchorPin& b) {
+                        return a.backbonePos < b.backbonePos;
+                    });
+
+                OrientedReadMember m;
+                m.orientedReadId = oid;
+                m.pins = std::move(pins);
+                m.backboneSpan = m.pins.back().backbonePos - m.pins.front().backbonePos;
+                if(m.backboneSpan <= 0) continue;
+                members.push_back(std::move(m));
             }
 
-            // Add reads to the MSA from the biggest shared interval to the
-            // smallest. The order reads are added to a POA graph matters:
-            // adding the longest-overlapping reads first builds the most
-            // reliable spine before shorter reads are layered on. Interval
-            // size is the backbone span [backboneBegin, backboneEnd); ties broken
-            // by extracted read length, then read id for determinism.
+            // Add members from the biggest backbone span to the smallest, so the
+            // longest-overlapping reads shape the graph spine before shorter
+            // ones. Ties broken by oriented read id for determinism.
             std::sort(members.begin(), members.end(),
-                [](const OrientedReadInterval& a, const OrientedReadInterval& b) {
-                    const int spanA = a.backboneEnd - a.backboneBegin;
-                    const int spanB = b.backboneEnd - b.backboneBegin;
-                    if(spanA != spanB) return spanA > spanB;
-                    if(a.seq.size() != b.seq.size()) return a.seq.size() > b.seq.size();
+                [](const OrientedReadMember& a, const OrientedReadMember& b) {
+                    if(a.backboneSpan != b.backboneSpan) return a.backboneSpan > b.backboneSpan;
                     return a.orientedReadId < b.orientedReadId;
                 });
 
-            // Total sequences = backbone + members.
             const int nMembers = int(members.size());
-            const int totalSeqs = 1 + nMembers;
+            const int totalSeqs = 1 + nMembers; // backbone + members.
 
-            // --- Run progressive abPOA ---
+            // --- Build the per-window abPOA graph ---
             abpoa_t* ab = abpoa_init();
             abpoa_para_t* abpt = abpoa_init_para();
             abpt->align_mode = ABPOA_GLOBAL_MODE;
-            // sub_aln MUST be set for abpoa_align_sequence_to_subgraph to honor
-            // the node-range bounds. Without it, abPOA ignores the subgraph
-            // restriction and allocates a DP matrix over the ENTIRE graph
-            // (query x whole-graph), which on a large window tries to allocate
-            // tens of GiB and aborts ([SIMDMalloc] posix_memalign fail).
+            // sub_aln: align reads to a subgraph (node-range restricted). Without
+            // it abpoa_align_sequence_to_subgraph ignores the node bounds.
             abpt->sub_aln = 1;
             abpt->inc_path_score = 1;
-            abpt->out_msa  = 1;
-            abpt->out_cons = 1;
+            abpt->out_msa  = 1;   // populate abc->msa_base (row-column MSA).
+            abpt->out_cons = 1;   // also compute a consensus row.
             abpt->out_gfa  = 0;
             abpt->sort_input_seq = 0;   // keep backbone as seq 0 (the spine).
             abpt->progressive_poa = 0;
@@ -285,9 +274,9 @@ void Assembler::computeWindowAbpoaGraphs(
 
             ab->abs->n_seq = totalSeqs;
 
-            // Seed backbone as sequence 0. On an empty graph,
-            // abpoa_add_subgraph_alignment creates nodes 2..L+1; thereafter
-            // backbone base position p maps to node id p + 2.
+            // Seed backbone as read_id 0. On an empty graph,
+            // abpoa_add_subgraph_alignment creates nodes 2..L+1 directly (no DP),
+            // so backbone base position p maps to node id p + 2.
             {
                 abpoa_res_t res{};
                 res.graph_cigar = nullptr;
@@ -300,47 +289,121 @@ void Assembler::computeWindowAbpoaGraphs(
                 if(res.n_cigar) free(res.graph_cigar);
             }
 
-            // Align each member to the backbone subgraph spanning its anchor
-            // interval [backboneBegin, backboneEnd).
+            // Add each member segment-by-segment between consecutive shared
+            // anchors. All segments of one member use the same read_id, so the
+            // member fills a single MSA row.
             for(int i = 0; i < nMembers; i++) {
-                const OrientedReadInterval& interval = members[size_t(i)];
+                const OrientedReadMember& m = members[size_t(i)];
+                const int readId = i + 1;
+                bool anySegment = false;
 
-                // Inclusive backbone node IDs for the flanking positions.
-                const int incBeg = interval.backboneBegin + 2;
-                const int incEnd = interval.backboneEnd + 2 - 1;
-                if(incBeg > incEnd) continue;
+                for(size_t p = 0; p + 1 < m.pins.size(); p++) {
+                    const AnchorPin& a = m.pins[p];
+                    const AnchorPin& b = m.pins[p + 1];
 
-                int excBeg = 0, excEnd = 1;
-                abpoa_subgraph_nodes(ab, abpt, incBeg, incEnd, &excBeg, &excEnd);
+                    // Require strictly increasing read ordinal (forward,
+                    // monotone) and backbone position. Tangled/duplicate pins
+                    // are skipped.
+                    if(b.readOrdinal <= a.readOrdinal) {
+                        segmentsSkipped.fetch_add(1);
+                        continue;
+                    }
+                    if(b.backbonePos <= a.backbonePos) {
+                        segmentsSkipped.fetch_add(1);
+                        continue;
+                    }
 
-                abpoa_res_t res{};
-                res.graph_cigar = nullptr;
-                res.n_cigar = 0;
-                abpoa_align_sequence_to_subgraph(
-                    ab, abpt, excBeg, excEnd,
-                    const_cast<uint8_t*>(interval.seq.data()),
-                    int(interval.seq.size()), &res);
-                abpoa_add_subgraph_alignment(
-                    ab, abpt, excBeg, excEnd,
-                    const_cast<uint8_t*>(interval.seq.data()), nullptr,
-                    int(interval.seq.size()), nullptr, res, i + 1, totalSeqs, 0);
-                if(res.n_cigar) free(res.graph_cigar);
-                readsAligned.fetch_add(1);
+                    // Backbone subgraph for this segment: nodes covering
+                    // backbone bases [a.backbonePos, b.backbonePos).
+                    const int incBeg = a.backbonePos + 2;
+                    const int incEnd = b.backbonePos + 2 - 1;
+                    if(incBeg > incEnd) {
+                        segmentsSkipped.fetch_add(1);
+                        continue;
+                    }
+
+                    // Read bases for this segment: [midpoint(a), midpoint(b)).
+                    vector<uint8_t> segSeq = extractSeq0123(m.orientedReadId, a.readOrdinal, b.readOrdinal);
+                    if(segSeq.empty()) {
+                        segmentsSkipped.fetch_add(1);
+                        continue;
+                    }
+
+                    int excBeg = 0, excEnd = 1;
+                    abpoa_subgraph_nodes(ab, abpt, incBeg, incEnd, &excBeg, &excEnd);
+
+                    abpoa_res_t res{};
+                    res.graph_cigar = nullptr;
+                    res.n_cigar = 0;
+                    abpoa_align_sequence_to_subgraph(
+                        ab, abpt, excBeg, excEnd,
+                        segSeq.data(), int(segSeq.size()), &res);
+                    // inc_both_ends = 1: register this read_id at the segment's
+                    // BEGIN anchor node. abPOA always excludes the end node, so
+                    // for adjacent segments sharing an anchor this fills the
+                    // internal anchor columns and makes the member's MSA row
+                    // thread continuously through its shared anchors (with 0,
+                    // every internal anchor column would be a gap for the read).
+                    abpoa_add_subgraph_alignment(
+                        ab, abpt, excBeg, excEnd,
+                        segSeq.data(), nullptr,
+                        int(segSeq.size()), nullptr, res, readId, totalSeqs, 1);
+                    if(res.n_cigar) free(res.graph_cigar);
+                    segmentsAligned.fetch_add(1);
+                    anySegment = true;
+                }
+                if(anySegment) membersAligned.fetch_add(1);
             }
 
-            // Generate consensus + MSA so the graph is complete, then GFA.
-            abpoa_output(ab, abpt, nullptr);
+            // --- Extract the row-column MSA matrix and write CSV ---
+            abpoa_generate_rc_msa(ab, abpt);
+            const abpoa_cons_t* abc = ab->abc;
 
-            const string gfaPath = outputPrefix + "window" +
-                std::to_string(uint64_t(window.windowId)) + ".gfa";
-            FILE* gfaFile = fopen(gfaPath.c_str(), "w");
-            if(gfaFile != nullptr) {
-                abpoa_generate_gfa(ab, abpt, gfaFile);
-                fclose(gfaFile);
-                windowsWritten.fetch_add(1);
-            } else {
-                windowsSkipped.fetch_add(1);
+            bool wrote = false;
+            if(abc != nullptr && abc->msa_base != nullptr && abc->msa_len > 0 && abc->n_seq > 0) {
+                const int gapValue = abpt->m; // abPOA stores gaps as value m (=5).
+                const string csvPath = outputPrefix + "window" +
+                    std::to_string(uint64_t(window.windowId)) + ".msa.csv";
+                FILE* f = fopen(csvPath.c_str(), "w");
+                if(f != nullptr) {
+                    // Header: row label, then one column per MSA column.
+                    fprintf(f, "row,orientedReadId,role");
+                    for(int c = 0; c < abc->msa_len; c++) fprintf(f, ",c%d", c);
+                    fprintf(f, "\n");
+
+                    // Row 0 = backbone; rows 1..nMembers = members in add order.
+                    for(int rowReadId = 0; rowReadId < abc->n_seq; rowReadId++) {
+                        const char* role = (rowReadId == 0) ? "backbone" : "member";
+                        uint64_t oidVal;
+                        if(rowReadId == 0) {
+                            oidVal = uint64_t(backboneOid.getValue());
+                        } else {
+                            oidVal = uint64_t(members[size_t(rowReadId - 1)].orientedReadId.getValue());
+                        }
+                        fprintf(f, "%d,%llu,%s", rowReadId, (unsigned long long)oidVal, role);
+                        const uint8_t* rowBases = abc->msa_base[rowReadId];
+                        for(int c = 0; c < abc->msa_len; c++) {
+                            fprintf(f, ",%c", intToBaseOrGap(rowBases[c], gapValue));
+                        }
+                        fprintf(f, "\n");
+                    }
+
+                    // Append the consensus row(s) if present.
+                    for(int consI = 0; consI < abc->n_cons; consI++) {
+                        const int row = abc->n_seq + consI;
+                        fprintf(f, "%d,-,consensus", row);
+                        const uint8_t* rowBases = abc->msa_base[row];
+                        for(int c = 0; c < abc->msa_len; c++) {
+                            fprintf(f, ",%c", intToBaseOrGap(rowBases[c], gapValue));
+                        }
+                        fprintf(f, "\n");
+                    }
+                    fclose(f);
+                    wrote = true;
+                }
             }
+            if(wrote) windowsWritten.fetch_add(1);
+            else windowsSkipped.fetch_add(1);
 
             abpoa_free(ab);
             abpoa_free_para(abpt);
@@ -357,6 +420,7 @@ void Assembler::computeWindowAbpoaGraphs(
     }
 
     cout << timestamp << "computeWindowAbpoaGraphs: wrote " << windowsWritten.load()
-         << " GFAs, skipped " << windowsSkipped.load() << " windows, aligned "
-         << readsAligned.load() << " member reads." << endl;
+         << " MSA CSVs, skipped " << windowsSkipped.load() << " windows, aligned "
+         << membersAligned.load() << " members over " << segmentsAligned.load()
+         << " segments (" << segmentsSkipped.load() << " segments skipped)." << endl;
 }

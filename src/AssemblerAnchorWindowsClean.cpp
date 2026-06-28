@@ -506,11 +506,31 @@ void Assembler::computeAnchorWindowsClean(
                 uint32_t(journey.size()) : convergentEnd;
             readSpans.push_back(ReadSpan{oid, claimBegin, claimEnd});
 
-            window.readIntervals.push_back(AnchorWindowReadInterval{
+            AnchorWindowReadInterval readInterval{
                 oid,
                 convergentBegin,
                 convergentEnd,
-                convergentCount});
+                convergentCount};
+
+            // Persist the shared-anchor pins (read/backbone journey positions),
+            // ordered by backbone position so consecutive pins delimit the
+            // inter-anchor segments used by the per-segment abPOA MSA. The
+            // parallel sharedReadPositions/sharedBackbonePositions are in read
+            // order; sort the paired (backbonePos, readPos) by backbone.
+            {
+                vector<AnchorWindowSharedPin>& pins = readInterval.sharedPins;
+                pins.reserve(sharedReadPositions.size());
+                for(size_t s = 0; s < sharedReadPositions.size(); s++) {
+                    pins.push_back(AnchorWindowSharedPin{
+                        sharedReadPositions[s], sharedBackbonePositions[s]});
+                }
+                std::sort(pins.begin(), pins.end(),
+                    [](const AnchorWindowSharedPin& a, const AnchorWindowSharedPin& b) {
+                        return a.backboneJourneyPos < b.backboneJourneyPos;
+                    });
+            }
+
+            window.readIntervals.push_back(std::move(readInterval));
 
         }
 
