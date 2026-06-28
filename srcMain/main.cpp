@@ -1020,7 +1020,7 @@ void dinara::main::assemble(
     //   deleteInternalOverlapsExtended: extends a SECOND time on top of the
     //                                   already-extended coords (more aggressive,
     //                                   diverges from hifiasm).
-    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
     // assembler.deleteInternalOverlapsExtended(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
@@ -1165,30 +1165,32 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow);
 
-    // // CIGAR-based het SNP detection per window.
-    // {
-    //     cout << timestamp << "Running CIGAR-based SNP detection on "
-    //          << anchorWindows.size() << " windows..." << endl;
-    //     const auto tSnp0 = steady_clock::now();
-    //     uint64_t hetWindows = 0;
-    //     uint64_t totalSnps = 0;
-    //     for(AnchorWindow& window : anchorWindows) {
-    //         window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
-    //             window, *shasta2Anchors, *shasta2Journeys);
-    //         if(window.cleanHetSnpCount > 0) {
-    //             hetWindows++;
-    //             totalSnps += window.cleanHetSnpCount;
-    //         }
-    //     }
-    //     const auto tSnp1 = steady_clock::now();
-    //     const double snpSecs = seconds(tSnp1 - tSnp0);
-    //     cout << timestamp << "CIGAR-based SNP detection complete."
-    //          << " hetWindows=" << hetWindows
-    //          << " homWindows=" << (anchorWindows.size() - hetWindows)
-    //          << " totalCleanHetSnps=" << totalSnps
-    //          << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
-    //          << std::defaultfloat << endl;
-    // }
+    // CIGAR-based het SNP detection per window. Reuses the pairwise CIGARs
+    // already computed by computeBaseAlignmentsAndStore (no re-alignment, no
+    // POA), so it is fast at window scale.
+    {
+        cout << timestamp << "Running CIGAR-based SNP detection on "
+             << anchorWindows.size() << " windows..." << endl;
+        const auto tSnp0 = steady_clock::now();
+        uint64_t hetWindows = 0;
+        uint64_t totalSnps = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
+                window, *shasta2Anchors, *shasta2Journeys);
+            if(window.cleanHetSnpCount > 0) {
+                hetWindows++;
+                totalSnps += window.cleanHetSnpCount;
+            }
+        }
+        const auto tSnp1 = steady_clock::now();
+        const double snpSecs = seconds(tSnp1 - tSnp0);
+        cout << timestamp << "CIGAR-based SNP detection complete."
+             << " hetWindows=" << hetWindows
+             << " homWindows=" << (anchorWindows.size() - hetWindows)
+             << " totalCleanHetSnps=" << totalSnps
+             << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
+             << std::defaultfloat << endl;
+    }
 
     // // Write per-read haplotype assignments and het SNP info for the first window.
     // if (!anchorWindows.empty()) {
@@ -1546,7 +1548,13 @@ void dinara::main::assemble(
     // spanning its shared-anchor interval. Writes one GFA per window; the
     // graph/MSA is the substrate for later het-site detection.
     {
-        constexpr bool computeWindowAbpoa = true;
+        // The per-segment abPOA path re-aligns sequences that
+        // computeBaseAlignmentsAndStore already aligned, and its per-segment
+        // graph rescans make it intractable at window scale. Het-site
+        // detection runs instead off the stored CIGARs via
+        // cigarDetectSnpsInWindow (see below). Keep the abPOA code for
+        // diagnostics but leave it off.
+        constexpr bool computeWindowAbpoa = false;
         if(computeWindowAbpoa) {
             assembler.computeWindowAbpoaGraphs(
                 anchorWindows,
