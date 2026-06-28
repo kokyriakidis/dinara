@@ -3900,6 +3900,19 @@ public:
         uint64_t minWindowBaseSpan = 4000,
         vector<uint32_t>* anchorDovetailWindow = nullptr);
 
+    // Per-window progressive abPOA.
+    // For each window, seed an abPOA graph with the backbone read sequence,
+    // then progressively align every other member read to the subgraph
+    // spanned by the backbone anchors it shares with the backbone (its
+    // anchor interval). Writes one GFA per window for diagnostics; the
+    // abPOA graph / MSA is the substrate for later het-site detection.
+    void computeWindowAbpoaGraphs(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const string& outputPrefix,
+        uint64_t threadCount) const;
+
     // Detect clean het SNPs in an anchor window using Theseus MSA.
     // Returns the number of SNPs passing strand bias and repeat filtering.
     uint32_t msaDetectSnpsInWindow(

@@ -1540,8 +1540,22 @@ void dinara::main::assemble(
     // derived (Phase 2). Each window is self-contained here (its readIntervals,
     // backbone, etc.), so per-window work (consensus, phasing, splitting,
     // filtering) belongs here and can be done independently per window.
-    // Intentionally empty for now.
     // ========================================================================
+    // Per-window progressive abPOA: seed each window's graph with the backbone
+    // read, then add every member read aligned to the backbone subgraph
+    // spanning its shared-anchor interval. Writes one GFA per window; the
+    // graph/MSA is the substrate for later het-site detection.
+    {
+        constexpr bool computeWindowAbpoa = true;
+        if(computeWindowAbpoa) {
+            assembler.computeWindowAbpoaGraphs(
+                anchorWindows,
+                *shasta2Anchors,
+                *shasta2Journeys,
+                "window_abpoa_",
+                threadCount);
+        }
+    }
 
     // ========================================================================
     // PHASE 2: Edge derivation.
