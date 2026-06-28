@@ -1165,18 +1165,21 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow);
 
-    // CIGAR-based het SNP detection per window. Reuses the pairwise CIGARs
-    // already computed by computeBaseAlignmentsAndStore (no re-alignment, no
-    // POA), so it is fast at window scale.
+    // ksw2-based het SNP detection per window. Aligns each member's
+    // inter-anchor segments against the backbone with banded 2-piece affine
+    // ksw2, using the persisted shared-anchor pins. Self-contained per window
+    // (handles transitive members, no global alignment table), and each DP is
+    // bounded by the small inter-anchor gap, so it is fast at window scale.
     {
-        cout << timestamp << "Running CIGAR-based SNP detection on "
+        cout << timestamp << "Running ksw2-based SNP detection on "
              << anchorWindows.size() << " windows..." << endl;
         const auto tSnp0 = steady_clock::now();
         uint64_t hetWindows = 0;
         uint64_t totalSnps = 0;
         for(AnchorWindow& window : anchorWindows) {
-            window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
-                window, *shasta2Anchors, *shasta2Journeys);
+            window.cleanHetSnpCount = assembler.ksw2DetectSnpsInWindow(
+                window, *shasta2Anchors, *shasta2Journeys,
+                assemblerOptions.alignOptions);
             if(window.cleanHetSnpCount > 0) {
                 hetWindows++;
                 totalSnps += window.cleanHetSnpCount;
@@ -1184,13 +1187,25 @@ void dinara::main::assemble(
         }
         const auto tSnp1 = steady_clock::now();
         const double snpSecs = seconds(tSnp1 - tSnp0);
-        cout << timestamp << "CIGAR-based SNP detection complete."
+        cout << timestamp << "ksw2-based SNP detection complete."
              << " hetWindows=" << hetWindows
              << " homWindows=" << (anchorWindows.size() - hetWindows)
              << " totalCleanHetSnps=" << totalSnps
              << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
              << std::defaultfloat << endl;
     }
+
+    // CIGAR-based het SNP detection (alternative). Reuses pairwise CIGARs from
+    // computeBaseAlignmentsAndStore. Superseded by ksw2DetectSnpsInWindow above;
+    // kept for comparison.
+    // {
+    //     cout << timestamp << "Running CIGAR-based SNP detection on "
+    //          << anchorWindows.size() << " windows..." << endl;
+    //     for(AnchorWindow& window : anchorWindows) {
+    //         window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
+    //             window, *shasta2Anchors, *shasta2Journeys);
+    //     }
+    // }
 
     // // Write per-read haplotype assignments and het SNP info for the first window.
     // if (!anchorWindows.empty()) {

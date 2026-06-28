@@ -3927,6 +3927,16 @@ public:
         const Shasta2Anchors& anchors,
         const Shasta2Journeys& journeys) const;
 
+    // Detect clean het SNPs in an anchor window using banded ksw2 (2-piece
+    // affine) alignment of each member's inter-anchor segments against the
+    // backbone. Self-contained: uses persisted shared-anchor pins, so it works
+    // for transitive members and needs no global alignment table. SNPs only.
+    uint32_t ksw2DetectSnpsInWindow(
+        AnchorWindow& window,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions) const;
+
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.
     void testAnchorWindowsCleanLongestRead(

@@ -35,7 +35,7 @@ endif(BUILD_NATIVE)
 add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 
 # Source files
-file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../srcMain/*.cpp ../src/edlib/src/edlib.cpp)
+file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../srcMain/*.cpp ../src/edlib/src/edlib.cpp ../src/ksw2/ksw2_extd2_sse.c)
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
@@ -51,7 +51,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../src/edlib/include)
+include_directories(../src ../src/edlib/include ../src/ksw2)
 include_directories(../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
 
 # Additional link directory.
