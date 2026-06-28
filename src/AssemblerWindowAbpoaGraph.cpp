@@ -267,6 +267,13 @@ void Assembler::computeWindowAbpoaGraphs(
             abpoa_t* ab = abpoa_init();
             abpoa_para_t* abpt = abpoa_init_para();
             abpt->align_mode = ABPOA_GLOBAL_MODE;
+            // sub_aln MUST be set for abpoa_align_sequence_to_subgraph to honor
+            // the node-range bounds. Without it, abPOA ignores the subgraph
+            // restriction and allocates a DP matrix over the ENTIRE graph
+            // (query x whole-graph), which on a large window tries to allocate
+            // tens of GiB and aborts ([SIMDMalloc] posix_memalign fail).
+            abpt->sub_aln = 1;
+            abpt->inc_path_score = 1;
             abpt->out_msa  = 1;
             abpt->out_cons = 1;
             abpt->out_gfa  = 0;
