@@ -225,10 +225,52 @@ void Assembler::computeAnchorWindowsClean(
     };
 
     // ========================================================================
-    // LIS helper: given a sequence of backbone positions (uint32_t),
-    // return the indices (into the input) of the longest increasing subsequence.
+    // LIS helper: given a sequence of values (uint32_t), return the indices
+    // (into the input) of a strictly-increasing longest subsequence.
     // Uses patience sorting (O(n log n)).
     // ========================================================================
+    auto longestIncreasingSubsequence = [](const vector<uint32_t>& values) {
+        vector<uint32_t> result;
+        const uint32_t n = uint32_t(values.size());
+        if(n == 0) return result;
+
+        // tailsIdx[len-1] = index (into values) of the smallest tail value of
+        // any strictly-increasing subsequence of length len found so far.
+        // predecessor[i] = index of the element before values[i] in the LIS
+        // that ends at i.
+        vector<uint32_t> tailsIdx;
+        vector<int32_t> predecessor(n, -1);
+
+        for(uint32_t i = 0; i < n; i++) {
+            // Binary search for the first tail whose value is >= values[i]
+            // (strict increase: replace that tail, extend otherwise).
+            uint32_t lo = 0;
+            uint32_t hi = uint32_t(tailsIdx.size());
+            while(lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if(values[tailsIdx[mid]] < values[i]) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if(lo > 0) {
+                predecessor[i] = int32_t(tailsIdx[lo - 1]);
+            }
+            if(lo == uint32_t(tailsIdx.size())) {
+                tailsIdx.push_back(i);
+            } else {
+                tailsIdx[lo] = i;
+            }
+        }
+
+        // Reconstruct from the last tail backwards.
+        for(int32_t k = int32_t(tailsIdx.back()); k >= 0; k = predecessor[uint32_t(k)]) {
+            result.push_back(uint32_t(k));
+        }
+        std::reverse(result.begin(), result.end());
+        return result;
+    };
 
     // Claim an anchor and its reverse complement.
     auto claimAnchor = [&](uint64_t anchorId, uint32_t windowId) {
@@ -514,20 +556,28 @@ void Assembler::computeAnchorWindowsClean(
 
             // Persist the shared-anchor pins (read/backbone journey positions),
             // ordered by backbone position so consecutive pins delimit the
-            // inter-anchor segments used by the per-segment abPOA MSA. The
-            // parallel sharedReadPositions/sharedBackbonePositions are in read
-            // order; sort the paired (backbonePos, readPos) by backbone.
+            // inter-anchor segments used by the per-segment abPOA MSA.
+            //
+            // sharedReadPositions is strictly increasing (collected in read
+            // order). The shared anchors are NOT guaranteed colinear with the
+            // backbone: a repeat can pair an anchor out of diagonal order, so
+            // sharedBackbonePositions may dip. The per-segment MSA requires
+            // pins where both read and backbone positions increase together
+            // (a proper alignment's diagonal). Keep the longest such colinear
+            // subset via LIS over the backbone positions (read order is the
+            // implicit increasing axis), discarding off-diagonal pins.
             {
+                const vector<uint32_t> keep =
+                    longestIncreasingSubsequence(sharedBackbonePositions);
                 vector<AnchorWindowSharedPin>& pins = readInterval.sharedPins;
-                pins.reserve(sharedReadPositions.size());
-                for(size_t s = 0; s < sharedReadPositions.size(); s++) {
+                pins.reserve(keep.size());
+                for(const uint32_t s : keep) {
                     pins.push_back(AnchorWindowSharedPin{
                         sharedReadPositions[s], sharedBackbonePositions[s]});
                 }
-                std::sort(pins.begin(), pins.end(),
-                    [](const AnchorWindowSharedPin& a, const AnchorWindowSharedPin& b) {
-                        return a.backboneJourneyPos < b.backboneJourneyPos;
-                    });
+                // LIS over backbone positions (read order increasing) yields
+                // pins already sorted by backbone position with strictly
+                // increasing read positions, matching the consumer's asserts.
             }
 
             window.readIntervals.push_back(std::move(readInterval));
