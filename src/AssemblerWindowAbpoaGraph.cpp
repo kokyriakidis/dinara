@@ -35,6 +35,7 @@
 #include "Reads.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
+#include "DINARA_ASSERT.hpp"
 #include "timestamp.hpp"
 
 #include "abpoa/abpoa.h"
@@ -119,7 +120,6 @@ void Assembler::computeWindowAbpoaGraphs(
     std::atomic<uint64_t> windowsSkipped{0};
     std::atomic<uint64_t> membersAligned{0};
     std::atomic<uint64_t> segmentsAligned{0};
-    std::atomic<uint64_t> segmentsSkipped{0};
 
     // Extract the base sequence of an oriented read between two marker ordinals
     // (midpoint to midpoint), encoded as 0123/4. Mirrors the extraction used in
@@ -264,7 +264,13 @@ void Assembler::computeWindowAbpoaGraphs(
             abpt->sub_aln = 1;
             abpt->inc_path_score = 1;
             abpt->out_msa  = 1;   // populate abc->msa_base (row-column MSA).
-            abpt->out_cons = 1;   // also compute a consensus row.
+            // out_cons MUST be 0 here. We add each member as multiple segments
+            // sharing one read_id, so a node's coverage (summed read_id bits)
+            // can exceed the per-cluster sequence count. abPOA's consensus path
+            // (abpoa_cons_phred_score) then asserts n_cov > n_seq and aborts
+            // ("unexpected n_cov/n_seq"). We only need the MSA matrix, so skip
+            // consensus entirely.
+            abpt->out_cons = 0;
             abpt->out_gfa  = 0;
             abpt->sort_input_seq = 0;   // keep backbone as seq 0 (the spine).
             abpt->progressive_poa = 0;
@@ -301,33 +307,25 @@ void Assembler::computeWindowAbpoaGraphs(
                     const AnchorPin& a = m.pins[p];
                     const AnchorPin& b = m.pins[p + 1];
 
-                    // Require strictly increasing read ordinal (forward,
-                    // monotone) and backbone position. Tangled/duplicate pins
-                    // are skipped.
-                    if(b.readOrdinal <= a.readOrdinal) {
-                        segmentsSkipped.fetch_add(1);
-                        continue;
-                    }
-                    if(b.backbonePos <= a.backbonePos) {
-                        segmentsSkipped.fetch_add(1);
-                        continue;
-                    }
+                    // The shared anchors between two oriented reads are
+                    // guaranteed monotone by the underlying alignment: ordering
+                    // pins by backbone position must also order them strictly
+                    // ascending in read ordinal. A violation means a broken
+                    // invariant upstream, not normal data, so assert.
+                    DINARA_ASSERT(b.backbonePos > a.backbonePos);
+                    DINARA_ASSERT(b.readOrdinal > a.readOrdinal);
 
                     // Backbone subgraph for this segment: nodes covering
                     // backbone bases [a.backbonePos, b.backbonePos).
                     const int incBeg = a.backbonePos + 2;
                     const int incEnd = b.backbonePos + 2 - 1;
-                    if(incBeg > incEnd) {
-                        segmentsSkipped.fetch_add(1);
-                        continue;
-                    }
+                    DINARA_ASSERT(incBeg <= incEnd);
 
                     // Read bases for this segment: [midpoint(a), midpoint(b)).
+                    // Strictly increasing ordinals over k-mer-spaced markers
+                    // always yield a non-empty span.
                     vector<uint8_t> segSeq = extractSeq0123(m.orientedReadId, a.readOrdinal, b.readOrdinal);
-                    if(segSeq.empty()) {
-                        segmentsSkipped.fetch_add(1);
-                        continue;
-                    }
+                    DINARA_ASSERT(!segSeq.empty());
 
                     int excBeg = 0, excEnd = 1;
                     abpoa_subgraph_nodes(ab, abpt, incBeg, incEnd, &excBeg, &excEnd);
@@ -388,16 +386,7 @@ void Assembler::computeWindowAbpoaGraphs(
                         fprintf(f, "\n");
                     }
 
-                    // Append the consensus row(s) if present.
-                    for(int consI = 0; consI < abc->n_cons; consI++) {
-                        const int row = abc->n_seq + consI;
-                        fprintf(f, "%d,-,consensus", row);
-                        const uint8_t* rowBases = abc->msa_base[row];
-                        for(int c = 0; c < abc->msa_len; c++) {
-                            fprintf(f, ",%c", intToBaseOrGap(rowBases[c], gapValue));
-                        }
-                        fprintf(f, "\n");
-                    }
+                    // No consensus rows: out_cons is disabled (see above).
                     fclose(f);
                     wrote = true;
                 }
@@ -422,5 +411,5 @@ void Assembler::computeWindowAbpoaGraphs(
     cout << timestamp << "computeWindowAbpoaGraphs: wrote " << windowsWritten.load()
          << " MSA CSVs, skipped " << windowsSkipped.load() << " windows, aligned "
          << membersAligned.load() << " members over " << segmentsAligned.load()
-         << " segments (" << segmentsSkipped.load() << " segments skipped)." << endl;
+         << " segments." << endl;
 }
