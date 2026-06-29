@@ -173,6 +173,92 @@ struct KwMemberProfile {
     bool isNoisy(uint32_t pos) const { return inRanges(noisyRanges, pos); }
 };
 
+// One read's allele row across the window's het sites (pgphase ReadVariantProfile).
+// alleles[i] is this read's call at hetSnps[i]:
+//   0 = ref, 1 = alt, -1 = not covered / non-informative.
+struct KwReadVariantProfile {
+    OrientedReadId oid;
+    int startVarIdx = -1;     // first het column this read informs (-1 = none)
+    int endVarIdx = -1;       // last het column this read informs
+    vector<int> alleles;      // one entry per het site, column order
+};
+
+// Build the row-oriented read x het-site matrix from the column-oriented
+// window.hetSnps (altReads / refReads). One row per read that touches at least
+// one het site; the backbone read is row 0 (ref at every het site it spans).
+// This is the per-window analogue of pgphase collect_read_var_profile and is
+// what you inspect to check the het sites for a window.
+static vector<KwReadVariantProfile> buildWindowHetSiteMatrix(const AnchorWindow& window) {
+    const size_t nSites = window.hetSnps.size();
+
+    // Map oriented-read value -> row index, allocating rows on first sight.
+    unordered_map<uint64_t, size_t> rowOf;
+    vector<KwReadVariantProfile> rows;
+
+    auto rowFor = [&](OrientedReadId oid) -> KwReadVariantProfile& {
+        const uint64_t key = oid.getValue();
+        auto it = rowOf.find(key);
+        if (it != rowOf.end()) return rows[it->second];
+        rowOf.emplace(key, rows.size());
+        KwReadVariantProfile p;
+        p.oid = oid;
+        p.alleles.assign(nSites, -1);
+        rows.push_back(move(p));
+        return rows.back();
+    };
+
+    for (size_t col = 0; col < nSites; col++) {
+        const auto& hs = window.hetSnps[col];
+        for (const OrientedReadId oid : hs.altReads) rowFor(oid).alleles[col] = 1;
+        for (const OrientedReadId oid : hs.refReads) {
+            auto& row = rowFor(oid);
+            if (row.alleles[col] != 1) row.alleles[col] = 0; // alt wins ties
+        }
+    }
+
+    // Fill covered span [startVarIdx, endVarIdx] per row.
+    for (auto& row : rows) {
+        for (size_t i = 0; i < nSites; i++) {
+            if (row.alleles[i] < 0) continue;
+            if (row.startVarIdx < 0) row.startVarIdx = int(i);
+            row.endVarIdx = int(i);
+        }
+    }
+
+    return rows;
+}
+
+// Print the read x het-site matrix for a window. Columns are het sites in
+// backbone-position order; '.' = not covered, '0' = ref, '1' = alt.
+static void printWindowHetSiteMatrix(const AnchorWindow& window) {
+    const size_t nSites = window.hetSnps.size();
+    if (nSites == 0) {
+        cout << "    hetMatrix bb=" << window.backboneOrientedReadId
+             << " window=" << window.windowId << " no het sites" << endl;
+        return;
+    }
+
+    const vector<KwReadVariantProfile> rows = buildWindowHetSiteMatrix(window);
+
+    cout << "    hetMatrix bb=" << window.backboneOrientedReadId
+         << " window=" << window.windowId
+         << " sites=" << nSites << " reads=" << rows.size() << endl;
+
+    // Header: het-site backbone positions.
+    cout << "      read \\ bbPos:";
+    for (const auto& hs : window.hetSnps) cout << ' ' << hs.bbPos;
+    cout << endl;
+
+    for (const auto& row : rows) {
+        cout << "      " << row.oid << " ";
+        for (size_t i = 0; i < nSites; i++) {
+            const int a = row.alleles[i];
+            cout << (a < 0 ? '.' : char('0' + a));
+        }
+        cout << "  [" << row.startVarIdx << ".." << row.endVarIdx << "]" << endl;
+    }
+}
+
 } // anonymous namespace
 
 
@@ -600,5 +686,10 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
     }
 
     window.cleanHetSnpCount = cleanHetSnps;
+
+    // Row-oriented read x het-site matrix for inspection (pgphase
+    // ReadVariantProfile view). Built from the per-site read lists above.
+    printWindowHetSiteMatrix(window);
+
     return cleanHetSnps;
 }
