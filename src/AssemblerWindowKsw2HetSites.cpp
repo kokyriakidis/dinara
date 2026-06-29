@@ -70,6 +70,77 @@ struct KwSnp {
     uint8_t altBase;  // 0=A,1=C,2=G,3=T
 };
 
+// Sliding-window CIGAR-density noise tracker (port of pgphase's XidQueue).
+// Each variant event (mismatch=1, insertion=len, deletion=len) is pushed in
+// backbone-coordinate order. Within a window of `win` backbone bases, if the
+// summed event size exceeds `maxS`, the spanned backbone interval is flagged
+// noisy. Contiguous/overlapping noisy spans are merged. The emitted ranges are
+// half-open [begin, end) backbone positions.
+//
+// Differences vs pgphase: no soft-clip handling (ksw2 segments are global, so
+// there are no end clips), and coordinates are uint32_t backbone positions.
+struct KwNoiseTracker {
+    int win;
+    int maxS;
+    // Pending events in the current window: backbone start pos, ref-length, size.
+    vector<uint32_t> pos;
+    vector<uint32_t> len;
+    vector<int> count;
+    size_t front = 0;
+    long total = 0;
+    // Current open noisy span and the queue indices spanning it.
+    long curStart = -1;
+    long curEnd = -1;
+    vector<pair<uint32_t, uint32_t>>& out; // merged noisy ranges [begin,end)
+
+    KwNoiseTracker(int win_, int maxS_, vector<pair<uint32_t, uint32_t>>& out_)
+        : win(win_), maxS(maxS_), out(out_) {}
+
+    // Push one variant event at backbone position p, ref-length l, size c.
+    void observe(uint32_t p, uint32_t l, int c) {
+        pos.push_back(p);
+        len.push_back(l);
+        count.push_back(c);
+        total += c;
+        const size_t rear = pos.size() - 1;
+
+        // Evict events whose ref-end falls before the window's trailing edge.
+        while (front <= rear &&
+               int64_t(pos[front]) + int64_t(len[front]) - 1 <= int64_t(p) - win) {
+            total -= count[front];
+            ++front;
+        }
+
+        if (c <= 0) return;
+        if (total <= maxS) return;
+
+        const long noisyStart = long(pos[front]);
+        const long noisyEnd = long(pos[rear]) + long(len[rear]); // half-open
+
+        if (curStart == -1) {
+            curStart = noisyStart;
+            curEnd = noisyEnd;
+            return;
+        }
+        if (noisyStart <= curEnd) { // overlap/adjacent: extend
+            curEnd = max(curEnd, noisyEnd);
+            return;
+        }
+        // Disjoint: flush previous span, open a new one.
+        out.push_back({uint32_t(curStart), uint32_t(curEnd)});
+        curStart = noisyStart;
+        curEnd = noisyEnd;
+    }
+
+    // Flush the final open span. Call once after all events.
+    void finish() {
+        if (curStart == -1) return;
+        out.push_back({uint32_t(curStart), uint32_t(curEnd)});
+        curStart = -1;
+        curEnd = -1;
+    }
+};
+
 // Per-member outcome: the SNPs it carries, its backbone coverage range, and the
 // backbone positions it DELETES (member has no base there). Deleted positions
 // must not be counted as ref support for a SNP, so they are excluded from
@@ -81,17 +152,25 @@ struct KwMemberProfile {
     uint32_t bbCovEnd = 0;
     // Sorted, non-overlapping [begin, end) backbone ranges deleted by this read.
     vector<pair<uint32_t, uint32_t>> deletionRanges;
+    // Sorted, non-overlapping [begin, end) backbone ranges flagged noisy by the
+    // CIGAR-density filter (too many mismatch/indel events locally). A read's
+    // SNP votes inside these ranges are not trusted.
+    vector<pair<uint32_t, uint32_t>> noisyRanges;
 
-    // True if backbone position pos falls inside a deletion in this read.
-    bool isDeleted(uint32_t pos) const {
-        auto it = upper_bound(deletionRanges.begin(), deletionRanges.end(), pos,
+    static bool inRanges(const vector<pair<uint32_t, uint32_t>>& ranges, uint32_t pos) {
+        auto it = upper_bound(ranges.begin(), ranges.end(), pos,
             [](uint32_t p, const pair<uint32_t, uint32_t>& r) { return p < r.first; });
-        if (it != deletionRanges.begin()) {
+        if (it != ranges.begin()) {
             --it;
             if (pos >= it->first && pos < it->second) return true;
         }
         return false;
     }
+
+    // True if backbone position pos falls inside a deletion in this read.
+    bool isDeleted(uint32_t pos) const { return inRanges(deletionRanges, pos); }
+    // True if backbone position pos falls inside a noisy region in this read.
+    bool isNoisy(uint32_t pos) const { return inRanges(noisyRanges, pos); }
 };
 
 } // anonymous namespace
@@ -103,7 +182,9 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
     AnchorWindow& window,
     const Shasta2Anchors& anchors,
     const Shasta2Journeys& journeys,
-    const AlignOptions& alignOptions) const
+    const AlignOptions& alignOptions,
+    int noisyRegSlideWin,
+    int noisyRegMaxXgaps) const
 {
     const Reads& rds = getReads();
     const auto& mkrs = *markers;
@@ -161,7 +242,8 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
         uint32_t bbSegBegin, uint32_t bbSegLen,
         uint32_t cSegBegin, uint32_t cSegLen,
         vector<KwSnp>& outSnps,
-        vector<pair<uint32_t, uint32_t>>& outDels)
+        vector<pair<uint32_t, uint32_t>>& outDels,
+        KwNoiseTracker& noise)
     {
         if (bbSegLen == 0 || cSegLen == 0) return;
 
@@ -206,13 +288,22 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
                         const uint8_t bb = bbSeqVec[bbPos];
                         if (cb != bb && cb < 4 && bb < 4) {
                             outSnps.push_back(KwSnp{bbPos, cb});
+                            // Mismatch: 1 variant base at this backbone position.
+                            noise.observe(bbPos, 1, 1);
                         }
                     }
                     qpos += len;
                     tpos += len;
                 } else if (op == 1) { // I: insertion in member, no backbone column
+                    // Insertion: counts toward local noise density (size = len),
+                    // anchored at the current backbone position, ref-length 0.
+                    // No SNP/indel variant emitted.
+                    noise.observe(tpos, 0, int(len));
                     qpos += len;
                 } else if (op == 2) { // D: deletion in member, advances backbone
+                    // Deletion: counts toward local noise density (size = len)
+                    // over the deleted backbone span.
+                    noise.observe(tpos, len, int(len));
                     // Record the deleted backbone span (clamped to the window)
                     // so these positions are not miscounted as ref support.
                     const uint32_t db = max(tpos, windowBbBegin);
@@ -268,6 +359,11 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
         prof.bbCovBegin = max(pins.front().bbPos, windowBbBegin);
         prof.bbCovEnd = min(pins.back().bbPos + uint32_t(k), windowBbEnd);
 
+        // Per-read CIGAR-density noise tracker. Events from all segments are fed
+        // in increasing backbone-position order (pins are sorted), so the
+        // sliding window over backbone coordinates is well-formed.
+        KwNoiseTracker noise(noisyRegSlideWin, noisyRegMaxXgaps, prof.noisyRanges);
+
         // Align the gap between each consecutive pin pair.
         for (size_t pi = 0; pi + 1 < pins.size(); pi++) {
             const Pin& left = pins[pi];
@@ -285,7 +381,25 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
             alignSegment(cOid,
                 bbSegBegin, bbSegEnd - bbSegBegin,
                 cSegBegin, cSegEnd - cSegBegin,
-                prof.snps, prof.deletionRanges);
+                prof.snps, prof.deletionRanges, noise);
+        }
+        noise.finish();
+
+        // noisyRanges are emitted already sorted and merged by the tracker,
+        // but adjacent spans flushed separately can still touch; merge them so
+        // isNoisy()'s binary search over non-overlapping ranges is correct.
+        if (!prof.noisyRanges.empty()) {
+            sort(prof.noisyRanges.begin(), prof.noisyRanges.end());
+            vector<pair<uint32_t, uint32_t>> merged;
+            merged.reserve(prof.noisyRanges.size());
+            for (const auto& r : prof.noisyRanges) {
+                if (!merged.empty() && r.first <= merged.back().second) {
+                    merged.back().second = max(merged.back().second, r.second);
+                } else {
+                    merged.push_back(r);
+                }
+            }
+            prof.noisyRanges = move(merged);
         }
 
         // Sort and merge deletion ranges so isDeleted() (binary search over
@@ -320,6 +434,9 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
     for (const auto& prof : profiles) {
         const bool isFwd = (prof.oid.getStrand() == 0);
         for (const KwSnp& s : prof.snps) {
+            // A SNP inside this read's locally-noisy region is untrusted
+            // (likely an alignment-error cluster, not a real allele): skip it.
+            if (prof.isNoisy(s.bbPos)) continue;
             auto& acc = snpCounts[snpKey(s.bbPos, s.altBase)];
             if (isFwd) acc.fwd++; else acc.rev++;
             acc.total++;
@@ -377,14 +494,17 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
         if (spanning == 0) continue;
 
         // Effective spanning: exclude members that DELETE this backbone position
-        // (they have no base here, so they are neither ref nor alt). The
-        // backbone is never deleted, so it stays counted.
-        uint32_t delCount = 0;
+        // (no base here) or are locally NOISY here (their base is untrusted, so
+        // they are counted as neither ref nor alt). The backbone is never
+        // deleted/noisy, so it stays counted.
+        uint32_t excludedCount = 0;
         for (const auto& prof : profiles) {
-            if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.isDeleted(pos))
-                delCount++;
+            if (pos < prof.bbCovBegin || pos >= prof.bbCovEnd) continue;
+            if (prof.isDeleted(pos) || prof.isNoisy(pos))
+                excludedCount++;
         }
-        const uint32_t effSpanning = (spanning > delCount) ? spanning - delCount : 0;
+        const uint32_t effSpanning =
+            (spanning > excludedCount) ? spanning - excludedCount : 0;
         if (effSpanning == 0) continue;
 
         for (uint8_t alt = 0; alt < 4; alt++) {
@@ -425,9 +545,14 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
         }
     }
 
+    uint32_t readsWithNoise = 0;
+    for (const auto& prof : profiles)
+        if (!prof.noisyRanges.empty()) readsWithNoise++;
+
     cout << "    ksw2DetectSnps bb=" << bbOid
          << " window=[" << windowBbBegin << "," << windowBbEnd << ")"
          << " reads=" << profiles.size()
+         << " readsWithNoise=" << readsWithNoise
          << " snpPositions=" << snpPositions.size()
          << " passAltSupport=" << passAltSupport
          << " failRefSupport=" << failRefSupport
@@ -455,8 +580,10 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
         for (const auto& prof : profiles) {
             if (passingSnps[i].pos < prof.bbCovBegin ||
                 passingSnps[i].pos >= prof.bbCovEnd) continue;
-            // A read that deletes this position has no base here: neither ref nor alt.
+            // A read that deletes this position has no base here, and a read
+            // that is locally noisy here has an untrusted base: neither ref nor alt.
             if (prof.isDeleted(passingSnps[i].pos)) continue;
+            if (prof.isNoisy(passingSnps[i].pos)) continue;
 
             bool hasThisAlt = false;
             bool hasOtherAlt = false;

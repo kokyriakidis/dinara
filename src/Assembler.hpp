@@ -3931,11 +3931,18 @@ public:
     // affine) alignment of each member's inter-anchor segments against the
     // backbone. Self-contained: uses persisted shared-anchor pins, so it works
     // for transitive members and needs no global alignment table. SNPs only.
+    // noisyRegSlideWin / noisyRegMaxXgaps control the per-read CIGAR-density
+    // noise filter (pgphase-style): within a window of noisyRegSlideWin backbone
+    // bases, if the summed mismatch+indel size exceeds noisyRegMaxXgaps the span
+    // is flagged noisy and its SNP votes are excluded. Tune per read technology
+    // (HiFi ~100/5, ONT ~25/5).
     uint32_t ksw2DetectSnpsInWindow(
         AnchorWindow& window,
         const Shasta2Anchors& anchors,
         const Shasta2Journeys& journeys,
-        const AlignOptions& alignOptions) const;
+        const AlignOptions& alignOptions,
+        int noisyRegSlideWin = 100,
+        int noisyRegMaxXgaps = 5) const;
 
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.

@@ -1176,10 +1176,15 @@ void dinara::main::assemble(
         const auto tSnp0 = steady_clock::now();
         uint64_t hetWindows = 0;
         uint64_t totalSnps = 0;
+        // CIGAR-density noise filter window/threshold. HiFi defaults (100/5);
+        // for ONT use a tighter window (~25/5). Tune per read technology.
+        constexpr int noisyRegSlideWin = 100;
+        constexpr int noisyRegMaxXgaps = 5;
         for(AnchorWindow& window : anchorWindows) {
             window.cleanHetSnpCount = assembler.ksw2DetectSnpsInWindow(
                 window, *shasta2Anchors, *shasta2Journeys,
-                assemblerOptions.alignOptions);
+                assemblerOptions.alignOptions,
+                noisyRegSlideWin, noisyRegMaxXgaps);
             if(window.cleanHetSnpCount > 0) {
                 hetWindows++;
                 totalSnps += window.cleanHetSnpCount;
@@ -1193,6 +1198,34 @@ void dinara::main::assemble(
              << " totalCleanHetSnps=" << totalSnps
              << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
              << std::defaultfloat << endl;
+
+        // Persist all called het sites so detection quality can be inspected.
+        // One row per (window, site): backbone read, backbone position, ref/alt
+        // base, coverage, and the number of reads supporting each allele.
+        {
+            const string fileName = "window_het_sites.tsv";
+            ofstream hetOut(fileName);
+            hetOut << "windowId\tbackboneOrientedReadId\tbbPos"
+                      "\trefBase\taltBase\trefCov\taltCov\tspanning"
+                      "\tnRefReads\tnAltReads\n";
+            const char baseChars[5] = {'A', 'C', 'G', 'T', 'N'};
+            for(const AnchorWindow& window : anchorWindows) {
+                for(const auto& hs : window.hetSnps) {
+                    hetOut << window.windowId
+                           << '\t' << window.backboneOrientedReadId
+                           << '\t' << hs.bbPos
+                           << '\t' << baseChars[hs.refBase < 5 ? hs.refBase : 4]
+                           << '\t' << baseChars[hs.altBase < 5 ? hs.altBase : 4]
+                           << '\t' << hs.refCov
+                           << '\t' << hs.altCov
+                           << '\t' << hs.spanning
+                           << '\t' << hs.refReads.size()
+                           << '\t' << hs.altReads.size()
+                           << '\n';
+                }
+            }
+            cout << timestamp << "Wrote het sites to " << fileName << "." << endl;
+        }
     }
 
     // CIGAR-based het SNP detection (alternative). Reuses pairwise CIGARs from
