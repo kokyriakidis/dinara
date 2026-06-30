@@ -3964,11 +3964,19 @@ public:
         vector<AnchorWindow>& anchorWindows,
         uint64_t threadCount);
 
-    // Test the multi-segment TheseusMSA on one anchor window.
+    // Test the multi-segment TheseusMSA per anchor window (all reads per window).
     void testMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         const vector<AnchorWindow>& anchorWindows);
+
+    // Build one multi-segment Theseus MSA for a single anchor window using all
+    // oriented reads sharing >=2 of the window's backbone anchors. Writes the
+    // window's MSA (FASTA) and POA graph (GFA). Returns true if produced.
+    bool runOneWindowMultiSegmentMSA(
+        const shared_ptr<Shasta2Anchors>& shasta2Anchors,
+        const shared_ptr<Shasta2Journeys>& shasta2Journeys,
+        const AnchorWindow& window);
 
     // Build a single multi-segment Theseus MSA for one focal read using
     // all its direct overlaps from alignmentTable. Evaluates feasibility

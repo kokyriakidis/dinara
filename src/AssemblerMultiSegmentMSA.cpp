@@ -66,21 +66,21 @@ string extractSegmentSequence(
 } // anonymous namespace
 
 
-void Assembler::testMultiSegmentMSA(
+// Build one multi-segment Theseus MSA for a single anchor window using all
+// oriented reads that share at least two of the window's backbone anchors.
+// Returns true if an MSA was produced (FASTA + GFA written), false if the
+// window was skipped (too few anchors, empty segment, etc.).
+// Defined as a member helper below; declared static-like via the Assembler
+// method so it can reuse member accessors.
+bool Assembler::runOneWindowMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-    const vector<AnchorWindow>& anchorWindows)
+    const AnchorWindow& window)
 {
     const Reads& readsRef = getReads();
     const auto& markersRef = *markers;
     const uint64_t k = assemblerInfo->k;
 
-    if(anchorWindows.empty()) {
-        cout << "testMultiSegmentMSA: no windows." << endl;
-        return;
-    }
-
-    const AnchorWindow& window = anchorWindows.front();
     const OrientedReadId backboneOid = window.backboneOrientedReadId;
     const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
@@ -102,6 +102,10 @@ void Assembler::testMultiSegmentMSA(
 
     // Build backbone segments: one segment between each pair of consecutive anchors.
     const uint32_t nBackboneAnchors = window.backboneEnd - window.backboneBegin;
+    if(nBackboneAnchors < 2) {
+        cout << "  window " << window.windowId << " has < 2 anchors, skipping." << endl;
+        return false;
+    }
     const uint32_t nSegments = nBackboneAnchors - 1;
 
     vector<string> segmentStrings;
@@ -123,7 +127,7 @@ void Assembler::testMultiSegmentMSA(
         if(seg.empty()) {
             cout << "  segment " << i << " is empty (ordinals " << leftOrdinal
                  << "->" << rightOrdinal << "), skipping window." << endl;
-            return;
+            return false;
         }
         segmentStrings.push_back(std::move(seg));
     }
@@ -143,7 +147,7 @@ void Assembler::testMultiSegmentMSA(
 
     // Create the multi-segment MSA.
     theseus::Penalties penalties(0, 2, 3, 1);
-    theseus::Heuristics heuristics(false, false);
+    theseus::Heuristics heuristics;   // defaults: density_drop=off, lag_pruning=off
     vector<theseus::Graph::NodeId> nodeIds;
     theseus::TheseusMSA aligner(penalties, heuristics, segmentViews, nodeIds, 1);
 
@@ -359,6 +363,21 @@ void Assembler::testMultiSegmentMSA(
 
     cout << "  aligned " << alignedReads << " reads (" << alignedSegments << " segments), skipped " << skippedReads << endl;
 
+    // Invariant: every read interval in the window is accounted for as exactly
+    // one of: the backbone (the reference, not aligned to itself), an aligned
+    // read (>=2 shared anchors, produced >=1 segment), or a skipped read
+    // (<2 shared anchors, no inter-anchor segment to align).
+    {
+        const uint64_t accounted = 1ULL + alignedReads + skippedReads; // +1 backbone
+        const uint64_t total = window.readIntervals.size();
+        if(accounted != total) {
+            cout << "  WARNING: read accounting mismatch: backbone(1) + aligned("
+                 << alignedReads << ") + skipped(" << skippedReads << ") = "
+                 << accounted << " != readIntervals(" << total << ")" << endl;
+        }
+        DINARA_ASSERT(accounted == total);
+    }
+
     // Report timing by quartile (reads are already in longest-first order).
     if(perReadTime.size() >= 4) {
         size_t q = perReadTime.size() / 4;
@@ -391,7 +410,10 @@ void Assembler::testMultiSegmentMSA(
     {
         const string msaPath = "testMultiSegmentMSA_window" + to_string(window.windowId) + ".fasta";
         ofstream msaFile(msaPath);
-        aligner.print_as_msa(msaFile, readSeqId - 1, &msaSeqNames);
+        // include_consensus = false: we only want the aligned input rows
+        // (backbone + reads), not the majority-voting consensus row.
+        aligner.print_as_msa(msaFile, readSeqId - 1, &msaSeqNames,
+            /* include_consensus = */ false);
         cout << "  MSA written to " << msaPath << endl;
     }
     {
@@ -400,4 +422,50 @@ void Assembler::testMultiSegmentMSA(
         aligner.print_as_gfa(gfaFile);
         cout << "  GFA written to " << gfaPath << endl;
     }
+    return true;
+}
+
+
+// Driver: build a per-window all-reads multi-segment MSA for each anchor window.
+// For each window it constructs one TheseusMSA seeded by the backbone read and
+// aligns every read that shares >=2 of the window's anchors (ends-free), then
+// writes the window's MSA (FASTA) and POA graph (GFA).
+//
+// The number of windows processed is capped by the DINARA_MSA_MAX_WINDOWS
+// environment variable (default: 1) to keep the test tractable; set it to 0 to
+// process all windows.
+void Assembler::testMultiSegmentMSA(
+    const shared_ptr<Shasta2Anchors>& shasta2Anchors,
+    const shared_ptr<Shasta2Journeys>& shasta2Journeys,
+    const vector<AnchorWindow>& anchorWindows)
+{
+    if(anchorWindows.empty()) {
+        cout << "testMultiSegmentMSA: no windows." << endl;
+        return;
+    }
+
+    uint64_t maxWindows = 1;
+    if(const char* env = getenv("DINARA_MSA_MAX_WINDOWS")) {
+        maxWindows = strtoull(env, nullptr, 10);  // 0 = all windows
+    }
+
+    cout << "testMultiSegmentMSA: " << anchorWindows.size() << " windows available";
+    if(maxWindows == 0) {
+        cout << ", processing all." << endl;
+    } else {
+        cout << ", processing up to " << maxWindows << " (set DINARA_MSA_MAX_WINDOWS=0 for all)." << endl;
+    }
+
+    uint64_t processed = 0;
+    uint64_t produced = 0;
+    for(const AnchorWindow& window : anchorWindows) {
+        if(maxWindows != 0 && processed >= maxWindows) break;
+        processed++;
+        if(runOneWindowMultiSegmentMSA(shasta2Anchors, shasta2Journeys, window)) {
+            produced++;
+        }
+    }
+
+    cout << "testMultiSegmentMSA: produced MSA for " << produced
+         << " of " << processed << " processed windows." << endl;
 }

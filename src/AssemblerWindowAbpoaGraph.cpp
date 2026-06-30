@@ -2,6 +2,32 @@
 //
 // Per-window, per-segment (inter-anchor) abPOA MSA construction.
 //
+// DESIGN NOTE — abPOA stays base-level; anchors are pins, not nodes.
+//   abPOA is a Partial Order Alignment library: every graph node is exactly one
+//   residue (one base). There is no mode in which a node holds a k=50 anchor
+//   k-mer; the DP, the row-column msa_base matrix, and the consensus all assume
+//   residue-level nodes. So the backbone is seeded as its whole BASE sequence
+//   (one node per base, node id = bbPos + 2), NOT as anchor nodes.
+//
+//   The k=50 anchors are used only as PINS: AnchorPin{backbonePos, readOrdinal}
+//   defines where each member's inter-anchor segment is DP-aligned against the
+//   base-level backbone subgraph (abpoa_align_sequence_to_subgraph with a node
+//   range). They constrain placement; they never become graph content.
+//
+//   This base resolution is a requirement, not a limitation: het sites and the
+//   2-base allele anchors minted from this MSA are SUB-anchor features (a single
+//   SNP lives inside one 50-base anchor's span). An anchor-node graph — which is
+//   what Shasta2AnchorGraph already provides for assembly topology — is blind to
+//   that signal by construction. The correct hybrid is:
+//       anchor graph (k=50, topology)  --pins-->  per-window abPOA (base-level)
+//   resolving fine structure between anchors, from which finer 2-base allele
+//   anchors are derived and handed back to the anchor-graph world.
+//
+//   Performance: per-base backbone is cheap here. Seeding an empty graph adds
+//   nodes with no DP, and each member segment's DP is bounded by the small
+//   inter-anchor gap — so base-level costs no more DP than an anchor-level band.
+
+//
 // For each anchor window we build ONE abPOA graph:
 //   1. Seed the graph with the backbone read's base sequence spanning the
 //      window's backbone anchors. The backbone is sequence 0 (the spine);

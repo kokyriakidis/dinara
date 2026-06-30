@@ -878,17 +878,17 @@ def installShasta2():
 
 
 def installTheseusLib():
-    # Upstream theseus-lib, pericles branch — the same source shasta2 itself
-    # uses (see shasta2/scripts/BuildTheseus.py). This provides the API that
-    # shasta2's theseusWrapper.cpp expects: default Heuristics() and the 6-arg
-    # align(seq, weight, reverse, ends_free, density_drop, lag_pruning).
+    # kokyriakidis fork of theseus-lib, pericles branch. The fork is a SUPERSET
+    # of upstream: it keeps the API shasta2's theseusWrapper.cpp expects
+    # (default Heuristics() and the 6-arg align) AND adds the fork-only API that
+    # dinara's MSA code uses (align_from + the multi-segment TheseusMSA ctor).
+    # Using the fork therefore satisfies both shasta2 and dinara from a single
+    # install, so dinara's multi-segment MSA sources can stay enabled.
     #
-    # We deliberately do NOT use the kokyriakidis fork: its tip diverged
-    # (removed the default Heuristics ctor and the 6-arg align), which broke the
-    # shasta2 build. dinara's own theseus code relied on fork-only features
-    # (align_from + multi-segment constructor); that code is now disabled (its
-    # source files are excluded from the build), so upstream is sufficient.
-    print("Installing theseus-lib (albertjimenezbl upstream, pericles branch)...")
+    # The fork emits GFA segment names as numeric node ids directly from
+    # TheseusAlignerImpl::print_as_gfa_internal, so the legacy graph.h GFA
+    # name patch upstream needed is not required here.
+    print("Installing theseus-lib (kokyriakidis fork, pericles branch)...")
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building theseus-lib using temporary directory", temporaryDirectory)
@@ -896,94 +896,16 @@ def installTheseusLib():
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
 
-        # Clone the upstream pericles branch, then pin to an exact commit
-        # for reproducible builds.
+        # Clone the fork's pericles branch, then pin to an exact commit
+        # for reproducible builds. The repository is public, so no
+        # authentication is required.
         runCommand(
             "git clone -b pericles "
-            "https://github.com/albertjimenezbl/theseus-lib.git"
+            "https://github.com/kokyriakidis/theseus-lib-multi-segment.git "
+            "theseus-lib"
         )
         os.chdir("theseus-lib")
-        runCommand("git checkout 1654decead209bf7ae852a2895e6d0e1ecc0de35")
-
-        # Legacy main-branch layout put print_as_gfa in graph.h with empty vtx.name
-        # for POA graphs. Pericles emits GFA segment names as numeric node ids from
-        # TheseusAlignerImpl::print_as_gfa_internal (no patch needed).
-        legacyGraphH = "theseus/graph.h"
-        includeGraphH = "include/theseus/graph.h"
-        if os.path.isfile(legacyGraphH):
-            graphH = legacyGraphH
-        elif os.path.isfile(includeGraphH):
-            graphH = includeGraphH
-        else:
-            graphH = None
-
-        if graphH is None:
-            print("Warning: theseus graph.h not found; skipping GFA patch.")
-        else:
-            with open(graphH, "r", encoding="utf-8") as f:
-                src = f.read()
-
-            old_gfa = (
-                "            // Print all nodes as segments\n"
-                "            for (const auto &vtx : _vertices)\n"
-                "            {\n"
-                "                gfa_output << \"S\\t\" << vtx.name << \"\\t\" << vtx.value << \"\\n\";\n"
-                "            }\n"
-                "\n"
-                "            // Print all edges as links\n"
-                "            for (const auto &vtx : _vertices)\n"
-                "            {\n"
-                "                // Go through all incoming vertices (with this you cover all possible edges,\n"
-                "                // since the graph is directed)\n"
-                "                for (const auto &edge : vtx.in_edges)\n"
-                "                {\n"
-                "                    gfa_output << \"L\\t\" << _vertices[edge.from_vertex].name << \"\\t+\\t\"\n"
-                "                        << vtx.name << \"\\t+\\t\"\n"
-                "                        << edge.overlap << \"M\\n\";\n"
-                "                }\n"
-                "            }"
-            )
-            new_gfa = (
-                "            // Build a per-vertex name: use the stored name if present,\n"
-                "            // otherwise fall back to the 1-based vertex index.\n"
-                "            // (POA-built graphs never set vtx.name, so it is always empty.)\n"
-                "            auto vtx_name = [&](size_t idx) -> std::string {\n"
-                "                return _vertices[idx].name.empty()\n"
-                "                    ? std::to_string(idx + 1)\n"
-                "                    : _vertices[idx].name;\n"
-                "            };\n"
-                "\n"
-                "            // Print all nodes as segments (skip empty sentinel nodes)\n"
-                "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
-                "            {\n"
-                "                if (_vertices[i].value.empty()) continue;\n"
-                "                gfa_output << \"S\\t\" << vtx_name(i) << \"\\t\" << _vertices[i].value << \"\\n\";\n"
-                "            }\n"
-                "\n"
-                "            // Print all edges as links (skip any link touching an empty sentinel)\n"
-                "            for (size_t i = 0; i < _vertices.size(); ++i)\n"
-                "            {\n"
-                "                if (_vertices[i].value.empty()) continue;\n"
-                "                for (const auto &edge : _vertices[i].in_edges)\n"
-                "                {\n"
-                "                    if (_vertices[edge.from_vertex].value.empty()) continue;\n"
-                "                    gfa_output << \"L\\t\" << vtx_name(edge.from_vertex) << \"\\t+\\t\"\n"
-                "                        << vtx_name(i) << \"\\t+\\t\"\n"
-                "                        << edge.overlap << \"M\\n\";\n"
-                "                }\n"
-                "            }"
-            )
-            if old_gfa not in src:
-                if graphH == legacyGraphH:
-                    print(
-                        "Warning: could not apply theseus GFA patch "
-                        "(legacy graph.h layout changed). Continuing anyway."
-                    )
-            else:
-                src = src.replace(old_gfa, new_gfa)
-                with open(graphH, "w", encoding="utf-8") as f:
-                    f.write(src)
-                print("Applied theseus GFA name patch.")
+        runCommand("git checkout 95a539f8a6e108a3989454c77eb2c7f729bdfb6a")
 
         # Build and install static library into DINARA_BUILD_DIR
         os.mkdir("build")

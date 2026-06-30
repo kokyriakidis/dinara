@@ -47,7 +47,19 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
+# AssemblerMultiSegmentMSA.cpp re-enabled: per-window all-reads Theseus MSA test.
+# Uses the fork theseus API (align_from, multi-segment ctor) installed in
+# ~/.dinaraBuild. See testMultiSegmentMSA / runOneWindowMultiSegmentMSA.
+#
+# AssemblerShasta2Anchors.cpp excluded: it is the only translation unit that
+# calls into the real shasta2 library (shasta2::Anchors/AnchorGraph/AssemblyGraph
+# /Journeys/Markers/MarkerKmers/Options). Its entry points (createShasta2Anchors)
+# are already unused (all call sites commented out). Excluding it lets dinara
+# build without linking libshasta2. dinara's own ported Shasta2* classes
+# (src/Shasta2*.hpp) and the header-only shasta2 templates used by
+# Shasta2RestrictedAnchorGraph remain; the latter's only link dependency,
+# shasta2::handleFailedAssertion, is provided locally by src/Shasta2Assert.cpp.
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerShasta2Anchors\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
@@ -92,21 +104,17 @@ if(NOT ABPOA_LIB)
     message(FATAL_ERROR "abpoa library not found. Please install it.")
 endif()
 
-# Find shasta2 library
-find_library(SHASTA2_LIB shasta2)
-if(NOT SHASTA2_LIB)
-    message(FATAL_ERROR "shasta2 library not found. Please install it.")
-endif()
+# shasta2 is intentionally NOT linked. dinara uses its own ported Shasta2*
+# classes (src/Shasta2*.hpp) plus header-only shasta2 templates; the only
+# translation unit that called into libshasta2 (AssemblerShasta2Anchors.cpp)
+# is excluded from the build above.
 
-# Find theseus library. Still linked because shasta2 depends on its symbols,
-# but dinara's own theseus code is DISABLED: we do NOT define DINARA_HAVE_THESEUS.
-# dinara's theseus usage relied on fork-only APIs (align_from, multi-segment
-# constructor) incompatible with the upstream theseus that shasta2 requires.
-# Guarded files (AssemblerSvAnchors, AssemblerMSAHetSites) compile to throw/no-op
-# stubs; unguarded theseus files are excluded from the build above.
+# Find theseus library (the kokyriakidis fork). dinara's per-window MSA code
+# (AssemblerMultiSegmentMSA.cpp) uses the fork-only API: align_from and the
+# multi-segment TheseusMSA constructor.
 find_library(THESEUS_LIB theseus)
 if(THESEUS_LIB)
-    message(STATUS "theseus found (linked for shasta2; dinara theseus code disabled).")
+    message(STATUS "theseus found (fork API used by AssemblerMultiSegmentMSA).")
 else()
     message(WARNING "theseus library not found. Run InstallPrerequisites.")
     set(THESEUS_LIB "")
@@ -131,7 +139,7 @@ if(APPLE)
         dinara_snarls
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
-        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB})
+        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB})
 else()
     # For arcane reasons, statically linking with the pthread
     # library on Linux requires "--whole-archive".
@@ -142,7 +150,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
@@ -150,7 +158,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
     endif(X86_64)
 endif()
   

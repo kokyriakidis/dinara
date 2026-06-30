@@ -1165,6 +1165,17 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow);
 
+    // Per-window all-reads Theseus MSA test (uses fork theseus API installed in
+    // ~/.dinaraBuild). Builds one multi-segment MSA per anchor window from all
+    // oriented reads sharing the window's anchors, writing FASTA + GFA per window.
+    // Number of windows capped by env DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
+    assembler.testMultiSegmentMSA(
+        assembler.shasta2Anchors,
+        assembler.shasta2Journeys,
+        anchorWindows);
+
+    return;
+
     // ksw2-based het SNP detection per window. Aligns each member's
     // inter-anchor segments against the backbone with banded 2-piece affine
     // ksw2, using the persisted shared-anchor pins. Self-contained per window
@@ -2189,13 +2200,8 @@ void dinara::main::assemble(
     assembler.testAnchorWindowsCleanLongestRead(threadCount,
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage);
 
-    // Theseus disabled: testMultiSegmentMSA and computeTheseusReadWindowMSAPrototype
-    // are defined in source files excluded from the build (they use fork-only
-    // theseus APIs). Calls stubbed out until theseus usage is reworked.
-    // assembler.testMultiSegmentMSA(
-    //     assembler.shasta2Anchors,
-    //     assembler.shasta2Journeys,
-    //     anchorWindows);
+    // (testMultiSegmentMSA is invoked earlier, right after anchor windows are
+    // built, since this code path returns before reaching here.)
     // assembler.computeTheseusReadWindowMSAPrototype(
     //     assembler.shasta2Anchors,
     //     assembler.shasta2Journeys,
