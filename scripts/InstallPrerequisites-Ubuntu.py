@@ -905,7 +905,7 @@ def installTheseusLib():
             "theseus-lib"
         )
         os.chdir("theseus-lib")
-        runCommand("git checkout 95a539f8a6e108a3989454c77eb2c7f729bdfb6a")
+        runCommand("git checkout 13a4321937b9bf36314c114c066efb13fa1d4dbc")
 
         # Build and install static library into DINARA_BUILD_DIR
         os.mkdir("build")

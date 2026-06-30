@@ -292,6 +292,49 @@ bool Assembler::runOneWindowMultiSegmentMSA(
     uint32_t maxAlignSeg = 0;
     size_t totalAlignBases = 0;
 
+    // Whole-span mode: align the entire read sequence (from its first shared
+    // anchor to its last shared anchor) to the backbone in a SINGLE align_from
+    // call, instead of one align_from per consecutive anchor pair. This is for
+    // timing comparison against the per-segment approach. Enable with
+    //   DINARA_MSA_WHOLE_SPAN=1
+    const bool wholeSpan = [](){
+        const char* e = getenv("DINARA_MSA_WHOLE_SPAN");
+        return e && e[0] == '1';
+    }();
+    cout << "  alignment mode: "
+         << (wholeSpan ? "WHOLE-SPAN (1 align_from/read)"
+                       : "PER-SEGMENT (1 align_from/anchor-pair)") << endl;
+
+    // Endpoint mode for the per-segment progressive POA fold.
+    //
+    // We build ONE shared backbone graph and fold each read piece into it
+    // progressively (add_alignment_poa mutates the graph each call). Each piece
+    // is pinned on the LEFT by custom_start_node = nodeIds[prevBoundary]. For
+    // the terminal we use ends-free (is_ends_free=true), which completes as soon
+    // as the read piece is consumed (offset == seq.size()). This ALWAYS
+    // terminates and is fast, and because each piece is short the right side
+    // cannot drift far from its anchor.
+    //
+    // The alternative end-to-end terminal (is_ends_free=false) requires the
+    // wavefront to land exactly on the interior _end_node with the query fully
+    // consumed. The fork's heuristics are off, so there is no max-score cap; if
+    // that exact coincidence is never hit (common when the piece spans an indel
+    // near the right anchor, or spans non-adjacent anchors), the alignment loop
+    // never terminates. Ends-free avoids this entirely. Set DINARA_MSA_END2END=1
+    // only for diagnostics; expect hangs on non-trivial windows.
+    const bool endsFree = [](){
+        const char* e = getenv("DINARA_MSA_END2END");
+        return !(e && e[0] == '1');   // default true (ends-free)
+    }();
+    cout << "  endpoint mode: "
+         << (endsFree ? "ENDS-FREE (left-pinned, query-consumed terminal)"
+                      : "END-TO-END (interior end node enforced; may hang)") << endl;
+
+    // Alignment status tally (theseus_status from each align_from).
+    uint64_t alnCompleted = 0;   // THESEUS_STATUS_ALG_COMPLETED (0)
+    uint64_t alnPartial   = 0;   // THESEUS_STATUS_ALG_PARTIAL (1)
+    uint64_t alnFailed    = 0;   // anything else (negative / max-steps)
+
     vector<double> perReadTime;  // per-read timing
     int readSeqId = 1;  // 0 is the backbone
     vector<string> msaSeqNames;
@@ -305,9 +348,91 @@ bool Assembler::runOneWindowMultiSegmentMSA(
 
         uint32_t readSegments = 0;
         double readTime = 0.0;
+
+        if(wholeSpan) {
+            // Align the read's entire span (first shared anchor -> last shared
+            // anchor) in a single align_from call. Start/end nodes are the same
+            // as the per-segment path would use for the first and last pieces:
+            //   start = nodeIds[firstBoundary], end = nodeIds[lastBoundary-1].
+            const uint32_t firstBoundary = hits.front().boundaryIndex;
+            const uint32_t lastBoundary  = hits.back().boundaryIndex;
+            const uint32_t firstOrdinal  = hits.front().ordinal;
+            const uint32_t lastOrdinal   = hits.back().ordinal;
+
+            if(lastBoundary > firstBoundary &&
+               firstBoundary < nodeIds.size() &&
+               lastOrdinal > firstOrdinal) {
+
+                string readSeq = extractSegmentSequence(
+                    readsRef, markersRef, k, oid, firstOrdinal, lastOrdinal);
+                if(!readSeq.empty()) {
+                    const uint32_t endSegment = lastBoundary - 1;
+                    const int endNode = static_cast<int>(nodeIds[endSegment]);
+
+                    auto t0 = chrono::steady_clock::now();
+                    auto alignment = aligner.align_from(
+                        readSeq,
+                        nodeIds[firstBoundary],
+                        1,        // weight
+                        endsFree, // is_ends_free
+                        0,        // start_offset
+                        endNode,
+                        readSeqId);
+                    auto t1 = chrono::steady_clock::now();
+                    double elapsed = chrono::duration<double>(t1 - t0).count();
+                    if(alignment.theseus_status == 0) alnCompleted++;
+                    else if(alignment.theseus_status == 1) alnPartial++;
+                    else alnFailed++;
+                    totalAlignTime += elapsed;
+                    readTime += elapsed;
+                    totalAlignBases += readSeq.size();
+                    if(elapsed > maxAlignTime) {
+                        maxAlignTime = elapsed;
+                        maxAlignSeg = alignedSegments;
+                    }
+                    readSegments++;
+                    alignedSegments++;
+                    if(elapsed > 0.1) {
+                        cout << "  SLOW: read " << oid
+                             << " span anchors [" << firstBoundary << ","
+                             << lastBoundary << "] seq " << readSeq.size()
+                             << " bases took " << elapsed << "s" << endl;
+                    }
+                }
+            }
+
+            if(readSegments > 0) {
+                msaSeqNames.push_back(to_string(oid.getValue()));
+                msaSeqIds.push_back(oid.getValue());
+                perReadTime.push_back(readTime);
+                alignedReads++;
+                readSeqId++;
+            }
+            continue;
+        }
+
         for(size_t hi = 0; hi + 1 < hits.size(); hi++) {
             const uint32_t prevBoundary = hits[hi].boundaryIndex;
             const uint32_t nextBoundary = hits[hi + 1].boundaryIndex;
+
+            // boundaryIndex is an ANCHOR index (0..nSegments). nodeIds is
+            // SEGMENT-indexed (nodeIds.size() == nSegments; nodeIds[s] is the
+            // node holding segment s, the sequence between anchor s and anchor
+            // s+1), chained
+            //   source -> seg0 -> seg1 -> ... -> seg(nSegments-1) -> sink.
+            //
+            // A read spanning anchor prevBoundary -> nextBoundary covers
+            // backbone segments [prevBoundary, nextBoundary-1], so it aligns
+            // from segment node nodeIds[prevBoundary] to segment node
+            // nodeIds[nextBoundary-1] (the LAST segment before the right
+            // anchor). The previous code passed nodeIds[nextBoundary] as the
+            // end node: for interior reads this overshot the end by one segment
+            // (harmless under is_ends_free, but it needlessly enlarged the
+            // align_from subgraph scope and perturbed the optimal path), and
+            // for nextBoundary==nSegments it was out of range and fell back to
+            // the sink node. Ending at nodeIds[nextBoundary-1] is the exact end
+            // segment in both cases (for the tail read this node feeds directly
+            // into the sink, so it is equivalent to the old sink fallback).
             if(nextBoundary <= prevBoundary || prevBoundary >= nodeIds.size()) continue;
 
             const uint32_t prevOrdinal = hits[hi].ordinal;
@@ -318,21 +443,24 @@ bool Assembler::runOneWindowMultiSegmentMSA(
                 readsRef, markersRef, k, oid, prevOrdinal, nextOrdinal);
             if(readSeq.empty()) continue;
 
-            int endNode = (nextBoundary < nodeIds.size())
-                ? static_cast<int>(nodeIds[nextBoundary])
-                : -1;
+            // End at the last segment node before the right anchor.
+            const uint32_t endSegment = nextBoundary - 1;  // >= prevBoundary, < nodeIds.size()
+            const int endNode = static_cast<int>(nodeIds[endSegment]);
 
             auto t0 = chrono::steady_clock::now();
             auto alignment = aligner.align_from(
                 readSeq,
                 nodeIds[prevBoundary],
-                1,     // weight
-                true,  // is_ends_free
-                0,     // start_offset
+                1,        // weight
+                endsFree, // is_ends_free
+                0,        // start_offset
                 endNode,
                 readSeqId);
             auto t1 = chrono::steady_clock::now();
             double elapsed = chrono::duration<double>(t1 - t0).count();
+            if(alignment.theseus_status == 0) alnCompleted++;
+            else if(alignment.theseus_status == 1) alnPartial++;
+            else alnFailed++;
             totalAlignTime += elapsed;
             readTime += elapsed;
             totalAlignBases += readSeq.size();
@@ -390,6 +518,9 @@ bool Assembler::runOneWindowMultiSegmentMSA(
                  << "): " << sum << "s total, " << (sum / (end - start) * 1000) << "ms/read" << endl;
         }
     }
+    cout << "  align status: completed=" << alnCompleted
+         << " partial=" << alnPartial
+         << " failed=" << alnFailed << endl;
     cout << "  total align time: " << totalAlignTime << "s"
          << "  avg: " << (alignedSegments > 0 ? totalAlignTime / alignedSegments * 1000 : 0) << "ms/seg"
          << "  max: " << maxAlignTime << "s (seg#" << maxAlignSeg << ")"
