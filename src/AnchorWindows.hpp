@@ -130,14 +130,40 @@ struct AnchorWindow {
     struct HetBubble {
         uint32_t backboneOffset = 0;
         std::vector<HetAnchor> alleles;   // [0]=ref, rest=alts
-        // Hom separator anchor at commonSucc ([succBase, nextBase]), carrying
-        // all reads spanning the site. When multiple SNP bubbles fall in one
-        // backbone interval they are chained in series and separated by these
-        // hom anchors: ... -> {alleles} -> hom -> {next alleles} -> ...
-        // The hom anchor for the LAST bubble in an interval connects to the
-        // succeeding backbone anchor. Empty members => no hom available.
-        uint32_t succBackboneOffset = 0;
+        // The bubble is bracketed by two hom anchors carrying all reads
+        // spanning the site (both alleles reconverge at each flank, and the
+        // flank-linearity test guarantees both flanks are linear):
+        //   leadHom  = [predPrevBase, predBase] at predPrev  (LEFT bracket)
+        //   hom      = [succBase, nextBase]     at commonSucc (RIGHT bracket)
+        // A backbone interval that contains the bubble is wired as:
+        //   bbA_i -> leadHom -> {alleles} -> hom -> bbA_{i+1}
+        // and multiple contained bubbles chain as:
+        //   bbA_i -> leadHom_0 -> {alleles_0} -> hom_0 -> leadHom_1 ->
+        //            {alleles_1} -> hom_1 -> ... -> bbA_{i+1}
+        // Connecting the backbone anchors to homs (not directly to allele arms)
+        // keeps every backbone-touching edge on the backbone read, so no arm
+        // edge is dropped for an empty k=50/k=2 read intersection.
+        // Empty members => that hom is unavailable.
+        uint32_t predPrevBackboneOffset = 0;   // backbone offset of leadHom
+        HetAnchor leadHom;
+        uint32_t succBackboneOffset = 0;       // backbone offset of hom
         HetAnchor hom;
+
+        // Transient planning fields, set by the intra-window edge planner (a
+        // pre-pass over the windows) and consumed by the append + staging
+        // passes so they agree on exactly which anchors get created and wired.
+        // This avoids appending an anchor that is never wired (which would leave
+        // an isolated vertex) and vice versa.
+        //   plannedInterval    : index i of the backbone interval [bbA_i, bbA_{i+1})
+        //                        that strictly contains this bubble's flank span,
+        //                        or -1 if no interval contains it (bubble dropped).
+        //   isFirstInInterval  : true for the leftmost contained bubble in an
+        //                        interval. Only this bubble contributes its
+        //                        leadHom (the left bracket). For every other
+        //                        bubble the preceding bubble's trailing hom is
+        //                        the single shared separator.
+        int32_t plannedInterval = -1;
+        bool isFirstInInterval = false;
     };
     std::vector<HetBubble> hetBubbles;
 
