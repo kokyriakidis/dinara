@@ -130,6 +130,14 @@ struct AnchorWindow {
     struct HetBubble {
         uint32_t backboneOffset = 0;
         std::vector<HetAnchor> alleles;   // [0]=ref, rest=alts
+        // Hom separator anchor at commonSucc ([succBase, nextBase]), carrying
+        // all reads spanning the site. When multiple SNP bubbles fall in one
+        // backbone interval they are chained in series and separated by these
+        // hom anchors: ... -> {alleles} -> hom -> {next alleles} -> ...
+        // The hom anchor for the LAST bubble in an interval connects to the
+        // succeeding backbone anchor. Empty members => no hom available.
+        uint32_t succBackboneOffset = 0;
+        HetAnchor hom;
     };
     std::vector<HetBubble> hetBubbles;
 

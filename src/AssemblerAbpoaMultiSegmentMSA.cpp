@@ -100,6 +100,16 @@ struct WindowSnp {
     // include reads whose predecessor position was recoverable from the POA.
     vector<HetAlleleMember> refMembers;
     vector<HetAlleleMember> altMembers;
+
+    // Hom-separator anchor members: reads at commonSucc (rawPosition = succ base
+    // position), forming the k=2 hom anchor [succBase, nextBase]. The
+    // flank-linearity test guarantees commonSucc->succNext is linear, so this
+    // 2-mer is shared by ALL reads spanning the site (both alleles reconverge
+    // here). Used to separate consecutive SNPs chained in the same backbone
+    // interval. succBackboneOffset is the backbone offset of commonSucc.
+    int succBackboneOffset = -1;
+    uint8_t succBase = 0;   // base at commonSucc (0-3)
+    vector<HetAlleleMember> homMembers;
 };
 
 // popcount over a read_ids bitset of `nWords` uint64 words.
@@ -241,6 +251,32 @@ vector<WindowSnp> detectWindowSnps(
             if(src < 0 || src >= nodeN || !isAllele[src]) { tangled = true; break; }
         }
         if(tangled) continue;
+
+        // Flank-linearity test. Require the two bases flanking the bubble to be
+        // unambiguous (homozygous) so the k=2 het/hom anchors are well-founded:
+        //   - the predecessor's own predecessor (predPrev) exists, connects ONLY
+        //     to commonPred, and commonPred has a single in-edge. This makes the
+        //     het anchor 2-mer [predBase, alleleBase] shared by all reads on the
+        //     allele (predBase is linear).
+        //   - the successor's own successor (succNext) exists, receives ONLY from
+        //     commonSucc, and commonSucc has a single out-edge. This makes the
+        //     hom separator 2-mer [succBase, nextBase] shared by all reads
+        //     (succBase->nextBase is linear), guaranteeing a clean separator can
+        //     be built between this SNP and the next one in the interval.
+        // Together these also force >=2 linear bases between any two accepted
+        // SNPs, so accepted bubbles are never adjacent and always chainable with
+        // a hom in between. SRC(0)/SINK(1) are not valid flanks.
+        if(commonPred < 2 || commonSucc < 2) continue;
+        if(predNode.in_edge_n != 1) continue;
+        const int predPrev = predNode.in_id[0];
+        if(predPrev < 2 || predPrev >= nodeN) continue;
+        if(abg->node[predPrev].out_edge_n != 1) continue;
+        if(abg->node[predPrev].out_id[0] != commonPred) continue;
+        if(succNode.out_edge_n != 1) continue;
+        const int succNext = succNode.out_id[0];
+        if(succNext < 2 || succNext >= nodeN) continue;
+        if(abg->node[succNext].in_edge_n != 1) continue;
+        if(abg->node[succNext].in_id[0] != commonSucc) continue;
 
         // Distinct non-gap bases (POA nodes always carry a real base 0-3).
         // Identify the backbone (reference) allele within the group.
@@ -394,16 +430,20 @@ vector<WindowSnp> detectWindowSnps(
         // (the k=2 marker's rawPosition = predBase position). Reads whose
         // predecessor position is not recoverable from the POA are skipped
         // (they still count in support; they just can't seed an anchor member).
-        auto mapMembers = [&](const vector<int>& seqIds, vector<HetAlleleMember>& out) {
+        auto mapMembersAt = [&](const vector<int>& seqIds, int atNode,
+                                vector<HetAlleleMember>& out) {
             out.clear();
             for(int sid : seqIds) {
                 if(sid < 0 || sid >= static_cast<int>(seqIdToOrientedRead.size())) continue;
                 if(sid >= static_cast<int>(seqIdNodeToReadPos.size())) continue;
                 const auto& nodeMap = seqIdNodeToReadPos[sid];
-                const auto it = nodeMap.find(commonPred);
-                if(it == nodeMap.end()) continue;  // predecessor pos not recoverable
+                const auto it = nodeMap.find(atNode);
+                if(it == nodeMap.end()) continue;  // position not recoverable
                 out.push_back({seqIdToOrientedRead[sid], it->second});
             }
+        };
+        auto mapMembers = [&](const vector<int>& seqIds, vector<HetAlleleMember>& out) {
+            mapMembersAt(seqIds, commonPred, out);
         };
 
         // Emit one biallelic record per distinct alt allele. Each is gated on
@@ -430,6 +470,19 @@ vector<WindowSnp> detectWindowSnps(
             mapReads(alt.seqIds, snp.altReads);
             mapMembers(refSeqIds, snp.refMembers);
             mapMembers(alt.seqIds, snp.altMembers);
+
+            // Hom-separator anchor at commonSucc: [succBase, nextBase]. All
+            // reads spanning the site (ref + this alt) reconverge here, so
+            // recover each one's position at commonSucc. rawPosition = succ base
+            // position; the flank-linearity test guarantees the next base is
+            // linear, so [succBase, nextBase] is shared by all these reads.
+            snp.succBackboneOffset = nodeToBackboneOffset[commonSucc];
+            snp.succBase = abg->node[commonSucc].base;
+            {
+                vector<int> homSeqIds = refSeqIds;
+                homSeqIds.insert(homSeqIds.end(), alt.seqIds.begin(), alt.seqIds.end());
+                mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
+            }
             snps.push_back(std::move(snp));
         }
     }
@@ -1029,6 +1082,26 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 
             bubble.alleles.push_back(std::move(refAnchor));
             bubble.alleles.push_back(std::move(altAnchor));
+
+            // Hom separator anchor [succBase, nextBase] at commonSucc. predBase
+            // of the hom is succBase (the base shared by all reads at
+            // commonSucc); alleleBase is the linear next base. Members are all
+            // spanning reads. Used to chain/separate consecutive SNPs.
+            if(snp.succBackboneOffset >= 0 && !snp.homMembers.empty()) {
+                bubble.succBackboneOffset = static_cast<uint32_t>(snp.succBackboneOffset);
+                AnchorWindow::HetAnchor homAnchor;
+                homAnchor.backboneOffset = bubble.succBackboneOffset;
+                homAnchor.predBase = snp.succBase;
+                // nextBase is the backbone base right after commonSucc.
+                homAnchor.alleleBase =
+                    (snp.succBackboneOffset + 1 < static_cast<int>(backboneCodes.size()))
+                    ? backboneCodes[snp.succBackboneOffset + 1] : 0;
+                homAnchor.isRef = true;
+                for(const HetAlleleMember& m : snp.homMembers)
+                    homAnchor.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.hom = std::move(homAnchor);
+            }
+
             window.hetBubbles.push_back(std::move(bubble));
         }
         cout << "  staged het bubbles: " << window.hetBubbles.size() << endl;
