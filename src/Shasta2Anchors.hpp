@@ -163,6 +163,24 @@ public:
     }
     uint64_t writeExternalAnchors(const string& name, bool canonicalOnly = true) const;
 
+    // Append a k=2 het anchor and its reverse complement to the store, returning
+    // the canonical (even) anchor id; the RC is at id+1. Members are (read,
+    // rawPosition) where rawPosition is the read base position of the first base
+    // of the 2-base marker [predBase, alleleBase], in the oriented read's own
+    // coordinate frame. The stored midpoint position follows the k-store
+    // convention (rawPosition + k/2) so writeExternalAnchors recovers the true
+    // raw position; shasta2 re-derives a 2-base k-mer from it. Must be called in
+    // a serial pass AFTER all window processing (it grows the store and thus
+    // invalidates any outstanding anchor spans). The first call records
+    // hetAnchorFirstId so the export can skip the k=50 k-mer consistency check
+    // for het anchors (their members agree on only 2 bases by design).
+    Shasta2AnchorId appendHetAnchorPair(
+        const vector<std::pair<OrientedReadId, uint32_t>>& members);
+
+    // First anchor id that is a k=2 het anchor (invalid if none). All ids >=
+    // this are het anchors, appended contiguously after the primary anchors.
+    Shasta2AnchorId hetAnchorFirstId = invalid<Shasta2AnchorId>;
+
 
     // Read composition analysis.
     uint64_t countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId anchorId1) const;

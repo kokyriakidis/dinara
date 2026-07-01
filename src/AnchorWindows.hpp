@@ -102,6 +102,37 @@ struct AnchorWindow {
     };
     std::vector<HetSnp> hetSnps;
 
+    // Staged het-anchor descriptors from per-window abPOA SNP detection.
+    // Each allele of a clean SNP bubble becomes one k=2 anchor: its members are
+    // the reads on that allele, each pinned at rawPosition (the read's base
+    // position at the bubble's common predecessor). shasta2 re-derives the
+    // 2-base k-mer [predBase, alleleBase] from rawPosition, so all members of
+    // one allele share the same 2 bases and the two alleles differ in the
+    // second base (forming the bubble). Anchor IDs are assigned in a later
+    // serial pass that appends them to the primary anchor store.
+    struct HetAnchorMember {
+        OrientedReadId orientedReadId;
+        uint32_t rawPosition;   // read base position at commonPred (predBase)
+    };
+    struct HetAnchor {
+        uint32_t backboneOffset = 0;   // backbone base offset of the SNP column
+        uint8_t predBase = 0;          // common predecessor base (0-3)
+        uint8_t alleleBase = 0;        // this allele's base (0-3)
+        bool isRef = false;            // true = backbone/reference allele
+        std::vector<HetAnchorMember> members;
+        // Assigned in the post-window append pass (invalid until then).
+        Shasta2AnchorId anchorId = std::numeric_limits<Shasta2AnchorId>::max();
+    };
+    // Grouped per SNP: [0] = ref allele anchor, [1..] = alt allele anchor(s).
+    // The predecessor/successor backbone anchors that flank each bubble are the
+    // window backbone anchors nearest to backboneOffset; resolved when the
+    // anchor graph bubble edges are built.
+    struct HetBubble {
+        uint32_t backboneOffset = 0;
+        std::vector<HetAnchor> alleles;   // [0]=ref, rest=alts
+    };
+    std::vector<HetBubble> hetBubbles;
+
     // Per-read haplotype assignment from k-means phasing.
     // hap: 0 = unassigned, 1 = haplotype 1 (cis with backbone), 2 = haplotype 2 (trans).
     struct ReadHaplotype {

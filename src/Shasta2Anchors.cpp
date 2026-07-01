@@ -419,16 +419,25 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             continue;
         }
 
+        // Het anchors (k=2) are grouped by only 2 shared bases, so their
+        // members' k=50 k-mers legitimately differ. Skip the k=50 consistency
+        // check for them; shasta2 re-derives a 2-base k-mer from rawPosition.
+        const bool isHetAnchor =
+            (hetAnchorFirstId != invalid<Shasta2AnchorId>) &&
+            (anchorId >= hetAnchorFirstId);
+
         const Kmer expectedKmer = getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
         vector<ReadId> readIds;
         readIds.reserve(anchor.size());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
-            const Kmer kmerValue = getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
-            if(kmerValue != expectedKmer) {
-                throw runtime_error(
-                    "Shasta2 external-anchor export failed: anchor " +
-                    shasta2AnchorIdToString(anchorId) +
-                    " contains inconsistent marker k-mers.");
+            if(!isHetAnchor) {
+                const Kmer kmerValue = getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
+                if(kmerValue != expectedKmer) {
+                    throw runtime_error(
+                        "Shasta2 external-anchor export failed: anchor " +
+                        shasta2AnchorIdToString(anchorId) +
+                        " contains inconsistent marker k-mers.");
+                }
             }
 
             const ReadId readId = markerInfo.orientedReadId.getReadId();
@@ -443,15 +452,90 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
+        // Het anchors store their position with the het marker half-length
+        // (hetK/2 = 1); primary anchors use the store's k/2. Recover rawPosition
+        // with the matching half-length so the exported first-base position is
+        // correct for both.
+        const uint32_t halfForRaw = isHetAnchor ? 1u : uint32_t(k / 2);
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
             // External anchors store the raw position (first base of k-mer).
-            const uint32_t rawPosition = markerInfo.position - uint32_t(k / 2);
+            const uint32_t rawPosition = markerInfo.position - halfForRaw;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
     }
 
     return exportedCount;
+}
+
+
+Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
+    const vector<std::pair<OrientedReadId, uint32_t>>& members)
+{
+    // Marker length of a het anchor (k=2). shasta2 re-derives [predBase,
+    // alleleBase] from rawPosition; only 2 bases are meaningful.
+    constexpr uint32_t hetK = 2;
+    constexpr uint32_t hetKHalf = hetK / 2;   // = 1
+
+    // Record where het anchors begin so the export can bypass the k=50 k-mer
+    // consistency check for them AND use hetK/2 (not k/2) when recovering the
+    // raw position.
+    if(hetAnchorFirstId == invalid<Shasta2AnchorId>) {
+        hetAnchorFirstId = size();
+    }
+
+    // Build the canonical (forward) member list. Store the midpoint position
+    // using the het marker's own half-length (hetK/2 = 1), NOT the store's k/2.
+    // This keeps the het anchor's position properly ordered between its flanking
+    // backbone anchors in the anchor graph (a k/2=25 offset would push it past
+    // nearby anchors and create spurious backward edges). writeExternalAnchors
+    // recovers rawPosition via (position - hetK/2) for het anchors.
+    // ordinal/positionInJourney are not meaningful for a k=2 het anchor and are
+    // left invalid.
+    vector<Shasta2AnchorMarkerInfo> fwd;
+    fwd.reserve(members.size());
+    for(const auto& [orientedReadId, rawPosition] : members) {
+        Shasta2AnchorMarkerInfo info;
+        info.orientedReadId = orientedReadId;
+        info.position = rawPosition + hetKHalf;
+        fwd.push_back(info);
+    }
+    std::sort(fwd.begin(), fwd.end());
+
+    // Build the reverse-complement member list: flip strand and mirror the raw
+    // position to the opposite strand's coordinate frame, then re-apply the
+    // store's midpoint convention. For a k=2 marker at rawPosition on strand s,
+    // the RC raw position on strand s^1 is readLen - rawPosition - hetK.
+    vector<Shasta2AnchorMarkerInfo> rc;
+    rc.reserve(members.size());
+    for(const auto& [orientedReadId, rawPosition] : members) {
+        OrientedReadId rcOid = orientedReadId;
+        rcOid.flipStrand();
+        const uint64_t readLen =
+            reads.getReadRawSequenceLength(orientedReadId.getReadId());
+        const uint32_t rcRaw =
+            uint32_t(readLen) - rawPosition - hetK;
+        Shasta2AnchorMarkerInfo info;
+        info.orientedReadId = rcOid;
+        info.position = rcRaw + hetKHalf;
+        rc.push_back(info);
+    }
+    std::sort(rc.begin(), rc.end());
+
+    // Append canonical (even id) then RC (odd id), preserving the store's
+    // 2i/2i+1 pairing. append() pushes to the end of the last vector, so
+    // forward iteration keeps the already-sorted ascending OrientedReadId order.
+    const Shasta2AnchorId canonicalId = size();
+    anchorMarkerInfos.appendVector();
+    for(const auto& info : fwd) {
+        anchorMarkerInfos.append(info);
+    }
+    anchorMarkerInfos.appendVector();
+    for(const auto& info : rc) {
+        anchorMarkerInfos.append(info);
+    }
+
+    return canonicalId;
 }
 
 

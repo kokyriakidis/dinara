@@ -14,6 +14,7 @@
 
 #include "Assembler.hpp"
 #include "AnchorWindows.hpp"
+#include "PhasingKmeansTypes.hpp"  // kmIsHomopolymer (homopolymer/STR context)
 #include "Reads.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2Journeys.hpp"
@@ -68,6 +69,382 @@ vector<uint8_t> extractSegmentCodes(
     return codes;
 }
 
+// One member of a het-anchor allele: an oriented read plus the base position
+// (in that read's own strand-0/strand coordinates) at the bubble's common
+// predecessor node. This is the rawPosition of the k=2 het anchor marker
+// [predBase, alleleBase]: shasta2 re-derives the 2-base k-mer from this
+// position, so all members of one allele share the same 2 bases and members of
+// different alleles differ in the second base (the bubble).
+struct HetAlleleMember {
+    OrientedReadId orientedReadId;
+    uint32_t rawPosition;             // read base position at commonPred (predBase)
+};
+
+// A detected clean biallelic SNP in a window POA graph.
+struct WindowSnp {
+    int msaRank = -1;                 // MSA column (topological rank) of the bubble
+    int backboneOffset = -1;          // backbone base offset (into backboneCodes), -1 if backbone gaps here
+    char refBase = 'N';               // backbone (reference) allele
+    char altBase = 'N';               // alternate allele
+    int refSupport = 0;               // reads carrying refBase
+    int altSupport = 0;               // reads carrying altBase
+    int delSupport = 0;               // reads carrying a coexisting deletion (skip edge)
+    int spanning = 0;                 // reads spanning the column (VAF denominator)
+    double vaf = 0.0;                  // altSupport / spanning (this alt allele)
+    int nAltAlleles = 1;              // # of distinct alt bases at this column (>1 = multiallelic)
+    bool inHomopolymerOrRepeat = false; // backbone context is a homopolymer/STR run
+    vector<OrientedReadId> refReads;  // reads on the reference allele (phasing)
+    vector<OrientedReadId> altReads;  // reads on the alternate allele (phasing)
+    // Het-anchor members (read + rawPosition at commonPred) for the two
+    // alleles. Parallel to refReads/altReads in the reads they cover, but only
+    // include reads whose predecessor position was recoverable from the POA.
+    vector<HetAlleleMember> refMembers;
+    vector<HetAlleleMember> altMembers;
+};
+
+// popcount over a read_ids bitset of `nWords` uint64 words.
+inline int bitsetPopcount(const uint64_t* words, int nWords) {
+    int c = 0;
+    for(int w = 0; w < nWords; w++) c += __builtin_popcountll(words[w]);
+    return c;
+}
+
+// Collect the read ids set in a bitset as a list of abPOA seq ids.
+inline void bitsetToSeqIds(const uint64_t* words, int nWords, vector<int>& out) {
+    out.clear();
+    for(int w = 0; w < nWords; w++) {
+        uint64_t bits = words[w];
+        while(bits) {
+            const int b = __builtin_ctzll(bits);
+            out.push_back(w * 64 + b);
+            bits &= bits - 1;
+        }
+    }
+}
+
+// abPOA base code (0-3) -> ASCII. Anything else -> 'N'.
+inline char codeToChar(uint8_t c) {
+    static const char lut[4] = {'A', 'C', 'G', 'T'};
+    return (c < 4) ? lut[c] : 'N';
+}
+
+// Detect clean biallelic SNP bubbles in a finished window POA graph.
+//
+// A clean SNP bubble is a set of aligned nodes (X plus X.aligned_node_id[])
+// that occupy the same MSA column but carry different bases, where every allele
+// node has exactly one in-edge and one out-edge, and all allele nodes share a
+// single common predecessor and a single common successor. This is the classic
+// substitution bubble: one source -> {allele nodes} -> one sink.
+//
+// The backbone (read id 0) allele is the reference. Support for each allele is
+// the popcount of the reads passing through the allele node (its out-edge
+// read_ids). Per-allele read sets are mapped back to OrientedReadIds through
+// seqIdToOrientedRead for downstream phasing.
+//
+// Filters: distinct non-gap bases, backbone present in the bubble, alt support
+// >= minSupport, and VAF >= minVaf (VAF = altSupport / (refSupport+altSupport)).
+vector<WindowSnp> detectWindowSnps(
+    abpoa_t* ab,
+    const vector<int>& backboneQposToNode,
+    const vector<uint8_t>& backboneCodes,
+    const vector<OrientedReadId>& seqIdToOrientedRead,
+    const vector<unordered_map<int, uint32_t>>& seqIdNodeToReadPos,
+    int minSupport,
+    double minVaf,
+    bool dropRepeatContext)
+{
+    vector<WindowSnp> snps;
+    int droppedRepeat = 0;  // SNPs suppressed by homopolymer/STR context
+    const abpoa_graph_t* abg = ab->abg;
+    if(abg == nullptr || abg->node == nullptr) {
+        return snps;
+    }
+    const int nodeN = abg->node_n;
+    const int backboneLen = static_cast<int>(backboneCodes.size());
+
+    // Reverse map: backbone node id -> backbone base offset. Node ids are dense
+    // and small; use a flat vector sized to nodeN.
+    vector<int> nodeToBackboneOffset(nodeN, -1);
+    for(int off = 0; off < backboneLen; off++) {
+        const int nid = backboneQposToNode[off];
+        if(nid >= 0 && nid < nodeN) {
+            nodeToBackboneOffset[nid] = off;
+        }
+    }
+
+    vector<char> visited(nodeN, 0);
+    vector<int> tmpSeqIds;
+
+    for(int nid = 0; nid < nodeN; nid++) {
+        if(nid == ABPOA_SRC_NODE_ID || nid == ABPOA_SINK_NODE_ID) continue;
+        if(visited[nid]) continue;
+
+        const abpoa_node_t& node = abg->node[nid];
+
+        // Gather the allele group: this node plus its aligned nodes.
+        vector<int> group;
+        group.push_back(nid);
+        for(int a = 0; a < node.aligned_node_n; a++) {
+            group.push_back(node.aligned_node_id[a]);
+        }
+        // Mark the whole group visited regardless of outcome.
+        for(int g : group) if(g >= 0 && g < nodeN) visited[g] = 1;
+
+        if(group.size() < 2) continue;  // no variation at this column
+
+        // Bubble test: every allele node has exactly one in-edge and one
+        // out-edge, and all alleles share a single common predecessor and a
+        // single common successor. A coexisting DELETION is allowed: it appears
+        // as a skip edge pred->succ (no node), which does not disturb the allele
+        // nodes. It is NOT a disqualifier -- the ref/alt substitution is still a
+        // real SNP; the deletion reads are simply another allele that must be
+        // counted into the spanning depth so VAF is not inflated.
+        bool clean = true;
+        int commonPred = -1, commonSucc = -1;
+        for(int g : group) {
+            if(g < 0 || g >= nodeN) { clean = false; break; }
+            const abpoa_node_t& an = abg->node[g];
+            if(an.in_edge_n != 1 || an.out_edge_n != 1) { clean = false; break; }
+            const int pred = an.in_id[0];
+            const int succ = an.out_id[0];
+            if(commonPred == -1) { commonPred = pred; commonSucc = succ; }
+            else if(pred != commonPred || succ != commonSucc) { clean = false; break; }
+        }
+        if(!clean) continue;
+
+        // Purity test: the ONLY paths through the bubble may be the allele nodes
+        // plus at most one deletion skip edge (pred->succ). Any predecessor
+        // out-edge or successor in-edge that lands somewhere else means the
+        // bubble is genuinely tangled (branch hub, overlapping indel), which we
+        // do not report as a SNP. Build the allowed-neighbour set once.
+        vector<char> isAllele(nodeN, 0);
+        for(int g : group) isAllele[g] = 1;
+        const abpoa_node_t& predNode = abg->node[commonPred];
+        const abpoa_node_t& succNode = abg->node[commonSucc];
+
+        // Deletion support = reads on the pred->succ skip edge (if present).
+        int delSupport = 0;
+        bool tangled = false;
+        for(int e = 0; e < predNode.out_edge_n; e++) {
+            const int tgt = predNode.out_id[e];
+            if(tgt == commonSucc) {
+                if(predNode.read_ids != nullptr && predNode.read_ids[e] != nullptr)
+                    delSupport = bitsetPopcount(predNode.read_ids[e], predNode.read_ids_n);
+            } else if(tgt < 0 || tgt >= nodeN || !isAllele[tgt]) {
+                tangled = true; break;  // pred branches outside the bubble
+            }
+        }
+        if(tangled) continue;
+        for(int e = 0; e < succNode.in_edge_n; e++) {
+            const int src = succNode.in_id[e];
+            if(src == commonPred) continue;               // deletion skip edge
+            if(src < 0 || src >= nodeN || !isAllele[src]) { tangled = true; break; }
+        }
+        if(tangled) continue;
+
+        // Distinct non-gap bases (POA nodes always carry a real base 0-3).
+        // Identify the backbone (reference) allele within the group.
+        int refNode = -1;
+        for(int g : group) {
+            if(nodeToBackboneOffset[g] != -1) { refNode = g; break; }
+        }
+        if(refNode == -1) continue;  // backbone not in bubble -> not a ref SNP
+
+        const uint8_t refCode = abg->node[refNode].base;
+
+        // Per-allele support = popcount of the allele node's out-edge read_ids.
+        // With out_edge_n==1 there is exactly one bitset per allele node.
+        auto alleleSupport = [&](int g, vector<int>& seqIdsOut) -> int {
+            const abpoa_node_t& an = abg->node[g];
+            if(an.out_edge_n < 1 || an.read_ids == nullptr || an.read_ids[0] == nullptr) {
+                seqIdsOut.clear();
+                return 0;
+            }
+            bitsetToSeqIds(an.read_ids[0], an.read_ids_n, seqIdsOut);
+            return static_cast<int>(seqIdsOut.size());
+        };
+
+        vector<int> refSeqIds;
+        const int refSupport = alleleSupport(refNode, refSeqIds);
+
+        // Collect EVERY distinct non-reference base allele. A multiallelic site
+        // (ref + 2 alt bases) is emitted as separate biallelic records sharing
+        // the same column and spanning depth, matching how the rest of the
+        // pipeline (KmVarKey, one altBase per record) represents variants. The
+        // total base-allele depth sums all alleles so per-alt VAF is correct.
+        struct AltAllele { int node; uint8_t base; int support; vector<int> seqIds; };
+        vector<AltAllele> alts;
+        int totalAlleleSupport = 0;
+        for(int g : group) {
+            vector<int> seqIds;
+            const int s = alleleSupport(g, seqIds);
+            totalAlleleSupport += s;
+            if(g == refNode) continue;
+            const uint8_t altCode = abg->node[g].base;
+            if(altCode == refCode) continue;  // same base, not a substitution
+            alts.push_back({g, altCode, s, std::move(seqIds)});
+        }
+        if(alts.empty()) continue;  // no distinct alt base
+
+        // Spanning depth folds the deletion reads into the denominator so a
+        // ref/alt/del site reports true VAF, not an inflated one. Shared across
+        // all alt alleles at this column.
+        const int spanning = totalAlleleSupport + delSupport;
+        const int nAltAlleles = static_cast<int>(alts.size());
+
+        // Homopolymer / short-tandem-repeat context of the backbone at this
+        // SNP. kmIsHomopolymer scans repeat units of length 1..6 requiring >=3
+        // copies on either flank, so it covers both homopolymers (unit=1) and
+        // STRs (unit 2..6). backboneCodes is already numeric (0-3), the exact
+        // format the function expects. kmIsRepeatRegion is indel-only and a
+        // no-op for SNPs, so it is intentionally not called here.
+        // Homopolymer/STR context depends only on the backbone position, so it
+        // is the same for every alt allele at this column.
+        const int backboneOff = nodeToBackboneOffset[refNode];
+        KmVarKey vkey;
+        vkey.pos = static_cast<uint32_t>(backboneOff);
+        vkey.type = KmVarType::Snp;
+        vkey.altBase = alts[0].base;
+        vkey.refLen = 1;
+        vkey.altLen = 1;
+        const bool inRepeat = kmIsHomopolymer(
+            backboneCodes.data(),
+            static_cast<uint32_t>(backboneCodes.size()),
+            vkey, /* xid */ 0);
+        if(inRepeat) droppedRepeat++;
+
+        // Verification dump (DINARA_SNP_VERIFY=1): print the backbone context
+        // around each SNP and an INDEPENDENT recomputation of the repeat rule,
+        // flagging any disagreement with kmIsHomopolymer. The independent check
+        // mirrors the documented rule (unit len 1..6, >=3 copies on either
+        // flank) but is written from scratch so a bug in one won't hide in the
+        // other.
+        if(getenv("DINARA_SNP_VERIFY")) {
+            const int n = static_cast<int>(backboneCodes.size());
+            auto at = [&](int p) -> int {
+                return (p >= 0 && p < n) ? int(backboneCodes[p]) : -1;
+            };
+            // Independent repeat test around the SNP at backboneOff.
+            // Forward flank starts at backboneOff+1, backward at backboneOff-1
+            // (SNP base excluded, matching kmIsHomopolymer's startPos/endPos).
+            auto indepRepeat = [&]() -> bool {
+                for(int r = 1; r <= 6; r++) {
+                    // forward: bases [off+1 .. off+r] repeated >=3x
+                    bool fwd = true;
+                    for(int c = 1; c < 3 && fwd; c++)
+                        for(int j = 0; j < r && fwd; j++) {
+                            const int a = at(backboneOff + 1 + j);
+                            const int b = at(backboneOff + 1 + c*r + j);
+                            if(a < 0 || a != b) fwd = false;
+                        }
+                    if(fwd) return true;
+                    // backward: bases [off-1 .. off-r] repeated >=3x
+                    bool bwd = true;
+                    for(int c = 1; c < 3 && bwd; c++)
+                        for(int j = 0; j < r && bwd; j++) {
+                            const int a = at(backboneOff - 1 - j);
+                            const int b = at(backboneOff - 1 - c*r - j);
+                            if(a < 0 || a != b) bwd = false;
+                        }
+                    if(bwd) return true;
+                }
+                return false;
+            };
+            const bool indep = indepRepeat();
+            string ctx;
+            for(int p = backboneOff - 18; p <= backboneOff + 18; p++) {
+                const int b = at(p);
+                char c = (b < 0) ? '.' : codeToChar(uint8_t(b));
+                if(p == backboneOff) { ctx += '['; ctx += c; ctx += ']'; }
+                else ctx += c;
+            }
+            // Bubble purity: how many paths actually enter/leave the bubble.
+            // For a truly biallelic SNP, pred.out_edge_n and succ.in_edge_n
+            // should equal the number of allele nodes. Any excess means an
+            // extra path (typically a deletion skip edge) coexists at this
+            // column, so the site is really multi-allelic.
+            const int nAlleles = static_cast<int>(group.size());
+            const int predOut = abg->node[commonPred].out_edge_n;
+            const int succIn  = abg->node[commonSucc].in_edge_n;
+            const bool extraPath = (predOut > nAlleles) || (succIn > nAlleles);
+            cout << "    VERIFY off=" << backboneOff
+                 << " " << ctx
+                 << " km=" << (inRepeat ? 1 : 0)
+                 << " indep=" << (indep ? 1 : 0)
+                 << " alleles=" << nAlleles
+                 << " predOut=" << predOut
+                 << " succIn=" << succIn
+                 << (extraPath ? "  <<< EXTRA_PATH(del?)" : "")
+                 << (inRepeat != indep ? "  <<< MISMATCH" : "") << endl;
+        }
+
+        if(dropRepeatContext && inRepeat) continue;
+
+        auto mapReads = [&](const vector<int>& seqIds, vector<OrientedReadId>& out) {
+            out.clear();
+            for(int sid : seqIds) {
+                if(sid >= 0 && sid < static_cast<int>(seqIdToOrientedRead.size())) {
+                    out.push_back(seqIdToOrientedRead[sid]);
+                }
+            }
+        };
+
+        // Build het-anchor members for an allele: for each supporting read,
+        // recover its base position at the bubble's common predecessor node
+        // (the k=2 marker's rawPosition = predBase position). Reads whose
+        // predecessor position is not recoverable from the POA are skipped
+        // (they still count in support; they just can't seed an anchor member).
+        auto mapMembers = [&](const vector<int>& seqIds, vector<HetAlleleMember>& out) {
+            out.clear();
+            for(int sid : seqIds) {
+                if(sid < 0 || sid >= static_cast<int>(seqIdToOrientedRead.size())) continue;
+                if(sid >= static_cast<int>(seqIdNodeToReadPos.size())) continue;
+                const auto& nodeMap = seqIdNodeToReadPos[sid];
+                const auto it = nodeMap.find(commonPred);
+                if(it == nodeMap.end()) continue;  // predecessor pos not recoverable
+                out.push_back({seqIdToOrientedRead[sid], it->second});
+            }
+        };
+
+        // Emit one biallelic record per distinct alt allele. Each is gated on
+        // its OWN support/VAF, so a strong alt is kept even if a second weak alt
+        // at the same column is filtered out.
+        for(const AltAllele& alt : alts) {
+            if(alt.support < minSupport) continue;
+            const double vaf = (spanning > 0) ? double(alt.support) / double(spanning) : 0.0;
+            if(vaf < minVaf) continue;
+
+            WindowSnp snp;
+            snp.msaRank = (abg->node_id_to_msa_rank != nullptr) ? abg->node_id_to_msa_rank[refNode] : -1;
+            snp.backboneOffset = backboneOff;
+            snp.inHomopolymerOrRepeat = inRepeat;
+            snp.refBase = codeToChar(refCode);
+            snp.altBase = codeToChar(alt.base);
+            snp.refSupport = refSupport;
+            snp.altSupport = alt.support;
+            snp.delSupport = delSupport;
+            snp.spanning = spanning;
+            snp.vaf = vaf;
+            snp.nAltAlleles = nAltAlleles;
+            mapReads(refSeqIds, snp.refReads);
+            mapReads(alt.seqIds, snp.altReads);
+            mapMembers(refSeqIds, snp.refMembers);
+            mapMembers(alt.seqIds, snp.altMembers);
+            snps.push_back(std::move(snp));
+        }
+    }
+
+    // Report in backbone order; alt records at the same column stay grouped.
+    sort(snps.begin(), snps.end(), [](const WindowSnp& a, const WindowSnp& b) {
+        if(a.backboneOffset != b.backboneOffset) return a.backboneOffset < b.backboneOffset;
+        return a.altBase < b.altBase;
+    });
+    cout << "  homopolymer/STR SNPs "
+         << (dropRepeatContext ? "dropped: " : "flagged: ")
+         << droppedRepeat << endl;
+    return snps;
+}
+
 } // anonymous namespace
 
 
@@ -77,7 +454,7 @@ vector<uint8_t> extractSegmentCodes(
 bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-    const AnchorWindow& window)
+    AnchorWindow& window)
 {
     const Reads& readsRef = getReads();
     const auto& markersRef = *markers;
@@ -324,6 +701,29 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     vector<double> perReadTime;
     int readSeqId = 1;  // 0 is the backbone
 
+    // Map abPOA read id (readSeqId) -> OrientedReadId, for SNP allele phasing.
+    // Index 0 is the backbone; entries 1..alignedReads are filled as reads fold.
+    vector<OrientedReadId> seqIdToOrientedRead;
+    seqIdToOrientedRead.push_back(backboneOid);  // read id 0 = backbone
+
+    // Per-read node->absolute-base-position map, indexed by abPOA read id.
+    // For each read we capture abPOA's qpos_to_node_id (queryPos -> nodeId) and
+    // invert it to nodeId -> (read's absolute base position). This lets het
+    // anchor generation recover, for any read on an allele, the read base
+    // position at the bubble's predecessor node (the k=2 anchor's rawPosition).
+    // seqId 0 = backbone: its node<->offset relation is backboneQposToNode, and
+    // the absolute read position is backboneBeginPos + backbone offset.
+    vector<unordered_map<int, uint32_t>> seqIdNodeToReadPos;
+    seqIdNodeToReadPos.emplace_back();  // seqId 0 = backbone
+    {
+        auto& bbMap = seqIdNodeToReadPos.back();
+        bbMap.reserve(backboneLen);
+        for(int off = 0; off < backboneLen; off++) {
+            const int nid = backboneQposToNode[off];
+            if(nid >= 0) bbMap[nid] = backboneBeginPos + uint32_t(off);
+        }
+    }
+
     // abPOA re-runs a full topological sort of the WHOLE graph on every
     // add_subgraph_alignment. Adding each piece separately therefore costs
     // O(graph_nodes) per piece -> O(graph_nodes * pieces), which dominates
@@ -465,18 +865,33 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             wholeRes.n_cigar = static_cast<int>(whole.size());
             wholeRes.m_cigar = static_cast<int>(whole.size());
             wholeRes.graph_cigar = whole.data();
+            // Capture this read's queryPos -> nodeId map so het anchor
+            // generation can recover the read's base position at any bubble
+            // node. qpos_to_node_id[q] is the node the read's q-th base landed
+            // on (-1 for inserted/unaligned bases).
+            vector<int> qposToNode(qlen, -1);
             auto t0 = chrono::steady_clock::now();
             abpoa_add_subgraph_alignment(
                 ab, abpt,
                 foldBegNode, foldEndNode,
                 readCodes.data(), nullptr, qlen,
-                nullptr, wholeRes,
+                qposToNode.data(), wholeRes,
                 readSeqId, totReadBound, /* inc_both_ends */ 0);
             auto t1 = chrono::steady_clock::now();
             readTime += chrono::duration<double>(t1 - t0).count();
             totalAlignTime += chrono::duration<double>(t1 - t0).count();
 
+            // Invert to nodeId -> absolute read base position (qBegin + q).
+            seqIdNodeToReadPos.emplace_back();
+            auto& nodeMap = seqIdNodeToReadPos.back();
+            nodeMap.reserve(qlen);
+            for(int q = 0; q < qlen; q++) {
+                const int nid = qposToNode[q];
+                if(nid >= 0) nodeMap[nid] = qBegin + uint32_t(q);
+            }
+
             perReadTime.push_back(readTime);
+            seqIdToOrientedRead.push_back(oid);  // read id readSeqId = this read
             alignedReads++;
             readSeqId++;
         }
@@ -543,6 +958,82 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         }
     }
 
+    // ------------------------------------------------------------------
+    // Detect clean SNP bubbles in the finished graph. abpoa_generate_rc_msa
+    // (called above) has populated node_id_to_msa_rank, so columns have ranks.
+    // ------------------------------------------------------------------
+    {
+        const int minSupport = 3;
+        const double minVaf = 0.12;
+        const bool dropRepeatContext = true;  // drop SNPs in homopolymer/STR runs
+        const vector<WindowSnp> snps = detectWindowSnps(
+            ab, backboneQposToNode, backboneCodes, seqIdToOrientedRead,
+            seqIdNodeToReadPos, minSupport, minVaf, dropRepeatContext);
+        cout << "  SNPs detected: " << snps.size()
+             << " (minSupport=" << minSupport << ", minVAF=" << minVaf
+             << ", dropRepeatContext=" << (dropRepeatContext ? "true" : "false")
+             << ")" << endl;
+        for(const WindowSnp& snp : snps) {
+            cout << "    col rank=" << snp.msaRank
+                 << " backboneOff=" << snp.backboneOffset
+                 << " " << snp.refBase << ">" << snp.altBase
+                 << " ref=" << snp.refSupport
+                 << " alt=" << snp.altSupport
+                 << " del=" << snp.delSupport
+                 << " span=" << snp.spanning
+                 << " VAF=" << snp.vaf
+                 << (snp.nAltAlleles > 1 ? " [multi]" : "")
+                 << (snp.delSupport > 0 ? " [+del]" : "")
+                 << (snp.inHomopolymerOrRepeat ? " [repeat]" : "")
+                 << " refMembers=" << snp.refMembers.size()
+                 << " altMembers=" << snp.altMembers.size() << endl;
+        }
+
+        // Stage het-anchor descriptors on the window: one k=2 anchor per allele
+        // (ref + this alt) per SNP record. Members carry rawPosition at the
+        // bubble's common predecessor; predBase is the backbone base there, the
+        // allele base is ref/alt. IDs are assigned in the post-window append
+        // pass. Only stage alleles that have at least one recoverable member.
+        for(const WindowSnp& snp : snps) {
+            if(snp.refMembers.empty() && snp.altMembers.empty()) continue;
+            // predBase: backbone base at (backboneOffset - 1); if the SNP is at
+            // offset 0 there is no predecessor base, so skip (cannot form the
+            // 2-base marker).
+            if(snp.backboneOffset <= 0) continue;
+            const uint8_t predBase = backboneCodes[snp.backboneOffset - 1];
+            const uint8_t refCode = static_cast<uint8_t>(
+                snp.refBase == 'A' ? 0 : snp.refBase == 'C' ? 1 :
+                snp.refBase == 'G' ? 2 : snp.refBase == 'T' ? 3 : 0);
+            const uint8_t altCode = static_cast<uint8_t>(
+                snp.altBase == 'A' ? 0 : snp.altBase == 'C' ? 1 :
+                snp.altBase == 'G' ? 2 : snp.altBase == 'T' ? 3 : 0);
+
+            AnchorWindow::HetBubble bubble;
+            bubble.backboneOffset = static_cast<uint32_t>(snp.backboneOffset);
+
+            AnchorWindow::HetAnchor refAnchor;
+            refAnchor.backboneOffset = bubble.backboneOffset;
+            refAnchor.predBase = predBase;
+            refAnchor.alleleBase = refCode;
+            refAnchor.isRef = true;
+            for(const HetAlleleMember& m : snp.refMembers)
+                refAnchor.members.push_back({m.orientedReadId, m.rawPosition});
+
+            AnchorWindow::HetAnchor altAnchor;
+            altAnchor.backboneOffset = bubble.backboneOffset;
+            altAnchor.predBase = predBase;
+            altAnchor.alleleBase = altCode;
+            altAnchor.isRef = false;
+            for(const HetAlleleMember& m : snp.altMembers)
+                altAnchor.members.push_back({m.orientedReadId, m.rawPosition});
+
+            bubble.alleles.push_back(std::move(refAnchor));
+            bubble.alleles.push_back(std::move(altAnchor));
+            window.hetBubbles.push_back(std::move(bubble));
+        }
+        cout << "  staged het bubbles: " << window.hetBubbles.size() << endl;
+    }
+
     abpoa_free(ab);
     abpoa_free_para(abpt);
     return true;
@@ -555,7 +1046,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 void Assembler::testAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-    const vector<AnchorWindow>& anchorWindows)
+    vector<AnchorWindow>& anchorWindows)
 {
     if(anchorWindows.empty()) {
         cout << "testAbpoaMultiSegmentMSA: no windows." << endl;
@@ -573,7 +1064,7 @@ void Assembler::testAbpoaMultiSegmentMSA(
     else cout << ", processing up to " << maxWindows << "." << endl;
 
     uint64_t processed = 0, produced = 0;
-    for(const AnchorWindow& window : anchorWindows) {
+    for(AnchorWindow& window : anchorWindows) {
         if(maxWindows != 0 && processed >= maxWindows) break;
         processed++;
         if(runOneWindowAbpoaMultiSegmentMSA(shasta2Anchors, shasta2Journeys, window)) {

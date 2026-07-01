@@ -1111,17 +1111,13 @@ void dinara::main::assemble(
         maxAnchorCoverage);
         auto& shasta2Anchors = assembler.shasta2Anchors;
 
+    // External-anchor export is deferred until after per-window MSA het-anchor
+    // generation (testAbpoaMultiSegmentMSA below), so that any anchors created
+    // from detected het sites are included in the exported set. Journeys and
+    // windows are built from shasta2Anchors but do not depend on the export,
+    // so moving the export down is dependency-safe.
     const string externalAnchorsName =
         std::filesystem::absolute("Shasta2ExternalAnchors").string();
-
-    // Write external anchors.
-    cout << timestamp << "Writing Shasta2 external anchors to "
-         << externalAnchorsName << "..." << endl;
-    const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
-    cout << timestamp << "Wrote " << exportedExternalAnchorCount
-         << " external anchors for Shasta2. Use --external-anchors-name "
-         << externalAnchorsName << endl;
 
     // Compute journeys.
     cout << timestamp << "Creating Shasta2Journeys..." << endl;
@@ -1177,6 +1173,80 @@ void dinara::main::assemble(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         anchorWindows);
+
+    // Append staged het anchors (k=2) to the primary anchor store. This is a
+    // serial pass: it grows the memory-mapped store and thus invalidates any
+    // outstanding anchor spans, so it must run after all window processing.
+    // Each allele of each staged bubble becomes one canonical/RC anchor pair;
+    // the assigned canonical id is written back onto the window so the anchor
+    // graph can wire the bubble edges.
+    {
+        cout << timestamp << "Appending het anchors from "
+             << anchorWindows.size() << " windows..." << endl;
+        uint64_t hetAnchorPairs = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            for(auto& bubble : window.hetBubbles) {
+                for(auto& allele : bubble.alleles) {
+                    if(allele.members.empty()) continue;
+                    vector<std::pair<OrientedReadId, uint32_t>> members;
+                    members.reserve(allele.members.size());
+                    for(const auto& m : allele.members) {
+                        members.push_back({m.orientedReadId, m.rawPosition});
+                    }
+                    allele.anchorId =
+                        shasta2Anchors->appendHetAnchorPair(members);
+                    ++hetAnchorPairs;
+                }
+            }
+        }
+        cout << timestamp << "Appended " << hetAnchorPairs
+             << " het anchor pairs (" << (2 * hetAnchorPairs)
+             << " anchors); store now has " << shasta2Anchors->size()
+             << " anchors." << endl;
+    }
+
+    // Write external anchors. Deferred to here (after MSA het-anchor
+    // generation) so newly generated het anchors are part of the exported set.
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
+
+    // Build and export the anchor graph, including het-anchor bubble edges.
+    // computeWindowTransitions fills the per-window transition fields the graph
+    // constructor consumes; the constructor then wires backbone chains,
+    // inter-window edges, and het bubbles. anchorDovetailWindow was populated
+    // above (with the windows). This is the second end product alongside the
+    // exported anchors.
+    {
+        computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
+            &anchorDovetailWindow);
+
+        const uint64_t minInterWindowCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
+        const uint64_t minInterWindowEdgeCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
+
+        cout << timestamp << "Creating Shasta2AnchorGraph (with het bubbles) from "
+             << anchorWindows.size() << " anchor windows..." << endl;
+        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            anchorWindows,
+            minInterWindowCoverage,
+            minInterWindowEdgeCoverage,
+            threadCount,
+            &assembler.getReads(),
+            nullptr, // bypassEdges
+            nullptr, // detourWindowPairs
+            &anchorDovetailWindow);
+        assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
+        assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
+        cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
+    }
 
     return;
 

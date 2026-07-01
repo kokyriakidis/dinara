@@ -347,6 +347,119 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         }
     }
 
+    // Het-anchor bubble edges. Each staged het bubble adds, per allele, the two
+    // edges predBackboneAnchor -> alleleAnchor -> succBackboneAnchor (plus RC
+    // mirrors), turning the k=2 het anchors into bubbles between the flanking
+    // backbone anchors. The flanking pair is the consecutive backbone anchor
+    // pair whose midpoint offsets bracket the bubble's backboneOffset. Anchor
+    // midpoint offset = Shasta2AnchorMarkerInfo.position(anchorId, backboneOid)
+    // - backboneBeginPos; backboneBeginPos is the first-base position of the
+    // window's first backbone anchor marker.
+    uint64_t hetBubbleEdgesAdded = 0;
+    for(const AnchorWindow& window : anchorWindows) {
+        if(window.hetBubbles.empty()) continue;
+        const OrientedReadId backboneOid = window.backboneOrientedReadId;
+        const auto backboneJourney = journeys[backboneOid];
+
+        // Ordered backbone anchors + their midpoint base offsets.
+        vector<Shasta2AnchorId> bbAnchors;
+        const auto& positions = window.filteredBackbonePositions;
+        if(!positions.empty()) {
+            for(const uint32_t pos : positions)
+                bbAnchors.push_back(backboneJourney[pos]);
+        } else {
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++)
+                bbAnchors.push_back(backboneJourney[pos]);
+        }
+        if(bbAnchors.size() < 2) continue;
+
+        // First-base position of the first backbone anchor's marker == the
+        // origin of window backbone base offsets (backboneBeginPos).
+        const uint32_t backboneBeginPos =
+            anchors.getPosition(bbAnchors.front(), backboneOid) - uint32_t(anchors.k / 2);
+
+        // Midpoint base offset of each backbone anchor, relative to backboneBeginPos.
+        vector<uint32_t> bbOffset(bbAnchors.size());
+        for(size_t i = 0; i < bbAnchors.size(); i++) {
+            bbOffset[i] = anchors.getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
+        }
+
+        for(const auto& bubble : window.hetBubbles) {
+            // Bisect bbOffset for the flanking pair bracketing backboneOffset.
+            const uint32_t off = bubble.backboneOffset;
+            size_t bi = 0;
+            bool found = false;
+            for(size_t i = 0; i + 1 < bbOffset.size(); i++) {
+                if(bbOffset[i] <= off && off < bbOffset[i + 1]) { bi = i; found = true; break; }
+            }
+            if(!found) continue;  // bubble outside the backbone anchor span
+            const Shasta2AnchorId predAnchor = bbAnchors[bi];
+            const Shasta2AnchorId succAnchor = bbAnchors[bi + 1];
+
+            // Dedicated het-bubble edge builder. Het anchors are virtual k=2
+            // anchors with no real marker ordinal / journey position, so the
+            // Shasta2AnchorPair marker-ordinal path (getAverageOffset indexing
+            // markers[oid][ordinal]) cannot be used. Instead, build the anchor
+            // pair directly from the reads shared between the endpoints and use
+            // a nominal base offset derived from the backbone gap. coverage()
+            // is anchorPair.size() = number of shared oriented reads.
+            const uint32_t predOff = bbOffset[bi];
+            const uint32_t succOff = bbOffset[bi + 1];
+            auto addHetEdge = [&](Shasta2AnchorId idA, Shasta2AnchorId idB,
+                                  uint32_t nominalOffset) -> bool {
+                // Shared reads between the two endpoints (both are anchors in
+                // the store; intersect their member OrientedReadIds).
+                const Shasta2Anchor anchorA = anchors[idA];
+                const Shasta2Anchor anchorB = anchors[idB];
+                Shasta2AnchorPair pair;
+                pair.anchorIdA = idA;
+                pair.anchorIdB = idB;
+                auto itA = anchorA.begin();
+                auto itB = anchorB.begin();
+                while(itA != anchorA.end() && itB != anchorB.end()) {
+                    if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
+                    if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+                    pair.orientedReadIds.push_back(itA->orientedReadId);
+                    ++itA; ++itB;
+                }
+                if(pair.orientedReadIds.empty()) return false;
+                edge_descriptor e;
+                tie(e, ignore) = add_edge(
+                    idA, idB,
+                    Shasta2AnchorGraphEdge(pair, nominalOffset, nextEdgeId++),
+                    anchorGraph);
+                anchorGraph[e].useForAssembly = true;
+                return true;
+            };
+
+            for(const auto& allele : bubble.alleles) {
+                if(allele.anchorId == invalid<Shasta2AnchorId>) continue;
+                if(uint64_t(allele.anchorId) >= anchorCount) continue;
+                const Shasta2AnchorId a = allele.anchorId;
+                // Forward bubble: pred -> allele -> succ. Split the pred->succ
+                // backbone gap across the two half-edges as nominal offsets.
+                const uint32_t gap = (succOff > predOff) ? (succOff - predOff) : 1;
+                const uint32_t half = (gap + 1) / 2;
+                if(addHetEdge(predAnchor, a, half)) ++hetBubbleEdgesAdded;
+                if(addHetEdge(a, succAnchor, gap - half + 1)) ++hetBubbleEdgesAdded;
+                // RC mirror: succ^1 -> allele^1 -> pred^1.
+                const Shasta2AnchorId aRc = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
+                const Shasta2AnchorId predRc = Shasta2AnchorId(uint64_t(predAnchor) ^ 1ULL);
+                const Shasta2AnchorId succRc = Shasta2AnchorId(uint64_t(succAnchor) ^ 1ULL);
+                if(uint64_t(aRc) < anchorCount &&
+                   uint64_t(predRc) < anchorCount &&
+                   uint64_t(succRc) < anchorCount) {
+                    if(addHetEdge(succRc, aRc, half)) ++hetBubbleEdgesAdded;
+                    if(addHetEdge(aRc, predRc, gap - half + 1)) ++hetBubbleEdgesAdded;
+                }
+            }
+        }
+    }
+    if(hetBubbleEdgesAdded > 0) {
+        cout << "Shasta2AnchorGraph: added " << hetBubbleEdgesAdded
+             << " het-bubble edges." << endl;
+    }
+
 
 
     // Per-window transition tracking (transitionReads, per-read

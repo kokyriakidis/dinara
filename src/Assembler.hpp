@@ -3972,12 +3972,12 @@ public:
     void testAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-        const vector<AnchorWindow>& anchorWindows);
+        vector<AnchorWindow>& anchorWindows);
 
     bool runOneWindowAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-        const AnchorWindow& window);
+        AnchorWindow& window);
 
     // Build a single multi-segment Theseus MSA for one focal read using
     // all its direct overlaps from alignmentTable. Evaluates feasibility
