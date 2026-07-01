@@ -1327,6 +1327,43 @@ void dinara::main::assemble(
                     continue;
                 }
 
+                // Series chaining requires a hom separator between every pair of
+                // consecutive kept bubbles. The flank-linearity test guarantees
+                // one is constructible, so this normally always holds. If it
+                // does NOT (e.g. the hom anchor had no shared members), two
+                // BUBBLE steps would end up adjacent and the connection loop
+                // below would emit a ref/alt cross product that mixes alleles
+                // and destroys phasing. Guard against that: if any non-last kept
+                // bubble is missing its hom, do NOT chain -- wire each bubble
+                // independently to the flanking backbone anchors (pred->arm and
+                // arm->succ). That is correct (never allele-mixing, never
+                // backward), just without the in-series separation.
+                bool allSeparated = true;
+                for(size_t bj = 0; bj + 1 < kept.size(); bj++) {
+                    const auto* b = kept[bj];
+                    if(b->hom.anchorId == invalid<Shasta2AnchorId> ||
+                       uint64_t(b->hom.anchorId) >= anchorCount ||
+                       b->hom.members.empty()) {
+                        allSeparated = false;
+                        break;
+                    }
+                }
+                if(!allSeparated) {
+                    for(const auto* b : kept) {
+                        const uint32_t gap =
+                            (bbOffset[i + 1] > bbOffset[i]) ? (bbOffset[i + 1] - bbOffset[i]) : 1;
+                        const uint32_t half = (gap + 1) / 2;
+                        for(const auto& allele : b->alleles) {
+                            if(allele.anchorId == invalid<Shasta2AnchorId>) continue;
+                            if(uint64_t(allele.anchorId) >= anchorCount) continue;
+                            emitEdge(window, bbAnchors[i], allele.anchorId, half, true, stagedHet);
+                            emitEdge(window, allele.anchorId, bbAnchors[i + 1],
+                                     gap - half + 1, true, stagedHet);
+                        }
+                    }
+                    continue;
+                }
+
                 vector<ChainStep> steps;
                 steps.push_back({{bbAnchors[i]}, bbOffset[i]});
                 for(size_t bj = 0; bj < kept.size(); bj++) {
