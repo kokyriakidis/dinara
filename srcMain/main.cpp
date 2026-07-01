@@ -1275,16 +1275,19 @@ void dinara::main::assemble(
             for(size_t i = 0; i < bbAnchors.size(); i++)
                 bbOffset[i] = shasta2Anchors->getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
 
-            // Bucket het bubbles into their flanking backbone interval.
+            // Bucket het bubbles into their flanking backbone interval. bbOffset
+            // is sorted ascending, so binary-search the interval [i, i+1) that
+            // contains the bubble's backbone offset. upper_bound gives the first
+            // backbone anchor strictly past off; the interval start is one
+            // before it. Offsets before the first / at-or-after the last
+            // backbone anchor fall outside any interval and are dropped.
             vector<vector<const AnchorWindow::HetBubble*>> byInterval(bbAnchors.size());
             for(const auto& bubble : window.hetBubbles) {
                 const uint32_t off = bubble.backboneOffset;
-                for(size_t i = 0; i + 1 < bbOffset.size(); i++) {
-                    if(bbOffset[i] <= off && off < bbOffset[i + 1]) {
-                        byInterval[i].push_back(&bubble);
-                        break;
-                    }
-                }
+                const auto ub = std::upper_bound(bbOffset.begin(), bbOffset.end(), off);
+                if(ub == bbOffset.begin() || ub == bbOffset.end()) continue;
+                const size_t i = size_t(ub - bbOffset.begin()) - 1;
+                byInterval[i].push_back(&bubble);
             }
 
             // For each backbone interval, either emit the plain backbone edge
