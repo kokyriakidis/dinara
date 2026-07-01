@@ -1205,6 +1205,92 @@ void dinara::main::assemble(
              << " anchors." << endl;
     }
 
+    // Stage all window-local (intra-window) anchor-graph edges on the windows:
+    // the backbone chain (consecutive backbone anchors + RC mirror) and the het
+    // bubbles (pred->allele->succ + RC mirror). These edges are fully determined
+    // by a single window, so they live in the window structure; the anchor graph
+    // constructor replays window.intraWindowEdges directly. Inter-window edges
+    // are NOT staged here (they need multiple windows and are discovered in a
+    // global pass). This runs after the het-anchor append so allele anchor ids
+    // are assigned.
+    {
+        const uint64_t anchorCount = shasta2Anchors->size();
+        const uint32_t kHalf = uint32_t(shasta2Anchors->k / 2);
+        uint64_t stagedBackbone = 0, stagedHet = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            const OrientedReadId backboneOid = window.backboneOrientedReadId;
+            const auto backboneJourney = (*shasta2Journeys)[backboneOid];
+
+            // Ordered backbone anchors for this window.
+            vector<Shasta2AnchorId> bbAnchors;
+            const auto& positions = window.filteredBackbonePositions;
+            if(!positions.empty()) {
+                for(const uint32_t pos : positions)
+                    bbAnchors.push_back(backboneJourney[pos]);
+            } else {
+                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++)
+                    bbAnchors.push_back(backboneJourney[pos]);
+            }
+
+            // Backbone chain edges (+ RC mirror). offset is ignored for
+            // non-het edges (the constructor recomputes it), so leave it 0.
+            for(uint64_t i = 0; i + 1 < bbAnchors.size(); i++) {
+                window.intraWindowEdges.push_back(
+                    {bbAnchors[i], bbAnchors[i + 1], 0, false});
+                ++stagedBackbone;
+                const Shasta2AnchorId rcA = Shasta2AnchorId(uint64_t(bbAnchors[i]) ^ 1ULL);
+                const Shasta2AnchorId rcB = Shasta2AnchorId(uint64_t(bbAnchors[i + 1]) ^ 1ULL);
+                if(uint64_t(rcA) < anchorCount && uint64_t(rcB) < anchorCount) {
+                    window.intraWindowEdges.push_back({rcB, rcA, 0, false});
+                    ++stagedBackbone;
+                }
+            }
+
+            // Het bubble edges. Need the flanking backbone anchor pair for each
+            // bubble's backboneOffset, so precompute backbone anchor offsets.
+            if(window.hetBubbles.empty() || bbAnchors.size() < 2) continue;
+            const uint32_t backboneBeginPos =
+                shasta2Anchors->getPosition(bbAnchors.front(), backboneOid) - kHalf;
+            vector<uint32_t> bbOffset(bbAnchors.size());
+            for(size_t i = 0; i < bbAnchors.size(); i++)
+                bbOffset[i] = shasta2Anchors->getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
+
+            for(const auto& bubble : window.hetBubbles) {
+                const uint32_t off = bubble.backboneOffset;
+                size_t bi = 0; bool found = false;
+                for(size_t i = 0; i + 1 < bbOffset.size(); i++) {
+                    if(bbOffset[i] <= off && off < bbOffset[i + 1]) { bi = i; found = true; break; }
+                }
+                if(!found) continue;
+                const Shasta2AnchorId predAnchor = bbAnchors[bi];
+                const Shasta2AnchorId succAnchor = bbAnchors[bi + 1];
+                const uint32_t gap = (bbOffset[bi + 1] > bbOffset[bi]) ?
+                    (bbOffset[bi + 1] - bbOffset[bi]) : 1;
+                const uint32_t half = (gap + 1) / 2;
+                for(const auto& allele : bubble.alleles) {
+                    if(allele.anchorId == invalid<Shasta2AnchorId>) continue;
+                    if(uint64_t(allele.anchorId) >= anchorCount) continue;
+                    const Shasta2AnchorId a = allele.anchorId;
+                    window.intraWindowEdges.push_back({predAnchor, a, half, true});
+                    window.intraWindowEdges.push_back({a, succAnchor, gap - half + 1, true});
+                    stagedHet += 2;
+                    const Shasta2AnchorId aRc = Shasta2AnchorId(uint64_t(a) ^ 1ULL);
+                    const Shasta2AnchorId predRc = Shasta2AnchorId(uint64_t(predAnchor) ^ 1ULL);
+                    const Shasta2AnchorId succRc = Shasta2AnchorId(uint64_t(succAnchor) ^ 1ULL);
+                    if(uint64_t(aRc) < anchorCount &&
+                       uint64_t(predRc) < anchorCount &&
+                       uint64_t(succRc) < anchorCount) {
+                        window.intraWindowEdges.push_back({succRc, aRc, half, true});
+                        window.intraWindowEdges.push_back({aRc, predRc, gap - half + 1, true});
+                        stagedHet += 2;
+                    }
+                }
+            }
+        }
+        cout << timestamp << "Staged intra-window edges: "
+             << stagedBackbone << " backbone, " << stagedHet << " het." << endl;
+    }
+
     // Write external anchors. Deferred to here (after MSA het-anchor
     // generation) so newly generated het anchors are part of the exported set.
     cout << timestamp << "Writing Shasta2 external anchors to "

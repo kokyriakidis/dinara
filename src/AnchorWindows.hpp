@@ -133,6 +133,28 @@ struct AnchorWindow {
     };
     std::vector<HetBubble> hetBubbles;
 
+    // Window-local (intra-window) anchor-graph edges, staged on the window so
+    // all edges that are fully determined by a single window live in the window
+    // structure. The anchor graph constructor replays these directly. Two
+    // kinds share this list:
+    //   - backbone chain edges (consecutive backbone anchors, + RC mirror):
+    //     isHet=false; the constructor builds them via the normal marker-based
+    //     Shasta2AnchorPair path (offset is recomputed, the staged offset is
+    //     ignored).
+    //   - het bubble edges (pred->allele, allele->succ, + RC mirror): isHet=true;
+    //     the constructor builds them via the direct read-intersection path
+    //     using the staged nominal offset (het anchors are k=2 and have no real
+    //     marker ordinal).
+    // Inter-window edges are NOT staged here: they depend on multiple windows
+    // and are discovered in a separate global pass.
+    struct IntraWindowEdge {
+        Shasta2AnchorId anchorIdA = std::numeric_limits<Shasta2AnchorId>::max();
+        Shasta2AnchorId anchorIdB = std::numeric_limits<Shasta2AnchorId>::max();
+        uint32_t offset = 0;   // nominal base offset (used only for het edges)
+        bool isHet = false;
+    };
+    std::vector<IntraWindowEdge> intraWindowEdges;
+
     // Per-read haplotype assignment from k-means phasing.
     // hap: 0 = unassigned, 1 = haplotype 1 (cis with backbone), 2 = haplotype 2 (trans).
     struct ReadHaplotype {
