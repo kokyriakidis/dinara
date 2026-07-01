@@ -109,18 +109,6 @@ struct WindowSnp {
     int succBackboneOffset = -1;
     uint8_t succBase = 0;   // base at commonSucc (0-3)
     vector<HetAlleleMember> homMembers;
-
-    // Leading hom anchor members: reads at predPrev (rawPosition = predPrev base
-    // position), forming the k=2 hom anchor [predPrevBase, predBase]. The
-    // flank-linearity test guarantees predPrev->commonPred is linear, so this
-    // 2-mer is shared by ALL reads spanning the site. This brackets the bubble
-    // on the LEFT so the backbone predecessor connects to a hom (which carries
-    // the backbone read and every spanning read) rather than directly to a
-    // low-coverage allele arm whose read set may not intersect the k=50
-    // backbone anchor. predPrevBackboneOffset is the backbone offset of predPrev.
-    int predPrevBackboneOffset = -1;
-    uint8_t predPrevBase = 0;   // base at predPrev (0-3)
-    vector<HetAlleleMember> leadHomMembers;
 };
 
 // popcount over a read_ids bitset of `nWords` uint64 words.
@@ -493,20 +481,6 @@ vector<WindowSnp> detectWindowSnps(
                 vector<int> homSeqIds = refSeqIds;
                 homSeqIds.insert(homSeqIds.end(), alt.seqIds.begin(), alt.seqIds.end());
                 mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
-            }
-
-            // Leading hom anchor at predPrev: [predPrevBase, predBase]. Same
-            // spanning-read set as the trailing hom (both alleles pass through
-            // predPrev, which the flank-linearity test guarantees is linear into
-            // commonPred). This brackets the bubble on the left so the backbone
-            // predecessor connects to a hom (carrying every spanning read incl.
-            // the backbone read) instead of a possibly-minority allele arm.
-            snp.predPrevBackboneOffset = nodeToBackboneOffset[predPrev];
-            snp.predPrevBase = abg->node[predPrev].base;
-            {
-                vector<int> leadSeqIds = refSeqIds;
-                leadSeqIds.insert(leadSeqIds.end(), alt.seqIds.begin(), alt.seqIds.end());
-                mapMembersAt(leadSeqIds, predPrev, snp.leadHomMembers);
             }
             snps.push_back(std::move(snp));
         }
@@ -1125,24 +1099,6 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
                 for(const HetAlleleMember& m : snp.homMembers)
                     homAnchor.members.push_back({m.orientedReadId, m.rawPosition});
                 bubble.hom = std::move(homAnchor);
-            }
-
-            // Leading hom bracket [predPrevBase, predBase] at predPrev.
-            if(snp.predPrevBackboneOffset >= 0 && !snp.leadHomMembers.empty()) {
-                bubble.predPrevBackboneOffset =
-                    static_cast<uint32_t>(snp.predPrevBackboneOffset);
-                AnchorWindow::HetAnchor leadAnchor;
-                leadAnchor.backboneOffset = bubble.predPrevBackboneOffset;
-                leadAnchor.predBase = snp.predPrevBase;
-                // alleleBase is predBase = backbone base at predPrev+1
-                // (== commonPred), which is backboneCodes[predPrevOffset + 1].
-                leadAnchor.alleleBase =
-                    (snp.predPrevBackboneOffset + 1 < static_cast<int>(backboneCodes.size()))
-                    ? backboneCodes[snp.predPrevBackboneOffset + 1] : 0;
-                leadAnchor.isRef = true;
-                for(const HetAlleleMember& m : snp.leadHomMembers)
-                    leadAnchor.members.push_back({m.orientedReadId, m.rawPosition});
-                bubble.leadHom = std::move(leadAnchor);
             }
 
             window.hetBubbles.push_back(std::move(bubble));

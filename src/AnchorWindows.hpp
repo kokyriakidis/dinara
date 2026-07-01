@@ -130,40 +130,37 @@ struct AnchorWindow {
     struct HetBubble {
         uint32_t backboneOffset = 0;
         std::vector<HetAnchor> alleles;   // [0]=ref, rest=alts
-        // The bubble is bracketed by two hom anchors carrying all reads
-        // spanning the site (both alleles reconverge at each flank, and the
-        // flank-linearity test guarantees both flanks are linear):
-        //   leadHom  = [predPrevBase, predBase] at predPrev  (LEFT bracket)
-        //   hom      = [succBase, nextBase]     at commonSucc (RIGHT bracket)
-        // A backbone interval that contains the bubble is wired as:
-        //   bbA_i -> leadHom -> {alleles} -> hom -> bbA_{i+1}
-        // and multiple contained bubbles chain as:
-        //   bbA_i -> leadHom_0 -> {alleles_0} -> hom_0 -> leadHom_1 ->
-        //            {alleles_1} -> hom_1 -> ... -> bbA_{i+1}
-        // Connecting the backbone anchors to homs (not directly to allele arms)
-        // keeps every backbone-touching edge on the backbone read, so no arm
-        // edge is dropped for an empty k=50/k=2 read intersection.
-        // Empty members => that hom is unavailable.
-        uint32_t predPrevBackboneOffset = 0;   // backbone offset of leadHom
-        HetAnchor leadHom;
+        // Trailing hom anchor at commonSucc ([succBase, nextBase]), carrying all
+        // reads spanning the site (both alleles reconverge here; the
+        // flank-linearity test guarantees commonSucc->succNext is linear). When
+        // multiple SNP bubbles fall in one backbone interval they are chained in
+        // series and separated by these hom anchors:
+        //   bbA_i -> {alleles_0} -> hom_0 -> {alleles_1} -> hom_1 -> ...
+        //         -> {alleles_n} -> bbA_{i+1}
+        // Only the INTERIOR homs (between two consecutive bubbles) are created;
+        // the last bubble connects directly to the backbone successor. The
+        // backbone-touching edges (bbA_i -> first alleles, last alleles ->
+        // bbA_{i+1}) are built by addHetEdge using the allele's own member list
+        // (not a k=50/k=2 intersection), so they are never dropped.
+        // Empty members => hom unavailable.
         uint32_t succBackboneOffset = 0;       // backbone offset of hom
         HetAnchor hom;
 
         // Transient planning fields, set by the intra-window edge planner (a
-        // pre-pass over the windows) and consumed by the append + staging
-        // passes so they agree on exactly which anchors get created and wired.
-        // This avoids appending an anchor that is never wired (which would leave
-        // an isolated vertex) and vice versa.
-        //   plannedInterval    : index i of the backbone interval [bbA_i, bbA_{i+1})
-        //                        that strictly contains this bubble's flank span,
-        //                        or -1 if no interval contains it (bubble dropped).
-        //   isFirstInInterval  : true for the leftmost contained bubble in an
-        //                        interval. Only this bubble contributes its
-        //                        leadHom (the left bracket). For every other
-        //                        bubble the preceding bubble's trailing hom is
-        //                        the single shared separator.
+        // pre-pass over the windows) and consumed by the append + staging passes
+        // so they agree on exactly which anchors get created and wired (no orphan
+        // anchors, no unwired bubbles).
+        //   plannedInterval   : index i of the backbone interval [bbA_i,
+        //                       bbA_{i+1}) that strictly contains this bubble's
+        //                       flank span, or -1 if none (bubble dropped).
+        //   isLastInInterval  : true for the rightmost contained bubble in an
+        //                       interval. Its trailing hom is NOT created (it
+        //                       would connect only to the backbone successor,
+        //                       which the last-alleles->bbA_{i+1} edge already
+        //                       does). Every other bubble's trailing hom is the
+        //                       shared separator to the next bubble.
         int32_t plannedInterval = -1;
-        bool isFirstInInterval = false;
+        bool isLastInInterval = false;
     };
     std::vector<HetBubble> hetBubbles;
 

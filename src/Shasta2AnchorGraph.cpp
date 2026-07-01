@@ -318,9 +318,28 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Dedicated het-bubble edge builder. Het anchors are virtual k=2 anchors
     // with no real marker ordinal / journey position, so the Shasta2AnchorPair
     // marker-ordinal path (getAverageOffset indexing markers[oid][ordinal])
-    // cannot be used. Instead, build the anchor pair directly from the reads
-    // shared between the endpoints and use the staged nominal base offset.
-    // coverage() is anchorPair.size() = number of shared oriented reads.
+    // cannot be used. Instead, build the anchor pair directly and use the staged
+    // nominal base offset. coverage() is anchorPair.size().
+    //
+    // Read set of the edge:
+    //  - het<->het edge (both endpoints are k=2 anchors, e.g. allele<->hom or
+    //    hom<->hom): use the INTERSECTION of the two member lists. Both come
+    //    from the same POA machinery, so the intersection is well-defined and
+    //    non-empty by construction.
+    //  - mixed het<->backbone edge (one endpoint is a k=50 backbone anchor,
+    //    the other a k=2 allele/hom): do NOT intersect. The k=50 anchor's read
+    //    set is derived independently (exact 50-mer match) and frequently omits
+    //    a minority allele's reads, which silently dropped the edge and left the
+    //    arm dangling. Instead use the HET endpoint's own member list as the
+    //    edge read set (these are exactly the reads that traverse the arm). The
+    //    edge verifier counts reads present on only one endpoint as onlyA/onlyB,
+    //    not "neither", so this passes verification; and because the arm sits
+    //    farther along the backbone than the backbone anchor, offsets stay
+    //    forward.
+    const Shasta2AnchorId hetFirst = anchors.hetAnchorFirstId;
+    auto isHetId = [&](Shasta2AnchorId id) {
+        return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
+    };
     auto addHetEdge = [&](Shasta2AnchorId idA, Shasta2AnchorId idB,
                           uint32_t nominalOffset) -> bool {
         const Shasta2Anchor anchorA = anchors[idA];
@@ -328,14 +347,26 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         Shasta2AnchorPair pair;
         pair.anchorIdA = idA;
         pair.anchorIdB = idB;
-        auto itA = anchorA.begin();
-        auto itB = anchorB.begin();
-        while(itA != anchorA.end() && itB != anchorB.end()) {
-            if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
-            if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
-            pair.orientedReadIds.push_back(itA->orientedReadId);
-            ++itA; ++itB;
+
+        const bool hetA = isHetId(idA);
+        const bool hetB = isHetId(idB);
+        if(hetA && hetB) {
+            // het<->het: intersection.
+            auto itA = anchorA.begin();
+            auto itB = anchorB.begin();
+            while(itA != anchorA.end() && itB != anchorB.end()) {
+                if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
+                if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+                pair.orientedReadIds.push_back(itA->orientedReadId);
+                ++itA; ++itB;
+            }
+        } else {
+            // mixed het<->backbone: take the het endpoint's members verbatim.
+            const Shasta2Anchor& hetAnchor = hetA ? anchorA : anchorB;
+            for(auto it = hetAnchor.begin(); it != hetAnchor.end(); ++it)
+                pair.orientedReadIds.push_back(it->orientedReadId);
         }
+
         if(pair.orientedReadIds.empty()) return false;
         edge_descriptor e;
         tie(e, ignore) = add_edge(
