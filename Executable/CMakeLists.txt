@@ -47,9 +47,11 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
-# AssemblerMultiSegmentMSA.cpp re-enabled: per-window all-reads Theseus MSA test.
-# Uses the fork theseus API (align_from, multi-segment ctor) installed in
-# ~/.dinaraBuild. See testMultiSegmentMSA / runOneWindowMultiSegmentMSA.
+# AssemblerMultiSegmentMSA.cpp excluded: the per-window multi-segment MSA test
+# has been reimplemented on abPOA (AssemblerAbpoaMultiSegmentMSA.cpp), which is
+# faster and avoids the theseus fork's terminal-condition / quadratic-blowup
+# issues. The theseus-based version is retained in-tree for reference only.
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 #
 # AssemblerShasta2Anchors.cpp excluded: it is the only translation unit that
 # calls into the real shasta2 library (shasta2::Anchors/AnchorGraph/AssemblyGraph
@@ -109,12 +111,12 @@ endif()
 # translation unit that called into libshasta2 (AssemblerShasta2Anchors.cpp)
 # is excluded from the build above.
 
-# Find theseus library (the kokyriakidis fork). dinara's per-window MSA code
-# (AssemblerMultiSegmentMSA.cpp) uses the fork-only API: align_from and the
-# multi-segment TheseusMSA constructor.
+# Find theseus library (the kokyriakidis fork). Still used by
+# AssemblerSvAnchors.cpp (multi-segment TheseusMSA constructor). The per-window
+# MSA test now uses abPOA instead (AssemblerAbpoaMultiSegmentMSA.cpp).
 find_library(THESEUS_LIB theseus)
 if(THESEUS_LIB)
-    message(STATUS "theseus found (fork API used by AssemblerMultiSegmentMSA).")
+    message(STATUS "theseus found (fork API used by AssemblerSvAnchors).")
 else()
     message(WARNING "theseus library not found. Run InstallPrerequisites.")
     set(THESEUS_LIB "")

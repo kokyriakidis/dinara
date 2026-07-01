@@ -1169,7 +1169,11 @@ void dinara::main::assemble(
     // ~/.dinaraBuild). Builds one multi-segment MSA per anchor window from all
     // oriented reads sharing the window's anchors, writing FASTA + GFA per window.
     // Number of windows capped by env DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
-    assembler.testMultiSegmentMSA(
+    // Per-window all-reads multi-segment MSA (abPOA engine). Builds one MSA per
+    // anchor window from all oriented reads sharing the window's anchors, writing
+    // FASTA + GFA per window. Number of windows capped by env
+    // DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
+    assembler.testAbpoaMultiSegmentMSA(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         anchorWindows);
@@ -2200,8 +2204,8 @@ void dinara::main::assemble(
     assembler.testAnchorWindowsCleanLongestRead(threadCount,
         assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage);
 
-    // (testMultiSegmentMSA is invoked earlier, right after anchor windows are
-    // built, since this code path returns before reaching here.)
+    // (testAbpoaMultiSegmentMSA is invoked earlier, right after anchor windows
+    // are built, since this code path returns before reaching here.)
     // assembler.computeTheseusReadWindowMSAPrototype(
     //     assembler.shasta2Anchors,
     //     assembler.shasta2Journeys,

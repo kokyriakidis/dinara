@@ -3964,16 +3964,17 @@ public:
         vector<AnchorWindow>& anchorWindows,
         uint64_t threadCount);
 
-    // Test the multi-segment TheseusMSA per anchor window (all reads per window).
-    void testMultiSegmentMSA(
+    // Per-window all-reads multi-segment MSA (abPOA engine). Builds one MSA per
+    // anchor window from all oriented reads sharing >=2 of the window's backbone
+    // anchors, folding read pieces into an abPOA partial-order graph via
+    // abpoa_align_sequence_to_subgraph. Writes
+    // testAbpoaMultiSegmentMSA_window<N>.{fasta,gfa}.
+    void testAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         const vector<AnchorWindow>& anchorWindows);
 
-    // Build one multi-segment Theseus MSA for a single anchor window using all
-    // oriented reads sharing >=2 of the window's backbone anchors. Writes the
-    // window's MSA (FASTA) and POA graph (GFA). Returns true if produced.
-    bool runOneWindowMultiSegmentMSA(
+    bool runOneWindowAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         const AnchorWindow& window);
