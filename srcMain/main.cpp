@@ -213,6 +213,266 @@ uint64_t envUintOrDefault(const char* variableName, uint64_t defaultValue)
 }
 
 
+// ============================================================================
+// Intra-window het-bubble wiring helpers.
+//
+// After per-window MSA het detection stages het bubbles on each window, three
+// serial passes turn those bubbles into anchor-graph structure:
+//   1. planWindowHetBubbles   — assign each bubble to the backbone interval that
+//                               strictly contains its flank span; drop the rest.
+//   2. appendWindowHetAnchors — create the anchor pairs for planned bubbles.
+//   3. stageWindowIntraEdges  — stage the backbone chain + het bubble edges.
+// All three need the window's ordered backbone anchors and their base offsets,
+// computed once by computeWindowBackbone.
+// ============================================================================
+
+// Ordered backbone anchors of a window plus their base offsets from the window
+// start. Returns false (empty vectors) when the window has fewer than two
+// backbone anchors, i.e. no interval to contain a bubble.
+bool computeWindowBackbone(
+    const Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys,
+    const AnchorWindow& window,
+    uint32_t kHalf,
+    vector<Shasta2AnchorId>& bbAnchors,
+    vector<uint32_t>& bbOffset)
+{
+    bbAnchors.clear();
+    bbOffset.clear();
+
+    const OrientedReadId backboneOid = window.backboneOrientedReadId;
+    const auto backboneJourney = journeys[backboneOid];
+
+    const auto& positions = window.filteredBackbonePositions;
+    if(!positions.empty()) {
+        for(const uint32_t pos : positions)
+            bbAnchors.push_back(backboneJourney[pos]);
+    } else {
+        for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++)
+            bbAnchors.push_back(backboneJourney[pos]);
+    }
+    if(bbAnchors.size() < 2) {
+        bbAnchors.clear();
+        return false;
+    }
+
+    const uint32_t backboneBeginPos =
+        anchors.getPosition(bbAnchors.front(), backboneOid) - kHalf;
+    bbOffset.resize(bbAnchors.size());
+    for(size_t i = 0; i < bbAnchors.size(); i++)
+        bbOffset[i] = anchors.getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
+    return true;
+}
+
+
+// Assign each het bubble in a window to the backbone interval [bbA_i, bbA_{i+1})
+// that STRICTLY contains its full flank span [backboneOffset, succBackboneOffset]
+// and mark the rightmost bubble per interval (whose trailing hom is not created).
+// A bubble whose flank span crosses/touches a backbone anchor, lacks a usable
+// hom, or lacks any arm is contained by NO interval and is dropped
+// (plannedInterval = -1). Accumulates counts into plannedBubbles/dropped.
+void planWindowHetBubbles(
+    AnchorWindow& window,
+    const vector<uint32_t>& bbOffset,
+    uint64_t& plannedBubbles,
+    uint64_t& dropped)
+{
+    // Assign each bubble to its strictly-containing interval.
+    for(auto& b : window.hetBubbles) {
+        b.plannedInterval = -1;
+        b.isLastInInterval = false;
+        const uint32_t snpOff = b.backboneOffset;
+        const auto ub = std::upper_bound(bbOffset.begin(), bbOffset.end(), snpOff);
+        if(ub == bbOffset.begin() || ub == bbOffset.end()) { ++dropped; continue; }
+        const size_t i = size_t(ub - bbOffset.begin()) - 1;
+        const bool haveTail = !b.hom.members.empty();
+        bool hasArm = false;
+        for(const auto& a : b.alleles) if(!a.members.empty()) { hasArm = true; break; }
+        // Strict containment of the whole flank span (SNP and its trailing hom
+        // flank strictly inside), plus a usable hom (needed as a separator if
+        // another bubble follows) and at least one arm.
+        if(haveTail && hasArm &&
+           bbOffset[i] < snpOff &&
+           b.succBackboneOffset < bbOffset[i + 1]) {
+            b.plannedInterval = int32_t(i);
+            ++plannedBubbles;
+        } else {
+            ++dropped;
+        }
+    }
+
+    // Mark the rightmost planned bubble per interval (largest SNP offset). Its
+    // trailing hom is not created (nothing follows it).
+    vector<int> lastIdx(bbOffset.size(), -1);
+    vector<uint32_t> lastOff(bbOffset.size(), 0);
+    for(size_t bi = 0; bi < window.hetBubbles.size(); bi++) {
+        auto& b = window.hetBubbles[bi];
+        if(b.plannedInterval < 0) continue;
+        const int iv = b.plannedInterval;
+        if(lastIdx[iv] < 0 || b.backboneOffset > lastOff[iv]) {
+            lastIdx[iv] = int(bi);
+            lastOff[iv] = b.backboneOffset;
+        }
+    }
+    for(int idx : lastIdx)
+        if(idx >= 0) window.hetBubbles[size_t(idx)].isLastInInterval = true;
+}
+
+
+// Create the canonical/RC anchor pair for one het/hom anchor from its member
+// list and record the assigned id on the anchor. No-op for empty member lists.
+void appendHetAnchor(Shasta2Anchors& anchors, AnchorWindow::HetAnchor& a)
+{
+    if(a.members.empty()) return;
+    vector<std::pair<OrientedReadId, uint32_t>> members;
+    members.reserve(a.members.size());
+    for(const auto& m : a.members)
+        members.push_back({m.orientedReadId, m.rawPosition});
+    a.anchorId = anchors.appendHetAnchorPair(members);
+}
+
+
+// Append anchor pairs for every planned bubble in a window: one per non-empty
+// allele arm, plus the interior separator hom of each non-last bubble. Only
+// bubbles the planner accepted (plannedInterval >= 0) get anchors, so every
+// appended anchor is wired by the staging pass. Accumulates pair counts.
+void appendWindowHetAnchors(
+    Shasta2Anchors& anchors,
+    AnchorWindow& window,
+    uint64_t& hetAnchorPairs,
+    uint64_t& homAnchorPairs)
+{
+    for(auto& bubble : window.hetBubbles) {
+        if(bubble.plannedInterval < 0) continue;
+        for(auto& allele : bubble.alleles) {
+            if(allele.members.empty()) continue;
+            appendHetAnchor(anchors, allele);
+            ++hetAnchorPairs;
+        }
+        // Trailing hom = interior separator to the next bubble. Not created for
+        // the last bubble in an interval (it connects straight to the backbone
+        // successor).
+        if(!bubble.isLastInInterval && !bubble.hom.members.empty()) {
+            appendHetAnchor(anchors, bubble.hom);
+            ++homAnchorPairs;
+        }
+    }
+}
+
+
+// Stage the window-local anchor-graph edges: for each backbone interval, a plain
+// backbone edge when it holds no planned bubble, otherwise the hom-bracketed
+// series chain bbA_i -> arms_0 -> hom_0 -> ... -> arms_{n-1} -> bbA_{i+1} (the
+// direct backbone edge is omitted, the chain replaces it). Emits each forward
+// edge plus its RC mirror. Accumulates edge/interval counts.
+void stageWindowIntraEdges(
+    AnchorWindow& window,
+    uint64_t anchorCount,
+    const vector<Shasta2AnchorId>& bbAnchors,
+    const vector<uint32_t>& bbOffset,
+    uint64_t& stagedBackbone,
+    uint64_t& stagedHet,
+    uint64_t& chainedIntervals)
+{
+    // Emit a forward edge plus its RC mirror (v^1 -> u^1) onto the window.
+    // isHet controls how the constructor builds the edge: false = the normal
+    // marker-based path (backbone-only endpoints), true = the direct
+    // read-intersection path (any het/hom endpoint, which has no marker ordinal).
+    auto emitEdge = [&](Shasta2AnchorId A, Shasta2AnchorId B,
+                        uint32_t off, bool isHet, uint64_t& counter) {
+        if(uint64_t(A) >= anchorCount || uint64_t(B) >= anchorCount) return;
+        window.intraWindowEdges.push_back({A, B, off, isHet});
+        ++counter;
+        const Shasta2AnchorId Arc = Shasta2AnchorId(uint64_t(A) ^ 1ULL);
+        const Shasta2AnchorId Brc = Shasta2AnchorId(uint64_t(B) ^ 1ULL);
+        if(uint64_t(Arc) < anchorCount && uint64_t(Brc) < anchorCount) {
+            window.intraWindowEdges.push_back({Brc, Arc, off, isHet});
+            ++counter;
+        }
+    };
+
+    // A step in an interval's series chain: either a SINGLE anchor (backbone
+    // endpoint or hom separator) or a BUBBLE (>=2 allele arms).
+    struct ChainStep {
+        vector<Shasta2AnchorId> ids;   // 1 = single, >=2 = bubble arms
+        uint32_t off = 0;              // representative backbone offset
+    };
+
+    // Group the planned bubbles by their assigned backbone interval. Bubbles
+    // with plannedInterval < 0 were dropped and are ignored here.
+    vector<vector<const AnchorWindow::HetBubble*>> byInterval(bbAnchors.size());
+    for(const auto& bubble : window.hetBubbles) {
+        if(bubble.plannedInterval < 0) continue;
+        const size_t i = size_t(bubble.plannedInterval);
+        if(i + 1 < bbAnchors.size()) byInterval[i].push_back(&bubble);
+    }
+
+    // For each backbone interval: no contained bubble -> plain backbone edge;
+    // otherwise build the hom-bracketed series chain and OMIT the direct
+    // backbone edge (the chain replaces the shortcut).
+    for(uint64_t i = 0; i + 1 < bbAnchors.size(); i++) {
+        auto& bubs = byInterval[i];
+        if(bubs.empty()) {
+            emitEdge(bbAnchors[i], bbAnchors[i + 1], 0, false, stagedBackbone);
+            continue;
+        }
+        ++chainedIntervals;
+
+        // Order the interval's bubbles by position.
+        std::sort(bubs.begin(), bubs.end(),
+            [](const AnchorWindow::HetBubble* a, const AnchorWindow::HetBubble* b) {
+                return a->backboneOffset < b->backboneOffset;
+            });
+
+        // Build the ordered step list: the flanking backbone anchors bracket the
+        // chain, and an INTERIOR hom separates each pair of consecutive bubbles
+        // (the last bubble connects straight to the backbone successor):
+        //   bbA_i -> arms_0 -> hom_0 -> arms_1 -> hom_1
+        //         -> ... -> hom_{n-2} -> arms_{n-1} -> bbA_{i+1}
+        // The two backbone-touching edges (bbA_i -> arms_0 and arms_{n-1} ->
+        // bbA_{i+1}) are built by addHetEdge from the arm's own member list (not
+        // a k=50/k=2 intersection), so they are never dropped -- no hom bracket
+        // needed at the ends.
+        vector<ChainStep> steps;
+        steps.push_back({{bbAnchors[i]}, bbOffset[i]});
+        for(size_t bj = 0; bj < bubs.size(); bj++) {
+            const auto* b = bubs[bj];
+            ChainStep bubbleStep;
+            bubbleStep.off = b->backboneOffset;
+            for(const auto& allele : b->alleles) {
+                if(allele.anchorId == invalid<Shasta2AnchorId>) continue;
+                if(uint64_t(allele.anchorId) >= anchorCount) continue;
+                bubbleStep.ids.push_back(allele.anchorId);
+            }
+            steps.push_back(std::move(bubbleStep));
+            // Interior separator hom: added for every bubble EXCEPT the last
+            // (which connects directly to the backbone successor).
+            const bool isLast = (bj + 1 == bubs.size());
+            if(!isLast &&
+               b->hom.anchorId != invalid<Shasta2AnchorId> &&
+               uint64_t(b->hom.anchorId) < anchorCount) {
+                steps.push_back({{b->hom.anchorId}, b->succBackboneOffset});
+            }
+        }
+        steps.push_back({{bbAnchors[i + 1]}, bbOffset[i + 1]});
+
+        // Connect consecutive steps. Every edge touches a het/hom anchor
+        // (backbone->arms, arms->hom, hom->arms, arms->backbone), so isHet=true.
+        // Offsets are strictly increasing by construction (containment guarantees
+        // bbOffset[i] < snpOff < succOff < bbOffset[i+1], bubbles sorted), so no
+        // fallback offset is used.
+        for(size_t s = 0; s + 1 < steps.size(); s++) {
+            const ChainStep& p = steps[s];
+            const ChainStep& q = steps[s + 1];
+            const uint32_t off = (q.off > p.off) ? (q.off - p.off) : 1;
+            for(const Shasta2AnchorId A : p.ids)
+                for(const Shasta2AnchorId B : q.ids)
+                    emitEdge(A, B, off, true, stagedHet);
+        }
+    }
+}
+
+
 void maybeRunBubbleFinderDirectedSuperbubbleComparison(
     const mode3::AnchorGraph& anchorGraph,
     const std::vector<std::pair<
@@ -1174,125 +1434,42 @@ void dinara::main::assemble(
         assembler.shasta2Journeys,
         anchorWindows);
 
-    // Append staged het anchors (k=2) to the primary anchor store. This is a
-    // serial pass: it grows the memory-mapped store and thus invalidates any
-    // outstanding anchor spans, so it must run after all window processing.
-    // Each allele of each staged bubble becomes one canonical/RC anchor pair;
-    // the assigned canonical id is written back onto the window so the anchor
-    // graph can wire the bubble edges.
-    // Plan intra-window het wiring first, so the append pass creates exactly the
-    // anchors that will be wired (no orphan anchors, no unwired bubbles). For
-    // each window we assign every het bubble to the backbone interval that
-    // STRICTLY CONTAINS its full flank span [backboneOffset, succBackboneOffset]
-    // and mark the rightmost bubble in each interval (whose trailing hom is not
-    // needed: interior homs separate consecutive bubbles, but the last bubble
-    // connects straight to the backbone successor). A bubble whose flank span
-    // crosses/touches a backbone anchor is contained by NO interval, so it is
-    // dropped. Backbone-touching arm edges use the arm's own member list (see
-    // addHetEdge), so no hom bracket is needed at the interval ends.
+    // Turn the staged het bubbles into anchor-graph structure in three serial
+    // passes (plan -> append -> stage edges). The passes are ordered so anchors
+    // are created only for bubbles that will be wired: the planner marks which
+    // bubbles are usable, the append pass creates exactly those anchors, and the
+    // staging pass wires them. See the helpers in the anonymous namespace above.
+    const uint32_t hetKHalf = uint32_t(shasta2Anchors->k / 2);
+
+    // Pass 1: plan. Assign each bubble to the backbone interval that strictly
+    // contains its flank span; drop the rest (plannedInterval = -1).
     uint64_t plannedBubbles = 0, droppedUncontained = 0;
     {
-        const uint32_t kHalf = uint32_t(shasta2Anchors->k / 2);
+        vector<Shasta2AnchorId> bbAnchors;
+        vector<uint32_t> bbOffset;
         for(AnchorWindow& window : anchorWindows) {
-            const OrientedReadId backboneOid = window.backboneOrientedReadId;
-            const auto backboneJourney = (*shasta2Journeys)[backboneOid];
-
-            vector<Shasta2AnchorId> bbAnchors;
-            const auto& positions = window.filteredBackbonePositions;
-            if(!positions.empty()) {
-                for(const uint32_t pos : positions)
-                    bbAnchors.push_back(backboneJourney[pos]);
-            } else {
-                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++)
-                    bbAnchors.push_back(backboneJourney[pos]);
-            }
-            if(bbAnchors.size() < 2) {
+            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
+                                      hetKHalf, bbAnchors, bbOffset)) {
+                // Fewer than two backbone anchors: no interval, drop all bubbles.
                 for(auto& b : window.hetBubbles) { b.plannedInterval = -1; ++droppedUncontained; }
                 continue;
             }
-
-            const uint32_t backboneBeginPos =
-                shasta2Anchors->getPosition(bbAnchors.front(), backboneOid) - kHalf;
-            vector<uint32_t> bbOffset(bbAnchors.size());
-            for(size_t i = 0; i < bbAnchors.size(); i++)
-                bbOffset[i] = shasta2Anchors->getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
-
-            // Assign each bubble to its strictly-containing interval.
-            for(auto& b : window.hetBubbles) {
-                b.plannedInterval = -1;
-                b.isLastInInterval = false;
-                const uint32_t snpOff = b.backboneOffset;
-                const auto ub = std::upper_bound(bbOffset.begin(), bbOffset.end(), snpOff);
-                if(ub == bbOffset.begin() || ub == bbOffset.end()) { ++droppedUncontained; continue; }
-                const size_t i = size_t(ub - bbOffset.begin()) - 1;
-                const bool haveTail = !b.hom.members.empty();
-                bool hasArm = false;
-                for(const auto& a : b.alleles) if(!a.members.empty()) { hasArm = true; break; }
-                // Strict containment of the whole flank span (SNP and its
-                // trailing hom flank strictly inside), plus a usable hom (needed
-                // as a separator if another bubble follows) and at least one arm.
-                if(haveTail && hasArm &&
-                   bbOffset[i] < snpOff &&
-                   b.succBackboneOffset < bbOffset[i + 1]) {
-                    b.plannedInterval = int32_t(i);
-                    ++plannedBubbles;
-                } else {
-                    ++droppedUncontained;
-                }
-            }
-
-            // Mark the rightmost planned bubble per interval (largest SNP
-            // offset). Its trailing hom is not created (nothing follows it).
-            vector<int> lastIdx(bbAnchors.size(), -1);
-            vector<uint32_t> lastOff(bbAnchors.size(), 0);
-            for(size_t bi = 0; bi < window.hetBubbles.size(); bi++) {
-                auto& b = window.hetBubbles[bi];
-                if(b.plannedInterval < 0) continue;
-                const int iv = b.plannedInterval;
-                if(lastIdx[iv] < 0 || b.backboneOffset > lastOff[iv]) {
-                    lastIdx[iv] = int(bi);
-                    lastOff[iv] = b.backboneOffset;
-                }
-            }
-            for(int idx : lastIdx)
-                if(idx >= 0) window.hetBubbles[size_t(idx)].isLastInInterval = true;
+            planWindowHetBubbles(window, bbOffset, plannedBubbles, droppedUncontained);
         }
         cout << timestamp << "Planned " << plannedBubbles
              << " contained het bubbles (" << droppedUncontained
              << " dropped: flank span not strictly inside a backbone interval)." << endl;
     }
 
+    // Pass 2: append. Create the canonical/RC anchor pairs for planned bubbles.
+    // This grows the memory-mapped store and invalidates outstanding anchor
+    // spans, so it must run after all window processing.
     {
         cout << timestamp << "Appending het anchors from "
              << anchorWindows.size() << " windows..." << endl;
         uint64_t hetAnchorPairs = 0, homAnchorPairs = 0;
-        auto appendAnchor = [&](AnchorWindow::HetAnchor& a) {
-            if(a.members.empty()) return;
-            vector<std::pair<OrientedReadId, uint32_t>> members;
-            members.reserve(a.members.size());
-            for(const auto& m : a.members)
-                members.push_back({m.orientedReadId, m.rawPosition});
-            a.anchorId = shasta2Anchors->appendHetAnchorPair(members);
-        };
-        for(AnchorWindow& window : anchorWindows) {
-            for(auto& bubble : window.hetBubbles) {
-                // Only create anchors for bubbles the planner accepted, so every
-                // appended anchor is wired by the staging pass below.
-                if(bubble.plannedInterval < 0) continue;
-                for(auto& allele : bubble.alleles) {
-                    if(allele.members.empty()) continue;
-                    appendAnchor(allele);
-                    ++hetAnchorPairs;
-                }
-                // Trailing hom = interior separator to the next bubble. Not
-                // created for the last bubble in an interval (it connects
-                // straight to the backbone successor).
-                if(!bubble.isLastInInterval && !bubble.hom.members.empty()) {
-                    appendAnchor(bubble.hom);
-                    ++homAnchorPairs;
-                }
-            }
-        }
+        for(AnchorWindow& window : anchorWindows)
+            appendWindowHetAnchors(*shasta2Anchors, window, hetAnchorPairs, homAnchorPairs);
         cout << timestamp << "  (" << homAnchorPairs
              << " hom separator anchor pairs)" << endl;
         cout << timestamp << "Appended " << hetAnchorPairs
@@ -1301,142 +1478,26 @@ void dinara::main::assemble(
              << " anchors." << endl;
     }
 
-    // Stage all window-local (intra-window) anchor-graph edges on the windows:
-    // the backbone chain (consecutive backbone anchors + RC mirror) and the het
-    // bubbles (pred->allele->succ + RC mirror). These edges are fully determined
-    // by a single window, so they live in the window structure; the anchor graph
-    // constructor replays window.intraWindowEdges directly. Inter-window edges
-    // are NOT staged here (they need multiple windows and are discovered in a
-    // global pass). This runs after the het-anchor append so allele anchor ids
-    // are assigned.
+    // Pass 3: stage window-local (intra-window) anchor-graph edges on the
+    // windows: the backbone chain (consecutive backbone anchors + RC mirror) and
+    // the het bubbles (pred->allele->succ + RC mirror). These edges are fully
+    // determined by a single window, so they live in the window structure; the
+    // anchor graph constructor replays window.intraWindowEdges directly.
+    // Inter-window edges are NOT staged here (they need multiple windows and are
+    // discovered in a global pass). Runs after the het-anchor append so allele
+    // anchor ids are assigned.
     {
         const uint64_t anchorCount = shasta2Anchors->size();
-        const uint32_t kHalf = uint32_t(shasta2Anchors->k / 2);
         uint64_t stagedBackbone = 0, stagedHet = 0, chainedIntervals = 0;
-
-        // Emit a forward edge plus its RC mirror (v^1 -> u^1) onto the window.
-        // isHet controls how the constructor builds the edge: false = the normal
-        // marker-based path (backbone-only endpoints), true = the direct
-        // read-intersection path (any het/hom endpoint, which has no marker
-        // ordinal).
-        auto emitEdge = [&](AnchorWindow& w, Shasta2AnchorId A, Shasta2AnchorId B,
-                            uint32_t off, bool isHet, uint64_t& counter) {
-            if(uint64_t(A) >= anchorCount || uint64_t(B) >= anchorCount) return;
-            w.intraWindowEdges.push_back({A, B, off, isHet});
-            ++counter;
-            const Shasta2AnchorId Arc = Shasta2AnchorId(uint64_t(A) ^ 1ULL);
-            const Shasta2AnchorId Brc = Shasta2AnchorId(uint64_t(B) ^ 1ULL);
-            if(uint64_t(Arc) < anchorCount && uint64_t(Brc) < anchorCount) {
-                w.intraWindowEdges.push_back({Brc, Arc, off, isHet});
-                ++counter;
-            }
-        };
-
-        // A step in an interval's series chain: either a SINGLE anchor
-        // (backbone endpoint or hom separator) or a BUBBLE (>=2 allele arms).
-        struct ChainStep {
-            vector<Shasta2AnchorId> ids;   // 1 = single, >=2 = bubble arms
-            uint32_t off = 0;              // representative backbone offset
-        };
-
+        vector<Shasta2AnchorId> bbAnchors;
+        vector<uint32_t> bbOffset;
         for(AnchorWindow& window : anchorWindows) {
-            const OrientedReadId backboneOid = window.backboneOrientedReadId;
-            const auto backboneJourney = (*shasta2Journeys)[backboneOid];
-
-            // Ordered backbone anchors for this window.
-            vector<Shasta2AnchorId> bbAnchors;
-            const auto& positions = window.filteredBackbonePositions;
-            if(!positions.empty()) {
-                for(const uint32_t pos : positions)
-                    bbAnchors.push_back(backboneJourney[pos]);
-            } else {
-                for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; pos++)
-                    bbAnchors.push_back(backboneJourney[pos]);
+            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
+                                      hetKHalf, bbAnchors, bbOffset)) {
+                continue;
             }
-            if(bbAnchors.size() < 2) continue;
-
-            // Backbone offsets of each backbone anchor.
-            const uint32_t backboneBeginPos =
-                shasta2Anchors->getPosition(bbAnchors.front(), backboneOid) - kHalf;
-            vector<uint32_t> bbOffset(bbAnchors.size());
-            for(size_t i = 0; i < bbAnchors.size(); i++)
-                bbOffset[i] = shasta2Anchors->getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
-
-            // Group the planned bubbles by their assigned backbone interval
-            // (computed by the planner pre-pass via strict flank-span
-            // containment). Bubbles with plannedInterval < 0 were dropped and
-            // are ignored here.
-            vector<vector<const AnchorWindow::HetBubble*>> byInterval(bbAnchors.size());
-            for(const auto& bubble : window.hetBubbles) {
-                if(bubble.plannedInterval < 0) continue;
-                const size_t i = size_t(bubble.plannedInterval);
-                if(i + 1 < bbAnchors.size()) byInterval[i].push_back(&bubble);
-            }
-
-            // For each backbone interval: no contained bubble -> plain backbone
-            // edge; otherwise build the hom-bracketed series chain and OMIT the
-            // direct backbone edge (the chain replaces the shortcut).
-            for(uint64_t i = 0; i + 1 < bbAnchors.size(); i++) {
-                auto& bubs = byInterval[i];
-                if(bubs.empty()) {
-                    emitEdge(window, bbAnchors[i], bbAnchors[i + 1], 0, false, stagedBackbone);
-                    continue;
-                }
-                ++chainedIntervals;
-
-                // Order the interval's bubbles by position.
-                std::sort(bubs.begin(), bubs.end(),
-                    [](const AnchorWindow::HetBubble* a, const AnchorWindow::HetBubble* b) {
-                        return a->backboneOffset < b->backboneOffset;
-                    });
-
-                // Build the ordered step list: the flanking backbone anchors
-                // bracket the chain, and an INTERIOR hom separates each pair of
-                // consecutive bubbles (the last bubble connects straight to the
-                // backbone successor):
-                //   bbA_i -> arms_0 -> hom_0 -> arms_1 -> hom_1
-                //         -> ... -> hom_{n-2} -> arms_{n-1} -> bbA_{i+1}
-                // The two backbone-touching edges (bbA_i -> arms_0 and
-                // arms_{n-1} -> bbA_{i+1}) are built by addHetEdge from the
-                // arm's own member list (not a k=50/k=2 intersection), so they
-                // are never dropped -- no hom bracket needed at the ends.
-                vector<ChainStep> steps;
-                steps.push_back({{bbAnchors[i]}, bbOffset[i]});
-                for(size_t bj = 0; bj < bubs.size(); bj++) {
-                    const auto* b = bubs[bj];
-                    ChainStep bubbleStep;
-                    bubbleStep.off = b->backboneOffset;
-                    for(const auto& allele : b->alleles) {
-                        if(allele.anchorId == invalid<Shasta2AnchorId>) continue;
-                        if(uint64_t(allele.anchorId) >= anchorCount) continue;
-                        bubbleStep.ids.push_back(allele.anchorId);
-                    }
-                    steps.push_back(std::move(bubbleStep));
-                    // Interior separator hom: added for every bubble EXCEPT the
-                    // last (which connects directly to the backbone successor).
-                    const bool isLast = (bj + 1 == bubs.size());
-                    if(!isLast &&
-                       b->hom.anchorId != invalid<Shasta2AnchorId> &&
-                       uint64_t(b->hom.anchorId) < anchorCount) {
-                        steps.push_back({{b->hom.anchorId}, b->succBackboneOffset});
-                    }
-                }
-                steps.push_back({{bbAnchors[i + 1]}, bbOffset[i + 1]});
-
-                // Connect consecutive steps. Every edge touches a het/hom anchor
-                // (backbone->arms, arms->hom, hom->arms, arms->backbone), so
-                // isHet=true. Offsets are strictly increasing by construction
-                // (containment guarantees bbOffset[i] < snpOff < succOff <
-                // bbOffset[i+1], bubbles sorted), so no fallback offset is used.
-                for(size_t s = 0; s + 1 < steps.size(); s++) {
-                    const ChainStep& p = steps[s];
-                    const ChainStep& q = steps[s + 1];
-                    const uint32_t off = (q.off > p.off) ? (q.off - p.off) : 1;
-                    for(const Shasta2AnchorId A : p.ids)
-                        for(const Shasta2AnchorId B : q.ids)
-                            emitEdge(window, A, B, off, true, stagedHet);
-                }
-            }
+            stageWindowIntraEdges(window, anchorCount, bbAnchors, bbOffset,
+                                  stagedBackbone, stagedHet, chainedIntervals);
         }
         cout << timestamp << "Staged intra-window edges: "
              << stagedBackbone << " backbone, " << stagedHet << " het ("
