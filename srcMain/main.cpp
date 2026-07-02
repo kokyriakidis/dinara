@@ -1564,15 +1564,20 @@ void dinara::main::assemble(
         assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
         cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
 
-        // Persist the anchor graph as binary, not just the GFA/CSV views:
-        //   - saveForShasta2: shasta2-compatible MemoryMapped format, consumed
-        //     by shasta2 via --external-anchor-graph-name.
-        //   - saveAnchorGraph: dinara's own binary format, so the graph can be
-        //     reloaded without rebuilding it.
-        assembler.shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
-        assembler.shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-        cout << timestamp << "Wrote Shasta2ExternalAnchorGraph (shasta2) and "
-             << "Shasta2AnchorGraph binary (dinara)." << endl;
+        // Persist the anchor graph as binary, not just the GFA/CSV views.
+        //
+        // saveForShasta2 writes the shasta2-compatible MemoryMapped format
+        // (a boost archive of shasta2::AnchorGraph). This is the ONLY file
+        // shasta2 can load via --external-anchor-graph-name; dinara's own
+        // save() format is a different, incompatible archive and will segfault
+        // shasta2 if passed there. Written to an absolute path, mirroring the
+        // external anchors, so the exact --external-anchor-graph-name to pass
+        // is printed below.
+        const string externalAnchorGraphName =
+            std::filesystem::absolute("Shasta2ExternalAnchorGraph").string();
+        assembler.shasta2AnchorGraph->saveForShasta2(externalAnchorGraphName);
+        cout << timestamp << "Wrote shasta2 anchor graph. Use "
+             << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
     }
 
     // Build the assembly graph from the anchor graph. This collapses each
