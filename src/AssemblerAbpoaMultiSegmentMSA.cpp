@@ -310,11 +310,12 @@ vector<WindowSnp> detectWindowSnps(
         vector<int> refSeqIds;
         const int refSupport = alleleSupport(refNode, refSeqIds);
 
-        // Collect EVERY distinct non-reference base allele. A multiallelic site
-        // (ref + 2 alt bases) is emitted as separate biallelic records sharing
-        // the same column and spanning depth, matching how the rest of the
-        // pipeline (KmVarKey, one altBase per record) represents variants. The
-        // total base-allele depth sums all alleles so per-alt VAF is correct.
+        // Collect EVERY distinct non-reference base allele. All alleles at this
+        // column (ref + each alt) are emitted together in a SINGLE WindowSnp,
+        // so a multiallelic site (ref + >=2 alt bases) becomes one N-armed
+        // bubble rather than several biallelic records that duplicate the
+        // reference. The total base-allele depth sums all alleles so per-alt
+        // VAF (alt.support / spanning) is correct.
         struct AltAllele { int node; uint8_t base; int support; vector<int> seqIds; };
         vector<AltAllele> alts;
         int totalAlleleSupport = 0;
@@ -333,7 +334,6 @@ vector<WindowSnp> detectWindowSnps(
         // ref/alt/del site reports true VAF, not an inflated one. Shared across
         // all alt alleles at this column.
         const int spanning = totalAlleleSupport + delSupport;
-        const int nAltAlleles = static_cast<int>(alts.size());
 
         // Homopolymer / short-tandem-repeat context of the backbone at this
         // SNP. kmIsHomopolymer scans repeat units of length 1..6 requiring >=3
