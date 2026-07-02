@@ -1570,11 +1570,18 @@ void dinara::main::assemble(
         // (a boost archive of shasta2::AnchorGraph). This is the ONLY file
         // shasta2 can load via --external-anchor-graph-name; dinara's own
         // save() format is a different, incompatible archive and will segfault
-        // shasta2 if passed there. Written to an absolute path, mirroring the
-        // external anchors, so the exact --external-anchor-graph-name to pass
-        // is printed below.
-        const string externalAnchorGraphName =
-            std::filesystem::absolute("Shasta2ExternalAnchorGraph").string();
+        // shasta2 if passed there. Write it into the run's Data/ directory under
+        // the same "Data/Shasta2-Shasta2AnchorGraph" name the binary-data path
+        // uses, so the standard --external-anchor-graph-name works unchanged.
+        string externalAnchorGraphName =
+            assembler.shasta2MappedMemoryOwner().largeDataName("Shasta2AnchorGraph");
+        if(externalAnchorGraphName.empty()) {
+            // No binary-data directory (e.g. memory-mode anonymous): fall back to
+            // a plain file in the working directory.
+            externalAnchorGraphName = "Shasta2ExternalAnchorGraph";
+        }
+        externalAnchorGraphName =
+            std::filesystem::absolute(externalAnchorGraphName).string();
         assembler.shasta2AnchorGraph->saveForShasta2(externalAnchorGraphName);
         cout << timestamp << "Wrote shasta2 anchor graph. Use "
              << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
