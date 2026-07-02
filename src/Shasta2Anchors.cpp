@@ -452,14 +452,21 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
-        // Het anchors store their position with the het marker half-length
-        // (hetK/2 = 1); primary anchors use the store's k/2. Recover rawPosition
-        // with the matching half-length so the exported first-base position is
-        // correct for both.
-        const uint32_t halfForRaw = isHetAnchor ? 1u : uint32_t(k / 2);
+        // Export is uniform for shasta2 --k 2: every anchor's rawPosition is
+        // its stored midpoint minus 1, so shasta2 (which stores midpoint =
+        // rawPosition + k/2 = rawPosition + 1) recovers exactly the original
+        // midpoint for both het and primary anchors. No positional shift.
+        //
+        // The exported 2-base k-mer differs by anchor class but is always
+        // consistent across a given anchor's member reads:
+        //  - Het anchors have 2 shared bases by construction.
+        //  - Primary anchors agree over the full k=50 window (verified above),
+        //    so the centered 2-base subset at [position-1, position] is
+        //    identical across all members too. Any 2-base subset would do;
+        //    the center keeps guaranteed-good flanking sequence on both sides.
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
-            // External anchors store the raw position (first base of k-mer).
-            const uint32_t rawPosition = markerInfo.position - halfForRaw;
+            // External anchors store the raw position (first base of the k-mer).
+            const uint32_t rawPosition = markerInfo.position - 1u;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
