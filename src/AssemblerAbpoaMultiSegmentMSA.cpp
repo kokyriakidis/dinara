@@ -80,31 +80,37 @@ struct HetAlleleMember {
     uint32_t rawPosition;             // read base position at commonPred (predBase)
 };
 
-// A detected clean biallelic SNP in a window POA graph.
+// One allele of a detected het site. The reference (backbone) allele and every
+// alternate allele that independently clears minSupport/minVAF is represented,
+// so a triallelic column becomes a single 3-armed bubble instead of two
+// biallelic bubbles that duplicate the reference.
+struct WindowSnpAllele {
+    char base = 'N';                  // allele base (A/C/G/T)
+    uint8_t code = 0;                 // allele base code (0-3)
+    int support = 0;                  // reads carrying this allele
+    bool isRef = false;               // true for the backbone/reference allele
+    vector<OrientedReadId> reads;     // reads on this allele (phasing)
+    // Het-anchor members (read + rawPosition at commonPred). Subset of `reads`
+    // whose predecessor position was recoverable from the POA.
+    vector<HetAlleleMember> members;
+};
+
+// A detected clean SNP site (biallelic or multiallelic) in a window POA graph.
 struct WindowSnp {
     int msaRank = -1;                 // MSA column (topological rank) of the bubble
     int backboneOffset = -1;          // backbone base offset (into backboneCodes), -1 if backbone gaps here
-    char refBase = 'N';               // backbone (reference) allele
-    char altBase = 'N';               // alternate allele
-    int refSupport = 0;               // reads carrying refBase
-    int altSupport = 0;               // reads carrying altBase
     int delSupport = 0;               // reads carrying a coexisting deletion (skip edge)
     int spanning = 0;                 // reads spanning the column (VAF denominator)
-    double vaf = 0.0;                  // altSupport / spanning (this alt allele)
-    int nAltAlleles = 1;              // # of distinct alt bases at this column (>1 = multiallelic)
     bool inHomopolymerOrRepeat = false; // backbone context is a homopolymer/STR run
-    vector<OrientedReadId> refReads;  // reads on the reference allele (phasing)
-    vector<OrientedReadId> altReads;  // reads on the alternate allele (phasing)
-    // Het-anchor members (read + rawPosition at commonPred) for the two
-    // alleles. Parallel to refReads/altReads in the reads they cover, but only
-    // include reads whose predecessor position was recoverable from the POA.
-    vector<HetAlleleMember> refMembers;
-    vector<HetAlleleMember> altMembers;
+    // All alleles clearing the gates: [0] = reference, [1..] = alternates. Every
+    // entry (including ref) has support >= minSupport; each alt also has
+    // vaf >= minVaf. Size >= 2 (ref + >=1 alt) whenever the site is emitted.
+    vector<WindowSnpAllele> alleles;
 
     // Trailing hom anchor members: reads at commonSucc (rawPosition = succ base
     // position), forming the k=2 hom anchor [succBase, nextBase]. The
     // flank-linearity test guarantees commonSucc->succNext is linear, so this
-    // 2-mer is shared by ALL reads spanning the site (both alleles reconverge
+    // 2-mer is shared by ALL reads spanning the site (all alleles reconverge
     // here). succBackboneOffset is the backbone offset of commonSucc.
     int succBackboneOffset = -1;
     uint8_t succBase = 0;   // base at commonSucc (0-3)
@@ -447,56 +453,76 @@ vector<WindowSnp> detectWindowSnps(
             mapMembersAt(seqIds, commonPred, out);
         };
 
-        // Emit one biallelic record per distinct alt allele. For a site to be a
-        // heterozygous variant, BOTH alleles must be independently supported:
-        // the reference allele and this alt allele each need >= minSupport
-        // reads. Gating only the alt lets through homozygous-alt-vs-backbone
-        // columns (refSupport == 1, the lone backbone read) and single-read
-        // artifacts, which are not het sites. Each alt is also gated on its own
-        // VAF so a strong alt survives a second weak alt at the same column.
+        // Emit ONE record per column, carrying every allele that clears the
+        // gates. For a het site the reference allele and at least one alternate
+        // must be independently supported (>= minSupport each; each alt also
+        // >= minVaf). Gating only the alt would let through
+        // homozygous-alt-vs-backbone columns (refSupport == 1, the lone
+        // backbone read) and single-read artifacts, which are not het sites.
+        // A multiallelic column (ref + >=2 strong alts) becomes a single
+        // N-armed bubble here rather than several biallelic bubbles that would
+        // duplicate the reference and be wrongly chained in series.
         if(refSupport < minSupport) continue;
+
+        // Collect the qualifying alt alleles first, so we know the arm count
+        // and can skip columns that end up with no usable alt.
+        vector<const AltAllele*> keptAlts;
         for(const AltAllele& alt : alts) {
             if(alt.support < minSupport) continue;
             const double vaf = (spanning > 0) ? double(alt.support) / double(spanning) : 0.0;
             if(vaf < minVaf) continue;
-
-            WindowSnp snp;
-            snp.msaRank = (abg->node_id_to_msa_rank != nullptr) ? abg->node_id_to_msa_rank[refNode] : -1;
-            snp.backboneOffset = backboneOff;
-            snp.inHomopolymerOrRepeat = inRepeat;
-            snp.refBase = codeToChar(refCode);
-            snp.altBase = codeToChar(alt.base);
-            snp.refSupport = refSupport;
-            snp.altSupport = alt.support;
-            snp.delSupport = delSupport;
-            snp.spanning = spanning;
-            snp.vaf = vaf;
-            snp.nAltAlleles = nAltAlleles;
-            mapReads(refSeqIds, snp.refReads);
-            mapReads(alt.seqIds, snp.altReads);
-            mapMembers(refSeqIds, snp.refMembers);
-            mapMembers(alt.seqIds, snp.altMembers);
-
-            // Hom-separator anchor at commonSucc: [succBase, nextBase]. All
-            // reads spanning the site (ref + this alt) reconverge here, so
-            // recover each one's position at commonSucc. rawPosition = succ base
-            // position; the flank-linearity test guarantees the next base is
-            // linear, so [succBase, nextBase] is shared by all these reads.
-            snp.succBackboneOffset = nodeToBackboneOffset[commonSucc];
-            snp.succBase = abg->node[commonSucc].base;
-            {
-                vector<int> homSeqIds = refSeqIds;
-                homSeqIds.insert(homSeqIds.end(), alt.seqIds.begin(), alt.seqIds.end());
-                mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
-            }
-            snps.push_back(std::move(snp));
+            keptAlts.push_back(&alt);
         }
+        if(keptAlts.empty()) continue;   // no strong alt: not a het site
+
+        WindowSnp snp;
+        snp.msaRank = (abg->node_id_to_msa_rank != nullptr) ? abg->node_id_to_msa_rank[refNode] : -1;
+        snp.backboneOffset = backboneOff;
+        snp.inHomopolymerOrRepeat = inRepeat;
+        snp.delSupport = delSupport;
+        snp.spanning = spanning;
+
+        // Reference allele (arm 0).
+        {
+            WindowSnpAllele refAllele;
+            refAllele.base = codeToChar(refCode);
+            refAllele.code = refCode;
+            refAllele.support = refSupport;
+            refAllele.isRef = true;
+            mapReads(refSeqIds, refAllele.reads);
+            mapMembers(refSeqIds, refAllele.members);
+            snp.alleles.push_back(std::move(refAllele));
+        }
+        // Alternate alleles (arms 1..).
+        for(const AltAllele* alt : keptAlts) {
+            WindowSnpAllele altAllele;
+            altAllele.base = codeToChar(alt->base);
+            altAllele.code = alt->base;
+            altAllele.support = alt->support;
+            altAllele.isRef = false;
+            mapReads(alt->seqIds, altAllele.reads);
+            mapMembers(alt->seqIds, altAllele.members);
+            snp.alleles.push_back(std::move(altAllele));
+        }
+
+        // Hom-separator anchor at commonSucc: [succBase, nextBase]. All reads
+        // spanning the site (ref + every kept alt) reconverge here, so recover
+        // each one's position at commonSucc. The flank-linearity test guarantees
+        // the next base is linear, so [succBase, nextBase] is shared by all.
+        snp.succBackboneOffset = nodeToBackboneOffset[commonSucc];
+        snp.succBase = abg->node[commonSucc].base;
+        {
+            vector<int> homSeqIds = refSeqIds;
+            for(const AltAllele* alt : keptAlts)
+                homSeqIds.insert(homSeqIds.end(), alt->seqIds.begin(), alt->seqIds.end());
+            mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
+        }
+        snps.push_back(std::move(snp));
     }
 
-    // Report in backbone order; alt records at the same column stay grouped.
+    // Report in backbone order.
     sort(snps.begin(), snps.end(), [](const WindowSnp& a, const WindowSnp& b) {
-        if(a.backboneOffset != b.backboneOffset) return a.backboneOffset < b.backboneOffset;
-        return a.altBase < b.altBase;
+        return a.backboneOffset < b.backboneOffset;
     });
     cout << "  homopolymer/STR SNPs "
          << (dropRepeatContext ? "dropped: " : "flagged: ")
@@ -1033,61 +1059,62 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
              << ", dropRepeatContext=" << (dropRepeatContext ? "true" : "false")
              << ")" << endl;
         for(const WindowSnp& snp : snps) {
+            const WindowSnpAllele& ref = snp.alleles.front();
             cout << "    col rank=" << snp.msaRank
                  << " backboneOff=" << snp.backboneOffset
-                 << " " << snp.refBase << ">" << snp.altBase
-                 << " ref=" << snp.refSupport
-                 << " alt=" << snp.altSupport
-                 << " del=" << snp.delSupport
+                 << " " << ref.base << ">";
+            // alt bases
+            for(size_t ai = 1; ai < snp.alleles.size(); ai++)
+                cout << (ai > 1 ? "," : "") << snp.alleles[ai].base;
+            cout << " ref=" << ref.support << " alt=";
+            for(size_t ai = 1; ai < snp.alleles.size(); ai++)
+                cout << (ai > 1 ? "," : "") << snp.alleles[ai].support;
+            const int nAlt = int(snp.alleles.size()) - 1;
+            const double topVaf = (snp.spanning > 0 && nAlt > 0)
+                ? double(snp.alleles[1].support) / double(snp.spanning) : 0.0;
+            cout << " del=" << snp.delSupport
                  << " span=" << snp.spanning
-                 << " VAF=" << snp.vaf
-                 << (snp.nAltAlleles > 1 ? " [multi]" : "")
+                 << " VAF=" << topVaf
+                 << (nAlt > 1 ? " [multi]" : "")
                  << (snp.delSupport > 0 ? " [+del]" : "")
                  << (snp.inHomopolymerOrRepeat ? " [repeat]" : "")
-                 << " refMembers=" << snp.refMembers.size()
-                 << " altMembers=" << snp.altMembers.size() << endl;
+                 << " arms=" << snp.alleles.size()
+                 << " refMembers=" << ref.members.size();
+            for(size_t ai = 1; ai < snp.alleles.size(); ai++)
+                cout << " altMembers[" << ai << "]=" << snp.alleles[ai].members.size();
+            cout << endl;
         }
 
         // Stage het-anchor descriptors on the window: one k=2 anchor per allele
-        // (ref + this alt) per SNP record. Members carry rawPosition at the
-        // bubble's common predecessor; predBase is the backbone base there, the
-        // allele base is ref/alt. IDs are assigned in the post-window append
-        // pass. Only stage alleles that have at least one recoverable member.
+        // per SNP record. A biallelic site yields 2 arms (ref + alt); a
+        // multiallelic site yields N arms (ref + each strong alt) in a SINGLE
+        // bubble. Members carry rawPosition at the bubble's common predecessor;
+        // predBase is the backbone base there, the allele base is this allele's
+        // base. IDs are assigned in the post-window append pass. Only stage
+        // arms that have at least one recoverable member.
         for(const WindowSnp& snp : snps) {
-            if(snp.refMembers.empty() && snp.altMembers.empty()) continue;
             // predBase: backbone base at (backboneOffset - 1); if the SNP is at
             // offset 0 there is no predecessor base, so skip (cannot form the
             // 2-base marker).
             if(snp.backboneOffset <= 0) continue;
             const uint8_t predBase = backboneCodes[snp.backboneOffset - 1];
-            const uint8_t refCode = static_cast<uint8_t>(
-                snp.refBase == 'A' ? 0 : snp.refBase == 'C' ? 1 :
-                snp.refBase == 'G' ? 2 : snp.refBase == 'T' ? 3 : 0);
-            const uint8_t altCode = static_cast<uint8_t>(
-                snp.altBase == 'A' ? 0 : snp.altBase == 'C' ? 1 :
-                snp.altBase == 'G' ? 2 : snp.altBase == 'T' ? 3 : 0);
 
             AnchorWindow::HetBubble bubble;
             bubble.backboneOffset = static_cast<uint32_t>(snp.backboneOffset);
 
-            AnchorWindow::HetAnchor refAnchor;
-            refAnchor.backboneOffset = bubble.backboneOffset;
-            refAnchor.predBase = predBase;
-            refAnchor.alleleBase = refCode;
-            refAnchor.isRef = true;
-            for(const HetAlleleMember& m : snp.refMembers)
-                refAnchor.members.push_back({m.orientedReadId, m.rawPosition});
-
-            AnchorWindow::HetAnchor altAnchor;
-            altAnchor.backboneOffset = bubble.backboneOffset;
-            altAnchor.predBase = predBase;
-            altAnchor.alleleBase = altCode;
-            altAnchor.isRef = false;
-            for(const HetAlleleMember& m : snp.altMembers)
-                altAnchor.members.push_back({m.orientedReadId, m.rawPosition});
-
-            bubble.alleles.push_back(std::move(refAnchor));
-            bubble.alleles.push_back(std::move(altAnchor));
+            for(const WindowSnpAllele& allele : snp.alleles) {
+                if(allele.members.empty()) continue;  // no recoverable member
+                AnchorWindow::HetAnchor arm;
+                arm.backboneOffset = bubble.backboneOffset;
+                arm.predBase = predBase;
+                arm.alleleBase = allele.code;
+                arm.isRef = allele.isRef;
+                for(const HetAlleleMember& m : allele.members)
+                    arm.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.alleles.push_back(std::move(arm));
+            }
+            // Need at least two arms to form a bubble.
+            if(bubble.alleles.size() < 2) continue;
 
             // Hom separator anchor [succBase, nextBase] at commonSucc. predBase
             // of the hom is succBase (the base shared by all reads at
