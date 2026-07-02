@@ -97,14 +97,19 @@ void writeMmapFile(const string& fileName, const string& data)
 
 
 // Wrapper that mirrors shasta2::AnchorGraph's serialization structure.
-// AnchorGraph::serialize() does: ar & base_object<AnchorGraphBaseClass>(*this)
-// This adds class tracking metadata that a standalone AnchorGraphBaseClass
-// serialization does not include. Without this wrapper, the archive is
-// 5 bytes shorter and shasta2's deserializer reads misaligned data.
+// Upstream AnchorGraph::serialize() does:
+//     ar & base_object<AnchorGraphBaseClass>(*this);
+//     ar & orientedReadIds;
+// Each AnchorGraphEdge stores anchorIdA/anchorIdB plus [begin,end) indices into
+// this graph-level orientedReadIds vector (rather than an inline AnchorPair), so
+// the wrapper must carry and serialize that vector for the archive to match what
+// shasta2's --external-anchor-graph-name loader expects.
 struct AnchorGraphWrapper : public shasta2::AnchorGraphBaseClass {
+    vector<shasta2::OrientedReadId> orientedReadIds;
     friend class boost::serialization::access;
     template<class Archive> void serialize(Archive& ar, unsigned int) {
         ar & boost::serialization::base_object<shasta2::AnchorGraphBaseClass>(*this);
+        ar & orientedReadIds;
     }
 };
 
@@ -137,19 +142,22 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
         const auto src = boost::source(e, dinaraGraph);
         const auto tgt = boost::target(e, dinaraGraph);
 
-        // Convert dinara AnchorPair -> shasta2 AnchorPair.
-        shasta2::AnchorPair shastaPair;
-        shastaPair.anchorIdA = dEdge.anchorPair.anchorIdA;
-        shastaPair.anchorIdB = dEdge.anchorPair.anchorIdB;
-        shastaPair.orientedReadIds.resize(dEdge.anchorPair.orientedReadIds.size());
-        for(size_t i = 0; i < dEdge.anchorPair.orientedReadIds.size(); i++) {
-            shastaPair.orientedReadIds[i] =
-                shasta2::OrientedReadId::fromValue(
-                    dEdge.anchorPair.orientedReadIds[i].getValue());
+        // Append this edge's oriented reads to the shared vector and record the
+        // [begin,end) range (upstream's AnchorGraph::addEdge layout). The edge no
+        // longer carries an offset; shasta2 recomputes offsets during assembly.
+        const uint64_t begin = shastaGraph.orientedReadIds.size();
+        for(const auto& rid : dEdge.anchorPair.orientedReadIds) {
+            shastaGraph.orientedReadIds.push_back(
+                shasta2::OrientedReadId::fromValue(rid.getValue()));
         }
+        const uint64_t end = shastaGraph.orientedReadIds.size();
 
-        shasta2::AnchorGraphEdge shastaEdge(shastaPair, dEdge.offset, dEdge.id);
-        shastaEdge.useForAssembly = true;
+        shasta2::AnchorGraphEdge shastaEdge(
+            dEdge.anchorPair.anchorIdA,
+            dEdge.anchorPair.anchorIdB,
+            begin, end,
+            dEdge.id,
+            /* useForAssembly */ true);
 
         boost::add_edge(src, tgt, shastaEdge, shastaGraph);
         ++edgeCount;
@@ -194,39 +202,46 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
             cout << "ROUND-TRIP MISMATCH: edges " << rtEdges << " vs " << edgeCount << endl;
             mismatch = true;
         }
+        if(roundTrip.orientedReadIds.size() != shastaGraph.orientedReadIds.size()) {
+            cout << "ROUND-TRIP MISMATCH: orientedReadIds "
+                 << roundTrip.orientedReadIds.size() << " vs "
+                 << shastaGraph.orientedReadIds.size() << endl;
+            mismatch = true;
+        }
 
-        // Compare each edge.
+        // Compare each edge: anchor ids, index range, and the reads in that range.
         uint64_t edgeIdx = 0;
         uint64_t badEdges = 0;
         auto [origIt, origEnd] = boost::edges(shastaGraph);
         auto [rtIt, rtEnd] = boost::edges(roundTrip);
         for(; origIt != origEnd && rtIt != rtEnd; ++origIt, ++rtIt, ++edgeIdx) {
-            const auto& origPair = shastaGraph[*origIt].anchorPair;
-            const auto& rtPair = roundTrip[*rtIt].anchorPair;
+            const auto& origEdge = shastaGraph[*origIt];
+            const auto& rtEdge = roundTrip[*rtIt];
 
             bool bad = false;
-            if(origPair.anchorIdA != rtPair.anchorIdA ||
-               origPair.anchorIdB != rtPair.anchorIdB) {
+            if(origEdge.anchorIdA != rtEdge.anchorIdA ||
+               origEdge.anchorIdB != rtEdge.anchorIdB) {
                 bad = true;
             }
-            if(origPair.orientedReadIds.size() != rtPair.orientedReadIds.size()) {
+            const uint64_t origN = origEdge.orientedReadIdsEnd - origEdge.orientedReadIdsBegin;
+            const uint64_t rtN = rtEdge.orientedReadIdsEnd - rtEdge.orientedReadIdsBegin;
+            if(origN != rtN) {
                 bad = true;
             } else {
-                for(size_t i = 0; i < origPair.orientedReadIds.size(); i++) {
-                    if(origPair.orientedReadIds[i].getValue() != rtPair.orientedReadIds[i].getValue()) {
-                        bad = true;
-                        break;
-                    }
+                for(uint64_t i = 0; i < origN; i++) {
+                    const auto o = shastaGraph.orientedReadIds[origEdge.orientedReadIdsBegin + i];
+                    const auto r = roundTrip.orientedReadIds[rtEdge.orientedReadIdsBegin + i];
+                    if(o.getValue() != r.getValue()) { bad = true; break; }
                 }
             }
             if(bad) {
                 ++badEdges;
                 if(badEdges <= 5) {
                     cout << "ROUND-TRIP EDGE MISMATCH #" << edgeIdx
-                         << ": orig " << origPair.anchorIdA << "->" << origPair.anchorIdB
-                         << " (" << origPair.orientedReadIds.size() << " reads)"
-                         << " vs rt " << rtPair.anchorIdA << "->" << rtPair.anchorIdB
-                         << " (" << rtPair.orientedReadIds.size() << " reads)" << endl;
+                         << ": orig " << origEdge.anchorIdA << "->" << origEdge.anchorIdB
+                         << " (" << origN << " reads)"
+                         << " vs rt " << rtEdge.anchorIdA << "->" << rtEdge.anchorIdB
+                         << " (" << rtN << " reads)" << endl;
                 }
             }
         }
@@ -236,7 +251,8 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
         }
         if(!mismatch) {
             cout << "Round-trip verification passed: " << rtVertices << " vertices, "
-                 << rtEdges << " edges match." << endl;
+                 << rtEdges << " edges, "
+                 << roundTrip.orientedReadIds.size() << " oriented reads match." << endl;
         }
     }
 }

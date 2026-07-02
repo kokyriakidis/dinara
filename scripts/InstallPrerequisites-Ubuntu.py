@@ -738,14 +738,16 @@ def installShasta2():
         os.chdir(temporaryDirectory)
         
         # Clone repo.
-        # Use the kokyriakidis fork of shasta2: it keeps Anchors::anchorInfos
-        # public, which dinara's populateAnchors* functions need to construct
-        # Anchors from external mode3 data. Upstream paoloshasta/shasta2 made
-        # that member private. The fork tracks upstream otherwise (including the
-        # upstream theseus API that theseusWrapper.cpp expects).
-        runCommand("git clone https://github.com/kokyriakidis/shasta2.git")
+        # Use upstream paoloshasta/shasta2. dinara's shasta2-compatible exporters
+        # (Shasta2AnchorGraphExport / Shasta2AssemblyGraphExport) match upstream's
+        # AnchorGraph serialization layout, and Anchors::anchorInfos is public in
+        # upstream, so no fork is needed. The generated external anchor graph must
+        # be loaded with a shasta2 binary built from this same upstream so the
+        # boost archive layout matches (edge = anchorIdA/B + index range into the
+        # graph-level orientedReadIds vector).
+        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
         # Pin to an exact commit for reproducible builds.
-        runCommand("git -C shasta2 checkout 277d537d1c9841bc1308e6e9a2c54acbb7ae241b")
+        runCommand("git -C shasta2 checkout 94389c2a6b1ff851f0302134dce386c133e64121")
         
         # Cleanup existing build directory to prevent BuildAbpoa.py failure
         home = os.path.expanduser("~")

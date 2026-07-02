@@ -91,10 +91,14 @@ void writeMmapFile(const string& fileName, const string& data)
 
 
 // Wrapper that mirrors shasta2::AnchorGraph's serialization structure.
+// Upstream edges reference reads by [begin,end) indices into this graph-level
+// orientedReadIds vector, which is serialized after the base graph object.
 struct AnchorGraphWrapper : public shasta2::AnchorGraphBaseClass {
+    vector<shasta2::OrientedReadId> orientedReadIds;
     friend class boost::serialization::access;
     template<class Archive> void serialize(Archive& ar, unsigned int) {
         ar & boost::serialization::base_object<shasta2::AnchorGraphBaseClass>(*this);
+        ar & orientedReadIds;
     }
 };
 
@@ -123,19 +127,18 @@ void Shasta2AssemblyGraph::saveForShasta2(const string& fileName) const
         for(const Shasta2AssemblyGraphEdgeStep& step : edge) {
             const Shasta2AnchorPair& dPair = step.anchorPair;
 
-            // Convert dinara AnchorPair -> shasta2 AnchorPair.
-            shasta2::AnchorPair shastaPair;
-            shastaPair.anchorIdA = dPair.anchorIdA;
-            shastaPair.anchorIdB = dPair.anchorIdB;
-            shastaPair.orientedReadIds.resize(dPair.orientedReadIds.size());
-            for(size_t i = 0; i < dPair.orientedReadIds.size(); i++) {
-                shastaPair.orientedReadIds[i] =
-                    shasta2::OrientedReadId::fromValue(
-                        dPair.orientedReadIds[i].getValue());
+            // Append this step's reads to the shared vector, record [begin,end)
+            // (upstream AnchorGraph::addEdge layout). Edges carry no offset.
+            const uint64_t begin = shastaGraph.orientedReadIds.size();
+            for(const auto& rid : dPair.orientedReadIds) {
+                shastaGraph.orientedReadIds.push_back(
+                    shasta2::OrientedReadId::fromValue(rid.getValue()));
             }
+            const uint64_t end = shastaGraph.orientedReadIds.size();
 
-            shasta2::AnchorGraphEdge shastaEdge(shastaPair, step.offset, edgeCount);
-            shastaEdge.useForAssembly = true;
+            shasta2::AnchorGraphEdge shastaEdge(
+                dPair.anchorIdA, dPair.anchorIdB,
+                begin, end, edgeCount, /* useForAssembly */ true);
 
             boost::add_edge(
                 uint64_t(dPair.anchorIdA),
