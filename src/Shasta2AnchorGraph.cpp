@@ -2817,6 +2817,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     {
         uint64_t backwardEdgeCount = 0;
         uint64_t missingReadEdgeCount = 0;
+        uint64_t zeroLenEdgeCount = 0;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
             const auto& dEdge = anchorGraph[e];
             if(!dEdge.useForAssembly) continue;
@@ -2828,6 +2829,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             uint64_t forwardCount = 0;
             uint64_t backwardCount = 0;
+            uint64_t zeroLenCount = 0;
             uint64_t onlyACount = 0;
             uint64_t onlyBCount = 0;
             uint64_t neitherCount = 0;
@@ -2845,8 +2847,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 const bool isOnB = (itB != anchorB.end() && itB->orientedReadId == orientedReadId);
 
                 if(isOnA && isOnB) {
-                    if(itB->position >= itA->position) {
+                    if(itB->position > itA->position) {
                         ++forwardCount;
+                    } else if(itB->position == itA->position) {
+                        // Equal positions on a read give this edge a zero-length
+                        // span, which shasta2's LocalAssembly6 rejects
+                        // (positionB > positionA). Count separately from backward.
+                        ++zeroLenCount;
                     } else {
                         ++backwardCount;
                     }
@@ -2859,13 +2866,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 }
             }
 
-            if(backwardCount > 0 || neitherCount > 0) {
+            if(backwardCount > 0 || neitherCount > 0 || zeroLenCount > 0) {
                 if(backwardCount > 0) ++backwardEdgeCount;
                 if(neitherCount > 0) ++missingReadEdgeCount;
-                if(backwardEdgeCount + missingReadEdgeCount <= 10) {
+                if(zeroLenCount > 0) ++zeroLenEdgeCount;
+                if(backwardEdgeCount + missingReadEdgeCount + zeroLenEdgeCount <= 20) {
                     cout << "EDGE CHECK " << ap.anchorIdA << " -> " << ap.anchorIdB
                          << ": forward=" << forwardCount
                          << " backward=" << backwardCount
+                         << " zeroLen=" << zeroLenCount
                          << " onlyA=" << onlyACount
                          << " onlyB=" << onlyBCount
                          << " neither=" << neitherCount
@@ -2875,6 +2884,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
         cout << "Edge verification: " << backwardEdgeCount << " edges with backward reads, "
+             << zeroLenEdgeCount << " edges with zero-length (equal-position) reads, "
              << missingReadEdgeCount << " edges with reads on neither anchor." << endl;
     }
 

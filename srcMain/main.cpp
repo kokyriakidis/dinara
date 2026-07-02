@@ -57,6 +57,7 @@ using namespace dinara;
 #include <map>
 #include "iostream.hpp"
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "stdexcept.hpp"
@@ -298,14 +299,20 @@ void planWindowHetBubbles(
         const auto ub = std::upper_bound(bbOffset.begin(), bbOffset.end(), leftOff);
         if(ub == bbOffset.begin() || ub == bbOffset.end()) { ++dropped; continue; }
         const size_t i = size_t(ub - bbOffset.begin()) - 1;
-        // Both bracketing homs must sit STRICTLY between the two backbone anchor
-        // midpoints. A hom that lands exactly on a midpoint shares that column
-        // with the backbone anchor (both export their k=2 marker centered at that
-        // offset), giving the hom<->backbone edge zero span and producing
-        // backward reads. Relaxing either bound to <= was verified to introduce
-        // backward-read edges, so strict containment is required.
+        // The bracketing homs must not collide with the flanking backbone
+        // anchors' EXPORTED positions. bbOffset[] is in the anchor-midpoint
+        // frame, but every anchor is exported at position (midpoint - 1) (the
+        // uniform k=2 half-length). So the backbone successor anchor bbOffset[i+1]
+        // is exported at bbOffset[i+1]-1: a trailing hom at succBackboneOffset ==
+        // bbOffset[i+1]-1 would map to the SAME read position as that backbone
+        // anchor, giving the hom->backbone edge a zero-length (equal-position)
+        // read that shasta2's LocalAssembly6 rejects (positionB > positionA).
+        // Require succBackboneOffset + 1 < bbOffset[i+1] on the right. The left
+        // side needs no extra margin: the predecessor anchor is likewise exported
+        // at bbOffset[i]-1, which shifts it further away from the leading hom, so
+        // strict bbOffset[i] < predBackboneOffset already avoids collision.
         if(bbOffset[i] < leftOff &&
-           b.succBackboneOffset < bbOffset[i + 1]) {
+           b.succBackboneOffset + 1 < bbOffset[i + 1]) {
             b.plannedInterval = int32_t(i);
             ++plannedBubbles;
         } else {
@@ -315,16 +322,93 @@ void planWindowHetBubbles(
 }
 
 
+// Reverse index (oriented-read, exported/shasta2 position) -> primary anchor id.
+// Built once over the primary anchors BEFORE any het/hom append. Every anchor is
+// exported at (storedMidpoint - 1) and shasta2 re-adds k/2 = 1, so an anchor's
+// shasta2 marker position equals its dinara stored midpoint. Thus two anchors
+// occupy the same shasta2 (read, position) marker iff their stored midpoints
+// coincide on that read. Used to detect a synthesized hom/allele that duplicates
+// an existing primary anchor's markers, which must reuse the primary's id rather
+// than append a positional duplicate (shasta2 read-following would otherwise pair
+// the two ids into a zero-length assembly step and assert).
+using PrimaryMarkerIndex = std::unordered_map<uint64_t, Shasta2AnchorId>;
+
+static inline uint64_t primaryMarkerKey(OrientedReadId oid, uint32_t position)
+{
+    return (uint64_t(oid.getValue()) << 32) | uint64_t(position);
+}
+
+PrimaryMarkerIndex buildPrimaryMarkerIndex(const Shasta2Anchors& anchors)
+{
+    // Called before any het/hom append, so anchors.size() is the primary count
+    // and every stored marker belongs to a primary anchor.
+    PrimaryMarkerIndex index;
+    const uint64_t primaryCount = anchors.size();
+    for(Shasta2AnchorId aid = 0; aid < primaryCount; aid++) {
+        const Shasta2Anchor anchor = anchors[aid];
+        for(const Shasta2AnchorMarkerInfo& mi : anchor)
+            index[primaryMarkerKey(mi.orientedReadId, mi.position)] = aid;
+    }
+    return index;
+}
+
 // Create the canonical/RC anchor pair for one het/hom anchor from its member
 // list and record the assigned id on the anchor. No-op for empty member lists.
-void appendHetAnchor(Shasta2Anchors& anchors, AnchorWindow::HetAnchor& a)
+// If every member's shasta2 marker position coincides with the SAME existing
+// primary anchor, reuse that primary id instead of appending a duplicate: a
+// synthesized hom at a column where all reads agree is, by construction, the same
+// marker as a primary anchor, and emitting it as a second id creates zero-length
+// edges (equal read positions) that crash shasta2's local assembly.
+void appendHetAnchor(
+    Shasta2Anchors& anchors,
+    AnchorWindow::HetAnchor& a,
+    const PrimaryMarkerIndex& primaryIndex,
+    uint64_t& reusedPrimary,
+    uint64_t& appendedFresh,
+    uint64_t& partialCollision)
 {
     if(a.members.empty()) return;
+
+    // Resolve each member to the primary anchor (if any) holding the same
+    // shasta2 marker. A het/hom member's shasta2 position is rawPosition + 1
+    // (hetK/2), matching how appendHetAnchorPair stores the midpoint.
+    constexpr uint32_t hetKHalf = 1;
+    Shasta2AnchorId mappedPrimary = invalid<Shasta2AnchorId>;
+    bool mappedAgree = true;   // do all MAPPED members point at one primary?
+    uint64_t mappedCount = 0;
+    for(const auto& m : a.members) {
+        const auto it = primaryIndex.find(
+            primaryMarkerKey(m.orientedReadId, m.rawPosition + hetKHalf));
+        if(it == primaryIndex.end()) continue;   // no primary at this marker
+        ++mappedCount;
+        if(mappedPrimary == invalid<Shasta2AnchorId>) mappedPrimary = it->second;
+        else if(mappedPrimary != it->second) mappedAgree = false;
+    }
+
+    // Any member that coincides with a primary anchor's marker means this
+    // synthesized anchor would carry a duplicate (read, position) marker. shasta2
+    // would then pair the two ids and hit a zero-length assembly step. When the
+    // colliding members all point at the SAME primary (observed to hold in every
+    // case: a hom column is homozygous, so the intervening primary there is
+    // unique), reuse that primary anchor. Non-colliding members are dropped: the
+    // primary already provides the backbone-spanning bracket with real coverage,
+    // and dropping the extras (reads that pass the column but were below the
+    // primary's coverage threshold) only shrinks the bracket edge's read set, it
+    // never breaks it. This also covers the full-match case (mappedCount == size).
+    if(mappedCount > 0 && mappedAgree) {
+        a.anchorId = mappedPrimary;
+        if(mappedCount == a.members.size()) ++reusedPrimary; else ++partialCollision;
+        return;
+    }
+
+    // No primary collides (mappedCount == 0), or (not observed in practice) the
+    // colliding members split across multiple primaries. Append a fresh anchor.
     vector<std::pair<OrientedReadId, uint32_t>> members;
     members.reserve(a.members.size());
     for(const auto& m : a.members)
         members.push_back({m.orientedReadId, m.rawPosition});
     a.anchorId = anchors.appendHetAnchorPair(members);
+    ++appendedFresh;
 }
 
 
@@ -336,22 +420,29 @@ void appendHetAnchor(Shasta2Anchors& anchors, AnchorWindow::HetAnchor& a)
 void appendWindowHetAnchors(
     Shasta2Anchors& anchors,
     AnchorWindow& window,
+    const PrimaryMarkerIndex& primaryIndex,
     uint64_t& hetAnchorPairs,
-    uint64_t& homAnchorPairs)
+    uint64_t& homAnchorPairs,
+    uint64_t& reusedPrimary,
+    uint64_t& appendedFresh,
+    uint64_t& partialCollision)
 {
     for(auto& bubble : window.hetBubbles) {
         if(bubble.plannedInterval < 0) continue;
         // Leading hom: brackets the bubble upstream (backbone -> leadHom edge).
-        appendHetAnchor(anchors, bubble.leadHom);
+        appendHetAnchor(anchors, bubble.leadHom, primaryIndex,
+                        reusedPrimary, appendedFresh, partialCollision);
         ++homAnchorPairs;
         for(auto& allele : bubble.alleles) {
             if(allele.members.empty()) continue;
-            appendHetAnchor(anchors, allele);
+            appendHetAnchor(anchors, allele, primaryIndex,
+                            reusedPrimary, appendedFresh, partialCollision);
             ++hetAnchorPairs;
         }
         // Trailing hom: brackets the bubble downstream (arms -> hom edge, then
         // hom -> next leadHom or hom -> backbone successor).
-        appendHetAnchor(anchors, bubble.hom);
+        appendHetAnchor(anchors, bubble.hom, primaryIndex,
+                        reusedPrimary, appendedFresh, partialCollision);
         ++homAnchorPairs;
     }
 }
@@ -1476,11 +1567,23 @@ void dinara::main::assemble(
     {
         cout << timestamp << "Appending het anchors from "
              << anchorWindows.size() << " windows..." << endl;
+        // Build the primary (read, position) -> primary anchor id index once,
+        // BEFORE any append (so anchors.size() is still the primary count). Used
+        // to reuse an existing primary anchor when a synthesized hom/allele would
+        // duplicate its markers (avoids zero-length shasta2 assembly edges).
+        const PrimaryMarkerIndex primaryIndex = buildPrimaryMarkerIndex(*shasta2Anchors);
         uint64_t hetAnchorPairs = 0, homAnchorPairs = 0;
+        uint64_t reusedPrimary = 0, appendedFresh = 0, partialCollision = 0;
         for(AnchorWindow& window : anchorWindows)
-            appendWindowHetAnchors(*shasta2Anchors, window, hetAnchorPairs, homAnchorPairs);
+            appendWindowHetAnchors(*shasta2Anchors, window, primaryIndex,
+                                   hetAnchorPairs, homAnchorPairs,
+                                   reusedPrimary, appendedFresh, partialCollision);
         cout << timestamp << "  (" << homAnchorPairs
              << " hom separator anchor pairs)" << endl;
+        cout << timestamp << "  het/hom anchor collision resolution: "
+             << reusedPrimary << " reused an existing primary anchor (full match), "
+             << partialCollision << " reused a primary (partial match, extra "
+             << "members dropped), " << appendedFresh << " appended fresh." << endl;
         cout << timestamp << "Appended " << hetAnchorPairs
              << " het anchor pairs (" << (2 * hetAnchorPairs)
              << " anchors); store now has " << shasta2Anchors->size()
