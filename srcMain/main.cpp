@@ -298,6 +298,12 @@ void planWindowHetBubbles(
         const auto ub = std::upper_bound(bbOffset.begin(), bbOffset.end(), leftOff);
         if(ub == bbOffset.begin() || ub == bbOffset.end()) { ++dropped; continue; }
         const size_t i = size_t(ub - bbOffset.begin()) - 1;
+        // Both bracketing homs must sit STRICTLY between the two backbone anchor
+        // midpoints. A hom that lands exactly on a midpoint shares that column
+        // with the backbone anchor (both export their k=2 marker centered at that
+        // offset), giving the hom<->backbone edge zero span and producing
+        // backward reads. Relaxing either bound to <= was verified to introduce
+        // backward-read edges, so strict containment is required.
         if(bbOffset[i] < leftOff &&
            b.succBackboneOffset < bbOffset[i + 1]) {
             b.plannedInterval = int32_t(i);
