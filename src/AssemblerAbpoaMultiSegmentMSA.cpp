@@ -1019,38 +1019,53 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const int totSeq = readSeqId;  // backbone (0) + alignedReads
     ab->abs->n_seq = totSeq;
 
-    {
-        const string msaPath = "testAbpoaMultiSegmentMSA_window"
-            + to_string(window.windowId) + ".fasta";
-        FILE* msaFp = fopen(msaPath.c_str(), "w");
-        if(msaFp) {
-            // Populate abc (msa_base, msa_len) from the graph, then write it.
-            // abpoa_output_rc_msa returns early if msa_len<=0, so the generate
-            // step is required for a manually-built graph.
-            abpoa_generate_rc_msa(ab, abpt);
-            abpoa_output_rc_msa(ab, abpt, msaFp);
-            fclose(msaFp);
-            out << "  MSA written to " << msaPath << endl;
-        } else {
-            out << "  WARNING: could not open " << msaPath << " for writing" << endl;
+    // Populate abc (msa_base, msa_len) from the graph. This also fills
+    // node_id_to_msa_rank, which the SNP detector below relies on, so it must
+    // run for every window regardless of whether we dump the MSA to disk.
+    abpoa_generate_rc_msa(ab, abpt);
+
+    // Per-window FASTA/GFA dumps are a debugging aid and, at genome scale, would
+    // write thousands of files into the run directory. Off by default; enable
+    // with DINARA_MSA_DUMP=1 (or true/yes/on) to inspect individual windows.
+    static const bool dumpMsaFiles = []() {
+        const char* env = getenv("DINARA_MSA_DUMP");
+        if(env == nullptr) return false;
+        const string s(env);
+        return s == "1" || s == "true" || s == "yes" || s == "on"
+            || s == "TRUE" || s == "YES" || s == "ON";
+    }();
+    if(dumpMsaFiles) {
+        {
+            const string msaPath = "testAbpoaMultiSegmentMSA_window"
+                + to_string(window.windowId) + ".fasta";
+            FILE* msaFp = fopen(msaPath.c_str(), "w");
+            if(msaFp) {
+                // abpoa_output_rc_msa returns early if msa_len<=0; the generate
+                // step above is required for a manually-built graph.
+                abpoa_output_rc_msa(ab, abpt, msaFp);
+                fclose(msaFp);
+                out << "  MSA written to " << msaPath << endl;
+            } else {
+                out << "  WARNING: could not open " << msaPath << " for writing" << endl;
+            }
         }
-    }
-    {
-        const string gfaPath = "testAbpoaMultiSegmentMSA_window"
-            + to_string(window.windowId) + ".gfa";
-        FILE* gfaFp = fopen(gfaPath.c_str(), "w");
-        if(gfaFp) {
-            abpt->out_gfa = 1;
-            abpoa_generate_gfa(ab, abpt, gfaFp);
-            abpt->out_gfa = 0;
-            fclose(gfaFp);
-            out << "  GFA written to " << gfaPath << endl;
+        {
+            const string gfaPath = "testAbpoaMultiSegmentMSA_window"
+                + to_string(window.windowId) + ".gfa";
+            FILE* gfaFp = fopen(gfaPath.c_str(), "w");
+            if(gfaFp) {
+                abpt->out_gfa = 1;
+                abpoa_generate_gfa(ab, abpt, gfaFp);
+                abpt->out_gfa = 0;
+                fclose(gfaFp);
+                out << "  GFA written to " << gfaPath << endl;
+            }
         }
     }
 
     // ------------------------------------------------------------------
-    // Detect clean SNP bubbles in the finished graph. abpoa_generate_rc_msa
-    // (called above) has populated node_id_to_msa_rank, so columns have ranks.
+    // Detect clean SNP bubbles in the finished graph. The abpoa_generate_rc_msa
+    // call above has populated node_id_to_msa_rank, so columns have ranks.
     // ------------------------------------------------------------------
     {
         // Per-allele support cutoff, derived from dataset coverage using the
@@ -1180,8 +1195,8 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 // each worker writes only to its own AnchorWindow (window.hetBubbles), so there
 // is no output data race. Het-anchor CREATION is NOT done here -- it grows the
 // shared memory-mapped anchor store and must stay in the serial append pass that
-// runs after this. Number of windows capped by env DINARA_MSA_MAX_WINDOWS
-// (default 1, 0=all).
+// runs after this. By default ALL windows are processed; env
+// DINARA_MSA_MAX_WINDOWS=N caps at the first N (0 = all).
 void Assembler::testAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
@@ -1193,7 +1208,10 @@ void Assembler::testAbpoaMultiSegmentMSA(
         return;
     }
 
-    uint64_t maxWindows = 1;
+    // Default: process ALL windows (genome-wide het detection). Set
+    // DINARA_MSA_MAX_WINDOWS=N to cap at the first N windows for debugging
+    // (0 also means all).
+    uint64_t maxWindows = 0;
     if(const char* env = getenv("DINARA_MSA_MAX_WINDOWS")) {
         maxWindows = strtoull(env, nullptr, 10);  // 0 = all windows
     }
