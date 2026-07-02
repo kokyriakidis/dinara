@@ -111,6 +111,20 @@ struct WindowSnp {
     // vaf >= minVaf. Size >= 2 (ref + >=1 alt) whenever the site is emitted.
     vector<WindowSnpAllele> alleles;
 
+    // Leading hom anchor members: reads at predPrev (the base BEFORE the
+    // bubble's common predecessor), rawPosition = predPrev base position,
+    // forming the k=2 hom anchor [predPrevBase, predBase]. The flank-linearity
+    // test guarantees predPrev->commonPred is linear, so this 2-mer is shared by
+    // ALL reads entering the site (every allele passes through predPrev). This
+    // is the symmetric counterpart of the trailing hom: it lets the interval's
+    // upstream backbone anchor connect to a hom (which the backbone read spans)
+    // instead of directly to a minority allele arm (which the backbone k=50
+    // anchor does not share reads with). predBackboneOffset is predPrev's
+    // backbone offset.
+    int predBackboneOffset = -1;
+    uint8_t predPrevBase = 0;   // base at predPrev (0-3)
+    vector<HetAlleleMember> leadHomMembers;
+
     // Trailing hom anchor members: reads at commonSucc (rawPosition = succ base
     // position), forming the k=2 hom anchor [succBase, nextBase]. The
     // flank-linearity test guarantees commonSucc->succNext is linear, so this
@@ -509,18 +523,31 @@ vector<WindowSnp> detectWindowSnps(
             snp.alleles.push_back(std::move(altAllele));
         }
 
-        // Hom-separator anchor at commonSucc: [succBase, nextBase]. All reads
-        // spanning the site (ref + every kept alt) reconverge here, so recover
-        // each one's position at commonSucc. The flank-linearity test guarantees
-        // the next base is linear, so [succBase, nextBase] is shared by all.
+        // All reads spanning the site (ref + every kept alt) share both flanks:
+        // they enter through predPrev and leave through commonSucc (both linear
+        // by the flank-linearity test). Build this shared set once for the two
+        // bracketing hom anchors.
+        vector<int> homSeqIds = refSeqIds;
+        for(const AltAllele* alt : keptAlts)
+            homSeqIds.insert(homSeqIds.end(), alt->seqIds.begin(), alt->seqIds.end());
+
+        // Leading hom anchor at predPrev: [predPrevBase, predBase]. predPrev is
+        // the base BEFORE commonPred; predPrev->commonPred is linear, so this
+        // 2-mer is shared by ALL reads entering the site. This lets the upstream
+        // backbone anchor connect to a hom instead of directly to a minority
+        // allele arm (whose reads the k=50 backbone anchor does not share).
+        snp.predBackboneOffset = nodeToBackboneOffset[predPrev];
+        snp.predPrevBase = abg->node[predPrev].base;
+        mapMembersAt(homSeqIds, predPrev, snp.leadHomMembers);
+
+        // Trailing hom anchor at commonSucc: [succBase, nextBase]. All reads
+        // spanning the site reconverge here, so recover each one's position at
+        // commonSucc. The flank-linearity test guarantees the next base is
+        // linear, so [succBase, nextBase] is shared by all.
         snp.succBackboneOffset = nodeToBackboneOffset[commonSucc];
         snp.succBase = abg->node[commonSucc].base;
-        {
-            vector<int> homSeqIds = refSeqIds;
-            for(const AltAllele* alt : keptAlts)
-                homSeqIds.insert(homSeqIds.end(), alt->seqIds.begin(), alt->seqIds.end());
-            mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
-        }
+        mapMembersAt(homSeqIds, commonSucc, snp.homMembers);
+
         snps.push_back(std::move(snp));
     }
 
@@ -1158,10 +1185,30 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             // Need at least two arms to form a bubble.
             if(bubble.alleles.size() < 2) continue;
 
-            // Hom separator anchor [succBase, nextBase] at commonSucc. predBase
+            // Leading hom anchor [predPrevBase, predBase] at predPrev. This
+            // brackets the bubble upstream so the interval's backbone anchor
+            // connects to a hom (shared by every entering read) rather than to a
+            // minority allele arm (whose reads the k=50 backbone anchor does not
+            // share). Both homs are required for a wired bubble; if the leading
+            // hom is unavailable (flank not on a backbone column, or no
+            // recoverable members) the plan pass drops the bubble.
+            if(snp.predBackboneOffset >= 0 && !snp.leadHomMembers.empty()) {
+                bubble.predBackboneOffset = static_cast<uint32_t>(snp.predBackboneOffset);
+                AnchorWindow::HetAnchor leadHom;
+                leadHom.backboneOffset = bubble.predBackboneOffset;
+                leadHom.predBase = snp.predPrevBase;
+                // alleleBase is predBase (the linear next base after predPrev).
+                leadHom.alleleBase = predBase;
+                leadHom.isRef = true;
+                for(const HetAlleleMember& m : snp.leadHomMembers)
+                    leadHom.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.leadHom = std::move(leadHom);
+            }
+
+            // Trailing hom anchor [succBase, nextBase] at commonSucc. predBase
             // of the hom is succBase (the base shared by all reads at
             // commonSucc); alleleBase is the linear next base. Members are all
-            // spanning reads. Used to chain/separate consecutive SNPs.
+            // spanning reads. Brackets the bubble downstream.
             if(snp.succBackboneOffset >= 0 && !snp.homMembers.empty()) {
                 bubble.succBackboneOffset = static_cast<uint32_t>(snp.succBackboneOffset);
                 AnchorWindow::HetAnchor homAnchor;

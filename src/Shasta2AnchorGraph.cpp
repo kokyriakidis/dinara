@@ -364,10 +364,21 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 ++itA; ++itB;
             }
         } else {
-            // mixed het<->backbone: take the het endpoint's members verbatim.
-            const Shasta2Anchor& hetAnchor = hetA ? anchorA : anchorB;
-            for(auto it = hetAnchor.begin(); it != hetAnchor.end(); ++it)
-                pair.orientedReadIds.push_back(it->orientedReadId);
+            // mixed het<->backbone: intersection. After the leading/trailing hom
+            // redesign, a backbone anchor only ever connects to a hom anchor
+            // (never directly to an allele arm), and the window backbone read is
+            // a member of both, so this intersection is non-empty. We still drop
+            // the edge if it is empty rather than emit an AnchorPair with no
+            // shared read (which shasta2's LocalAssembly6::estimateOffset cannot
+            // handle: it asserts at least one read spans both endpoints).
+            auto itA = anchorA.begin();
+            auto itB = anchorB.begin();
+            while(itA != anchorA.end() && itB != anchorB.end()) {
+                if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
+                if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+                pair.orientedReadIds.push_back(itA->orientedReadId);
+                ++itA; ++itB;
+            }
         }
 
         if(pair.orientedReadIds.empty()) return false;
