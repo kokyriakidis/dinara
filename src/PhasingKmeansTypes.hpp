@@ -335,8 +335,15 @@ inline double kmFisherExactTwoTail(int a, int b, int c, int d)
 
 /// Check if a variant sits in a homopolymer or short tandem repeat context.
 /// Looks for a repeat unit of length 1..6 with ≥3 copies flanking the variant.
-inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
-                            const KmVarKey& key, int xid)
+// Core repeat-context test, restricted to repeat unit lengths in
+// [minUnitLen, maxUnitLen]. A variant is "in a repeat" if the reference flank
+// (forward from endPos, or backward from startPos) consists of >=3 copies of a
+// unit whose length is in the requested range. Callers use this to distinguish
+// homopolymer context (unit length 1) from short-tandem-repeat context
+// (unit length 2..6), which are otherwise identical tests over different ranges.
+inline bool kmIsRepeatUnitRange(const uint8_t* seq, uint32_t seqLen,
+                                const KmVarKey& key, int xid,
+                                int minUnitLen, int maxUnitLen)
 {
     if (seqLen == 0) return false;
     const int64_t sn = int64_t(seqLen);
@@ -353,7 +360,6 @@ inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
         startPos = int64_t(key.pos) + int64_t(key.refLen) - 1;
         endPos   = int64_t(key.pos);
     }
-    constexpr int maxUnitLen = 6;
     constexpr int nCheckCopyNum = 3;
     auto safeBase = [&](int64_t p) -> uint8_t {
         if (p < 0 || p >= sn) return 4;
@@ -362,7 +368,7 @@ inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
     // Check forward from endPos.
     uint8_t refBases[6];
     for (int i = 0; i < 6; i++) refBases[i] = safeBase(endPos + i);
-    for (int r = 1; r <= maxUnitLen; r++) {
+    for (int r = minUnitLen; r <= maxUnitLen; r++) {
         bool isHp = true;
         for (int i = 1; i < nCheckCopyNum && isHp; i++)
             for (int j = 0; j < r && isHp; j++)
@@ -371,7 +377,7 @@ inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
     }
     // Check backward from startPos.
     for (int i = 0; i < 6; i++) refBases[i] = safeBase(startPos - i);
-    for (int r = 1; r <= maxUnitLen; r++) {
+    for (int r = minUnitLen; r <= maxUnitLen; r++) {
         bool isHp = true;
         for (int i = 1; i < nCheckCopyNum && isHp; i++)
             for (int j = 0; j < r && isHp; j++)
@@ -379,6 +385,15 @@ inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
         if (isHp) return true;
     }
     return false;
+}
+
+// Repeat context over unit lengths 1..6 (homopolymers AND short tandem
+// repeats). Kept for existing callers; equivalent to the union of the
+// homopolymer (unit 1) and STR (unit 2..6) tests.
+inline bool kmIsHomopolymer(const uint8_t* seq, uint32_t seqLen,
+                            const KmVarKey& key, int xid)
+{
+    return kmIsRepeatUnitRange(seq, seqLen, key, xid, 1, 6);
 }
 
 /// Check if the deleted/inserted motif is a tandem repeat of the flanking reference.

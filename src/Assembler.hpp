@@ -3974,7 +3974,11 @@ public:
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         vector<AnchorWindow>& anchorWindows,
-        uint64_t threadCount);
+        uint64_t threadCount,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat);
 
     // Per-thread state and the thread function for the parallel per-window MSA
     // loop (one window per work item, dynamic load balancing). Each worker owns
@@ -3988,6 +3992,11 @@ public:
         uint64_t windowEnd = 0;                 // process windows in [0, windowEnd)
         std::atomic<uint64_t> processed{0};
         std::atomic<uint64_t> produced{0};
+        // Het-SNP detection tunables (from Assembly.mode3.het* options).
+        double hetMinVaf = 0.12;
+        uint64_t hetMinSupport = 0;             // 0 = auto-derive from coverage
+        bool hetDropHomopolymer = false;        // drop unit-length-1 context
+        bool hetDropRepeat = false;             // drop unit-length-2..6 context
     };
     AbpoaMultiSegmentMSAData abpoaMultiSegmentMSAData;
     void testAbpoaMultiSegmentMSAThreadFunction(size_t threadId);
@@ -3999,7 +4008,11 @@ public:
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
         AnchorWindow& window,
-        std::ostream& out);
+        std::ostream& out,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat);
 
     // Build a single multi-segment Theseus MSA for one focal read using
     // all its direct overlaps from alignmentTable. Evaluates feasibility

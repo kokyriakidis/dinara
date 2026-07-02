@@ -1511,7 +1511,11 @@ void dinara::main::assemble(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         anchorWindows,
-        threadCount);
+        threadCount,
+        assemblerOptions.assemblyOptions.mode3Options.hetMinVaf,
+        assemblerOptions.assemblyOptions.mode3Options.hetMinSupport,
+        assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer,
+        assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat);
 
     // Turn the staged het bubbles into anchor-graph structure in three serial
     // passes (plan -> append -> stage edges). The passes are ordered so anchors

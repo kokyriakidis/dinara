@@ -1504,6 +1504,38 @@ void AssemblerOptions::addConfigurableOptions()
         "journey to be accepted as a window backbone. Reads with shorter "
         "journey spans are skipped during window creation.")
 
+        ("Assembly.mode3.hetMinVaf",
+        value<double>(&assemblyOptions.mode3Options.hetMinVaf)->
+        default_value(0.12, "0.12"),
+        "Minimum variant allele fraction for an alt allele to be accepted "
+        "as a het SNP in the per-window abPOA MSA. "
+        "(Mode 3 assembly only).")
+
+        ("Assembly.mode3.hetMinSupport",
+        value<uint64_t>(&assemblyOptions.mode3Options.hetMinSupport)->
+        default_value(0),
+        "Minimum per-allele read support for a het SNP in the per-window "
+        "abPOA MSA. 0 (default) auto-derives it from the k-mer coverage "
+        "histogram (peak/2 * 0.7, floored at 6). "
+        "(Mode 3 assembly only).")
+
+        ("Assembly.mode3.hetDropHomopolymer",
+        value<bool>(&assemblyOptions.mode3Options.hetDropHomopolymer)->
+        default_value(false),
+        "If true, drop het SNPs whose backbone context is a homopolymer run "
+        "(repeat unit length 1). Default false: the flank-linearity test "
+        "already guarantees a clean homozygous base on each side, so such SNPs "
+        "are real; dropping them discarded far more true SNPs than it kept. "
+        "(Mode 3 assembly only).")
+
+        ("Assembly.mode3.hetDropRepeat",
+        value<bool>(&assemblyOptions.mode3Options.hetDropRepeat)->
+        default_value(false),
+        "If true, drop het SNPs whose backbone context is a short-tandem-repeat "
+        "run (repeat unit length 2..6). Default false, for the same reason as "
+        "hetDropHomopolymer. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
         default_value(0),
@@ -1955,6 +1987,12 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
+    s << "mode3.hetMinVaf = " << hetMinVaf << "\n";
+    s << "mode3.hetMinSupport = " << hetMinSupport << "\n";
+    s << "mode3.hetDropHomopolymer = " <<
+        convertBoolToPythonString(hetDropHomopolymer) << "\n";
+    s << "mode3.hetDropRepeat = " <<
+        convertBoolToPythonString(hetDropRepeat) << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);

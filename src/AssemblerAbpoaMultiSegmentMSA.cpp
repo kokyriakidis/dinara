@@ -186,7 +186,8 @@ vector<WindowSnp> detectWindowSnps(
     const vector<unordered_map<int, uint32_t>>& seqIdNodeToReadPos,
     int minSupport,
     double minVaf,
-    bool dropRepeatContext)
+    bool dropHomopolymer,
+    bool dropRepeat)
 {
     vector<WindowSnp> snps;
     int droppedRepeat = 0;  // SNPs suppressed by homopolymer/STR context
@@ -368,10 +369,14 @@ vector<WindowSnp> detectWindowSnps(
         vkey.altBase = alts[0].base;
         vkey.refLen = 1;
         vkey.altLen = 1;
-        const bool inRepeat = kmIsHomopolymer(
-            backboneCodes.data(),
-            static_cast<uint32_t>(backboneCodes.size()),
-            vkey, /* xid */ 0);
+        // Split the repeat-context test into two independent classes so each
+        // can be filtered separately: homopolymer = repeat unit length 1,
+        // short tandem repeat (STR) = repeat unit length 2..6.
+        const uint8_t* bcData = backboneCodes.data();
+        const uint32_t bcLen = static_cast<uint32_t>(backboneCodes.size());
+        const bool inHomopolymer = kmIsRepeatUnitRange(bcData, bcLen, vkey, 0, 1, 1);
+        const bool inStr         = kmIsRepeatUnitRange(bcData, bcLen, vkey, 0, 2, 6);
+        const bool inRepeat = inHomopolymer || inStr;
         if(inRepeat) droppedRepeat++;
 
         // Verification dump (DINARA_SNP_VERIFY=1): print the backbone context
@@ -439,7 +444,9 @@ vector<WindowSnp> detectWindowSnps(
                  << (inRepeat != indep ? "  <<< MISMATCH" : "") << endl;
         }
 
-        if(dropRepeatContext && inRepeat) continue;
+        // Drop by class: homopolymer and STR context are gated independently.
+        if(dropHomopolymer && inHomopolymer) continue;
+        if(dropRepeat && inStr) continue;
 
         auto mapReads = [&](const vector<int>& seqIds, vector<OrientedReadId>& out) {
             out.clear();
@@ -556,7 +563,7 @@ vector<WindowSnp> detectWindowSnps(
         return a.backboneOffset < b.backboneOffset;
     });
     cout << "  homopolymer/STR SNPs "
-         << (dropRepeatContext ? "dropped: " : "flagged: ")
+         << ((dropHomopolymer || dropRepeat) ? "dropped(some): " : "flagged: ")
          << droppedRepeat << endl;
     return snps;
 }
@@ -571,7 +578,11 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
     AnchorWindow& window,
-    std::ostream& out)
+    std::ostream& out,
+    double hetMinVaf,
+    uint64_t hetMinSupport,
+    bool hetDropHomopolymer,
+    bool hetDropRepeat)
 {
     const Reads& readsRef = getReads();
     const auto& markersRef = *markers;
@@ -1103,8 +1114,13 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         // the expected per-haplotype depth and a het allele must carry >=70% of
         // it, floored at 6. When coverageHet is unavailable (histogram not
         // computed) fall back to the floor so we never under-gate.
+        // Per-allele support cutoff. If the caller supplied a nonzero
+        // hetMinSupport (Assembly.mode3.hetMinSupport) use it verbatim;
+        // otherwise auto-derive from coverage as before.
         int minSupport = 6;
-        {
+        if(hetMinSupport > 0) {
+            minSupport = static_cast<int>(hetMinSupport);
+        } else {
             constexpr uint64_t cut_bd = 6;
             constexpr uint64_t cut_rate_num = 7;
             constexpr uint64_t cut_rate_den = 10;
@@ -1118,14 +1134,22 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             if(cc < cut_bd) cc = cut_bd;
             minSupport = static_cast<int>(cc);
         }
-        const double minVaf = 0.12;
-        const bool dropRepeatContext = true;  // drop SNPs in homopolymer/STR runs
+        const double minVaf = hetMinVaf;
+        // Repeat-context SNPs are kept by default (see
+        // Assembly.mode3.hetDropHomopolymer / hetDropRepeat): the
+        // flank-linearity test already requires a clean homozygous base on each
+        // side, so such SNPs are real het sites; dropping them discarded far
+        // more true SNPs than it kept. The two classes are gated separately.
+        const bool dropHomopolymer = hetDropHomopolymer;
+        const bool dropRepeat = hetDropRepeat;
         const vector<WindowSnp> snps = detectWindowSnps(
             ab, backboneQposToNode, backboneCodes, seqIdToOrientedRead,
-            seqIdNodeToReadPos, minSupport, minVaf, dropRepeatContext);
+            seqIdNodeToReadPos, minSupport, minVaf,
+            dropHomopolymer, dropRepeat);
         out << "  SNPs detected: " << snps.size()
              << " (minSupport=" << minSupport << ", minVAF=" << minVaf
-             << ", dropRepeatContext=" << (dropRepeatContext ? "true" : "false")
+             << ", dropHomopolymer=" << (dropHomopolymer ? "true" : "false")
+             << ", dropRepeat=" << (dropRepeat ? "true" : "false")
              << ")" << endl;
         for(const WindowSnp& snp : snps) {
             const WindowSnpAllele& ref = snp.alleles.front();
@@ -1248,7 +1272,11 @@ void Assembler::testAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
     vector<AnchorWindow>& anchorWindows,
-    uint64_t threadCount)
+    uint64_t threadCount,
+    double hetMinVaf,
+    uint64_t hetMinSupport,
+    bool hetDropHomopolymer,
+    bool hetDropRepeat)
 {
     if(anchorWindows.empty()) {
         cout << "testAbpoaMultiSegmentMSA: no windows." << endl;
@@ -1281,6 +1309,10 @@ void Assembler::testAbpoaMultiSegmentMSA(
     abpoaMultiSegmentMSAData.windowEnd = windowEnd;
     abpoaMultiSegmentMSAData.processed = 0;
     abpoaMultiSegmentMSAData.produced = 0;
+    abpoaMultiSegmentMSAData.hetMinVaf = hetMinVaf;
+    abpoaMultiSegmentMSAData.hetMinSupport = hetMinSupport;
+    abpoaMultiSegmentMSAData.hetDropHomopolymer = hetDropHomopolymer;
+    abpoaMultiSegmentMSAData.hetDropRepeat = hetDropRepeat;
 
     // One work item per window (batch size 1: per-window cost is high and
     // uneven, so fine-grained dynamic balancing is what we want).
@@ -1310,7 +1342,9 @@ void Assembler::testAbpoaMultiSegmentMSAThreadFunction(size_t)
             // interleaved with other threads' output.
             std::ostringstream buffer;
             const bool ok = runOneWindowAbpoaMultiSegmentMSA(
-                shasta2Anchors, shasta2Journeys, window, buffer);
+                shasta2Anchors, shasta2Journeys, window, buffer,
+                data.hetMinVaf, data.hetMinSupport,
+                data.hetDropHomopolymer, data.hetDropRepeat);
 
             data.processed.fetch_add(1, std::memory_order_relaxed);
             if(ok) data.produced.fetch_add(1, std::memory_order_relaxed);

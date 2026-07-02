@@ -602,6 +602,27 @@ public:
     // journey to be accepted as a window backbone.
     uint64_t minWindowBaseSpan;
 
+    // --- Per-window abPOA het-SNP detection tunables ---
+    // Minimum variant allele fraction for an alt allele to be accepted.
+    double hetMinVaf;
+
+    // Minimum per-allele read support. If 0, it is auto-derived from the
+    // k-mer coverage histogram (peak/2 * 0.7, floored at 6), matching the
+    // hifiasm het-site rule.
+    uint64_t hetMinSupport;
+
+    // If true, drop SNPs whose backbone context is a homopolymer run
+    // (repeat unit length 1). Default false.
+    bool hetDropHomopolymer;
+
+    // If true, drop SNPs whose backbone context is a short-tandem-repeat run
+    // (repeat unit length 2..6). Default false.
+    // Both default false: the flank-linearity test already requires a clean
+    // (bubble-free) homozygous base on each side, so repeat-context SNPs that
+    // pass it are real het sites; dropping them discarded far more true SNPs
+    // than it kept.
+    bool hetDropRepeat;
+
     // Options used by class mode3::LocalAssembly
     class LocalAssemblyOptions {
     public:
