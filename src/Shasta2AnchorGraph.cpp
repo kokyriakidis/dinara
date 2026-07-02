@@ -222,16 +222,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // unambiguous linear links between disjoint cores, leaving forks/joins for
     // the bridge stage. Independent of edgelessWindows (which only controls the
     // Stage A reciprocal-best block).
-    // TEMPORARILY DISABLED: keep all windows disjoint (no inter-window edges)
-    // while iterating on intra-window het-bubble construction.
-    constexpr bool connectOneToOneWindows = false;
+    // Enabled: run the inter-window connection block below. With
+    // connectAllWindows set, its strict-degree gate is bypassed so every
+    // read-supported window pair is connected (see connectAllWindows).
+    constexpr bool connectOneToOneWindows = true;
 
-    // Connect ALL inter-window pairs (diagnostic). When true, the strict
-    // 1-to-1 gate is bypassed and an edge is created for every read-supported
-    // window pair (support >= 1), forward and RC-mirror. Use to visualize the
-    // full inter-window connectivity. Requires connectOneToOneWindows = true
-    // (this overrides the degree gate inside that block).
-    constexpr bool connectAllWindows = false;
+    // Connect ALL inter-window pairs. When true, the strict 1-to-1 degree gate
+    // is bypassed and an edge is created for every read-supported window pair
+    // (support >= 1), forward and RC-mirror, giving the full inter-window
+    // connectivity. Requires connectOneToOneWindows = true (this overrides the
+    // degree gate inside that block).
+    constexpr bool connectAllWindows = true;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
