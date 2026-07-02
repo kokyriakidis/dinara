@@ -1543,6 +1543,23 @@ void dinara::main::assemble(
             nullptr, // bypassEdges
             nullptr, // detourWindowPairs
             &anchorDovetailWindow);
+
+        // Trim dangling backbone ends that extend past the outermost inter-
+        // window connection points. Now that inter-window edges are created,
+        // each window's backbone typically has unsupported overhangs beyond its
+        // first/last inter-window link; trimming disables those dead-end edges
+        // before the graph is compressed into the assembly graph. Called once:
+        // the trim criterion (first/last anchor carrying any inter-window edge)
+        // is unaffected by disabling backbone edges, so a second standalone call
+        // would report the same count -- it only advances when interleaved with
+        // other filters that change inter-window connectivity.
+        {
+            const uint64_t trimmed =
+                assembler.shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
+            cout << timestamp << "trimBackbones: disabled backbone edges for "
+                 << trimmed << " overhang anchors." << endl;
+        }
+
         assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
         assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
         cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
