@@ -1547,6 +1547,41 @@ void dinara::main::assemble(
         cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
     }
 
+    // Build the assembly graph from the anchor graph. This collapses each
+    // maximal non-branching anchor chain into a single segment (compress), so
+    // the graph is far smaller than the anchor graph while preserving its
+    // topology. Iterative short-tip removal + compress then cleans dangling
+    // ends, mirroring the cleanup used in the later (disabled) pipeline.
+    {
+        cout << timestamp << "Creating Shasta2AssemblyGraph (with het bubbles) from "
+             << "the anchor graph..." << endl;
+        Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
+        assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            *assembler.shasta2AnchorGraph,
+            anchorWindows,
+            shasta2AssemblyGraphOptions);
+        auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
+        shasta2AssemblyGraph->compress();
+        shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
+
+        // Iterative tip removal + compress. Shorter tips are processed first so
+        // their removal can expose longer ones; loop until nothing changes.
+        {
+            const uint32_t maxTipWindows = 3;
+            const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
+            for(uint64_t cleanRound = 0; ; cleanRound++) {
+                uint64_t changeCount = 0;
+                changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
+                shasta2AssemblyGraph->compress();
+                if(changeCount == 0) break;
+            }
+        }
+        shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
+        cout << timestamp << "Wrote Shasta2AssemblyGraph.gfa / -cleaned.gfa" << endl;
+    }
+
     return;
 
     // ksw2-based het SNP detection per window. Aligns each member's
