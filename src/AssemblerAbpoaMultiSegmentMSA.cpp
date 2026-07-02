@@ -1048,7 +1048,29 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     // (called above) has populated node_id_to_msa_rank, so columns have ranks.
     // ------------------------------------------------------------------
     {
-        const int minSupport = 3;
+        // Per-allele support cutoff, derived from dataset coverage using the
+        // same rule hifiasm applies at the final het-site stage (see
+        // AssemblerHifiasmEC.cpp): cc = max(cut_bd, (coverageHet / n_hap) *
+        // cut_rate) with n_hap=2, cut_rate=0.7, cut_bd=6. coverageHet is the
+        // k-mer histogram peak (total diploid coverage), so coverageHet/2 is
+        // the expected per-haplotype depth and a het allele must carry >=70% of
+        // it, floored at 6. When coverageHet is unavailable (histogram not
+        // computed) fall back to the floor so we never under-gate.
+        int minSupport = 6;
+        {
+            constexpr uint64_t cut_bd = 6;
+            constexpr uint64_t cut_rate_num = 7;
+            constexpr uint64_t cut_rate_den = 10;
+            constexpr uint64_t n_hap = 2;
+            const uint64_t coverageHet = assemblerInfo.isOpen ?
+                assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
+            uint64_t base = 0;
+            if(coverageHet != invalid<uint64_t> && coverageHet > 0)
+                base = coverageHet / n_hap;
+            uint64_t cc = (base * cut_rate_num) / cut_rate_den;
+            if(cc < cut_bd) cc = cut_bd;
+            minSupport = static_cast<int>(cc);
+        }
         const double minVaf = 0.12;
         const bool dropRepeatContext = true;  // drop SNPs in homopolymer/STR runs
         const vector<WindowSnp> snps = detectWindowSnps(
