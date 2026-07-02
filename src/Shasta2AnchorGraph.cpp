@@ -222,14 +222,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // unambiguous linear links between disjoint cores, leaving forks/joins for
     // the bridge stage. Independent of edgelessWindows (which only controls the
     // Stage A reciprocal-best block).
-    constexpr bool connectOneToOneWindows = true;
+    // TEMPORARILY DISABLED: keep all windows disjoint (no inter-window edges)
+    // while iterating on intra-window het-bubble construction.
+    constexpr bool connectOneToOneWindows = false;
 
     // Connect ALL inter-window pairs (diagnostic). When true, the strict
     // 1-to-1 gate is bypassed and an edge is created for every read-supported
     // window pair (support >= 1), forward and RC-mirror. Use to visualize the
     // full inter-window connectivity. Requires connectOneToOneWindows = true
     // (this overrides the degree gate inside that block).
-    constexpr bool connectAllWindows = true;
+    constexpr bool connectAllWindows = false;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
@@ -383,11 +385,27 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // staged nominal offset) are window-local and were computed when the
     // windows were finalized. Inter-window edges are added separately below.
     uint64_t backboneEdgesAdded = 0, hetBubbleEdgesAdded = 0;
-    for(const AnchorWindow& window : anchorWindows) {
+    for(uint32_t windowId = 0; windowId < windowCount; windowId++) {
+        const AnchorWindow& window = anchorWindows[windowId];
         for(const auto& edge : window.intraWindowEdges) {
             if(uint64_t(edge.anchorIdA) >= anchorCount) continue;
             if(uint64_t(edge.anchorIdB) >= anchorCount) continue;
+            // Map het/hom anchors to this window so the final edge-type recount
+            // (which keys on anchorToWindow) classifies het-bubble edges as
+            // intra-window. Backbone anchors are already mapped above; only the
+            // appended k=2 het/hom anchors (still noWindow) need this. Canonical
+            // (even) ids belong to the forward window, RC (odd) ids to the
+            // mirror window windowId + windowCount, matching the backbone
+            // convention.
+            auto mapHet = [&](Shasta2AnchorId id) {
+                const uint64_t a = uint64_t(id);
+                if(a < anchorCount && anchorToWindow[a] == noWindow) {
+                    anchorToWindow[a] = (a & 1ULL) ? (windowId + windowCount) : windowId;
+                }
+            };
             if(edge.isHet) {
+                mapHet(edge.anchorIdA);
+                mapHet(edge.anchorIdB);
                 if(addHetEdge(edge.anchorIdA, edge.anchorIdB, edge.offset))
                     ++hetBubbleEdgesAdded;
             } else {

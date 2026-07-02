@@ -150,8 +150,10 @@ inline char codeToChar(uint8_t c) {
 // read_ids). Per-allele read sets are mapped back to OrientedReadIds through
 // seqIdToOrientedRead for downstream phasing.
 //
-// Filters: distinct non-gap bases, backbone present in the bubble, alt support
-// >= minSupport, and VAF >= minVaf (VAF = altSupport / (refSupport+altSupport)).
+// Filters: distinct non-gap bases, backbone present in the bubble, BOTH the
+// reference and the alt allele supported by >= minSupport reads (a het site
+// needs both alleles present, not just a strong alt vs the lone backbone read),
+// and VAF >= minVaf (VAF = altSupport / spanning).
 vector<WindowSnp> detectWindowSnps(
     abpoa_t* ab,
     const vector<int>& backboneQposToNode,
@@ -445,9 +447,14 @@ vector<WindowSnp> detectWindowSnps(
             mapMembersAt(seqIds, commonPred, out);
         };
 
-        // Emit one biallelic record per distinct alt allele. Each is gated on
-        // its OWN support/VAF, so a strong alt is kept even if a second weak alt
-        // at the same column is filtered out.
+        // Emit one biallelic record per distinct alt allele. For a site to be a
+        // heterozygous variant, BOTH alleles must be independently supported:
+        // the reference allele and this alt allele each need >= minSupport
+        // reads. Gating only the alt lets through homozygous-alt-vs-backbone
+        // columns (refSupport == 1, the lone backbone read) and single-read
+        // artifacts, which are not het sites. Each alt is also gated on its own
+        // VAF so a strong alt survives a second weak alt at the same column.
+        if(refSupport < minSupport) continue;
         for(const AltAllele& alt : alts) {
             if(alt.support < minSupport) continue;
             const double vaf = (spanning > 0) ? double(alt.support) / double(spanning) : 0.0;
