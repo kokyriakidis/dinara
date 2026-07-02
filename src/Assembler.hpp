@@ -42,6 +42,7 @@
 #include <boost/graph/adjacency_list.hpp>
 
 // Standard library.
+#include <atomic>
 #include <mutex>
 
 namespace dinara {
@@ -3972,12 +3973,33 @@ public:
     void testAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-        vector<AnchorWindow>& anchorWindows);
+        vector<AnchorWindow>& anchorWindows,
+        uint64_t threadCount);
 
+    // Per-thread state and the thread function for the parallel per-window MSA
+    // loop (one window per work item, dynamic load balancing). Each worker owns
+    // a distinct AnchorWindow, so windows are processed independently; only the
+    // shared counters and cout are serialized (atomics + mutex).
+    class AbpoaMultiSegmentMSAData {
+    public:
+        const shared_ptr<Shasta2Anchors>* shasta2Anchors = nullptr;
+        const shared_ptr<Shasta2Journeys>* shasta2Journeys = nullptr;
+        vector<AnchorWindow>* anchorWindows = nullptr;
+        uint64_t windowEnd = 0;                 // process windows in [0, windowEnd)
+        std::atomic<uint64_t> processed{0};
+        std::atomic<uint64_t> produced{0};
+    };
+    AbpoaMultiSegmentMSAData abpoaMultiSegmentMSAData;
+    void testAbpoaMultiSegmentMSAThreadFunction(size_t threadId);
+
+    // isHet detection for one window. Diagnostic output is written to `out`
+    // (buffered by the caller and flushed atomically) instead of cout, so it can
+    // run in parallel without interleaving.
     bool runOneWindowAbpoaMultiSegmentMSA(
         const shared_ptr<Shasta2Anchors>& shasta2Anchors,
         const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-        AnchorWindow& window);
+        AnchorWindow& window,
+        std::ostream& out);
 
     // Build a single multi-segment Theseus MSA for one focal read using
     // all its direct overlaps from alignmentTable. Evaluates feasibility

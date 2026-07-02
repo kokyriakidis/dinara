@@ -23,11 +23,15 @@
 #include <abpoa.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <fstream>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -539,7 +543,8 @@ vector<WindowSnp> detectWindowSnps(
 bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-    AnchorWindow& window)
+    AnchorWindow& window,
+    std::ostream& out)
 {
     const Reads& readsRef = getReads();
     const auto& markersRef = *markers;
@@ -548,14 +553,14 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const OrientedReadId backboneOid = window.backboneOrientedReadId;
     const auto backboneJourney = (*shasta2Journeys)[backboneOid];
 
-    cout << "testAbpoaMultiSegmentMSA: window " << window.windowId
+    out << "testAbpoaMultiSegmentMSA: window " << window.windowId
          << " backbone " << backboneOid
          << " anchors [" << window.backboneBegin << "," << window.backboneEnd << ")"
          << " reads " << window.readIntervals.size() << endl;
 
     const uint32_t nBackboneAnchors = window.backboneEnd - window.backboneBegin;
     if(nBackboneAnchors < 2) {
-        cout << "  window " << window.windowId << " has < 2 anchors, skipping." << endl;
+        out << "  window " << window.windowId << " has < 2 anchors, skipping." << endl;
         return false;
     }
     const uint32_t nSegments = nBackboneAnchors - 1;
@@ -586,7 +591,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const uint32_t backboneBeginPos = backboneMarkers[anchorOrdinal.front()].position;          // first anchor START
     const uint32_t backboneEndPos   = backboneMarkers[anchorOrdinal.back()].position + uint32_t(k); // last anchor END
     if(backboneEndPos <= backboneBeginPos) {
-        cout << "  backbone span empty, skipping window." << endl;
+        out << "  backbone span empty, skipping window." << endl;
         return false;
     }
     vector<uint8_t> backboneCodes;
@@ -605,7 +610,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         anchorOffset[bi] = static_cast<int>(pos - backboneBeginPos);
     }
 
-    cout << "  backbone " << backboneLen << " bases across "
+    out << "  backbone " << backboneLen << " bases across "
          << nSegments << " segments (full-anchor span, +" << kHalf
          << "bp each end)" << endl;
 
@@ -761,7 +766,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     sort(readsBySpan.begin(), readsBySpan.end(),
         [](const auto& a, const auto& b) { return a.first > b.first; });
 
-    cout << "  reads with >=2 shared anchors: " << readsBySpan.size()
+    out << "  reads with >=2 shared anchors: " << readsBySpan.size()
          << ", skipped: " << skippedReads << endl;
 
     // ------------------------------------------------------------------
@@ -909,7 +914,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             totalAlignBases += gapLen;
             if(elapsed > maxAlignTime) maxAlignTime = elapsed;
             if(elapsed > 0.1) {
-                cout << "  SLOW: read " << oid
+                out << "  SLOW: read " << oid
                      << " gap near anchor " << boundaryForLog
                      << " seq " << gapLen << " bases took " << elapsed << "s" << endl;
             }
@@ -982,7 +987,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         }
     }
 
-    cout << "  aligned " << alignedReads << " reads ("
+    out << "  aligned " << alignedReads << " reads ("
          << alignedSegments << " segments), skipped " << skippedReads << endl;
 
     // Report timing by quartile (reads are already longest-first).
@@ -993,12 +998,12 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             size_t end = (qi == 3) ? perReadTime.size() : (qi + 1) * q;
             double sum = 0;
             for(size_t i = start; i < end; i++) sum += perReadTime[i];
-            cout << "  Q" << (qi + 1) << " (reads " << start << "-" << (end - 1)
+            out << "  Q" << (qi + 1) << " (reads " << start << "-" << (end - 1)
                  << "): " << sum << "s total, "
                  << (sum / (end - start) * 1000) << "ms/read" << endl;
         }
     }
-    cout << "  total align time: " << totalAlignTime << "s"
+    out << "  total align time: " << totalAlignTime << "s"
          << "  avg: " << (alignedSegments > 0 ? totalAlignTime / alignedSegments * 1000 : 0)
          << "ms/seg  max: " << maxAlignTime << "s"
          << "  total bases: " << totalAlignBases << endl;
@@ -1025,9 +1030,9 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             abpoa_generate_rc_msa(ab, abpt);
             abpoa_output_rc_msa(ab, abpt, msaFp);
             fclose(msaFp);
-            cout << "  MSA written to " << msaPath << endl;
+            out << "  MSA written to " << msaPath << endl;
         } else {
-            cout << "  WARNING: could not open " << msaPath << " for writing" << endl;
+            out << "  WARNING: could not open " << msaPath << " for writing" << endl;
         }
     }
     {
@@ -1039,7 +1044,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             abpoa_generate_gfa(ab, abpt, gfaFp);
             abpt->out_gfa = 0;
             fclose(gfaFp);
-            cout << "  GFA written to " << gfaPath << endl;
+            out << "  GFA written to " << gfaPath << endl;
         }
     }
 
@@ -1076,25 +1081,25 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         const vector<WindowSnp> snps = detectWindowSnps(
             ab, backboneQposToNode, backboneCodes, seqIdToOrientedRead,
             seqIdNodeToReadPos, minSupport, minVaf, dropRepeatContext);
-        cout << "  SNPs detected: " << snps.size()
+        out << "  SNPs detected: " << snps.size()
              << " (minSupport=" << minSupport << ", minVAF=" << minVaf
              << ", dropRepeatContext=" << (dropRepeatContext ? "true" : "false")
              << ")" << endl;
         for(const WindowSnp& snp : snps) {
             const WindowSnpAllele& ref = snp.alleles.front();
-            cout << "    col rank=" << snp.msaRank
+            out << "    col rank=" << snp.msaRank
                  << " backboneOff=" << snp.backboneOffset
                  << " " << ref.base << ">";
             // alt bases
             for(size_t ai = 1; ai < snp.alleles.size(); ai++)
-                cout << (ai > 1 ? "," : "") << snp.alleles[ai].base;
-            cout << " ref=" << ref.support << " alt=";
+                out << (ai > 1 ? "," : "") << snp.alleles[ai].base;
+            out << " ref=" << ref.support << " alt=";
             for(size_t ai = 1; ai < snp.alleles.size(); ai++)
-                cout << (ai > 1 ? "," : "") << snp.alleles[ai].support;
+                out << (ai > 1 ? "," : "") << snp.alleles[ai].support;
             const int nAlt = int(snp.alleles.size()) - 1;
             const double topVaf = (snp.spanning > 0 && nAlt > 0)
                 ? double(snp.alleles[1].support) / double(snp.spanning) : 0.0;
-            cout << " del=" << snp.delSupport
+            out << " del=" << snp.delSupport
                  << " span=" << snp.spanning
                  << " VAF=" << topVaf
                  << (nAlt > 1 ? " [multi]" : "")
@@ -1103,8 +1108,8 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
                  << " arms=" << snp.alleles.size()
                  << " refMembers=" << ref.members.size();
             for(size_t ai = 1; ai < snp.alleles.size(); ai++)
-                cout << " altMembers[" << ai << "]=" << snp.alleles[ai].members.size();
-            cout << endl;
+                out << " altMembers[" << ai << "]=" << snp.alleles[ai].members.size();
+            out << endl;
         }
 
         // Stage het-anchor descriptors on the window: one k=2 anchor per allele
@@ -1159,7 +1164,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 
             window.hetBubbles.push_back(std::move(bubble));
         }
-        cout << "  staged het bubbles: " << window.hetBubbles.size() << endl;
+        out << "  staged het bubbles: " << window.hetBubbles.size() << endl;
     }
 
     abpoa_free(ab);
@@ -1169,12 +1174,19 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 
 
 // Driver: build a per-window all-reads abPOA multi-segment MSA for each anchor
-// window, mirroring testMultiSegmentMSA so the two engines can be compared.
-// Number of windows capped by env DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
+// window and detect het sites, one window per work item with dynamic load
+// balancing (per-window cost varies with read count / backbone length, so a
+// dynamic schedule keeps threads busy). Windows are processed independently:
+// each worker writes only to its own AnchorWindow (window.hetBubbles), so there
+// is no output data race. Het-anchor CREATION is NOT done here -- it grows the
+// shared memory-mapped anchor store and must stay in the serial append pass that
+// runs after this. Number of windows capped by env DINARA_MSA_MAX_WINDOWS
+// (default 1, 0=all).
 void Assembler::testAbpoaMultiSegmentMSA(
     const shared_ptr<Shasta2Anchors>& shasta2Anchors,
     const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-    vector<AnchorWindow>& anchorWindows)
+    vector<AnchorWindow>& anchorWindows,
+    uint64_t threadCount)
 {
     if(anchorWindows.empty()) {
         cout << "testAbpoaMultiSegmentMSA: no windows." << endl;
@@ -1185,21 +1197,63 @@ void Assembler::testAbpoaMultiSegmentMSA(
     if(const char* env = getenv("DINARA_MSA_MAX_WINDOWS")) {
         maxWindows = strtoull(env, nullptr, 10);  // 0 = all windows
     }
+    const uint64_t windowEnd = (maxWindows == 0) ?
+        anchorWindows.size() : std::min<uint64_t>(maxWindows, anchorWindows.size());
 
-    cout << "testAbpoaMultiSegmentMSA: " << anchorWindows.size()
-         << " windows available";
-    if(maxWindows == 0) cout << ", processing all." << endl;
-    else cout << ", processing up to " << maxWindows << "." << endl;
-
-    uint64_t processed = 0, produced = 0;
-    for(AnchorWindow& window : anchorWindows) {
-        if(maxWindows != 0 && processed >= maxWindows) break;
-        processed++;
-        if(runOneWindowAbpoaMultiSegmentMSA(shasta2Anchors, shasta2Journeys, window)) {
-            produced++;
-        }
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+        if(threadCount == 0) threadCount = 1;
     }
 
-    cout << "testAbpoaMultiSegmentMSA: produced MSA for " << produced
-         << " of " << processed << " processed windows." << endl;
+    cout << "testAbpoaMultiSegmentMSA: " << anchorWindows.size()
+         << " windows available, processing " << windowEnd
+         << " on " << threadCount << " threads." << endl;
+
+    // Publish the shared inputs/outputs for the thread function.
+    abpoaMultiSegmentMSAData.shasta2Anchors = &shasta2Anchors;
+    abpoaMultiSegmentMSAData.shasta2Journeys = &shasta2Journeys;
+    abpoaMultiSegmentMSAData.anchorWindows = &anchorWindows;
+    abpoaMultiSegmentMSAData.windowEnd = windowEnd;
+    abpoaMultiSegmentMSAData.processed = 0;
+    abpoaMultiSegmentMSAData.produced = 0;
+
+    // One work item per window (batch size 1: per-window cost is high and
+    // uneven, so fine-grained dynamic balancing is what we want).
+    setupLoadBalancing(windowEnd, 1);
+    runThreads(&Assembler::testAbpoaMultiSegmentMSAThreadFunction, threadCount);
+
+    cout << "testAbpoaMultiSegmentMSA: produced MSA for "
+         << abpoaMultiSegmentMSAData.produced.load()
+         << " of " << abpoaMultiSegmentMSAData.processed.load()
+         << " processed windows." << endl;
+}
+
+
+void Assembler::testAbpoaMultiSegmentMSAThreadFunction(size_t)
+{
+    auto& data = abpoaMultiSegmentMSAData;
+    const auto& shasta2Anchors = *data.shasta2Anchors;
+    const auto& shasta2Journeys = *data.shasta2Journeys;
+    auto& anchorWindows = *data.anchorWindows;
+
+    uint64_t begin = 0, end = 0;
+    while(getNextBatch(begin, end)) {
+        for(uint64_t i = begin; i != end; i++) {
+            AnchorWindow& window = anchorWindows[i];
+
+            // Buffer this window's diagnostics so they flush as one block, not
+            // interleaved with other threads' output.
+            std::ostringstream buffer;
+            const bool ok = runOneWindowAbpoaMultiSegmentMSA(
+                shasta2Anchors, shasta2Journeys, window, buffer);
+
+            data.processed.fetch_add(1, std::memory_order_relaxed);
+            if(ok) data.produced.fetch_add(1, std::memory_order_relaxed);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                cout << buffer.str();
+            }
+        }
+    }
 }

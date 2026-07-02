@@ -1432,7 +1432,8 @@ void dinara::main::assemble(
     assembler.testAbpoaMultiSegmentMSA(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
-        anchorWindows);
+        anchorWindows,
+        threadCount);
 
     // Turn the staged het bubbles into anchor-graph structure in three serial
     // passes (plan -> append -> stage edges). The passes are ordered so anchors
