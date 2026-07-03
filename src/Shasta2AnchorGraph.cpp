@@ -381,6 +381,14 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             }
         }
 
+        // Drop reads whose base offset is not strictly forward (positionB >
+        // positionA). Het anchors are synthetic k=2 midpoints whose positions
+        // can collide or invert on a read; unlike the backbone path this edge
+        // builder does not go through the Shasta2AnchorPair constructor's strict
+        // journey-order filter, so without this an equal-position or backward
+        // read reaches shasta2's LocalAssembly7 and trips its
+        // positionB > positionA assertion.
+        pair.removeNegativeOffsets(anchors);
         if(pair.orientedReadIds.empty()) return false;
         edge_descriptor e;
         tie(e, ignore) = add_edge(
@@ -2886,6 +2894,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "Edge verification: " << backwardEdgeCount << " edges with backward reads, "
              << zeroLenEdgeCount << " edges with zero-length (equal-position) reads, "
              << missingReadEdgeCount << " edges with reads on neither anchor." << endl;
+
+        // Hard invariant: backward and zero-length reads both trip shasta2's
+        // LocalAssembly7 positionB > positionA assertion during local assembly.
+        // The edge builders (Shasta2AnchorPair strict filter + addHetEdge's
+        // removeNegativeOffsets) should have removed every such read, so any
+        // survivor is a builder bug. Fail here with a clear message rather than
+        // deep inside shasta2. Reads on NEITHER anchor are not fatal: shasta2's
+        // gatherOrientedReads skips them, so they remain a report only.
+        DINARA_ASSERT(backwardEdgeCount == 0);
+        DINARA_ASSERT(zeroLenEdgeCount == 0);
     }
 
     // Trim backbone ends that extend beyond inter-window connection points.

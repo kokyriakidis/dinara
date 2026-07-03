@@ -145,11 +145,15 @@ void Shasta2AnchorPair::removeNegativeOffsets(const Shasta2Anchors& anchors)
     uint64_t removedCount = 0;
     for(uint64_t i=0; i<orientedReadIds.size(); i++) {
         const auto& p = anchorPositions[i];
-        if(p.second >= p.first) {
+        // Keep only STRICTLY forward reads (positionB > positionA). shasta2's
+        // LocalAssembly7::positionOffsetAB() asserts positionB > positionA, so
+        // an equal-position (zero-length span) read passes here but crashes
+        // shasta2. Match its strict predicate exactly.
+        if(p.second > p.first) {
             newOrientedReadIds.push_back(orientedReadIds[i]);
         } else {
             if(removedCount == 0) {
-                cout << "Negative base offsets on edge "
+                cout << "Non-forward base offsets on edge "
                      << anchorIdA << " -> " << anchorIdB << ":" << endl;
             }
             if(removedCount < 5) {
@@ -167,7 +171,7 @@ void Shasta2AnchorPair::removeNegativeOffsets(const Shasta2Anchors& anchors)
     }
     if(removedCount > 0) {
         cout << "  Removed " << removedCount << " / " << orientedReadIds.size()
-             << " reads with negative base offset from edge "
+             << " reads with non-forward base offset from edge "
              << anchorIdA << " -> " << anchorIdB << endl;
     }
 
@@ -195,7 +199,9 @@ void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) c
     for(uint64_t i = 0; i < orientedReadIds.size(); i++) {
         const auto& p = anchorPositions[i];
         const auto& jp = journeyPositions[i];
-        if(p.second < p.first) {
+        // shasta2's LocalAssembly7::positionOffsetAB() asserts positionB >
+        // positionA (strict), so an equal-position read is also invalid here.
+        if(p.second <= p.first) {
             // Find ordinals for this read in both anchors.
             uint32_t ordA = 0, ordB = 0;
             for(auto it = anchorA.begin(); it != anchorA.end(); ++it) {
@@ -204,7 +210,7 @@ void Shasta2AnchorPair::assertNoNegativeOffsets(const Shasta2Anchors& anchors) c
             for(auto it = anchorB.begin(); it != anchorB.end(); ++it) {
                 if(it->orientedReadId == orientedReadIds[i]) { ordB = it->ordinal; break; }
             }
-            cout << "Negative base offset on edge "
+            cout << "Non-forward base offset on edge "
                  << anchorIdA << " -> " << anchorIdB
                  << ": " << orientedReadIds[i]
                  << " basePos A=" << p.first << " B=" << p.second
@@ -222,7 +228,9 @@ bool Shasta2AnchorPair::hasNegativeOffsets(const Shasta2Anchors& anchors) const
     vector< pair<uint32_t, uint32_t> > anchorPositions;
     getAnchorPositions(anchors, anchorPositions);
     for(const auto& p : anchorPositions) {
-        if(p.second < p.first) return true;
+        // Strict: equal positions (zero-length span) are also invalid, matching
+        // shasta2's LocalAssembly7 positionB > positionA assertion.
+        if(p.second <= p.first) return true;
     }
     return false;
 }
