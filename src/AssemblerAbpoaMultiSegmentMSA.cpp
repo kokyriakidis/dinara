@@ -896,6 +896,26 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 
     const int intK = static_cast<int>(k);
 
+    // abPOA allocates the FULL DP matrix for every subgraph alignment
+    // (simd_abpoa_realloc: sn * gn * 3 * size, where sn ~ qlen/lanes and gn is
+    // the subgraph node span). The adaptive band (wb) limits COMPUTATION but
+    // NOT allocation, so a read whose two shared anchors are far apart on the
+    // backbone -- a chimera, a repeat mismap, or a large structural variant --
+    // forces a matrix of tens of GiB and aborts the whole run via a
+    // posix_memalign failure ("[SIMDMalloc] posix_memalign fail!"). Estimate
+    // the matrix size before each gap alignment and drop the offending read
+    // rather than let abPOA abort. Cap is per-alignment; override with
+    // DINARA_ABPOA_MAX_DP_GIB (default 4 GiB, generous for legitimate gaps
+    // which are at most a few thousand bases x a few thousand nodes).
+    uint64_t maxDpGiB = 4;
+    if(const char* e = getenv("DINARA_ABPOA_MAX_DP_GIB")) {
+        char* endp = nullptr;
+        const unsigned long v = strtoul(e, &endp, 10);
+        if(endp != e && v > 0) maxDpGiB = v;
+    }
+    const uint64_t maxDpBytes = maxDpGiB << 30;
+    uint32_t oversizeDroppedReads = 0;
+
     for(const auto& [baseSpan, readIdValue] : readsBySpan) {
         (void)baseSpan;
         const auto& hits = readBoundaryHits[readIdValue];
@@ -935,8 +955,28 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         // Helper to align a gap [begQpos, gapEnd) against subgraph (beg, end)
         // and append its cigars, updating timers.
         auto alignGap = [&](int begNode, int endNode, int begQpos, int gapLen,
-                            uint32_t boundaryForLog) {
-            if(gapLen <= 0) return;
+                            uint32_t boundaryForLog) -> bool {
+            if(gapLen <= 0) return true;
+            // Estimate abPOA's DP allocation and skip this read if it would be
+            // oversized. gn is the subgraph node span (begNode..endNode in
+            // topological index order); the matrix is ~ (gapLen/lanes + 1) * gn
+            // * 3 (affine) * 4 bytes (32-bit fallback, the larger case). Using
+            // 4 bytes/lane and dropping the /lanes factor is a safe upper bound
+            // that never under-counts, so we stay well clear of the real alloc.
+            const int begIndex = ab->abg->node_id_to_index[begNode];
+            const int endIndex = ab->abg->node_id_to_index[endNode];
+            const uint64_t gn = (endIndex >= begIndex)
+                ? uint64_t(endIndex - begIndex + 1) : 0;
+            const uint64_t estBytes =
+                (uint64_t(gapLen) + 1) * gn * 3 * 4;
+            if(estBytes > maxDpBytes) {
+                out << "  OVERSIZE: read " << oid
+                    << " gap near anchor " << boundaryForLog
+                    << " would need ~" << (estBytes >> 30)
+                    << " GiB (" << gapLen << " bases x " << gn
+                    << " nodes); dropping read" << endl;
+                return false;
+            }
             abpoa_res_t res;
             res.n_cigar = 0; res.m_cigar = 0; res.graph_cigar = nullptr;
             auto t0 = chrono::steady_clock::now();
@@ -956,6 +996,7 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
                      << " gap near anchor " << boundaryForLog
                      << " seq " << gapLen << " bases took " << elapsed << "s" << endl;
             }
+            return true;
         };
 
         int begNode = foldBegNode;   // excluded left boundary
@@ -972,7 +1013,11 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             // Gap of read bases strictly before this anchor midpoint, aligned
             // against (begNode, pinNode). For hi==0 this is the outer kHalf of
             // the first anchor; for hi>0 it is the inter-anchor segment.
-            alignGap(begNode, pinNode, begQpos, pinQpos - begQpos, boundary);
+            if(!alignGap(begNode, pinNode, begQpos, pinQpos - begQpos, boundary)) {
+                readOk = false;
+                oversizeDroppedReads++;
+                break;
+            }
 
             // Anchor midpoint MATCH (read's own base).
             whole.push_back(encodeMatch(pinNode));
@@ -985,7 +1030,10 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         if(readOk) {
             // Trailing gap: outer kHalf of the last anchor, aligned against
             // (lastAnchorNode, foldEndNode).
-            alignGap(begNode, foldEndNode, begQpos, qlen - begQpos, lastBoundary);
+            if(!alignGap(begNode, foldEndNode, begQpos, qlen - begQpos, lastBoundary)) {
+                readOk = false;
+                oversizeDroppedReads++;
+            }
         }
 
         if(readOk && readSegments > 0 && !whole.empty()) {
@@ -1026,7 +1074,10 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     }
 
     out << "  aligned " << alignedReads << " reads ("
-         << alignedSegments << " segments), skipped " << skippedReads << endl;
+         << alignedSegments << " segments), skipped " << skippedReads;
+    if(oversizeDroppedReads > 0)
+        out << ", dropped " << oversizeDroppedReads << " oversize";
+    out << endl;
 
     // Report timing by quartile (reads are already longest-first).
     if(perReadTime.size() >= 4) {
