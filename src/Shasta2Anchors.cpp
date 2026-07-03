@@ -11,6 +11,7 @@
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <iostream>
 
@@ -396,6 +397,40 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 
     uint64_t exportedCount = 0;
 
+    // Per-read guard against equal-position collisions between exported anchors.
+    //
+    // shasta2 recovers each read's per-anchor position as (rawPosition + k/2),
+    // which for --k 2 equals this store's markerInfo.position exactly. When
+    // shasta2 assembles a chain step it pairs two anchors and, for every read
+    // common to both, requires the positions to differ: LocalAssembly7 keeps a
+    // read only if positionA != positionB (it drops strictly-backward reads),
+    // and positionOffsetAB() then asserts positionB > positionA. Two exported
+    // anchors that carry the same read at the SAME position therefore crash
+    // shasta2 with "Assertion failed: positionB > positionA".
+    //
+    // This cannot be prevented at the anchor-graph edge layer: shasta2 borrows
+    // reads from neighbouring chain steps before pairing, and it reads positions
+    // from anchor membership, not from any edge's read list. The only robust,
+    // dinara-side invariant is that no oriented read appears at the same
+    // position on two distinct exported anchors.
+    //
+    // Backbone anchors (k=50) cannot collide with each other: a read's marker
+    // maps to exactly one vertex, and all backbone positions share the uniform
+    // +k/2 shift, so distinct markers give distinct positions. The collisions
+    // come from het anchors (k=2), whose synthetic positions can coincide with
+    // a neighbouring backbone (or earlier het) position on the same read.
+    //
+    // Anchors are visited in ascending id, and backbone anchors precede het
+    // anchors (hetAnchorFirstId marks the boundary). So the first claimant of a
+    // (read, position) pair wins - normally the backbone - and a later het
+    // member that collides is dropped from that het anchor only. Dropping a
+    // member from anchor membership is safe: if a graph edge still lists the
+    // read, shasta2 sees it on at most one side (isOnA xor isOnB) and skips it
+    // rather than pairing it. The key packs the oriented read value in the high
+    // 32 bits and the position in the low 32 bits.
+    std::unordered_set<uint64_t> claimedPositions;
+    uint64_t droppedCollisionCount = 0;
+
     // With paired anchor IDs (2*i = canonical, 2*i+1 = RC),
     // canonical anchors are at even indices.
     // We must not skip empty anchors: shasta2 assigns sequential IDs to
@@ -464,12 +499,34 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
         //    so the centered 2-base subset at [position-1, position] is
         //    identical across all members too. Any 2-base subset would do;
         //    the center keeps guaranteed-good flanking sequence on both sides.
+        //
+        // Enforce the per-read distinct-position invariant here (see the
+        // claimedPositions comment above). Backbone anchors are visited first
+        // and never dropped; a later het member whose (read, position) was
+        // already claimed is skipped so shasta2 never pairs two anchors that
+        // carry the same read at the same position.
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const uint64_t key =
+                (uint64_t(markerInfo.orientedReadId.getValue()) << 32) |
+                uint64_t(markerInfo.position);
+            if(not claimedPositions.insert(key).second) {
+                // This (read, position) is already carried by an earlier
+                // exported anchor. Drop this member to avoid an equal-position
+                // collision in shasta2.
+                ++droppedCollisionCount;
+                continue;
+            }
             // External anchors store the raw position (first base of the k-mer).
             const uint32_t rawPosition = markerInfo.position - 1u;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
+    }
+
+    if(droppedCollisionCount > 0) {
+        cout << "writeExternalAnchors: dropped " << droppedCollisionCount <<
+            " anchor members that would have collided at an equal per-read "
+            "position with an earlier exported anchor." << endl;
     }
 
     return exportedCount;
