@@ -4288,11 +4288,25 @@ void Assembler::flagPalindromicReads(
     const auto* hashTablePtr = invertedIndexData.hashTable.data();
 
     std::atomic<uint64_t> palindromicCount{0};
-    const uint64_t batchSize = 100;
+    // Small batches keep threads balanced: per-read cost is now bounded
+    // (local self-hit grouping), so fine-grained dynamic scheduling avoids a
+    // tail where one thread finishes a heavy batch alone.
+    const uint64_t batchSize = 8;
     std::atomic<uint64_t> nextBatch{0};
+
+    // One entry per marker of the read being processed, used to find
+    // self-hits (opposite-strand markers sharing a canonical k-mer) locally
+    // instead of scanning the k-mer's global occurrence list.
+    struct LocalMarker {
+        KmerId canon;
+        uint32_t ord;
+        uint32_t pos;
+        uint8_t isRc;
+    };
 
     auto workerFn = [&]() {
         vector<HifiasmKmerHit> selfHits;
+        vector<LocalMarker> localMarkers;
         HifiasmChainDataScratch dpScratch;
         vector<HifiasmOverlapRegion> overlapRegions;
         vector<uint32_t> chainHitIndexFlat;
@@ -4351,6 +4365,15 @@ void Assembler::flagPalindromicReads(
 
                 selfHits.clear();
 
+                // Collect this read's markers with their canonical k-mer, then
+                // find self-hits (opposite-strand markers that share a canonical
+                // k-mer) by grouping locally. This is O(numMarkersA log numMarkersA)
+                // and independent of a k-mer's global frequency, avoiding the
+                // pathological O(sum of global k-mer counts) scan that made a
+                // single high-coverage/repeat-heavy read (e.g. the reference)
+                // dominate one thread.
+                localMarkers.clear();
+                localMarkers.reserve(numMarkersA);
                 for(uint32_t ordA = 0; ordA < numMarkersA; ordA++) {
                     KmerId currentKId;
                     uint8_t isRcA;
@@ -4367,66 +4390,86 @@ void Assembler::flagPalindromicReads(
                             isRcA = 0;
                         }
                     }
+                    localMarkers.push_back(
+                        LocalMarker{currentKId, ordA,
+                                    uint32_t(markersA[ordA].position), isRcA});
+                }
 
-                    // Hash table lookup.
-                    uint64_t slotIdx =
-                        hashKmer(currentKId) & hashMask;
-                    uint64_t startIdx = 0;
-                    uint32_t count = 0;
-                    bool found = false;
-                    while(!hashTablePtr[slotIdx].empty) {
-                        if(hashTablePtr[slotIdx].key == currentKId) {
-                            startIdx = hashTablePtr[slotIdx].start;
-                            count = hashTablePtr[slotIdx].count;
-                            found = true;
-                            break;
+                // Group markers by canonical k-mer. Ties keep ascending ordinal
+                // so the emitted (ordA, posB) pairs match the previous
+                // occurrence-scan order for a given k-mer group.
+                std::sort(localMarkers.begin(), localMarkers.end(),
+                    [](const LocalMarker& x, const LocalMarker& y) {
+                        if(x.canon != y.canon) return x.canon < y.canon;
+                        return x.ord < y.ord;
+                    });
+
+                const uint32_t seedSpan = uint32_t(
+                    std::min<uint64_t>(kmerLen, 255ULL));
+
+                size_t gBegin = 0;
+                while(gBegin < localMarkers.size()) {
+                    size_t gEnd = gBegin + 1;
+                    while(gEnd < localMarkers.size() &&
+                          localMarkers[gEnd].canon == localMarkers[gBegin].canon) {
+                        ++gEnd;
+                    }
+                    // A group with a single marker cannot form a self-hit.
+                    if(gEnd - gBegin >= 2) {
+                        // Weight from the k-mer's global frequency (one lookup
+                        // per distinct k-mer group).
+                        const KmerId currentKId = localMarkers[gBegin].canon;
+                        uint64_t slotIdx = hashKmer(currentKId) & hashMask;
+                        uint32_t count = 0;
+                        bool found = false;
+                        while(!hashTablePtr[slotIdx].empty) {
+                            if(hashTablePtr[slotIdx].key == currentKId) {
+                                count = hashTablePtr[slotIdx].count;
+                                found = true;
+                                break;
+                            }
+                            slotIdx = (slotIdx + 1) & hashMask;
                         }
-                        slotIdx = (slotIdx + 1) & hashMask;
+                        if(found) {
+                            const uint32_t w = computeInvertedIndexHitWeight(
+                                count, lowFreqThreshold, highFreqThreshold,
+                                highFreqWeightUnit, rareKmerWeight,
+                                invertedIndexData.weightLut, weightExponent);
+                            if(w != 0) {
+                                // Emit a self-hit for every opposite-strand
+                                // ordered pair (a as ordinalA, b as the matching
+                                // self occurrence). Iterating a in ascending
+                                // ordinal and b in ascending ordinal reproduces
+                                // the previous (ordA outer, occurrence inner)
+                                // emission order.
+                                for(size_t a = gBegin; a < gEnd; a++) {
+                                    const uint32_t selfOff =
+                                        localMarkers[a].pos + (seedSpan - 1U);
+                                    for(size_t b = gBegin; b < gEnd; b++) {
+                                        if((localMarkers[a].isRc ^
+                                            localMarkers[b].isRc) == 0) continue;
+                                        const uint32_t posB = localMarkers[b].pos;
+                                        const uint32_t offDiff = uint32_t(
+                                            readLen - 1ULL - uint64_t(posB));
+
+                                        HifiasmKmerHit kh{};
+                                        kh.readID = readId;
+                                        kh.strand = 1;
+                                        kh.self_offset = selfOff;
+                                        kh.offset = offDiff;
+                                        kh.cnt = (std::min(w, 0xffffffu) << 8)
+                                                 | seedSpan;
+                                        kh.ordinalA = localMarkers[a].ord;
+                                        kh.ordinalB =
+                                            std::numeric_limits<uint32_t>::max();
+                                        kh.globalIndex = uint32_t(selfHits.size());
+                                        selfHits.push_back(kh);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if(!found) continue;
-
-                    const uint32_t w = computeInvertedIndexHitWeight(
-                        count, lowFreqThreshold, highFreqThreshold,
-                        highFreqWeightUnit, rareKmerWeight,
-                        invertedIndexData.weightLut, weightExponent);
-                    if(w == 0) continue;
-
-                    const uint32_t posA = markersA[ordA].position;
-                    const uint32_t seedSpan = uint32_t(
-                        std::min<uint64_t>(kmerLen, 255ULL));
-
-                    for(uint64_t idx = startIdx; idx < startIdx + count; idx++) {
-                        const auto& occ =
-                            invertedIndexData.compactOccurrences[idx];
-                        if(occ.readId != readId) continue;
-
-                        const uint32_t posBEncoded = occ.position;
-                        const uint32_t posB = posBEncoded & 0x7fffffffU;
-                        const uint8_t isRcB =
-                            uint8_t(posBEncoded >> 31);
-
-                        // Strand of hit: isRcA ^ isRcB.
-                        // For palindrome we want opposite strand (rev=1).
-                        const uint8_t rev = isRcA ^ isRcB;
-                        if(rev == 0) continue;
-
-                        const uint32_t selfOff = posA + (seedSpan - 1U);
-                        const uint32_t offDiff = uint32_t(
-                            readLen - 1ULL - uint64_t(posB));
-
-                        HifiasmKmerHit kh{};
-                        kh.readID = readId;
-                        kh.strand = 1;
-                        kh.self_offset = selfOff;
-                        kh.offset = offDiff;
-                        kh.cnt = (std::min(w, 0xffffffu) << 8)
-                                 | seedSpan;
-                        kh.ordinalA = ordA;
-                        kh.ordinalB =
-                            std::numeric_limits<uint32_t>::max();
-                        kh.globalIndex = uint32_t(selfHits.size());
-                        selfHits.push_back(kh);
-                    }
+                    gBegin = gEnd;
                 }
 
                 if(selfHits.size() < 2) continue;
@@ -4460,7 +4503,18 @@ void Assembler::flagPalindromicReads(
                     if(!allMapped) continue;
                 }
 
-                sortHifiasmHitsBySelfOffsetThenOffsetRuns(selfHits);
+                // The DP requires hits ordered by self_offset (ties by offset).
+                // The local grouping above emits hits grouped by canonical
+                // k-mer rather than by ascending position, so sort fully here
+                // by (self_offset, offset). sortHifiasmHitsBySelfOffsetThenOffsetRuns
+                // only sorts within already-consecutive equal-self_offset runs
+                // and cannot establish the global ordering on its own.
+                std::sort(selfHits.begin(), selfHits.end(),
+                    [](const HifiasmKmerHit& a, const HifiasmKmerHit& b) noexcept {
+                        if(a.self_offset != b.self_offset)
+                            return a.self_offset < b.self_offset;
+                        return a.offset < b.offset;
+                    });
 
                 // Reassign globalIndex after sort so chain indices
                 // map back to the correct elements.
