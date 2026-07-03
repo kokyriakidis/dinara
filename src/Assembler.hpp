@@ -2802,7 +2802,11 @@ public:
 
     // Alignment candidates using Inverted Index (modular pipeline).
     // Phase 1-4: Build the inverted index for overlap candidate discovery.
-    void buildInvertedIndex(uint64_t threadCount);
+    // buildCanonicalCache=true (default) stores a per-marker canonical k-mer
+    // cache that lets chaining skip reverse-complement recomputation, at a cost
+    // of ~17 bytes/marker of persistent RAM. Set false to save that memory on
+    // low-RAM machines; the query phase then recomputes canonicalization inline.
+    void buildInvertedIndex(uint64_t threadCount, bool buildCanonicalCache = true);
 
     // Phase 5: Run DP chaining on the built index to find alignment candidates.
     void chainAlignmentCandidates(

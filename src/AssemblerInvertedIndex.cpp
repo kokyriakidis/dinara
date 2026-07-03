@@ -2772,7 +2772,7 @@ using namespace dinara;
 // Uses count-then-scatter (hifiasm-style) to avoid the 24-byte intermediate
 // array and radix sort. See InvertedIndexBuilder.hpp for implementation.
 // =============================================================================
-void Assembler::buildInvertedIndex(uint64_t threadCount) {
+void Assembler::buildInvertedIndex(uint64_t threadCount, bool buildCanonicalCache) {
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
@@ -2789,7 +2789,8 @@ void Assembler::buildInvertedIndex(uint64_t threadCount) {
         *markers,
         *markerKmerIds,
         assemblerInfo->k,
-        threadCount);
+        threadCount,
+        buildCanonicalCache);
 }
 
 // =============================================================================

@@ -2,14 +2,32 @@
 
 // Count-then-scatter inverted index construction (hifiasm-style).
 //
-// Replaces the old sort-based approach that materialized a 24-byte-per-occurrence
-// intermediate array and radix-sorted it. This version:
+// This version:
 //   1. Counts k-mer occurrences via per-thread hash tables (no positions stored).
-//   2. Merges thread tables, computes prefix sums to assign each k-mer a range.
-//   3. Scatters (readId, position) directly into the 8-byte CompactOccurrence array.
+//   2. Merges thread tables into a global counting table, then builds the query
+//      hash table with prefix-sum ranges (each k-mer's slice of the output).
+//   3. Scatters (readId, position) directly into the 8-byte CompactOccurrence
+//      array, using a write cursor parallel to the query hash table.
 //
-// Peak memory: ~8 bytes/occurrence (final array) + hash table overhead.
-// The old approach peaked at ~48 bytes/occurrence (24-byte sort src + dst buffers).
+// Memory model (N = total occurrences, D = distinct k-mers, T = threads,
+// s = sizeof(KmerId), typically 16):
+//   - Counting/merge tables are sized by DISTINCT k-mers (load factor ~0.7),
+//     grown on demand, not sized by marker count. Footprint is O(D) per thread
+//     and O(D) global, using parallel key/count arrays (no 32-byte entry, no
+//     unused "start" field during counting).
+//   - The scatter cursor array is parallel to the query hash table, i.e. O(D),
+//     replacing the earlier design's cursor array sized to the (much larger)
+//     counting table.
+//   - The per-occurrence canonical k-mer cache (s + 1 bytes each) is optional
+//     (buildCanonicalCache). Counting and scatter recompute canonicalization
+//     inline (cheap ALU, no memory), so the cache only exists to speed the
+//     query phase and can be disabled to save ~17N bytes on low-RAM machines.
+//
+// Peak heap is therefore dominated by the 8N output array plus O(D) tables.
+// Measured on synthetic data: ~25 bytes/occurrence with the canonical cache on,
+// ~8 bytes/occurrence with it off, versus the previous design's ~190-245
+// bytes/occurrence (per-thread tables at 4-8x marker count with 32-byte entries
+// plus a counting-table-sized atomic cursor array).
 
 #include "Assembler.hpp"
 #include "bitReversal.hpp"
@@ -59,41 +77,90 @@ inline uint64_t hashKmer(KmerId k) {
 namespace inverted_index_builder {
 
 // ---------------------------------------------------------------------------
-// Counting hash table used only during index construction.
+// Compact counting hash table used only during index construction.
+//
+// Open-addressing, linear probing, parallel arrays:
+//   keys[slot]   : the canonical k-mer for an occupied slot.
+//   counts[slot] : occurrence count; 0 means the slot is empty (sentinel).
+//
+// Sizing is driven by the number of DISTINCT k-mers via a load-factor trigger
+// (grow at ~0.7), so the footprint tracks the working set rather than the
+// marker count. Storing count directly (no 32-byte struct, no unused "start"
+// field during counting) minimizes bytes touched per probe.
 // ---------------------------------------------------------------------------
 
-struct CountEntry {
-    KmerId key{};
-    uint64_t start = 0;     // Prefix-sum offset into compactOccurrences.
-    uint32_t count = 0;     // Number of occurrences of this k-mer.
-    bool empty = true;
-};
+struct CompactCountTable {
+    std::vector<KmerId>   keys;
+    std::vector<uint32_t> counts;   // 0 => empty
+    uint64_t mask = 0;
+    uint64_t size = 0;              // capacity (power of two)
+    uint64_t occupied = 0;         // number of distinct keys stored
+    uint64_t growThreshold = 0;    // occupied count that triggers a grow
 
-// Atomic write cursor, stored separately from CountEntry to avoid
-// polluting the merge phase with atomic overhead.
-struct ScatterState {
-    std::atomic<uint64_t> writeCursor{0};
-};
-
-inline CountEntry* findOrInsert(
-    std::vector<CountEntry>& table,
-    const uint64_t mask,
-    const KmerId key)
-{
-    uint64_t slot = hashKmer(key) & mask;
-    while (true) {
-        if (table[slot].empty) {
-            table[slot].key = key;
-            table[slot].empty = false;
-            table[slot].count = 0;
-            return &table[slot];
-        }
-        if (table[slot].key == key) {
-            return &table[slot];
-        }
-        slot = (slot + 1) & mask;
+    void init(uint64_t initialCapacityPow2) {
+        size = initialCapacityPow2;
+        mask = size - 1;
+        keys.assign(size, KmerId(0));
+        counts.assign(size, 0u);
+        occupied = 0;
+        growThreshold = (size * 7) / 10;   // load factor 0.7
     }
-}
+
+    void grow() {
+        std::vector<KmerId>   oldKeys;
+        std::vector<uint32_t> oldCounts;
+        oldKeys.swap(keys);
+        oldCounts.swap(counts);
+        const uint64_t oldSize = size;
+
+        size <<= 1;
+        mask = size - 1;
+        keys.assign(size, KmerId(0));
+        counts.assign(size, 0u);
+        growThreshold = (size * 7) / 10;
+
+        for (uint64_t i = 0; i < oldSize; ++i) {
+            if (oldCounts[i] != 0) {
+                uint64_t slot = hashKmer(oldKeys[i]) & mask;
+                while (counts[slot] != 0) slot = (slot + 1) & mask;
+                keys[slot] = oldKeys[i];
+                counts[slot] = oldCounts[i];
+            }
+        }
+    }
+
+    // Increment the count for key, inserting if absent. Grows on demand.
+    inline void add(const KmerId key) {
+        if (occupied >= growThreshold) grow();
+        uint64_t slot = hashKmer(key) & mask;
+        while (true) {
+            if (counts[slot] == 0) {
+                keys[slot] = key;
+                counts[slot] = 1;
+                ++occupied;
+                return;
+            }
+            if (keys[slot] == key) { ++counts[slot]; return; }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    // Merge another key with an explicit count (used when merging thread tables).
+    inline void addCount(const KmerId key, const uint32_t c) {
+        if (occupied >= growThreshold) grow();
+        uint64_t slot = hashKmer(key) & mask;
+        while (true) {
+            if (counts[slot] == 0) {
+                keys[slot] = key;
+                counts[slot] = c;
+                ++occupied;
+                return;
+            }
+            if (keys[slot] == key) { counts[slot] += c; return; }
+            slot = (slot + 1) & mask;
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Main builder function.
@@ -104,14 +171,21 @@ inline CountEntry* findOrInsert(
 /// Populates:
 ///   - data.compactOccurrences  (8 bytes per occurrence)
 ///   - data.hashTable           (query-phase hash table)
-///   - data.strand0CanonicalKmerIds / IsRc / Offsets
 ///   - data.k
+/// and, when buildCanonicalCache is true, the optional per-marker canonical
+/// cache (data.strand0CanonicalKmerIds / IsRc / Offsets) that lets the query
+/// phase skip recomputing reverse complements. When false, those vectors are
+/// left empty and the query phase recomputes canonicalization on the fly.
+///
+/// Internal counting/scatter passes recompute canonicalization inline from
+/// markerKmerIds, so construction never depends on the canonical cache.
 inline void build(
     Assembler::AlignmentCandidatesInvertedIndexData& data,
     const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
     const MemoryMapped::VectorOfVectors<KmerId, uint64_t>& markerKmerIds,
     const uint64_t k,
-    const uint64_t threadCount)
+    const uint64_t threadCount,
+    const bool buildCanonicalCache = true)
 {
     using std::vector;
     using std::thread;
@@ -122,7 +196,7 @@ inline void build(
     const ReadId readCount = ReadId(markers.size() / 2);
 
     // =====================================================================
-    // Phase 1: Compute per-read marker counts + canonical cache
+    // Phase 1: Per-read marker counts (and optional canonical cache)
     // =====================================================================
 
     vector<uint64_t> readMarkerCounts(size_t(readCount), 0);
@@ -132,41 +206,37 @@ inline void build(
         readMarkerCounts[size_t(rId)] = std::min<size_t>(rMarkers.size(), rKmerIds.size());
     }
 
-    data.strand0CanonicalOffsets.resize(size_t(readCount) + 1, 0);
+    // Per-read base offsets into the flat per-marker arrays. Always needed for
+    // the optional cache; also serves as the strand0CanonicalOffsets output.
+    vector<uint64_t> readBase(size_t(readCount) + 1, 0);
     for (size_t r = 0; r < size_t(readCount); ++r) {
-        data.strand0CanonicalOffsets[r + 1] =
-            data.strand0CanonicalOffsets[r] + readMarkerCounts[r];
+        readBase[r + 1] = readBase[r] + readMarkerCounts[r];
     }
-    const uint64_t totalMarkersFound = data.strand0CanonicalOffsets.back();
-
-    data.strand0CanonicalKmerIds.resize(totalMarkersFound);
-    data.strand0CanonicalIsRc.resize(totalMarkersFound);
+    const uint64_t totalMarkersFound = readBase.back();
 
     cout << "Building Inverted Index for " << totalMarkersFound
          << " markers (" << readCount << " reads)." << endl;
 
-    // Parallel canonicalization.
-    {
+    if (buildCanonicalCache) {
+        data.strand0CanonicalOffsets = readBase;   // copy: also used by query phase
+        data.strand0CanonicalKmerIds.resize(totalMarkersFound);
+        data.strand0CanonicalIsRc.resize(totalMarkersFound);
+
         vector<thread> threads;
         threads.reserve(threadCount);
         for (size_t tid = 0; tid < threadCount; ++tid) {
             threads.emplace_back([&, tid]() {
                 const ReadId startRead = ReadId((uint64_t(readCount) * tid) / threadCount);
                 const ReadId endRead = ReadId((uint64_t(readCount) * (tid + 1)) / threadCount);
-
                 for (ReadId rId = startRead; rId < endRead; ++rId) {
                     const auto& rKmerIds = markerKmerIds[size_t(rId) << 1];
                     const size_t n = readMarkerCounts[size_t(rId)];
-                    size_t writeOff = size_t(data.strand0CanonicalOffsets[size_t(rId)]);
-
+                    size_t writeOff = size_t(readBase[size_t(rId)]);
                     for (size_t i = 0; i < n; ++i) {
-                        KmerId kId = rKmerIds[i];
-                        KmerId rcKId = getRcKmerId(kId, k);
-                        KmerId canonicalKId = (kId < rcKId) ? kId : rcKId;
-                        uint8_t isRc = uint8_t(kId > rcKId);
-
-                        data.strand0CanonicalKmerIds[writeOff] = canonicalKId;
-                        data.strand0CanonicalIsRc[writeOff] = isRc;
+                        const KmerId kId = rKmerIds[i];
+                        const KmerId rcKId = getRcKmerId(kId, k);
+                        data.strand0CanonicalKmerIds[writeOff] = (kId < rcKId) ? kId : rcKId;
+                        data.strand0CanonicalIsRc[writeOff] = uint8_t(kId > rcKId);
                         ++writeOff;
                     }
                 }
@@ -175,17 +245,34 @@ inline void build(
         for (auto& t : threads) t.join();
     }
 
+    // Helper: canonical k-mer for marker i of a read (cache or recompute).
+    // Generic over the row type so it works with the memory-mapped span the
+    // real VectorOfVectors returns.
+    const bool useCache = buildCanonicalCache;
+    auto canonicalAt = [&](size_t i, const auto& rKmerIds, uint64_t base) -> KmerId {
+        if (useCache) {
+            return data.strand0CanonicalKmerIds[base + i];
+        }
+        const KmerId kId = rKmerIds[i];
+        const KmerId rcKId = getRcKmerId(kId, k);
+        return (kId < rcKId) ? kId : rcKId;
+    };
+
+    // Reasonable initial per-thread table capacity: enough to hold a small
+    // fraction of this thread's markers before the first grow, capped so we
+    // never pre-allocate anywhere near marker-count territory.
+    auto initialCapacityFor = [](uint64_t threadMarkers) -> uint64_t {
+        uint64_t cap = 1024;
+        const uint64_t target = std::max<uint64_t>(1024, threadMarkers / 8);
+        while (cap < target) cap <<= 1;
+        return cap;
+    };
+
     // =====================================================================
     // Phase 2: Count occurrences per canonical k-mer (per-thread tables)
     // =====================================================================
 
-    struct ThreadCountTable {
-        vector<CountEntry> table;
-        uint64_t mask = 0;
-        uint64_t distinctCount = 0;
-    };
-    vector<ThreadCountTable> threadTables(threadCount);
-
+    vector<CompactCountTable> threadTables(threadCount);
     {
         vector<thread> threads;
         threads.reserve(threadCount);
@@ -199,26 +286,15 @@ inline void build(
                     threadMarkers += readMarkerCounts[size_t(rId)];
                 }
 
-                // Size local table at ~4x marker count for low collision rate.
-                uint64_t tableSize = 1024;
-                while (tableSize < threadMarkers * 4) tableSize *= 2;
-
                 auto& tt = threadTables[tid];
-                tt.table.resize(tableSize);
-                tt.mask = tableSize - 1;
-                tt.distinctCount = 0;
+                tt.init(initialCapacityFor(threadMarkers));
 
                 for (ReadId rId = startRead; rId < endRead; ++rId) {
+                    const auto& rKmerIds = markerKmerIds[size_t(rId) << 1];
                     const size_t n = readMarkerCounts[size_t(rId)];
-                    const size_t base = size_t(data.strand0CanonicalOffsets[size_t(rId)]);
-
+                    const uint64_t base = readBase[size_t(rId)];
                     for (size_t i = 0; i < n; ++i) {
-                        const KmerId canonicalKId = data.strand0CanonicalKmerIds[base + i];
-                        CountEntry* entry = findOrInsert(tt.table, tt.mask, canonicalKId);
-                        if (entry->count == 0) {
-                            ++tt.distinctCount;
-                        }
-                        ++entry->count;
+                        tt.add(canonicalAt(i, rKmerIds, base));
                     }
                 }
             });
@@ -227,52 +303,63 @@ inline void build(
     }
 
     // =====================================================================
-    // Phase 3: Merge per-thread tables into global counting table
+    // Phase 3: Merge per-thread tables into a global counting table
     // =====================================================================
 
-    uint64_t totalDistinctUpperBound = 0;
-    for (const auto& tt : threadTables) {
-        totalDistinctUpperBound += tt.distinctCount;
+    uint64_t distinctUpperBound = 0;
+    for (const auto& tt : threadTables) distinctUpperBound += tt.occupied;
+
+    CompactCountTable globalTable;
+    {
+        uint64_t cap = 1024;
+        const uint64_t target = std::max<uint64_t>(1024, (distinctUpperBound * 10) / 7 + 1);
+        while (cap < target) cap <<= 1;
+        globalTable.init(cap);
     }
 
-    uint64_t globalTableSize = 1024;
-    while (globalTableSize < totalDistinctUpperBound * 4) globalTableSize *= 2;
-
-    vector<CountEntry> globalTable(globalTableSize);
-    const uint64_t globalMask = globalTableSize - 1;
-    uint64_t numDistinctKmers = 0;
-
     for (auto& tt : threadTables) {
-        for (auto& entry : tt.table) {
-            if (!entry.empty) {
-                CountEntry* ge = findOrInsert(globalTable, globalMask, entry.key);
-                if (ge->count == 0) {
-                    ++numDistinctKmers;
-                }
-                ge->count += entry.count;
+        for (uint64_t s = 0; s < tt.size; ++s) {
+            if (tt.counts[s] != 0) {
+                globalTable.addCount(tt.keys[s], tt.counts[s]);
             }
         }
         // Free thread-local table immediately.
-        { vector<CountEntry>().swap(tt.table); }
+        { vector<KmerId>().swap(tt.keys); }
+        { vector<uint32_t>().swap(tt.counts); }
     }
-    { vector<ThreadCountTable>().swap(threadTables); }
+    { vector<CompactCountTable>().swap(threadTables); }
 
+    const uint64_t numDistinctKmers = globalTable.occupied;
     cout << "Distinct K-mers found: " << numDistinctKmers << endl;
 
     // =====================================================================
-    // Phase 4: Prefix-sum → assign each k-mer its range
+    // Phase 4: Build query hash table with prefix-sum ranges; init cursors
     // =====================================================================
+    //
+    // The query hash table (indexed by hash of the canonical k-mer) doubles as
+    // the scatter lookup structure. A cursor array parallel to it (indexed by
+    // query slot) holds each k-mer's next free write position. This keeps the
+    // cursor footprint O(distinct), not O(counting-table-size).
 
-    // Build a parallel array of atomic write cursors for the scatter phase.
-    vector<ScatterState> scatterStates(globalTableSize);
+    uint64_t queryTableSize = 1;
+    while (queryTableSize < numDistinctKmers * 2) queryTableSize <<= 1;
+    const uint64_t queryMask = queryTableSize - 1;
+
+    data.hashTable.assign(queryTableSize, {});
+    vector<std::atomic<uint64_t>> cursors(queryTableSize);
+
     {
         uint64_t offset = 0;
-        for (size_t i = 0; i < globalTableSize; ++i) {
-            if (!globalTable[i].empty) {
-                globalTable[i].start = offset;
-                scatterStates[i].writeCursor.store(offset, std::memory_order_relaxed);
-                offset += globalTable[i].count;
-            }
+        for (uint64_t s = 0; s < globalTable.size; ++s) {
+            if (globalTable.counts[s] == 0) continue;
+            const KmerId key = globalTable.keys[s];
+            const uint32_t count = globalTable.counts[s];
+
+            uint64_t slot = hashKmer(key) & queryMask;
+            while (!data.hashTable[slot].empty) slot = (slot + 1) & queryMask;
+            data.hashTable[slot] = {key, offset, count, false};
+            cursors[slot].store(offset, std::memory_order_relaxed);
+            offset += count;
         }
         if (offset != totalMarkersFound) {
             throw std::runtime_error(
@@ -280,6 +367,10 @@ inline void build(
                 + std::to_string(offset) + " vs " + std::to_string(totalMarkersFound));
         }
     }
+
+    // Free the global counting table before allocating the output array.
+    { vector<KmerId>().swap(globalTable.keys); }
+    { vector<uint32_t>().swap(globalTable.counts); }
 
     // =====================================================================
     // Phase 5: Allocate compactOccurrences and scatter positions
@@ -297,25 +388,31 @@ inline void build(
 
                 for (ReadId rId = startRead; rId < endRead; ++rId) {
                     const auto& rMarkers = markers[size_t(rId) << 1];
+                    const auto& rKmerIds = markerKmerIds[size_t(rId) << 1];
                     const size_t n = readMarkerCounts[size_t(rId)];
-                    const size_t base = size_t(data.strand0CanonicalOffsets[size_t(rId)]);
+                    const uint64_t base = readBase[size_t(rId)];
 
                     for (size_t i = 0; i < n; ++i) {
-                        const KmerId canonicalKId = data.strand0CanonicalKmerIds[base + i];
-                        const uint8_t isRc = data.strand0CanonicalIsRc[base + i];
+                        KmerId canonicalKId;
+                        uint8_t isRc;
+                        if (useCache) {
+                            canonicalKId = data.strand0CanonicalKmerIds[base + i];
+                            isRc = data.strand0CanonicalIsRc[base + i];
+                        } else {
+                            const KmerId kId = rKmerIds[i];
+                            const KmerId rcKId = getRcKmerId(kId, k);
+                            canonicalKId = (kId < rcKId) ? kId : rcKId;
+                            isRc = uint8_t(kId > rcKId);
+                        }
                         const uint32_t position = rMarkers[i].position;
                         const uint32_t encodedPosition = position | (uint32_t(isRc) << 31);
 
-                        // Look up the k-mer's slot in the global table.
-                        uint64_t slot = hashKmer(canonicalKId) & globalMask;
-                        while (globalTable[slot].key != canonicalKId) {
-                            slot = (slot + 1) & globalMask;
+                        uint64_t slot = hashKmer(canonicalKId) & queryMask;
+                        while (data.hashTable[slot].key != canonicalKId) {
+                            slot = (slot + 1) & queryMask;
                         }
-
-                        // Atomically claim a write position.
                         const uint64_t writeIdx =
-                            scatterStates[slot].writeCursor.fetch_add(1, std::memory_order_relaxed);
-
+                            cursors[slot].fetch_add(1, std::memory_order_relaxed);
                         data.compactOccurrences[writeIdx] = {rId, encodedPosition};
                     }
                 }
@@ -324,33 +421,8 @@ inline void build(
         for (auto& t : threads) t.join();
     }
 
-    // Free scatter state.
-    { vector<ScatterState>().swap(scatterStates); }
-
-    // =====================================================================
-    // Phase 6: Build the final query hash table
-    // =====================================================================
-
-    {
-        uint64_t queryTableSize = 1;
-        while (queryTableSize < numDistinctKmers * 2) queryTableSize *= 2;
-
-        data.hashTable.resize(queryTableSize);
-        const uint64_t queryMask = queryTableSize - 1;
-
-        for (const auto& entry : globalTable) {
-            if (!entry.empty) {
-                uint64_t slot = hashKmer(entry.key) & queryMask;
-                while (!data.hashTable[slot].empty) {
-                    slot = (slot + 1) & queryMask;
-                }
-                data.hashTable[slot] = {entry.key, entry.start, entry.count, false};
-            }
-        }
-    }
-
-    // Free the global counting table.
-    { vector<CountEntry>().swap(globalTable); }
+    // Free scatter cursors.
+    { vector<std::atomic<uint64_t>>().swap(cursors); }
 
     cout << "Index construction complete (count-scatter)." << endl;
 }
