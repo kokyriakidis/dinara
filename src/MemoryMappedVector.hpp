@@ -374,7 +374,18 @@ template<class T> inline dinara::MemoryMapped::Vector<T>::~Vector()
         } else {
 
             if(isOpenWithWriteAccess) {
-                unreserve();
+                // unreserve() shrinks the backing file (capacity -> size) via a
+                // close()+mmap() round-trip, which can throw on ENOMEM. A
+                // destructor is implicitly noexcept, so an escaping exception
+                // would call std::terminate(). Failing to trim the file at
+                // teardown is non-fatal: the data is already persisted and the
+                // only cost is a slightly oversized file. Swallow the failure so
+                // teardown never aborts the process.
+                try {
+                    unreserve();
+                } catch(const std::exception&) {
+                    // Best-effort trim; ignore and proceed to close().
+                }
             }
             close();
         }

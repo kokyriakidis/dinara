@@ -102,6 +102,36 @@ struct AnchorWindow {
     };
     std::vector<HetSnp> hetSnps;
 
+    // ------------------------------------------------------------------
+    // MSA-DAG anchor staging (replaces the het/hom bubble splice model).
+    //
+    // Each per-window abPOA MSA is walked in topological (msa-rank) order and a
+    // sparse set of columns is SELECTED for anchor generation: every VARIANT
+    // column (>=2 distinct bases aligned at one rank) and every COVERAGE-CHANGE
+    // column (the set of reads present differs from the previous column, i.e. a
+    // read enters or leaves). Between consecutive selected columns the read set
+    // is constant and there is no variation, so no intermediate anchor is
+    // needed; the two bounding anchors already connect those reads.
+    //
+    // At each selected column the reads present are grouped by their REAL 2-mer
+    // [read[pos], read[pos+1]] read from the read itself. Each distinct 2-mer
+    // becomes one anchor (this both splits alleles into arms and satisfies
+    // shasta2's requirement that every external anchor's members share an
+    // identical k-mer). A member is (orientedReadId, rawPosition) where
+    // rawPosition is the read's real absolute base position at that node.
+    //
+    // Because a read's base position is strictly increasing along the MSA, and
+    // because per-read window spans are disjoint (exclusive anchor ownership in
+    // window construction), every anchor a read belongs to has a distinct,
+    // strictly-ordered position - within a window AND across windows. Rebuilding
+    // journeys over these anchors (sorted by position) therefore yields strictly
+    // increasing journeys, making equal-position collisions and offset
+    // inversions impossible by construction.
+    //
+    // Each entry is one anchor's member list, becoming a single
+    // appendHetAnchorPair call in the post-window serial append pass.
+    std::vector<std::vector<std::pair<OrientedReadId, uint32_t>>> msaAnchorMembers;
+
     // Staged het-anchor descriptors from per-window abPOA SNP detection.
     // Each allele of a clean SNP bubble becomes one k=2 anchor: its members are
     // the reads on that allele, each pinned at rawPosition (the read's base

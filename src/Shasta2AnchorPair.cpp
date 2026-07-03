@@ -400,8 +400,6 @@ void Shasta2AnchorPair::createChildren(
 
 uint32_t Shasta2AnchorPair::getAverageOffset(const Shasta2Anchors& anchors) const
 {
-    const uint32_t kHalf = uint32_t(anchors.k / 2);
-
     uint64_t sumBaseOffset = 0;
 
     const Shasta2Anchor anchorA = anchors[anchorIdA];
@@ -436,22 +434,24 @@ uint32_t Shasta2AnchorPair::getAverageOffset(const Shasta2Anchors& anchors) cons
         if(orientedReadId == *it) {
             ++it;
 
-            const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
-
-            const uint32_t ordinalA = itA->ordinal;
-            const uint32_t ordinalB = itB->ordinal;
-            if(ordinalB < ordinalA) {       // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
+            // Use the anchor's STORED midpoint position rather than re-deriving
+            // it from markers[ordinal]. For k=50 marker-graph anchors the stored
+            // position equals markers[ordinal].position + kHalf (set that way at
+            // construction), so this is identical. For k=2 MSA anchors the
+            // ordinal is a real base position, not a marker index, so
+            // markers[ordinal] would be out of range; the stored position is the
+            // real base midpoint and is the correct value.
+            const uint32_t positionA = itA->position;
+            const uint32_t positionB = itB->position;
+            if(positionB < positionA) {     // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
                 throw runtime_error(
                     "Order violation at anchor pair " +
                     shasta2AnchorIdToString(anchorIdA) + " " +
                     shasta2AnchorIdToString(anchorIdB) + " " +
-                    orientedReadId.getString() + " ordinals " +
-                    to_string(ordinalA) + " " +
-                    to_string(ordinalB));
+                    orientedReadId.getString() + " positions " +
+                    to_string(positionA) + " " +
+                    to_string(positionB));
             }
-            const uint32_t positionA = orientedReadMarkers[ordinalA].position + kHalf;
-            const uint32_t positionB = orientedReadMarkers[ordinalB].position + kHalf;
-            DINARA_ASSERT(positionB >= positionA);      // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
 
             const uint32_t offset = positionB - positionA;
             sumBaseOffset += offset;

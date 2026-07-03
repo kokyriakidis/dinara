@@ -137,6 +137,20 @@ public:
         const MarkerGraph& markerGraph,
         uint64_t threadCount);
 
+    // Empty-store constructor for MSA-DAG anchor generation. Creates an empty
+    // anchorMarkerInfos ready for appendHetAnchorPair, and does NOT build
+    // MarkerKmers or any marker-graph anchors. The store will contain only k=2
+    // anchors appended by the caller. `markers`/`markerGraph` references are
+    // retained (unused for k=2 export/journeys) to satisfy the class layout.
+    struct EmptyForAppend {};
+    Shasta2Anchors(
+        EmptyForAppend,
+        const MappedMemoryOwner&,
+        const Reads& reads,
+        uint64_t k,
+        const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+        const MarkerGraph& markerGraph);
+
     // Access existing.
     Shasta2Anchors(
         const string& baseName,

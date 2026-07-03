@@ -1522,53 +1522,127 @@ void dinara::main::assemble(
     // are created only for bubbles that will be wired: the planner marks which
     // bubbles are usable, the append pass creates exactly those anchors, and the
     // staging pass wires them. See the helpers in the anonymous namespace above.
-    const uint32_t hetKHalf = uint32_t(shasta2Anchors->k / 2);
-
-    // Pass 1: plan. Assign each bubble to the backbone interval that strictly
-    // contains its flank span; drop the rest (plannedInterval = -1). Also drop
-    // any bubble whose bracketing homs would collide with an existing primary
-    // anchor's (read, position) marker (see planWindowHetBubbles).
-    uint64_t plannedBubbles = 0, droppedUncontained = 0, droppedPrimaryCollision = 0;
+    // ------------------------------------------------------------------
+    // MSA-DAG anchor generation.
+    //
+    // Build a FRESH anchor store containing only the k=2 anchors staged from
+    // each window's MSA (window.msaAnchorMembers). This fully replaces the old
+    // splice model (backbone k=50 anchors + het/hom anchors spliced into
+    // intervals): every anchor now comes from a single coordinate system (each
+    // read's real base position), so positions are strictly monotonic per read
+    // and equal-position collisions / offset inversions are impossible by
+    // construction. The primary k=50 store remains only as scaffolding used
+    // during window construction; it is not exported.
+    //
+    // Because window construction claims anchors exclusively, per-read window
+    // spans are disjoint, so a read's anchors across all windows have distinct,
+    // strictly-increasing base positions. Rebuilding journeys over this store
+    // (sorted by ordinal = base position) therefore yields strictly increasing
+    // journeys, and deriving all edges from those journeys keeps every edge's
+    // read list a subset of both endpoint anchors' membership.
+    auto msaAnchors = make_shared<Shasta2Anchors>(
+        Shasta2Anchors::EmptyForAppend{},
+        shasta2Owner,
+        assembler.getReads(),
+        uint64_t(2),                       // k = 2 for all MSA anchors
+        *assembler.markers,
+        assembler.markerGraph);
     {
-        // (read, position) markers owned by primary anchors, built once before
-        // any het anchor is appended (so the store still holds only primaries).
-        const PrimaryMarkerSet primarySet = buildPrimaryMarkerSet(*shasta2Anchors);
-        vector<Shasta2AnchorId> bbAnchors;
-        vector<uint32_t> bbOffset;
-        for(AnchorWindow& window : anchorWindows) {
-            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
-                                      hetKHalf, bbAnchors, bbOffset)) {
-                // Fewer than two backbone anchors: no interval, drop all bubbles.
-                for(auto& b : window.hetBubbles) { b.plannedInterval = -1; ++droppedUncontained; }
-                continue;
-            }
-            planWindowHetBubbles(window, bbOffset, primarySet,
-                                 plannedBubbles, droppedUncontained,
-                                 droppedPrimaryCollision);
-        }
-        cout << timestamp << "Planned " << plannedBubbles
-             << " contained het bubbles (" << droppedUncontained
-             << " dropped, of which " << droppedPrimaryCollision
-             << " for hom/primary anchor collision)." << endl;
-    }
-
-    // Pass 2: append. Create the canonical/RC anchor pairs for planned bubbles.
-    // This grows the memory-mapped store and invalidates outstanding anchor
-    // spans, so it must run after all window processing.
-    {
-        cout << timestamp << "Appending het anchors from "
+        cout << timestamp << "Building MSA-DAG anchors from "
              << anchorWindows.size() << " windows..." << endl;
-        uint64_t hetAnchorPairs = 0, homAnchorPairs = 0;
-        for(AnchorWindow& window : anchorWindows)
-            appendWindowHetAnchors(*shasta2Anchors, window,
-                                   hetAnchorPairs, homAnchorPairs);
-        cout << timestamp << "  (" << homAnchorPairs
-             << " hom separator anchor pairs)" << endl;
-        cout << timestamp << "Appended " << hetAnchorPairs
-             << " het anchor pairs (" << (2 * hetAnchorPairs)
-             << " anchors); store now has " << shasta2Anchors->size()
-             << " anchors." << endl;
+        uint64_t stagedAnchorPairs = 0, stagedMembers = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            for(auto& members : window.msaAnchorMembers) {
+                if(members.empty()) continue;
+                msaAnchors->appendHetAnchorPair(members);
+                ++stagedAnchorPairs;
+                stagedMembers += members.size();
+                // Free per-window staging as we go to bound memory.
+                vector<std::pair<OrientedReadId, uint32_t>>().swap(members);
+            }
+            vector<vector<std::pair<OrientedReadId, uint32_t>>>().swap(
+                window.msaAnchorMembers);
+        }
+        cout << timestamp << "Appended " << stagedAnchorPairs
+             << " MSA anchor pairs (" << (2 * stagedAnchorPairs)
+             << " anchors, " << stagedMembers << " members); store has "
+             << msaAnchors->size() << " anchors." << endl;
     }
+
+    // Release the primary k=50 anchor store and its journeys before building the
+    // MSA journeys. From here on only the MSA store is used: windows are already
+    // built, external-anchor export and the exported anchor graph both read from
+    // msaAnchors/msaJourneys, and the legacy splice path below is disabled
+    // (return; + #if 0). Holding both stores mapped simultaneously doubles peak
+    // footprint, which overruns the cgroup memory cap on constrained hosts and
+    // manifests as an ENOMEM during the next mmap. Drop the primary store first
+    // so the MSA journeys build within budget. (shasta2Anchors/shasta2Journeys
+    // are references to the assembler.* members, so these resets clear both.)
+    shasta2Journeys.reset();
+    shasta2Anchors.reset();
+
+    // Rebuild journeys over the MSA anchor store. The journey builder sorts each
+    // read's anchors by ordinal (= real base position) and sets
+    // positionInJourney, which findChildren/findParents use to derive edges.
+    cout << timestamp << "Rebuilding journeys over MSA anchors..." << endl;
+    auto msaJourneys = make_shared<Shasta2Journeys>(
+        2 * assembler.getReads().readCount(),
+        msaAnchors,
+        threadCount,
+        shasta2Owner);
+
+    // Redirect the exported artifacts to the MSA store/journeys. dinara's own
+    // internal assembly graph (below) continues to use the primary store; only
+    // the shasta2 export uses the MSA anchors.
+    shasta2Anchors = msaAnchors;
+    assembler.shasta2Anchors = msaAnchors;
+    shasta2Journeys = msaJourneys;
+    assembler.shasta2Journeys = msaJourneys;
+
+    // Write external anchors from the MSA store.
+    cout << timestamp << "Writing Shasta2 external anchors to "
+         << externalAnchorsName << "..." << endl;
+    const uint64_t exportedExternalAnchorCount =
+        msaAnchors->writeExternalAnchors(externalAnchorsName);
+    cout << timestamp << "Wrote " << exportedExternalAnchorCount
+         << " external anchors for Shasta2. Use --external-anchors-name "
+         << externalAnchorsName << endl;
+
+    // Build the anchor graph from the rebuilt journeys (all edges derived from
+    // journey adjacency), then export it for shasta2.
+    {
+        const uint64_t minEdgeCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
+        cout << timestamp << "Creating Shasta2AnchorGraph from MSA journeys "
+             << "(minEdgeCoverage=" << minEdgeCoverage << ")..." << endl;
+        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+            *msaAnchors,
+            *msaJourneys,
+            minEdgeCoverage,
+            threadCount);
+
+        assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
+        assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
+        cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
+
+        string externalAnchorGraphName =
+            assembler.shasta2MappedMemoryOwner().largeDataName("Shasta2AnchorGraph");
+        if(externalAnchorGraphName.empty()) {
+            externalAnchorGraphName = "Shasta2ExternalAnchorGraph";
+        }
+        externalAnchorGraphName =
+            std::filesystem::absolute(externalAnchorGraphName).string();
+        assembler.shasta2AnchorGraph->saveForShasta2(externalAnchorGraphName);
+        cout << timestamp << "Wrote shasta2 anchor graph. Use "
+             << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
+    }
+
+    // The remainder of the legacy splice/graph path is disabled; the MSA-DAG
+    // build above fully replaces it. Return before the dead code.
+    return;
+
+#if 0
+    const uint32_t hetKHalf = uint32_t(shasta2Anchors->k / 2);
 
     // Pass 3: stage window-local (intra-window) anchor-graph edges on the
     // windows: the backbone chain (consecutive backbone anchors + RC mirror) and
@@ -1714,6 +1788,7 @@ void dinara::main::assemble(
     }
 
     return;
+#endif // disabled legacy splice/graph path (replaced by MSA-DAG build above)
 
     // ksw2-based het SNP detection per window. Aligns each member's
     // inter-anchor segments against the backbone with banded 2-piece affine

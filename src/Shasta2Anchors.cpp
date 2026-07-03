@@ -96,6 +96,35 @@ Shasta2Anchors::Shasta2Anchors(
 
 
 Shasta2Anchors::Shasta2Anchors(
+    EmptyForAppend,
+    const MappedMemoryOwner& mappedMemoryOwner,
+    const Reads& reads,
+    uint64_t k,
+    const MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>& markers,
+    const MarkerGraph& markerGraph) :
+    MultithreadedObject<Shasta2Anchors>(*this),
+    MappedMemoryOwner(mappedMemoryOwner),
+    reads(reads),
+    k(k),
+    kHalf(k/2),
+    markers(markers),
+    markerGraph(markerGraph)
+{
+    // Create an empty anchorMarkerInfos ready for incremental
+    // appendHetAnchorPair. Distinct file name so it does not collide with the
+    // primary (k=50) store's memory-mapped files. No MarkerKmers are built:
+    // this store holds only k=2 MSA anchors whose export/journeys read the
+    // stored positions directly.
+    anchorMarkerInfos.createNew(
+        largeDataName("Shasta2MsaAnchors-AnchorMarkerInfos"),
+        largeDataPageSize);
+    anchorMarkerInfos.beginPass1(0);
+    anchorMarkerInfos.beginPass2();
+    anchorMarkerInfos.endPass2();
+}
+
+
+Shasta2Anchors::Shasta2Anchors(
     const MappedMemoryOwner& mappedMemoryOwner,
     const Reads& reads,
     uint64_t k,
@@ -426,7 +455,16 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             (hetAnchorFirstId != invalid<Shasta2AnchorId>) &&
             (anchorId >= hetAnchorFirstId);
 
-        const Kmer expectedKmer = getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
+        // expectedKmer is only used by the k=50 consistency check below, which
+        // runs for primary anchors only. Het anchors (k=2) skip that check, and
+        // for them getKmerAtPosition would derive a k=2 raw position that can
+        // underflow near a read boundary (rawPosition - k/2 wrapping to
+        // uint32_t(-1)) and read out of bounds. In the MSA-only store every
+        // anchor is het, so computing expectedKmer here is both unused and
+        // unsafe. Only compute it when a consistency check will actually use it.
+        const Kmer expectedKmer = isHetAnchor
+            ? Kmer()
+            : getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
         vector<ReadId> readIds;
         readIds.reserve(anchor.size());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
@@ -505,6 +543,12 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
         Shasta2AnchorMarkerInfo info;
         info.orientedReadId = orientedReadId;
         info.position = rawPosition + hetKHalf;
+        // Set ordinal to the real base position so Shasta2Journeys (which sorts
+        // each read's anchors by ordinal) orders a read's anchors by their true
+        // base coordinate. In the MSA-DAG model per-read window spans are
+        // disjoint, so a read's rawPositions are unique and strictly ordered,
+        // making the journey a strictly increasing base-position sequence.
+        info.ordinal = rawPosition;
         fwd.push_back(info);
     }
     std::sort(fwd.begin(), fwd.end());
@@ -525,6 +569,10 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
         Shasta2AnchorMarkerInfo info;
         info.orientedReadId = rcOid;
         info.position = rcRaw + hetKHalf;
+        // Ordinal = real base position on the RC strand (same rationale as fwd);
+        // rcRaw is the RC strand's base coordinate and is likewise unique and
+        // monotonic per RC read.
+        info.ordinal = rcRaw;
         rc.push_back(info);
     }
     std::sort(rc.begin(), rc.end());
