@@ -540,6 +540,14 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     vector<Shasta2AnchorMarkerInfo> fwd;
     fwd.reserve(members.size());
     for(const auto& [orientedReadId, rawPosition] : members) {
+        // A k=2 marker needs rawPosition+2 <= readLen so both the forward 2-mer
+        // and the RC mirror (rcRaw = readLen - rawPosition - 2) stay in bounds.
+        // Callers must filter read-end positions; assert here so a bad member
+        // fails loudly instead of underflowing rcRaw to uint32_t(-1) and
+        // corrupting journey order.
+        const uint64_t readLenFwd =
+            reads.getReadRawSequenceLength(orientedReadId.getReadId());
+        DINARA_ASSERT(uint64_t(rawPosition) + hetK <= readLenFwd);
         Shasta2AnchorMarkerInfo info;
         info.orientedReadId = orientedReadId;
         info.position = rawPosition + hetKHalf;

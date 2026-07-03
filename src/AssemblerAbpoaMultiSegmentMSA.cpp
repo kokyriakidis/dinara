@@ -1296,18 +1296,29 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             for(const auto& [r, nodes] : rankToNodes) ranks.push_back(r);
             sort(ranks.begin(), ranks.end());
 
+            // A k=2 anchor member needs two real in-bounds bases at
+            // [rawPosition, rawPosition+1]. This also guarantees the RC mirror
+            // stays in bounds: appendHetAnchorPair computes
+            // rcRaw = readLen - rawPosition - 2, which is >= 0 iff
+            // rawPosition + 2 <= readLen. A member at the read end
+            // (rawPosition == readLen-1) would make rcRaw underflow to
+            // uint32_t(-1), producing a bogus max-valued ordinal that breaks
+            // journey ordering. Reject such members at the source.
+            auto memberHasValidTwoMer = [&](const NodeMember& m) -> bool {
+                const uint64_t readLen =
+                    readsRef.getReadRawSequenceLength(m.oid.getReadId());
+                return uint64_t(m.rawPosition) + 2 <= readLen;
+            };
+
             // 2-mer at a member: [read[rawPosition], read[rawPosition+1]] read
-            // from the read itself (matches shasta2's getKmer frame). The
-            // second base may fall at read end; encode as 0 there (rare, and
-            // still self-consistent across members with the same read end).
+            // from the read itself (matches shasta2's getKmer frame). Only
+            // called for members that passed memberHasValidTwoMer, so both
+            // bases are in bounds.
             auto twoMerKey = [&](const NodeMember& m) -> uint16_t {
                 const uint8_t b0 = readsRef.getOrientedReadBase(
                     m.oid, m.rawPosition).value;
-                const uint64_t readLen =
-                    readsRef.getReadRawSequenceLength(m.oid.getReadId());
-                const uint8_t b1 = (uint64_t(m.rawPosition) + 1 < readLen)
-                    ? readsRef.getOrientedReadBase(m.oid, m.rawPosition + 1).value
-                    : uint8_t(0);
+                const uint8_t b1 = readsRef.getOrientedReadBase(
+                    m.oid, m.rawPosition + 1).value;
                 return uint16_t(uint16_t(b0) << 8 | b1);
             };
 
@@ -1337,6 +1348,9 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
                 std::map<uint16_t, vector<std::pair<OrientedReadId, uint32_t>>> byKmer;
                 for(const int nid : nodes) {
                     for(const NodeMember& m : nodeMembers[nid]) {
+                        // Skip read-end members: no valid second base for the
+                        // k=2 marker, and their RC mirror would underflow.
+                        if(!memberHasValidTwoMer(m)) continue;
                         byKmer[twoMerKey(m)].push_back({m.oid, m.rawPosition});
                     }
                 }
