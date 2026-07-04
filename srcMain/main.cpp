@@ -57,6 +57,7 @@ using namespace dinara;
 #include <map>
 #include "iostream.hpp"
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "stdexcept.hpp"
@@ -421,17 +422,23 @@ void planWindowHetBubbles(
 // predPrev_{N+1} (predBackboneOffset_{N+1}). Flank linearity only guarantees >=2
 // linear backbone bases between accepted SNPs, so when two SNPs are exactly 3 bp
 // apart these two backbone offsets coincide: commonSucc_N == predPrev_{N+1}.
-// That single backbone column is ONE abPOA node, so both homs are recovered from
-// the same node with identical members and identical read positions. Appending
-// them as two anchor ids builds two anchors on one node and stages a
-// hom_N -> leadHom_{N+1} edge whose two endpoints report equal positions on
-// every shared read -- exactly the equal-position violation step 3 verifies and
-// shasta2's LocalAssembly6 asserts on (positionB > positionA).
+// That single backbone column is ONE abPOA node. Appending both homs as separate
+// anchor ids builds two anchors on one node and stages a hom_N -> leadHom_{N+1}
+// edge whose endpoints report equal positions on every shared read -- exactly
+// the equal-position violation step 3 verifies and shasta2's LocalAssembly6
+// asserts on (positionB > positionA).
 //
-// The fix. Fold bubble N+1's leading hom onto bubble N's trailing hom. Because
-// the two homs are the same node the fold is lossless: we mark N+1's leading hom
-// as shared (sharedLeadFromBubble) so the append pass reuses N's trailing-hom
-// anchor id instead of allocating a second one, and the staging pass omits the
+// The two homs share the NODE but not their MEMBER SETS: cur.hom is built from
+// SNP N's spanning reads, nxt.leadHom from SNP N+1's spanning reads, so a read
+// spanning only one SNP appears in only one list. Reads present in BOTH are
+// recovered at the same rawPosition (same node, same per-read position map), so
+// the physically correct shared anchor is the UNION of the two member sets --
+// every read passing through this backbone column belongs to this k=2 column.
+//
+// The fix. Union nxt.leadHom's members into cur.hom (dedup by OrientedReadId,
+// asserting positions agree on the overlap), then mark N+1's leading hom as
+// shared (sharedLeadFromBubble) so the append pass reuses N's trailing-hom
+// anchor id instead of allocating a second one and the staging pass omits the
 // redundant leadHom_{N+1} step. The chain becomes
 //   ...arms_N -> sharedHom -> arms_{N+1}...
 // with a single anchor on the shared node, keeping BOTH SNPs. This is the
@@ -461,20 +468,37 @@ void mergeWindowCoincidentHoms(
         for(size_t bj = 0; bj + 1 < bubs.size(); bj++) {
             AnchorWindow::HetBubble& cur = *bubs[bj];
             AnchorWindow::HetBubble& nxt = *bubs[bj + 1];
-            // Coincident iff the two homs sit on the same backbone column.
+            // Coincident iff the two homs sit on the same backbone column, which
+            // (nodeToBackboneOffset is a bijection) means the SAME POA node.
             if(cur.succBackboneOffset != nxt.predBackboneOffset) continue;
-            // Same node => same members (equal count, same reads at same
-            // positions). Assert to catch any representation drift.
-            DINARA_ASSERT(cur.hom.members.size() == nxt.leadHom.members.size());
-            for(size_t m = 0; m < cur.hom.members.size(); m++) {
-                DINARA_ASSERT(
-                    cur.hom.members[m].orientedReadId ==
-                        nxt.leadHom.members[m].orientedReadId);
-                DINARA_ASSERT(
-                    cur.hom.members[m].rawPosition ==
-                        nxt.leadHom.members[m].rawPosition);
+
+            // The two homs sit on one node but were built from DIFFERENT read
+            // sets: cur.hom from SNP N's spanning reads, nxt.leadHom from SNP
+            // N+1's spanning reads. A read spanning only one of the two SNPs is
+            // in only one list, so the lists are not equal (and their allele-
+            // grouped orderings differ). But because both lookups use the same
+            // node and the same per-read position map, a read present in BOTH is
+            // recovered at the SAME rawPosition. The physically correct shared
+            // anchor is therefore the UNION of the two member sets (every read
+            // through this backbone column belongs to this k=2 column); an
+            // intersection would needlessly weaken the anchor. Merge nxt.leadHom
+            // into cur.hom by OrientedReadId, deduplicating and asserting the
+            // position invariant on the overlap.
+            std::unordered_map<uint64_t, uint32_t> posByRead;
+            posByRead.reserve(cur.hom.members.size() + nxt.leadHom.members.size());
+            for(const auto& m : cur.hom.members)
+                posByRead.emplace(m.orientedReadId.getValue(), m.rawPosition);
+            for(const auto& m : nxt.leadHom.members) {
+                const auto [it, inserted] =
+                    posByRead.emplace(m.orientedReadId.getValue(), m.rawPosition);
+                // Read in both sets: same node + same per-read map => same
+                // rawPosition. A mismatch would mean the coincidence assumption
+                // is broken, so assert.
+                if(!inserted) DINARA_ASSERT(it->second == m.rawPosition);
+                else cur.hom.members.push_back(m);   // union: add the extra read
             }
-            // Fold: bubble N+1 reuses bubble N's trailing hom as its leading hom.
+            // Fold: bubble N+1 reuses bubble N's (now unioned) trailing hom as
+            // its leading hom.
             nxt.sharedLeadFromBubble = int64_t(bubs[bj] - window.hetBubbles.data());
             ++mergedHoms;
         }
