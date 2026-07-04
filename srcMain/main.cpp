@@ -1568,7 +1568,6 @@ void dinara::main::assemble(
         assembler.markerGraph);
     {
         const Reads& readsRef = assembler.getReads();
-        const uint64_t primaryKHalf = shasta2Anchors->kHalf;
 
         // (orientedReadId.getValue() << 32) | basePos. getValue() = readId*2 +
         // strand fits in 32 bits for any realistic read count.
@@ -1577,10 +1576,20 @@ void dinara::main::assemble(
         };
         std::unordered_set<uint64_t> claimed;
 
-        // Insert both strand frames for a member at (oid, basePos). The RC frame
-        // mirrors exactly as appendHetAnchorPair does: on the flipped strand a
-        // k=2 marker at basePos maps to readLen - basePos - 2.
-        auto claimBoth = [&](OrientedReadId oid, uint32_t basePos) {
+        // Claim BOTH strand frames of a member, at k=2 (matching how
+        // appendHetAnchorPair mirrors: RC of a k=2 marker at basePos is
+        // readLen - basePos - 2). This must track both strands because RC
+        // anchors are real store members and can collide: clipping k=50 -> k=2
+        // can make two DISTINCT k=50 anchors represent the identical 2-base
+        // marker on some read (they were separable at k=50 but not at k=2),
+        // and the collision typically surfaces on the RC strand where one
+        // anchor's native member meets another anchor's mirrored member. Such a
+        // pair would create a zero-length (offset 0) edge that fails
+        // assertNoNegativeOffsets. Dropping the colliding member (and, if an
+        // anchor loses all members, the anchor) is correct: shasta2 at k=2
+        // cannot distinguish those loci anyway, and the surviving anchor
+        // preserves connectivity through that base.
+        auto claim = [&](OrientedReadId oid, uint32_t basePos) {
             const uint64_t readLen =
                 readsRef.getReadRawSequenceLength(oid.getReadId());
             claimed.insert(keyOf(oid, basePos));
@@ -1605,14 +1614,34 @@ void dinara::main::assemble(
             members.clear();
             members.reserve(anchor.size());
             for(const Shasta2AnchorMarkerInfo& mi : anchor) {
-                const uint32_t basePos = mi.position - uint32_t(primaryKHalf);
+                // Clip the k=50 backbone marker to its MIDDLE 2 bases, not its
+                // leftmost 2. mi.position is the marker midpoint
+                // (firstBase + k/2), so the two central bases are at
+                // [firstBase + k/2 - 1, firstBase + k/2] and the k=2 rawPosition
+                // is mi.position - 1.
+                //
+                // The midpoint is the ONLY clip point that is self-consistent
+                // under reverse-complement: appendHetAnchorPair mirrors a k=2
+                // marker at p to readLen - p - 2, and the midpoint of a marker
+                // maps exactly to the midpoint of its RC marker, whereas the
+                // leftmost base maps ~ (k-2) bases away from the RC marker's
+                // leftmost base. Clipping to the leftmost base therefore made
+                // two DISTINCT k=50 anchors collide at k=2 on the RC strand,
+                // producing zero-length (offset 0) edges. Middle-clipping keeps
+                // distinct k=50 anchors distinct on BOTH strands.
+                //
+                // It also frees each backbone anchor's flanks
+                // ([firstBase .. +k/2-2] and [+k/2+1 .. +k-1]) for het SNP
+                // anchors found by the MSA between backbone anchors.
+                const uint32_t basePos = mi.position - 1u;
                 const uint64_t k = keyOf(mi.orientedReadId, basePos);
                 if(claimed.find(k) != claimed.end()) {
-                    // Defensive: backbone anchors should not collide.
+                    // With middle-clipping distinct markers have distinct
+                    // (read, basePos) on both strands, so this should not fire.
                     ++backboneDropped;
                     continue;
                 }
-                claimBoth(mi.orientedReadId, basePos);
+                claim(mi.orientedReadId, basePos);
                 members.push_back({mi.orientedReadId, basePos});
             }
             if(members.empty()) continue;
@@ -1634,11 +1663,13 @@ void dinara::main::assemble(
                 for(const auto& [oid, rawPos] : staged) {
                     if(claimed.find(keyOf(oid, rawPos)) != claimed.end()) {
                         // Exact same-base collision with a backbone (or earlier
-                        // het) anchor: drop this member; span overlap is fine.
+                        // het) anchor on this read: drop this member; span
+                        // overlap within a backbone anchor's clipped k=50 range
+                        // is allowed, only exact same-base ties are forbidden.
                         ++hetDropped;
                         continue;
                     }
-                    claimBoth(oid, rawPos);
+                    claim(oid, rawPos);
                     members.push_back({oid, rawPos});
                 }
                 // Free per-window staging as we go to bound memory.
