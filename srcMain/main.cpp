@@ -413,6 +413,75 @@ void planWindowHetBubbles(
 }
 
 
+// Pass 1.5 of the per-window het pipeline: merge coincident hom anchors.
+//
+// Why the collision arises. Adjacent bubbles N and N+1 in the same backbone
+// interval are chained trailing-hom(N) -> leading-hom(N+1). The trailing hom
+// sits at commonSucc_N (succBackboneOffset_N) and the leading hom at
+// predPrev_{N+1} (predBackboneOffset_{N+1}). Flank linearity only guarantees >=2
+// linear backbone bases between accepted SNPs, so when two SNPs are exactly 3 bp
+// apart these two backbone offsets coincide: commonSucc_N == predPrev_{N+1}.
+// That single backbone column is ONE abPOA node, so both homs are recovered from
+// the same node with identical members and identical read positions. Appending
+// them as two anchor ids builds two anchors on one node and stages a
+// hom_N -> leadHom_{N+1} edge whose two endpoints report equal positions on
+// every shared read -- exactly the equal-position violation step 3 verifies and
+// shasta2's LocalAssembly6 asserts on (positionB > positionA).
+//
+// The fix. Fold bubble N+1's leading hom onto bubble N's trailing hom. Because
+// the two homs are the same node the fold is lossless: we mark N+1's leading hom
+// as shared (sharedLeadFromBubble) so the append pass reuses N's trailing-hom
+// anchor id instead of allocating a second one, and the staging pass omits the
+// redundant leadHom_{N+1} step. The chain becomes
+//   ...arms_N -> sharedHom -> arms_{N+1}...
+// with a single anchor on the shared node, keeping BOTH SNPs. This is the
+// root-cause representation fix, not an export-time drop.
+void mergeWindowCoincidentHoms(
+    AnchorWindow& window,
+    const vector<Shasta2AnchorId>& bbAnchors,
+    uint64_t& mergedHoms)
+{
+    // Group planned bubbles by interval, then within each interval look for
+    // adjacent pairs whose homs coincide.
+    vector<vector<AnchorWindow::HetBubble*>> byInterval(bbAnchors.size());
+    for(auto& b : window.hetBubbles) {
+        if(b.plannedInterval < 0) continue;
+        const size_t i = size_t(b.plannedInterval);
+        if(i + 1 < bbAnchors.size()) byInterval[i].push_back(&b);
+    }
+
+    for(size_t i = 0; i + 1 < bbAnchors.size(); i++) {
+        auto& bubs = byInterval[i];
+        if(bubs.size() < 2) continue;
+        std::sort(bubs.begin(), bubs.end(),
+            [](const AnchorWindow::HetBubble* a, const AnchorWindow::HetBubble* b) {
+                return a->backboneOffset < b->backboneOffset;
+            });
+
+        for(size_t bj = 0; bj + 1 < bubs.size(); bj++) {
+            AnchorWindow::HetBubble& cur = *bubs[bj];
+            AnchorWindow::HetBubble& nxt = *bubs[bj + 1];
+            // Coincident iff the two homs sit on the same backbone column.
+            if(cur.succBackboneOffset != nxt.predBackboneOffset) continue;
+            // Same node => same members (equal count, same reads at same
+            // positions). Assert to catch any representation drift.
+            DINARA_ASSERT(cur.hom.members.size() == nxt.leadHom.members.size());
+            for(size_t m = 0; m < cur.hom.members.size(); m++) {
+                DINARA_ASSERT(
+                    cur.hom.members[m].orientedReadId ==
+                        nxt.leadHom.members[m].orientedReadId);
+                DINARA_ASSERT(
+                    cur.hom.members[m].rawPosition ==
+                        nxt.leadHom.members[m].rawPosition);
+            }
+            // Fold: bubble N+1 reuses bubble N's trailing hom as its leading hom.
+            nxt.sharedLeadFromBubble = int64_t(bubs[bj] - window.hetBubbles.data());
+            ++mergedHoms;
+        }
+    }
+}
+
+
 // Create the canonical/RC anchor pair for one het/hom anchor from its member
 // list and record the assigned id on the anchor. No-op for empty member lists.
 void appendHetAnchor(Shasta2Anchors& anchors, AnchorWindow::HetAnchor& a)
@@ -440,8 +509,17 @@ void appendWindowHetAnchors(
     for(auto& bubble : window.hetBubbles) {
         if(bubble.plannedInterval < 0) continue;
         // Leading hom: brackets the bubble upstream (backbone -> leadHom edge).
-        appendHetAnchor(anchors, bubble.leadHom);
-        ++homAnchorPairs;
+        // If this bubble's leading hom was merged onto the preceding bubble's
+        // trailing hom (coincident-hom, Pass 1.5), reuse that anchor id rather
+        // than allocating a second anchor on the same POA node.
+        if(bubble.sharedLeadFromBubble >= 0) {
+            const AnchorWindow::HetBubble& prev =
+                window.hetBubbles[size_t(bubble.sharedLeadFromBubble)];
+            bubble.leadHom.anchorId = prev.hom.anchorId;
+        } else {
+            appendHetAnchor(anchors, bubble.leadHom);
+            ++homAnchorPairs;
+        }
         for(auto& allele : bubble.alleles) {
             if(allele.members.empty()) continue;
             appendHetAnchor(anchors, allele);
@@ -540,8 +618,15 @@ void stageWindowIntraEdges(
         steps.push_back({{bbAnchors[i]}, bbOffset[i]});
         for(size_t bj = 0; bj < bubs.size(); bj++) {
             const auto* b = bubs[bj];
-            // Leading hom.
-            if(b->leadHom.anchorId != invalid<Shasta2AnchorId> &&
+            // Leading hom. When this bubble's leading hom was merged onto the
+            // preceding bubble's trailing hom (coincident-hom, Pass 1.5), that
+            // trailing hom is already in the step list as the previous bubble's
+            // hom step, so omit the redundant leadHom step here: the chain runs
+            // ...arms_prev -> sharedHom -> arms_this... through the single shared
+            // anchor. (leadHom.anchorId still equals the shared id, set by the
+            // append pass, but re-adding it would stage a self-edge.)
+            if(b->sharedLeadFromBubble < 0 &&
+               b->leadHom.anchorId != invalid<Shasta2AnchorId> &&
                uint64_t(b->leadHom.anchorId) < anchorCount) {
                 steps.push_back({{b->leadHom.anchorId}, b->predBackboneOffset});
             }
@@ -1330,18 +1415,18 @@ void dinara::main::assemble(
     // for chaining marker matches into alignments.
     assembler.buildInvertedIndex(threadCount);
 
-    // Detect palindromic reads — reads whose reverse complement aligns well
-    // to themselves. These cause spurious overlaps because both strands map
-    // to the same genomic location. Flagged reads are excluded from overlap
-    // candidate discovery.
-    if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
-        assembler.flagPalindromicReads(
-            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
-            assemblerOptions.overlapCandidatesOptions,
-            assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
-            assemblerOptions.readsOptions.palindromicReads.maxErrorRate,
-            threadCount);
-    }
+    // // Detect palindromic reads — reads whose reverse complement aligns well
+    // // to themselves. These cause spurious overlaps because both strands map
+    // // to the same genomic location. Flagged reads are excluded from overlap
+    // // candidate discovery.
+    // if(!assemblerOptions.readsOptions.palindromicReads.skipFlagging) {
+    //     assembler.flagPalindromicReads(
+    //         assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+    //         assemblerOptions.overlapCandidatesOptions,
+    //         assemblerOptions.readsOptions.palindromicReads.alignedFractionThreshold,
+    //         assemblerOptions.readsOptions.palindromicReads.maxErrorRate,
+    //         threadCount);
+    // }
 
     // Discover overlapping read pairs and chain their shared markers into
     // alignments. Each chain represents a collinear sequence of marker
@@ -1637,6 +1722,30 @@ void dinara::main::assemble(
              << " contained het bubbles (" << droppedUncontained
              << " dropped, of which " << droppedPrimaryCollision
              << " for hom/primary anchor collision)." << endl;
+    }
+
+    // Pass 1.5: merge coincident hom anchors. When two adjacent bubbles in the
+    // same interval have succBackboneOffset_N == predBackboneOffset_{N+1} (their
+    // SNPs are exactly 3 bp apart), the trailing hom of bubble N and the leading
+    // hom of bubble N+1 are the SAME abPOA node -- same members, same recovered
+    // read positions. Appending them as two separate anchor ids would build two
+    // anchors on one node and stage a hom_N -> leadHom_{N+1} edge that is
+    // equal-position on every shared read (the crash step 3 catches). Instead we
+    // fold bubble N+1's leading hom onto bubble N's trailing hom so the chain
+    // becomes ...arms_N -> sharedHom -> arms_{N+1}..., keeping BOTH SNPs.
+    {
+        uint64_t mergedHoms = 0;
+        vector<Shasta2AnchorId> bbAnchors;
+        vector<uint32_t> bbOffset;
+        for(AnchorWindow& window : anchorWindows) {
+            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
+                                      hetKHalf, bbAnchors, bbOffset)) {
+                continue;
+            }
+            mergeWindowCoincidentHoms(window, bbAnchors, mergedHoms);
+        }
+        cout << timestamp << "Merged " << mergedHoms
+             << " coincident hom anchors (adjacent SNPs 3 bp apart)." << endl;
     }
 
     // Pass 2: append. Create the canonical/RC anchor pairs for planned bubbles.

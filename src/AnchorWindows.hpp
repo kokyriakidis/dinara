@@ -169,6 +169,18 @@ struct AnchorWindow {
         //                     by its own lead/trailing hom, there is no
         //                     last-in-interval special case.
         int32_t plannedInterval = -1;
+
+        // Coincident-hom merge (Pass 1.5). When this bubble's leading hom sits
+        // on the SAME backbone column (POA node) as the PRECEDING bubble's
+        // trailing hom -- i.e. predBackboneOffset == that bubble's
+        // succBackboneOffset, which happens when two accepted SNPs are exactly
+        // 3 bp apart -- the two homs are one node with identical members. This
+        // field holds the hetBubbles index of that preceding bubble, and its
+        // trailing-hom anchor is reused as this bubble's leading hom: the append
+        // pass does NOT allocate a separate anchor for this leadHom and the
+        // staging pass omits the redundant leadHom step, so the chain is
+        // ...arms_prev -> sharedHom -> arms_this... (-1 = not shared).
+        int64_t sharedLeadFromBubble = -1;
     };
     std::vector<HetBubble> hetBubbles;
 
