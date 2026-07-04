@@ -1523,49 +1523,138 @@ void dinara::main::assemble(
     // bubbles are usable, the append pass creates exactly those anchors, and the
     // staging pass wires them. See the helpers in the anonymous namespace above.
     // ------------------------------------------------------------------
-    // MSA-DAG anchor generation.
+    // Backbone (k=50) + het (k=2) anchor merge for the shasta2 export.
     //
-    // Build a FRESH anchor store containing only the k=2 anchors staged from
-    // each window's MSA (window.msaAnchorMembers). This fully replaces the old
-    // splice model (backbone k=50 anchors + het/hom anchors spliced into
-    // intervals): every anchor now comes from a single coordinate system (each
-    // read's real base position), so positions are strictly monotonic per read
-    // and equal-position collisions / offset inversions are impossible by
-    // construction. The primary k=50 store remains only as scaffolding used
-    // during window construction; it is not exported.
+    // Build a FRESH store that exports as uniform k=2 and contains:
+    //   1. the primary k=50 backbone anchors, CLIPPED to k=2 at their leftmost
+    //      base (gives assembly connectivity in every window), and
+    //   2. the gated het/SNP anchors staged from each window's MSA (gives the
+    //      phasing signal).
     //
-    // Because window construction claims anchors exclusively, per-read window
-    // spans are disjoint, so a read's anchors across all windows have distinct,
-    // strictly-increasing base positions. Rebuilding journeys over this store
-    // (sorted by ordinal = base position) therefore yields strictly increasing
-    // journeys, and deriving all edges from those journeys keeps every edge's
-    // read list a subset of both endpoint anchors' membership.
+    // Why this shape:
+    //   - Staging het columns only (not coverage-change columns) keeps the het
+    //     set sparse; but het alone leaves SNP-free windows disconnected. The
+    //     backbone restores connectivity everywhere.
+    //   - Everything is stored with the k=2 leftmost-base convention
+    //     (ordinal = base position, position = base position + 1). A backbone
+    //     anchor clipped to k=2 is just a k=2 anchor at basePos = (primary
+    //     position - primary k/2), so appendHetAnchorPair handles both types
+    //     identically (it also builds the RC frame with the same mirror
+    //     formula). Because position = ordinal + 1 for every anchor, journeys
+    //     sorted by ordinal are strictly position-monotonic across both types,
+    //     so all journey-derived edges are forward (offset >= 1) by
+    //     construction. hetAnchorFirstId therefore becomes 0 and the whole
+    //     store exports as k=2.
+    //
+    // Forward-edge guarantee / collision rule (matches the export semantics):
+    //   The anchor graph asserts strictly increasing base position along every
+    //   edge, so two anchors must never share the exact same base position on
+    //   the same read. Since export clips backbone anchors to k=2, a het SNP is
+    //   allowed to fall WITHIN a backbone anchor's original 50-base span; only
+    //   an EXACT same-base collision is forbidden. We enforce a single
+    //   invariant: for each OrientedReadId, all stored base positions are
+    //   distinct. A `claimed` set keyed by (orientedReadId, basePos) records
+    //   every position the store will contain, in BOTH strand frames. The
+    //   backbone claims first (backbone anchors never collide with each other:
+    //   one marker position maps to at most one anchor); het members landing on
+    //   an already-claimed exact position are dropped. Checking a member's
+    //   forward key suffices because every claim inserts both frames.
     auto msaAnchors = make_shared<Shasta2Anchors>(
         Shasta2Anchors::EmptyForAppend{},
         shasta2Owner,
         assembler.getReads(),
-        uint64_t(2),                       // k = 2 for all MSA anchors
+        uint64_t(2),                       // k = 2 for all exported anchors
         *assembler.markers,
         assembler.markerGraph);
     {
-        cout << timestamp << "Building MSA-DAG anchors from "
-             << anchorWindows.size() << " windows..." << endl;
-        uint64_t stagedAnchorPairs = 0, stagedMembers = 0;
+        const Reads& readsRef = assembler.getReads();
+        const uint64_t primaryKHalf = shasta2Anchors->kHalf;
+
+        // (orientedReadId.getValue() << 32) | basePos. getValue() = readId*2 +
+        // strand fits in 32 bits for any realistic read count.
+        auto keyOf = [](OrientedReadId oid, uint32_t basePos) -> uint64_t {
+            return (uint64_t(oid.getValue()) << 32) | uint64_t(basePos);
+        };
+        std::unordered_set<uint64_t> claimed;
+
+        // Insert both strand frames for a member at (oid, basePos). The RC frame
+        // mirrors exactly as appendHetAnchorPair does: on the flipped strand a
+        // k=2 marker at basePos maps to readLen - basePos - 2.
+        auto claimBoth = [&](OrientedReadId oid, uint32_t basePos) {
+            const uint64_t readLen =
+                readsRef.getReadRawSequenceLength(oid.getReadId());
+            claimed.insert(keyOf(oid, basePos));
+            OrientedReadId rc = oid;
+            rc.flipStrand();
+            const uint32_t rcBase = uint32_t(readLen) - basePos - 2u;
+            claimed.insert(keyOf(rc, rcBase));
+        };
+
+        // ---- Backbone pass: copy primary k=50 anchors as clipped k=2 ----
+        // Iterate canonical (even) primary anchors; appendHetAnchorPair rebuilds
+        // the RC partner, so odd ids are not read. basePos = markerPos =
+        // primary position - primary k/2. A k=50 marker fits in its read, so
+        // basePos + 2 <= readLen holds (no RC underflow, assert-safe).
+        cout << timestamp << "Building backbone+het anchors from "
+             << anchorWindows.size() << " windows (primary store has "
+             << shasta2Anchors->size() << " anchors)..." << endl;
+        uint64_t backbonePairs = 0, backboneMembers = 0, backboneDropped = 0;
+        vector<std::pair<OrientedReadId, uint32_t>> members;
+        for(Shasta2AnchorId id = 0; id < shasta2Anchors->size(); id += 2) {
+            const Shasta2Anchor anchor = (*shasta2Anchors)[id];
+            members.clear();
+            members.reserve(anchor.size());
+            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                const uint32_t basePos = mi.position - uint32_t(primaryKHalf);
+                const uint64_t k = keyOf(mi.orientedReadId, basePos);
+                if(claimed.find(k) != claimed.end()) {
+                    // Defensive: backbone anchors should not collide.
+                    ++backboneDropped;
+                    continue;
+                }
+                claimBoth(mi.orientedReadId, basePos);
+                members.push_back({mi.orientedReadId, basePos});
+            }
+            if(members.empty()) continue;
+            msaAnchors->appendHetAnchorPair(members);
+            ++backbonePairs;
+            backboneMembers += members.size();
+        }
+        cout << timestamp << "Appended " << backbonePairs
+             << " backbone anchor pairs (" << (2 * backbonePairs)
+             << " anchors, " << backboneMembers << " members, "
+             << backboneDropped << " colliding members dropped)." << endl;
+
+        // ---- Het pass: append gated het/SNP anchors, dedup on exact base ----
+        uint64_t hetPairs = 0, hetMembers = 0, hetDropped = 0;
         for(AnchorWindow& window : anchorWindows) {
-            for(auto& members : window.msaAnchorMembers) {
+            for(auto& staged : window.msaAnchorMembers) {
+                members.clear();
+                members.reserve(staged.size());
+                for(const auto& [oid, rawPos] : staged) {
+                    if(claimed.find(keyOf(oid, rawPos)) != claimed.end()) {
+                        // Exact same-base collision with a backbone (or earlier
+                        // het) anchor: drop this member; span overlap is fine.
+                        ++hetDropped;
+                        continue;
+                    }
+                    claimBoth(oid, rawPos);
+                    members.push_back({oid, rawPos});
+                }
+                // Free per-window staging as we go to bound memory.
+                vector<std::pair<OrientedReadId, uint32_t>>().swap(staged);
                 if(members.empty()) continue;
                 msaAnchors->appendHetAnchorPair(members);
-                ++stagedAnchorPairs;
-                stagedMembers += members.size();
-                // Free per-window staging as we go to bound memory.
-                vector<std::pair<OrientedReadId, uint32_t>>().swap(members);
+                ++hetPairs;
+                hetMembers += members.size();
             }
             vector<vector<std::pair<OrientedReadId, uint32_t>>>().swap(
                 window.msaAnchorMembers);
         }
-        cout << timestamp << "Appended " << stagedAnchorPairs
-             << " MSA anchor pairs (" << (2 * stagedAnchorPairs)
-             << " anchors, " << stagedMembers << " members); store has "
+        cout << timestamp << "Appended " << hetPairs
+             << " het anchor pairs (" << (2 * hetPairs)
+             << " anchors, " << hetMembers << " members, "
+             << hetDropped << " colliding members dropped); store has "
              << msaAnchors->size() << " anchors." << endl;
     }
 

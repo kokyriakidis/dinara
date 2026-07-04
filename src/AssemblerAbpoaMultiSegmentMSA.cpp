@@ -1154,6 +1154,15 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         }
     }
 
+    // MSA ranks of gated het/SNP sites, populated by the detector below and
+    // consumed by the anchor-staging walk. Staging only these columns (instead
+    // of every >=2-distinct-base column) keeps the anchor set sparse: raw
+    // sequencing errors flip a base and would otherwise mark almost every column
+    // as a variant, exploding the anchor count and RAM. The detector applies the
+    // real het-site gates (minSupport, minVaf, flank/repeat tests), so this is
+    // the phasing signal shasta2 needs.
+    std::set<int> hetRanks;
+
     // ------------------------------------------------------------------
     // Detect clean SNP bubbles in the finished graph. The abpoa_generate_rc_msa
     // call above has populated node_id_to_msa_rank, so columns have ranks.
@@ -1231,10 +1240,15 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             out << endl;
         }
 
-        // (void the legacy SNP list; anchors now come from the MSA-DAG walk
-        // below. detectWindowSnps is still called above for its logging/gating
-        // diagnostics but no longer drives anchor creation.)
-        (void)snps;
+        // Drive anchor staging from the gated het sites: record each detected
+        // SNP's MSA rank. The staging walk below stages exactly these columns,
+        // so anchors are created only at real het sites (same minSupport/minVaf/
+        // flank gating applied here), not at every error-flipped column.
+        for(const WindowSnp& snp : snps) {
+            if(snp.msaRank >= 0) {
+                hetRanks.insert(snp.msaRank);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1322,24 +1336,22 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
                 return uint16_t(uint16_t(b0) << 8 | b1);
             };
 
-            // Walk columns; select variant + coverage-change columns.
-            std::set<uint64_t> prevReadSet;
+            // Walk columns; stage only the gated het/SNP columns identified by
+            // detectWindowSnps (hetRanks). A naive ">=2 distinct bases" test
+            // marks almost every column as variant because raw sequencing errors
+            // flip a base, which exploded the anchor count (~326K from ~1K reads)
+            // and exhausted RAM. hetRanks applies the real het-site gates
+            // (minSupport, minVaf, flank/repeat), yielding the sparse phasing
+            // signal shasta2 needs.
+            //
+            // The forward-only-edge guarantee is unaffected: for a given read,
+            // ascending MSA rank corresponds to ascending base position, so
+            // dropping columns keeps each read's staged anchors in strictly
+            // increasing base order (monotonic journeys, no backward edges).
             uint64_t stagedAnchors = 0;
             for(const int r : ranks) {
+                if(hetRanks.find(r) == hetRanks.end()) continue;
                 const vector<int>& nodes = rankToNodes[r];
-
-                // Distinct bases at this rank -> variant if >=2.
-                std::set<uint8_t> distinctBases;
-                std::set<uint64_t> readSet;
-                for(const int nid : nodes) {
-                    distinctBases.insert(abg->node[nid].base);
-                    for(const NodeMember& m : nodeMembers[nid])
-                        readSet.insert(m.oid.getValue());
-                }
-                const bool isVariant = distinctBases.size() >= 2;
-                const bool coverageChanged = (readSet != prevReadSet);
-                prevReadSet = readSet;
-                if(!isVariant && !coverageChanged) continue;
 
                 // Group all members at this column by their real 2-mer; one
                 // anchor per distinct 2-mer. A read can appear at only one node
