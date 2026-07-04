@@ -1522,247 +1522,53 @@ void dinara::main::assemble(
     // are created only for bubbles that will be wired: the planner marks which
     // bubbles are usable, the append pass creates exactly those anchors, and the
     // staging pass wires them. See the helpers in the anonymous namespace above.
-    // ------------------------------------------------------------------
-    // Backbone (k=50) + het (k=2) anchor merge for the shasta2 export.
-    //
-    // Build a FRESH store that exports as uniform k=2 and contains:
-    //   1. the primary k=50 backbone anchors, CLIPPED to k=2 at their leftmost
-    //      base (gives assembly connectivity in every window), and
-    //   2. the gated het/SNP anchors staged from each window's MSA (gives the
-    //      phasing signal).
-    //
-    // Why this shape:
-    //   - Staging het columns only (not coverage-change columns) keeps the het
-    //     set sparse; but het alone leaves SNP-free windows disconnected. The
-    //     backbone restores connectivity everywhere.
-    //   - Everything is stored with the k=2 leftmost-base convention
-    //     (ordinal = base position, position = base position + 1). A backbone
-    //     anchor clipped to k=2 is just a k=2 anchor at basePos = (primary
-    //     position - primary k/2), so appendHetAnchorPair handles both types
-    //     identically (it also builds the RC frame with the same mirror
-    //     formula). Because position = ordinal + 1 for every anchor, journeys
-    //     sorted by ordinal are strictly position-monotonic across both types,
-    //     so all journey-derived edges are forward (offset >= 1) by
-    //     construction. hetAnchorFirstId therefore becomes 0 and the whole
-    //     store exports as k=2.
-    //
-    // Forward-edge guarantee / collision rule (matches the export semantics):
-    //   The anchor graph asserts strictly increasing base position along every
-    //   edge, so two anchors must never share the exact same base position on
-    //   the same read. Since export clips backbone anchors to k=2, a het SNP is
-    //   allowed to fall WITHIN a backbone anchor's original 50-base span; only
-    //   an EXACT same-base collision is forbidden. We enforce a single
-    //   invariant: for each OrientedReadId, all stored base positions are
-    //   distinct. A `claimed` set keyed by (orientedReadId, basePos) records
-    //   every position the store will contain, in BOTH strand frames. The
-    //   backbone claims first (backbone anchors never collide with each other:
-    //   one marker position maps to at most one anchor); het members landing on
-    //   an already-claimed exact position are dropped. Checking a member's
-    //   forward key suffices because every claim inserts both frames.
-    auto msaAnchors = make_shared<Shasta2Anchors>(
-        Shasta2Anchors::EmptyForAppend{},
-        shasta2Owner,
-        assembler.getReads(),
-        uint64_t(2),                       // k = 2 for all exported anchors
-        *assembler.markers,
-        assembler.markerGraph);
-    {
-        const Reads& readsRef = assembler.getReads();
-
-        // (orientedReadId.getValue() << 32) | basePos. getValue() = readId*2 +
-        // strand fits in 32 bits for any realistic read count.
-        auto keyOf = [](OrientedReadId oid, uint32_t basePos) -> uint64_t {
-            return (uint64_t(oid.getValue()) << 32) | uint64_t(basePos);
-        };
-        std::unordered_set<uint64_t> claimed;
-
-        // Claim BOTH strand frames of a member, at k=2 (matching how
-        // appendHetAnchorPair mirrors: RC of a k=2 marker at basePos is
-        // readLen - basePos - 2). This must track both strands because RC
-        // anchors are real store members and can collide: clipping k=50 -> k=2
-        // can make two DISTINCT k=50 anchors represent the identical 2-base
-        // marker on some read (they were separable at k=50 but not at k=2),
-        // and the collision typically surfaces on the RC strand where one
-        // anchor's native member meets another anchor's mirrored member. Such a
-        // pair would create a zero-length (offset 0) edge that fails
-        // assertNoNegativeOffsets. Dropping the colliding member (and, if an
-        // anchor loses all members, the anchor) is correct: shasta2 at k=2
-        // cannot distinguish those loci anyway, and the surviving anchor
-        // preserves connectivity through that base.
-        auto claim = [&](OrientedReadId oid, uint32_t basePos) {
-            const uint64_t readLen =
-                readsRef.getReadRawSequenceLength(oid.getReadId());
-            claimed.insert(keyOf(oid, basePos));
-            OrientedReadId rc = oid;
-            rc.flipStrand();
-            const uint32_t rcBase = uint32_t(readLen) - basePos - 2u;
-            claimed.insert(keyOf(rc, rcBase));
-        };
-
-        // ---- Backbone pass: copy primary k=50 anchors as clipped k=2 ----
-        // Iterate canonical (even) primary anchors; appendHetAnchorPair rebuilds
-        // the RC partner, so odd ids are not read. basePos = markerPos =
-        // primary position - primary k/2. A k=50 marker fits in its read, so
-        // basePos + 2 <= readLen holds (no RC underflow, assert-safe).
-        cout << timestamp << "Building backbone+het anchors from "
-             << anchorWindows.size() << " windows (primary store has "
-             << shasta2Anchors->size() << " anchors)..." << endl;
-        uint64_t backbonePairs = 0, backboneMembers = 0, backboneDropped = 0;
-        vector<std::pair<OrientedReadId, uint32_t>> members;
-        for(Shasta2AnchorId id = 0; id < shasta2Anchors->size(); id += 2) {
-            const Shasta2Anchor anchor = (*shasta2Anchors)[id];
-            members.clear();
-            members.reserve(anchor.size());
-            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
-                // Clip the k=50 backbone marker to its MIDDLE 2 bases, not its
-                // leftmost 2. mi.position is the marker midpoint
-                // (firstBase + k/2), so the two central bases are at
-                // [firstBase + k/2 - 1, firstBase + k/2] and the k=2 rawPosition
-                // is mi.position - 1.
-                //
-                // The midpoint is the ONLY clip point that is self-consistent
-                // under reverse-complement: appendHetAnchorPair mirrors a k=2
-                // marker at p to readLen - p - 2, and the midpoint of a marker
-                // maps exactly to the midpoint of its RC marker, whereas the
-                // leftmost base maps ~ (k-2) bases away from the RC marker's
-                // leftmost base. Clipping to the leftmost base therefore made
-                // two DISTINCT k=50 anchors collide at k=2 on the RC strand,
-                // producing zero-length (offset 0) edges. Middle-clipping keeps
-                // distinct k=50 anchors distinct on BOTH strands.
-                //
-                // It also frees each backbone anchor's flanks
-                // ([firstBase .. +k/2-2] and [+k/2+1 .. +k-1]) for het SNP
-                // anchors found by the MSA between backbone anchors.
-                const uint32_t basePos = mi.position - 1u;
-                const uint64_t k = keyOf(mi.orientedReadId, basePos);
-                if(claimed.find(k) != claimed.end()) {
-                    // With middle-clipping distinct markers have distinct
-                    // (read, basePos) on both strands, so this should not fire.
-                    ++backboneDropped;
-                    continue;
-                }
-                claim(mi.orientedReadId, basePos);
-                members.push_back({mi.orientedReadId, basePos});
-            }
-            if(members.empty()) continue;
-            msaAnchors->appendHetAnchorPair(members);
-            ++backbonePairs;
-            backboneMembers += members.size();
-        }
-        cout << timestamp << "Appended " << backbonePairs
-             << " backbone anchor pairs (" << (2 * backbonePairs)
-             << " anchors, " << backboneMembers << " members, "
-             << backboneDropped << " colliding members dropped)." << endl;
-
-        // ---- Het pass: append gated het/SNP anchors, dedup on exact base ----
-        uint64_t hetPairs = 0, hetMembers = 0, hetDropped = 0;
-        for(AnchorWindow& window : anchorWindows) {
-            for(auto& staged : window.msaAnchorMembers) {
-                members.clear();
-                members.reserve(staged.size());
-                for(const auto& [oid, rawPos] : staged) {
-                    if(claimed.find(keyOf(oid, rawPos)) != claimed.end()) {
-                        // Exact same-base collision with a backbone (or earlier
-                        // het) anchor on this read: drop this member; span
-                        // overlap within a backbone anchor's clipped k=50 range
-                        // is allowed, only exact same-base ties are forbidden.
-                        ++hetDropped;
-                        continue;
-                    }
-                    claim(oid, rawPos);
-                    members.push_back({oid, rawPos});
-                }
-                // Free per-window staging as we go to bound memory.
-                vector<std::pair<OrientedReadId, uint32_t>>().swap(staged);
-                if(members.empty()) continue;
-                msaAnchors->appendHetAnchorPair(members);
-                ++hetPairs;
-                hetMembers += members.size();
-            }
-            vector<vector<std::pair<OrientedReadId, uint32_t>>>().swap(
-                window.msaAnchorMembers);
-        }
-        cout << timestamp << "Appended " << hetPairs
-             << " het anchor pairs (" << (2 * hetPairs)
-             << " anchors, " << hetMembers << " members, "
-             << hetDropped << " colliding members dropped); store has "
-             << msaAnchors->size() << " anchors." << endl;
-    }
-
-    // Release the primary k=50 anchor store and its journeys before building the
-    // MSA journeys. From here on only the MSA store is used: windows are already
-    // built, external-anchor export and the exported anchor graph both read from
-    // msaAnchors/msaJourneys, and the legacy splice path below is disabled
-    // (return; + #if 0). Holding both stores mapped simultaneously doubles peak
-    // footprint, which overruns the cgroup memory cap on constrained hosts and
-    // manifests as an ENOMEM during the next mmap. Drop the primary store first
-    // so the MSA journeys build within budget. (shasta2Anchors/shasta2Journeys
-    // are references to the assembler.* members, so these resets clear both.)
-    shasta2Journeys.reset();
-    shasta2Anchors.reset();
-
-    // Rebuild journeys over the MSA anchor store. The journey builder sorts each
-    // read's anchors by ordinal (= real base position) and sets
-    // positionInJourney, which findChildren/findParents use to derive edges.
-    cout << timestamp << "Rebuilding journeys over MSA anchors..." << endl;
-    auto msaJourneys = make_shared<Shasta2Journeys>(
-        2 * assembler.getReads().readCount(),
-        msaAnchors,
-        threadCount,
-        shasta2Owner);
-
-    // Redirect the exported artifacts to the MSA store/journeys. dinara's own
-    // internal assembly graph (below) continues to use the primary store; only
-    // the shasta2 export uses the MSA anchors.
-    shasta2Anchors = msaAnchors;
-    assembler.shasta2Anchors = msaAnchors;
-    shasta2Journeys = msaJourneys;
-    assembler.shasta2Journeys = msaJourneys;
-
-    // Write external anchors from the MSA store.
-    cout << timestamp << "Writing Shasta2 external anchors to "
-         << externalAnchorsName << "..." << endl;
-    const uint64_t exportedExternalAnchorCount =
-        msaAnchors->writeExternalAnchors(externalAnchorsName);
-    cout << timestamp << "Wrote " << exportedExternalAnchorCount
-         << " external anchors for Shasta2. Use --external-anchors-name "
-         << externalAnchorsName << endl;
-
-    // Build the anchor graph from the rebuilt journeys (all edges derived from
-    // journey adjacency), then export it for shasta2.
-    {
-        const uint64_t minEdgeCoverage =
-            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
-        cout << timestamp << "Creating Shasta2AnchorGraph from MSA journeys "
-             << "(minEdgeCoverage=" << minEdgeCoverage << ")..." << endl;
-        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-            *msaAnchors,
-            *msaJourneys,
-            minEdgeCoverage,
-            threadCount);
-
-        assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
-        assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
-        cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;
-
-        string externalAnchorGraphName =
-            assembler.shasta2MappedMemoryOwner().largeDataName("Shasta2AnchorGraph");
-        if(externalAnchorGraphName.empty()) {
-            externalAnchorGraphName = "Shasta2ExternalAnchorGraph";
-        }
-        externalAnchorGraphName =
-            std::filesystem::absolute(externalAnchorGraphName).string();
-        assembler.shasta2AnchorGraph->saveForShasta2(externalAnchorGraphName);
-        cout << timestamp << "Wrote shasta2 anchor graph. Use "
-             << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
-    }
-
-    // The remainder of the legacy splice/graph path is disabled; the MSA-DAG
-    // build above fully replaces it. Return before the dead code.
-    return;
-
-#if 0
     const uint32_t hetKHalf = uint32_t(shasta2Anchors->k / 2);
+
+    // Pass 1: plan. Assign each bubble to the backbone interval that strictly
+    // contains its flank span; drop the rest (plannedInterval = -1). Also drop
+    // any bubble whose bracketing homs would collide with an existing primary
+    // anchor's (read, position) marker (see planWindowHetBubbles).
+    uint64_t plannedBubbles = 0, droppedUncontained = 0, droppedPrimaryCollision = 0;
+    {
+        // (read, position) markers owned by primary anchors, built once before
+        // any het anchor is appended (so the store still holds only primaries).
+        const PrimaryMarkerSet primarySet = buildPrimaryMarkerSet(*shasta2Anchors);
+        vector<Shasta2AnchorId> bbAnchors;
+        vector<uint32_t> bbOffset;
+        for(AnchorWindow& window : anchorWindows) {
+            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
+                                      hetKHalf, bbAnchors, bbOffset)) {
+                // Fewer than two backbone anchors: no interval, drop all bubbles.
+                for(auto& b : window.hetBubbles) { b.plannedInterval = -1; ++droppedUncontained; }
+                continue;
+            }
+            planWindowHetBubbles(window, bbOffset, primarySet,
+                                 plannedBubbles, droppedUncontained,
+                                 droppedPrimaryCollision);
+        }
+        cout << timestamp << "Planned " << plannedBubbles
+             << " contained het bubbles (" << droppedUncontained
+             << " dropped, of which " << droppedPrimaryCollision
+             << " for hom/primary anchor collision)." << endl;
+    }
+
+    // Pass 2: append. Create the canonical/RC anchor pairs for planned bubbles.
+    // This grows the memory-mapped store and invalidates outstanding anchor
+    // spans, so it must run after all window processing.
+    {
+        cout << timestamp << "Appending het anchors from "
+             << anchorWindows.size() << " windows..." << endl;
+        uint64_t hetAnchorPairs = 0, homAnchorPairs = 0;
+        for(AnchorWindow& window : anchorWindows)
+            appendWindowHetAnchors(*shasta2Anchors, window,
+                                   hetAnchorPairs, homAnchorPairs);
+        cout << timestamp << "  (" << homAnchorPairs
+             << " hom separator anchor pairs)" << endl;
+        cout << timestamp << "Appended " << hetAnchorPairs
+             << " het anchor pairs (" << (2 * hetAnchorPairs)
+             << " anchors); store now has " << shasta2Anchors->size()
+             << " anchors." << endl;
+    }
 
     // Pass 3: stage window-local (intra-window) anchor-graph edges on the
     // windows: the backbone chain (consecutive backbone anchors + RC mirror) and
@@ -1908,7 +1714,6 @@ void dinara::main::assemble(
     }
 
     return;
-#endif // disabled legacy splice/graph path (replaced by MSA-DAG build above)
 
     // ksw2-based het SNP detection per window. Aligns each member's
     // inter-anchor segments against the backbone with banded 2-piece affine

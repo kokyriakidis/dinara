@@ -28,9 +28,7 @@
 #include <cstdint>
 #include <iostream>
 #include <fstream>
-#include <map>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1154,15 +1152,6 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
         }
     }
 
-    // MSA ranks of gated het/SNP sites, populated by the detector below and
-    // consumed by the anchor-staging walk. Staging only these columns (instead
-    // of every >=2-distinct-base column) keeps the anchor set sparse: raw
-    // sequencing errors flip a base and would otherwise mark almost every column
-    // as a variant, exploding the anchor count and RAM. The detector applies the
-    // real het-site gates (minSupport, minVaf, flank/repeat tests), so this is
-    // the phasing signal shasta2 needs.
-    std::set<int> hetRanks;
-
     // ------------------------------------------------------------------
     // Detect clean SNP bubbles in the finished graph. The abpoa_generate_rc_msa
     // call above has populated node_id_to_msa_rank, so columns have ranks.
@@ -1240,142 +1229,79 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             out << endl;
         }
 
-        // Drive anchor staging from the gated het sites: record each detected
-        // SNP's MSA rank. The staging walk below stages exactly these columns,
-        // so anchors are created only at real het sites (same minSupport/minVaf/
-        // flank gating applied here), not at every error-flipped column.
+        // Stage het-anchor descriptors on the window: one k=2 anchor per allele
+        // per SNP record. A biallelic site yields 2 arms (ref + alt); a
+        // multiallelic site yields N arms (ref + each strong alt) in a SINGLE
+        // bubble. Members carry rawPosition at the bubble's common predecessor;
+        // predBase is the backbone base there, the allele base is this allele's
+        // base. IDs are assigned in the post-window append pass. Only stage
+        // arms that have at least one recoverable member.
         for(const WindowSnp& snp : snps) {
-            if(snp.msaRank >= 0) {
-                hetRanks.insert(snp.msaRank);
+            // predBase: backbone base at (backboneOffset - 1); if the SNP is at
+            // offset 0 there is no predecessor base, so skip (cannot form the
+            // 2-base marker).
+            if(snp.backboneOffset <= 0) continue;
+            const uint8_t predBase = backboneCodes[snp.backboneOffset - 1];
+
+            AnchorWindow::HetBubble bubble;
+            bubble.backboneOffset = static_cast<uint32_t>(snp.backboneOffset);
+
+            for(const WindowSnpAllele& allele : snp.alleles) {
+                if(allele.members.empty()) continue;  // no recoverable member
+                AnchorWindow::HetAnchor arm;
+                arm.backboneOffset = bubble.backboneOffset;
+                arm.predBase = predBase;
+                arm.alleleBase = allele.code;
+                arm.isRef = allele.isRef;
+                for(const HetAlleleMember& m : allele.members)
+                    arm.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.alleles.push_back(std::move(arm));
             }
+            // Need at least two arms to form a bubble.
+            if(bubble.alleles.size() < 2) continue;
+
+            // Leading hom anchor [predPrevBase, predBase] at predPrev. This
+            // brackets the bubble upstream so the interval's backbone anchor
+            // connects to a hom (shared by every entering read) rather than to a
+            // minority allele arm (whose reads the k=50 backbone anchor does not
+            // share). Both homs are required for a wired bubble; if the leading
+            // hom is unavailable (flank not on a backbone column, or no
+            // recoverable members) the plan pass drops the bubble.
+            if(snp.predBackboneOffset >= 0 && !snp.leadHomMembers.empty()) {
+                bubble.predBackboneOffset = static_cast<uint32_t>(snp.predBackboneOffset);
+                AnchorWindow::HetAnchor leadHom;
+                leadHom.backboneOffset = bubble.predBackboneOffset;
+                leadHom.predBase = snp.predPrevBase;
+                // alleleBase is predBase (the linear next base after predPrev).
+                leadHom.alleleBase = predBase;
+                leadHom.isRef = true;
+                for(const HetAlleleMember& m : snp.leadHomMembers)
+                    leadHom.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.leadHom = std::move(leadHom);
+            }
+
+            // Trailing hom anchor [succBase, nextBase] at commonSucc. predBase
+            // of the hom is succBase (the base shared by all reads at
+            // commonSucc); alleleBase is the linear next base. Members are all
+            // spanning reads. Brackets the bubble downstream.
+            if(snp.succBackboneOffset >= 0 && !snp.homMembers.empty()) {
+                bubble.succBackboneOffset = static_cast<uint32_t>(snp.succBackboneOffset);
+                AnchorWindow::HetAnchor homAnchor;
+                homAnchor.backboneOffset = bubble.succBackboneOffset;
+                homAnchor.predBase = snp.succBase;
+                // nextBase is the backbone base right after commonSucc.
+                homAnchor.alleleBase =
+                    (snp.succBackboneOffset + 1 < static_cast<int>(backboneCodes.size()))
+                    ? backboneCodes[snp.succBackboneOffset + 1] : 0;
+                homAnchor.isRef = true;
+                for(const HetAlleleMember& m : snp.homMembers)
+                    homAnchor.members.push_back({m.orientedReadId, m.rawPosition});
+                bubble.hom = std::move(homAnchor);
+            }
+
+            window.hetBubbles.push_back(std::move(bubble));
         }
-    }
-
-    // ------------------------------------------------------------------
-    // MSA-DAG anchor staging.
-    //
-    // Walk the finished POA graph column by column (msa-rank order) and stage a
-    // sparse set of anchors:
-    //   - VARIANT columns: a rank with >=2 distinct aligned bases.
-    //   - COVERAGE-CHANGE columns: a rank whose set of present reads differs
-    //     from the previous staged column (a read entered or left).
-    // At each selected column the present reads are grouped by their real 2-mer
-    // [read[pos], read[pos+1]]; each distinct 2-mer becomes one staged anchor.
-    // Members carry the read's real absolute base position (rawPosition), so the
-    // later journey rebuild orders each read's anchors by true base coordinate.
-    //
-    // The backbone (seqId 0) is included as a member wherever it is present, via
-    // backboneQposToNode / backboneBeginPos, so backbone reads participate in
-    // the same anchors as everyone else.
-    {
-        const abpoa_graph_t* abg = ab->abg;
-        if(abg != nullptr && abg->node != nullptr && abg->node_id_to_msa_rank != nullptr) {
-            const int nodeN = abg->node_n;
-
-            // nodeId -> ascending column rank.
-            auto rankOf = [&](int nid) -> int {
-                return (nid >= 0 && nid < nodeN) ? abg->node_id_to_msa_rank[nid] : -1;
-            };
-
-            // Per-node member list: (orientedReadId, rawPosition, base). Built
-            // from every aligned read's seqIdNodeToReadPos plus the backbone.
-            struct NodeMember { OrientedReadId oid; uint32_t rawPosition; uint8_t base; };
-            vector<vector<NodeMember>> nodeMembers(nodeN);
-
-            // All reads including the backbone: seqIdNodeToReadPos[0] is the
-            // backbone (seqIdToOrientedRead[0] == backboneOid), 1.. are aligned
-            // reads. Positions are absolute base positions in the oriented read
-            // frame (same frame shasta2's getKmer uses).
-            for(size_t sid = 0; sid < seqIdNodeToReadPos.size(); sid++) {
-                if(sid >= seqIdToOrientedRead.size()) break;
-                const OrientedReadId oid = seqIdToOrientedRead[sid];
-                for(const auto& [nid, rawPosition] : seqIdNodeToReadPos[sid]) {
-                    if(nid < 0 || nid >= nodeN) continue;
-                    nodeMembers[nid].push_back(
-                        {oid, rawPosition, abg->node[nid].base});
-                }
-            }
-
-            // Group node ids by column rank.
-            unordered_map<int, vector<int>> rankToNodes;
-            for(int nid = 0; nid < nodeN; nid++) {
-                if(nid == ABPOA_SRC_NODE_ID || nid == ABPOA_SINK_NODE_ID) continue;
-                if(nodeMembers[nid].empty()) continue;
-                const int r = rankOf(nid);
-                if(r < 0) continue;
-                rankToNodes[r].push_back(nid);
-            }
-            vector<int> ranks;
-            ranks.reserve(rankToNodes.size());
-            for(const auto& [r, nodes] : rankToNodes) ranks.push_back(r);
-            sort(ranks.begin(), ranks.end());
-
-            // A k=2 anchor member needs two real in-bounds bases at
-            // [rawPosition, rawPosition+1]. This also guarantees the RC mirror
-            // stays in bounds: appendHetAnchorPair computes
-            // rcRaw = readLen - rawPosition - 2, which is >= 0 iff
-            // rawPosition + 2 <= readLen. A member at the read end
-            // (rawPosition == readLen-1) would make rcRaw underflow to
-            // uint32_t(-1), producing a bogus max-valued ordinal that breaks
-            // journey ordering. Reject such members at the source.
-            auto memberHasValidTwoMer = [&](const NodeMember& m) -> bool {
-                const uint64_t readLen =
-                    readsRef.getReadRawSequenceLength(m.oid.getReadId());
-                return uint64_t(m.rawPosition) + 2 <= readLen;
-            };
-
-            // 2-mer at a member: [read[rawPosition], read[rawPosition+1]] read
-            // from the read itself (matches shasta2's getKmer frame). Only
-            // called for members that passed memberHasValidTwoMer, so both
-            // bases are in bounds.
-            auto twoMerKey = [&](const NodeMember& m) -> uint16_t {
-                const uint8_t b0 = readsRef.getOrientedReadBase(
-                    m.oid, m.rawPosition).value;
-                const uint8_t b1 = readsRef.getOrientedReadBase(
-                    m.oid, m.rawPosition + 1).value;
-                return uint16_t(uint16_t(b0) << 8 | b1);
-            };
-
-            // Walk columns; stage only the gated het/SNP columns identified by
-            // detectWindowSnps (hetRanks). A naive ">=2 distinct bases" test
-            // marks almost every column as variant because raw sequencing errors
-            // flip a base, which exploded the anchor count (~326K from ~1K reads)
-            // and exhausted RAM. hetRanks applies the real het-site gates
-            // (minSupport, minVaf, flank/repeat), yielding the sparse phasing
-            // signal shasta2 needs.
-            //
-            // The forward-only-edge guarantee is unaffected: for a given read,
-            // ascending MSA rank corresponds to ascending base position, so
-            // dropping columns keeps each read's staged anchors in strictly
-            // increasing base order (monotonic journeys, no backward edges).
-            uint64_t stagedAnchors = 0;
-            for(const int r : ranks) {
-                if(hetRanks.find(r) == hetRanks.end()) continue;
-                const vector<int>& nodes = rankToNodes[r];
-
-                // Group all members at this column by their real 2-mer; one
-                // anchor per distinct 2-mer. A read can appear at only one node
-                // per rank (its base at that column), so ReadIds are distinct
-                // within a group.
-                std::map<uint16_t, vector<std::pair<OrientedReadId, uint32_t>>> byKmer;
-                for(const int nid : nodes) {
-                    for(const NodeMember& m : nodeMembers[nid]) {
-                        // Skip read-end members: no valid second base for the
-                        // k=2 marker, and their RC mirror would underflow.
-                        if(!memberHasValidTwoMer(m)) continue;
-                        byKmer[twoMerKey(m)].push_back({m.oid, m.rawPosition});
-                    }
-                }
-                for(auto& [kmer, members] : byKmer) {
-                    (void)kmer;
-                    if(members.empty()) continue;
-                    window.msaAnchorMembers.push_back(std::move(members));
-                    ++stagedAnchors;
-                }
-            }
-            out << "  staged MSA anchors: " << stagedAnchors
-                << " from " << ranks.size() << " columns" << endl;
-        }
+        out << "  staged het bubbles: " << window.hetBubbles.size() << endl;
     }
 
     abpoa_free(ab);
