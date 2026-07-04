@@ -265,6 +265,34 @@ bool computeWindowBackbone(
 }
 
 
+// Step 1 of the per-window het pipeline: the explicit "middle-2 backbone
+// shift". Every k=50 backbone anchor is exported to shasta2 as the CENTERED
+// 2-base clip of its 50-mer footprint: the exported raw position is
+// (storedMidpoint - 1), i.e. bases [midpoint-1, midpoint]. Because the full
+// 50-mer agrees across all member reads, the centered 2 bases agree too, so the
+// clip is a valid k=2 anchor while keeping guaranteed-good flanking sequence on
+// both sides. This is the SAME frame het detection runs against (both use the
+// anchor-midpoint origin; see computeWindowBackbone and the abPOA backboneCodes
+// span), and the same frame the monotonicity verifier checks. Making it an
+// explicit, named step keeps the three coordinate frames (midpoint, exported,
+// MSA) reconciled in one place.
+//
+// bbOffset[i] is anchor i's midpoint offset from the window start; the exported
+// clip sits one base earlier, so the exported window-local offset is
+// bbOffset[i] - 1. Returns those exported offsets. (bbOffset[0] >= kHalf by
+// construction, so the subtraction never underflows for a real backbone anchor.)
+void computeWindowShiftedBackbone(
+    const vector<uint32_t>& bbOffset,
+    vector<uint32_t>& bbExportedOffset)
+{
+    bbExportedOffset.resize(bbOffset.size());
+    for(size_t i = 0; i < bbOffset.size(); i++) {
+        DINARA_ASSERT(bbOffset[i] >= 1);   // midpoint frame: >= kHalf for real anchors
+        bbExportedOffset[i] = bbOffset[i] - 1u;
+    }
+}
+
+
 // Set of (oriented-read, exported/shasta2 position) markers owned by primary
 // anchors. Built once over the primary anchors BEFORE any het/hom append. Every
 // anchor is exported at (storedMidpoint - 1) and shasta2 re-adds k/2 = 1, so an
@@ -546,6 +574,65 @@ void stageWindowIntraEdges(
             for(const Shasta2AnchorId A : p.ids)
                 for(const Shasta2AnchorId B : q.ids)
                     emitEdge(A, B, off, true, stagedHet);
+        }
+    }
+}
+
+
+// Step 3 of the per-window het pipeline: monotonicity verification. Every staged
+// intra-window edge A -> B must be strictly FORWARD on every read the two
+// anchors share: the read's exported position at B must exceed its exported
+// position at A. shasta2's LocalAssembly6 walks read-following in increasing
+// position and rejects (asserts) a step whose target position is <= its source
+// position, so a single backward edge here corrupts the whole export.
+//
+// The exported read position is (storedMidpoint - 1) for EVERY anchor class
+// (primary and k=2 het/hom alike; see writeExternalAnchors and
+// appendHetAnchorPair), so ordering by the stored midpoint position is identical
+// to ordering by the exported position: the -1 cancels in the comparison.
+// Backbone anchors already satisfy monotonicity by construction (journey order),
+// and the shift (step 1) is uniform, so this pass is an assertion that the
+// het-bubble wiring did not introduce a backward step. A violation is a bug in
+// the planning/staging logic, so we throw rather than silently drop.
+//
+// Both anchor member lists are sorted by OrientedReadId, so shared reads are
+// found by a linear merge. RC-mirror edges are covered because they are staged
+// as their own edges and verified in the same pass.
+void verifyWindowEdgeMonotonicity(
+    const Shasta2Anchors& anchors,
+    const AnchorWindow& window,
+    uint64_t& checkedEdges,
+    uint64_t& checkedReadSteps)
+{
+    for(const AnchorWindow::IntraWindowEdge& edge : window.intraWindowEdges) {
+        const Shasta2Anchor anchorA = anchors[edge.anchorIdA];
+        const Shasta2Anchor anchorB = anchors[edge.anchorIdB];
+        ++checkedEdges;
+
+        auto itA = anchorA.begin();
+        auto itB = anchorB.begin();
+        const auto endA = anchorA.end();
+        const auto endB = anchorB.end();
+        while(itA != endA && itB != endB) {
+            if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
+            if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+            // Shared read: exported ordering must be strictly forward. Both sides
+            // subtract the same 1, so compare stored positions directly.
+            if(!(itB->position > itA->position)) {
+                throw runtime_error(
+                    "Backward intra-window edge detected during monotonicity "
+                    "verification: anchor " +
+                    shasta2AnchorIdToString(edge.anchorIdA) + " -> anchor " +
+                    shasta2AnchorIdToString(edge.anchorIdB) +
+                    " on oriented read " +
+                    to_string(itA->orientedReadId.getValue()) +
+                    " has non-increasing position (" +
+                    to_string(itA->position) + " -> " +
+                    to_string(itB->position) + ").");
+            }
+            ++checkedReadSteps;
+            ++itA;
+            ++itB;
         }
     }
 }
@@ -1583,17 +1670,41 @@ void dinara::main::assemble(
         uint64_t stagedBackbone = 0, stagedHet = 0, chainedIntervals = 0;
         vector<Shasta2AnchorId> bbAnchors;
         vector<uint32_t> bbOffset;
+        vector<uint32_t> bbExportedOffset;
         for(AnchorWindow& window : anchorWindows) {
             if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
                                       hetKHalf, bbAnchors, bbOffset)) {
                 continue;
             }
+            // Step 1: middle-2 backbone shift. Materialize the exported (k=2)
+            // frame the edges and monotonicity check operate in. The shift is a
+            // uniform -1 per anchor, so it preserves the backbone's strict
+            // ordering; assert that here so a broken window backbone is caught
+            // before it reaches the edge staging.
+            computeWindowShiftedBackbone(bbOffset, bbExportedOffset);
+            for(size_t i = 1; i < bbExportedOffset.size(); i++)
+                DINARA_ASSERT(bbExportedOffset[i] > bbExportedOffset[i - 1]);
             stageWindowIntraEdges(window, anchorCount, bbAnchors, bbOffset,
                                   stagedBackbone, stagedHet, chainedIntervals);
         }
         cout << timestamp << "Staged intra-window edges: "
              << stagedBackbone << " backbone, " << stagedHet << " het ("
              << chainedIntervals << " chained intervals)." << endl;
+    }
+
+    // Step 3: monotonicity verification. Every staged intra-window edge must be
+    // strictly forward on the reads its endpoints share (exported position at B
+    // > exported position at A). Runs after staging (edges present) and after
+    // the het-anchor append (all endpoint ids valid). A backward edge is a bug
+    // in planning/staging, so the verifier throws.
+    {
+        uint64_t checkedEdges = 0, checkedReadSteps = 0;
+        for(const AnchorWindow& window : anchorWindows)
+            verifyWindowEdgeMonotonicity(*shasta2Anchors, window,
+                                         checkedEdges, checkedReadSteps);
+        cout << timestamp << "Verified " << checkedEdges
+             << " intra-window edges forward-monotonic across "
+             << checkedReadSteps << " shared-read steps." << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
