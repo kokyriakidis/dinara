@@ -229,7 +229,10 @@ public:
 
     // Export in shasta2-compatible MemoryMapped::Vector<char> format.
     // The output file can be passed to shasta2 via --external-anchor-graph-name.
-    void saveForShasta2(const string& fileName) const;
+    // Verifies every serialized edge is forward-monotonic on its shared reads
+    // (throws on a violation) so the exported graph can never trip shasta2's
+    // LocalAssembly positionB > positionA assertion.
+    void saveForShasta2(const string& fileName, const Shasta2Anchors& anchors) const;
 
     // Per-anchor window assignment (populated by the anchor-window constructor).
     // Maps anchorId -> windowId. noWindow means unmapped.

@@ -116,7 +116,8 @@ struct AnchorGraphWrapper : public shasta2::AnchorGraphBaseClass {
 } // anonymous namespace
 
 
-void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
+void Shasta2AnchorGraph::saveForShasta2(
+    const string& fileName, const Shasta2Anchors& anchors) const
 {
     const auto& dinaraGraph = *this;
     const uint64_t nVertices = boost::num_vertices(dinaraGraph);
@@ -127,6 +128,17 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
     for(uint64_t i = 0; i < nVertices; i++) {
         boost::add_vertex(shastaGraph);
     }
+
+    // Export-time monotonicity verification, bound to the exact edge set being
+    // serialized. The Shasta2AnchorGraph constructor already verifies edges, but
+    // that runs BEFORE trimBackbones and on the in-memory graph; this pass runs
+    // on the precise set written to disk, so nothing between construction and
+    // export can slip a backward/equal-position edge into the file shasta2 loads.
+    // For each exported edge A -> B and each read on the pair, the read's stored
+    // position at B must strictly exceed its position at A (shasta2 assembles by
+    // read-following in increasing position and asserts positionB > positionA).
+    uint64_t verifiedEdges = 0;
+    uint64_t verifiedReadSteps = 0;
 
     uint64_t edgeCount = 0;
     uint64_t skippedEdgeCount = 0;
@@ -141,6 +153,45 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
 
         const auto src = boost::source(e, dinaraGraph);
         const auto tgt = boost::target(e, dinaraGraph);
+
+        // Verify this edge is forward-monotonic on every shared read before it
+        // is written. Both anchor member lists are sorted by OrientedReadId, so
+        // shared reads are found by a linear merge. A read on the edge's anchor
+        // pair that is missing from an anchor is skipped here (shasta2's
+        // gatherOrientedReads likewise skips it); only reads present on BOTH
+        // anchors constrain assembly order.
+        {
+            const Shasta2Anchor anchorA = anchors[dEdge.anchorPair.anchorIdA];
+            const Shasta2Anchor anchorB = anchors[dEdge.anchorPair.anchorIdB];
+            auto itA = anchorA.begin();
+            auto itB = anchorB.begin();
+            const auto endA = anchorA.end();
+            const auto endB = anchorB.end();
+            while(itA != endA && itB != endB) {
+                if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
+                if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+                // Shared read: exported ordering must be strictly forward. Every
+                // anchor exports position - 1, so the -1 cancels; compare stored
+                // positions directly.
+                if(!(itB->position > itA->position)) {
+                    throw runtime_error(
+                        "Shasta2 anchor-graph export failed: backward edge "
+                        "anchor " +
+                        shasta2AnchorIdToString(dEdge.anchorPair.anchorIdA) +
+                        " -> anchor " +
+                        shasta2AnchorIdToString(dEdge.anchorPair.anchorIdB) +
+                        " on oriented read " +
+                        std::to_string(itA->orientedReadId.getValue()) +
+                        " has non-increasing position (" +
+                        std::to_string(itA->position) + " -> " +
+                        std::to_string(itB->position) + ").");
+                }
+                ++verifiedReadSteps;
+                ++itA;
+                ++itB;
+            }
+            ++verifiedEdges;
+        }
 
         // Append this edge's oriented reads to the shared vector and record the
         // [begin,end) range (upstream's AnchorGraph::addEdge layout). The edge no
@@ -162,6 +213,10 @@ void Shasta2AnchorGraph::saveForShasta2(const string& fileName) const
         boost::add_edge(src, tgt, shastaEdge, shastaGraph);
         ++edgeCount;
     }
+
+    cout << "Export monotonicity check: verified " << verifiedEdges
+         << " edges forward across " << verifiedReadSteps
+         << " shared-read steps." << endl;
 
     cout << "Exporting AnchorGraph for shasta2: "
          << nVertices << " vertices, "

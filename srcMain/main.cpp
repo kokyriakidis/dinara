@@ -1917,7 +1917,8 @@ void dinara::main::assemble(
         }
         externalAnchorGraphName =
             std::filesystem::absolute(externalAnchorGraphName).string();
-        assembler.shasta2AnchorGraph->saveForShasta2(externalAnchorGraphName);
+        assembler.shasta2AnchorGraph->saveForShasta2(
+            externalAnchorGraphName, *shasta2Anchors);
         cout << timestamp << "Wrote shasta2 anchor graph. Use "
              << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
     }
@@ -2466,7 +2467,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
 
     // Export in shasta2-native format for --external-anchor-graph-name.
-    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
+    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph", *shasta2Anchors);
 
     // Create the AssemblyGraph with window info.
     cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
@@ -2600,7 +2601,7 @@ void dinara::main::assemble(
     shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
 
     // Export in shasta2-native format for --external-anchor-graph-name.
-    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
+    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph", *shasta2Anchors);
 
     // Create the AssemblyGraph with window info.
     cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
