@@ -994,59 +994,6 @@ def installVg():
     print("vg " + tag + " installed at " + installBinary)
 
 
-def installMinipoa():
-    print("Installing minipoa (fast SIMD POA MSA tool)...")
-
-    installBinDir = os.path.join(HOME, ".local", "bin")
-    installBinary = os.path.join(installBinDir, "minipoa")
-
-    os.makedirs(installBinDir, exist_ok=True)
-
-    if os.path.exists(installBinary) and os.access(installBinary, os.X_OK):
-        print("minipoa binary found at " + installBinary + ". Skipping installation.")
-        return
-
-    sourceDir = os.path.join(HOME, "Downloads", "minipoa")
-
-    with tempfile.TemporaryDirectory() as temporaryDirectory:
-        print("Building minipoa using temporary directory", temporaryDirectory)
-
-        oldDirectory = os.getcwd()
-        os.chdir(temporaryDirectory)
-
-        if os.path.isdir(sourceDir):
-            print("Updating existing minipoa source at", sourceDir)
-            runCommand("git -C " + sourceDir + " pull --ff-only")
-        else:
-            if os.path.exists(sourceDir):
-                os.remove(sourceDir)
-            print("Cloning minipoa source to", sourceDir)
-            runCommand("git clone https://github.com/NCl3-lhd/minipoa.git " + sourceDir)
-
-        buildDir = os.path.join(sourceDir, "build")
-        if os.path.exists(buildDir):
-            shutil.rmtree(buildDir)
-
-        runCommand("cmake -S " + sourceDir + " -B " + buildDir +
-                   " -DCMAKE_BUILD_TYPE=Release")
-        runCommand("cmake --build " + buildDir + " -j")
-
-        # The binary may be in build/ or build/bin/ depending on CMake config.
-        builtBinary = os.path.join(buildDir, "minipoa")
-        if not os.path.exists(builtBinary):
-            builtBinary = os.path.join(buildDir, "bin", "minipoa")
-        if not os.path.exists(builtBinary):
-            raise Exception("minipoa binary not found after build. Check build output.")
-
-        runCommand("cp " + builtBinary + " " + installBinary)
-        os.chmod(installBinary, 0o755)
-
-        os.chdir(oldDirectory)
-
-    print("minipoa installed at " + installBinary)
-
-
-
 # All installable targets in dependency order.
 # Each entry: (name, function, description)
 INSTALL_TARGETS = [
@@ -1059,7 +1006,6 @@ INSTALL_TARGETS = [
     ("theseus",          installTheseusLib,        "theseus-lib POA aligner (C++)"),
     ("shasta2",          installShasta2,           "shasta2 library and abPOA"),
     ("vg",               installVg,               "vg binary"),
-    ("minipoa",          installMinipoa,           "minipoa binary"),
     ("snarls",           installSnarlFinderDeps,   "snarl finder dependencies (libhandlegraph, structures)"),
 ]
 

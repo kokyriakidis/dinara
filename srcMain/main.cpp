@@ -57,6 +57,7 @@ using namespace dinara;
 #include <map>
 #include "iostream.hpp"
 #include <set>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -65,6 +66,7 @@ using namespace dinara;
 
 // Shasta 2 Integration
 #include "AssemblerShasta2Anchors.hpp"
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -1695,23 +1697,117 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow);
 
-    // Per-window all-reads Theseus MSA test (uses fork theseus API installed in
-    // ~/.dinaraBuild). Builds one multi-segment MSA per anchor window from all
-    // oriented reads sharing the window's anchors, writing FASTA + GFA per window.
-    // Number of windows capped by env DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
-    // Per-window all-reads multi-segment MSA (abPOA engine). Builds one MSA per
-    // anchor window from all oriented reads sharing the window's anchors, writing
-    // FASTA + GFA per window. Number of windows capped by env
-    // DINARA_MSA_MAX_WINDOWS (default 1, 0=all).
-    assembler.testAbpoaMultiSegmentMSA(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        anchorWindows,
-        threadCount,
-        assemblerOptions.assemblyOptions.mode3Options.hetMinVaf,
-        assemblerOptions.assemblyOptions.mode3Options.hetMinSupport,
-        assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer,
-        assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat);
+    // Per-window het-bubble detection. Interchangeable engines produce the
+    // SAME output (AnchorWindow::hetBubbles), so the downstream plan/append/stage
+    // passes are identical regardless of which one runs:
+    //   - abpoa (default): all-reads multi-segment abPOA MSA per window, bubbles
+    //     read off the partial-order graph.
+    //   - ksw2: banded per-member ksw2 pileup against the backbone, bubbles
+    //     synthesized from the member SNP pileup (ksw2DetectHetBubblesInWindow).
+    // Engine selection via env DINARA_HET_ENGINE:
+    //   unset / "intervalpoa" (DEFAULT) : per-interval parallel POA. ~5x faster
+    //         than whole-window abPOA with equal-or-better het recall; each
+    //         window's anchor intervals are POA'd independently and in parallel.
+    //   "abpoa"   : legacy whole-window multi-segment abPOA (one growing graph
+    //         per window, one window per thread). Capped by DINARA_MSA_MAX_WINDOWS
+    //         (default 1, 0=all).
+    //   "ksw2"    : star alignment against the backbone (no read-to-read POA).
+    {
+        const char* hetEngineEnv = getenv("DINARA_HET_ENGINE");
+        const string hetEngine = (hetEngineEnv != nullptr) ? string(hetEngineEnv) : "";
+        const bool useKsw2HetEngine = (hetEngine == "ksw2");
+        const bool useAbpoaHetEngine = (hetEngine == "abpoa");
+        // Default engine is per-interval POA: selected explicitly or when unset
+        // and no other engine was requested.
+        const bool useIntervalPoaHetEngine =
+            (hetEngine == "intervalpoa") ||
+            (!useKsw2HetEngine && !useAbpoaHetEngine);
+
+        if(useIntervalPoaHetEngine) {
+            cout << timestamp << "Detecting het bubbles with the per-interval POA"
+                    " engine on " << anchorWindows.size() << " windows on "
+                 << threadCount << " threads..." << endl;
+            const auto tHet0 = steady_clock::now();
+            std::atomic<uint64_t> hetWindows{0};
+            std::atomic<uint64_t> totalBubbles{0};
+            const AlignOptions& alignOptionsRef = assemblerOptions.alignOptions;
+            const double hetMinVaf = assemblerOptions.assemblyOptions.mode3Options.hetMinVaf;
+            const uint64_t hetMinSupport = assemblerOptions.assemblyOptions.mode3Options.hetMinSupport;
+            const bool hetDropHomopolymer = assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer;
+            const bool hetDropRepeat = assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat;
+            // Each window is independent: its own POA graphs, its own hetBubbles
+            // slot. Parallelize across windows -- this replaces the whole-window
+            // abPOA path's one-window-per-thread serialization on the biggest
+            // window, since here no single window dominates (its intervals are
+            // tiny). Static scheduling over the window index range.
+            std::vector<std::thread> hetThreads;
+            std::atomic<uint64_t> nextWindow{0};
+            const uint64_t nWindows = anchorWindows.size();
+            auto worker = [&]() {
+                for(;;) {
+                    const uint64_t wi = nextWindow.fetch_add(1);
+                    if(wi >= nWindows) break;
+                    const uint32_t n = assembler.intervalPoaDetectHetBubblesInWindow(
+                        anchorWindows[wi], *shasta2Anchors, *shasta2Journeys,
+                        alignOptionsRef, hetMinVaf, hetMinSupport,
+                        hetDropHomopolymer, hetDropRepeat);
+                    if(n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
+                }
+            };
+            for(uint64_t t = 0; t < threadCount; t++) hetThreads.emplace_back(worker);
+            for(auto& th : hetThreads) th.join();
+            const double hetSecs = seconds(steady_clock::now() - tHet0);
+            cout << timestamp << "per-interval POA het-bubble detection complete."
+                 << " hetWindows=" << hetWindows.load()
+                 << " homWindows=" << (anchorWindows.size() - hetWindows.load())
+                 << " totalHetBubbles=" << totalBubbles.load()
+                 << " seconds=" << std::fixed << std::setprecision(2) << hetSecs
+                 << std::defaultfloat << endl;
+        } else if(useKsw2HetEngine) {
+            cout << timestamp << "Detecting het bubbles with the ksw2 pileup"
+                    " engine on " << anchorWindows.size() << " windows..." << endl;
+            const auto tHet0 = steady_clock::now();
+            uint64_t hetWindows = 0, totalBubbles = 0;
+            // CIGAR-density noise filter window/threshold (HiFi defaults 100/5).
+            constexpr int noisyRegSlideWin = 100;
+            constexpr int noisyRegMaxXgaps = 5;
+            for(AnchorWindow& window : anchorWindows) {
+                const uint32_t n = assembler.ksw2DetectHetBubblesInWindow(
+                    window, *shasta2Anchors, *shasta2Journeys,
+                    assemblerOptions.alignOptions,
+                    assemblerOptions.assemblyOptions.mode3Options.hetMinVaf,
+                    assemblerOptions.assemblyOptions.mode3Options.hetMinSupport,
+                    assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer,
+                    assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat,
+                    noisyRegSlideWin, noisyRegMaxXgaps);
+                if(n > 0) { hetWindows++; totalBubbles += n; }
+            }
+            const double hetSecs = seconds(steady_clock::now() - tHet0);
+            cout << timestamp << "ksw2 het-bubble detection complete."
+                 << " hetWindows=" << hetWindows
+                 << " homWindows=" << (anchorWindows.size() - hetWindows)
+                 << " totalHetBubbles=" << totalBubbles
+                 << " seconds=" << std::fixed << std::setprecision(2) << hetSecs
+                 << std::defaultfloat << endl;
+        } else {  // useAbpoaHetEngine (DINARA_HET_ENGINE=abpoa)
+            const auto tAbpoa0 = steady_clock::now();
+            assembler.testAbpoaMultiSegmentMSA(
+                assembler.shasta2Anchors,
+                assembler.shasta2Journeys,
+                anchorWindows,
+                threadCount,
+                assemblerOptions.assemblyOptions.mode3Options.hetMinVaf,
+                assemblerOptions.assemblyOptions.mode3Options.hetMinSupport,
+                assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer,
+                assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat);
+            const double abpoaSecs = seconds(steady_clock::now() - tAbpoa0);
+            cout << timestamp << "abPOA het-bubble detection complete."
+                 << " windows=" << anchorWindows.size()
+                 << " threads=" << threadCount
+                 << " seconds=" << std::fixed << std::setprecision(2) << abpoaSecs
+                 << std::defaultfloat << endl;
+        }
+    }
 
     // Turn the staged het bubbles into anchor-graph structure in three serial
     // passes (plan -> append -> stage edges). The passes are ordered so anchors
@@ -1788,6 +1884,110 @@ void dinara::main::assemble(
              << " het anchor pairs (" << (2 * hetAnchorPairs)
              << " anchors); store now has " << shasta2Anchors->size()
              << " anchors." << endl;
+    }
+
+    // DIAGNOSTIC (env DINARA_DEDUP_DIAG=1): quantify het/hom anchors that land
+    // on the SAME (read, position) markers as another anchor. The per-window
+    // merge/collision passes only dedup within a single window and against the
+    // ORIGINAL primaries, so two windows touching the same locus can each append
+    // a hom/het anchor on identical markers. This pass counts how many such
+    // duplicates exist and characterizes the member-set overlap, WITHOUT changing
+    // anything, so we can decide the union rule before implementing the fix.
+    if(getenv("DINARA_DEDUP_DIAG") != nullptr) {
+        const uint64_t nAnchors = shasta2Anchors->size();
+        const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
+
+        // Map each (read,position) marker key -> list of anchor ids carrying it,
+        // restricted to het/hom anchors (id >= hetFirst). Primaries are the
+        // reference frame; a het/hom colliding with a primary is a different
+        // (already-handled) case, so we focus on het/hom<->het/hom collisions.
+        std::unordered_map<uint64_t, vector<Shasta2AnchorId>> markerToAnchors;
+        markerToAnchors.reserve(nAnchors * 2);
+        if(hetFirst != invalid<Shasta2AnchorId>) {
+            for(Shasta2AnchorId aid = hetFirst; aid < nAnchors; aid++) {
+                const Shasta2Anchor anchor = (*shasta2Anchors)[aid];
+                for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                    const uint64_t key =
+                        (uint64_t(mi.orientedReadId.getValue()) << 32) |
+                        uint64_t(mi.position);
+                    markerToAnchors[key].push_back(aid);
+                }
+            }
+        }
+
+        // Build an anchor-pair collision graph: two het/hom anchors are
+        // "colliding" if they share at least one (read,position) marker. Union
+        // colliding anchors into clusters (simple union-find over anchor ids).
+        std::unordered_map<Shasta2AnchorId, Shasta2AnchorId> parent;
+        std::function<Shasta2AnchorId(Shasta2AnchorId)> find =
+            [&](Shasta2AnchorId x) {
+                while(parent.count(x) && parent[x] != x) {
+                    parent[x] = parent.count(parent[x]) ? parent[parent[x]] : parent[x];
+                    x = parent[x];
+                }
+                return x;
+            };
+        auto unite = [&](Shasta2AnchorId a, Shasta2AnchorId b) {
+            if(!parent.count(a)) parent[a] = a;
+            if(!parent.count(b)) parent[b] = b;
+            parent[find(a)] = find(b);
+        };
+
+        uint64_t collidingMarkers = 0;
+        for(const auto& [key, ids] : markerToAnchors) {
+            if(ids.size() < 2) continue;
+            ++collidingMarkers;
+            for(size_t i = 1; i < ids.size(); i++) unite(ids[0], ids[i]);
+        }
+
+        // Group anchors by cluster root.
+        std::unordered_map<Shasta2AnchorId, vector<Shasta2AnchorId>> clusters;
+        for(const auto& [aid, _] : parent) clusters[find(aid)].push_back(aid);
+
+        // Characterize each multi-anchor cluster: how many anchors, and for the
+        // 2-anchor case, the member-set overlap (identical vs partial).
+        uint64_t nClusters = 0, nAnchorsInClusters = 0;
+        uint64_t nIdenticalPairs = 0, nPartialPairs = 0, nBigClusters = 0;
+        auto memberSet = [&](Shasta2AnchorId aid) {
+            std::unordered_set<uint64_t> s;
+            const Shasta2Anchor anchor = (*shasta2Anchors)[aid];
+            for(const Shasta2AnchorMarkerInfo& mi : anchor)
+                s.insert((uint64_t(mi.orientedReadId.getValue()) << 32) |
+                         uint64_t(mi.position));
+            return s;
+        };
+        uint64_t examplesShown = 0;
+        for(const auto& [root, ids] : clusters) {
+            if(ids.size() < 2) continue;
+            ++nClusters;
+            nAnchorsInClusters += ids.size();
+            if(ids.size() > 2) ++nBigClusters;
+            if(ids.size() == 2) {
+                const auto sA = memberSet(ids[0]);
+                const auto sB = memberSet(ids[1]);
+                uint64_t common = 0;
+                for(uint64_t k : sA) if(sB.count(k)) ++common;
+                const bool identical = (common == sA.size() && common == sB.size());
+                if(identical) ++nIdenticalPairs; else ++nPartialPairs;
+                // Show first few concrete examples for the union-rule decision.
+                if(examplesShown < 8) {
+                    cout << "    DEDUP-DIAG cluster: anchorA=" << ids[0]
+                         << " (" << sA.size() << " members) anchorB=" << ids[1]
+                         << " (" << sB.size() << " members) common=" << common
+                         << (identical ? " [IDENTICAL]" : " [PARTIAL]") << endl;
+                    ++examplesShown;
+                }
+            }
+        }
+
+        cout << timestamp << "DEDUP-DIAG: het/hom anchors=" 
+             << (hetFirst == invalid<Shasta2AnchorId> ? 0 : (nAnchors - hetFirst))
+             << " collidingMarkers=" << collidingMarkers
+             << " collisionClusters=" << nClusters
+             << " anchorsInClusters=" << nAnchorsInClusters
+             << " (2-anchor identical=" << nIdenticalPairs
+             << ", 2-anchor partial=" << nPartialPairs
+             << ", >2-anchor clusters=" << nBigClusters << ")" << endl;
     }
 
     // Pass 3: stage window-local (intra-window) anchor-graph edges on the

@@ -3949,6 +3949,46 @@ public:
         int noisyRegSlideWin = 100,
         int noisyRegMaxXgaps = 5) const;
 
+    // Detect clean het BUBBLES in an anchor window using the same banded ksw2
+    // member pileup as ksw2DetectSnpsInWindow, but emit AnchorWindow::hetBubbles
+    // in the exact format produced by testAbpoaMultiSegmentMSA (arms + leadHom +
+    // hom, rawPositions = absolute oriented read base positions at the k=2
+    // anchor columns, backboneOffset = bbPos - windowBbBegin). This is a drop-in
+    // alternative to the abPOA het path: the downstream plan/append/stage passes
+    // consume the bubbles unchanged. Returns the number of bubbles emitted.
+    uint32_t ksw2DetectHetBubblesInWindow(
+        AnchorWindow& window,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat,
+        int noisyRegSlideWin = 100,
+        int noisyRegMaxXgaps = 5) const;
+
+    // Shasta2 LocalAssembly7-style het detection: instead of one POA over the
+    // whole window (testAbpoaMultiSegmentMSA, which builds a single growing
+    // graph per window and serializes on one thread), this tiles the window at
+    // its backbone anchors and runs an INDEPENDENT small POA (spoa) per
+    // consecutive-anchor interval. Each interval's reads are aligned to each
+    // other (true POA quality, unlike ksw2's star alignment), the graphs stay
+    // tiny (one inter-anchor gap, not the whole 100kb window), and the intervals
+    // are embarrassingly parallel. Per-interval MSA columns are mapped back to
+    // absolute backbone offsets and merged into per-read KwMemberProfile rows,
+    // then the shared emitHetBubblesFromProfiles tail emits the identical
+    // AnchorWindow::hetBubbles. Returns the number of bubbles emitted.
+    uint32_t intervalPoaDetectHetBubblesInWindow(
+        AnchorWindow& window,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat) const;
+
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.
     void testAnchorWindowsCleanLongestRead(

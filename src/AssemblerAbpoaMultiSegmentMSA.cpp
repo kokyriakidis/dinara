@@ -653,74 +653,6 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
          << "bp each end)" << endl;
 
     // ------------------------------------------------------------------
-    // abPOA setup.
-    // Scoring chosen to match the theseus path's intent: match=0 implied by
-    // POA (abPOA uses positive match), 2/3/1 style mismatch+gap. abPOA needs a
-    // positive match score; we use the abPOA defaults (match=2, mismatch=4,
-    // affine gap 4/2) which are well tuned for long-read POA. Banding (wb=10)
-    // is what keeps each piece alignment O(qlen*band).
-    // ------------------------------------------------------------------
-    abpoa_t* ab = abpoa_init();
-    abpoa_para_t* abpt = abpoa_init_para();
-    abpt->align_mode = ABPOA_GLOBAL_MODE;
-    abpt->gap_mode = ABPOA_AFFINE_GAP;
-    abpt->match = 2;
-    abpt->mismatch = 4;
-    abpt->gap_open1 = 4;
-    abpt->gap_ext1 = 2;
-    abpt->gap_open2 = 0;       // affine (single-piece) gap
-    abpt->gap_ext2 = 0;
-    abpt->wb = 10;             // adaptive band; <0 disables banding
-    abpt->wf = 0.01;
-    abpt->disable_seeding = 1; // we drive the segmentation ourselves
-    abpt->progressive_poa = 0;
-    abpt->out_msa = 1;         // need RC-MSA output
-    abpt->out_cons = 0;
-    abpt->ret_cigar = 1;
-    abpoa_post_set_para(abpt);  // sets use_read_ids etc. from out_msa
-
-    // Total number of sequences = backbone + all reads sharing >=2 anchors.
-    // We need an upper bound up front for read_id bitsets; recount precisely
-    // after building boundary hits. Use readIntervals.size() as a safe bound.
-    const int totReadBound = static_cast<int>(window.readIntervals.size()) + 1;
-
-    // Seed the backbone as read_id 0. On an empty graph (node_n==2),
-    // abpoa_add_subgraph_alignment lays the sequence down as a linear chain and
-    // fills qpos_to_node_id with the node id for each base position.
-    vector<int> backboneQposToNode(backboneLen, -1);
-    {
-        abpoa_res_t res;
-        res.n_cigar = 0; res.m_cigar = 0; res.graph_cigar = nullptr;
-        abpoa_add_subgraph_alignment(
-            ab, abpt,
-            ABPOA_SRC_NODE_ID, ABPOA_SINK_NODE_ID,
-            backboneCodes.data(), nullptr, backboneLen,
-            backboneQposToNode.data(), res,
-            /* read_id */ 0, /* tot_read_n */ totReadBound,
-            /* inc_both_ends */ 1);
-    }
-
-    // anchorNode[bi] = abPOA node id of anchor bi's MIDPOINT base.
-    // With the kHalf-extended backbone, every anchor midpoint offset lies in
-    // [kHalf, backboneLen-kHalf], so ALL anchors map to real interior nodes and
-    // are handled uniformly as anchor MATCHes (no SINK special case).
-    // backboneNodeAt(off) resolves a backbone base offset to its node id, or to
-    // SRC/SINK when the offset falls just before/after the chain (used for the
-    // excluded fold boundaries of a read's outer anchor halves).
-    vector<int> anchorNode(nBackboneAnchors);
-    for(uint32_t bi = 0; bi < nBackboneAnchors; bi++) {
-        const int off = anchorOffset[bi];
-        anchorNode[bi] = (off >= 0 && off < backboneLen)
-            ? backboneQposToNode[off]
-            : ABPOA_SINK_NODE_ID;  // defensive; should not occur with extension
-    }
-    auto backboneNodeAt = [&](int off) -> int {
-        if(off < 0) return ABPOA_SRC_NODE_ID;
-        if(off >= backboneLen) return ABPOA_SINK_NODE_ID;
-        return backboneQposToNode[off];
-    };
-
-    // ------------------------------------------------------------------
     // Build read -> backbone boundary hits (identical logic to the theseus
     // path: anchor membership, sort, drop <2, clip to pairwise alignment
     // ordinal range, re-drop <2, sort by base span descending).
@@ -806,6 +738,123 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
 
     out << "  reads with >=2 shared anchors: " << readsBySpan.size()
          << ", skipped: " << skippedReads << endl;
+
+    // ------------------------------------------------------------------
+    // Split each read's shared pins into contiguous RUNS, breaking wherever the
+    // backbone distance between consecutive pins exceeds maxPinGap. A wide gap
+    // means the read fails to share the intervening backbone anchors (divergent
+    // haplotype / SV / error-dense stretch); aligning across it is the most
+    // expensive fold (DP ~ gapBases x graphNodeSpan, the OVERSIZE trigger) and
+    // the least reliable. Folding each run as its own abPOA row keeps the read's
+    // coverage on both well-anchored sides instead of dropping the whole read.
+    // Runs of <2 pins are dropped (no inter-anchor segment). maxPinGap==0
+    // disables splitting (one run per read, legacy behavior).
+    //
+    // This runs BEFORE graph seeding so totReadBound (which sizes abPOA's
+    // per-edge read_id bitsets) can be set to the true number of rows; a read
+    // that splits into R runs consumes R seqIds, so bounding by read count would
+    // overflow the bitsets (heap corruption).
+    uint32_t maxPinGap = 2000;
+    if(const char* e = getenv("DINARA_ABPOA_MAX_PIN_GAP")) {
+        char* endp = nullptr;
+        const unsigned long v = strtoul(e, &endp, 10);
+        if(endp != e) maxPinGap = static_cast<uint32_t>(v);
+    }
+    // readRuns: one entry per emitted run, as (readIdValue, pinSubset), in
+    // longest-read-first order (readsBySpan is already sorted).
+    vector<pair<uint64_t, vector<BoundaryHit>>> readRuns;
+    uint32_t readsWithMultipleRuns = 0;
+    for(const auto& [baseSpan, readIdValue] : readsBySpan) {
+        (void)baseSpan;
+        const auto& allHits = readBoundaryHits[readIdValue];
+        uint32_t runsThisRead = 0;
+        size_t runBegin = 0;
+        for(size_t hi = 1; hi <= allHits.size(); hi++) {
+            bool breakHere = (hi == allHits.size());
+            if(!breakHere && maxPinGap > 0) {
+                const int prevOff = anchorOffset[allHits[hi - 1].boundaryIndex];
+                const int curOff  = anchorOffset[allHits[hi].boundaryIndex];
+                if(curOff - prevOff > static_cast<int>(maxPinGap)) breakHere = true;
+            }
+            if(breakHere) {
+                if(hi - runBegin >= 2) {
+                    readRuns.emplace_back(readIdValue,
+                        vector<BoundaryHit>(allHits.begin() + runBegin,
+                                            allHits.begin() + hi));
+                    ++runsThisRead;
+                }
+                runBegin = hi;
+            }
+        }
+        if(runsThisRead > 1) readsWithMultipleRuns++;
+    }
+
+    // ------------------------------------------------------------------
+    // abPOA setup. Deferred until here so totReadBound can be sized to the true
+    // number of rows (readRuns.size()) rather than the read count -- a read that
+    // splits into several runs consumes several seqIds, and totReadBound sizes
+    // abPOA's per-edge read_id bitsets, so under-counting overflows them.
+    // Scoring uses abPOA defaults (match=2, mismatch=4, affine gap 4/2), well
+    // tuned for long-read POA. Banding (wb=10) keeps each piece O(qlen*band).
+    // ------------------------------------------------------------------
+    abpoa_t* ab = abpoa_init();
+    abpoa_para_t* abpt = abpoa_init_para();
+    abpt->align_mode = ABPOA_GLOBAL_MODE;
+    abpt->gap_mode = ABPOA_AFFINE_GAP;
+    abpt->match = 2;
+    abpt->mismatch = 4;
+    abpt->gap_open1 = 4;
+    abpt->gap_ext1 = 2;
+    abpt->gap_open2 = 0;       // affine (single-piece) gap
+    abpt->gap_ext2 = 0;
+    abpt->wb = 10;             // adaptive band; <0 disables banding
+    abpt->wf = 0.01;
+    abpt->disable_seeding = 1; // we drive the segmentation ourselves
+    abpt->progressive_poa = 0;
+    abpt->out_msa = 1;         // need RC-MSA output
+    abpt->out_cons = 0;
+    abpt->ret_cigar = 1;
+    abpoa_post_set_para(abpt);  // sets use_read_ids etc. from out_msa
+
+    // Row count = backbone (seqId 0) + one row per emitted run. This bounds
+    // abPOA's per-edge read_id bitsets.
+    const int totReadBound = static_cast<int>(readRuns.size()) + 1;
+
+    // Seed the backbone as read_id 0. On an empty graph (node_n==2),
+    // abpoa_add_subgraph_alignment lays the sequence down as a linear chain and
+    // fills qpos_to_node_id with the node id for each base position.
+    vector<int> backboneQposToNode(backboneLen, -1);
+    {
+        abpoa_res_t res;
+        res.n_cigar = 0; res.m_cigar = 0; res.graph_cigar = nullptr;
+        abpoa_add_subgraph_alignment(
+            ab, abpt,
+            ABPOA_SRC_NODE_ID, ABPOA_SINK_NODE_ID,
+            backboneCodes.data(), nullptr, backboneLen,
+            backboneQposToNode.data(), res,
+            /* read_id */ 0, /* tot_read_n */ totReadBound,
+            /* inc_both_ends */ 1);
+    }
+
+    // anchorNode[bi] = abPOA node id of anchor bi's MIDPOINT base.
+    // With the kHalf-extended backbone, every anchor midpoint offset lies in
+    // [kHalf, backboneLen-kHalf], so ALL anchors map to real interior nodes and
+    // are handled uniformly as anchor MATCHes (no SINK special case).
+    // backboneNodeAt(off) resolves a backbone base offset to its node id, or to
+    // SRC/SINK when the offset falls just before/after the chain (used for the
+    // excluded fold boundaries of a read's outer anchor halves).
+    vector<int> anchorNode(nBackboneAnchors);
+    for(uint32_t bi = 0; bi < nBackboneAnchors; bi++) {
+        const int off = anchorOffset[bi];
+        anchorNode[bi] = (off >= 0 && off < backboneLen)
+            ? backboneQposToNode[off]
+            : ABPOA_SINK_NODE_ID;  // defensive; should not occur with extension
+    }
+    auto backboneNodeAt = [&](int off) -> int {
+        if(off < 0) return ABPOA_SRC_NODE_ID;
+        if(off >= backboneLen) return ABPOA_SINK_NODE_ID;
+        return backboneQposToNode[off];
+    };
 
     // ------------------------------------------------------------------
     // Per-read alignment: fold each read piece (between consecutive shared
@@ -916,12 +965,18 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
     const uint64_t maxDpBytes = maxDpGiB << 30;
     uint32_t oversizeDroppedReads = 0;
 
-    for(const auto& [baseSpan, readIdValue] : readsBySpan) {
-        (void)baseSpan;
-        const auto& hits = readBoundaryHits[readIdValue];
+    // Iterate the precomputed runs (readRuns), built before graph seeding so
+    // totReadBound could size abPOA's per-edge read_id bitsets to the true row
+    // count. Each run is one contiguous pin subset (split at wide pin gaps) and
+    // becomes its own abPOA row (seqId), so one OrientedReadId may contribute
+    // several rows; downstream support is counted per column via edge read_id
+    // bitsets and member positions are recovered per seqId, so disjoint runs
+    // never double-count.
+    for(const auto& [readIdValue, hits] : readRuns) {
         const OrientedReadId oid = OrientedReadId::fromValue(static_cast<ReadId>(readIdValue));
         const auto rm = markersRef[oid.getValue()];
 
+        {
         const uint32_t firstBoundary = hits.front().boundaryIndex;
         const uint32_t lastBoundary  = hits.back().boundaryIndex;
         if(firstBoundary >= nBackboneAnchors || lastBoundary >= nBackboneAnchors) continue;
@@ -1067,16 +1122,19 @@ bool Assembler::runOneWindowAbpoaMultiSegmentMSA(
             }
 
             perReadTime.push_back(readTime);
-            seqIdToOrientedRead.push_back(oid);  // read id readSeqId = this read
+            seqIdToOrientedRead.push_back(oid);  // read id readSeqId = this run
             alignedReads++;
             readSeqId++;
         }
+        }  // this run
     }
 
-    out << "  aligned " << alignedReads << " reads ("
+    out << "  aligned " << alignedReads << " rows ("
          << alignedSegments << " segments), skipped " << skippedReads;
     if(oversizeDroppedReads > 0)
         out << ", dropped " << oversizeDroppedReads << " oversize";
+    if(readsWithMultipleRuns > 0)
+        out << ", " << readsWithMultipleRuns << " reads split at wide pin gaps";
     out << endl;
 
     // Report timing by quartile (reads are already longest-first).
