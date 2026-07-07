@@ -294,6 +294,25 @@ inline std::uint32_t emitHetBubblesFromProfiles(
 
     window.hetBubbles.clear();
 
+    // A k=2 anchor member stores a read position p; shasta2 reconstructs the
+    // anchor k-mer as read[p..p+2] and requires EVERY member to carry the same
+    // two bases. Pinning a member at the predecessor column (colAt(predPos)) is
+    // only valid if that read actually spells [kmer0, kmer1] there: the base at
+    // predPos equals kmer0, and the very next READ base (predPos's readPos + 1,
+    // i.e. no insertion in between) is the aligned base at predPos+1 and equals
+    // kmer1. A read with a mismatch/indel at the predecessor otherwise gets
+    // pinned into an anchor whose k-mer it does not share, which shasta2 rejects
+    // as an inconsistent k-mer. Returns the pred column to pin at, or nullptr.
+    auto pinnedKmerCol = [](const KwMemberProfile& prof, uint32_t predPos,
+                            uint8_t kmer0, uint8_t kmer1) -> const KwAlignedCol* {
+        const KwAlignedCol* c0 = prof.colAt(predPos);
+        if (!c0 || c0->readBase != kmer0) return nullptr;
+        const KwAlignedCol* c1 = prof.colAt(predPos + 1);
+        if (!c1 || c1->readPos != c0->readPos + 1 || c1->readBase != kmer1)
+            return nullptr;
+        return c0;
+    };
+
     uint32_t emitted = 0;
     for (const PassingSite& site : passingSites) {
         const uint32_t pos = site.pos;
@@ -315,7 +334,7 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         refArm.members.push_back({bbOid, pos - 1});
         for (const auto& prof : profiles) {
             if (memberCall(prof, pos) != -2) continue;
-            const KwAlignedCol* c = prof.colAt(pos - 1);
+            const KwAlignedCol* c = pinnedKmerCol(prof, pos - 1, predBase, refArm.alleleBase);
             if (!c) continue;
             refArm.members.push_back({prof.oid, c->readPos});
             homMemberProf.push_back(&prof);
@@ -331,7 +350,7 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             arm.isRef = false;
             for (const auto& prof : profiles) {
                 if (memberCall(prof, pos) != int(pa.altBase)) continue;
-                const KwAlignedCol* c = prof.colAt(pos - 1);
+                const KwAlignedCol* c = pinnedKmerCol(prof, pos - 1, predBase, pa.altBase);
                 if (!c) continue;
                 arm.members.push_back({prof.oid, c->readPos});
                 homMemberProf.push_back(&prof);
@@ -351,7 +370,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             leadHom.isRef = true;
             leadHom.members.push_back({bbOid, pos - 2});
             for (const KwMemberProfile* prof : homMemberProf) {
-                const KwAlignedCol* c = prof->colAt(pos - 2);
+                const KwAlignedCol* c =
+                    pinnedKmerCol(*prof, pos - 2, leadHom.predBase, leadHom.alleleBase);
                 if (!c) continue;
                 leadHom.members.push_back({prof->oid, c->readPos});
             }
@@ -371,7 +391,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             homAnchor.isRef = true;
             homAnchor.members.push_back({bbOid, pos + 1});
             for (const KwMemberProfile* prof : homMemberProf) {
-                const KwAlignedCol* c = prof->colAt(pos + 1);
+                const KwAlignedCol* c =
+                    pinnedKmerCol(*prof, pos + 1, homAnchor.predBase, homAnchor.alleleBase);
                 if (!c) continue;
                 homAnchor.members.push_back({prof->oid, c->readPos});
             }
