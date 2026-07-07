@@ -392,19 +392,28 @@ void planWindowHetBubbles(
             continue;
         }
 
-        // Beyond the flanking backbone anchors, either bracketing hom can still
-        // coincide with an INTERVENING primary anchor (the backbone is a sparse
-        // subset of primaries, so a primary can sit strictly inside the interval).
-        // A hom column is homozygous, which is exactly what defines a primary
-        // anchor, so homs are naturally drawn onto such positions. Emitting the
-        // hom as a second anchor id on the same (read, position) marker makes
-        // shasta2 read-following pair the two into a zero-length assembly step and
-        // assert. Drop the whole bubble when either hom collides with a primary
-        // (keep only bubbles that sit cleanly inside the interval). The allele
-        // arms are heterozygous and cannot match a primary, so only the homs are
-        // checked.
-        if(hetAnchorCollidesWithPrimary(b.leadHom, primarySet) ||
-           hetAnchorCollidesWithPrimary(b.hom, primarySet)) {
+        // Beyond the flanking backbone anchors, ANY of the bubble's k=2 anchors
+        // (both bracketing homs AND the allele arms) can coincide with an
+        // INTERVENING primary anchor: the backbone is a sparse subset of
+        // primaries, so a primary can sit strictly inside the interval. A hom
+        // column is homozygous, which is exactly what defines a primary anchor,
+        // so homs are naturally drawn onto such positions. An allele ARM is not
+        // exempt: heterozygosity constrains the allele BASE, not the read
+        // POSITION, and a minority allele that is a coherent haplotype forms its
+        // own k=50 primary anchor over exactly the same (read, position) markers.
+        // Emitting the arm/hom as a second anchor id on a marker already owned by
+        // a primary makes shasta2 read-following pair the two into a zero-length
+        // assembly step and assert (the primary<->het "same read position"
+        // collision). Drop the whole bubble when ANY of its anchors collides with
+        // a primary, keeping only bubbles that sit cleanly inside the interval.
+        bool primaryCollision =
+            hetAnchorCollidesWithPrimary(b.leadHom, primarySet) ||
+            hetAnchorCollidesWithPrimary(b.hom, primarySet);
+        for(const auto& arm : b.alleles) {
+            if(primaryCollision) break;
+            if(hetAnchorCollidesWithPrimary(arm, primarySet)) primaryCollision = true;
+        }
+        if(primaryCollision) {
             ++dropped;
             ++droppedPrimaryCollision;
             continue;
@@ -1988,6 +1997,39 @@ void dinara::main::assemble(
              << " (2-anchor identical=" << nIdenticalPairs
              << ", 2-anchor partial=" << nPartialPairs
              << ", >2-anchor clusters=" << nBigClusters << ")" << endl;
+
+        // Second scan: ALL anchors (primary + het/hom). The first scan only sees
+        // het/hom<->het/hom collisions; a het/hom anchor can also land on a
+        // marker already owned by a PRIMARY anchor (most importantly an allele
+        // arm that duplicates the minority haplotype's own k=50 primary). Report
+        // any (read,position) marker carried by >=2 anchors, split by whether a
+        // primary is involved, so the primary-collision screen can be verified.
+        std::unordered_map<uint64_t, vector<Shasta2AnchorId>> allMarkerToAnchors;
+        allMarkerToAnchors.reserve(nAnchors * 2);
+        for(Shasta2AnchorId aid = 0; aid < nAnchors; aid++) {
+            const Shasta2Anchor anchor = (*shasta2Anchors)[aid];
+            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                const uint64_t key =
+                    (uint64_t(mi.orientedReadId.getValue()) << 32) |
+                    uint64_t(mi.position);
+                allMarkerToAnchors[key].push_back(aid);
+            }
+        }
+        auto isHetAid = [&](Shasta2AnchorId a) {
+            return hetFirst != invalid<Shasta2AnchorId> && a >= hetFirst;
+        };
+        uint64_t primaryHetMarkers = 0, hetHetMarkers = 0, primaryPrimaryMarkers = 0;
+        for(const auto& [key, ids] : allMarkerToAnchors) {
+            if(ids.size() < 2) continue;
+            bool anyPrimary = false, anyHet = false;
+            for(Shasta2AnchorId a : ids) { if(isHetAid(a)) anyHet = true; else anyPrimary = true; }
+            if(anyPrimary && anyHet) ++primaryHetMarkers;
+            else if(anyHet) ++hetHetMarkers;
+            else ++primaryPrimaryMarkers;
+        }
+        cout << timestamp << "DEDUP-DIAG (all anchors): primary<->het/hom markers="
+             << primaryHetMarkers << " het/hom<->het/hom markers=" << hetHetMarkers
+             << " primary<->primary markers=" << primaryPrimaryMarkers << endl;
     }
 
     // Pass 3: stage window-local (intra-window) anchor-graph edges on the
