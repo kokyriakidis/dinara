@@ -107,23 +107,21 @@ inline bool ipoaTimingEnabled() {
 }
 
 // Max interval span (backbone bp between consecutive breakpoints) that will be
-// POA'd. Intervals wider than this are gaps with no shared anchor across any
-// member -- repeats / low-coverage / structural regions. A global affine POA
-// there is O(span * graphNodes) over ~50 reads (measured up to ~500 ms each; a
-// ~10% tail of giant intervals consumed ~85% of all het MSA time), one-sided
-// members inject a full span-length GUESSED sequence, and the resulting
-// alignment drifts so badly it corrupts member profiles and SUPPRESSES real
-// bubbles at the interval edges. Capping is therefore a win on both axes:
-// dropping these intervals is faster AND recovers het calls (test fastq:
-// cap=1000 gave -34% het time and +5 bubbles vs no cap). Default 1000bp; set
-// DINARA_IPOA_MAX_INTERVAL_BP=0 to disable, or any value to override.
+// POA'd. 0 = NO CAP (default): every region is processed. This exists only as a
+// diagnostic / profiling knob, NOT a correctness setting -- skipping wide
+// intervals silently drops any het inside them, which is unacceptable for a
+// variant caller. Wide anchor-less gaps (repeats / low coverage / SV) are slow
+// (a global affine POA is O(span * graphNodes) over ~50 reads) and drift-prone
+// (one-sided members inject a full span-length GUESSED sequence), but the fix
+// is to SUB-TILE them into small POAs, not to skip them. Set
+// DINARA_IPOA_MAX_INTERVAL_BP=N only to measure the cost of that tail.
 inline std::uint32_t ipoaMaxIntervalBp() {
     static const std::uint32_t v = []() -> std::uint32_t {
         const char* e = std::getenv("DINARA_IPOA_MAX_INTERVAL_BP");
-        if (e == nullptr) return 1000u;   // default cap
+        if (e == nullptr) return 0u;   // no cap: process all regions
         char* endp = nullptr;
         const unsigned long p = std::strtoul(e, &endp, 10);
-        return (endp != e) ? std::uint32_t(p) : 1000u;
+        return (endp != e) ? std::uint32_t(p) : 0u;
     }();
     return v;
 }
@@ -420,12 +418,10 @@ inline void runIpoaInterval(
     if (bbEnd <= bbBegin) return;
     if (bbEnd <= plan.windowBbBegin || bbBegin >= plan.windowBbEnd) return;
 
-    // Skip pathologically wide intervals: a large gap between consecutive shared
-    // breakpoints is a repeat/low-coverage region. A global affine POA there is
-    // O(span * graphNodes) over ~50 reads (measured up to ~500 ms each; a
-    // handful dominate total het time), and one-sided members inject a full
-    // span-length guessed sequence, and per-base het calls in such regions are
-    // unreliable anyway. 0 = no cap.
+    // Diagnostic-only interval span cap (default 0 = off; every region is
+    // processed). Wide anchor-less gaps are slow and drift-prone, but the fix is
+    // to sub-tile them, NOT to skip them -- skipping silently drops any het
+    // inside the gap. This knob only exists to MEASURE that tail's cost.
     if (const uint32_t cap = ipoaMaxIntervalBp())
         if (bbEnd - bbBegin > cap) return;
 
