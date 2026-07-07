@@ -168,85 +168,119 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     const uint64_t coverageHet = assemblerInfo.isOpen ?
         assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
 
-    // --- Phase 1: build plans and flatten interval steps --------------------
-    vector<IpoaPlan> plans(windows.size());
-    vector<vector<IpoaFragment>> fragments(windows.size());
-
-    struct Step {
-        uint32_t windowIndex;
-        uint32_t intervalIndex;
-        uint64_t cost;   // descending-cost load balancing
-        bool operator<(const Step& that) const { return cost > that.cost; }
-    };
-    vector<Step> steps;
-
-    for (uint32_t w = 0; w < windows.size(); w++) {
-        plans[w] = buildIpoaPlan(windows[w], anchors, journeys, mkrs, rds, k);
-        windows[w].hetBubbles.clear();
-        if (!plans[w].valid) continue;
-        const IpoaPlan& plan = plans[w];
-        const uint32_t nI = plan.intervalCount();
-        fragments[w].resize(nI);
-        for (uint32_t bi = 0; bi < nI; bi++) {
-            const uint32_t span = plan.breakpoints[bi + 1] - plan.breakpoints[bi];
-            const uint64_t rows =
-                plan.atBreakpoint[bi].size() + plan.atBreakpoint[bi + 1].size();
-            steps.push_back({w, bi, uint64_t(span) * (rows + 1)});
-        }
-    }
-
-    // Biggest MSAs first so a straggler never runs alone at the end.
-    sort(steps.begin(), steps.end());
-
-    // Per-window remaining-interval countdown. The thread that runs a window's
-    // LAST interval immediately merges+emits and frees that window's fragments
-    // and plan pins. This bounds resident memory to in-flight windows (like the
-    // old per-window path) while keeping global interval work-stealing: the
-    // heavy aligned-column fragments never accumulate across all windows.
-    vector<std::atomic<uint32_t>> remaining(windows.size());
-    for (uint32_t w = 0; w < windows.size(); w++)
-        remaining[w].store(plans[w].valid ? plans[w].intervalCount() : 0u);
-
     std::atomic<uint64_t> hetWindows{0};
     std::atomic<uint64_t> totalBubbles{0};
     std::mutex debugMutex;
 
-    auto finishWindow = [&](uint32_t w) {
-        const uint32_t n = mergeAndEmitIpoaWindow(
-            windows[w], plans[w], fragments[w], rds, coverageHet,
-            hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
-        if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
-        if (debug) {
-            std::lock_guard<std::mutex> lock(debugMutex);
-            ipoaDebugLine(plans[w], fragments[w]);
-        }
-        // Release heavy state now that this window is done.
-        vector<IpoaFragment>().swap(fragments[w]);
-        plans[w].freeHeavy();
+    // Clear all het-bubble slots up front (windows not processed / homozygous
+    // must end up empty).
+    for (AnchorWindow& w : windows) w.hetBubbles.clear();
+
+    // --- Chunked processing to bound memory --------------------------------
+    // Building EVERY window's plan and holding EVERY window's fragments at once
+    // is O(genome): each window's aligned-column fragments are ~depth*span, and
+    // summed over thousands of windows that is many GB -> OOM. Instead process
+    // windows in chunks whose combined backbone span stays under a budget. Only
+    // a chunk's plans+fragments are resident at a time, so peak het memory is
+    // ~depth*chunkSpan regardless of genome size. Within a chunk, intervals are
+    // still flattened and work-stolen globally, so a single huge window (its own
+    // chunk) parallelizes its thousands of intervals across all threads -- the
+    // load-balancing win is preserved.
+    //
+    // Budget defaults to 4 Mbp of backbone span per chunk; override with
+    // DINARA_IPOA_CHUNK_MBP. A chunk always holds >=1 window, so a window larger
+    // than the budget is processed alone (still fully parallel internally).
+    uint64_t chunkSpanBudget = 4ull * 1000ull * 1000ull;
+    if (const char* e = getenv("DINARA_IPOA_CHUNK_MBP")) {
+        const double mbp = atof(e);
+        if (mbp > 0.0) chunkSpanBudget = uint64_t(mbp * 1e6);
+    }
+
+    struct Step {
+        uint32_t windowIndex;    // absolute window index
+        uint32_t localIndex;     // index within the current chunk
+        uint32_t intervalIndex;
+        uint64_t cost;           // descending-cost load balancing
+        bool operator<(const Step& that) const { return cost > that.cost; }
     };
 
-    // --- Run interval MSAs (work-stealing, batch=1), merge+free per window ---
-    {
-        std::atomic<uint64_t> nextStep{0};
-        const uint64_t nSteps = steps.size();
-        auto worker = [&]() {
-            IpoaAbHandle ah;   // thread-local abPOA handle, reused across steps
-            for (;;) {
-                const uint64_t i = nextStep.fetch_add(1);
-                if (i >= nSteps) break;
-                const Step& s = steps[i];
-                runIpoaInterval(plans[s.windowIndex], s.intervalIndex,
-                                rds, oneSidedEnabled, ah,
-                                fragments[s.windowIndex][s.intervalIndex]);
-                // Last interval of this window? Then merge+emit+free it here.
-                if (remaining[s.windowIndex].fetch_sub(1) == 1)
-                    finishWindow(s.windowIndex);
+    uint32_t wBegin = 0;
+    while (wBegin < windows.size()) {
+        // Grow the chunk until the span budget is reached (>=1 window always).
+        uint32_t wEnd = wBegin;
+        uint64_t chunkSpan = 0;
+        while (wEnd < windows.size()) {
+            const uint64_t s = windows[wEnd].baseSpan;
+            if (wEnd > wBegin && chunkSpan + s > chunkSpanBudget) break;
+            chunkSpan += s;
+            wEnd++;
+        }
+        const uint32_t chunkN = wEnd - wBegin;
+
+        // Build this chunk's plans and flatten its interval steps.
+        vector<IpoaPlan> plans(chunkN);
+        vector<vector<IpoaFragment>> fragments(chunkN);
+        vector<std::atomic<uint32_t>> remaining(chunkN);
+        vector<Step> steps;
+        for (uint32_t li = 0; li < chunkN; li++) {
+            const uint32_t w = wBegin + li;
+            plans[li] = buildIpoaPlan(windows[w], anchors, journeys, mkrs, rds, k);
+            const uint32_t nI = plans[li].valid ? plans[li].intervalCount() : 0u;
+            remaining[li].store(nI);
+            if (nI == 0) continue;
+            fragments[li].resize(nI);
+            const IpoaPlan& plan = plans[li];
+            for (uint32_t bi = 0; bi < nI; bi++) {
+                const uint32_t span = plan.breakpoints[bi + 1] - plan.breakpoints[bi];
+                const uint64_t rows =
+                    plan.atBreakpoint[bi].size() + plan.atBreakpoint[bi + 1].size();
+                steps.push_back({w, li, bi, uint64_t(span) * (rows + 1)});
             }
+        }
+
+        // Biggest MSAs first so a straggler never runs alone at the end.
+        sort(steps.begin(), steps.end());
+
+        // Merge+emit a chunk window once its last interval finishes, then free
+        // its heavy state immediately.
+        auto finishWindow = [&](uint32_t li) {
+            const uint32_t w = wBegin + li;
+            const uint32_t n = mergeAndEmitIpoaWindow(
+                windows[w], plans[li], fragments[li], rds, coverageHet,
+                hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
+            if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
+            if (debug) {
+                std::lock_guard<std::mutex> lock(debugMutex);
+                ipoaDebugLine(plans[li], fragments[li]);
+            }
+            vector<IpoaFragment>().swap(fragments[li]);
+            plans[li].freeHeavy();
         };
-        vector<std::thread> pool;
-        pool.reserve(threadCount);
-        for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
-        for (auto& th : pool) th.join();
+
+        // Run this chunk's interval MSAs (work-stealing, batch=1).
+        {
+            std::atomic<uint64_t> nextStep{0};
+            const uint64_t nSteps = steps.size();
+            auto worker = [&]() {
+                IpoaAbHandle ah;   // thread-local abPOA handle, reused
+                for (;;) {
+                    const uint64_t i = nextStep.fetch_add(1);
+                    if (i >= nSteps) break;
+                    const Step& s = steps[i];
+                    runIpoaInterval(plans[s.localIndex], s.intervalIndex,
+                                    rds, oneSidedEnabled, ah,
+                                    fragments[s.localIndex][s.intervalIndex]);
+                    if (remaining[s.localIndex].fetch_sub(1) == 1)
+                        finishWindow(s.localIndex);
+                }
+            };
+            vector<std::thread> pool;
+            pool.reserve(threadCount);
+            for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
+            for (auto& th : pool) th.join();
+        }
+
+        wBegin = wEnd;
     }
 
     hetWindowsOut = hetWindows.load();
