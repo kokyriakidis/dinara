@@ -426,7 +426,13 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             (hetAnchorFirstId != invalid<Shasta2AnchorId>) &&
             (anchorId >= hetAnchorFirstId);
 
-        const Kmer expectedKmer = getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
+        // Only compute the k=50 reference k-mer for primary anchors. A het
+        // anchor's stored position is a k=2 midpoint (rawPosition + 1), so
+        // getKmerAtPosition -- which subtracts k/2 = 25 and reads k=50 bases --
+        // would underflow the raw position and read out of bounds (segfault)
+        // near a read end. Het anchors skip the k=50 consistency check anyway.
+        const Kmer expectedKmer = isHetAnchor ? Kmer() :
+            getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
         vector<ReadId> readIds;
         readIds.reserve(anchor.size());
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
