@@ -496,9 +496,25 @@ inline void runIpoaInterval(
 
         int64_t pendingDelBegin = -1;
         bool entered = false;
-        const bool leftPinTrue  = (sm.side == 0 || sm.side == 1);
-        const bool rightPinTrue = (sm.side == 0 || sm.side == 2);
 
+        // Bound the read position by the member's segment [cBegin, cEnd) on BOTH
+        // sides, whether each boundary is a TRUE pin or a guessed one-sided end.
+        //
+        // On a one-sided read the free end (cEnd for left-only, cBegin for
+        // right-only) is a base-count GUESS (cB + segLenApprox). Indels make the
+        // read's true base count across the span differ from the backbone's, so
+        // readAbs drifts past the read's true position at the next shared anchor.
+        // A later het arm/hom anchor built from that drifted readPos then lands
+        // beyond the read's real position at the neighbouring backbone anchor,
+        // producing a backward intra-window edge (caught by monotonity
+        // verification as an off-by-one, which is the overshoot minus the
+        // primary anchor's k/2 frame offset).
+        //
+        // Clamping to the guessed boundary drops those uncertain overshoot
+        // columns -- we lose a little coverage on the guessed end, never emit a
+        // position we cannot trust. (This is what commit aeba3de intended; it
+        // previously bounded only the true-pinned side, leaving the drift side
+        // unchecked.)
         for (int64_t col = colFirst; col <= colLast; col++) {
             const AlignedBase mb = row[col];
             const int64_t bbPos = colBbPos[col];
@@ -507,8 +523,7 @@ inline void runIpoaInterval(
                 if (!mb.isGap()) {
                     const uint8_t code = mb.value & 0xff;
                     const bool posValid =
-                        (!leftPinTrue  || readAbs >= sm.cBegin) &&
-                        (!rightPinTrue || readAbs <  sm.cEnd);
+                        (readAbs >= sm.cBegin) && (readAbs < sm.cEnd);
                     if (!posValid) { entered = true; readAbs++; continue; }
                     rf.alignedCols.push_back(
                         KwAlignedCol{uint32_t(bbPos), readAbs, code});

@@ -172,109 +172,65 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     // must end up empty).
     for (AnchorWindow& w : windows) w.hetBubbles.clear();
 
-    // --- Chunked processing to bound memory --------------------------------
-    // Building EVERY window's plan and holding EVERY window's fragments at once
-    // is O(genome): each window's aligned-column fragments are ~depth*span, and
-    // summed over thousands of windows that is many GB -> OOM. Process windows
-    // in small chunks so only a chunk's plans+fragments are resident at a time.
+    // --- Per-window work-stealing ------------------------------------------
+    // One persistent thread pool; each thread pulls the next window and handles
+    // it ENTIRELY on its own: build plan, run all its intervals serially into
+    // its own accumulator, merge+emit, free. Full utilization whenever there are
+    // more windows than threads (the normal case) with none of the overhead a
+    // flatten-all-intervals scheme adds -- no per-chunk barriers, no accumulator
+    // locking (one thread owns the window), one pool spawn for the whole run.
     //
-    // The chunk size is a WINDOW COUNT, defaulting to threadCount. This makes
-    // resident memory match the OLD per-window driver exactly (it too kept
-    // ~threadCount windows in flight, one per worker) -- so this path can never
-    // use more het memory than the version that worked. Within a chunk,
-    // intervals are still flattened and work-stolen across all threads, so when
-    // a few big windows dominate their thousands of intervals fan out over every
-    // thread -- the load-balancing win, at old-path memory. Override with
-    // DINARA_IPOA_CHUNK_WINDOWS to trade memory for cross-window overlap.
-    uint32_t chunkWindows = uint32_t(threadCount);
-    if (const char* e = getenv("DINARA_IPOA_CHUNK_WINDOWS")) {
-        const long v = atol(e);
-        if (v > 0) chunkWindows = uint32_t(v);
-    }
-    if (chunkWindows == 0) chunkWindows = 1;
+    // Memory stays bounded: at most ~threadCount windows are resident (one per
+    // worker), and each window streams its intervals so its peak is just the
+    // accumulator (~depth*span) -- the same footprint as the original per-window
+    // driver that worked.
+    //
+    // Windows are visited biggest-first (by backbone span) so a dominant window
+    // starts early and does not end up as an end-of-run straggler running alone.
+    vector<uint32_t> order(windows.size());
+    for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
+    sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return windows[a].baseSpan > windows[b].baseSpan;
+    });
 
-    struct Step {
-        uint32_t windowIndex;    // absolute window index
-        uint32_t localIndex;     // index within the current chunk
-        uint32_t intervalIndex;
-        uint64_t cost;           // descending-cost load balancing
-        bool operator<(const Step& that) const { return cost > that.cost; }
-    };
+    {
+        std::atomic<uint64_t> nextIdx{0};
+        const uint64_t nWindows = windows.size();
+        auto worker = [&]() {
+            IpoaAbHandle ah;       // thread-local abPOA handle, reused
+            IpoaFragment scratch;  // thread-local, reused across intervals
+            for (;;) {
+                const uint64_t idx = nextIdx.fetch_add(1);
+                if (idx >= nWindows) break;
+                const uint32_t w = order[idx];
 
-    uint32_t wBegin = 0;
-    while (wBegin < windows.size()) {
-        const uint32_t wEnd =
-            std::min<uint32_t>(uint32_t(windows.size()), wBegin + chunkWindows);
-        const uint32_t chunkN = wEnd - wBegin;
+                IpoaPlan plan =
+                    buildIpoaPlan(windows[w], anchors, journeys, mkrs, rds, k);
+                if (!plan.valid) continue;
 
-        // Build this chunk's plans and flatten its interval steps. Each window
-        // has one streaming accumulator; interval outputs are folded in as they
-        // complete and never stored, so peak memory per window is just its
-        // accumulator (~depth*span) -- matching the original per-window path.
-        vector<IpoaPlan> plans(chunkN);
-        vector<IpoaWindowAccum> accums(chunkN);
-        vector<std::atomic<uint32_t>> remaining(chunkN);
-        vector<Step> steps;
-        for (uint32_t li = 0; li < chunkN; li++) {
-            const uint32_t w = wBegin + li;
-            plans[li] = buildIpoaPlan(windows[w], anchors, journeys, mkrs, rds, k);
-            const uint32_t nI = plans[li].valid ? plans[li].intervalCount() : 0u;
-            remaining[li].store(nI);
-            if (nI == 0) continue;
-            const IpoaPlan& plan = plans[li];
-            for (uint32_t bi = 0; bi < nI; bi++) {
-                const uint32_t span = plan.breakpoints[bi + 1] - plan.breakpoints[bi];
-                const uint64_t rows =
-                    plan.atBreakpoint[bi].size() + plan.atBreakpoint[bi + 1].size();
-                steps.push_back({w, li, bi, uint64_t(span) * (rows + 1)});
-            }
-        }
-
-        // Biggest MSAs first so a straggler never runs alone at the end.
-        sort(steps.begin(), steps.end());
-
-        // Merge+emit a chunk window once its last interval finishes, then free
-        // its heavy state immediately.
-        auto finishWindow = [&](uint32_t li) {
-            const uint32_t w = wBegin + li;
-            const uint32_t n = mergeAndEmitIpoaWindow(
-                windows[w], plans[li], accums[li], rds, coverageHet,
-                hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
-            if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
-            if (debug) {
-                std::lock_guard<std::mutex> lock(debugMutex);
-                ipoaDebugLine(plans[li], accums[li]);
-            }
-            plans[li].freeHeavy();
-        };
-
-        // Run this chunk's interval MSAs (work-stealing, batch=1). Each thread
-        // reuses one scratch fragment: run interval -> fold into the window
-        // accumulator -> clear. No per-interval storage survives.
-        {
-            std::atomic<uint64_t> nextStep{0};
-            const uint64_t nSteps = steps.size();
-            auto worker = [&]() {
-                IpoaAbHandle ah;       // thread-local abPOA handle, reused
-                IpoaFragment scratch;  // thread-local, reused across intervals
-                for (;;) {
-                    const uint64_t i = nextStep.fetch_add(1);
-                    if (i >= nSteps) break;
-                    const Step& s = steps[i];
-                    runIpoaInterval(plans[s.localIndex], s.intervalIndex,
-                                    rds, oneSidedEnabled, ah, scratch);
-                    accumulateIpoaFragment(accums[s.localIndex], scratch);
-                    if (remaining[s.localIndex].fetch_sub(1) == 1)
-                        finishWindow(s.localIndex);
+                // All intervals of this window run serially into its own
+                // accumulator -- single owner, so no locking is needed.
+                IpoaWindowAccum wa;
+                const uint32_t nI = plan.intervalCount();
+                for (uint32_t bi = 0; bi < nI; bi++) {
+                    runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
+                    accumulateIpoaFragment(wa, scratch);
                 }
-            };
-            vector<std::thread> pool;
-            pool.reserve(threadCount);
-            for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
-            for (auto& th : pool) th.join();
-        }
 
-        wBegin = wEnd;
+                const uint32_t n = mergeAndEmitIpoaWindow(
+                    windows[w], plan, wa, rds, coverageHet,
+                    hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
+                if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
+                if (debug) {
+                    std::lock_guard<std::mutex> lock(debugMutex);
+                    ipoaDebugLine(plan, wa);
+                }
+            }
+        };
+        vector<std::thread> pool;
+        pool.reserve(threadCount);
+        for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
+        for (auto& th : pool) th.join();
     }
 
     hetWindowsOut = hetWindows.load();
