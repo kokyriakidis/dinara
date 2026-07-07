@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -164,6 +165,10 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     const uint64_t coverageHet = assemblerInfo.isOpen ?
         assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
 
+    const bool timing = ipoaTimingEnabled();
+    if (timing) ipoaTiming().reset();
+    const auto tAll0 = std::chrono::steady_clock::now();
+
     std::atomic<uint64_t> hetWindows{0};
     std::atomic<uint64_t> totalBubbles{0};
     std::mutex debugMutex;
@@ -204,8 +209,14 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 if (idx >= nWindows) break;
                 const uint32_t w = order[idx];
 
+                const auto tPlan0 = timing ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point{};
                 IpoaPlan plan =
                     buildIpoaPlan(windows[w], anchors, journeys, mkrs, rds, k);
+                if (timing)
+                    ipoaTiming().planNs.fetch_add(ipoaNsSince(tPlan0),
+                                                  std::memory_order_relaxed);
                 if (!plan.valid) continue;
 
                 // All intervals of this window run serially into its own
@@ -214,12 +225,24 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 const uint32_t nI = plan.intervalCount();
                 for (uint32_t bi = 0; bi < nI; bi++) {
                     runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
+                    const auto tAcc0 = timing ?
+                        std::chrono::steady_clock::now() :
+                        std::chrono::steady_clock::time_point{};
                     accumulateIpoaFragmentUnlocked(wa, scratch);
+                    if (timing)
+                        ipoaTiming().accumNs.fetch_add(ipoaNsSince(tAcc0),
+                                                       std::memory_order_relaxed);
                 }
 
+                const auto tMerge0 = timing ?
+                    std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point{};
                 const uint32_t n = mergeAndEmitIpoaWindow(
                     windows[w], plan, wa, rds, coverageHet,
                     hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
+                if (timing)
+                    ipoaTiming().mergeNs.fetch_add(ipoaNsSince(tMerge0),
+                                                   std::memory_order_relaxed);
                 if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
                 if (debug) {
                     std::lock_guard<std::mutex> lock(debugMutex);
@@ -231,6 +254,53 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
         pool.reserve(threadCount);
         for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
         for (auto& th : pool) th.join();
+    }
+
+    if (timing) {
+        const double wallSecs = std::chrono::duration_cast<
+            std::chrono::duration<double>>(
+                std::chrono::steady_clock::now() - tAll0).count();
+        const IpoaTiming& t = ipoaTiming();
+        // The phase counters are summed across threads (thread-busy time), so
+        // they add up to ~threadCount * wall. ms() reports thread-seconds; the
+        // percentage is share of total thread-busy time, which is what tells you
+        // where the CPU actually went.
+        const double planS    = double(t.planNs.load())    / 1e9;
+        const double setupS   = double(t.setupNs.load())   / 1e9;
+        const double resetS   = double(t.resetNs.load())   / 1e9;
+        const double msaS     = double(t.msaNs.load())     / 1e9;
+        const double extractS = double(t.extractNs.load()) / 1e9;
+        const double accumS   = double(t.accumNs.load())   / 1e9;
+        const double mergeS   = double(t.mergeNs.load())   / 1e9;
+        const double busyS = planS + setupS + resetS + msaS + extractS +
+                             accumS + mergeS;
+        const double denom = busyS > 0 ? busyS : 1.0;
+        const uint64_t nInt = t.intervals.load();
+        const uint64_t nRun = t.msaRuns.load();
+        const double nRunD = nRun ? double(nRun) : 1.0;
+        auto pct = [&](double s) { return 100.0 * s / denom; };
+        std::cout << std::fixed << std::setprecision(2)
+                  << "[HetTiming] wall=" << wallSecs << "s"
+                  << " threadBusy=" << busyS << "s"
+                  << " intervals=" << nInt
+                  << " msaRuns=" << nRun << "\n"
+                  << "[HetTiming]   buildPlan   " << planS    << "s (" << pct(planS)    << "%)\n"
+                  << "[HetTiming]   setup       " << setupS   << "s (" << pct(setupS)   << "%)  member-gather + code arrays\n"
+                  << "[HetTiming]   abpoa_reset " << resetS   << "s (" << pct(resetS)   << "%)  [" << (1e6 * resetS / nRunD) << " us/run]\n"
+                  << "[HetTiming]   abpoa_msa   " << msaS     << "s (" << pct(msaS)     << "%)  [" << (1e6 * msaS / nRunD) << " us/run]\n"
+                  << "[HetTiming]   extract     " << extractS << "s (" << pct(extractS) << "%)  msa copy + column walk\n"
+                  << "[HetTiming]   accumulate  " << accumS   << "s (" << pct(accumS)   << "%)  fold fragment\n"
+                  << "[HetTiming]   mergeEmit   " << mergeS   << "s (" << pct(mergeS)   << "%)  merge + emit bubbles\n"
+                  << "[HetTiming]   msa dims: nSeq avg=" << (double(t.seqSum.load()) / nRunD) << " max=" << t.seqMax.load()
+                  << "  maxLen(bp) avg=" << (double(t.lenSum.load()) / nRunD) << " max=" << t.lenMax.load()
+                  << "  msaCols avg=" << (double(t.colSum.load()) / nRunD) << " max=" << t.colMax.load() << "\n"
+                  << "[HetTiming]   run dist: slowest=" << (double(t.runMaxNs.load()) / 1e6) << "ms"
+                  << "  >100us=" << t.runOver100us.load()
+                  << "  >1ms=" << t.runOver1ms.load()
+                  << "  >10ms=" << t.runOver10ms.load()
+                  << "  time in >1ms runs=" << (double(t.nsOver1ms.load()) / 1e9) << "s ("
+                  << (100.0 * double(t.nsOver1ms.load()) / 1e9 / ((msaS + resetS) > 0 ? (msaS + resetS) : 1.0)) << "% of reset+msa)\n"
+                  << std::defaultfloat << std::flush;
     }
 
     hetWindowsOut = hetWindows.load();

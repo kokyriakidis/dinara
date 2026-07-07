@@ -47,6 +47,8 @@
 #include <abpoa.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <unordered_map>
@@ -54,6 +56,82 @@
 #include <vector>
 
 namespace dinara {
+
+// --- Optional per-phase timing (DINARA_HET_TIMING=1) --------------------------
+// Off by default and effectively free when off (one bool check per phase). Each
+// worker thread accumulates into thread-local nanosecond counters, then flushes
+// them into these global atomics once, so there is no per-interval atomic
+// contention. The orchestrator reads them after joining and prints a breakdown.
+struct IpoaTiming {
+    std::atomic<std::uint64_t> planNs{0};        // buildIpoaPlan
+    std::atomic<std::uint64_t> setupNs{0};       // member gather + code arrays
+    std::atomic<std::uint64_t> msaNs{0};         // abpoa_reset + abpoa_msa
+    std::atomic<std::uint64_t> extractNs{0};     // MSA copy + column/SNP walk
+    std::atomic<std::uint64_t> accumNs{0};       // fold fragment into window
+    std::atomic<std::uint64_t> mergeNs{0};       // mergeAndEmitIpoaWindow
+    std::atomic<std::uint64_t> resetNs{0};       // abpoa_reset only
+    std::atomic<std::uint64_t> intervals{0};     // intervals attempted
+    std::atomic<std::uint64_t> msaRuns{0};       // intervals that ran an MSA
+    std::atomic<std::uint64_t> seqSum{0};        // sum of nSeq over runs
+    std::atomic<std::uint64_t> seqMax{0};        // max nSeq
+    std::atomic<std::uint64_t> lenSum{0};        // sum of maxLen over runs
+    std::atomic<std::uint64_t> lenMax{0};        // max maxLen
+    std::atomic<std::uint64_t> colSum{0};        // sum of msa_len over runs
+    std::atomic<std::uint64_t> colMax{0};        // max msa_len
+    // Per-run (reset+msa) time distribution, to see outlier vs uniform cost.
+    std::atomic<std::uint64_t> runMaxNs{0};      // slowest single reset+msa
+    std::atomic<std::uint64_t> runOver100us{0};  // runs > 100 us
+    std::atomic<std::uint64_t> runOver1ms{0};    // runs > 1 ms
+    std::atomic<std::uint64_t> runOver10ms{0};   // runs > 10 ms
+    std::atomic<std::uint64_t> nsOver1ms{0};     // total ns spent by >1ms runs
+    void reset() {
+        planNs = 0; setupNs = 0; msaNs = 0; extractNs = 0;
+        accumNs = 0; mergeNs = 0; resetNs = 0;
+        intervals = 0; msaRuns = 0;
+        seqSum = 0; seqMax = 0; lenSum = 0; lenMax = 0; colSum = 0; colMax = 0;
+        runMaxNs = 0; runOver100us = 0; runOver1ms = 0; runOver10ms = 0;
+        nsOver1ms = 0;
+    }
+};
+
+inline void ipoaAtomicMax(std::atomic<std::uint64_t>& a, std::uint64_t v) {
+    std::uint64_t cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v,
+                                               std::memory_order_relaxed)) {}
+}
+
+inline IpoaTiming& ipoaTiming() { static IpoaTiming t; return t; }
+inline bool ipoaTimingEnabled() {
+    static const bool on = (std::getenv("DINARA_HET_TIMING") != nullptr);
+    return on;
+}
+
+// Max interval span (backbone bp between consecutive breakpoints) that will be
+// POA'd. Intervals wider than this are gaps with no shared anchor across any
+// member -- repeats / low-coverage / structural regions. A global affine POA
+// there is O(span * graphNodes) over ~50 reads (measured up to ~500 ms each; a
+// ~10% tail of giant intervals consumed ~85% of all het MSA time), one-sided
+// members inject a full span-length GUESSED sequence, and the resulting
+// alignment drifts so badly it corrupts member profiles and SUPPRESSES real
+// bubbles at the interval edges. Capping is therefore a win on both axes:
+// dropping these intervals is faster AND recovers het calls (test fastq:
+// cap=1000 gave -34% het time and +5 bubbles vs no cap). Default 1000bp; set
+// DINARA_IPOA_MAX_INTERVAL_BP=0 to disable, or any value to override.
+inline std::uint32_t ipoaMaxIntervalBp() {
+    static const std::uint32_t v = []() -> std::uint32_t {
+        const char* e = std::getenv("DINARA_IPOA_MAX_INTERVAL_BP");
+        if (e == nullptr) return 1000u;   // default cap
+        char* endp = nullptr;
+        const unsigned long p = std::strtoul(e, &endp, 10);
+        return (endp != e) ? std::uint32_t(p) : 1000u;
+    }();
+    return v;
+}
+using IpoaClock = std::chrono::steady_clock;
+inline std::uint64_t ipoaNsSince(const IpoaClock::time_point& t0) {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        IpoaClock::now() - t0).count());
+}
 
 // A member read pinned at a breakpoint, with its base position there.
 struct IpoaMemberBp {
@@ -331,10 +409,25 @@ inline void runIpoaInterval(
     frag.ran = false;
     frag.hadOneSided = false;
 
+    const bool timing = ipoaTimingEnabled();
+    if (timing) ipoaTiming().intervals.fetch_add(1, std::memory_order_relaxed);
+    // setup phase clock: member gather + code-array assembly, up to abpoa_reset.
+    const IpoaClock::time_point tSetup0 =
+        timing ? IpoaClock::now() : IpoaClock::time_point{};
+
     const uint32_t bbBegin = plan.breakpoints[bi];
     const uint32_t bbEnd = plan.breakpoints[bi + 1];
     if (bbEnd <= bbBegin) return;
     if (bbEnd <= plan.windowBbBegin || bbBegin >= plan.windowBbEnd) return;
+
+    // Skip pathologically wide intervals: a large gap between consecutive shared
+    // breakpoints is a repeat/low-coverage region. A global affine POA there is
+    // O(span * graphNodes) over ~50 reads (measured up to ~500 ms each; a
+    // handful dominate total het time), and one-sided members inject a full
+    // span-length guessed sequence, and per-base het calls in such regions are
+    // unreliable anyway. 0 = no cap.
+    if (const uint32_t cap = ipoaMaxIntervalBp())
+        if (bbEnd - bbBegin > cap) return;
 
     // Members spanning this interval = intersection of members pinned at bi and
     // bi+1. side: 0=both, 1=left-only, 2=right-only.
@@ -443,11 +536,61 @@ inline void runIpoaInterval(
 
     int maxLen = 0;
     for (int r = 0; r < nSeq; r++) if (seqLens[r] > maxLen) maxLen = seqLens[r];
+
+    if (timing) {
+        ipoaTiming().setupNs.fetch_add(ipoaNsSince(tSetup0),
+                                       std::memory_order_relaxed);
+    }
+    const IpoaClock::time_point tReset0 =
+        timing ? IpoaClock::now() : IpoaClock::time_point{};
+
     abpoa_reset(ah.ab, ah.abpt, maxLen > 0 ? maxLen : 1);
+
+    const IpoaClock::time_point tMsa0 =
+        timing ? IpoaClock::now() : IpoaClock::time_point{};
+
     abpoa_msa(ah.ab, ah.abpt, nSeq, nullptr, seqLens.data(),
               seqPtrs.data(), nullptr, nullptr);
+
+    if (timing) {
+        IpoaTiming& tt = ipoaTiming();
+        const uint64_t resetDt = ipoaNsSince(tReset0);   // includes msa below? no
+        const uint64_t msaDt = ipoaNsSince(tMsa0);
+        // resetDt above spans reset+msa; recompute reset-only as (tMsa0-tReset0).
+        const uint64_t resetOnly = uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tMsa0 - tReset0).count());
+        const uint64_t runDt = resetOnly + msaDt;        // reset + msa
+        tt.resetNs.fetch_add(resetOnly, std::memory_order_relaxed);
+        tt.msaNs.fetch_add(msaDt, std::memory_order_relaxed);
+        tt.msaRuns.fetch_add(1, std::memory_order_relaxed);
+        tt.seqSum.fetch_add(uint64_t(nSeq), std::memory_order_relaxed);
+        ipoaAtomicMax(tt.seqMax, uint64_t(nSeq));
+        tt.lenSum.fetch_add(uint64_t(maxLen), std::memory_order_relaxed);
+        ipoaAtomicMax(tt.lenMax, uint64_t(maxLen));
+        if (ah.ab->abc && ah.ab->abc->msa_len > 0) {
+            tt.colSum.fetch_add(uint64_t(ah.ab->abc->msa_len),
+                                std::memory_order_relaxed);
+            ipoaAtomicMax(tt.colMax, uint64_t(ah.ab->abc->msa_len));
+        }
+        ipoaAtomicMax(tt.runMaxNs, runDt);
+        if (runDt > 100000)   tt.runOver100us.fetch_add(1, std::memory_order_relaxed);
+        if (runDt > 1000000) {
+            tt.runOver1ms.fetch_add(1, std::memory_order_relaxed);
+            tt.nsOver1ms.fetch_add(runDt, std::memory_order_relaxed);
+        }
+        if (runDt > 10000000) tt.runOver10ms.fetch_add(1, std::memory_order_relaxed);
+        (void)resetDt;
+    }
+    const IpoaClock::time_point tExtract0 =
+        timing ? IpoaClock::now() : IpoaClock::time_point{};
+
     const abpoa_cons_t* abc = ah.ab->abc;
-    if (abc == nullptr || abc->msa_len <= 0 || abc->n_seq != nSeq) return;
+    if (abc == nullptr || abc->msa_len <= 0 || abc->n_seq != nSeq) {
+        if (timing) ipoaTiming().extractNs.fetch_add(ipoaNsSince(tExtract0),
+                                                     std::memory_order_relaxed);
+        return;
+    }
     frag.ran = true;
 
     const uint64_t ncols = uint64_t(abc->msa_len);
@@ -558,6 +701,9 @@ inline void runIpoaInterval(
         if (!rf.alignedCols.empty())
             frag.reads.push_back(std::move(rf));
     }
+
+    if (timing) ipoaTiming().extractNs.fetch_add(ipoaNsSince(tExtract0),
+                                                 std::memory_order_relaxed);
 }
 
 // Per-read accumulator. Same shape as the original in-function Accum. Filled by
