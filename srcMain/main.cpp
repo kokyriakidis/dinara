@@ -550,6 +550,11 @@ void appendWindowHetAnchors(
         if(bubble.sharedLeadFromBubble >= 0) {
             const AnchorWindow::HetBubble& prev =
                 window.hetBubbles[size_t(bubble.sharedLeadFromBubble)];
+            // Pass 1.5 only sets sharedLeadFromBubble for pairs where BOTH
+            // bubbles are planned and coincident, so prev.hom was appended and
+            // its anchorId is valid here.
+            DINARA_ASSERT(prev.plannedInterval >= 0);
+            DINARA_ASSERT(prev.hom.anchorId != invalid<Shasta2AnchorId>);
             bubble.leadHom.anchorId = prev.hom.anchorId;
         } else {
             appendHetAnchor(anchors, bubble.leadHom);

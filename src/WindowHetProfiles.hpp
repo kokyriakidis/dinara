@@ -406,16 +406,15 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         emitted++;
     }
 
-    // Coincident-hom merge (mirrors the abPOA Pass 1.5 condition).
-    for (size_t i = 1; i < window.hetBubbles.size(); i++) {
-        const auto& prev = window.hetBubbles[i - 1];
-        auto& cur = window.hetBubbles[i];
-        if (cur.predBackboneOffset != 0 && prev.succBackboneOffset != 0 &&
-            cur.predBackboneOffset == prev.succBackboneOffset &&
-            !cur.leadHom.members.empty() && !prev.hom.members.empty()) {
-            cur.sharedLeadFromBubble = int64_t(i - 1);
-        }
-    }
+    // NOTE: coincident-hom merging (sharedLeadFromBubble) is intentionally NOT
+    // done here. It must run AFTER planning (main.cpp mergeWindowCoincidentHoms,
+    // Pass 1.5), because it may only link bubbles that both SURVIVE planning and
+    // land in the SAME interval, and it also unions the two homs' member sets.
+    // Setting the flag here (pre-planning, in raw emission order) would let it
+    // point at a bubble that planning later drops: the append pass would then
+    // copy the dropped bubble's invalid hom anchor id and the staging pass would
+    // omit the leadHom step, leaving two SNPs chained with no separating hom.
+    // Leave sharedLeadFromBubble at its default (-1) and let Pass 1.5 set it.
 
     if (debug) {
         std::cout << "    " << enginePrefix << "DetectHetBubbles bb=" << bbOid
