@@ -230,14 +230,22 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
         sort(v.begin(), v.end(),
             [](const MemberBp& a, const MemberBp& b) { return a.oidValue < b.oidValue; });
 
-    // One-sided read support (semi-global). When enabled, reads pinned at only
-    // ONE interval boundary are still placed into the interval POA; their bases
-    // are clipped to the aligned footprint during column extraction so the free
-    // end does not force a global end-gap. This recovers the ~19% of read placements the strict
-    // both-anchors gate drops (up to 62% in the largest windows). Their bases
-    // are clipped to the aligned footprint so the free end creates no phantom
-    // deletions. Off by default (DINARA_IPOA_ONESIDED=1 to enable) for A/B.
-    const bool oneSidedEnabled = (getenv("DINARA_IPOA_ONESIDED") != nullptr);
+    // One-sided read support (semi-global). Reads pinned at only ONE interval
+    // boundary are still placed into the interval POA; their bases are clipped to
+    // the aligned footprint during column extraction so the free end does not
+    // force a global end-gap. This recovers the ~19% of read placements the
+    // strict both-anchors gate drops (up to 62% in the largest windows).
+    //
+    // ON BY DEFAULT. Without it, a read that spans a het locus but is pinned at
+    // only one of the interval's two backbone anchors is dropped, leaving a
+    // COVERAGE HOLE: the read's cov range still spans the SNP, so the emit tail
+    // miscounts it as ref support, yet no aligned column exists to build the arm
+    // from -- yielding coverage-1 ref arms and, in windows seeded by the
+    // opposite haplotype, whole het sites with no recoverable ref allele. With
+    // one-sided placement these reads get real columns, restoring valid
+    // multi-member ref/alt arms. Set DINARA_IPOA_ONESIDED=0 to disable.
+    const char* oneSidedEnv = getenv("DINARA_IPOA_ONESIDED");
+    const bool oneSidedEnabled = (oneSidedEnv == nullptr) || (oneSidedEnv[0] != '0');
 
     uint32_t intervalsRun = 0;
     uint64_t twoSidedTotal = 0;    // reads pinned at both interval boundaries

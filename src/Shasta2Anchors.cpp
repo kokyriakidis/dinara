@@ -484,6 +484,15 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     constexpr uint32_t hetK = 2;
     constexpr uint32_t hetKHalf = hetK / 2;   // = 1
 
+    // Safety net: a het/hom anchor must have at least 2 members. A coverage-1
+    // anchor (a single read, or only the backbone) is a spurious branch in the
+    // assembly graph and must never be exported. The emit tail enforces this
+    // upstream (per-arm minSupport gate; homs require >1) and the interval engine
+    // now places one-sided reads by default so real allele support is not lost to
+    // coverage holes. Assert it here so any future caller that regresses is
+    // caught immediately rather than emitting a bad external anchor.
+    DINARA_ASSERT(members.size() >= 2);
+
     // Record where het anchors begin so the export can bypass the k=50 k-mer
     // consistency check for them AND use hetK/2 (not k/2) when recovering the
     // raw position.

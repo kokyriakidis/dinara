@@ -339,6 +339,14 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             refArm.members.push_back({prof.oid, c->readPos});
             homMemberProf.push_back(&prof);
         }
+        // The site gate used raw observation counts (refCount / altCov), but the
+        // arm's real members are re-filtered by pinnedKmerCol (k-mer-consistency
+        // guard), which can drop reads whose predecessor base mismatches or is
+        // separated by an insertion. Re-apply minSupport to the PINNED member
+        // counts so an allele that fell below threshold after pinning does not
+        // become a weak/spurious branch. refArm.members includes the backbone
+        // (+1), matching refCount's +1; alt arms exclude it, matching altCov.
+        if (refArm.members.size() < size_t(minSupport)) continue;
         bubble.alleles.push_back(std::move(refArm));
 
         // Alternate arms.
@@ -355,7 +363,9 @@ inline std::uint32_t emitHetBubblesFromProfiles(
                 arm.members.push_back({prof.oid, c->readPos});
                 homMemberProf.push_back(&prof);
             }
-            if (arm.members.empty()) continue;
+            // Post-pinning support gate (see refArm above): require the arm's
+            // actual pinned members to reach minSupport, not just the raw altCov.
+            if (arm.members.size() < size_t(minSupport)) continue;
             bubble.alleles.push_back(std::move(arm));
         }
         if (bubble.alleles.size() < 2) continue;
