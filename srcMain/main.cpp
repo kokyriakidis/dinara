@@ -828,6 +828,230 @@ void verifyWindowEdgeMonotonicity(
 }
 
 
+// Structural verification of a window's intra-window graph. Enforces the two
+// invariants the staging pass (stageWindowIntraEdges) is supposed to guarantee:
+//
+//   (1) LINEAR: with each bubble's parallel allele arms condensed to a single
+//       node, the window's anchor graph is a set of simple paths -- every
+//       condensed node has in-degree <=1 and out-degree <=1, and every weakly
+//       connected component is a path (equal source/sink counts, all nodes
+//       reachable by walking sources). A backbone run with no bubble is a
+//       straight chain; a bubble is a diamond (hom -> {arms} -> hom) that
+//       condenses to one node. intraWindowEdges stores BOTH strands (each
+//       forward edge plus its reversed RC mirror on id^1 anchors), so a correct
+//       window is TWO node-disjoint paths (forward + reverse-complement). A node
+//       with two distinct predecessors/successors means a fork/join that is not
+//       a condensed bubble.
+//
+//   (2) HOM-FLANKED: every het allele arm is bracketed by hom/backbone anchors
+//       on BOTH sides. Concretely, no edge connects one het allele arm directly
+//       to another (arm->arm), and every arm has at least one incoming and one
+//       outgoing edge (so it cannot dangle). Since staging only ever wires
+//       arms as hom -> {arms} -> hom, any arm neighbor that is itself a het
+//       allele arm (rather than a hom/backbone anchor) is a violation.
+//
+// hetFirst is the first het/hom anchor id; anchors below it are backbone/primary
+// (treated as hom for flanking). het allele arms vs hom anchors are distinguished
+// via the window's HetBubble records (allele anchorIds are arms; leadHom/hom
+// anchorIds are homs). Throws on violation -- these are staging bugs.
+void verifyWindowGraphStructure(
+    const AnchorWindow& window,
+    Shasta2AnchorId hetFirst,
+    uint64_t& checkedWindows,
+    uint64_t& checkedBubbles)
+{
+    using std::unordered_map;
+    using std::unordered_set;
+    using std::vector;
+
+    if(window.intraWindowEdges.empty()) return;
+
+    // Classify every het/hom anchor that appears in this window's bubbles:
+    // allele arms are "arm" nodes; leadHom/hom are "hom" nodes. Anchors below
+    // hetFirst are backbone/primary -> hom-like. Anything not recorded (should
+    // not happen for het edges) is treated as hom-like so it cannot mask an
+    // arm->arm edge.
+    //
+    // intraWindowEdges stores BOTH strands: each forward edge A->B plus its RC
+    // mirror B^1 -> A^1 (reversed direction, strand-flipped ids, id^1). The two
+    // strands are node-disjoint chains running in opposite directions, so we
+    // must NOT merge them: node identity is the RAW anchor id (a forward-strand
+    // path and an RC-strand path). The bubble records only carry one strand's
+    // ids, so for each recorded id we register BOTH strands (id and id^1) as the
+    // same class -- arms on the forward strand and their id^1 mirrors on the RC
+    // strand are all arms; likewise for homs.
+    auto flip = [](Shasta2AnchorId a) -> Shasta2AnchorId {
+        return a ^ Shasta2AnchorId(1);
+    };
+    unordered_set<Shasta2AnchorId> armAnchors;   // raw ids, both strands
+    unordered_set<Shasta2AnchorId> homAnchors;   // raw ids, both strands
+    for(const AnchorWindow::HetBubble& b : window.hetBubbles) {
+        bool any = false;
+        for(const AnchorWindow::HetAnchor& a : b.alleles)
+            if(a.anchorId != invalid<Shasta2AnchorId>) {
+                armAnchors.insert(a.anchorId);
+                armAnchors.insert(flip(a.anchorId));
+                any = true;
+            }
+        if(b.leadHom.anchorId != invalid<Shasta2AnchorId>) {
+            homAnchors.insert(b.leadHom.anchorId);
+            homAnchors.insert(flip(b.leadHom.anchorId));
+        }
+        if(b.hom.anchorId != invalid<Shasta2AnchorId>) {
+            homAnchors.insert(b.hom.anchorId);
+            homAnchors.insert(flip(b.hom.anchorId));
+        }
+        if(any) ++checkedBubbles;
+    }
+    auto isArm = [&](Shasta2AnchorId a) {
+        return armAnchors.find(a) != armAnchors.end();
+    };
+
+    // Assign condensed-node ids: node identity is the raw anchor id, so the two
+    // strands stay separate. Each backbone/hom anchor is its own node; all arms
+    // of the same bubble on the same strand collapse to one shared node id
+    // (forward arms -> one node, their id^1 RC mirrors -> a second node).
+    unordered_map<Shasta2AnchorId, uint64_t> node;   // raw anchorId -> node id
+    uint64_t nextNode = 0;
+    auto nodeOf = [&](Shasta2AnchorId a) -> uint64_t {
+        auto it = node.find(a);
+        if(it != node.end()) return it->second;
+        const uint64_t id = nextNode++;
+        node.emplace(a, id);
+        return id;
+    };
+    // Collapse each bubble's arms onto one node id, per strand.
+    for(const AnchorWindow::HetBubble& b : window.hetBubbles) {
+        for(bool rc : {false, true}) {
+            uint64_t shared = std::numeric_limits<uint64_t>::max();
+            for(const AnchorWindow::HetAnchor& a : b.alleles) {
+                if(a.anchorId == invalid<Shasta2AnchorId>) continue;
+                const Shasta2AnchorId id = rc ? flip(a.anchorId) : a.anchorId;
+                if(shared == std::numeric_limits<uint64_t>::max())
+                    shared = nodeOf(id);
+                else
+                    node[id] = shared;
+            }
+        }
+    }
+
+    // Condensed directed graph.
+    unordered_map<uint64_t, unordered_set<uint64_t>> succ, pred;
+    unordered_set<uint64_t> nodes;
+    for(const auto& e : window.intraWindowEdges) {
+        // (2) HOM-FLANKED: reject a direct arm -> arm edge (two het alleles
+        // wired together with no hom between them).
+        if(isArm(e.anchorIdA) && isArm(e.anchorIdB)) {
+            throw runtime_error(
+                "Window " + to_string(window.windowId) +
+                ": het allele arm connected directly to another het allele arm (" +
+                shasta2AnchorIdToString(e.anchorIdA) + " -> " +
+                shasta2AnchorIdToString(e.anchorIdB) +
+                "); bubbles must be hom-flanked on both sides.");
+        }
+        const uint64_t na = nodeOf(e.anchorIdA);
+        const uint64_t nb = nodeOf(e.anchorIdB);
+        if(na == nb) continue;   // intra-bubble parallel arm edge (condensed away)
+        nodes.insert(na);
+        nodes.insert(nb);
+        succ[na].insert(nb);
+        pred[nb].insert(na);
+    }
+
+    // (2) HOM-FLANKED (dangle check): every arm node must have >=1 predecessor
+    // and >=1 successor (a hom on each side).
+    {
+        unordered_set<uint64_t> armNodes;
+        for(Shasta2AnchorId a : armAnchors) {
+            auto it = node.find(a);
+            if(it != node.end()) armNodes.insert(it->second);
+        }
+        for(uint64_t n : armNodes) {
+            const bool hasPred = pred.count(n) && !pred[n].empty();
+            const bool hasSucc = succ.count(n) && !succ[n].empty();
+            if(!hasPred || !hasSucc) {
+                throw runtime_error(
+                    "Window " + to_string(window.windowId) +
+                    ": het bubble arm is not hom-flanked on both sides (missing " +
+                    string(!hasPred ? "leading" : "trailing") + " hom anchor).");
+            }
+        }
+    }
+
+    // (1) LINEAR: every weakly-connected component of the condensed graph must
+    // be a simple path. Note intraWindowEdges stores BOTH strands (each forward
+    // edge A->B plus its RC mirror Brc->Arc), so a correct window has TWO
+    // node-disjoint paths (forward strand + reverse-complement); we therefore
+    // check "each component is a path", not "one global path".
+    //   - No node may have in-degree >1 or out-degree >1 (a fork or join means a
+    //     branch that is not a condensed bubble -> non-linear).
+    //   - #sources (in-deg 0) == #sinks (out-deg 0): each path has exactly one
+    //     of each.
+    //   - Walking forward from every source visits every node exactly once (no
+    //     cycles, nothing stranded off a path).
+    vector<uint64_t> sourceNodes;
+    uint64_t sinks = 0;
+    for(uint64_t n : nodes) {
+        const size_t outDeg = succ.count(n) ? succ[n].size() : 0;
+        const size_t inDeg  = pred.count(n) ? pred[n].size() : 0;
+        if(outDeg > 1 || inDeg > 1) {
+            // Diagnostic: identify the offending anchors and their class.
+            string detail;
+            for(const auto& e : window.intraWindowEdges) {
+                const uint64_t na = node.count(e.anchorIdA) ? node[e.anchorIdA] : ~0ull;
+                const uint64_t nb = node.count(e.anchorIdB) ? node[e.anchorIdB] : ~0ull;
+                if(na != n && nb != n) continue;
+                auto cls = [&](Shasta2AnchorId a) {
+                    if(isArm(a)) return string("arm");
+                    if(homAnchors.count(a)) return string("hom");
+                    return (a >= hetFirst) ? string("het?") : string("bb");
+                };
+                detail += "\n    " + shasta2AnchorIdToString(e.anchorIdA) + "(" +
+                          cls(e.anchorIdA) + ") -> " +
+                          shasta2AnchorIdToString(e.anchorIdB) + "(" +
+                          cls(e.anchorIdB) + ") isHet=" + to_string(e.isHet);
+            }
+            throw runtime_error(
+                "Window " + to_string(window.windowId) +
+                ": intra-window graph is not linear (condensed node has in-degree " +
+                to_string(inDeg) + ", out-degree " + to_string(outDeg) +
+                "); expected linear chains of backbone anchors and bubbles."
+                " Edges touching this node:" + detail);
+        }
+        if(inDeg == 0)  sourceNodes.push_back(n);
+        if(outDeg == 0) ++sinks;
+    }
+    if(sourceNodes.size() != sinks) {
+        throw runtime_error(
+            "Window " + to_string(window.windowId) +
+            ": intra-window graph is not a set of paths (" +
+            to_string(sourceNodes.size()) + " sources, " + to_string(sinks) +
+            " sinks); expected equal counts.");
+    }
+    // Walk each source to its sink; total visited must equal node count.
+    uint64_t visited = 0;
+    unordered_set<uint64_t> seen;
+    for(uint64_t src : sourceNodes) {
+        uint64_t cur = src;
+        while(true) {
+            if(!seen.insert(cur).second) break;   // cycle / re-entry guard
+            ++visited;
+            if(!succ.count(cur) || succ[cur].empty()) break;
+            cur = *succ[cur].begin();
+        }
+    }
+    if(visited != nodes.size()) {
+        throw runtime_error(
+            "Window " + to_string(window.windowId) +
+            ": intra-window graph has nodes off the backbone path(s) or a cycle (" +
+            to_string(visited) + " of " + to_string(nodes.size()) +
+            " condensed nodes reachable from sources).");
+    }
+
+    ++checkedWindows;
+}
+
+
 void maybeRunBubbleFinderDirectedSuperbubbleComparison(
     const mode3::AnchorGraph& anchorGraph,
     const std::vector<std::pair<
@@ -2146,6 +2370,18 @@ void dinara::main::assemble(
         cout << timestamp << "Verified " << checkedEdges
              << " intra-window edges forward-monotonic across "
              << checkedReadSteps << " shared-read steps." << endl;
+
+        // Structural check: each window's intra-window graph must be a single
+        // linear path of backbone anchors and bubbles, and every het bubble arm
+        // must be flanked by hom anchors on both sides.
+        uint64_t checkedStructureWindows = 0, checkedBubbles = 0;
+        const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
+        for(const AnchorWindow& window : anchorWindows)
+            verifyWindowGraphStructure(window, hetFirst,
+                                       checkedStructureWindows, checkedBubbles);
+        cout << timestamp << "Verified intra-window graph structure: "
+             << checkedStructureWindows << " windows linear, "
+             << checkedBubbles << " het bubbles hom-flanked." << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
