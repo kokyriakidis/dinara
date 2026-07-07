@@ -3989,6 +3989,26 @@ public:
         bool hetDropHomopolymer,
         bool hetDropRepeat) const;
 
+    // All-windows per-interval POA het detection with global interval load
+    // balancing (shasta2 assembleChainsMultithreaded model): every interval of
+    // every window is one work unit, flattened into a single list, sorted by
+    // descending cost, and run batch=1 across threads. Each interval writes its
+    // own fragment (no shared state); a serial-per-window merge then emits the
+    // identical AnchorWindow::hetBubbles as the single-window path. This keeps
+    // all threads busy even when a few large windows hold most intervals.
+    // Returns total bubbles; also reports hetWindows and totalBubbles counts.
+    uint32_t intervalPoaDetectHetBubblesAllWindows(
+        std::vector<AnchorWindow>& windows,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat,
+        uint64_t threadCount,
+        uint64_t& hetWindowsOut,
+        uint64_t& totalBubblesOut) const;
+
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.
     void testAnchorWindowsCleanLongestRead(

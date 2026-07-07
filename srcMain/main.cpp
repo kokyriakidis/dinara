@@ -1742,39 +1742,28 @@ void dinara::main::assemble(
                     " engine on " << anchorWindows.size() << " windows on "
                  << threadCount << " threads..." << endl;
             const auto tHet0 = steady_clock::now();
-            std::atomic<uint64_t> hetWindows{0};
-            std::atomic<uint64_t> totalBubbles{0};
-            const AlignOptions& alignOptionsRef = assemblerOptions.alignOptions;
             const double hetMinVaf = assemblerOptions.assemblyOptions.mode3Options.hetMinVaf;
             const uint64_t hetMinSupport = assemblerOptions.assemblyOptions.mode3Options.hetMinSupport;
             const bool hetDropHomopolymer = assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer;
             const bool hetDropRepeat = assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat;
-            // Each window is independent: its own POA graphs, its own hetBubbles
-            // slot. Parallelize across windows -- this replaces the whole-window
-            // abPOA path's one-window-per-thread serialization on the biggest
-            // window, since here no single window dominates (its intervals are
-            // tiny). Static scheduling over the window index range.
-            std::vector<std::thread> hetThreads;
-            std::atomic<uint64_t> nextWindow{0};
-            const uint64_t nWindows = anchorWindows.size();
-            auto worker = [&]() {
-                for(;;) {
-                    const uint64_t wi = nextWindow.fetch_add(1);
-                    if(wi >= nWindows) break;
-                    const uint32_t n = assembler.intervalPoaDetectHetBubblesInWindow(
-                        anchorWindows[wi], *shasta2Anchors, *shasta2Journeys,
-                        alignOptionsRef, hetMinVaf, hetMinSupport,
-                        hetDropHomopolymer, hetDropRepeat);
-                    if(n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
-                }
-            };
-            for(uint64_t t = 0; t < threadCount; t++) hetThreads.emplace_back(worker);
-            for(auto& th : hetThreads) th.join();
+            // Global interval load balancing (shasta2 assembleChainsMultithreaded
+            // model): every interval of every window is one work unit, flattened
+            // into a single list, sorted biggest-first, and run batch=1 across
+            // threads. This keeps all threads busy even when a few large windows
+            // hold most intervals -- the previous per-window scheduling left
+            // threads idle once the small windows finished while one thread
+            // ground through a window with thousands of serial intervals.
+            uint64_t hetWindows = 0;
+            uint64_t totalBubbles = 0;
+            assembler.intervalPoaDetectHetBubblesAllWindows(
+                anchorWindows, *shasta2Anchors, *shasta2Journeys,
+                hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat,
+                threadCount, hetWindows, totalBubbles);
             const double hetSecs = seconds(steady_clock::now() - tHet0);
             cout << timestamp << "per-interval POA het-bubble detection complete."
-                 << " hetWindows=" << hetWindows.load()
-                 << " homWindows=" << (anchorWindows.size() - hetWindows.load())
-                 << " totalHetBubbles=" << totalBubbles.load()
+                 << " hetWindows=" << hetWindows
+                 << " homWindows=" << (anchorWindows.size() - hetWindows)
+                 << " totalHetBubbles=" << totalBubbles
                  << " seconds=" << std::fixed << std::setprecision(2) << hetSecs
                  << std::defaultfloat << endl;
         } else if(useKsw2HetEngine) {
