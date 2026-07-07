@@ -493,6 +493,22 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
             int64_t pendingDelBegin = -1;
             bool entered = false;
 
+            // True-pin bounds for this member. A member's readAbs at a backbone
+            // column becomes the read's exported position for any het/hom anchor
+            // built there, and the downstream monotonicity verifier requires that
+            // position to lie strictly between the read's TRUE marker positions at
+            // the bracketing backbone anchors. cBegin is a true pin only when the
+            // member is pinned at the LEFT boundary (side 0 or 1); cEnd is true
+            // only when pinned at the RIGHT boundary (side 0 or 2). A guessed
+            // bound (segLenApprox on the free end of a one-sided read) gives no
+            // valid coordinate, so columns positioned relative to it must be
+            // dropped. Enforcing readAbs in [cBegin, cEnd) against the TRUE pins
+            // guarantees every recorded column is monotonic with the backbone
+            // anchors it will edge to -- eliminating backward edges from both
+            // one-sided guesses and interior POA drift.
+            const bool leftPinTrue  = (sm.side == 0 || sm.side == 1);
+            const bool rightPinTrue = (sm.side == 0 || sm.side == 2);
+
             for (int64_t col = colFirst; col <= colLast; col++) {
                 const AlignedBase mb = row[col];
                 const int64_t bbPos = colBbPos[col];
@@ -501,6 +517,13 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
                     // Backbone-bearing column.
                     if (!mb.isGap()) {
                         const uint8_t code = mb.value & 0xff;
+                        // Drop columns whose walked readAbs violates a TRUE pin
+                        // (POA misalignment or one-sided overshoot): they cannot
+                        // be positioned consistently with the backbone anchors.
+                        const bool posValid =
+                            (!leftPinTrue  || readAbs >= sm.cBegin) &&
+                            (!rightPinTrue || readAbs <  sm.cEnd);
+                        if (!posValid) { entered = true; readAbs++; continue; }
                         acc.alignedCols.push_back(
                             KwAlignedCol{uint32_t(bbPos), readAbs, code});
                         if (acc.firstBb < 0) acc.firstBb = bbPos;
