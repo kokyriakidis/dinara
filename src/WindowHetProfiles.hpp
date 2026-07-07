@@ -84,6 +84,24 @@ struct KwMemberProfile {
     bool isNoisy(std::uint32_t pos) const { return inRanges(noisyRanges, pos); }
 };
 
+// Resolve the per-allele support cutoff used by the het gates. If the caller
+// supplied a nonzero hetMinSupport it is used verbatim; otherwise it is
+// auto-derived from coverageHet with the same rule as testAbpoaMultiSegmentMSA
+// (cut_bd=6, cut_rate=0.7, n_hap=2). Kept as a single source of truth so the
+// emit tail and the interval-skip pre-filter agree on the exact threshold.
+inline int resolveHetMinSupport(
+    std::uint64_t hetMinSupport, std::uint64_t coverageHet)
+{
+    if (hetMinSupport > 0) return int(hetMinSupport);
+    constexpr std::uint64_t cut_bd = 6, cut_rate_num = 7, cut_rate_den = 10, n_hap = 2;
+    std::uint64_t base = 0;
+    if (coverageHet != invalid<std::uint64_t> && coverageHet > 0)
+        base = coverageHet / n_hap;
+    std::uint64_t cc = (base * cut_rate_num) / cut_rate_den;
+    if (cc < cut_bd) cc = cut_bd;
+    return int(cc);
+}
+
 // Emit AnchorWindow::hetBubbles from a completed member pileup. This is the
 // shared tail of both engines: SNP aggregation, coverage sweep, per-allele
 // support/VAF/homopolymer/STR gating, majority-based flank-linearity, and
@@ -207,20 +225,9 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         return d;
     };
 
-    // abPOA-matching per-allele support cutoff. If the caller supplied a nonzero
-    // hetMinSupport use it verbatim; otherwise auto-derive from coverageHet with
-    // the same rule as testAbpoaMultiSegmentMSA (cut_bd=6, cut_rate=0.7,n_hap=2).
-    int minSupport = 6;
-    if (hetMinSupport > 0) {
-        minSupport = int(hetMinSupport);
-    } else {
-        constexpr uint64_t cut_bd = 6, cut_rate_num = 7, cut_rate_den = 10, n_hap = 2;
-        uint64_t base = 0;
-        if (coverageHet != invalid<uint64_t> && coverageHet > 0) base = coverageHet / n_hap;
-        uint64_t cc = (base * cut_rate_num) / cut_rate_den;
-        if (cc < cut_bd) cc = cut_bd;
-        minSupport = int(cc);
-    }
+    // abPOA-matching per-allele support cutoff (shared derivation so the
+    // interval-skip pre-filter uses the identical threshold).
+    const int minSupport = resolveHetMinSupport(hetMinSupport, coverageHet);
     const double minVaf = hetMinVaf;
 
     // Classify passing SNPs with the SAME gates as detectWindowSnps (abPOA).

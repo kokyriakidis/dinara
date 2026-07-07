@@ -73,6 +73,7 @@ struct IpoaTiming {
     std::atomic<std::uint64_t> resetNs{0};       // abpoa_reset only
     std::atomic<std::uint64_t> intervals{0};     // intervals attempted
     std::atomic<std::uint64_t> msaRuns{0};       // intervals that ran an MSA
+    std::atomic<std::uint64_t> skippedIntervals{0}; // skipped by member pre-filter
     std::atomic<std::uint64_t> seqSum{0};        // sum of nSeq over runs
     std::atomic<std::uint64_t> seqMax{0};        // max nSeq
     std::atomic<std::uint64_t> lenSum{0};        // sum of maxLen over runs
@@ -88,7 +89,7 @@ struct IpoaTiming {
     void reset() {
         planNs = 0; setupNs = 0; msaNs = 0; extractNs = 0;
         accumNs = 0; mergeNs = 0; resetNs = 0;
-        intervals = 0; msaRuns = 0;
+        intervals = 0; msaRuns = 0; skippedIntervals = 0;
         seqSum = 0; seqMax = 0; lenSum = 0; lenMax = 0; colSum = 0; colMax = 0;
         runMaxNs = 0; runOver100us = 0; runOver1ms = 0; runOver10ms = 0;
         nsOver1ms = 0;
@@ -412,13 +413,24 @@ inline void runIpoaOnRows(
     const IpoaPlan& plan, std::uint32_t bbBegin, std::uint32_t bbEnd,
     std::vector<IpoaSpanMember>& spanMembers, const Reads& rds,
     IpoaAbHandle& ah, IpoaFragment& frag, bool timing,
-    const IpoaClock::time_point& tSetup0);
+    const IpoaClock::time_point& tSetup0, int minMembers);
 
 // Shared MSA + emit for a backbone interval. Given `spanMembers` already placed
 // over [bbBegin, bbEnd), run ONE abPOA MSA with row 0 = backbone segment and
 // emit each member's per-column contribution into `frag`. Split out from
 // runIpoaInterval so the member-selection and the MSA/extraction concerns are
 // separable. Requires >=2 two-sided members. Safe to call from any thread.
+//
+// minMembers is a per-position support pre-filter: a het at a backbone position
+// needs both a ref allele (>=minSupport members, counting the backbone) and an
+// alt allele (>=minSupport members) over DISJOINT member sets, so a passing
+// position needs >= 2*minSupport-1 covering members. Every member here spans the
+// whole interval, so spanMembers.size() is an upper bound on per-position
+// coverage: if it is below minMembers no position in this interval can ever
+// pass, and the abPOA MSA is skipped. This never drops a real het (it is a
+// strict upper bound) and never affects the backbone chain (a skipped interval
+// simply holds no bubble -> a plain bbA_i->bbA_i+1 edge is staged). Pass
+// minMembers<=0 to disable the pre-filter.
 inline void runIpoaOnRows(
     const IpoaPlan& plan,
     std::uint32_t bbBegin,
@@ -428,7 +440,8 @@ inline void runIpoaOnRows(
     IpoaAbHandle& ah,
     IpoaFragment& frag,
     bool timing,
-    const IpoaClock::time_point& tSetup0)
+    const IpoaClock::time_point& tSetup0,
+    int minMembers)
 {
     using std::vector;
     using std::uint8_t;
@@ -437,6 +450,16 @@ inline void runIpoaOnRows(
     using std::int64_t;
 
     if (spanMembers.empty()) return;
+
+    // Per-position support pre-filter: skip the MSA when no position could pass.
+    // Kill switch (DINARA_IPOA_NO_SKIP=1) forces every interval to run, for
+    // measuring the filter's speedup and confirming it changes no output.
+    static const bool noSkip = (std::getenv("DINARA_IPOA_NO_SKIP") != nullptr);
+    if (!noSkip && minMembers > 0 && spanMembers.size() < std::size_t(minMembers)) {
+        if (timing) ipoaTiming().skippedIntervals.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
 
     const uint32_t segLen = bbEnd - bbBegin;
 
@@ -668,7 +691,8 @@ inline void runIpoaInterval(
     const Reads& rds,
     bool oneSidedEnabled,
     IpoaAbHandle& ah,
-    IpoaFragment& frag)
+    IpoaFragment& frag,
+    int minMembers = 0)
 {
     using std::vector;
     using std::uint8_t;
@@ -757,7 +781,7 @@ inline void runIpoaInterval(
     frag.hadOneSided = (oneSidedHere > 0);
 
     runIpoaOnRows(plan, bbBegin, bbEnd, spanMembers, rds, ah, frag,
-                  timing, tSetup0);
+                  timing, tSetup0, minMembers);
 }
 
 // Per-read accumulator. Same shape as the original in-function Accum. Filled by

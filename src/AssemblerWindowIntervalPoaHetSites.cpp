@@ -109,6 +109,17 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
     const bool oneSidedEnabled = ipoaOneSidedEnabled();
     const bool debug = (getenv("DINARA_HET_DEBUG") != nullptr);
 
+    const uint64_t coverageHet = assemblerInfo.isOpen ?
+        assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
+
+    // Per-position support pre-filter threshold: a het needs a ref allele and a
+    // competing allele, each with >=minSupport members over disjoint sets, so a
+    // passing position needs >= 2*minSupport-1 covering members. Every span
+    // member covers the whole interval, so an interval with fewer members can
+    // never yield a het and its MSA is skipped (see runIpoaOnRows).
+    const int minSupport = resolveHetMinSupport(hetMinSupport, coverageHet);
+    const int minMembers = 2 * minSupport - 1;
+
     // Stream each interval into the accumulator, reusing one scratch fragment so
     // per-interval outputs never accumulate.
     const uint32_t nIntervals = plan.intervalCount();
@@ -116,12 +127,9 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
     IpoaAbHandle ah;
     IpoaFragment scratch;
     for (uint32_t bi = 0; bi < nIntervals; bi++) {
-        runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
+        runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch, minMembers);
         accumulateIpoaFragmentUnlocked(wa, scratch);
     }
-
-    const uint64_t coverageHet = assemblerInfo.isOpen ?
-        assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
 
     const uint32_t n = mergeAndEmitIpoaWindow(
         window, plan, wa, rds, coverageHet,
@@ -164,6 +172,14 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
 
     const uint64_t coverageHet = assemblerInfo.isOpen ?
         assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
+
+    // Per-position support pre-filter threshold: a passing het position needs a
+    // ref allele and a competing allele, each with >=minSupport members over
+    // disjoint sets, hence >= 2*minSupport-1 covering members. Span members all
+    // cover the whole interval, so an interval below this can never yield a het
+    // and its MSA is skipped (see runIpoaOnRows).
+    const int minSupport = resolveHetMinSupport(hetMinSupport, coverageHet);
+    const int minMembers = 2 * minSupport - 1;
 
     const bool timing = ipoaTimingEnabled();
     if (timing) ipoaTiming().reset();
@@ -224,7 +240,8 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 IpoaWindowAccum wa;
                 const uint32_t nI = plan.intervalCount();
                 for (uint32_t bi = 0; bi < nI; bi++) {
-                    runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
+                    runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch,
+                                    minMembers);
                     const auto tAcc0 = timing ?
                         std::chrono::steady_clock::now() :
                         std::chrono::steady_clock::time_point{};
@@ -283,7 +300,8 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                   << "[HetTiming] wall=" << wallSecs << "s"
                   << " threadBusy=" << busyS << "s"
                   << " intervals=" << nInt
-                  << " msaRuns=" << nRun << "\n"
+                  << " msaRuns=" << nRun
+                  << " skipped=" << t.skippedIntervals.load() << "\n"
                   << "[HetTiming]   buildPlan   " << planS    << "s (" << pct(planS)    << "%)\n"
                   << "[HetTiming]   setup       " << setupS   << "s (" << pct(setupS)   << "%)  member-gather + code arrays\n"
                   << "[HetTiming]   abpoa_reset " << resetS   << "s (" << pct(resetS)   << "%)  [" << (1e6 * resetS / nRunD) << " us/run]\n"
