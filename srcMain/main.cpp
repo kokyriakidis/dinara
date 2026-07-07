@@ -351,13 +351,60 @@ bool hetAnchorCollidesWithPrimary(
 // there is no last-in-interval special case: consecutive bubbles in the same
 // interval are chained hom-to-hom and every backbone-touching edge is a
 // hom<->backbone edge with a non-empty read intersection.
+// Drop the members of a bracketing hom whose EXPORTED position would create a
+// backward edge against the flanking backbone anchor on that same read.
+//
+// Only the homs touch backbone anchors (arms connect solely to homs). A hom is
+// exported at rawPosition + hetKHalf; a backbone anchor at markerPosition +
+// k/2. The verifier compares these stored positions directly, requiring every
+// shared read to step strictly forward:
+//   bbA_i    -> leadHom : leadHom.pos  >  getPosition(bbA_i,   read)
+//   hom      -> bbA_i+1 : getPosition(bbA_i+1, read)  >  hom.pos
+//
+// A member's rawPosition can drift (one-sided reads walk a guessed span through
+// indels), landing on or past the read's TRUE position at a flanking backbone
+// anchor -- and that anchor may not even be one of the read's POA breakpoints,
+// so the interval walk never bounded against it. getPosition consults the read's
+// actual marker position on the backbone anchor, so it catches the drift
+// regardless. Drop only the offending members; the hom keeps the rest (it stays
+// valid as long as it retains members, checked by the caller).
+void dropBackwardHomMembers(
+    const Shasta2Anchors& anchors,
+    AnchorWindow::HetAnchor& hom,
+    uint32_t hetKHalf,
+    Shasta2AnchorId flankingBackbone,
+    bool homIsLeading,             // true: bbA -> hom; false: hom -> bbA
+    uint64_t& droppedMembers)
+{
+    vector<AnchorWindow::HetAnchorMember> kept;
+    kept.reserve(hom.members.size());
+    for(const auto& m : hom.members) {
+        const uint32_t bbPos = anchors.getPosition(flankingBackbone, m.orientedReadId);
+        if(bbPos == invalid<uint32_t>) {
+            // Read is not on this backbone anchor: no edge on this read, keep it.
+            kept.push_back(m);
+            continue;
+        }
+        const uint32_t homPos = m.rawPosition + hetKHalf;
+        const bool forward = homIsLeading ? (homPos > bbPos)   // bbA -> leadHom
+                                          : (bbPos > homPos);   // hom  -> bbA
+        if(forward) kept.push_back(m);
+        else ++droppedMembers;
+    }
+    hom.members.swap(kept);
+}
+
 void planWindowHetBubbles(
     AnchorWindow& window,
+    const Shasta2Anchors& anchors,
+    const vector<Shasta2AnchorId>& bbAnchors,
     const vector<uint32_t>& bbOffset,
+    uint32_t hetKHalf,
     const PrimaryMarkerSet& primarySet,
     uint64_t& plannedBubbles,
     uint64_t& dropped,
-    uint64_t& droppedPrimaryCollision)
+    uint64_t& droppedPrimaryCollision,
+    uint64_t& droppedBackwardMembers)
 {
     for(auto& b : window.hetBubbles) {
         b.plannedInterval = -1;
@@ -388,6 +435,24 @@ void planWindowHetBubbles(
         // at bbOffset[i]-1, which shifts it further away from the leading hom, so
         // strict bbOffset[i] < predBackboneOffset already avoids collision.
         if(!(bbOffset[i] < leftOff && b.succBackboneOffset + 1 < bbOffset[i + 1])) {
+            ++dropped;
+            continue;
+        }
+
+        // Per-read backward-edge guard. The offset checks above use the backbone
+        // MIDPOINT frame, which is shared across reads; they do not catch a
+        // single member whose own rawPosition drifted onto/past that read's TRUE
+        // position at a flanking backbone anchor. Drop such members from the
+        // bracketing homs (only homs touch backbone anchors). bbAnchors[i] flanks
+        // the leading hom (bbA_i -> leadHom); bbAnchors[i+1] flanks the trailing
+        // hom (hom -> bbA_i+1).
+        dropBackwardHomMembers(anchors, b.leadHom, hetKHalf,
+            bbAnchors[i], /*homIsLeading=*/true, droppedBackwardMembers);
+        dropBackwardHomMembers(anchors, b.hom, hetKHalf,
+            bbAnchors[i + 1], /*homIsLeading=*/false, droppedBackwardMembers);
+        // A hom must keep >=2 members to remain a valid anchor; if the drift
+        // gutted one, drop the whole bubble.
+        if(b.leadHom.members.size() < 2 || b.hom.members.size() < 2) {
             ++dropped;
             continue;
         }
@@ -1824,6 +1889,7 @@ void dinara::main::assemble(
     // any bubble whose bracketing homs would collide with an existing primary
     // anchor's (read, position) marker (see planWindowHetBubbles).
     uint64_t plannedBubbles = 0, droppedUncontained = 0, droppedPrimaryCollision = 0;
+    uint64_t droppedBackwardMembers = 0;
     {
         // (read, position) markers owned by primary anchors, built once before
         // any het anchor is appended (so the store still holds only primaries).
@@ -1837,14 +1903,20 @@ void dinara::main::assemble(
                 for(auto& b : window.hetBubbles) { b.plannedInterval = -1; ++droppedUncontained; }
                 continue;
             }
-            planWindowHetBubbles(window, bbOffset, primarySet,
+            // NOTE: het members are stored at rawPosition + hetK/2 = rawPosition
+            // + 1 (see appendHetAnchorPair), NOT the store's k/2. Pass the het
+            // half-length (1), not the k/2 used for the backbone frame, so the
+            // backward-member comparison uses the same frame the verifier sees.
+            planWindowHetBubbles(window, *shasta2Anchors, bbAnchors, bbOffset,
+                                 /*hetKHalf=*/1u, primarySet,
                                  plannedBubbles, droppedUncontained,
-                                 droppedPrimaryCollision);
+                                 droppedPrimaryCollision, droppedBackwardMembers);
         }
         cout << timestamp << "Planned " << plannedBubbles
              << " contained het bubbles (" << droppedUncontained
              << " dropped, of which " << droppedPrimaryCollision
-             << " for hom/primary anchor collision)." << endl;
+             << " for hom/primary anchor collision, "
+             << droppedBackwardMembers << " backward hom members removed)." << endl;
     }
 
     // Pass 1.5: merge coincident hom anchors. When two adjacent bubbles in the
