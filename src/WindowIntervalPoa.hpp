@@ -540,8 +540,10 @@ inline void runIpoaInterval(
     }
 }
 
-// Per-read accumulator used during the serial merge. Same shape as the original
-// in-function Accum, but filled from fragments instead of interval-by-interval.
+// Per-read accumulator. Same shape as the original in-function Accum. Filled by
+// streaming each interval fragment in as it completes (accumulateIpoaFragment)
+// so per-interval outputs never accumulate -- peak memory per window is just the
+// final accumulators (~depth*span), matching the original per-window path.
 struct IpoaAccum {
     OrientedReadId oid;
     std::vector<KwAlignedCol> alignedCols;
@@ -550,6 +552,43 @@ struct IpoaAccum {
     std::int64_t firstBb = -1;
     std::int64_t lastBb = -1;
 };
+
+// Per-window streaming accumulator: the map plus its own mutex, so workers can
+// fold interval fragments in concurrently without a whole-window serial pass.
+struct IpoaWindowAccum {
+    std::unordered_map<std::uint32_t, IpoaAccum> accums;
+    std::mutex mutex;
+    // Instrumentation, summed as fragments arrive.
+    std::uint32_t intervalsRun = 0;
+    std::uint32_t intervalsWithOneSided = 0;
+    std::uint64_t twoSidedTotal = 0;
+    std::uint64_t oneSidedTotal = 0;
+    std::uint64_t oneSidedPlaced = 0;
+};
+
+// Fold one completed interval fragment into a window accumulator, then leave the
+// fragment ready to be cleared and reused. Thread-safe (locks the window).
+inline void accumulateIpoaFragment(IpoaWindowAccum& wa, IpoaFragment& frag)
+{
+    std::lock_guard<std::mutex> lock(wa.mutex);
+    if (frag.ran) wa.intervalsRun++;
+    if (frag.hadOneSided) wa.intervalsWithOneSided++;
+    wa.twoSidedTotal += frag.twoSided;
+    wa.oneSidedTotal += frag.oneSided;
+    wa.oneSidedPlaced += frag.oneSidedPlaced;
+    for (IpoaReadFrag& rf : frag.reads) {
+        IpoaAccum& acc = wa.accums[rf.oidValue];
+        acc.oid = OrientedReadId::fromValue(ReadId(rf.oidValue));
+        acc.alignedCols.insert(acc.alignedCols.end(),
+            rf.alignedCols.begin(), rf.alignedCols.end());
+        acc.snps.insert(acc.snps.end(), rf.snps.begin(), rf.snps.end());
+        acc.deletionRanges.insert(acc.deletionRanges.end(),
+            rf.deletionRanges.begin(), rf.deletionRanges.end());
+        if (rf.firstBb >= 0 && (acc.firstBb < 0 || rf.firstBb < acc.firstBb))
+            acc.firstBb = rf.firstBb;
+        if (rf.lastBb > acc.lastBb) acc.lastBb = rf.lastBb;
+    }
+}
 
 // Merge all interval fragments of one window into KwMemberProfiles, apply the
 // same dedup/monotonicity/RC cleanups as the original single-window path, then
@@ -562,7 +601,7 @@ struct IpoaAccum {
 inline std::uint32_t mergeAndEmitIpoaWindow(
     AnchorWindow& window,
     const IpoaPlan& plan,
-    const std::vector<IpoaFragment>& fragments,
+    IpoaWindowAccum& wa,
     const Reads& rds,
     std::uint64_t coverageHet,
     double hetMinVaf,
@@ -583,23 +622,8 @@ inline std::uint32_t mergeAndEmitIpoaWindow(
 
     window.hetBubbles.clear();
 
-    // Concatenate fragments per read.
-    unordered_map<uint64_t, IpoaAccum> accums;
-    accums.reserve(plan.memberCount * 2);
-    for (const IpoaFragment& frag : fragments) {
-        for (const IpoaReadFrag& rf : frag.reads) {
-            IpoaAccum& acc = accums[rf.oidValue];
-            acc.oid = OrientedReadId::fromValue(ReadId(rf.oidValue));
-            acc.alignedCols.insert(acc.alignedCols.end(),
-                rf.alignedCols.begin(), rf.alignedCols.end());
-            acc.snps.insert(acc.snps.end(), rf.snps.begin(), rf.snps.end());
-            acc.deletionRanges.insert(acc.deletionRanges.end(),
-                rf.deletionRanges.begin(), rf.deletionRanges.end());
-            if (rf.firstBb >= 0 && (acc.firstBb < 0 || rf.firstBb < acc.firstBb))
-                acc.firstBb = rf.firstBb;
-            if (rf.lastBb > acc.lastBb) acc.lastBb = rf.lastBb;
-        }
-    }
+    // Fragments were streamed into wa.accums as intervals completed; consume it.
+    unordered_map<uint32_t, IpoaAccum>& accums = wa.accums;
 
     // Flush accumulators into KwMemberProfile rows.
     vector<KwMemberProfile> profiles;

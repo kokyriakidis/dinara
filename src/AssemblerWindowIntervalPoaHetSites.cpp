@@ -63,30 +63,21 @@ using namespace dinara;
 namespace {
 
 // Emit the DINARA_HET_DEBUG per-window instrumentation line from a window's
-// fragments. Shared by both entry points.
-void ipoaDebugLine(const IpoaPlan& plan, const vector<IpoaFragment>& frags)
+// streamed accumulator. Shared by both entry points.
+void ipoaDebugLine(const IpoaPlan& plan, const IpoaWindowAccum& wa)
 {
-    uint32_t intervalsRun = 0, intervalsWithOneSided = 0;
-    uint64_t twoSidedTotal = 0, oneSidedTotal = 0, oneSidedPlaced = 0;
-    for (const IpoaFragment& f : frags) {
-        if (f.ran) intervalsRun++;
-        if (f.hadOneSided) intervalsWithOneSided++;
-        twoSidedTotal += f.twoSided;
-        oneSidedTotal += f.oneSided;
-        oneSidedPlaced += f.oneSidedPlaced;
-    }
-    const double oneSidedFrac = (twoSidedTotal + oneSidedTotal) > 0
-        ? double(oneSidedTotal) / double(twoSidedTotal + oneSidedTotal) : 0.0;
+    const double oneSidedFrac = (wa.twoSidedTotal + wa.oneSidedTotal) > 0
+        ? double(wa.oneSidedTotal) / double(wa.twoSidedTotal + wa.oneSidedTotal) : 0.0;
     cout << "    intervalPoaDetectHetBubbles bb=" << plan.bbOid
          << " window=[" << plan.windowBbBegin << "," << plan.windowBbEnd << ")"
          << " members=" << plan.memberCount
-         << " intervals=" << intervalsRun
-         << " twoSided=" << twoSidedTotal
-         << " oneSided=" << oneSidedTotal
-         << " oneSidedPlaced=" << oneSidedPlaced
+         << " intervals=" << wa.intervalsRun
+         << " twoSided=" << wa.twoSidedTotal
+         << " oneSided=" << wa.oneSidedTotal
+         << " oneSidedPlaced=" << wa.oneSidedPlaced
          << " oneSidedFrac=" << std::fixed << std::setprecision(3) << oneSidedFrac
          << std::defaultfloat
-         << " intervalsWithOneSided=" << intervalsWithOneSided << endl;
+         << " intervalsWithOneSided=" << wa.intervalsWithOneSided << endl;
 }
 
 }  // anonymous namespace
@@ -117,20 +108,25 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
     const bool oneSidedEnabled = ipoaOneSidedEnabled();
     const bool debug = (getenv("DINARA_HET_DEBUG") != nullptr);
 
+    // Stream each interval into the accumulator, reusing one scratch fragment so
+    // per-interval outputs never accumulate.
     const uint32_t nIntervals = plan.intervalCount();
-    vector<IpoaFragment> fragments(nIntervals);
+    IpoaWindowAccum wa;
     IpoaAbHandle ah;
-    for (uint32_t bi = 0; bi < nIntervals; bi++)
-        runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, fragments[bi]);
+    IpoaFragment scratch;
+    for (uint32_t bi = 0; bi < nIntervals; bi++) {
+        runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
+        accumulateIpoaFragment(wa, scratch);
+    }
 
     const uint64_t coverageHet = assemblerInfo.isOpen ?
         assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
 
     const uint32_t n = mergeAndEmitIpoaWindow(
-        window, plan, fragments, rds, coverageHet,
+        window, plan, wa, rds, coverageHet,
         hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
 
-    if (debug) ipoaDebugLine(plan, fragments);
+    if (debug) ipoaDebugLine(plan, wa);
     return n;
 }
 
@@ -179,22 +175,23 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     // --- Chunked processing to bound memory --------------------------------
     // Building EVERY window's plan and holding EVERY window's fragments at once
     // is O(genome): each window's aligned-column fragments are ~depth*span, and
-    // summed over thousands of windows that is many GB -> OOM. Instead process
-    // windows in chunks whose combined backbone span stays under a budget. Only
-    // a chunk's plans+fragments are resident at a time, so peak het memory is
-    // ~depth*chunkSpan regardless of genome size. Within a chunk, intervals are
-    // still flattened and work-stolen globally, so a single huge window (its own
-    // chunk) parallelizes its thousands of intervals across all threads -- the
-    // load-balancing win is preserved.
+    // summed over thousands of windows that is many GB -> OOM. Process windows
+    // in small chunks so only a chunk's plans+fragments are resident at a time.
     //
-    // Budget defaults to 4 Mbp of backbone span per chunk; override with
-    // DINARA_IPOA_CHUNK_MBP. A chunk always holds >=1 window, so a window larger
-    // than the budget is processed alone (still fully parallel internally).
-    uint64_t chunkSpanBudget = 4ull * 1000ull * 1000ull;
-    if (const char* e = getenv("DINARA_IPOA_CHUNK_MBP")) {
-        const double mbp = atof(e);
-        if (mbp > 0.0) chunkSpanBudget = uint64_t(mbp * 1e6);
+    // The chunk size is a WINDOW COUNT, defaulting to threadCount. This makes
+    // resident memory match the OLD per-window driver exactly (it too kept
+    // ~threadCount windows in flight, one per worker) -- so this path can never
+    // use more het memory than the version that worked. Within a chunk,
+    // intervals are still flattened and work-stolen across all threads, so when
+    // a few big windows dominate their thousands of intervals fan out over every
+    // thread -- the load-balancing win, at old-path memory. Override with
+    // DINARA_IPOA_CHUNK_WINDOWS to trade memory for cross-window overlap.
+    uint32_t chunkWindows = uint32_t(threadCount);
+    if (const char* e = getenv("DINARA_IPOA_CHUNK_WINDOWS")) {
+        const long v = atol(e);
+        if (v > 0) chunkWindows = uint32_t(v);
     }
+    if (chunkWindows == 0) chunkWindows = 1;
 
     struct Step {
         uint32_t windowIndex;    // absolute window index
@@ -206,20 +203,16 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
 
     uint32_t wBegin = 0;
     while (wBegin < windows.size()) {
-        // Grow the chunk until the span budget is reached (>=1 window always).
-        uint32_t wEnd = wBegin;
-        uint64_t chunkSpan = 0;
-        while (wEnd < windows.size()) {
-            const uint64_t s = windows[wEnd].baseSpan;
-            if (wEnd > wBegin && chunkSpan + s > chunkSpanBudget) break;
-            chunkSpan += s;
-            wEnd++;
-        }
+        const uint32_t wEnd =
+            std::min<uint32_t>(uint32_t(windows.size()), wBegin + chunkWindows);
         const uint32_t chunkN = wEnd - wBegin;
 
-        // Build this chunk's plans and flatten its interval steps.
+        // Build this chunk's plans and flatten its interval steps. Each window
+        // has one streaming accumulator; interval outputs are folded in as they
+        // complete and never stored, so peak memory per window is just its
+        // accumulator (~depth*span) -- matching the original per-window path.
         vector<IpoaPlan> plans(chunkN);
-        vector<vector<IpoaFragment>> fragments(chunkN);
+        vector<IpoaWindowAccum> accums(chunkN);
         vector<std::atomic<uint32_t>> remaining(chunkN);
         vector<Step> steps;
         for (uint32_t li = 0; li < chunkN; li++) {
@@ -228,7 +221,6 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
             const uint32_t nI = plans[li].valid ? plans[li].intervalCount() : 0u;
             remaining[li].store(nI);
             if (nI == 0) continue;
-            fragments[li].resize(nI);
             const IpoaPlan& plan = plans[li];
             for (uint32_t bi = 0; bi < nI; bi++) {
                 const uint32_t span = plan.breakpoints[bi + 1] - plan.breakpoints[bi];
@@ -246,30 +238,32 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
         auto finishWindow = [&](uint32_t li) {
             const uint32_t w = wBegin + li;
             const uint32_t n = mergeAndEmitIpoaWindow(
-                windows[w], plans[li], fragments[li], rds, coverageHet,
+                windows[w], plans[li], accums[li], rds, coverageHet,
                 hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
             if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
             if (debug) {
                 std::lock_guard<std::mutex> lock(debugMutex);
-                ipoaDebugLine(plans[li], fragments[li]);
+                ipoaDebugLine(plans[li], accums[li]);
             }
-            vector<IpoaFragment>().swap(fragments[li]);
             plans[li].freeHeavy();
         };
 
-        // Run this chunk's interval MSAs (work-stealing, batch=1).
+        // Run this chunk's interval MSAs (work-stealing, batch=1). Each thread
+        // reuses one scratch fragment: run interval -> fold into the window
+        // accumulator -> clear. No per-interval storage survives.
         {
             std::atomic<uint64_t> nextStep{0};
             const uint64_t nSteps = steps.size();
             auto worker = [&]() {
-                IpoaAbHandle ah;   // thread-local abPOA handle, reused
+                IpoaAbHandle ah;       // thread-local abPOA handle, reused
+                IpoaFragment scratch;  // thread-local, reused across intervals
                 for (;;) {
                     const uint64_t i = nextStep.fetch_add(1);
                     if (i >= nSteps) break;
                     const Step& s = steps[i];
                     runIpoaInterval(plans[s.localIndex], s.intervalIndex,
-                                    rds, oneSidedEnabled, ah,
-                                    fragments[s.localIndex][s.intervalIndex]);
+                                    rds, oneSidedEnabled, ah, scratch);
+                    accumulateIpoaFragment(accums[s.localIndex], scratch);
                     if (remaining[s.localIndex].fetch_sub(1) == 1)
                         finishWindow(s.localIndex);
                 }
