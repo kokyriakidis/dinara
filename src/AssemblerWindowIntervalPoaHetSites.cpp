@@ -127,7 +127,7 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
         assemblerInfo->kmerDistributionInfo.coverageHet : invalid<uint64_t>;
 
     const uint32_t n = mergeAndEmitIpoaWindow(
-        window, plan, fragments, coverageHet,
+        window, plan, fragments, rds, coverageHet,
         hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
 
     if (debug) ipoaDebugLine(plan, fragments);
@@ -198,7 +198,34 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     // Biggest MSAs first so a straggler never runs alone at the end.
     sort(steps.begin(), steps.end());
 
-    // --- Phase 2: run interval MSAs, work-stealing batch=1 ------------------
+    // Per-window remaining-interval countdown. The thread that runs a window's
+    // LAST interval immediately merges+emits and frees that window's fragments
+    // and plan pins. This bounds resident memory to in-flight windows (like the
+    // old per-window path) while keeping global interval work-stealing: the
+    // heavy aligned-column fragments never accumulate across all windows.
+    vector<std::atomic<uint32_t>> remaining(windows.size());
+    for (uint32_t w = 0; w < windows.size(); w++)
+        remaining[w].store(plans[w].valid ? plans[w].intervalCount() : 0u);
+
+    std::atomic<uint64_t> hetWindows{0};
+    std::atomic<uint64_t> totalBubbles{0};
+    std::mutex debugMutex;
+
+    auto finishWindow = [&](uint32_t w) {
+        const uint32_t n = mergeAndEmitIpoaWindow(
+            windows[w], plans[w], fragments[w], rds, coverageHet,
+            hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
+        if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
+        if (debug) {
+            std::lock_guard<std::mutex> lock(debugMutex);
+            ipoaDebugLine(plans[w], fragments[w]);
+        }
+        // Release heavy state now that this window is done.
+        vector<IpoaFragment>().swap(fragments[w]);
+        plans[w].freeHeavy();
+    };
+
+    // --- Run interval MSAs (work-stealing, batch=1), merge+free per window ---
     {
         std::atomic<uint64_t> nextStep{0};
         const uint64_t nSteps = steps.size();
@@ -211,34 +238,9 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 runIpoaInterval(plans[s.windowIndex], s.intervalIndex,
                                 rds, oneSidedEnabled, ah,
                                 fragments[s.windowIndex][s.intervalIndex]);
-            }
-        };
-        vector<std::thread> pool;
-        pool.reserve(threadCount);
-        for (uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
-        for (auto& th : pool) th.join();
-    }
-
-    // --- Phase 3: merge + emit per window (parallel over windows) -----------
-    std::atomic<uint64_t> hetWindows{0};
-    std::atomic<uint64_t> totalBubbles{0};
-    std::mutex debugMutex;
-    {
-        std::atomic<uint64_t> nextWindow{0};
-        const uint64_t nWindows = windows.size();
-        auto worker = [&]() {
-            for (;;) {
-                const uint64_t w = nextWindow.fetch_add(1);
-                if (w >= nWindows) break;
-                if (!plans[w].valid) continue;
-                const uint32_t n = mergeAndEmitIpoaWindow(
-                    windows[w], plans[w], fragments[w], coverageHet,
-                    hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat);
-                if (n > 0) { hetWindows.fetch_add(1); totalBubbles.fetch_add(n); }
-                if (debug) {
-                    std::lock_guard<std::mutex> lock(debugMutex);
-                    ipoaDebugLine(plans[w], fragments[w]);
-                }
+                // Last interval of this window? Then merge+emit+free it here.
+                if (remaining[s.windowIndex].fetch_sub(1) == 1)
+                    finishWindow(s.windowIndex);
             }
         };
         vector<std::thread> pool;

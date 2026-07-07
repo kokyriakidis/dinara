@@ -74,8 +74,19 @@ struct IpoaPlan {
     std::uint32_t windowBbBegin = 0;
     std::uint32_t windowBbEnd = 0;
 
-    // Full backbone read base codes (index = oriented backbone position).
-    std::vector<std::uint8_t> bbSeqVec;
+    // Backbone read length. Backbone bases are read on demand from the Reads
+    // store (runIpoaInterval) or materialized transiently at merge time
+    // (buildBbSeqVec), NEVER held per-window across all windows -- that full-read
+    // vector, times thousands of windows, is a memory blowup.
+    std::uint32_t bbLen = 0;
+
+    // Free the heavy per-window state after this window has been merged+emitted.
+    // Keeps resident memory bounded to in-flight windows (like the old
+    // per-window path) instead of all windows at once.
+    void freeHeavy() {
+        std::vector<std::uint32_t>().swap(breakpoints);
+        std::vector<std::vector<IpoaMemberBp>>().swap(atBreakpoint);
+    }
 
     // Sorted unique interval breakpoints (backbone positions where some read is
     // pinned). Intervals are [breakpoints[bi], breakpoints[bi+1]).
@@ -155,9 +166,7 @@ inline IpoaPlan buildIpoaPlan(
     plan.windowBbEnd = mkrs[bbOid.getValue()][lastOrd].position + uint32_t(k);
     if (plan.windowBbEnd <= plan.windowBbBegin) return plan;
 
-    plan.bbSeqVec.resize(bbLen);
-    for (uint32_t i = 0; i < bbLen; i++)
-        plan.bbSeqVec[i] = rds.getOrientedReadBase(bbOid, i).value;
+    plan.bbLen = bbLen;
 
     // Live-anchor pin enumeration (identical to the ksw2 path). Each backbone
     // anchor a read shares in the window becomes a pin (bbPos, cPos).
@@ -417,7 +426,7 @@ inline void runIpoaInterval(
         auto& bb = seqStore[0];
         bb.resize(segLen);
         for (uint32_t i = 0; i < segLen; i++)
-            bb[i] = uint8_t(plan.bbSeqVec[bbBegin + i] & 3);
+            bb[i] = uint8_t(rds.getOrientedReadBase(plan.bbOid, bbBegin + i).value & 3);
         seqPtrs[0] = bb.data();
         seqLens[0] = int(segLen);
     }
@@ -505,7 +514,8 @@ inline void runIpoaInterval(
                         KwAlignedCol{uint32_t(bbPos), readAbs, code});
                     if (rf.firstBb < 0) rf.firstBb = bbPos;
                     rf.lastBb = bbPos;
-                    const uint8_t bbBase = plan.bbSeqVec[uint32_t(bbPos)] & 3;
+                    const uint8_t bbBase =
+                        rds.getOrientedReadBase(plan.bbOid, uint32_t(bbPos)).value & 3;
                     if (code < 4 && code != bbBase)
                         rf.snps.push_back(KwSnp{uint32_t(bbPos), code});
                     if (pendingDelBegin >= 0) {
@@ -553,6 +563,7 @@ inline std::uint32_t mergeAndEmitIpoaWindow(
     AnchorWindow& window,
     const IpoaPlan& plan,
     const std::vector<IpoaFragment>& fragments,
+    const Reads& rds,
     std::uint64_t coverageHet,
     double hetMinVaf,
     std::uint64_t hetMinSupport,
@@ -693,8 +704,16 @@ inline std::uint32_t mergeAndEmitIpoaWindow(
 
     if (profiles.size() < 2) return 0;
 
+    // Materialize the full backbone base vector transiently for the emit tail
+    // (it indexes absolute backbone positions, e.g. bbSeqVec[pos-2]). Built here
+    // and freed on return, so at most `threadCount` of these exist at once --
+    // never one per window across all windows.
+    vector<uint8_t> bbSeqVec(plan.bbLen);
+    for (uint32_t i = 0; i < plan.bbLen; i++)
+        bbSeqVec[i] = rds.getOrientedReadBase(plan.bbOid, i).value;
+
     return emitHetBubblesFromProfiles(
-        window, profiles, plan.bbSeqVec, plan.windowBbBegin, plan.windowBbEnd,
+        window, profiles, bbSeqVec, plan.windowBbBegin, plan.windowBbEnd,
         plan.bbOid, plan.k, hetMinVaf, hetMinSupport,
         hetDropHomopolymer, hetDropRepeat, coverageHet, "intervalpoa");
 }
