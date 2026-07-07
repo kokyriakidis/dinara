@@ -116,7 +116,7 @@ uint32_t Assembler::intervalPoaDetectHetBubblesInWindow(
     IpoaFragment scratch;
     for (uint32_t bi = 0; bi < nIntervals; bi++) {
         runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
-        accumulateIpoaFragment(wa, scratch);
+        accumulateIpoaFragmentUnlocked(wa, scratch);
     }
 
     const uint64_t coverageHet = assemblerInfo.isOpen ?
@@ -214,7 +214,7 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 const uint32_t nI = plan.intervalCount();
                 for (uint32_t bi = 0; bi < nI; bi++) {
                     runIpoaInterval(plan, bi, rds, oneSidedEnabled, ah, scratch);
-                    accumulateIpoaFragment(wa, scratch);
+                    accumulateIpoaFragmentUnlocked(wa, scratch);
                 }
 
                 const uint32_t n = mergeAndEmitIpoaWindow(

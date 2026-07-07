@@ -529,8 +529,13 @@ inline void runIpoaInterval(
                         KwAlignedCol{uint32_t(bbPos), readAbs, code});
                     if (rf.firstBb < 0) rf.firstBb = bbPos;
                     rf.lastBb = bbPos;
-                    const uint8_t bbBase =
-                        rds.getOrientedReadBase(plan.bbOid, uint32_t(bbPos)).value & 3;
+                    // Backbone base for the SNP check: index the interval's
+                    // already-materialized backbone codes (row 0 = seqStore[0],
+                    // built [bbBegin, bbEnd) and &3), NOT a per-column
+                    // getOrientedReadBase call. That call in the innermost loop
+                    // (per column, per read, per interval) was the dominant het
+                    // cost after bbSeqVec was removed for the OOM fix.
+                    const uint8_t bbBase = seqStore[0][uint32_t(bbPos) - bbBegin];
                     if (code < 4 && code != bbBase)
                         rf.snps.push_back(KwSnp{uint32_t(bbPos), code});
                     if (pendingDelBegin >= 0) {
@@ -581,8 +586,34 @@ struct IpoaWindowAccum {
     std::uint64_t oneSidedPlaced = 0;
 };
 
+// Lock-free fold of one interval fragment into a window accumulator. Use this
+// when the caller owns `wa` exclusively (the per-window path: one thread runs
+// all of a window's intervals serially into its own `wa`, so no other thread
+// touches it). Avoids ~intervalCount() uncontended lock/unlock pairs per window.
+inline void accumulateIpoaFragmentUnlocked(IpoaWindowAccum& wa, IpoaFragment& frag)
+{
+    if (frag.ran) wa.intervalsRun++;
+    if (frag.hadOneSided) wa.intervalsWithOneSided++;
+    wa.twoSidedTotal += frag.twoSided;
+    wa.oneSidedTotal += frag.oneSided;
+    wa.oneSidedPlaced += frag.oneSidedPlaced;
+    for (IpoaReadFrag& rf : frag.reads) {
+        IpoaAccum& acc = wa.accums[rf.oidValue];
+        acc.oid = OrientedReadId::fromValue(ReadId(rf.oidValue));
+        acc.alignedCols.insert(acc.alignedCols.end(),
+            rf.alignedCols.begin(), rf.alignedCols.end());
+        acc.snps.insert(acc.snps.end(), rf.snps.begin(), rf.snps.end());
+        acc.deletionRanges.insert(acc.deletionRanges.end(),
+            rf.deletionRanges.begin(), rf.deletionRanges.end());
+        if (rf.firstBb >= 0 && (acc.firstBb < 0 || rf.firstBb < acc.firstBb))
+            acc.firstBb = rf.firstBb;
+        if (rf.lastBb > acc.lastBb) acc.lastBb = rf.lastBb;
+    }
+}
+
 // Fold one completed interval fragment into a window accumulator, then leave the
-// fragment ready to be cleared and reused. Thread-safe (locks the window).
+// fragment ready to be cleared and reused. Thread-safe (locks the window); for
+// callers that fold fragments from multiple threads into a shared `wa`.
 inline void accumulateIpoaFragment(IpoaWindowAccum& wa, IpoaFragment& frag)
 {
     std::lock_guard<std::mutex> lock(wa.mutex);
