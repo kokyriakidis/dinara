@@ -51,6 +51,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -352,8 +353,9 @@ inline bool ipoaOneSidedEnabled() {
 }
 
 // abPOA handle wrapper. Thread-local; reset per interval by abpoa_reset. Long-
-// read-tuned affine scoring, adaptive banding, row order preserved so row 0 is
-// always the backbone.
+// read-tuned affine scoring, adaptive banding, minimizer seeding + partitioning
+// (so wide gaps become many tiny window POAs, not one huge DP), row order
+// preserved so row 0 is always the backbone.
 struct IpoaAbHandle {
     abpoa_t* ab = nullptr;
     abpoa_para_t* abpt = nullptr;
@@ -370,9 +372,23 @@ struct IpoaAbHandle {
         abpt->gap_ext2 = 0;
         abpt->wb = 10;
         abpt->wf = 0.01;
-        abpt->disable_seeding = 1;
+        // Minimizer-based seeding + partitioning (shasta2 LocalAssembly values).
+        // With disable_seeding=1 AND progressive_poa=0, abpoa takes the
+        // abpoa_poa() branch: ONE monolithic O(qlen * graphNodes) DP over the
+        // whole interval. On wide anchor-less gaps (up to ~4.7 kb x ~50 reads)
+        // that single DP was ~500 ms and dominated het time. Leaving seeding on
+        // (as shasta2 does) makes abpoa take the abpoa_anchor_poa() branch: it
+        // finds shared minimizers, partitions each sequence into small windows
+        // at those anchors, and runs a tiny DP per window -- exactly the
+        // sub-tiling we'd otherwise hand-roll, done inside abpoa. Row order is
+        // still input order (abpoa_anchor_poa adds each read at its ORIGINAL
+        // index read_id = read_id_map[_i], so msa_base[0] stays the backbone).
+        abpt->disable_seeding = 0;
+        abpt->w = 6;
+        abpt->k = 9;
+        abpt->min_w = 10;
         abpt->progressive_poa = 0;
-        abpt->sort_input_seq = 0;
+        abpt->sort_input_seq = 0;   // keep row 0 = backbone
         abpt->out_msa = 1;
         abpt->out_cons = 0;
         abpt->ret_cigar = 1;
@@ -381,117 +397,55 @@ struct IpoaAbHandle {
     ~IpoaAbHandle() { if (ab) abpoa_free(ab); if (abpt) abpoa_free_para(abpt); }
 };
 
-// Run ONE interval's abPOA MSA and write per-read contributions to `frag`.
-// Independent of every other interval: reads only from `plan` (const) and the
-// Reads store, writes only to `frag`. Safe to call from any thread.
-inline void runIpoaInterval(
+// A member's placement over a backbone range [bbBegin, bbEnd): the read's base
+// interval [cBegin, cEnd) and which ends are TRUE pins. side: 0=both, 1=left-
+// only, 2=right-only. Interval mode may fill the free end of a one-sided member
+// with a guess; range mode always uses true pins (both ends), so side==0 there.
+struct IpoaSpanMember {
+    OrientedReadId oid;
+    std::uint32_t cBegin;
+    std::uint32_t cEnd;
+    std::uint8_t side;
+};
+
+inline void runIpoaOnRows(
+    const IpoaPlan& plan, std::uint32_t bbBegin, std::uint32_t bbEnd,
+    std::vector<IpoaSpanMember>& spanMembers, const Reads& rds,
+    IpoaAbHandle& ah, IpoaFragment& frag, bool timing,
+    const IpoaClock::time_point& tSetup0);
+
+// Shared MSA + emit for a backbone interval. Given `spanMembers` already placed
+// over [bbBegin, bbEnd), run ONE abPOA MSA with row 0 = backbone segment and
+// emit each member's per-column contribution into `frag`. Split out from
+// runIpoaInterval so the member-selection and the MSA/extraction concerns are
+// separable. Requires >=2 two-sided members. Safe to call from any thread.
+inline void runIpoaOnRows(
     const IpoaPlan& plan,
-    std::uint32_t bi,
+    std::uint32_t bbBegin,
+    std::uint32_t bbEnd,
+    std::vector<IpoaSpanMember>& spanMembers,
     const Reads& rds,
-    bool oneSidedEnabled,
     IpoaAbHandle& ah,
-    IpoaFragment& frag)
+    IpoaFragment& frag,
+    bool timing,
+    const IpoaClock::time_point& tSetup0)
 {
     using std::vector;
     using std::uint8_t;
     using std::uint32_t;
     using std::uint64_t;
     using std::int64_t;
-    using std::min;
-    using std::max;
 
-    frag.reads.clear();
-    frag.twoSided = 0;
-    frag.oneSided = 0;
-    frag.oneSidedPlaced = 0;
-    frag.ran = false;
-    frag.hadOneSided = false;
-
-    const bool timing = ipoaTimingEnabled();
-    if (timing) ipoaTiming().intervals.fetch_add(1, std::memory_order_relaxed);
-    // setup phase clock: member gather + code-array assembly, up to abpoa_reset.
-    const IpoaClock::time_point tSetup0 =
-        timing ? IpoaClock::now() : IpoaClock::time_point{};
-
-    const uint32_t bbBegin = plan.breakpoints[bi];
-    const uint32_t bbEnd = plan.breakpoints[bi + 1];
-    if (bbEnd <= bbBegin) return;
-    if (bbEnd <= plan.windowBbBegin || bbBegin >= plan.windowBbEnd) return;
-
-    // Diagnostic-only interval span cap (default 0 = off; every region is
-    // processed). Wide anchor-less gaps are slow and drift-prone, but the fix is
-    // to sub-tile them, NOT to skip them -- skipping silently drops any het
-    // inside the gap. This knob only exists to MEASURE that tail's cost.
-    if (const uint32_t cap = ipoaMaxIntervalBp())
-        if (bbEnd - bbBegin > cap) return;
-
-    // Members spanning this interval = intersection of members pinned at bi and
-    // bi+1. side: 0=both, 1=left-only, 2=right-only.
-    struct SpanMember { OrientedReadId oid; uint32_t cBegin; uint32_t cEnd; uint8_t side; };
-    vector<SpanMember> spanMembers;
-    uint64_t oneSidedHere = 0;
-    const uint32_t segLenApprox = bbEnd - bbBegin;
-    auto readLenOf = [&](uint32_t oidValue) -> uint32_t {
-        const OrientedReadId o = OrientedReadId::fromValue(ReadId(oidValue));
-        return uint32_t(rds.getRead(o.getReadId()).baseCount);
-    };
-    {
-        const auto& lo = plan.atBreakpoint[bi];
-        const auto& hi = plan.atBreakpoint[bi + 1];
-        size_t a = 0, b = 0;
-        auto addLeftOnly = [&](const IpoaMemberBp& e) {
-            oneSidedHere++;
-            if (!oneSidedEnabled) return;
-            const uint32_t rl = readLenOf(e.oidValue);
-            const uint32_t cB = e.cPos;
-            if (cB >= rl) return;
-            const uint32_t cE = min(rl, cB + max<uint32_t>(segLenApprox, 1));
-            if (cE > cB)
-                spanMembers.push_back(
-                    {OrientedReadId::fromValue(ReadId(e.oidValue)), cB, cE, 1});
-        };
-        auto addRightOnly = [&](const IpoaMemberBp& e) {
-            oneSidedHere++;
-            if (!oneSidedEnabled) return;
-            const uint32_t cE = e.cPos;
-            if (cE == 0) return;
-            const uint32_t back = max<uint32_t>(segLenApprox, 1);
-            const uint32_t cB = (cE > back) ? (cE - back) : 0;
-            if (cE > cB)
-                spanMembers.push_back(
-                    {OrientedReadId::fromValue(ReadId(e.oidValue)), cB, cE, 2});
-        };
-        while (a < lo.size() && b < hi.size()) {
-            if (lo[a].oidValue < hi[b].oidValue) { addLeftOnly(lo[a]); a++; }
-            else if (lo[a].oidValue > hi[b].oidValue) { addRightOnly(hi[b]); b++; }
-            else {
-                const uint32_t cB = lo[a].cPos;
-                const uint32_t cE = hi[b].cPos;
-                if (cE > cB)
-                    spanMembers.push_back(
-                        {OrientedReadId::fromValue(ReadId(lo[a].oidValue)), cB, cE, 0});
-                a++; b++;
-            }
-        }
-        while (a < lo.size()) { addLeftOnly(lo[a]); a++; }
-        while (b < hi.size()) { addRightOnly(hi[b]); b++; }
-    }
-    uint64_t twoSidedHere = 0;
-    for (const auto& sm : spanMembers) if (sm.side == 0) twoSidedHere++;
-    frag.twoSided = twoSidedHere;
-    frag.oneSided = oneSidedHere;
-    frag.oneSidedPlaced = spanMembers.size() - twoSidedHere;
-    frag.hadOneSided = (oneSidedHere > 0);
     if (spanMembers.empty()) return;
 
     const uint32_t segLen = bbEnd - bbBegin;
 
     // Order rows: two-sided first (they anchor the POA), then one-sided.
-    vector<const SpanMember*> ordered;
+    vector<const IpoaSpanMember*> ordered;
     ordered.reserve(spanMembers.size());
-    for (const SpanMember& sm : spanMembers) if (sm.side == 0) ordered.push_back(&sm);
+    for (const IpoaSpanMember& sm : spanMembers) if (sm.side == 0) ordered.push_back(&sm);
     const uint32_t nTwoSided = uint32_t(ordered.size());
-    for (const SpanMember& sm : spanMembers) if (sm.side != 0) ordered.push_back(&sm);
+    for (const IpoaSpanMember& sm : spanMembers) if (sm.side != 0) ordered.push_back(&sm);
     if (nTwoSided < 2) return;   // need >=2 two-sided reads to anchor the POA
 
     auto toCodes = [&](const OrientedReadId o, uint32_t cB, uint32_t cE,
@@ -521,7 +475,7 @@ inline void runIpoaInterval(
     }
     bool addFailed = false;
     for (uint32_t oi = 0; oi < ordered.size(); oi++) {
-        const SpanMember& sm = *ordered[oi];
+        const IpoaSpanMember& sm = *ordered[oi];
         auto& codes = seqStore[oi + 1];
         toCodes(sm.oid, sm.cBegin, sm.cEnd, codes);
         if (codes.empty()) { addFailed = true; break; }
@@ -614,7 +568,7 @@ inline void runIpoaInterval(
 
     frag.reads.reserve(ordered.size());
     for (uint32_t si = 1; si < alignment.size(); si++) {
-        const SpanMember& sm = *ordered[si - 1];
+        const IpoaSpanMember& sm = *ordered[si - 1];
         const auto& row = alignment[si];
 
         IpoaReadFrag rf;
@@ -700,6 +654,110 @@ inline void runIpoaInterval(
 
     if (timing) ipoaTiming().extractNs.fetch_add(ipoaNsSince(tExtract0),
                                                  std::memory_order_relaxed);
+}
+
+// --- Mode front-ends: choose spanMembers, then call runIpoaOnRows ------------
+
+// INTERVAL MODE (baseline, unchanged behavior). One POA between adjacent
+// breakpoints [bi, bi+1]. Two-sided members come from the endpoint intersection;
+// one-sided members get a GUESSED free end (cB + segLenApprox). This is the
+// proven path -- kept byte-for-byte so `mode=interval` reproduces prior output.
+inline void runIpoaInterval(
+    const IpoaPlan& plan,
+    std::uint32_t bi,
+    const Reads& rds,
+    bool oneSidedEnabled,
+    IpoaAbHandle& ah,
+    IpoaFragment& frag)
+{
+    using std::vector;
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::uint64_t;
+    using std::min;
+    using std::max;
+
+    frag.reads.clear();
+    frag.twoSided = 0;
+    frag.oneSided = 0;
+    frag.oneSidedPlaced = 0;
+    frag.ran = false;
+    frag.hadOneSided = false;
+
+    const bool timing = ipoaTimingEnabled();
+    if (timing) ipoaTiming().intervals.fetch_add(1, std::memory_order_relaxed);
+    const IpoaClock::time_point tSetup0 =
+        timing ? IpoaClock::now() : IpoaClock::time_point{};
+
+    const uint32_t bbBegin = plan.breakpoints[bi];
+    const uint32_t bbEnd = plan.breakpoints[bi + 1];
+    if (bbEnd <= bbBegin) return;
+    if (bbEnd <= plan.windowBbBegin || bbBegin >= plan.windowBbEnd) return;
+
+    // Diagnostic-only interval span cap (default 0 = off; every region is
+    // processed). Wide anchor-less gaps are slow and drift-prone, but the fix is
+    // to sub-tile them, NOT to skip them -- skipping silently drops any het
+    // inside the gap. This knob only exists to MEASURE that tail's cost.
+    if (const uint32_t cap = ipoaMaxIntervalBp())
+        if (bbEnd - bbBegin > cap) return;
+
+    vector<IpoaSpanMember> spanMembers;
+    uint64_t oneSidedHere = 0;
+    const uint32_t segLenApprox = bbEnd - bbBegin;
+    auto readLenOf = [&](uint32_t oidValue) -> uint32_t {
+        const OrientedReadId o = OrientedReadId::fromValue(ReadId(oidValue));
+        return uint32_t(rds.getRead(o.getReadId()).baseCount);
+    };
+    {
+        const auto& lo = plan.atBreakpoint[bi];
+        const auto& hi = plan.atBreakpoint[bi + 1];
+        size_t a = 0, b = 0;
+        auto addLeftOnly = [&](const IpoaMemberBp& e) {
+            oneSidedHere++;
+            if (!oneSidedEnabled) return;
+            const uint32_t rl = readLenOf(e.oidValue);
+            const uint32_t cB = e.cPos;
+            if (cB >= rl) return;
+            const uint32_t cE = min(rl, cB + max<uint32_t>(segLenApprox, 1));
+            if (cE > cB)
+                spanMembers.push_back(
+                    {OrientedReadId::fromValue(ReadId(e.oidValue)), cB, cE, 1});
+        };
+        auto addRightOnly = [&](const IpoaMemberBp& e) {
+            oneSidedHere++;
+            if (!oneSidedEnabled) return;
+            const uint32_t cE = e.cPos;
+            if (cE == 0) return;
+            const uint32_t back = max<uint32_t>(segLenApprox, 1);
+            const uint32_t cB = (cE > back) ? (cE - back) : 0;
+            if (cE > cB)
+                spanMembers.push_back(
+                    {OrientedReadId::fromValue(ReadId(e.oidValue)), cB, cE, 2});
+        };
+        while (a < lo.size() && b < hi.size()) {
+            if (lo[a].oidValue < hi[b].oidValue) { addLeftOnly(lo[a]); a++; }
+            else if (lo[a].oidValue > hi[b].oidValue) { addRightOnly(hi[b]); b++; }
+            else {
+                const uint32_t cB = lo[a].cPos;
+                const uint32_t cE = hi[b].cPos;
+                if (cE > cB)
+                    spanMembers.push_back(
+                        {OrientedReadId::fromValue(ReadId(lo[a].oidValue)), cB, cE, 0});
+                a++; b++;
+            }
+        }
+        while (a < lo.size()) { addLeftOnly(lo[a]); a++; }
+        while (b < hi.size()) { addRightOnly(hi[b]); b++; }
+    }
+    uint64_t twoSidedHere = 0;
+    for (const auto& sm : spanMembers) if (sm.side == 0) twoSidedHere++;
+    frag.twoSided = twoSidedHere;
+    frag.oneSided = oneSidedHere;
+    frag.oneSidedPlaced = spanMembers.size() - twoSidedHere;
+    frag.hadOneSided = (oneSidedHere > 0);
+
+    runIpoaOnRows(plan, bbBegin, bbEnd, spanMembers, rds, ah, frag,
+                  timing, tSetup0);
 }
 
 // Per-read accumulator. Same shape as the original in-function Accum. Filled by
