@@ -225,7 +225,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Enabled: run the inter-window connection block below. With
     // connectAllWindows set, its strict-degree gate is bypassed so every
     // read-supported window pair is connected (see connectAllWindows).
-    constexpr bool connectOneToOneWindows = true;
+    //
+    // TEMPORARILY DISABLED (false): the inter-window discovery/creation pass
+    // exhausts RAM on large inputs (E821). Static analysis shows this function's
+    // own structures scale ~linearly, so the true OOM source is not yet
+    // confirmed; disabling unblocks large runs while it is diagnosed. Each
+    // window keeps its intra-window backbone chain and het bubbles; only the
+    // links between windows are suppressed. Restore to true once the OOM is
+    // root-caused and fixed.
+    constexpr bool connectOneToOneWindows = false;
 
     // Connect ALL inter-window pairs. When true, the strict 1-to-1 degree gate
     // is bypassed and an edge is created for every read-supported window pair
@@ -501,9 +509,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     std::map<uint64_t, std::map<uint32_t, ReadWindowSpan>> readWindowSpans;
 
     // windowReads and readWindows are class members, populated here.
-
+    //
+    // The discovery loop below and its accumulators (windowPairTransitions,
+    // readWindowSpans, windowReads, readWindows) exist ONLY to feed inter-window
+    // edge creation, which is gated on connectOneToOneWindows. When inter-window
+    // connection is off, skip the whole pass so large inputs neither spend the
+    // time nor allocate the structures (this is the pass suspected in the E821
+    // OOM). findDetourWindowPairs scans the graph's edges, not these structures,
+    // so it is unaffected.
     uint64_t containedSkipCount = 0;
     const uint64_t journeyCount = journeys.size();
+    if(connectOneToOneWindows) {
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
         const auto journey = journeys[oid];
@@ -717,6 +733,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
+    }   // end if(connectOneToOneWindows): discovery pass
 
     // Edgeless-windows: skip all inter-window edge creation. Windows stay as
     // bare anchor sets (intra-window backbone chains above are kept).
