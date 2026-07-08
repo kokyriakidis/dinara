@@ -301,7 +301,8 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                   << " threadBusy=" << busyS << "s"
                   << " intervals=" << nInt
                   << " msaRuns=" << nRun
-                  << " skipped=" << t.skippedIntervals.load() << "\n"
+                  << " skipped=" << t.skippedIntervals.load()
+                  << " skippedByLen=" << t.skippedByLen.load() << "\n"
                   << "[HetTiming]   buildPlan   " << planS    << "s (" << pct(planS)    << "%)\n"
                   << "[HetTiming]   setup       " << setupS   << "s (" << pct(setupS)   << "%)  member-gather + code arrays\n"
                   << "[HetTiming]   abpoa_reset " << resetS   << "s (" << pct(resetS)   << "%)  [" << (1e6 * resetS / nRunD) << " us/run]\n"

@@ -74,6 +74,7 @@ struct IpoaTiming {
     std::atomic<std::uint64_t> intervals{0};     // intervals attempted
     std::atomic<std::uint64_t> msaRuns{0};       // intervals that ran an MSA
     std::atomic<std::uint64_t> skippedIntervals{0}; // skipped by member pre-filter
+    std::atomic<std::uint64_t> skippedByLen{0};  // skipped: maxLen over DP budget
     std::atomic<std::uint64_t> seqSum{0};        // sum of nSeq over runs
     std::atomic<std::uint64_t> seqMax{0};        // max nSeq
     std::atomic<std::uint64_t> lenSum{0};        // sum of maxLen over runs
@@ -89,7 +90,7 @@ struct IpoaTiming {
     void reset() {
         planNs = 0; setupNs = 0; msaNs = 0; extractNs = 0;
         accumNs = 0; mergeNs = 0; resetNs = 0;
-        intervals = 0; msaRuns = 0; skippedIntervals = 0;
+        intervals = 0; msaRuns = 0; skippedIntervals = 0; skippedByLen = 0;
         seqSum = 0; seqMax = 0; lenSum = 0; lenMax = 0; colSum = 0; colMax = 0;
         runMaxNs = 0; runOver100us = 0; runOver1ms = 0; runOver10ms = 0;
         nsOver1ms = 0;
@@ -509,6 +510,28 @@ inline void runIpoaOnRows(
 
     int maxLen = 0;
     for (int r = 0; r < nSeq; r++) if (seqLens[r] > maxLen) maxLen = seqLens[r];
+
+    // Length guard against abpoa's monolithic DP blowup. When reads over an
+    // anchor-less span (a divergent repeat / SV / low-coverage gap) share no
+    // minimizers, abpoa_anchor_poa cannot partition the interval and falls back
+    // to one O(node_n * qlen) DP matrix; adaptive banding does not bound it. At
+    // genome scale a single such interval demanded a 128 GiB SIMDMalloc and OOM-
+    // killed the run. maxLen (the longest row) upper-bounds both DP dimensions,
+    // so worst-case bytes ~= maxLen^2 * ~32. Cap maxLen so that stays within a
+    // safe budget (default 16 kb -> ~8 GiB peak per thread); pathological long
+    // intervals are skipped rather than crashing the whole assembly. Override
+    // with DINARA_IPOA_MAX_LEN=0 to disable, or a custom cap in bases.
+    static const int maxLenCap = [] {
+        const char* e = std::getenv("DINARA_IPOA_MAX_LEN");
+        if (e == nullptr) return 16384;
+        const int v = std::atoi(e);
+        return v;   // 0 disables the guard; negative treated as disabled below
+    }();
+    if (maxLenCap > 0 && maxLen > maxLenCap) {
+        if (timing) ipoaTiming().skippedByLen.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
 
     if (timing) {
         ipoaTiming().setupNs.fetch_add(ipoaNsSince(tSetup0),
