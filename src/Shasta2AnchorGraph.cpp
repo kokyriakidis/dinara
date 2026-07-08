@@ -225,11 +225,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Enabled: run the inter-window connection block below. With
     // connectAllWindows set, its strict-degree gate is bypassed so every
     // read-supported window pair is connected (see connectAllWindows).
-    // TEMPORARILY DISABLED: set to false to drop ALL inter-window connections so
-    // each window can be inspected in isolation with its new het sites. Each
-    // window keeps its intra-window backbone chain and het bubbles; only the
-    // links between windows are suppressed. Restore to true to reconnect.
-    constexpr bool connectOneToOneWindows = false;
+    constexpr bool connectOneToOneWindows = true;
 
     // Connect ALL inter-window pairs. When true, the strict 1-to-1 degree gate
     // is bypassed and an edge is created for every read-supported window pair
