@@ -419,6 +419,50 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             }
         }
 
+        // Both homs must bracket EVERY allele arm. The chain wires two edges per
+        // arm -- leadHom -> arm and arm -> hom -- and each edge is built by
+        // intersecting the two endpoints' read sets (Shasta2AnchorGraph
+        // addHetEdge). A k=2 hom pins a fixed 2-mer at the flank column, so a
+        // read that carries an insertion, deletion, or mismatch at that flank is
+        // not a member of the hom even though it supports an allele. When a
+        // hom thereby loses a whole haplotype's reads, that allele's arm shares
+        // no read with the hom, the arm -> hom (or leadHom -> arm) edge is
+        // dropped, and the arm is left connected on only one side -- a hanging
+        // tip in the assembly graph. There is no single flank 2-mer both
+        // haplotypes share in that case (e.g. a one-haplotype flank insertion),
+        // so the bubble cannot be represented; drop it whole rather than emit a
+        // half-connected arm.
+        {
+            const auto oidSet = [](const AnchorWindow::HetAnchor& h) {
+                std::vector<OrientedReadId> s;
+                s.reserve(h.members.size());
+                for (const auto& m : h.members) s.push_back(m.orientedReadId);
+                std::sort(s.begin(), s.end());
+                s.erase(std::unique(s.begin(), s.end()), s.end());
+                return s;
+            };
+            const auto shares = [](const std::vector<OrientedReadId>& a,
+                                   const AnchorWindow::HetAnchor& arm) {
+                for (const auto& m : arm.members)
+                    if (std::binary_search(a.begin(), a.end(), m.orientedReadId))
+                        return true;
+                return false;
+            };
+            const std::vector<OrientedReadId> leadOids = oidSet(bubble.leadHom);
+            const std::vector<OrientedReadId> homOids  = oidSet(bubble.hom);
+            bool bracketed = (bubble.leadHom.members.size() > 1) &&
+                             (bubble.hom.members.size() > 1);
+            if (bracketed) {
+                for (const AnchorWindow::HetAnchor& arm : bubble.alleles) {
+                    if (!shares(leadOids, arm) || !shares(homOids, arm)) {
+                        bracketed = false;
+                        break;
+                    }
+                }
+            }
+            if (!bracketed) continue;   // drop the bubble; both homs must bracket every arm
+        }
+
         window.hetBubbles.push_back(std::move(bubble));
         emitted++;
     }

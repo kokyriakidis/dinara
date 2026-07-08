@@ -347,6 +347,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     auto isHetId = [&](Shasta2AnchorId id) {
         return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
     };
+    // Count het-bubble edges dropped for lack of a shared read. These leave an
+    // allele arm connected on only one side (a hanging tip in the assembly
+    // graph), so a nonzero count is a staging/membership bug, not normal.
+    uint64_t hetEdgesDroppedEmptyIntersect = 0;
+    uint64_t hetEdgesDroppedNegOffset = 0;
     auto addHetEdge = [&](Shasta2AnchorId idA, Shasta2AnchorId idB,
                           uint32_t nominalOffset) -> bool {
         const Shasta2Anchor anchorA = anchors[idA];
@@ -392,8 +397,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         // journey-order filter, so without this an equal-position or backward
         // read reaches shasta2's LocalAssembly7 and trips its
         // positionB > positionA assertion.
+        const bool emptyBeforeOffsetFilter = pair.orientedReadIds.empty();
         pair.removeNegativeOffsets(anchors);
-        if(pair.orientedReadIds.empty()) return false;
+        if(pair.orientedReadIds.empty()) {
+            if(emptyBeforeOffsetFilter) ++hetEdgesDroppedEmptyIntersect;
+            else                        ++hetEdgesDroppedNegOffset;
+            return false;
+        }
         edge_descriptor e;
         tie(e, ignore) = add_edge(
             idA, idB,
@@ -442,6 +452,16 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         cout << "Shasta2AnchorGraph: added " << backboneEdgesAdded
              << " backbone + " << hetBubbleEdgesAdded
              << " het-bubble intra-window edges." << endl;
+    }
+    const uint64_t hetEdgesDropped =
+        hetEdgesDroppedEmptyIntersect + hetEdgesDroppedNegOffset;
+    if(hetEdgesDropped > 0) {
+        cout << "Shasta2AnchorGraph: WARNING dropped " << hetEdgesDropped
+             << " het-bubble intra-window edges ("
+             << hetEdgesDroppedEmptyIntersect << " empty-intersection, "
+             << hetEdgesDroppedNegOffset << " non-forward-offset); each leaves "
+             << "an allele arm connected on only one side (hanging tip)."
+             << endl;
     }
 
 
