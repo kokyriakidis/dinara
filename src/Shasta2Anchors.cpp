@@ -459,18 +459,20 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
-        // Export is uniform for shasta2 --k 2: every anchor's rawPosition is
-        // its stored midpoint minus 1, so shasta2 (which stores midpoint =
-        // rawPosition + k/2 = rawPosition + 1) recovers exactly the original
-        // midpoint for both het and primary anchors. No positional shift.
+        // Every anchor's rawPosition is its stored midpoint minus the uniform
+        // export shift, so shasta2 (which stores midpoint = rawPosition + k/2 on
+        // load) recovers exactly the original midpoint for backbone, het, and
+        // hom anchors alike. The recovered midpoint is the SAME in both modes;
+        // only the exported raw number and the loader --k differ.
         //
-        // The exported 2-base k-mer differs by anchor class but is always
+        // At k=2 the exported 2-base k-mer differs by anchor class but is always
         // consistent across a given anchor's member reads:
-        //  - Het anchors have 2 shared bases by construction.
+        //  - Het/hom anchors have 2 shared bases by construction.
         //  - Primary anchors agree over the full k=50 window (verified above),
         //    so the centered 2-base subset at [position-1, position] is
-        //    identical across all members too. Any 2-base subset would do;
-        //    the center keeps guaranteed-good flanking sequence on both sides.
+        //    identical across all members too.
+        // At k=0 there is no k-mer at all -- each anchor is a bare position
+        // marker -- so no per-class k-mer consistency applies.
         // Export shift is UNIFORM across every anchor class and equals the k/2
         // that the shasta2 loader re-adds. shasta2 uses a single --k for the
         // whole external anchor set, so the shift cannot differ between primary

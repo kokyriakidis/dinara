@@ -353,10 +353,12 @@ void computeWindowShiftedBackbone(
 
 // Set of (oriented-read, exported/shasta2 position) markers owned by primary
 // anchors. Built once over the primary anchors BEFORE any het/hom append. Every
-// anchor is exported at (storedMidpoint - 1) and shasta2 re-adds k/2 = 1, so an
-// anchor's shasta2 marker position equals its dinara stored midpoint. Thus two
-// anchors occupy the same shasta2 (read, position) marker iff their stored
-// midpoints coincide on that read. Used during planning to drop any het bubble
+// anchor is exported at (storedMidpoint - k/2) with the SAME uniform export
+// shift and shasta2 re-adds that same k/2 on load, so an anchor's shasta2 marker
+// position equals its dinara stored midpoint regardless of k. Thus two anchors
+// occupy the same shasta2 (read, position) marker iff their stored midpoints
+// coincide on that read -- a k-independent test, so this set is compared in the
+// stored-midpoint frame directly. Used during planning to drop any het bubble
 // whose bracketing homs would duplicate an existing primary anchor's markers
 // (shasta2 read-following would otherwise pair the two ids into a zero-length
 // assembly step and assert).
@@ -382,8 +384,9 @@ PrimaryMarkerSet buildPrimaryMarkerSet(const Shasta2Anchors& anchors)
 }
 
 // True if any member of this het/hom anchor lands on an existing primary anchor's
-// (read, position) marker. A het/hom member's shasta2 position is rawPosition + 1
-// (hetK/2), matching how appendHetAnchorPair stores the midpoint.
+// (read, position) marker. A het/hom member's stored midpoint is rawPosition +
+// hetAnchorKHalf() (1 for k=2, 0 for k=0), matching appendHetAnchorPair; the
+// primary set is keyed in the same stored-midpoint frame (see buildPrimaryMarkerSet).
 bool hetAnchorCollidesWithPrimary(
     const AnchorWindow::HetAnchor& a, const PrimaryMarkerSet& primarySet)
 {

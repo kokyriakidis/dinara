@@ -171,8 +171,9 @@ void Shasta2AnchorGraph::saveForShasta2(
                 if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
                 if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
                 // Shared read: exported ordering must be strictly forward. Every
-                // anchor exports position - 1, so the -1 cancels; compare stored
-                // positions directly.
+                // anchor exports position - k/2 with the SAME uniform export
+                // shift (1 for k=2, 0 for k=0), so the shift cancels regardless
+                // of k; compare stored positions directly.
                 if(!(itB->position > itA->position)) {
                     throw runtime_error(
                         "Shasta2 anchor-graph export failed: backward edge "
