@@ -67,6 +67,8 @@ using namespace dinara;
 // Shasta 2 Integration
 #include "AssemblerShasta2Anchors.hpp"
 #include <atomic>
+#include <exception>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -213,6 +215,55 @@ uint64_t envUintOrDefault(const char* variableName, uint64_t defaultValue)
     } catch(...) {
         return defaultValue;
     }
+}
+
+
+// Run `body(windowIndex)` for every window across `threadCount` worker threads
+// (work-stealing over a shared atomic counter, batch=1). The post-MSA het passes
+// (plan, merge, stage, verify) are all window-local: they read shared read-only
+// state (the anchor store, journeys, the frozen primary set) and mutate only
+// their own window, so they parallelize cleanly over windows the same way the
+// MSA phase already does. Only the anchor APPEND pass stays serial (it grows the
+// memory-mapped store and assigns ids in order); it is not run through here.
+//
+// `body` must be safe to call concurrently for distinct window indices: use
+// thread-local scratch (bbAnchors/bbOffset) and atomic counters. Any exception
+// thrown by `body` (the verifiers throw on a structural violation) is captured
+// and rethrown on the calling thread after all workers join, so a violation
+// still aborts the run with its original message.
+template<class Body>
+void parallelForEachWindow(uint64_t windowCount, uint64_t threadCount, Body&& body)
+{
+    if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
+    if(threadCount == 0) threadCount = 1;
+    threadCount = std::min<uint64_t>(threadCount, std::max<uint64_t>(1, windowCount));
+
+    std::atomic<uint64_t> nextIdx{0};
+    std::mutex errMutex;
+    std::exception_ptr firstError;
+
+    auto worker = [&]() {
+        for(;;) {
+            const uint64_t w = nextIdx.fetch_add(1);
+            if(w >= windowCount) break;
+            try {
+                body(w);
+            } catch(...) {
+                std::lock_guard<std::mutex> lock(errMutex);
+                if(!firstError) firstError = std::current_exception();
+                // Fast-drain the rest so we stop promptly after a failure.
+                nextIdx.store(windowCount, std::memory_order_relaxed);
+                break;
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(threadCount);
+    for(uint64_t t = 0; t < threadCount; t++) pool.emplace_back(worker);
+    for(auto& th : pool) th.join();
+
+    if(firstError) std::rethrow_exception(firstError);
 }
 
 
@@ -2118,24 +2169,42 @@ void dinara::main::assemble(
         // (read, position) markers owned by primary anchors, built once before
         // any het anchor is appended (so the store still holds only primaries).
         const PrimaryMarkerSet primarySet = buildPrimaryMarkerSet(*shasta2Anchors);
-        vector<Shasta2AnchorId> bbAnchors;
-        vector<uint32_t> bbOffset;
-        for(AnchorWindow& window : anchorWindows) {
+        // Parallel over windows: planning is window-local (mutates only its own
+        // window's bubbles) and reads shared state read-only (the store via
+        // getPosition, the frozen primarySet). Counters are atomic; the backbone
+        // scratch is thread-local.
+        std::atomic<uint64_t> aPlanned{0}, aUncontained{0}, aPrimaryCollision{0};
+        std::atomic<uint64_t> aBackwardMembers{0};
+        parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
+            AnchorWindow& window = anchorWindows[wi];
+            thread_local vector<Shasta2AnchorId> bbAnchors;
+            thread_local vector<uint32_t> bbOffset;
             if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
                                       hetKHalf, bbAnchors, bbOffset)) {
                 // Fewer than two backbone anchors: no interval, drop all bubbles.
-                for(auto& b : window.hetBubbles) { b.plannedInterval = -1; ++droppedUncontained; }
-                continue;
+                for(auto& b : window.hetBubbles) { b.plannedInterval = -1; }
+                aUncontained.fetch_add(window.hetBubbles.size(),
+                                       std::memory_order_relaxed);
+                return;
             }
             // NOTE: het members are stored at rawPosition + hetK/2 = rawPosition
             // + 1 (see appendHetAnchorPair), NOT the store's k/2. Pass the het
             // half-length (1), not the k/2 used for the backbone frame, so the
             // backward-member comparison uses the same frame the verifier sees.
+            uint64_t planned = 0, uncontained = 0, primaryCollision = 0, backward = 0;
             planWindowHetBubbles(window, *shasta2Anchors, bbAnchors, bbOffset,
                                  /*hetKHalf=*/1u, primarySet,
-                                 plannedBubbles, droppedUncontained,
-                                 droppedPrimaryCollision, droppedBackwardMembers);
-        }
+                                 planned, uncontained,
+                                 primaryCollision, backward);
+            aPlanned.fetch_add(planned, std::memory_order_relaxed);
+            aUncontained.fetch_add(uncontained, std::memory_order_relaxed);
+            aPrimaryCollision.fetch_add(primaryCollision, std::memory_order_relaxed);
+            aBackwardMembers.fetch_add(backward, std::memory_order_relaxed);
+        });
+        plannedBubbles = aPlanned.load();
+        droppedUncontained = aUncontained.load();
+        droppedPrimaryCollision = aPrimaryCollision.load();
+        droppedBackwardMembers = aBackwardMembers.load();
         cout << timestamp << "Planned " << plannedBubbles
              << " contained het bubbles (" << droppedUncontained
              << " dropped, of which " << droppedPrimaryCollision
@@ -2153,17 +2222,22 @@ void dinara::main::assemble(
     // fold bubble N+1's leading hom onto bubble N's trailing hom so the chain
     // becomes ...arms_N -> sharedHom -> arms_{N+1}..., keeping BOTH SNPs.
     {
-        uint64_t mergedHoms = 0;
-        vector<Shasta2AnchorId> bbAnchors;
-        vector<uint32_t> bbOffset;
-        for(AnchorWindow& window : anchorWindows) {
+        // Parallel over windows: the merge is window-local (folds one window's
+        // adjacent-bubble homs) and reads no mutable shared state.
+        std::atomic<uint64_t> aMergedHoms{0};
+        parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
+            AnchorWindow& window = anchorWindows[wi];
+            thread_local vector<Shasta2AnchorId> bbAnchors;
+            thread_local vector<uint32_t> bbOffset;
             if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
                                       hetKHalf, bbAnchors, bbOffset)) {
-                continue;
+                return;
             }
-            mergeWindowCoincidentHoms(window, bbAnchors, mergedHoms);
-        }
-        cout << timestamp << "Merged " << mergedHoms
+            uint64_t merged = 0;
+            mergeWindowCoincidentHoms(window, bbAnchors, merged);
+            aMergedHoms.fetch_add(merged, std::memory_order_relaxed);
+        });
+        cout << timestamp << "Merged " << aMergedHoms.load()
              << " coincident hom anchors (adjacent SNPs 3 bp apart)." << endl;
     }
 
@@ -2332,14 +2406,18 @@ void dinara::main::assemble(
     // anchor ids are assigned.
     {
         const uint64_t anchorCount = shasta2Anchors->size();
-        uint64_t stagedBackbone = 0, stagedHet = 0, chainedIntervals = 0;
-        vector<Shasta2AnchorId> bbAnchors;
-        vector<uint32_t> bbOffset;
-        vector<uint32_t> bbExportedOffset;
-        for(AnchorWindow& window : anchorWindows) {
+        // Parallel over windows: staging is window-local (mutates only its own
+        // window.intraWindowEdges) and reads the store read-only. anchorCount is
+        // fixed here (append is complete), so all endpoint ids are valid.
+        std::atomic<uint64_t> aBackbone{0}, aHet{0}, aChained{0};
+        parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
+            AnchorWindow& window = anchorWindows[wi];
+            thread_local vector<Shasta2AnchorId> bbAnchors;
+            thread_local vector<uint32_t> bbOffset;
+            thread_local vector<uint32_t> bbExportedOffset;
             if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
                                       hetKHalf, bbAnchors, bbOffset)) {
-                continue;
+                return;
             }
             // Step 1: middle-2 backbone shift. Materialize the exported (k=2)
             // frame the edges and monotonicity check operate in. The shift is a
@@ -2349,9 +2427,16 @@ void dinara::main::assemble(
             computeWindowShiftedBackbone(bbOffset, bbExportedOffset);
             for(size_t i = 1; i < bbExportedOffset.size(); i++)
                 DINARA_ASSERT(bbExportedOffset[i] > bbExportedOffset[i - 1]);
+            uint64_t backbone = 0, het = 0, chained = 0;
             stageWindowIntraEdges(window, anchorCount, bbAnchors, bbOffset,
-                                  stagedBackbone, stagedHet, chainedIntervals);
-        }
+                                  backbone, het, chained);
+            aBackbone.fetch_add(backbone, std::memory_order_relaxed);
+            aHet.fetch_add(het, std::memory_order_relaxed);
+            aChained.fetch_add(chained, std::memory_order_relaxed);
+        });
+        const uint64_t stagedBackbone = aBackbone.load();
+        const uint64_t stagedHet = aHet.load();
+        const uint64_t chainedIntervals = aChained.load();
         cout << timestamp << "Staged intra-window edges: "
              << stagedBackbone << " backbone, " << stagedHet << " het ("
              << chainedIntervals << " chained intervals)." << endl;
@@ -2363,25 +2448,37 @@ void dinara::main::assemble(
     // the het-anchor append (all endpoint ids valid). A backward edge is a bug
     // in planning/staging, so the verifier throws.
     {
-        uint64_t checkedEdges = 0, checkedReadSteps = 0;
-        for(const AnchorWindow& window : anchorWindows)
-            verifyWindowEdgeMonotonicity(*shasta2Anchors, window,
-                                         checkedEdges, checkedReadSteps);
-        cout << timestamp << "Verified " << checkedEdges
+        // Parallel over windows: both verifiers are read-only. They THROW on a
+        // violation; parallelForEachWindow captures the first exception and
+        // rethrows it on this thread after the workers join, so a violation
+        // still aborts the run with its original message.
+        std::atomic<uint64_t> aCheckedEdges{0}, aCheckedReadSteps{0};
+        parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
+            uint64_t edges = 0, steps = 0;
+            verifyWindowEdgeMonotonicity(*shasta2Anchors, anchorWindows[wi],
+                                         edges, steps);
+            aCheckedEdges.fetch_add(edges, std::memory_order_relaxed);
+            aCheckedReadSteps.fetch_add(steps, std::memory_order_relaxed);
+        });
+        cout << timestamp << "Verified " << aCheckedEdges.load()
              << " intra-window edges forward-monotonic across "
-             << checkedReadSteps << " shared-read steps." << endl;
+             << aCheckedReadSteps.load() << " shared-read steps." << endl;
 
         // Structural check: each window's intra-window graph must be a single
         // linear path of backbone anchors and bubbles, and every het bubble arm
         // must be flanked by hom anchors on both sides.
-        uint64_t checkedStructureWindows = 0, checkedBubbles = 0;
         const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
-        for(const AnchorWindow& window : anchorWindows)
-            verifyWindowGraphStructure(window, hetFirst,
-                                       checkedStructureWindows, checkedBubbles);
+        std::atomic<uint64_t> aStructWindows{0}, aStructBubbles{0};
+        parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
+            uint64_t windows = 0, bubbles = 0;
+            verifyWindowGraphStructure(anchorWindows[wi], hetFirst,
+                                       windows, bubbles);
+            aStructWindows.fetch_add(windows, std::memory_order_relaxed);
+            aStructBubbles.fetch_add(bubbles, std::memory_order_relaxed);
+        });
         cout << timestamp << "Verified intra-window graph structure: "
-             << checkedStructureWindows << " windows linear, "
-             << checkedBubbles << " het bubbles hom-flanked." << endl;
+             << aStructWindows.load() << " windows linear, "
+             << aStructBubbles.load() << " het bubbles hom-flanked." << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
