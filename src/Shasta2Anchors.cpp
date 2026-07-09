@@ -1,4 +1,5 @@
 #include "Shasta2Anchors.hpp"
+#include "HetAnchorK.hpp"
 #include "Shasta2Journeys.hpp"
 #include "deduplicate.hpp"
 #include "findMarkerId.hpp"
@@ -470,9 +471,21 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
         //    so the centered 2-base subset at [position-1, position] is
         //    identical across all members too. Any 2-base subset would do;
         //    the center keeps guaranteed-good flanking sequence on both sides.
+        // Export shift is UNIFORM across every anchor class and equals the k/2
+        // that the shasta2 loader re-adds. shasta2 uses a single --k for the
+        // whole external anchor set, so the shift cannot differ between primary
+        // and het anchors without breaking their relative ordering. Default
+        // k=2 -> subtract 1 (shasta2 --k 2 re-adds 1); experimental k=0 ->
+        // subtract 0 (shasta2 --k 0 re-adds 0, positions land exactly on the
+        // stored midpoints, which for het anchors are the exact SNP bases).
+        // Primaries are k=2-clipped at k=2 and become point markers at their
+        // k=50 center at k=0; either way the stored-midpoint ordering used by
+        // the whole internal graph is preserved. The export k must match: see
+        // the writeExternalAnchors caller, which passes --k hetAnchorK().
+        const uint32_t exportShift = hetAnchorKHalf();
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
             // External anchors store the raw position (first base of the k-mer).
-            const uint32_t rawPosition = markerInfo.position - 1u;
+            const uint32_t rawPosition = markerInfo.position - exportShift;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
@@ -485,10 +498,14 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
 Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     const vector<std::pair<OrientedReadId, uint32_t>>& members)
 {
-    // Marker length of a het anchor (k=2). shasta2 re-derives [predBase,
-    // alleleBase] from rawPosition; only 2 bases are meaningful.
-    constexpr uint32_t hetK = 2;
-    constexpr uint32_t hetKHalf = hetK / 2;   // = 1
+    // Marker length of a het anchor. Default k=2: shasta2 re-derives [predBase,
+    // alleleBase] from rawPosition; only 2 bases are meaningful. Experimental
+    // k=0 (DINARA_HET_K=0): a zero-length position marker at the exact SNP base.
+    // See HetAnchorK.hpp. The RC mirror formula below (readLen - rawPosition -
+    // hetK, then + hetKHalf) keeps fwd+rc stored positions summing to readLen
+    // for both k, so no per-k special case is needed.
+    const uint32_t hetK = hetAnchorK();
+    const uint32_t hetKHalf = hetAnchorKHalf();
 
     // Safety net: a het/hom anchor must have at least 2 members. A coverage-1
     // anchor (a single read, or only the backbone) is a spurious branch in the
@@ -512,7 +529,7 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     // backbone anchors in the anchor graph (a k/2=25 offset would push it past
     // nearby anchors and create spurious backward edges). writeExternalAnchors
     // recovers rawPosition via (position - hetK/2) for het anchors.
-    // ordinal/positionInJourney are not meaningful for a k=2 het anchor and are
+    // ordinal/positionInJourney are not meaningful for a het anchor and are
     // left invalid.
     vector<Shasta2AnchorMarkerInfo> fwd;
     fwd.reserve(members.size());
@@ -526,8 +543,10 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
 
     // Build the reverse-complement member list: flip strand and mirror the raw
     // position to the opposite strand's coordinate frame, then re-apply the
-    // store's midpoint convention. For a k=2 marker at rawPosition on strand s,
-    // the RC raw position on strand s^1 is readLen - rawPosition - hetK.
+    // store's midpoint convention. For a k-base marker at rawPosition on strand
+    // s, the RC raw position on strand s^1 is readLen - rawPosition - hetK. This
+    // is general in hetK: k=0 gives readLen - rawPosition (mirror of a boundary
+    // position), keeping fwd+rc stored midpoints summing to readLen for both k.
     vector<Shasta2AnchorMarkerInfo> rc;
     rc.reserve(members.size());
     for(const auto& [orientedReadId, rawPosition] : members) {

@@ -66,6 +66,7 @@ using namespace dinara;
 
 // Shasta 2 Integration
 #include "AssemblerShasta2Anchors.hpp"
+#include "HetAnchorK.hpp"
 #include <atomic>
 #include <exception>
 #include <mutex>
@@ -332,17 +333,20 @@ bool computeWindowBackbone(
 // MSA) reconciled in one place.
 //
 // bbOffset[i] is anchor i's midpoint offset from the window start; the exported
-// clip sits one base earlier, so the exported window-local offset is
-// bbOffset[i] - 1. Returns those exported offsets. (bbOffset[0] >= kHalf by
-// construction, so the subtraction never underflows for a real backbone anchor.)
+// clip sits k/2 bases earlier, so the exported window-local offset is
+// bbOffset[i] - k/2 (1 for k=2, 0 for k=0). The export shift is UNIFORM across
+// anchor classes (shasta2 uses a single --k), so the backbone uses the same
+// hetAnchorKHalf() the het anchors do. Returns those exported offsets.
+// (bbOffset[0] >= kHalf by construction, so the subtraction never underflows.)
 void computeWindowShiftedBackbone(
     const vector<uint32_t>& bbOffset,
     vector<uint32_t>& bbExportedOffset)
 {
+    const uint32_t hetKHalf = hetAnchorKHalf();
     bbExportedOffset.resize(bbOffset.size());
     for(size_t i = 0; i < bbOffset.size(); i++) {
-        DINARA_ASSERT(bbOffset[i] >= 1);   // midpoint frame: >= kHalf for real anchors
-        bbExportedOffset[i] = bbOffset[i] - 1u;
+        DINARA_ASSERT(bbOffset[i] >= hetKHalf);   // midpoint frame: >= kHalf
+        bbExportedOffset[i] = bbOffset[i] - hetKHalf;
     }
 }
 
@@ -383,7 +387,9 @@ PrimaryMarkerSet buildPrimaryMarkerSet(const Shasta2Anchors& anchors)
 bool hetAnchorCollidesWithPrimary(
     const AnchorWindow::HetAnchor& a, const PrimaryMarkerSet& primarySet)
 {
-    constexpr uint32_t hetKHalf = 1;
+    // rawPosition + k/2 is the anchor's stored midpoint = the SNP read position
+    // in both k=2 (predReadPos+1) and k=0 (snpReadPos+0). See HetAnchorK.hpp.
+    const uint32_t hetKHalf = hetAnchorKHalf();
     for(const auto& m : a.members)
         if(primarySet.count(primaryMarkerKey(m.orientedReadId, m.rawPosition + hetKHalf)))
             return true;
@@ -481,11 +487,13 @@ void planWindowHetBubbles(
         // bbOffset[i+1]-1 would map to the SAME read position as that backbone
         // anchor, giving the hom->backbone edge a zero-length (equal-position)
         // read that shasta2's LocalAssembly6 rejects (positionB > positionA).
-        // Require succBackboneOffset + 1 < bbOffset[i+1] on the right. The left
-        // side needs no extra margin: the predecessor anchor is likewise exported
-        // at bbOffset[i]-1, which shifts it further away from the leading hom, so
-        // strict bbOffset[i] < predBackboneOffset already avoids collision.
-        if(!(bbOffset[i] < leftOff && b.succBackboneOffset + 1 < bbOffset[i + 1])) {
+        // Require succBackboneOffset + k/2 < bbOffset[i+1] on the right (k/2 = 1
+        // for k=2, 0 for k=0). The left side needs no extra margin: the
+        // predecessor anchor is likewise exported at bbOffset[i]-k/2, no closer
+        // to the leading hom, so strict bbOffset[i] < predBackboneOffset already
+        // avoids collision.
+        const uint32_t hetKHalf = hetAnchorKHalf();
+        if(!(bbOffset[i] < leftOff && b.succBackboneOffset + hetKHalf < bbOffset[i + 1])) {
             ++dropped;
             continue;
         }
@@ -2187,13 +2195,14 @@ void dinara::main::assemble(
                                        std::memory_order_relaxed);
                 return;
             }
-            // NOTE: het members are stored at rawPosition + hetK/2 = rawPosition
-            // + 1 (see appendHetAnchorPair), NOT the store's k/2. Pass the het
-            // half-length (1), not the k/2 used for the backbone frame, so the
-            // backward-member comparison uses the same frame the verifier sees.
+            // NOTE: het members are stored at rawPosition + hetAnchorKHalf()
+            // (1 for k=2, 0 for k=0; see appendHetAnchorPair), NOT the store's
+            // k/2. Pass the HET half-length, not the k/2 used for the backbone
+            // frame, so the backward-member comparison uses the same frame the
+            // verifier sees.
             uint64_t planned = 0, uncontained = 0, primaryCollision = 0, backward = 0;
             planWindowHetBubbles(window, *shasta2Anchors, bbAnchors, bbOffset,
-                                 /*hetKHalf=*/1u, primarySet,
+                                 /*hetKHalf=*/hetAnchorKHalf(), primarySet,
                                  planned, uncontained,
                                  primaryCollision, backward);
             aPlanned.fetch_add(planned, std::memory_order_relaxed);
@@ -2490,6 +2499,14 @@ void dinara::main::assemble(
     cout << timestamp << "Wrote " << exportedExternalAnchorCount
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
+    // The export subtracts hetAnchorKHalf() uniformly from every stored midpoint
+    // (see writeExternalAnchors), so shasta2 must be loaded with the MATCHING
+    // --k: 2 by default, 0 for the experimental DINARA_HET_K=0 path. A mismatch
+    // shifts every anchor by one base. Report it so the caller passes the right
+    // value to the downstream shasta2 invocation.
+    cout << timestamp << "Shasta2 must load these external anchors with --k "
+         << hetAnchorK()
+         << (hetAnchorK() == 0 ? " (EXPERIMENTAL DINARA_HET_K=0)." : ".") << endl;
 
     // Build and export the anchor graph, including het-anchor bubble edges.
     // computeWindowTransitions fills the per-window transition fields the graph

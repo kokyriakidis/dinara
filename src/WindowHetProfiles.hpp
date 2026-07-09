@@ -14,6 +14,7 @@
 /// how they populate the profiles.
 
 #include "AnchorWindows.hpp"
+#include "HetAnchorK.hpp"
 #include "PhasingKmeansTypes.hpp"
 #include "ReadId.hpp"
 #include "invalid.hpp"
@@ -320,6 +321,40 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         return c0;
     };
 
+    // k=0 experimental pin. A k=0 anchor is a zero-length position marker with
+    // NO k-mer, so a member need only carry the required base at the anchor's
+    // own column -- the predecessor base and the flank-adjacency (no-insertion)
+    // checks that pinnedKmerCol enforces for the k=2 2-mer are dropped. This is
+    // exactly the membership relaxation that makes k=0 recover reads the 2-mer
+    // guard rejected (flank mismatch / indel). Returns the anchor column to pin
+    // at (storing the read's position of THAT base), or nullptr if the read does
+    // not carry `base` there. Callers pass the anchor's own column and base:
+    //  - arm:      colAt(pos),   alleleBase   (k=2 used pos-1 + predBase)
+    //  - leadHom:  colAt(pos-2), bbSeq[pos-2]  (same column as k=2)
+    //  - hom:      colAt(pos+1), bbSeq[pos+1]  (same column as k=2)
+    auto pinnedPointCol = [](const KwMemberProfile& prof, uint32_t atPos,
+                             uint8_t base) -> const KwAlignedCol* {
+        const KwAlignedCol* c = prof.colAt(atPos);
+        if (!c || c->readBase != base) return nullptr;
+        return c;
+    };
+
+    const bool hetK0 = (hetAnchorK() == 0);
+
+    // Pin a member for an anchor whose k=2 form is the 2-mer [kmer0, kmer1] at
+    // column predCol (storing predCol's readPos), and whose k=0 form is the
+    // single base `pointBase` at column pointCol (storing pointCol's readPos).
+    // For the arm, k=2 stores the PREDECESSOR read position and k=0 stores the
+    // SNP read position; for the homs the column is the same in both modes and
+    // only the adjacency guard differs.
+    auto pinMember = [&](const KwMemberProfile& prof,
+                         uint32_t predCol, uint8_t kmer0, uint8_t kmer1,
+                         uint32_t pointCol, uint8_t pointBase)
+                         -> const KwAlignedCol* {
+        return hetK0 ? pinnedPointCol(prof, pointCol, pointBase)
+                     : pinnedKmerCol(prof, predCol, kmer0, kmer1);
+    };
+
     uint32_t emitted = 0;
     for (const PassingSite& site : passingSites) {
         const uint32_t pos = site.pos;
@@ -338,10 +373,14 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         refArm.predBase = predBase;
         refArm.alleleBase = bbSeqVec[pos];
         refArm.isRef = true;
-        refArm.members.push_back({bbOid, pos - 1});
+        // Backbone member position: predecessor base (pos-1) for k=2, the exact
+        // SNP base (pos) for k=0. appendHetAnchorPair stores rawPosition + k/2,
+        // so the stored midpoint is the SNP read position in BOTH modes.
+        refArm.members.push_back({bbOid, hetK0 ? pos : pos - 1});
         for (const auto& prof : profiles) {
             if (memberCall(prof, pos) != -2) continue;
-            const KwAlignedCol* c = pinnedKmerCol(prof, pos - 1, predBase, refArm.alleleBase);
+            const KwAlignedCol* c = pinMember(prof, pos - 1, predBase, refArm.alleleBase,
+                                              pos, refArm.alleleBase);
             if (!c) continue;
             refArm.members.push_back({prof.oid, c->readPos});
             homMemberProf.push_back(&prof);
@@ -365,7 +404,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             arm.isRef = false;
             for (const auto& prof : profiles) {
                 if (memberCall(prof, pos) != int(pa.altBase)) continue;
-                const KwAlignedCol* c = pinnedKmerCol(prof, pos - 1, predBase, pa.altBase);
+                const KwAlignedCol* c = pinMember(prof, pos - 1, predBase, pa.altBase,
+                                                  pos, pa.altBase);
                 if (!c) continue;
                 arm.members.push_back({prof.oid, c->readPos});
                 homMemberProf.push_back(&prof);
@@ -387,8 +427,11 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             leadHom.isRef = true;
             leadHom.members.push_back({bbOid, pos - 2});
             for (const KwMemberProfile* prof : homMemberProf) {
+                // Same anchor column (pos-2) in both modes; k=0 only drops the
+                // second-base adjacency guard. Stored rawPos = readPos(pos-2).
                 const KwAlignedCol* c =
-                    pinnedKmerCol(*prof, pos - 2, leadHom.predBase, leadHom.alleleBase);
+                    pinMember(*prof, pos - 2, leadHom.predBase, leadHom.alleleBase,
+                              pos - 2, leadHom.predBase);
                 if (!c) continue;
                 leadHom.members.push_back({prof->oid, c->readPos});
             }
@@ -408,8 +451,11 @@ inline std::uint32_t emitHetBubblesFromProfiles(
             homAnchor.isRef = true;
             homAnchor.members.push_back({bbOid, pos + 1});
             for (const KwMemberProfile* prof : homMemberProf) {
+                // Same anchor column (pos+1) in both modes; k=0 only drops the
+                // second-base adjacency guard. Stored rawPos = readPos(pos+1).
                 const KwAlignedCol* c =
-                    pinnedKmerCol(*prof, pos + 1, homAnchor.predBase, homAnchor.alleleBase);
+                    pinMember(*prof, pos + 1, homAnchor.predBase, homAnchor.alleleBase,
+                              pos + 1, homAnchor.predBase);
                 if (!c) continue;
                 homAnchor.members.push_back({prof->oid, c->readPos});
             }
