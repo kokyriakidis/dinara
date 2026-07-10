@@ -2512,11 +2512,19 @@ void dinara::main::assemble(
             return (hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst)
                 ? "het/hom" : "primary";
         };
-        // Per oriented read: (exportedPosition, anchorId). Canonical anchors only
-        // (even ids), matching writeExternalAnchors(canonicalOnly=true).
+        // Per oriented read: (exportedPosition, anchorId). shasta2 loads the
+        // canonical (even) anchors and REGENERATES the RC of each on the opposite
+        // strand (that is why it reports 2x the exported count), so a read's
+        // shasta2 journey includes both the canonical occurrences that list it
+        // directly AND the RC occurrences whose canonical twin lists the read on
+        // the opposite strand. dinara's store already holds those RC twins as the
+        // odd anchors (appendHetAnchorPair builds the mirror), so iterating the
+        // FULL store (even + odd) reproduces exactly what shasta2 reconstructs.
+        // Iterating even-only (the previous version) missed every canonical<->RC
+        // collision -- including the +/- pair in the reported error.
         std::unordered_map<uint64_t, vector<std::pair<uint32_t, Shasta2AnchorId>>> byRead;
         const uint64_t anchorCount = shasta2Anchors->size();
-        for(Shasta2AnchorId id = 0; id < anchorCount; id += 2) {
+        for(Shasta2AnchorId id = 0; id < anchorCount; id++) {
             const Shasta2Anchor anchor = (*shasta2Anchors)[id];
             for(const Shasta2AnchorMarkerInfo& mi : anchor) {
                 byRead[mi.orientedReadId.getValue()].push_back(
@@ -2534,12 +2542,18 @@ void dinara::main::assemble(
                 if(!readReported) { ++readsWithCollision; readReported = true; }
                 if(collisions <= maxReport) {
                     const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+                    // even id => canonical (+ strand), odd id => RC twin (- strand),
+                    // matching the "<anchor>+ <anchor>-" form shasta2 prints.
+                    const Shasta2AnchorId aPrev = occ[i - 1].second;
+                    const Shasta2AnchorId aCur  = occ[i].second;
                     cout << "  [journey-collision] read " << oid
-                         << " pos " << occ[i - 1].first << " anchor " << occ[i - 1].second
-                         << " (" << classOf(occ[i - 1].second) << ")"
+                         << " pos " << occ[i - 1].first << " anchor " << aPrev
+                         << ((aPrev & 1) ? "-" : "+")
+                         << " (" << classOf(aPrev) << ")"
                          << (occ[i].first == occ[i - 1].first ? " == " : " >= ")
-                         << "pos " << occ[i].first << " anchor " << occ[i].second
-                         << " (" << classOf(occ[i].second) << ")" << endl;
+                         << "pos " << occ[i].first << " anchor " << aCur
+                         << ((aCur & 1) ? "-" : "+")
+                         << " (" << classOf(aCur) << ")" << endl;
                 }
             }
         }
