@@ -2493,6 +2493,61 @@ void dinara::main::assemble(
              << aStructBubbles.load() << " het bubbles hom-flanked." << endl;
     }
 
+    // Global per-read journey diagnostic. shasta2 builds, for every oriented
+    // read, the ordered list of ALL anchors that read belongs to (sorted by the
+    // read's exported position) and asserts they are strictly increasing -- no
+    // two anchors at equal or backward position on the same read ("Invalid
+    // Journey ..."). dinara's own guards are all LOCAL (per intra-window edge,
+    // per exported edge, or het/hom-vs-primary only); none enforce this GLOBAL
+    // per-read constraint across all het/hom anchors, which the k=0 membership
+    // relaxation (pinnedPointCol drops the k=2 flank-adjacency guard) can now
+    // violate: two het/hom anchors in different windows can land on the same
+    // read at equal/backward positions. Reproduce shasta2's check here over the
+    // EXACT exported set so we see the collision before export. Read-only; the
+    // fix (member drop) is applied separately once the collision is understood.
+    {
+        const uint32_t exportShift = hetAnchorKHalf();
+        const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
+        auto classOf = [&](Shasta2AnchorId id) -> const char* {
+            return (hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst)
+                ? "het/hom" : "primary";
+        };
+        // Per oriented read: (exportedPosition, anchorId). Canonical anchors only
+        // (even ids), matching writeExternalAnchors(canonicalOnly=true).
+        std::unordered_map<uint64_t, vector<std::pair<uint32_t, Shasta2AnchorId>>> byRead;
+        const uint64_t anchorCount = shasta2Anchors->size();
+        for(Shasta2AnchorId id = 0; id < anchorCount; id += 2) {
+            const Shasta2Anchor anchor = (*shasta2Anchors)[id];
+            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                byRead[mi.orientedReadId.getValue()].push_back(
+                    {mi.position - exportShift, id});
+            }
+        }
+        uint64_t collisions = 0, readsWithCollision = 0;
+        const uint64_t maxReport = 40;
+        for(auto& [oidValue, occ] : byRead) {
+            std::sort(occ.begin(), occ.end());
+            bool readReported = false;
+            for(size_t i = 1; i < occ.size(); i++) {
+                if(occ[i].first > occ[i - 1].first) continue;  // strictly forward: ok
+                ++collisions;
+                if(!readReported) { ++readsWithCollision; readReported = true; }
+                if(collisions <= maxReport) {
+                    const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+                    cout << "  [journey-collision] read " << oid
+                         << " pos " << occ[i - 1].first << " anchor " << occ[i - 1].second
+                         << " (" << classOf(occ[i - 1].second) << ")"
+                         << (occ[i].first == occ[i - 1].first ? " == " : " >= ")
+                         << "pos " << occ[i].first << " anchor " << occ[i].second
+                         << " (" << classOf(occ[i].second) << ")" << endl;
+                }
+            }
+        }
+        cout << timestamp << "Global per-read journey check: " << collisions
+             << " colliding steps on " << readsWithCollision
+             << " reads (exported set, --k " << hetAnchorK() << ")." << endl;
+    }
+
     // Write external anchors. Deferred to here (after MSA het-anchor
     // generation) so newly generated het anchors are part of the exported set.
     cout << timestamp << "Writing Shasta2 external anchors to "
