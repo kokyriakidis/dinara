@@ -226,14 +226,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // connectAllWindows set, its strict-degree gate is bypassed so every
     // read-supported window pair is connected (see connectAllWindows).
     //
-    // TEMPORARILY DISABLED (false): the inter-window discovery/creation pass
-    // exhausts RAM on large inputs (E821). Static analysis shows this function's
-    // own structures scale ~linearly, so the true OOM source is not yet
-    // confirmed; disabling unblocks large runs while it is diagnosed. Each
-    // window keeps its intra-window backbone chain and het bubbles; only the
-    // links between windows are suppressed. Restore to true once the OOM is
-    // root-caused and fixed.
-    constexpr bool connectOneToOneWindows = false;
+    // Re-enabled (true). This pass was temporarily disabled as OOM hygiene on
+    // large inputs (E821), but the real OOM was later root-caused to a single
+    // 128 GiB abPOA SIMD DP allocation in het detection on a pathological
+    // anchor-less interval, not this pass -- fixed by the per-interval length
+    // guard (see runIpoaOnRows / DINARA_IPOA_MAX_LEN). This pass's own
+    // structures scale ~linearly, so it is safe to restore.
+    constexpr bool connectOneToOneWindows = true;
 
     // Connect ALL inter-window pairs. When true, the strict 1-to-1 degree gate
     // is bypassed and an edge is created for every read-supported window pair
