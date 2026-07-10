@@ -30,8 +30,6 @@ void dinara::computeWindowTransitions(
     vector<AnchorWindow>& anchorWindows,
     const vector<uint32_t>* anchorDovetailWindow)
 {
-    cout << timestamp << "computeWindowTransitions begins." << endl;
-
     const uint32_t windowCount = uint32_t(anchorWindows.size());
     const uint64_t anchorCount = anchors.anchorMarkerInfos.size();
     const uint32_t noW = AnchorWindowReadInterval::noWindow;
@@ -183,28 +181,6 @@ void dinara::computeWindowTransitions(
         }
     }
 
-    // Diagnostic summary.
-    uint64_t totalTransitionEntries = 0;
-    uint64_t totalTransitionReads = 0;
-    uint64_t fullTripletEntries = 0;
-    uint64_t fullTripletReads = 0;
-    for(const auto& window : anchorWindows) {
-        for(const auto& [key, reads] : window.transitionReads) {
-            totalTransitionEntries++;
-            totalTransitionReads += reads.size();
-            if(key.first != noW && key.second != noW) {
-                fullTripletEntries++;
-                fullTripletReads += reads.size();
-            }
-        }
-    }
-
-    cout << timestamp << "computeWindowTransitions: "
-         << windowCount << " windows, "
-         << totalTransitionEntries << " transition entries ("
-         << fullTripletEntries << " full triplets), "
-         << totalTransitionReads << " total read-transitions ("
-         << fullTripletReads << " in full triplets)." << endl;
 
     // ========================================================================
     // Window reach diagnostic (read-only).
@@ -230,7 +206,7 @@ void dinara::computeWindowTransitions(
     // Output: WindowReach.csv. No graph or struct mutation.
     // ========================================================================
     {
-        constexpr bool windowReachDiagnostic = true;
+        constexpr bool windowReachDiagnostic = false;
         if(windowReachDiagnostic) {
             // Immediate-neighbor votes: window -> (neighborWindow -> read count).
             vector<map<uint32_t, uint64_t>> leftImmediateVotes(windowCount);
@@ -373,7 +349,7 @@ void dinara::computeWindowTransitions(
     // No graph or struct mutation.
     // ========================================================================
     {
-        constexpr bool windowClassDiagnostic = true;
+        constexpr bool windowClassDiagnostic = false;
         if(windowClassDiagnostic) {
             auto wstr = [&](uint32_t w) -> std::string {
                 return (w == noW) ? std::string("none") : std::to_string(w);
@@ -492,7 +468,7 @@ void dinara::computeWindowTransitions(
     // No graph or struct mutation.
     // ========================================================================
     {
-        constexpr bool windowArcDiagnostic = true;
+        constexpr bool windowArcDiagnostic = false;
         if(windowArcDiagnostic) {
             // Minimum read support for an arc to be used (toggle).
             constexpr uint64_t minArcReads = 1;
