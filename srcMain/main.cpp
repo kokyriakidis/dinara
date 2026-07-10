@@ -2049,9 +2049,13 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
-    // Two-pass: disjoint full-journey cores, then tile leftover unclaimed
-    // intervals into fragment windows (longest first).
-    assembler.computeAnchorWindowsWithUnclaimed(
+    // Disjoint windows only: a read seeds a window ONLY if its entire journey is
+    // still unclaimed (one window = one whole unclaimed read journey). The seam
+    // tiling second pass is disabled (tileUnclaimedIntervals=false), so the
+    // dovetail/overlap seams between cores are left unclaimed -- no fragment
+    // windows. Because journeys hold only primary anchors, the inter-window edges
+    // built later are backbone-to-backbone by construction.
+    assembler.computeAnchorWindowsClean(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         readIdsSortedByLength,
@@ -2060,7 +2064,8 @@ void dinara::main::assemble(
         minCommonForBackbone,
         maxSkipForBackbone,
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
-        &anchorDovetailWindow);
+        &anchorDovetailWindow,
+        /* tileUnclaimedIntervals = */ false);
 
     // Per-window het-bubble detection. Interchangeable engines produce the
     // SAME output (AnchorWindow::hetBubbles), so the downstream plan/append/stage
