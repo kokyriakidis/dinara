@@ -25,6 +25,7 @@
 #include <boost/serialization/vector.hpp>
 
 // Standard library.
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -117,7 +118,8 @@ struct AnchorGraphWrapper : public shasta2::AnchorGraphBaseClass {
 
 
 void Shasta2AnchorGraph::saveForShasta2(
-    const string& fileName, const Shasta2Anchors& anchors) const
+    const string& fileName, const Shasta2Anchors& anchors,
+    const Shasta2Anchors::ExternalAnchorDropMap* dropMap) const
 {
     const auto& dinaraGraph = *this;
     const uint64_t nVertices = boost::num_vertices(dinaraGraph);
@@ -140,8 +142,28 @@ void Shasta2AnchorGraph::saveForShasta2(
     uint64_t verifiedEdges = 0;
     uint64_t verifiedReadSteps = 0;
 
+    // Is ReadId dropped from the canonical anchor of anchorId? The drop map is
+    // keyed on canonical (even) ids; a drop removes the read from both the
+    // canonical anchor and its regenerated RC, so mask the low bit before the
+    // lookup. Used to keep edge oriented-read lists consistent with the
+    // (drop-filtered) anchor member lists exported by writeExternalAnchors.
+    const auto isDroppedFromAnchor =
+        [&](Shasta2AnchorId anchorId, ReadId readId) -> bool {
+            if(dropMap == nullptr) {
+                return false;
+            }
+            const auto it = dropMap->find(anchorId & ~Shasta2AnchorId(1));
+            if(it == dropMap->end()) {
+                return false;
+            }
+            return std::find(it->second.begin(), it->second.end(), readId) !=
+                it->second.end();
+        };
+
     uint64_t edgeCount = 0;
     uint64_t skippedEdgeCount = 0;
+    uint64_t droppedEdgeReadCount = 0;
+    uint64_t emptiedEdgeCount = 0;
     BGL_FORALL_EDGES(e, dinaraGraph, Shasta2AnchorGraphBaseClass) {
         const auto& dEdge = dinaraGraph[e];
 
@@ -170,6 +192,16 @@ void Shasta2AnchorGraph::saveForShasta2(
             while(itA != endA && itB != endB) {
                 if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
                 if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
+                // Shared read. If it was dropped from either endpoint anchor to
+                // resolve a journey tie, it is no longer a shared member in the
+                // exported set, so skip it here too (shasta2 will not see it).
+                const ReadId sharedReadId = itA->orientedReadId.getReadId();
+                if(isDroppedFromAnchor(dEdge.anchorPair.anchorIdA, sharedReadId) ||
+                   isDroppedFromAnchor(dEdge.anchorPair.anchorIdB, sharedReadId)) {
+                    ++itA;
+                    ++itB;
+                    continue;
+                }
                 // Shared read: exported ordering must be strictly forward. Every
                 // anchor exports position - k/2 with the SAME uniform export
                 // shift (1 for k=2, 0 for k=0), so the shift cancels regardless
@@ -197,12 +229,32 @@ void Shasta2AnchorGraph::saveForShasta2(
         // Append this edge's oriented reads to the shared vector and record the
         // [begin,end) range (upstream's AnchorGraph::addEdge layout). The edge no
         // longer carries an offset; shasta2 recomputes offsets during assembly.
+        //
+        // Filter out any read dropped from either endpoint anchor. shasta2's
+        // AnchorPair::getAverageOffset walks this list and requires every read
+        // to be a common member of BOTH endpoint anchors; a read dropped from an
+        // anchor (journey-tie resolution) would fail its terminal
+        // it == orientedReadIds.end() assertion.
         const uint64_t begin = shastaGraph.orientedReadIds.size();
         for(const auto& rid : dEdge.anchorPair.orientedReadIds) {
+            const ReadId readId = rid.getReadId();
+            if(isDroppedFromAnchor(dEdge.anchorPair.anchorIdA, readId) ||
+               isDroppedFromAnchor(dEdge.anchorPair.anchorIdB, readId)) {
+                ++droppedEdgeReadCount;
+                continue;
+            }
             shastaGraph.orientedReadIds.push_back(
                 shasta2::OrientedReadId::fromValue(rid.getValue()));
         }
         const uint64_t end = shastaGraph.orientedReadIds.size();
+
+        // An edge whose reads were all dropped has no support left; skip it. A
+        // zero-read AnchorPair divides by zero in getAverageOffset (size() == 0).
+        if(end == begin) {
+            ++emptiedEdgeCount;
+            ++skippedEdgeCount;
+            continue;
+        }
 
         shasta2::AnchorGraphEdge shastaEdge(
             dEdge.anchorPair.anchorIdA,
@@ -218,6 +270,12 @@ void Shasta2AnchorGraph::saveForShasta2(
     cout << "Export monotonicity check: verified " << verifiedEdges
          << " edges forward across " << verifiedReadSteps
          << " shared-read steps." << endl;
+
+    if(droppedEdgeReadCount > 0 || emptiedEdgeCount > 0) {
+        cout << "Journey-tie drop applied to anchor graph: removed "
+             << droppedEdgeReadCount << " edge oriented-read(s); skipped "
+             << emptiedEdgeCount << " edge(s) left with no reads." << endl;
+    }
 
     cout << "Exporting AnchorGraph for shasta2: "
          << nVertices << " vertices, "

@@ -2701,7 +2701,7 @@ void dinara::main::assemble(
         externalAnchorGraphName =
             std::filesystem::absolute(externalAnchorGraphName).string();
         assembler.shasta2AnchorGraph->saveForShasta2(
-            externalAnchorGraphName, *shasta2Anchors);
+            externalAnchorGraphName, *shasta2Anchors, &journeyTieDropMap);
         cout << timestamp << "Wrote shasta2 anchor graph. Use "
              << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
     }

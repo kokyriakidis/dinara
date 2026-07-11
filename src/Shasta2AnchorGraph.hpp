@@ -232,7 +232,19 @@ public:
     // Verifies every serialized edge is forward-monotonic on its shared reads
     // (throws on a violation) so the exported graph can never trip shasta2's
     // LocalAssembly positionB > positionA assertion.
-    void saveForShasta2(const string& fileName, const Shasta2Anchors& anchors) const;
+    //
+    // dropMap: the SAME per-canonical-anchor member drop set passed to
+    // writeExternalAnchors (journey position-tie resolution). A read dropped
+    // from an anchor is no longer a member of that anchor in the exported set,
+    // so it must also be removed from every edge incident to that anchor;
+    // otherwise shasta2's AnchorPair::getAverageOffset -- which requires each
+    // edge oriented read to be a common member of BOTH endpoint anchors --
+    // asserts (it == orientedReadIds.end()). Edges left with zero reads after
+    // filtering are skipped (a zero-read AnchorPair divides by zero).
+    void saveForShasta2(
+        const string& fileName,
+        const Shasta2Anchors& anchors,
+        const Shasta2Anchors::ExternalAnchorDropMap* dropMap = nullptr) const;
 
     // Per-anchor window assignment (populated by the anchor-window constructor).
     // Maps anchorId -> windowId. noWindow means unmapped.
