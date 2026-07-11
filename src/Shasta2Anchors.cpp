@@ -388,7 +388,10 @@ Kmer Shasta2Anchors::anchorKmer(Shasta2AnchorId anchorId) const
 }
 
 
-uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonicalOnly) const
+uint64_t Shasta2Anchors::writeExternalAnchors(
+    const string& name,
+    bool canonicalOnly,
+    const ExternalAnchorDropMap* dropMap) const
 {
     MemoryMapped::VectorOfVectors<ExternalAnchorOrientedRead, uint64_t> data;
     MemoryMapped::VectorOfVectors<char, uint64_t> names;
@@ -396,6 +399,21 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
     names.createNew(name + "-Names", 4096);
 
     uint64_t exportedCount = 0;
+    uint64_t droppedMemberCount = 0;
+
+    // Predicate: is this (canonical anchor, read) member dropped to resolve a
+    // journey position tie? The drop set is keyed on the canonical (even) id.
+    const auto isDropped = [&](Shasta2AnchorId anchorId, ReadId readId) -> bool {
+        if(dropMap == nullptr) {
+            return false;
+        }
+        const auto it = dropMap->find(anchorId);
+        if(it == dropMap->end()) {
+            return false;
+        }
+        return std::find(it->second.begin(), it->second.end(), readId) !=
+            it->second.end();
+    };
 
     // With paired anchor IDs (2*i = canonical, 2*i+1 = RC),
     // canonical anchors are at even indices.
@@ -436,7 +454,18 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
             getKmerAtPosition(anchor.front().orientedReadId, anchor.front().position);
         vector<ReadId> readIds;
         readIds.reserve(anchor.size());
+        uint64_t keptMembers = 0;
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            const ReadId readId = markerInfo.orientedReadId.getReadId();
+
+            // Skip members dropped to resolve a journey position tie. Do this
+            // before the k-mer / duplicate-ReadId checks: a dropped member is
+            // not exported, so it need not satisfy them.
+            if(isDropped(anchorId, readId)) {
+                ++droppedMemberCount;
+                continue;
+            }
+
             if(!isHetAnchor) {
                 const Kmer kmerValue = getKmerAtPosition(markerInfo.orientedReadId, markerInfo.position);
                 if(kmerValue != expectedKmer) {
@@ -447,7 +476,6 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
                 }
             }
 
-            const ReadId readId = markerInfo.orientedReadId.getReadId();
             if(std::find(readIds.begin(), readIds.end(), readId) != readIds.end()) {
                 throw runtime_error(
                     "Shasta2 external-anchor export failed: anchor " +
@@ -455,7 +483,13 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
                     " contains the same ReadId on both strands.");
             }
             readIds.push_back(readId);
+            ++keptMembers;
         }
+
+        // A drop can empty an anchor (or leave it a singleton). shasta2 accepts
+        // low-coverage external anchors; still export the (possibly empty)
+        // anchor to preserve the sequential id-to-id mapping shasta2 relies on.
+        (void)keptMembers;
 
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
@@ -486,11 +520,21 @@ uint64_t Shasta2Anchors::writeExternalAnchors(const string& name, bool canonical
         // the writeExternalAnchors caller, which passes --k hetAnchorK().
         const uint32_t exportShift = hetAnchorKHalf();
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
+            // Same drop filter as the validation loop above, so the exported
+            // members exactly match the validated set.
+            if(isDropped(anchorId, markerInfo.orientedReadId.getReadId())) {
+                continue;
+            }
             // External anchors store the raw position (first base of the k-mer).
             const uint32_t rawPosition = markerInfo.position - exportShift;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
         }
         ++exportedCount;
+    }
+
+    if(droppedMemberCount > 0) {
+        cout << "Dropped " << droppedMemberCount
+             << " anchor member(s) to resolve journey position ties." << endl;
     }
 
     return exportedCount;

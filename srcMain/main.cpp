@@ -2493,81 +2493,134 @@ void dinara::main::assemble(
              << aStructBubbles.load() << " het bubbles hom-flanked." << endl;
     }
 
-    // Global per-read journey diagnostic. shasta2 builds, for every oriented
+    // Global per-read journey tie resolution. shasta2 builds, for every oriented
     // read, the ordered list of ALL anchors that read belongs to (sorted by the
-    // read's exported position) and asserts they are strictly increasing -- no
-    // two anchors at equal or backward position on the same read ("Invalid
-    // Journey ..."). dinara's own guards are all LOCAL (per intra-window edge,
-    // per exported edge, or het/hom-vs-primary only); none enforce this GLOBAL
+    // read's exported position) and asserts they are STRICTLY INCREASING; two
+    // anchors at the SAME exported position on one read triggers "Invalid
+    // Journey ...". dinara's own guards are all LOCAL (per intra-window edge, per
+    // exported edge, or het/hom-vs-primary only); none enforce this GLOBAL
     // per-read constraint across all het/hom anchors, which the k=0 membership
     // relaxation (pinnedPointCol drops the k=2 flank-adjacency guard) can now
-    // violate: two het/hom anchors in different windows can land on the same
-    // read at equal/backward positions. Reproduce shasta2's check here over the
-    // EXACT exported set so we see the collision before export. Read-only; the
-    // fix (member drop) is applied separately once the collision is understood.
+    // violate: two het/hom anchors in different windows can pin the same read at
+    // the same exported base position.
+    //
+    // Model. The exportable unit is (canonicalAnchorId, readId): shasta2 loads
+    // only the canonical (even) anchors and REGENERATES the RC of each, so one
+    // unit becomes TWO journey occurrences -- one on readId-0, one on readId-1.
+    // dinara's store already holds each RC twin as the odd anchor
+    // (appendHetAnchorPair), so iterating the FULL store (even + odd) reproduces
+    // exactly the occurrence set shasta2 sees. An occurrence's unit is
+    // (anchorId & ~1, orientedReadId.getReadId()); dropping that unit removes
+    // BOTH the direct and the RC-induced occurrence for the read.
+    //
+    // Resolution. For each oriented read, group occurrences by exported position;
+    // for every position with >1 unit keep one (primary over het/hom, then higher
+    // coverage, then lower canonical id) and record the rest in the drop map.
+    // Dropping only REMOVES occurrences, so a position group can only shrink
+    // (n -> <=1) and no new tie can appear; a single pass therefore leaves every
+    // (read, position) group with <=1 survivor regardless of mirror-strand
+    // interactions. writeExternalAnchors omits the dropped members.
+    Shasta2Anchors::ExternalAnchorDropMap journeyTieDropMap;
     {
         const uint32_t exportShift = hetAnchorKHalf();
         const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
-        auto classOf = [&](Shasta2AnchorId id) -> const char* {
-            return (hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst)
-                ? "het/hom" : "primary";
+        auto isHet = [&](Shasta2AnchorId canonicalId) -> bool {
+            return hetFirst != invalid<Shasta2AnchorId> && canonicalId >= hetFirst;
         };
-        // Per oriented read: (exportedPosition, anchorId). shasta2 loads the
-        // canonical (even) anchors and REGENERATES the RC of each on the opposite
-        // strand (that is why it reports 2x the exported count), so a read's
-        // shasta2 journey includes both the canonical occurrences that list it
-        // directly AND the RC occurrences whose canonical twin lists the read on
-        // the opposite strand. dinara's store already holds those RC twins as the
-        // odd anchors (appendHetAnchorPair builds the mirror), so iterating the
-        // FULL store (even + odd) reproduces exactly what shasta2 reconstructs.
-        // Iterating even-only (the previous version) missed every canonical<->RC
-        // collision -- including the +/- pair in the reported error.
+        auto classOf = [&](Shasta2AnchorId canonicalId) -> const char* {
+            return isHet(canonicalId) ? "het/hom" : "primary";
+        };
+        // Per oriented read: (exportedPosition, canonicalAnchorId). The unit's
+        // readId is the read's own ReadId, identical for both strands.
         std::unordered_map<uint64_t, vector<std::pair<uint32_t, Shasta2AnchorId>>> byRead;
         const uint64_t anchorCount = shasta2Anchors->size();
         for(Shasta2AnchorId id = 0; id < anchorCount; id++) {
+            const Shasta2AnchorId canonicalId = id & ~Shasta2AnchorId(1);
             const Shasta2Anchor anchor = (*shasta2Anchors)[id];
             for(const Shasta2AnchorMarkerInfo& mi : anchor) {
                 byRead[mi.orientedReadId.getValue()].push_back(
-                    {mi.position - exportShift, id});
+                    {mi.position - exportShift, canonicalId});
             }
         }
-        uint64_t collisions = 0, readsWithCollision = 0;
-        const uint64_t maxReport = 40;
+        // Coverage of a canonical anchor (member count), used to pick the keeper.
+        auto coverageOf = [&](Shasta2AnchorId canonicalId) -> uint64_t {
+            return (*shasta2Anchors)[canonicalId].size();
+        };
+        // Prefer to KEEP: primary over het/hom, then higher coverage, then lower
+        // canonical id. Returns true if a should be kept over b.
+        auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
+            const bool aHet = isHet(a), bHet = isHet(b);
+            if(aHet != bHet) return !aHet;                 // primary wins
+            const uint64_t ca = coverageOf(a), cb = coverageOf(b);
+            if(ca != cb) return ca > cb;                    // higher coverage wins
+            return a < b;                                   // lower id wins
+        };
+        // Record a dropped unit (canonicalId, readId), de-duplicated.
+        auto recordDrop = [&](Shasta2AnchorId canonicalId, ReadId readId) {
+            auto& v = journeyTieDropMap[canonicalId];
+            if(std::find(v.begin(), v.end(), readId) == v.end()) {
+                v.push_back(readId);
+            }
+        };
+        uint64_t tieGroups = 0, unitsDropped = 0, readsWithTie = 0;
+        const uint64_t maxReport = 20;
+        uint64_t reported = 0;
         for(auto& [oidValue, occ] : byRead) {
             std::sort(occ.begin(), occ.end());
-            bool readReported = false;
-            for(size_t i = 1; i < occ.size(); i++) {
-                if(occ[i].first > occ[i - 1].first) continue;  // strictly forward: ok
-                ++collisions;
-                if(!readReported) { ++readsWithCollision; readReported = true; }
-                if(collisions <= maxReport) {
-                    const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
-                    // even id => canonical (+ strand), odd id => RC twin (- strand),
-                    // matching the "<anchor>+ <anchor>-" form shasta2 prints.
-                    const Shasta2AnchorId aPrev = occ[i - 1].second;
-                    const Shasta2AnchorId aCur  = occ[i].second;
-                    cout << "  [journey-collision] read " << oid
-                         << " pos " << occ[i - 1].first << " anchor " << aPrev
-                         << ((aPrev & 1) ? "-" : "+")
-                         << " (" << classOf(aPrev) << ")"
-                         << (occ[i].first == occ[i - 1].first ? " == " : " >= ")
-                         << "pos " << occ[i].first << " anchor " << aCur
-                         << ((aCur & 1) ? "-" : "+")
-                         << " (" << classOf(aCur) << ")" << endl;
+            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
+            const ReadId readId = oid.getReadId();
+            bool readCounted = false;
+            for(size_t i = 0; i < occ.size(); ) {
+                // Advance over a run of equal positions [i, j).
+                size_t j = i + 1;
+                while(j < occ.size() && occ[j].first == occ[i].first) ++j;
+                if(j - i > 1) {
+                    ++tieGroups;
+                    if(!readCounted) { ++readsWithTie; readCounted = true; }
+                    // Choose the keeper among the tied canonical anchors.
+                    Shasta2AnchorId keeper = occ[i].second;
+                    for(size_t t = i + 1; t < j; t++) {
+                        if(keepAOverB(occ[t].second, keeper)) keeper = occ[t].second;
+                    }
+                    // Drop every tied unit except the keeper.
+                    for(size_t t = i; t < j; t++) {
+                        const Shasta2AnchorId cId = occ[t].second;
+                        if(cId == keeper) continue;
+                        recordDrop(cId, readId);
+                        ++unitsDropped;
+                    }
+                    if(reported < maxReport) {
+                        ++reported;
+                        cout << "  [journey-tie] read " << oid
+                             << " pos " << occ[i].first << " keep anchor "
+                             << keeper << " (" << classOf(keeper) << "), drop";
+                        for(size_t t = i; t < j; t++) {
+                            if(occ[t].second == keeper) continue;
+                            cout << " " << occ[t].second
+                                 << " (" << classOf(occ[t].second) << ")";
+                        }
+                        cout << endl;
+                    }
                 }
+                i = j;
             }
         }
-        cout << timestamp << "Global per-read journey check: " << collisions
-             << " colliding steps on " << readsWithCollision
-             << " reads (exported set, --k " << hetAnchorK() << ")." << endl;
+        cout << timestamp << "Journey tie resolution: " << tieGroups
+             << " tied position group(s) on " << readsWithTie
+             << " read(s); dropping " << unitsDropped
+             << " unit(s) across " << journeyTieDropMap.size()
+             << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
     // generation) so newly generated het anchors are part of the exported set.
+    // The drop map removes the members that would otherwise collide in a
+    // per-read journey (see the tie resolution above).
     cout << timestamp << "Writing Shasta2 external anchors to "
          << externalAnchorsName << "..." << endl;
     const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
+        shasta2Anchors->writeExternalAnchors(
+            externalAnchorsName, true, &journeyTieDropMap);
     cout << timestamp << "Wrote " << exportedExternalAnchorCount
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;

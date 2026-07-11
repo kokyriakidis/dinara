@@ -18,6 +18,7 @@
 #include <string>
 #include <iostream>
 #include <limits>
+#include <unordered_map>
 
 namespace dinara {
     using Shasta2AnchorId = uint64_t;
@@ -161,7 +162,20 @@ public:
     {
         return markerKmers.get();
     }
-    uint64_t writeExternalAnchors(const string& name, bool canonicalOnly = true) const;
+    // Optional per-canonical-anchor member drop set: canonicalAnchorId ->
+    // ReadIds to omit from that anchor at export. Used to resolve global
+    // per-read journey position ties (two anchors at the same exported position
+    // on one read), which shasta2 rejects with "Invalid Journey". Keyed on the
+    // canonical (even) id and ReadId only: shasta2 loads canonicals and
+    // regenerates each RC, so one canonical drop removes both the direct and the
+    // RC-induced occurrence on that read. See resolveJourneyPositionTies in
+    // main.cpp.
+    using ExternalAnchorDropMap =
+        std::unordered_map<Shasta2AnchorId, std::vector<ReadId>>;
+    uint64_t writeExternalAnchors(
+        const string& name,
+        bool canonicalOnly = true,
+        const ExternalAnchorDropMap* dropMap = nullptr) const;
 
     // Append a k=2 het anchor and its reverse complement to the store, returning
     // the canonical (even) anchor id; the RC is at id+1. Members are (read,
