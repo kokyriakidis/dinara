@@ -2678,6 +2678,27 @@ void dinara::main::assemble(
                  << trimmed << " overhang anchors." << endl;
         }
 
+        // Tip cleanup before export. Two complementary passes:
+        //   (B) removeHetArmTips fixes the tip SOURCE -- het/hom allele arms left
+        //       one-sided because addHetEdge dropped one of the arm's two flank
+        //       edges (empty read intersection / non-forward offset). It disables
+        //       the arm's surviving edge and cascades to any stranded hom.
+        //   (A) removeAnchorGraphTips is a general safety net that removes any
+        //       remaining interior one-sided anchor (e.g. from inter-window
+        //       coverage gating or journey-tie edge drops), while preserving real
+        //       contig/telomere ends (anchors with an inter-window edge) and
+        //       backbone window boundaries.
+        // Iterate the pair until neither removes anything, since each can expose
+        // a new tip for the other.
+        for(uint64_t tipPass = 0; ; ++tipPass) {
+            const uint64_t hetTips =
+                assembler.shasta2AnchorGraph->removeHetArmTips(*shasta2Anchors);
+            const uint64_t genTips =
+                assembler.shasta2AnchorGraph->removeAnchorGraphTips(
+                    *shasta2Anchors, anchorWindows, *shasta2Journeys);
+            if(hetTips == 0 && genTips == 0) break;
+        }
+
         assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
         assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
         cout << timestamp << "Wrote Shasta2AnchorGraph.gfa / .csv" << endl;

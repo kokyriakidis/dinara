@@ -140,6 +140,33 @@ public:
         const vector<AnchorWindow>& anchorWindows,
         const Shasta2Journeys& journeys);
 
+    // Remove het/hom allele-arm tips: het/hom anchors (id >= hetAnchorFirstId)
+    // that end up with active edges on only one side. The staging guarantees
+    // every arm is hom-flanked on both sides, but addHetEdge can drop one of an
+    // arm's two flank edges (empty read intersection or non-forward offset),
+    // leaving the arm hanging. This disables the arm's surviving edge(s) and
+    // cascades (a stranded hom can in turn become one-sided), so no het/hom
+    // anchor is exported connected on only one side. Backbone/primary anchors
+    // are never touched (their legitimate one-sided ends are window/telomere
+    // boundaries handled by trimBackbones). Returns the number of edges
+    // disabled.
+    uint64_t removeHetArmTips(const Shasta2Anchors& anchors);
+
+    // General anchor-graph tip remover (safety net). Iteratively disables edges
+    // incident to interior tip vertices -- vertices with active edges on only
+    // one side that are NOT legitimate boundaries. A het/hom anchor is always
+    // interior (must be two-sided), so any one-sided het/hom anchor is a tip. A
+    // backbone/primary anchor is exempt when it is a window backbone endpoint
+    // (first/last backbone anchor of its window; a real contig/telomere end) or
+    // has an inter-window edge (a real contig junction) or carries no window
+    // mapping. Interior backbone anchors that go one-sided are dangling stubs
+    // and are removed. Complements removeHetArmTips; run after it before export.
+    // Returns the number of edges disabled.
+    uint64_t removeAnchorGraphTips(
+        const Shasta2Anchors& anchors,
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Journeys& journeys);
+
     // Remove inter-window edges that land internally on a window's backbone
     // (between the first and last inter-window connection points).
     // For reads traversing internal connections, create bypass edges that

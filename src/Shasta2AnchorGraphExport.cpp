@@ -250,6 +250,13 @@ void Shasta2AnchorGraph::saveForShasta2(
 
         // An edge whose reads were all dropped has no support left; skip it. A
         // zero-read AnchorPair divides by zero in getAverageOffset (size() == 0).
+        // NOTE: this drop happens at serialization, AFTER the anchor-graph tip
+        // removal in main.cpp, so a skipped edge here can leave a residual tip
+        // in the exported graph. This only fires when EVERY read on an edge was
+        // a journey-tie loser (rare; edges are typically coverage >= 4). If
+        // emptiedEdgeCount is ever nonzero AND tips persist, move the journey-tie
+        // edge filtering ahead of tip removal (apply the drop map to the live
+        // graph before removeHetArmTips/removeAnchorGraphTips run).
         if(end == begin) {
             ++emptiedEdgeCount;
             ++skippedEdgeCount;

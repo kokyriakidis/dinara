@@ -4005,6 +4005,234 @@ uint64_t Shasta2AnchorGraph::trimBackbones(
 }
 
 
+uint64_t Shasta2AnchorGraph::removeHetArmTips(const Shasta2Anchors& anchors)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+    const Shasta2AnchorId hetFirst = anchors.hetAnchorFirstId;
+    if(hetFirst == invalid<Shasta2AnchorId>) {
+        return 0;  // No het/hom anchors: nothing to do.
+    }
+
+    // Active in/out degree of a vertex (edges with useForAssembly == true).
+    auto activeInDegree = [&](uint64_t a) -> uint64_t {
+        uint64_t n = 0;
+        auto ie = boost::in_edges(a, anchorGraph);
+        for(auto it = ie.first; it != ie.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) ++n;
+        }
+        return n;
+    };
+    auto activeOutDegree = [&](uint64_t a) -> uint64_t {
+        uint64_t n = 0;
+        auto oe = boost::out_edges(a, anchorGraph);
+        for(auto it = oe.first; it != oe.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) ++n;
+        }
+        return n;
+    };
+
+    // A het/hom anchor is a graph-interior node: it must have active edges on
+    // BOTH sides. One-sided (or fully isolated-but-was-connected) => tip.
+    // Isolated (0/0) het/hom anchors are staging artifacts with no edges to
+    // disable, so they are not tips for our purposes (nothing to remove).
+    auto isHetArmTip = [&](uint64_t a) -> bool {
+        if(a < hetFirst || a >= anchorCount) return false;
+        const uint64_t in = activeInDegree(a);
+        const uint64_t out = activeOutDegree(a);
+        if(in == 0 && out == 0) return false;   // already fully disconnected
+        return (in == 0) || (out == 0);          // connected on only one side
+    };
+
+    // Disable all active edges incident to a vertex. disableEdge() also
+    // disables the RC twin edge, so the mirror strand stays consistent.
+    auto disableAllEdges = [&](uint64_t a) {
+        if(a >= anchorCount) return;
+        auto oe = boost::out_edges(a, anchorGraph);
+        for(auto it = oe.first; it != oe.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) disableEdge(*it);
+        }
+        auto ie = boost::in_edges(a, anchorGraph);
+        for(auto it = ie.first; it != ie.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) disableEdge(*it);
+        }
+    };
+
+    // Iterate to a fixpoint: disabling a tip arm's surviving edge can strand a
+    // neighboring hom anchor, turning it into a new one-sided het/hom tip.
+    // disableEdge() disables the RC twin edge too, so processing the forward
+    // anchor keeps both strands consistent without a separate RC pass.
+    uint64_t totalDisabled = 0;
+    uint64_t armsRemoved = 0;
+    for(uint64_t pass = 0; ; ++pass) {
+        uint64_t disabledThisPass = 0;
+        for(uint64_t a = hetFirst; a < anchorCount; ++a) {
+            if(!isHetArmTip(a)) continue;
+            const uint64_t before =
+                activeInDegree(a) + activeOutDegree(a);
+            disableAllEdges(a);
+            disabledThisPass += before;
+            ++armsRemoved;
+        }
+        totalDisabled += disabledThisPass;
+        if(disabledThisPass == 0) break;
+    }
+
+    cout << "Remove het-arm tips: disabled " << totalDisabled
+         << " edge(s) across " << armsRemoved
+         << " one-sided het/hom anchor(s)." << endl;
+    return totalDisabled;
+}
+
+
+uint64_t Shasta2AnchorGraph::removeAnchorGraphTips(
+    const Shasta2Anchors& anchors,
+    const vector<AnchorWindow>& anchorWindows,
+    const Shasta2Journeys& journeys)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    const uint64_t anchorCount = num_vertices(anchorGraph);
+    const Shasta2AnchorId hetFirst = anchors.hetAnchorFirstId;
+
+    auto normalizeW = [&](uint32_t w2) -> uint32_t {
+        return (w2 >= windowCount) ? (w2 - windowCount) : w2;
+    };
+
+    // Mark the first and last backbone anchor of every window (both strands) as
+    // legitimate one-sided boundaries: these are contig/telomere ends and must
+    // survive tip removal even with no inter-window edge. Uses the same
+    // journey-position -> anchor mapping trimBackbones uses.
+    vector<bool> isBackboneEndpoint(anchorCount, false);
+    for(uint32_t w = 0; w < windowCount; ++w) {
+        const auto& window = anchorWindows[w];
+        static thread_local vector<uint32_t> allPositions;
+        const vector<uint32_t>* positionsPtr;
+        if(!window.filteredBackbonePositions.empty()) {
+            positionsPtr = &window.filteredBackbonePositions;
+        } else {
+            allPositions.clear();
+            for(uint32_t pos = window.backboneBegin; pos < window.backboneEnd; ++pos) {
+                allPositions.push_back(pos);
+            }
+            positionsPtr = &allPositions;
+        }
+        const auto& positions = *positionsPtr;
+        if(positions.empty()) continue;
+        const auto journey = journeys[window.backboneOrientedReadId];
+        auto mark = [&](uint32_t pos) {
+            const uint64_t aid = uint64_t(journey[pos]);
+            if(aid < anchorCount) isBackboneEndpoint[aid] = true;
+            const uint64_t rc = aid ^ 1ULL;
+            if(rc < anchorCount) isBackboneEndpoint[rc] = true;
+        };
+        mark(positions.front());
+        mark(positions.back());
+    }
+
+    auto activeInDegree = [&](uint64_t a) -> uint64_t {
+        uint64_t n = 0;
+        auto ie = boost::in_edges(a, anchorGraph);
+        for(auto it = ie.first; it != ie.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) ++n;
+        }
+        return n;
+    };
+    auto activeOutDegree = [&](uint64_t a) -> uint64_t {
+        uint64_t n = 0;
+        auto oe = boost::out_edges(a, anchorGraph);
+        for(auto it = oe.first; it != oe.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) ++n;
+        }
+        return n;
+    };
+
+    // Does anchor a have an active edge crossing to a DIFFERENT window on the
+    // given side? Such a crossing marks a real contig junction/end that must be
+    // preserved even if one-sided.
+    auto hasInterWindowEdgeAnySide = [&](uint64_t a) -> bool {
+        if(a >= anchorCount) return false;
+        const uint32_t aWin = anchorToWindow[a];
+        if(aWin == noWindow) return true;  // unmapped: treat as boundary, keep
+        const uint32_t aNorm = normalizeW(aWin);
+        auto oe = boost::out_edges(a, anchorGraph);
+        for(auto it = oe.first; it != oe.second; ++it) {
+            if(!anchorGraph[*it].useForAssembly) continue;
+            const uint64_t t = uint64_t(boost::target(*it, anchorGraph));
+            if(t < anchorCount) {
+                const uint32_t tWin = anchorToWindow[t];
+                if(tWin != noWindow && normalizeW(tWin) != aNorm) return true;
+            }
+        }
+        auto ie = boost::in_edges(a, anchorGraph);
+        for(auto it = ie.first; it != ie.second; ++it) {
+            if(!anchorGraph[*it].useForAssembly) continue;
+            const uint64_t s = uint64_t(boost::source(*it, anchorGraph));
+            if(s < anchorCount) {
+                const uint32_t sWin = anchorToWindow[s];
+                if(sWin != noWindow && normalizeW(sWin) != aNorm) return true;
+            }
+        }
+        return false;
+    };
+
+    auto disableAllEdges = [&](uint64_t a) {
+        if(a >= anchorCount) return;
+        auto oe = boost::out_edges(a, anchorGraph);
+        for(auto it = oe.first; it != oe.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) disableEdge(*it);
+        }
+        auto ie = boost::in_edges(a, anchorGraph);
+        for(auto it = ie.first; it != ie.second; ++it) {
+            if(anchorGraph[*it].useForAssembly) disableEdge(*it);
+        }
+    };
+
+    // A vertex is an interior tip if it is connected on only one side AND it is
+    // not a legitimate boundary. Legitimate boundaries: any anchor with an
+    // inter-window edge (real contig junction/telomere end), and unmapped
+    // anchors. het/hom anchors (>= hetFirst) are never boundaries -- they must
+    // be two-sided -- so any one-sided het/hom anchor is a tip.
+    auto isInteriorTip = [&](uint64_t a) -> bool {
+        if(a >= anchorCount) return false;
+        const uint64_t in = activeInDegree(a);
+        const uint64_t out = activeOutDegree(a);
+        if(in == 0 && out == 0) return false;      // isolated, no edges to cut
+        if(!((in == 0) || (out == 0))) return false; // two-sided: not a tip
+        const bool isHet =
+            (hetFirst != invalid<Shasta2AnchorId>) && (a >= hetFirst);
+        if(isHet) return true;                      // het/hom must be two-sided
+        // Primary/backbone: keep real boundaries -- window backbone endpoints
+        // (contig/telomere ends) and anchors with an inter-window edge (contig
+        // junctions). Remove only interior one-sided backbone stubs.
+        if(isBackboneEndpoint[a]) return false;
+        return !hasInterWindowEdgeAnySide(a);
+    };
+
+    // disableEdge() disables the RC twin edge too, so processing the forward
+    // anchor keeps both strands consistent. Iterate to a fixpoint since removing
+    // one tip can expose its neighbor as a new tip.
+    uint64_t totalDisabled = 0;
+    uint64_t tipsRemoved = 0;
+    for(uint64_t pass = 0; ; ++pass) {
+        uint64_t disabledThisPass = 0;
+        for(uint64_t a = 0; a < anchorCount; ++a) {
+            if(!isInteriorTip(a)) continue;
+            const uint64_t before = activeInDegree(a) + activeOutDegree(a);
+            disableAllEdges(a);
+            disabledThisPass += before;
+            ++tipsRemoved;
+        }
+        totalDisabled += disabledThisPass;
+        if(disabledThisPass == 0) break;
+    }
+
+    cout << "Remove anchor-graph tips: disabled " << totalDisabled
+         << " edge(s) across " << tipsRemoved
+         << " interior tip anchor(s)." << endl;
+    return totalDisabled;
+}
+
+
 uint64_t Shasta2AnchorGraph::removeIsolatedWindows(
     const vector<AnchorWindow>& anchorWindows,
     const Shasta2Journeys& journeys)
