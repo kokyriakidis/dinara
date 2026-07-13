@@ -232,7 +232,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // anchor-less interval, not this pass -- fixed by the per-interval length
     // guard (see runIpoaOnRows / DINARA_IPOA_MAX_LEN). This pass's own
     // structures scale ~linearly, so it is safe to restore.
-    constexpr bool connectOneToOneWindows = true;
+    //
+    // Disabled (false): no inter-window edges are created. Each window is
+    // exported as an independent backbone/bubble subgraph with no links between
+    // windows. Combined with edgelessWindows = true (Stage A off), this yields
+    // a fully window-local anchor graph. Set back to true (with connectAllWindows)
+    // to restore full inter-window connectivity.
+    constexpr bool connectOneToOneWindows = false;
 
     // Connect ALL inter-window pairs. When true, the strict 1-to-1 degree gate
     // is bypassed and an edge is created for every read-supported window pair
