@@ -1977,17 +1977,19 @@ void dinara::main::assemble(
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
 
+    // Repeat-kmer and low-complexity filtering now happens at the minimizer
+    // stage (applyKmerCountFilter with filterRepeatKmers / filterLowComplexity),
+    // so these marker-graph vertex filters are redundant -- the offending k-mers
+    // never seed a vertex. Left commented out; re-enable if the minimizer-stage
+    // filters are ever turned off.
+    //
     // Remove vertices whose k-mer is a short-period tandem repeat (period 1-5,
-    // including homopolymers). These k-mers match many genomic positions and
-    // produce unreliable marker graph vertices. Thresholds: {6, 4, 4, 4, 4}
-    // consecutive repeat units for periods 1-5. Removes ~18.5% of vertices.
-    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-
-    // Remove vertices whose k-mer has low sequence complexity, measured by
-    // counting distinct sub-k-mers of lengths 1, 2, 3. Thresholds: {4, 12, 24}.
-    // A k-mer with fewer distinct sub-k-mers than the threshold at any length
-    // is considered low-complexity. Removes ~4.5% of vertices with k=50.
-    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    // including homopolymers). Thresholds: {6, 4, 4, 4, 4}. Removes ~18.5%.
+    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
+    //
+    // Remove vertices whose k-mer has low sequence complexity (distinct
+    // sub-k-mers of lengths 1, 2, 3). Thresholds: {4, 12, 24}. Removes ~4.5%.
+    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
     // Remove vertices where the transitive collapse grouped reads at k-mer
     // positions outside their direct chaining range. For each pair of reads
