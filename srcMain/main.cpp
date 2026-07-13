@@ -1738,10 +1738,22 @@ void dinara::main::assemble(
         // Prune the existing minimizer markers in-place.
         // applyKmerCountFilter keeps a marker only if:
         // - its canonical k-mer frequency is in the inclusive range [minFreq, maxFreq],
-        // - and, by default, the k-mer is not palindromic/self-reverse-complementary.
-        // The function rebuilds both markers and markerKmerIds from the pre-filtered
-        // arrays, preserving only marker positions whose matching k-mer id passes.
-        assembler.applyKmerCountFilter(minFreq, maxFreq, threadCount, removePalindromicKmers);
+        // - the k-mer is not palindromic/self-reverse-complementary (default),
+        // - the k-mer is not a short-period tandem repeat (filterRepeatKmers), and
+        // - the k-mer is not low-complexity by distinct sub-k-mer count
+        //   (filterLowComplexity).
+        // The last two apply the SAME predicates the marker-graph vertex filters
+        // (filterMarkerGraphVerticesByRepeatKmers /
+        // filterMarkerGraphVerticesByDistinctSubkmerCount) use, but at the
+        // minimizer stage, so repeat/low-complexity minimizers never seed a
+        // marker or marker-graph vertex. The function rebuilds both markers and
+        // markerKmerIds from the pre-filtered arrays, preserving only marker
+        // positions whose matching k-mer id passes.
+        const bool filterRepeatKmers = true;
+        const bool filterLowComplexity = true;
+        assembler.applyKmerCountFilter(
+            minFreq, maxFreq, threadCount, removePalindromicKmers,
+            filterRepeatKmers, filterLowComplexity);
         
         // writeReadMarkerGapDiagnostic("afterFrequencyFilter", ReadId(3729));
 

@@ -1314,11 +1314,16 @@ void Assembler::countKmersFromMarkerKmerIds(uint64_t threadCount)
  * @param maxFreq Maximum k-mer frequency threshold (inclusive)
  * @param threadCount Number of worker threads (0 = auto-detect)
  */
-void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes)
+void Assembler::applyKmerCountFilter(
+    uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes,
+    bool filterRepeatKmers, bool filterLowComplexity)
 {
     performanceLog << timestamp << "Filtering markers by frequency [" 
                    << minFreq << ", " << maxFreq << "] and palindromes: " 
-                   << (filterPalindromes ? "yes" : "no") << "." << endl;
+                   << (filterPalindromes ? "yes" : "no")
+                   << ", repeat k-mers: " << (filterRepeatKmers ? "yes" : "no")
+                   << ", low-complexity: " << (filterLowComplexity ? "yes" : "no")
+                   << "." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
     // =========================================================================
@@ -1349,6 +1354,8 @@ void Assembler::applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_
     applyKmerCountFilterData.minFreq = minFreq;
     applyKmerCountFilterData.maxFreq = maxFreq;
     applyKmerCountFilterData.filterPalindromes = filterPalindromes;
+    applyKmerCountFilterData.filterRepeatKmers = filterRepeatKmers;
+    applyKmerCountFilterData.filterLowComplexity = filterLowComplexity;
 
     markers->createNew(markersName, largeDataPageSize);
     markerKmerIds->createNew(kmerIdsName, largeDataPageSize);
@@ -1459,7 +1466,44 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
     const uint64_t k = assemblerInfo->k;
     const uint64_t minF = applyKmerCountFilterData.minFreq;
     const uint64_t maxF = applyKmerCountFilterData.maxFreq;
-    
+    const bool filterRepeatKmers = applyKmerCountFilterData.filterRepeatKmers;
+    const bool filterLowComplexity = applyKmerCountFilterData.filterLowComplexity;
+
+    // Short-period tandem-repeat predicate (periods 1-6). Mirrors
+    // filterMarkerGraphVerticesByRepeatKmers (--max-anchor-repeat-length).
+    const vector<uint64_t> maxAnchorRepeatLength = {6, 4, 4, 4, 4};
+    auto isRepeatKmer = [&](const Kmer& kmer0) -> bool {
+        for(uint64_t i = 0; i < maxAnchorRepeatLength.size(); i++) {
+            const uint64_t period = i + 1;
+            const uint64_t maxAllowedCopyNumber = maxAnchorRepeatLength[i];
+            uint64_t copies = 0;
+            switch(period) {
+            case 1: copies = kmer0.countExactRepeatCopies<1>(k); break;
+            case 2: copies = kmer0.countExactRepeatCopies<2>(k); break;
+            case 3: copies = kmer0.countExactRepeatCopies<3>(k); break;
+            case 4: copies = kmer0.countExactRepeatCopies<4>(k); break;
+            case 5: copies = kmer0.countExactRepeatCopies<5>(k); break;
+            case 6: copies = kmer0.countExactRepeatCopies<6>(k); break;
+            default: copies = 0; break;
+            }
+            if(copies > maxAllowedCopyNumber) return true;
+        }
+        return false;
+    };
+
+    // Low-complexity predicate by distinct sub-k-mer count (lengths 1-3).
+    // Mirrors filterMarkerGraphVerticesByDistinctSubkmerCount
+    // (--min-anchor-distinct-subkmer-count).
+    const vector<uint64_t> minAnchorDistinctSubkmerCount = {4, 12, 24};
+    auto isLowComplexity = [&](const Kmer& kmer) -> bool {
+        for(uint64_t i = 0; i < minAnchorDistinctSubkmerCount.size(); i++) {
+            const uint64_t subKmerLength = i + 1;
+            const uint64_t minAllowedCount = minAnchorDistinctSubkmerCount[i];
+            if(kmer.count(subKmerLength, k) < minAllowedCount) return true;
+        }
+        return false;
+    };
+
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
@@ -1487,6 +1531,18 @@ void Assembler::applyKmerCountFilterThreadFunctionPass1(size_t /* threadId */)
                 // rejected before the frequency lookup because their frequency cannot
                 // change the filtering decision.
                 if(applyKmerCountFilterData.filterPalindromes && kmerId == rcKmerId) {
+                    continue;
+                }
+
+                // Drop short-period tandem-repeat and low-complexity k-mers
+                // (same predicates as the marker-graph vertex filters), so these
+                // minimizers never seed a marker or a marker-graph vertex.
+                // Checked before the frequency lookup: their k-mer content alone
+                // decides rejection, independent of coverage.
+                if(filterRepeatKmers && isRepeatKmer(kmer)) {
+                    continue;
+                }
+                if(filterLowComplexity && isLowComplexity(kmer)) {
                     continue;
                 }
 

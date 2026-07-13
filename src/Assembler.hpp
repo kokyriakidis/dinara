@@ -2575,7 +2575,19 @@ private:
 
 public:
     // Prune existing markers based on KmerCounter frequencies.
-    void applyKmerCountFilter(uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount, bool filterPalindromes = true);
+    // filterRepeatKmers: also drop markers whose k-mer is a short-period tandem
+    //   repeat (periods 1-6, thresholds {6,4,4,4,4,4}), the same predicate used
+    //   by filterMarkerGraphVerticesByRepeatKmers.
+    // filterLowComplexity: also drop markers whose k-mer is low-complexity by
+    //   distinct sub-k-mer count (lengths 1-3, thresholds {4,12,24}), the same
+    //   predicate used by filterMarkerGraphVerticesByDistinctSubkmerCount.
+    // Applying these at the minimizer stage removes repeat/low-complexity
+    // minimizers before marker-graph construction, so they never seed vertices.
+    void applyKmerCountFilter(
+        uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount,
+        bool filterPalindromes = true,
+        bool filterRepeatKmers = false,
+        bool filterLowComplexity = false);
 
     // Remove all markers from reads whose marker span covers less than
     // minSpanFraction of the read length. Span = lastMarkerPos + k - firstMarkerPos.
@@ -2903,6 +2915,8 @@ private:
         uint64_t minFreq;
         uint64_t maxFreq;
         bool filterPalindromes;
+        bool filterRepeatKmers;
+        bool filterLowComplexity;
         shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> oldMarkers;
         shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> oldMarkerKmerIds;
         
