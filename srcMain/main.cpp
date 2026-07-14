@@ -2699,64 +2699,83 @@ void dinara::main::assemble(
              << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
     }
 
-    // Out-of-bounds member resolution. A het/hom member carried by a one-sided
-    // read holds a GUESSED rawPosition (the interval walk extrapolates a span
-    // through indels), which can drift onto or past that read's end. The
-    // downstream dropBackwardHomMembers guard only catches drift past a flanking
-    // BACKBONE anchor, not past the read boundary itself, so such a member
-    // survives into the export. shasta2's loader then calls Reads::getKmer on the
-    // exported (position, --k) and throws "Invalid position in read" when
-    // position + k > readLength -- aborting the whole assembly. Primaries cannot
-    // trigger this (a k=50 marker's stored midpoint is always well inside the
-    // read); only guessed het/hom positions can. Clamping is not an option: a
-    // het anchor's position encodes the SNP base, so moving it would corrupt the
-    // allele. Instead drop the offending members into the SAME journeyTieDropMap
-    // both exports honor, so the external anchors and the anchor graph stay
-    // consistent. The loader k is hetAnchorK() (see the --k note below).
+    // Out-of-bounds member resolution. shasta2's external-anchor loader calls
+    // Reads::getKmer(k, orientedReadId, position) on every exported member and
+    // throws "Invalid position in read" when position + k > readLength, aborting
+    // the whole assembly. This mirrors that EXACT check on the dinara side and
+    // drops any offending member into the SAME journeyTieDropMap both exports
+    // (writeExternalAnchors and saveForShasta2) honor, so the external anchors
+    // and the anchor graph stay consistent.
+    //
+    // Every exported member is validated -- both primary and het/hom anchors --
+    // because the loader validates them all. (A het/hom member on a one-sided
+    // read is the usual offender: its guessed rawPosition can drift past the
+    // read end, and the dropBackwardHomMembers guard only bounds drift past a
+    // flanking backbone anchor, not the read boundary. But we no longer ASSUME
+    // primaries are safe -- we check them too.) The loader length is
+    // getRead(readId).baseCount (the stored-representation length shasta2 uses),
+    // matched here via the same accessor. The loader k is hetAnchorK().
     {
         const Reads& reads = assembler.getReads();
         const uint32_t exportShift = hetAnchorKHalf();
         const uint64_t loaderK = hetAnchorK();
         const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
         const uint64_t anchorCount = shasta2Anchors->size();
+        auto isHet = [&](Shasta2AnchorId canonicalId) -> bool {
+            return hetFirst != invalid<Shasta2AnchorId> && canonicalId >= hetFirst;
+        };
         uint64_t oobMembers = 0;
+        uint64_t oobPrimaryMembers = 0;
+        uint64_t oobHetMembers = 0;
         std::unordered_set<Shasta2AnchorId> oobAnchors;
-        // Only canonical (even) anchors are exported; shasta2 regenerates each
-        // RC arithmetically without an extra getKmer bound check, so validating
-        // the canonical members' forward positions matches exactly what the
-        // loader tests. Skip anchors before hetFirst: primaries are always in
-        // bounds by construction.
-        if(hetFirst != invalid<Shasta2AnchorId>) {
-            for(Shasta2AnchorId canonicalId = hetFirst;
-                canonicalId < anchorCount; canonicalId += 2) {
-                const Shasta2Anchor anchor = (*shasta2Anchors)[canonicalId];
-                for(const Shasta2AnchorMarkerInfo& mi : anchor) {
-                    const ReadId readId = mi.orientedReadId.getReadId();
-                    // Skip members already dropped by tie resolution.
-                    {
-                        const auto it = journeyTieDropMap.find(canonicalId);
-                        if(it != journeyTieDropMap.end() &&
-                            std::find(it->second.begin(), it->second.end(), readId)
-                                != it->second.end()) {
-                            continue;
-                        }
+        uint64_t reported = 0;
+        const uint64_t maxReport = 20;
+        // Only canonical (even) anchors are exported; shasta2 regenerates each RC
+        // arithmetically without an extra getKmer bound check, so validating the
+        // canonical members' positions matches exactly what the loader tests.
+        for(Shasta2AnchorId canonicalId = 0;
+            canonicalId < anchorCount; canonicalId += 2) {
+            const Shasta2Anchor anchor = (*shasta2Anchors)[canonicalId];
+            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                const ReadId readId = mi.orientedReadId.getReadId();
+                // Skip members already dropped by tie resolution.
+                {
+                    const auto it = journeyTieDropMap.find(canonicalId);
+                    if(it != journeyTieDropMap.end() &&
+                        std::find(it->second.begin(), it->second.end(), readId)
+                            != it->second.end()) {
+                        continue;
                     }
-                    const uint32_t exportedPos = mi.position - exportShift;
-                    const uint64_t readLen = reads.getReadRawSequenceLength(readId);
-                    if(uint64_t(exportedPos) + loaderK > readLen) {
-                        auto& v = journeyTieDropMap[canonicalId];
-                        if(std::find(v.begin(), v.end(), readId) == v.end()) {
-                            v.push_back(readId);
-                            ++oobMembers;
-                            oobAnchors.insert(canonicalId);
+                }
+                const uint32_t exportedPos = mi.position - exportShift;
+                // Mirror shasta2 Reads::getKmer exactly: length is the stored
+                // read's baseCount, checked as position + k > readLength.
+                const uint64_t readLen = reads.getRead(readId).baseCount;
+                if(uint64_t(exportedPos) + loaderK > readLen) {
+                    auto& v = journeyTieDropMap[canonicalId];
+                    if(std::find(v.begin(), v.end(), readId) == v.end()) {
+                        v.push_back(readId);
+                        ++oobMembers;
+                        if(isHet(canonicalId)) ++oobHetMembers; else ++oobPrimaryMembers;
+                        oobAnchors.insert(canonicalId);
+                        if(reported < maxReport) {
+                            ++reported;
+                            cout << "  [oob] anchor " << canonicalId
+                                 << (isHet(canonicalId) ? " (het/hom)" : " (primary)")
+                                 << " oid " << mi.orientedReadId
+                                 << " exportedPos " << exportedPos
+                                 << " storedPos " << mi.position
+                                 << " readLen " << readLen
+                                 << " loaderK " << loaderK << endl;
                         }
                     }
                 }
             }
         }
         cout << timestamp << "Out-of-bounds member resolution: dropping "
-             << oobMembers << " het/hom member(s) across " << oobAnchors.size()
-             << " anchor(s) whose guessed position ran past the read end (--k "
+             << oobMembers << " member(s) (" << oobPrimaryMembers << " primary, "
+             << oobHetMembers << " het/hom) across " << oobAnchors.size()
+             << " anchor(s) whose exported position ran past the read end (--k "
              << loaderK << ")." << endl;
     }
 
