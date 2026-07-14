@@ -190,12 +190,32 @@ void Shasta2Journeys::filterThreadFunction(uint64_t /* threadId */)
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(uint64_t oidValue = begin; oidValue != end; oidValue++) {
+            // Strand symmetry: the journey of oriented read (R,1) must be the
+            // exact reverse complement of (R,0) -- journey(R,1)[k] ==
+            // journey(R,0)[n-1-k] ^ 1. The DP tie-breaking is not mirror-
+            // symmetric, so filtering the two strands independently would
+            // diverge and break the coverage(a) == coverage(a^1) invariant that
+            // downstream stages assert. Filter only strand 0 (even oidValue)
+            // and mirror the result into strand 1 (oidValue ^ 1).
+            if((oidValue & 1ULL) != 0ULL) continue;   // strand 1 done below.
+
             const auto journey = journeys[oidValue];
             const uint32_t n = uint32_t(journey.size());
             std::vector<Shasta2AnchorId>& out = filteredJourneys[oidValue];
+            std::vector<Shasta2AnchorId>& outRc = filteredJourneys[oidValue ^ 1ULL];
             out.clear();
-            if(n == 0) continue;
-            if(n == 1) { out.push_back(journey[0]); continue; }
+            outRc.clear();
+
+            // Emit both strands: strand 0 = fwd, strand 1 = reversed + RC.
+            auto emitMirror = [&]() {
+                outRc.resize(out.size());
+                for(size_t k = 0; k < out.size(); k++) {
+                    outRc[k] = out[out.size() - 1 - k] ^ 1ULL;
+                }
+            };
+
+            if(n == 0) { continue; }
+            if(n == 1) { out.push_back(journey[0]); emitMirror(); continue; }
 
             // DP over the journey: dp[i] = length of the longest chain ending at
             // position i; prev[i] = predecessor position (-1 if the chain starts
@@ -229,6 +249,7 @@ void Shasta2Journeys::filterThreadFunction(uint64_t /* threadId */)
             for(auto it = chain.rbegin(); it != chain.rend(); ++it) {
                 out.push_back(journey[*it]);
             }
+            emitMirror();
         }
     }
 }
