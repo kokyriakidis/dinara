@@ -283,13 +283,14 @@ inline std::uint32_t emitHetBubblesFromProfiles(
     // Flank-linearity gate (majority-based reconstruction of abPOA's degree-1
     // predPrev/commonPred and commonSucc/succNext test). A flank column breaks
     // linearity only if a competing base allele OR a deletion reaches minSupport
-    // there. Columns p-3,p-2,p-1,p+1,p+2,p+3 are checked so >=3 linear bases
+    // there. Columns p-4..p-1,p+1..p+4 are checked so >=4 linear bases
     // separate accepted SNPs (chainable homs) on each side.
     auto flanksLinear = [&](uint32_t pos) -> bool {
-        if (pos < windowBbBegin + 3) return false;
-        if (pos + 3 >= windowBbEnd) return false;
-        const uint32_t flankCols[6] = {
-            pos - 3, pos - 2, pos - 1, pos + 1, pos + 2, pos + 3};
+        if (pos < windowBbBegin + 4) return false;
+        if (pos + 4 >= windowBbEnd) return false;
+        const uint32_t flankCols[8] = {
+            pos - 4, pos - 3, pos - 2, pos - 1,
+            pos + 1, pos + 2, pos + 3, pos + 4};
         for (uint32_t c : flankCols) {
             for (uint8_t b = 0; b < 4; b++) {
                 auto it = snpCounts.find(snpKey(c, b));
