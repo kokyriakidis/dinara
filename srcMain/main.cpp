@@ -2699,6 +2699,67 @@ void dinara::main::assemble(
              << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
     }
 
+    // Out-of-bounds member resolution. A het/hom member carried by a one-sided
+    // read holds a GUESSED rawPosition (the interval walk extrapolates a span
+    // through indels), which can drift onto or past that read's end. The
+    // downstream dropBackwardHomMembers guard only catches drift past a flanking
+    // BACKBONE anchor, not past the read boundary itself, so such a member
+    // survives into the export. shasta2's loader then calls Reads::getKmer on the
+    // exported (position, --k) and throws "Invalid position in read" when
+    // position + k > readLength -- aborting the whole assembly. Primaries cannot
+    // trigger this (a k=50 marker's stored midpoint is always well inside the
+    // read); only guessed het/hom positions can. Clamping is not an option: a
+    // het anchor's position encodes the SNP base, so moving it would corrupt the
+    // allele. Instead drop the offending members into the SAME journeyTieDropMap
+    // both exports honor, so the external anchors and the anchor graph stay
+    // consistent. The loader k is hetAnchorK() (see the --k note below).
+    {
+        const Reads& reads = assembler.getReads();
+        const uint32_t exportShift = hetAnchorKHalf();
+        const uint64_t loaderK = hetAnchorK();
+        const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
+        const uint64_t anchorCount = shasta2Anchors->size();
+        uint64_t oobMembers = 0;
+        std::unordered_set<Shasta2AnchorId> oobAnchors;
+        // Only canonical (even) anchors are exported; shasta2 regenerates each
+        // RC arithmetically without an extra getKmer bound check, so validating
+        // the canonical members' forward positions matches exactly what the
+        // loader tests. Skip anchors before hetFirst: primaries are always in
+        // bounds by construction.
+        if(hetFirst != invalid<Shasta2AnchorId>) {
+            for(Shasta2AnchorId canonicalId = hetFirst;
+                canonicalId < anchorCount; canonicalId += 2) {
+                const Shasta2Anchor anchor = (*shasta2Anchors)[canonicalId];
+                for(const Shasta2AnchorMarkerInfo& mi : anchor) {
+                    const ReadId readId = mi.orientedReadId.getReadId();
+                    // Skip members already dropped by tie resolution.
+                    {
+                        const auto it = journeyTieDropMap.find(canonicalId);
+                        if(it != journeyTieDropMap.end() &&
+                            std::find(it->second.begin(), it->second.end(), readId)
+                                != it->second.end()) {
+                            continue;
+                        }
+                    }
+                    const uint32_t exportedPos = mi.position - exportShift;
+                    const uint64_t readLen = reads.getReadRawSequenceLength(readId);
+                    if(uint64_t(exportedPos) + loaderK > readLen) {
+                        auto& v = journeyTieDropMap[canonicalId];
+                        if(std::find(v.begin(), v.end(), readId) == v.end()) {
+                            v.push_back(readId);
+                            ++oobMembers;
+                            oobAnchors.insert(canonicalId);
+                        }
+                    }
+                }
+            }
+        }
+        cout << timestamp << "Out-of-bounds member resolution: dropping "
+             << oobMembers << " het/hom member(s) across " << oobAnchors.size()
+             << " anchor(s) whose guessed position ran past the read end (--k "
+             << loaderK << ")." << endl;
+    }
+
     // Write external anchors. Deferred to here (after MSA het-anchor
     // generation) so newly generated het anchors are part of the exported set.
     // The drop map removes the members that would otherwise collide in a
