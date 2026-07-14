@@ -52,13 +52,25 @@ Shasta2AnchorPair::Shasta2AnchorPair(
         const OrientedReadId orientedReadId = itA->orientedReadId;
         DINARA_ASSERT(orientedReadId == itB->orientedReadId);
 
-        if(adjacentInJourney) {
-            if(itB->positionInJourney == itA->positionInJourney + 1) {
-                orientedReadIds.push_back(orientedReadId);
-            }
-        } else {
-            if(itB->positionInJourney > itA->positionInJourney) {
-                orientedReadIds.push_back(orientedReadId);
+        // Skip reads whose filtered journey dropped either endpoint anchor
+        // (positionInJourney == invalid). Such a read no longer traverses this
+        // anchor pair; including it would compare against the invalid sentinel
+        // (0xFFFFFFFF), which is not symmetric between an edge and its reverse
+        // complement and breaks the downstream coverage(a) == coverage(a^1)
+        // check. When journeys are unfiltered no member is ever invalid, so this
+        // is a no-op for the default path.
+        const bool eitherInvalid =
+            itA->positionInJourney == invalid<uint32_t> ||
+            itB->positionInJourney == invalid<uint32_t>;
+        if(!eitherInvalid) {
+            if(adjacentInJourney) {
+                if(itB->positionInJourney == itA->positionInJourney + 1) {
+                    orientedReadIds.push_back(orientedReadId);
+                }
+            } else {
+                if(itB->positionInJourney > itA->positionInJourney) {
+                    orientedReadIds.push_back(orientedReadId);
+                }
             }
         }
 

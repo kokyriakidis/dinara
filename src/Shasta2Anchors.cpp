@@ -642,6 +642,13 @@ void Shasta2Anchors::findChildren(
         const OrientedReadId orientedReadId = markerInfo.orientedReadId;
         const auto journey = journeys[orientedReadId];
         const uint64_t position = markerInfo.positionInJourney;
+        // A read whose filtered journey no longer includes this anchor has
+        // positionInJourney == invalid here; it does not transition out of this
+        // anchor, so skip it (guards against invalid+1 == 0 aliasing to
+        // journey[0], which would add a spurious, non-RC-symmetric child).
+        if(position == invalid<uint32_t>) {
+            continue;
+        }
         const uint64_t nextPosition = position + 1;
         if(nextPosition < journey.size()) {
             const Shasta2AnchorId nextAnchorId = journey[nextPosition];
@@ -664,6 +671,13 @@ void Shasta2Anchors::findParents(
         const OrientedReadId orientedReadId = markerInfo.orientedReadId;
         const auto journey = journeys[orientedReadId];
         const uint64_t position = markerInfo.positionInJourney;
+        // A read whose filtered journey no longer includes this anchor has
+        // positionInJourney == invalid here; it does not transition into this
+        // anchor, so skip it (guards against invalid-1 indexing journey out of
+        // bounds and producing a non-RC-symmetric parent).
+        if(position == invalid<uint32_t>) {
+            continue;
+        }
         if(position > 0) {
             const uint64_t previousPosition = position - 1;
             const Shasta2AnchorId previousAnchorId = journey[previousPosition];
