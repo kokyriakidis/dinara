@@ -30,13 +30,27 @@ struct CleanWindowCandidate {
     uint32_t begin;
     uint32_t end;
     uint64_t baseSpan;
+    uint64_t anchorCount;
     uint64_t readLength;
     uint32_t generation;
 };
 
+// Priority key for the seeding heap. When false (default), candidates are popped
+// largest base span first (the original behavior). When true, they are popped
+// largest anchor count first, so windows are seeded from the interval covering
+// the most anchors rather than the most base pairs. Base span and anchor count
+// swap primary/secondary roles so each remains the tiebreak of the other.
+constexpr bool orderByAnchorCount = true;
+
 struct CleanWindowCandidateLess {
     bool operator()(const CleanWindowCandidate& a, const CleanWindowCandidate& b) const {
-        if(a.baseSpan != b.baseSpan) return a.baseSpan < b.baseSpan;
+        if(orderByAnchorCount) {
+            if(a.anchorCount != b.anchorCount) return a.anchorCount < b.anchorCount;
+            if(a.baseSpan != b.baseSpan) return a.baseSpan < b.baseSpan;
+        } else {
+            if(a.baseSpan != b.baseSpan) return a.baseSpan < b.baseSpan;
+            if(a.anchorCount != b.anchorCount) return a.anchorCount < b.anchorCount;
+        }
         if(a.readLength != b.readLength) return a.readLength < b.readLength;
         return a.backboneOrientedReadId.getValue() > b.backboneOrientedReadId.getValue();
     }
@@ -192,6 +206,7 @@ void Assembler::computeAnchorWindowsClean(
             begin,
             end,
             span,
+            uint64_t(end - begin),
             reads->getReadRawSequenceLength(oid.getReadId()),
             candidateGeneration[uint64_t(oid.getReadId())]});
     };
