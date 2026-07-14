@@ -241,11 +241,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // connectivity. Requires connectOneToOneWindows = true (this overrides the
     // degree gate inside that block).
     //
-    // Disabled (false): restore the strict 1-to-1 degree gate so only
-    // unambiguous linear links between disjoint cores are added (A's only
-    // out-neighbor is B and B's only in-neighbor is A). Forks/joins are left
-    // for the bridge stage.
-    constexpr bool connectAllWindows = false;
+    // Enabled (true): bypass the strict 1-to-1 degree gate and connect every
+    // read-supported window pair (forks/joins included). The coverage filters
+    // (minInterWindowCoverage / minInterWindowEdgeCoverage) still apply, so the
+    // pair must clear those thresholds to get an edge.
+    constexpr bool connectAllWindows = true;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
