@@ -726,13 +726,12 @@ void Assembler::computeAnchorWindowsClean(
     // first, with no preceding full-journey-cores pass. Experimental toggle;
     // when false, the two-pass scheme (cores, then optional tiling) runs.
     //
-    // Disabled (false): use the two-pass scheme. Its first pass seeds windows
-    // ONLY from reads whose entire journey is still unclaimed (pristine
-    // full-journey cores), and the fragment-tiling second pass is gated by
-    // tileUnclaimedIntervals. With tileUnclaimedIntervals=false this yields
-    // disjoint full-journey windows only (reads whose journey overlaps an
-    // already-claimed core get no window).
-    constexpr bool purePriorityQueue = false;
+    // Enabled (true): single-pass unclaimed seeding. There is no full-journey-
+    // cores priority pass -- the heap is drained greedily longest-base-span
+    // first, and every contiguous unclaimed run (whole journey or fragment)
+    // seeds a window as it is popped. This ignores the tileUnclaimedIntervals
+    // argument (the two-pass branch below does not run).
+    constexpr bool purePriorityQueue = true;
     if(purePriorityQueue) {
         runPqPass(true);
     } else {
