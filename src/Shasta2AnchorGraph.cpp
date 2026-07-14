@@ -866,10 +866,10 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                     strandRejectPairs.insert({A, B});
                     continue;
                 }
-                std::set<uint32_t> physicalReads;
-                for(const auto& t : transitions) physicalReads.insert(t.oidValue / 2);
+                std::set<uint32_t> orientedReads;
+                for(const auto& t : transitions) orientedReads.insert(t.oidValue);
                 const uint8_t c = uint8_t(strandOf(A) ^ strandOf(B));
-                candidates.push_back({a, b, c, A, B, physicalReads.size()});
+                candidates.push_back({a, b, c, A, B, orientedReads.size()});
             }
 
             // Strongest support first; deterministic tie-break.
@@ -957,15 +957,15 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
             // Coverage filter on the active path. When enabled, require the
             // window pair to be supported by at least minInterWindowCoverage
-            // distinct physical reads (oidValue/2 collapses the two strands of
-            // a read), and the chosen anchor pair to have at least
-            // minInterWindowEdgeCoverage coverage. Off by default so the
-            // current all-pairs behavior is unchanged.
+            // distinct oriented reads (each strand counted separately), and the
+            // chosen anchor pair to have at least minInterWindowEdgeCoverage
+            // coverage. Off by default so the current all-pairs behavior is
+            // unchanged.
             constexpr bool applyInterWindowCoverageFilter = true;
             if(applyInterWindowCoverageFilter && minInterWindowCoverage > 1) {
-                std::set<uint32_t> physicalReads;
-                for(const auto& t : transitions) physicalReads.insert(t.oidValue / 2);
-                if(physicalReads.size() < minInterWindowCoverage) {
+                std::set<uint32_t> orientedReads;
+                for(const auto& t : transitions) orientedReads.insert(t.oidValue);
+                if(orientedReads.size() < minInterWindowCoverage) {
                     ++interWindowLowCoverageSkipped;
                     continue;
                 }
@@ -1056,17 +1056,17 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         std::map<std::pair<uint32_t, uint32_t>, PairScore> pairScore;
 
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            // Distinct physical reads and their summed length.
-            std::set<uint32_t> physicalReads;
+            // Distinct oriented reads and their summed length.
+            std::set<uint32_t> orientedReads;
             uint64_t lengthSum = 0;
             for(const auto& t : transitions) {
-                if(physicalReads.insert(t.oidValue / 2).second) {
+                if(orientedReads.insert(t.oidValue).second) {
                     lengthSum += readLengthOf(t.oidValue);
                 }
             }
-            if(physicalReads.size() < minInterWindowCoverage) continue;
+            if(orientedReads.size() < minInterWindowCoverage) continue;
 
-            const PairScore s{physicalReads.size(), lengthSum};
+            const PairScore s{orientedReads.size(), lengthSum};
             pairScore[windowPair] = s;
             // RC mirror pair carries the same score (mirror edge is created too).
             const std::pair<uint32_t, uint32_t> mirror(
@@ -1105,11 +1105,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t interWindowNotReciprocal = 0;
 
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            std::set<uint32_t> physicalReads;
+            std::set<uint32_t> orientedReads;
             for(const auto& t : transitions) {
-                physicalReads.insert(t.oidValue / 2);
+                orientedReads.insert(t.oidValue);
             }
-            if(physicalReads.size() < minInterWindowCoverage) {
+            if(orientedReads.size() < minInterWindowCoverage) {
                 ++interWindowSkipped;
                 continue;
             }
@@ -1170,12 +1170,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         uint64_t interWindowSkipped = 0;
 
         for(const auto& [windowPair, transitions] : windowPairTransitions) {
-            // Count distinct physical reads (deduplicate by read ID).
-            std::set<uint32_t> physicalReads;
+            // Count distinct oriented reads (each strand counted separately).
+            std::set<uint32_t> orientedReads;
             for(const auto& t : transitions) {
-                physicalReads.insert(t.oidValue / 2);
+                orientedReads.insert(t.oidValue);
             }
-            if(physicalReads.size() < minInterWindowCoverage) {
+            if(orientedReads.size() < minInterWindowCoverage) {
                 ++interWindowSkipped;
                 continue;
             }
