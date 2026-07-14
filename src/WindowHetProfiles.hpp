@@ -69,6 +69,9 @@ struct KwMemberProfile {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> deletionRanges;
     // Sorted, non-overlapping [begin, end) backbone ranges flagged noisy.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> noisyRanges;
+    // Sorted backbone positions with an insertion immediately before them (i.e.
+    // this read carries >=1 inserted base between pos-1 and pos on the backbone).
+    std::vector<std::uint32_t> insertionSites;
 
     static bool inRanges(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& ranges,
                          std::uint32_t pos) {
@@ -83,6 +86,10 @@ struct KwMemberProfile {
     }
     bool isDeleted(std::uint32_t pos) const { return inRanges(deletionRanges, pos); }
     bool isNoisy(std::uint32_t pos) const { return inRanges(noisyRanges, pos); }
+    // True if this read has an insertion immediately before backbone position pos.
+    bool hasInsertionAt(std::uint32_t pos) const {
+        return std::binary_search(insertionSites.begin(), insertionSites.end(), pos);
+    }
 };
 
 // Resolve the per-allele support cutoff used by the het gates. If the caller
@@ -226,6 +233,15 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         return d;
     };
 
+    // Per-column insertion support (spanning members carrying an insertion
+    // immediately before this position). Used only by the flank-linearity gate.
+    auto insSupportAt = [&](uint32_t pos) -> uint32_t {
+        uint32_t n = 0;
+        for (const auto& prof : profiles)
+            if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.hasInsertionAt(pos)) n++;
+        return n;
+    };
+
     // abPOA-matching per-allele support cutoff (shared derivation so the
     // interval-skip pre-filter uses the identical threshold).
     const int minSupport = resolveHetMinSupport(hetMinSupport, coverageHet);
@@ -282,9 +298,9 @@ inline std::uint32_t emitHetBubblesFromProfiles(
 
     // Flank-linearity gate (majority-based reconstruction of abPOA's degree-1
     // predPrev/commonPred and commonSucc/succNext test). A flank column breaks
-    // linearity only if a competing base allele OR a deletion reaches minSupport
-    // there. Columns p-4..p-1,p+1..p+4 are checked so >=4 linear bases
-    // separate accepted SNPs (chainable homs) on each side.
+    // linearity only if a competing base allele, a deletion, OR an insertion
+    // reaches minSupport there. Columns p-4..p-1,p+1..p+4 are checked so >=4
+    // linear bases separate accepted SNPs (chainable homs) on each side.
     auto flanksLinear = [&](uint32_t pos) -> bool {
         if (pos < windowBbBegin + 4) return false;
         if (pos + 4 >= windowBbEnd) return false;
@@ -298,6 +314,7 @@ inline std::uint32_t emitHetBubblesFromProfiles(
                     return false;
             }
             if (delSupportAt(c) >= uint32_t(minSupport)) return false;
+            if (insSupportAt(c) >= uint32_t(minSupport)) return false;
         }
         return true;
     };

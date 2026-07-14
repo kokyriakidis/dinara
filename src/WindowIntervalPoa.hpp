@@ -190,6 +190,10 @@ struct IpoaReadFrag {
     std::vector<KwAlignedCol> alignedCols;
     std::vector<KwSnp> snps;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> deletionRanges;
+    // Backbone positions with an insertion immediately BEFORE them (the aligned
+    // base at this position is preceded by >=1 read base with no backbone
+    // column). Mirrors deletionRanges' use of the trailing backbone position.
+    std::vector<std::uint32_t> insertionSites;
     std::int64_t firstBb = -1;
     std::int64_t lastBb = -1;
 };
@@ -634,6 +638,7 @@ inline void runIpoaOnRows(
             if (!row[col].isGap()) readAbs++;
 
         int64_t pendingDelBegin = -1;
+        bool pendingInsertion = false;
         bool entered = false;
 
         // Bound the read position by the member's segment [cBegin, cEnd) on BOTH
@@ -682,6 +687,12 @@ inline void runIpoaOnRows(
                             {uint32_t(pendingDelBegin), uint32_t(bbPos)});
                         pendingDelBegin = -1;
                     }
+                    // An insertion accumulated in the backbone-gap columns just
+                    // before this aligned base: attach it to this backbone pos.
+                    if (pendingInsertion) {
+                        rf.insertionSites.push_back(uint32_t(bbPos));
+                        pendingInsertion = false;
+                    }
                     entered = true;
                     readAbs++;
                 } else {
@@ -689,7 +700,13 @@ inline void runIpoaOnRows(
                         pendingDelBegin = bbPos;
                 }
             } else {
-                if (!mb.isGap()) readAbs++;
+                if (!mb.isGap()) {
+                    // Read base with no backbone column = inserted base. Flag it
+                    // (only once we are inside the read's aligned span) so the
+                    // next aligned backbone column records the insertion site.
+                    if (entered) pendingInsertion = true;
+                    readAbs++;
+                }
             }
         }
         (void)pendingDelBegin;
@@ -816,6 +833,7 @@ struct IpoaAccum {
     std::vector<KwAlignedCol> alignedCols;
     std::vector<KwSnp> snps;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> deletionRanges;
+    std::vector<std::uint32_t> insertionSites;
     std::int64_t firstBb = -1;
     std::int64_t lastBb = -1;
 };
@@ -852,6 +870,8 @@ inline void accumulateIpoaFragmentUnlocked(IpoaWindowAccum& wa, IpoaFragment& fr
         acc.snps.insert(acc.snps.end(), rf.snps.begin(), rf.snps.end());
         acc.deletionRanges.insert(acc.deletionRanges.end(),
             rf.deletionRanges.begin(), rf.deletionRanges.end());
+        acc.insertionSites.insert(acc.insertionSites.end(),
+            rf.insertionSites.begin(), rf.insertionSites.end());
         if (rf.firstBb >= 0 && (acc.firstBb < 0 || rf.firstBb < acc.firstBb))
             acc.firstBb = rf.firstBb;
         if (rf.lastBb > acc.lastBb) acc.lastBb = rf.lastBb;
@@ -877,6 +897,8 @@ inline void accumulateIpoaFragment(IpoaWindowAccum& wa, IpoaFragment& frag)
         acc.snps.insert(acc.snps.end(), rf.snps.begin(), rf.snps.end());
         acc.deletionRanges.insert(acc.deletionRanges.end(),
             rf.deletionRanges.begin(), rf.deletionRanges.end());
+        acc.insertionSites.insert(acc.insertionSites.end(),
+            rf.insertionSites.begin(), rf.insertionSites.end());
         if (rf.firstBb >= 0 && (acc.firstBb < 0 || rf.firstBb < acc.firstBb))
             acc.firstBb = rf.firstBb;
         if (rf.lastBb > acc.lastBb) acc.lastBb = rf.lastBb;
@@ -986,6 +1008,14 @@ inline std::uint32_t mergeAndEmitIpoaWindow(
                 else merged.push_back(r);
             }
             prof.deletionRanges = std::move(merged);
+        }
+
+        if (!acc.insertionSites.empty()) {
+            sort(acc.insertionSites.begin(), acc.insertionSites.end());
+            acc.insertionSites.erase(
+                unique(acc.insertionSites.begin(), acc.insertionSites.end()),
+                acc.insertionSites.end());
+            prof.insertionSites = std::move(acc.insertionSites);
         }
 
         profiles.push_back(std::move(prof));
