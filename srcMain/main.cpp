@@ -2043,6 +2043,17 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
+    // Filter each read's journey to its longest well-supported anchor chain
+    // (every consecutive pair sharing >= minCommonForBackbone reads, bounded
+    // look-back maxSkipForBackbone). Runs per read independently and rewrites
+    // the stored journeys + positionInJourney before any windowing decision, so
+    // every downstream stage sees the cleaned chains.
+    cout << timestamp << "Filtering journeys by anchor chaining..." << endl;
+    shasta2Journeys->filterByAnchorChaining(
+        assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone,
+        assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone,
+        threadCount);
+
     // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
     // assembler.phaseOverlapsMSA(threadCount);
 

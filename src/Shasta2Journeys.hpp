@@ -36,6 +36,22 @@ public:
     // Access from binary data.
     Shasta2Journeys(const MappedMemoryOwner&);
 
+    // Rewrite each oriented read's journey in place, keeping only the longest
+    // chain of anchors where every consecutive pair in the chain has at least
+    // minCommonForBackbone common reads (forward flow), looking back at most
+    // maxSkipForBackbone positions. Each read is filtered independently -- the
+    // decision for one read never depends on any other read's journey (it uses
+    // only pairwise anchor countCommon, which is a global anchor-pair property).
+    // No endpoints are forced: a read whose anchors are weakly linked collapses
+    // to its longest well-supported subsequence. The stored journeys and every
+    // anchor's positionInJourney are rebuilt to match; anchors dropped from a
+    // read's chain get positionInJourney = invalid for that read.
+    // Requires the Anchors pointer retained from initial creation.
+    void filterByAnchorChaining(
+        uint64_t minCommonForBackbone,
+        uint64_t maxSkipForBackbone,
+        uint64_t threadCount);
+
     // Return the Journey for an oriented read.
     Shasta2Journey operator[](OrientedReadId orientedReadId) const
     {
@@ -67,5 +83,13 @@ private:
 
     // Temporary storage of journeys with ordinals.
     MemoryMapped::VectorOfVectors<pair<uint64_t, uint32_t>, uint64_t> journeysWithOrdinals;
+
+    // Transient state for filterByAnchorChaining. filteredJourneys[oidValue]
+    // holds the surviving anchor ids for that oriented read; each entry is
+    // written by exactly one thread, so no locking is needed.
+    std::vector<std::vector<Shasta2AnchorId>> filteredJourneys;
+    uint64_t filterMinCommon = 0;
+    uint64_t filterMaxSkip = 0;
+    void filterThreadFunction(uint64_t threadId);
 
 };
