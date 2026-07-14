@@ -623,6 +623,15 @@ public:
     // than it kept.
     bool hetDropRepeat;
 
+    // Skip het-anchor detection in windows that are highly connected on both
+    // sides -- i.e. windows with at least this many distinct incoming AND this
+    // many distinct outgoing inter-window neighbors. Such windows sit at
+    // tangles/repeats where per-window het calls are unreliable. A window is
+    // skipped only when BOTH its in-degree and out-degree meet the threshold.
+    // 0 disables the gate (default), so behavior is unchanged unless set.
+    uint64_t hetMaxWindowInDegree;
+    uint64_t hetMaxWindowOutDegree;
+
     // Options used by class mode3::LocalAssembly
     class LocalAssemblyOptions {
     public:

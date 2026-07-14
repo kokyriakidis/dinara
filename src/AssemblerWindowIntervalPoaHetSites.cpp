@@ -161,7 +161,8 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
     bool hetDropRepeat,
     uint64_t threadCount,
     uint64_t& hetWindowsOut,
-    uint64_t& totalBubblesOut) const
+    uint64_t& totalBubblesOut,
+    const vector<bool>* skipWindow) const
 {
     const Reads& rds = getReads();
     const auto& mkrs = *markers;
@@ -224,6 +225,10 @@ uint32_t Assembler::intervalPoaDetectHetBubblesAllWindows(
                 const uint64_t idx = nextIdx.fetch_add(1);
                 if (idx >= nWindows) break;
                 const uint32_t w = order[idx];
+
+                // Highly connected tangle windows are gated out: leave them
+                // homozygous (hetBubbles already cleared above) and skip the MSA.
+                if (skipWindow != nullptr && (*skipWindow)[w]) continue;
 
                 const auto tPlan0 = timing ?
                     std::chrono::steady_clock::now() :

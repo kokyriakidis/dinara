@@ -4021,7 +4021,11 @@ public:
         bool hetDropRepeat,
         uint64_t threadCount,
         uint64_t& hetWindowsOut,
-        uint64_t& totalBubblesOut) const;
+        uint64_t& totalBubblesOut,
+        // Optional per-window skip mask (size == windows.size()). When set and
+        // skipWindow[w] is true, window w is left homozygous (no het detection).
+        // Used to suppress het calls in highly connected tangle windows.
+        const std::vector<bool>* skipWindow = nullptr) const;
 
     // Test computeAnchorWindowsClean on the longest read, then build
     // a restricted anchor graph from the kept anchors and write GFA.

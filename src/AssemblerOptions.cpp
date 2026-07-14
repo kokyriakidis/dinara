@@ -1536,6 +1536,22 @@ void AssemblerOptions::addConfigurableOptions()
         "hetDropHomopolymer. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.hetMaxWindowInDegree",
+        value<uint64_t>(&assemblyOptions.mode3Options.hetMaxWindowInDegree)->
+        default_value(0),
+        "Skip het-anchor detection in windows whose distinct incoming "
+        "inter-window neighbor count is >= this value AND whose outgoing "
+        "count is >= hetMaxWindowOutDegree. 0 disables the gate. "
+        "(Mode 3 assembly only).")
+
+        ("Assembly.mode3.hetMaxWindowOutDegree",
+        value<uint64_t>(&assemblyOptions.mode3Options.hetMaxWindowOutDegree)->
+        default_value(0),
+        "Skip het-anchor detection in windows whose distinct outgoing "
+        "inter-window neighbor count is >= this value AND whose incoming "
+        "count is >= hetMaxWindowInDegree. 0 disables the gate. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
         default_value(0),
@@ -1993,6 +2009,8 @@ void Mode3AssemblyOptions::write(ostream& s) const
         convertBoolToPythonString(hetDropHomopolymer) << "\n";
     s << "mode3.hetDropRepeat = " <<
         convertBoolToPythonString(hetDropRepeat) << "\n";
+    s << "mode3.hetMaxWindowInDegree = " << hetMaxWindowInDegree << "\n";
+    s << "mode3.hetMaxWindowOutDegree = " << hetMaxWindowOutDegree << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);

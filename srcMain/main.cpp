@@ -2095,6 +2095,57 @@ void dinara::main::assemble(
         &anchorDovetailWindow,
         /* tileUnclaimedIntervals = */ true);
 
+    // High-connectivity het gate: optionally suppress het detection in windows
+    // that sit at tangles/repeats -- i.e. windows with many distinct incoming
+    // AND many distinct outgoing inter-window neighbors. Per-window het calls in
+    // such windows are unreliable, so we leave them homozygous.
+    //
+    // In/out degree is derived from the same per-window transition map the
+    // anchor-graph constructor consumes. computeWindowTransitions clears and
+    // repopulates its output fields on entry, so calling it here (before het
+    // detection) and again later (before the graph build) is safe and idempotent
+    // for the same journeys/windows. It reads only anchors/journeys/windows.
+    std::vector<bool> hetSkipWindow;
+    {
+        const uint64_t hetMaxInDeg =
+            assemblerOptions.assemblyOptions.mode3Options.hetMaxWindowInDegree;
+        const uint64_t hetMaxOutDeg =
+            assemblerOptions.assemblyOptions.mode3Options.hetMaxWindowOutDegree;
+        // Gate is active only when BOTH thresholds are set (>0); either at 0
+        // disables it (0 would otherwise match every window trivially).
+        if(hetMaxInDeg > 0 && hetMaxOutDeg > 0) {
+            computeWindowTransitions(*shasta2Anchors, *shasta2Journeys,
+                anchorWindows, &anchorDovetailWindow);
+
+            hetSkipWindow.assign(anchorWindows.size(), false);
+            const uint32_t noW = AnchorWindowReadInterval::noWindow;
+            uint64_t gatedWindows = 0;
+            for(uint64_t w = 0; w < anchorWindows.size(); w++) {
+                // Count distinct incoming and outgoing neighbor windows from the
+                // transition keys (previousWindow, nextWindow); noWindow (read
+                // starts/ends here) is not a real neighbor.
+                std::set<uint32_t> inNbrs;
+                std::set<uint32_t> outNbrs;
+                for(const auto& kv : anchorWindows[w].transitionReads) {
+                    const uint32_t prev = kv.first.first;
+                    const uint32_t next = kv.first.second;
+                    if(prev != noW) inNbrs.insert(prev);
+                    if(next != noW) outNbrs.insert(next);
+                }
+                if(inNbrs.size() >= hetMaxInDeg && outNbrs.size() >= hetMaxOutDeg) {
+                    hetSkipWindow[w] = true;
+                    gatedWindows++;
+                }
+            }
+            cout << timestamp << "High-connectivity het gate active"
+                 << " (minInDegree=" << hetMaxInDeg
+                 << ", minOutDegree=" << hetMaxOutDeg
+                 << "): gating " << gatedWindows << " of "
+                 << anchorWindows.size() << " windows out of het detection."
+                 << endl;
+        }
+    }
+
     // Per-window het-bubble detection. Interchangeable engines produce the
     // SAME output (AnchorWindow::hetBubbles), so the downstream plan/append/stage
     // passes are identical regardless of which one runs:
@@ -2142,7 +2193,8 @@ void dinara::main::assemble(
             assembler.intervalPoaDetectHetBubblesAllWindows(
                 anchorWindows, *shasta2Anchors, *shasta2Journeys,
                 hetMinVaf, hetMinSupport, hetDropHomopolymer, hetDropRepeat,
-                threadCount, hetWindows, totalBubbles);
+                threadCount, hetWindows, totalBubbles,
+                hetSkipWindow.empty() ? nullptr : &hetSkipWindow);
             const double hetSecs = seconds(steady_clock::now() - tHet0);
             cout << timestamp << "per-interval POA het-bubble detection complete."
                  << " hetWindows=" << hetWindows
@@ -2158,7 +2210,9 @@ void dinara::main::assemble(
             // CIGAR-density noise filter window/threshold (HiFi defaults 100/5).
             constexpr int noisyRegSlideWin = 100;
             constexpr int noisyRegMaxXgaps = 5;
-            for(AnchorWindow& window : anchorWindows) {
+            for(uint64_t wi = 0; wi < anchorWindows.size(); wi++) {
+                if(!hetSkipWindow.empty() && hetSkipWindow[wi]) continue;
+                AnchorWindow& window = anchorWindows[wi];
                 const uint32_t n = assembler.ksw2DetectHetBubblesInWindow(
                     window, *shasta2Anchors, *shasta2Journeys,
                     assemblerOptions.alignOptions,
