@@ -8,7 +8,10 @@
 using namespace dinara;
 
 #include <algorithm>
+#include <iostream>
 #include <thread>
+using std::cout;
+using std::endl;
 
 // Explicit instantiation.
 #include "MultithreadedObject.tpp"
@@ -259,6 +262,20 @@ void Shasta2Journeys::filterByAnchorChaining(
     setupLoadBalancing(orientedReadCount, orientedReadBatchCount);
     runThreads(&Shasta2Journeys::filterThreadFunction, threadCount);
 
+    // Report how much the filter removed.
+    {
+        uint64_t anchorsBefore = 0, anchorsAfter = 0, collapsed = 0;
+        for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
+            anchorsBefore += journeys[oidValue].size();
+            anchorsAfter += filteredJourneys[oidValue].size();
+            if(journeys[oidValue].size() >= 2 && filteredJourneys[oidValue].size() < 2) collapsed++;
+        }
+        cout << timestamp << "Journey filtering: anchors " << anchorsBefore
+            << " -> " << anchorsAfter << ", " << collapsed
+            << " journeys collapsed below 2 anchors (minCommon=" << minCommonForBackbone
+            << " maxSkip=" << maxSkipForBackbone << ")." << endl;
+    }
+
     // Pass B: rebuild the journeys VectorOfVectors in place from
     // filteredJourneys. The old content has already been captured into
     // filteredJourneys (pass A), so the fixed-size mmap storage is dropped and
@@ -271,12 +288,21 @@ void Shasta2Journeys::filterByAnchorChaining(
         journeys.incrementCount(oidValue, filteredJourneys[oidValue].size());
     }
     journeys.beginPass2();
+    // Fill by direct index assignment, NOT store(): store() writes each vector
+    // back-to-front (it decrements the per-index count), which would reverse
+    // every journey and break the ordinal monotonicity window construction
+    // relies on. beginPass2 has already allocated the exact space.
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-        for(const Shasta2AnchorId anchorId : filteredJourneys[oidValue]) {
-            journeys.store(oidValue, anchorId);
+        const auto journey = journeys[oidValue];
+        const std::vector<Shasta2AnchorId>& filtered = filteredJourneys[oidValue];
+        DINARA_ASSERT(journey.size() == filtered.size());
+        for(uint64_t i = 0; i < filtered.size(); i++) {
+            journey[i] = filtered[i];
         }
     }
-    journeys.endPass2();
+    // count was consumed by incrementCount but store() never ran, so skip the
+    // all-zero check (check=false); free the count vector (free=true).
+    journeys.endPass2(false, true);
     filteredJourneys.clear();
     filteredJourneys.shrink_to_fit();
 
