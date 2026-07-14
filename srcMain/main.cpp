@@ -2054,7 +2054,9 @@ void dinara::main::assemble(
     cout << timestamp << "Computing anchor windows..." << endl;
     // ========================================================================
     // PHASE 1: Window creation.
-    // Partitions anchors into disjoint windows (one whole read journey each).
+    // Partitions anchors into disjoint windows. A first pass seeds pristine
+    // full-journey cores (one window = one whole read journey); a second pass
+    // then tiles the leftover unclaimed base spans into fragment windows.
     // Produces `anchorWindows` only — no inter-window edges, no transitions.
     // ========================================================================
     vector<AnchorWindow> anchorWindows;
@@ -2063,11 +2065,13 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
-    // Full-journey-only disjoint windows: seed a window only from a read whose
-    // entire journey is still unclaimed (pristine core), claiming its anchors so
-    // windows never overlap. tileUnclaimedIntervals=false skips the fragment
-    // second pass, so reads whose journey overlaps an already-claimed core get
-    // no window (requires purePriorityQueue=false in computeAnchorWindowsClean).
+    // Full-journey cores first, then tile the seams: pass 1 seeds a window only
+    // from a read whose entire journey is still unclaimed (pristine core),
+    // claiming its anchors so windows never overlap. tileUnclaimedIntervals=true
+    // enables the fragment second pass, so reads whose journey overlaps an
+    // already-claimed core still contribute windows from their remaining
+    // contiguous unclaimed runs (longest base span first) rather than being
+    // dropped.
     assembler.computeAnchorWindowsClean(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
@@ -2078,7 +2082,7 @@ void dinara::main::assemble(
         maxSkipForBackbone,
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow,
-        /* tileUnclaimedIntervals = */ false);
+        /* tileUnclaimedIntervals = */ true);
 
     // Per-window het-bubble detection. Interchangeable engines produce the
     // SAME output (AnchorWindow::hetBubbles), so the downstream plan/append/stage
