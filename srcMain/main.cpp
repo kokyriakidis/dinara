@@ -2063,9 +2063,12 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
-    // Two-pass: disjoint full-journey cores, then tile leftover unclaimed
-    // intervals into fragment windows (longest first).
-    assembler.computeAnchorWindowsWithUnclaimed(
+    // Full-journey-only disjoint windows: seed a window only from a read whose
+    // entire journey is still unclaimed (pristine core), claiming its anchors so
+    // windows never overlap. tileUnclaimedIntervals=false skips the fragment
+    // second pass, so reads whose journey overlaps an already-claimed core get
+    // no window (requires purePriorityQueue=false in computeAnchorWindowsClean).
+    assembler.computeAnchorWindowsClean(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
         readIdsSortedByLength,
@@ -2074,7 +2077,8 @@ void dinara::main::assemble(
         minCommonForBackbone,
         maxSkipForBackbone,
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
-        &anchorDovetailWindow);
+        &anchorDovetailWindow,
+        /* tileUnclaimedIntervals = */ false);
 
     // Per-window het-bubble detection. Interchangeable engines produce the
     // SAME output (AnchorWindow::hetBubbles), so the downstream plan/append/stage
