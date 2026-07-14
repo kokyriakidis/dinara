@@ -240,7 +240,12 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // (support >= 1), forward and RC-mirror, giving the full inter-window
     // connectivity. Requires connectOneToOneWindows = true (this overrides the
     // degree gate inside that block).
-    constexpr bool connectAllWindows = true;
+    //
+    // Disabled (false): restore the strict 1-to-1 degree gate so only
+    // unambiguous linear links between disjoint cores are added (A's only
+    // out-neighbor is B and B's only in-neighbor is A). Forks/joins are left
+    // for the bridge stage.
+    constexpr bool connectAllWindows = false;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
