@@ -62,6 +62,14 @@ namespace dinara {
         uint64_t length,
         ShortBaseSequence<uint64_t>&);
 
+#ifdef DINARA_LONG_MARKERS
+    extern template void extractKmer(
+        const LongBaseSequenceView&,
+        uint64_t position,
+        uint64_t length,
+        ShortBaseSequence<__uint128_t>&);
+#endif
+
 }
 
 

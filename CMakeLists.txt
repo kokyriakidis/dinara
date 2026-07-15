@@ -54,6 +54,21 @@ option(BUILD_DEBUG "Make a debuggable build." OFF)
 message(STATUS "BUILD_DEBUG is " ${BUILD_DEBUG})
 
 
+
+# Option to enable long marker k-mers (k up to 126).
+# When ON (the default), KmerId is a 256-bit POD (Uint256) so markers with
+# k > 64 are supported, matching shasta2's capacity-128 Kmer. When OFF, KmerId
+# is a 128-bit integer (k up to 62), which uses less transient memory during
+# assembly (16 vs 32 bytes per stored KmerId) at the cost of the longer-k path.
+# Turn OFF for full-genome, small-k runs where peak memory is a concern:
+#   cmake -DDINARA_LONG_MARKERS=OFF
+option(DINARA_LONG_MARKERS "Support long marker k-mers (k up to 126)." ON)
+message(STATUS "DINARA_LONG_MARKERS is " ${DINARA_LONG_MARKERS})
+if(DINARA_LONG_MARKERS)
+    add_compile_definitions(DINARA_LONG_MARKERS)
+endif()
+
+
 # Discover htslib and libcurl link flags for static linking.
 # We run pkg-config --libs --static to get the full transitive dependency
 # list and pass the raw flags to the linker.

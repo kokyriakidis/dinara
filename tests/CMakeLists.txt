@@ -136,9 +136,31 @@ set_target_properties(test_integration PROPERTIES
     BUILD_RPATH "${DINARA_BUILD_DIR}/lib"
 )
 
+# ============================================================================
+# LONG-MARKERS UNIT TEST (compiled with -DDINARA_LONG_MARKERS)
+# ============================================================================
+# Validates the capacity-128 Kmer / 256-bit KmerId primitives (Uint256,
+# ShortBaseSequence<__uint128_t>, id() round-trip, reverseComplement,
+# extractKmer) in isolation. This is a focused unit target rather than a full
+# rebuild of dinara under the flag: only the minimal sources the primitives
+# depend on are compiled here.
+add_executable(test_long_markers
+    test_long_markers.cpp
+    ${DINARA_ROOT}/src/extractKmer.cpp
+    ${DINARA_ROOT}/src/DINARA_ASSERT.cpp
+    $<TARGET_OBJECTS:catch_main>
+)
+target_compile_definitions(test_long_markers PRIVATE DINARA_LONG_MARKERS)
+target_link_libraries(test_long_markers pthread)
+add_custom_command(TARGET test_long_markers POST_BUILD
+    COMMAND chmod +x $<TARGET_FILE:test_long_markers>
+    VERBATIM
+)
+
 # Enable CTest
 enable_testing()
 add_test(NAME IntegrationTests COMMAND test_integration)
+add_test(NAME LongMarkersTests COMMAND test_long_markers)
 
 # CI/dev environments can have LD_LIBRARY_PATH pointing at /usr/local/lib first.
 # Force our curated dependency builds (in ${DINARA_BUILD_DIR}/lib) to take precedence.

@@ -1,7 +1,7 @@
 #pragma once
 
 #ifdef DINARA_LONG_MARKERS
-#include <boost/multiprecision/cpp_int.hpp>
+#include "Uint256.hpp"
 #endif
 
 #include <cstdint.hpp>
@@ -15,7 +15,11 @@ namespace dinara {
     using KmerId64 = __uint128_t;
 
 #ifdef DINARA_LONG_MARKERS
-    using KmerId128 = boost::multiprecision::uint256_t;
+    // With capacity-128 Kmers, KmerId needs 256 bits. Use a flat POD type
+    // (four uint64_t words) rather than boost::multiprecision::uint256_t:
+    // KmerId is memory-mapped, hashed by raw bytes, and used as a hash-table
+    // key, all of which require a trivially copyable, flat byte layout.
+    using KmerId128 = Uint256;
     using KmerId = KmerId128;
 #else
     using KmerId = KmerId64;

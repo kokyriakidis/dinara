@@ -71,7 +71,9 @@ public:
     // Set the base at a given position.
     void set(uint64_t i, Base base) {
         const uint64_t bitIndex = capacityMinus1 - (i & capacityMinus1);
-        const Int mask = Int(1ULL << bitIndex);
+        // Shift in the Int type, not in uint64: bitIndex can reach capacity-1
+        // (127 for Kmer128), so a 64-bit shift would be undefined behavior.
+        const Int mask = Int(1ULL) << bitIndex;
         const Int maskComplement = Int(~mask);
 
         const uint64_t bit0 = (base.value) & 1ULL;
@@ -128,7 +130,8 @@ public:
     ShortBaseSequence<Int> reverseComplement(uint64_t n) const
     {
         const Int shift = Int(capacity - n);
-        const Int mask = Int(1ULL << n) - Int(1);
+        // Shift in the Int type: n can exceed 64 for Kmer128.
+        const Int mask = (Int(1ULL) << n) - Int(1);
         ShortBaseSequence<Int> reverseComplementedSequence;
         reverseComplementedSequence.data[0] = Int(((~bitReversal(data[0])) & mask) << shift);
         reverseComplementedSequence.data[1] = Int(((~bitReversal(data[1])) & mask) << shift);

@@ -111,7 +111,7 @@ void KmerTable::createKmerTable()
     for(uint64_t kmerId=0; kmerId<kmerCount; kmerId++) {
         const Kmer kmer(kmerId, k);
         const Kmer reverseComplementedKmer = kmer.reverseComplement(k);
-        kmerTable[kmerId].reverseComplementedKmerId = KmerId16(reverseComplementedKmer.id(k));
+        kmerTable[kmerId].reverseComplementedKmerId = KmerId16(uint64_t(reverseComplementedKmer.id(k)));
     }
     for(uint64_t kmerId=0; kmerId<kmerCount; kmerId++) {
         const uint64_t reverseComplementedKmerId = kmerTable[kmerId].reverseComplementedKmerId;
@@ -325,7 +325,7 @@ KmerTable1::KmerTable1(
         ++kmerCount;
 
         // If this k-mer is palindromic, we are done.
-        if(info.reverseComplementedKmerId == kmerId) {
+        if(info.reverseComplementedKmerId == uint64_t(kmerId)) {
             continue;
         }
 
@@ -665,7 +665,7 @@ KmerTable2::KmerTable2(
         ++kmerCount;
 
         // If this k-mer is palindromic, we are done.
-        if(info.reverseComplementedKmerId == kmerId) {
+        if(info.reverseComplementedKmerId == uint64_t(kmerId)) {
             continue;
         }
 
@@ -948,7 +948,7 @@ KmerTable4::KmerTable4(
             continue;
         }
         // Only store the lower KmerId in the pair.
-        if(kmerId > kmerIdRc) {
+        if(uint64_t(kmerId) > uint64_t(kmerIdRc)) {
             continue;
         }
         if(minimumDistance[uint64_t(kmerId)].second < distanceThreshold) {

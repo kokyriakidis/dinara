@@ -1386,8 +1386,15 @@ void dinara::main::assemble(
 
     // Various checks for option validity.
 
-    if(assemblerOptions.kmersOptions.k > 62 or assemblerOptions.kmersOptions.k < 6) {
-        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and 62.");
+#ifdef DINARA_LONG_MARKERS
+    // With capacity-128 Kmers (256-bit KmerId), k can be up to 126.
+    constexpr uint64_t maxK = 126;
+#else
+    constexpr uint64_t maxK = 62;
+#endif
+    if(assemblerOptions.kmersOptions.k > maxK or assemblerOptions.kmersOptions.k < 6) {
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and " +
+            to_string(maxK) + ".");
     }
 
     if((assemblerOptions.kmersOptions.k % 2) == 1) {
@@ -5172,8 +5179,15 @@ void dinara::main::svanchors(
     }
 
     const int k = assemblerOptions.kmersOptions.k;
-    if(k > 62 or k < 6) {
-        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and 62.");
+#ifdef DINARA_LONG_MARKERS
+    // With capacity-128 Kmers (256-bit KmerId), k can be up to 126.
+    constexpr int maxK = 126;
+#else
+    constexpr int maxK = 62;
+#endif
+    if(k > maxK or k < 6) {
+        throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and " +
+            to_string(maxK) + ".");
     }
     if((k % 2) == 1) {
         throw runtime_error("Invalid value specified for --Kmers.k. Must be even.");

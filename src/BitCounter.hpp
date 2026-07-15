@@ -9,7 +9,7 @@
 // and cannot be extended.
 
 #ifdef DINARA_LONG_MARKERS
-#include <boost/multiprecision/cpp_int.hpp>
+#include "Uint256.hpp"
 #endif
 
 #include <cstdint.hpp>
@@ -50,15 +50,15 @@ namespace dinara {
     public:
         static constexpr int numberOfBits = 128;
 #ifdef DINARA_LONG_MARKERS
-        using doubleSizeType = boost::multiprecision::uint256_t;
+        using doubleSizeType = Uint256;
 #endif
     };
 
 #ifdef DINARA_LONG_MARKERS
-    template<> class BitCounter<boost::multiprecision::uint256_t> {
+    template<> class BitCounter<Uint256> {
     public:
         static constexpr int numberOfBits = 256;
-        using doubleSizeType = boost::multiprecision::uint512_t;
+        // No doubleSizeType: nothing needs a 512-bit id for capacity-128 Kmers.
     };
 #endif
 }
