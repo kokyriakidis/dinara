@@ -2083,13 +2083,12 @@ void dinara::main::assemble(
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone;
-    // Full-journey cores first, then tile the seams: pass 1 seeds a window only
-    // from a read whose entire journey is still unclaimed (pristine core),
-    // claiming its anchors so windows never overlap. tileUnclaimedIntervals=true
-    // enables the fragment second pass, so reads whose journey overlaps an
-    // already-claimed core still contribute windows from their remaining
-    // contiguous unclaimed runs (longest base span first) rather than being
-    // dropped.
+    // Windows from full journeys only: pass 1 seeds a window only from a read
+    // whose entire journey is still unclaimed (pristine disjoint core), claiming
+    // its anchors so windows never overlap. tileUnclaimedIntervals=false disables
+    // the fragment second pass, so reads whose journey overlaps an already-claimed
+    // core contribute no window (their anchors stay unclaimed) rather than seeding
+    // fragment windows from leftover runs.
     assembler.computeAnchorWindowsClean(
         assembler.shasta2Anchors,
         assembler.shasta2Journeys,
@@ -2100,7 +2099,7 @@ void dinara::main::assemble(
         maxSkipForBackbone,
         assemblerOptions.assemblyOptions.mode3Options.minWindowBaseSpan,
         &anchorDovetailWindow,
-        /* tileUnclaimedIntervals = */ true);
+        /* tileUnclaimedIntervals = */ false);
 
     // High-connectivity het gate: optionally suppress het detection in windows
     // that sit at tangles/repeats -- i.e. windows with many distinct incoming
