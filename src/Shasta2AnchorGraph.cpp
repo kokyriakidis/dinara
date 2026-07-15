@@ -524,7 +524,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // so it is unaffected.
     uint64_t containedSkipCount = 0;
     const uint64_t journeyCount = journeys.size();
-    if(connectOneToOneWindows) {
+    if(connectOneToOneWindows && !edgelessWindows) {
     for(uint64_t oidValue = 0; oidValue < journeyCount; oidValue++) {
         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
         const auto journey = journeys[oid];
@@ -738,7 +738,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
     cout << "Inter-window discovery: " << windowPairTransitions.size()
          << " window pairs found." << endl;
-    }   // end if(connectOneToOneWindows): discovery pass
+    }   // end if(connectOneToOneWindows && !edgelessWindows): discovery pass
 
     // Edgeless-windows: skip all inter-window edge creation. Windows stay as
     // bare anchor sets (intra-window backbone chains above are kept).
@@ -753,7 +753,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // including the RC mirror pair so degrees are strand-symmetric. This adds
     // only unambiguous linear links between disjoint cores; forks (outdeg > 1)
     // and joins (indeg > 1) are left for the bridge stage.
-    if(connectOneToOneWindows) {
+    //
+    // Gated by !edgelessWindows: when edgeless, windows are kept disjoint and
+    // this connection block is skipped entirely (windowPairTransitions is empty
+    // anyway because the discovery pass above is also gated on !edgelessWindows).
+    if(connectOneToOneWindows && !edgelessWindows) {
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
         };
