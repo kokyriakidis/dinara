@@ -211,9 +211,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // Edgeless-windows toggle. When true, inter-window edges are not created:
     // each window remains a bare anchor set (its intra-window backbone chain
     // is still built, but windows are not connected to each other). Downstream
-    // stages still run on the resulting graph. Set to false to restore the
-    // Stage A length-weighted reciprocal-best inter-window backbone.
-    constexpr bool edgelessWindows = true;
+    // stages still run on the resulting graph. Set to false to connect windows.
+    //
+    // Disabled (false): inter-window edges ARE created. The connection method is
+    // the modern connectOneToOneWindows block below; with connectAllWindows set,
+    // every read-supported window pair is connected (all-to-all). The legacy
+    // Stage A reciprocal-best block is kept off via useStageAConnection.
+    constexpr bool edgelessWindows = false;
 
     // Strict 1-to-1 window connection. When true, connect a window pair A->B
     // with an edge only when A has exactly one outgoing window neighbor AND B
@@ -246,6 +250,13 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // (minInterWindowCoverage / minInterWindowEdgeCoverage) still apply, so the
     // pair must clear those thresholds to get an edge.
     constexpr bool connectAllWindows = true;
+
+    // Legacy Stage A reciprocal-best connector. This is the older length-weighted
+    // reciprocal-best inter-window backbone, superseded by the connectOneToOneWindows
+    // block above (which, with connectAllWindows, gives all-to-all connectivity).
+    // Both blocks are gated on !edgelessWindows; keep Stage A off so only one
+    // connector runs and edges are not created twice.
+    constexpr bool useStageAConnection = false;
 
     // Build anchorId -> windowId and anchorId -> position-in-backbone maps.
     // For each original window W (windowId), we also create a mirror RC window
@@ -1037,9 +1048,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     // forward and the RC mirror edge, so best-in/best-out is accumulated over
     // both the forward pair (A,B) and its mirror (rcWindow(B), rcWindow(A)).
     //
-    // Gated by edgelessWindows: when edgeless, this entire inter-window edge
-    // construction is skipped (kept here, not deleted, for easy restoration).
-    if(!edgelessWindows)
+    // Gated by useStageAConnection (and edgelessWindows): this legacy
+    // reciprocal-best construction is off by default because the
+    // connectOneToOneWindows block above is the active connector. Kept here, not
+    // deleted, for easy restoration.
+    if(useStageAConnection && !edgelessWindows)
     {
         auto rcWindow = [&](uint32_t w) -> uint32_t {
             return (w >= windowCount) ? (w - windowCount) : (w + windowCount);
