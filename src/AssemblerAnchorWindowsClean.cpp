@@ -319,51 +319,54 @@ void Assembler::computeAnchorWindowsClean(
     // For each touched read, find first/last shared anchor with backbone
     // and claim all anchors in between.
     // ========================================================================
-    // Kmer (ShortBaseSequence<Int>, Int = uint64_t or __uint128_t depending on
-    // DINARA_LONG_MARKERS) has no std::hash specialization, so the duplicate-kmer
-    // scan below used a std::set (tree, O(log n) comparisons of the underlying
-    // 2-word representation). Byte-level FNV-style hash over the same
-    // `array<Int, 2> data` the comparison operators already use, so an
-    // unordered_set can be used instead -- O(1) average instead of O(log n),
-    // with no change to which k-mers compare equal.
-    struct KmerHash {
-        size_t operator()(const Kmer& kmer) const {
-            size_t h = 14695981039346656037ULL;  // FNV-1a offset basis.
-            for(const auto& word : kmer.data) {
-                const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&word);
-                for(size_t i = 0; i < sizeof(word); i++) {
-                    h = (h ^ bytes[i]) * 1099511628211ULL;  // FNV-1a prime.
-                }
-            }
-            return h;
+    // KmerId lookup for an anchor's representative marker (front() of its
+    // sorted member list), reusing the marker's OWN precomputed kmerId
+    // (populated pipeline-wide, once, by computeMarkerKmerIds -- called well
+    // before window creation, for both the SIMD and non-SIMD marker paths)
+    // instead of reconstructing the k-mer base by base from the read sequence
+    // via Shasta2Anchors::anchorKmer(). Valid only for PRIMARY anchors, whose
+    // Shasta2AnchorMarkerInfo::ordinal is always a valid index into markers /
+    // markerKmerIds (het/hom anchors leave ordinal invalid -- see
+    // Shasta2AnchorMarkerInfo -- but window creation runs before any het/hom
+    // anchor is appended, so every anchor here is primary).
+    //
+    // markerKmerIds[oid][ordinal] is populated via the same extraction and
+    // strand handling (map strand-1 to strand-0's raw sequence, extract,
+    // reverse-complement) that Shasta2Anchors::getKmerAtPosition/anchorKmer
+    // perform -- see getOrientedReadMarkerKmerStrand0/1 in
+    // markerAccessFunctions.cpp -- so this is bit-for-bit the same value
+    // anchorKmer() would return for the same (orientedReadId, ordinal), just
+    // an O(1) lookup instead of an O(k) base-by-base reconstruction.
+    // Profiling showed anchorKmer() was ~59% of window creation's remaining
+    // wall time after the caching fixes above.
+    auto anchorKmerId = [&](Shasta2AnchorId anchorId) -> KmerId {
+        const Shasta2Anchor anchor = (*shasta2Anchors)[anchorId];
+        if(anchor.empty()) {
+            return KmerId(0);
         }
+        const Shasta2AnchorMarkerInfo& mi = anchor.front();
+        DINARA_ASSERT(mi.ordinal != invalid<uint32_t>);
+        return (*markerKmerIds)[mi.orientedReadId.getValue()][mi.ordinal];
     };
 
     // Find anchor IDs in a journey interval whose k-mer appears more than once.
     // Anchors at the first and last positions of the interval are never marked
     // as duplicates, to avoid disconnecting chain endpoints.
-    //
-    // anchorKmer() reconstructs the k-mer base by base from the read sequence
-    // (O(k) per call) -- profiling showed this is the single largest cost in
-    // window creation, because it used to run TWICE per journey position (once
-    // to find which k-mers repeat, once to mark the repeated ones) every time
-    // this was called. Compute each position's k-mer exactly once into a local
-    // buffer and reuse it for both passes.
     auto findDuplicateKmerAnchors = [&](const auto& journey, uint32_t begin, uint32_t end) {
         std::unordered_set<uint64_t> duplicateAnchorIds;
         if(end <= begin) {
             return duplicateAnchorIds;
         }
         const auto profFdkaT0 = steady_clock::now();
-        vector<Kmer> kmers(end - begin);
+        vector<KmerId> kmers(end - begin);
         for(uint32_t pos = begin; pos < end; pos++) {
-            kmers[pos - begin] = shasta2Anchors->anchorKmer(journey[pos]);
+            kmers[pos - begin] = anchorKmerId(journey[pos]);
         }
         if(profileClaiming) profFdkaBuildKmers += seconds(steady_clock::now() - profFdkaT0);
 
         const auto profFdkaT1 = steady_clock::now();
-        std::unordered_set<Kmer, KmerHash> seen;
-        std::unordered_set<Kmer, KmerHash> duplicateKmers;
+        std::unordered_set<KmerId> seen;
+        std::unordered_set<KmerId> duplicateKmers;
         seen.reserve(end - begin);
         for(uint32_t pos = begin; pos < end; pos++) {
             if(!seen.insert(kmers[pos - begin]).second) {
