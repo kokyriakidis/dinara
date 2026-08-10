@@ -268,6 +268,24 @@ void Shasta2Journeys::filterByAnchorChaining(
     DINARA_ASSERT(anchorsPointer);
     DINARA_ASSERT(journeys.isOpen());
 
+    // With minCommonForBackbone == 0, filterThreadFunction's chainability test
+    // (countCommon(...) >= minCommon) is trivially true for any pair, for any
+    // input -- not just on the data we happened to test. Its DP always ends up
+    // picking the immediately preceding position (dp[i-1]+1 strictly beats any
+    // dp[j]+1 for j further back, since dp is non-decreasing), so the "longest
+    // chain" is always the full, untouched original journey. The whole call
+    // (per-read DP, a full drop+recreate+two-pass rebuild of the journeys
+    // VectorOfVectors, and an anchor-store-wide positionInJourney reconciliation
+    // pass) is therefore provably a no-op here, not just empirically one -- skip
+    // it rather than pay for a rewrite that changes nothing.
+    if(minCommonForBackbone == 0) {
+        cout << timestamp << "Journey filtering (anchor chaining): minCommonForBackbone=0, "
+                "filter is a no-op by construction -- skipping." << endl;
+        performanceLog << timestamp << "Journey filtering (anchor chaining) skipped "
+                "(minCommonForBackbone=0)." << endl;
+        return;
+    }
+
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
     }
