@@ -15,7 +15,6 @@ using namespace dinara;
 #include <iomanip>
 #include <limits>
 #include <queue>
-#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -167,6 +166,18 @@ void Assembler::computeAnchorWindowsClean(
     uint64_t claimedAnchors = 0;
     uint64_t totalReadIntervals = 0;
 
+    // Temporary phase-timing breakdown (env DINARA_WINDOW_CLAIM_PROFILE=1), to
+    // find where computeAnchorWindowsClean's wall time actually goes. Overhead
+    // is a few steady_clock::now() calls per createWindow invocation (negligible
+    // next to the work being timed).
+    const bool profileClaiming = (getenv("DINARA_WINDOW_CLAIM_PROFILE") != nullptr);
+    double profTouchedDiscovery = 0.0, profDirectCis = 0.0, profBackboneDup = 0.0;
+    double profSharedScan = 0.0, profLis = 0.0, profClaim = 0.0, profRepush = 0.0;
+    double profInitSeed = 0.0, profUnclaimedScan = 0.0, profCreateWindowTotal = 0.0, profReseed = 0.0;
+    double profFilteredPosBuild = 0.0, profBackboneMapBuild = 0.0, profDupCacheLookup = 0.0;
+    double profDupCacheHitTime = 0.0, profDupCacheMissTime = 0.0;
+    uint64_t profDupCacheHits = 0, profDupCacheMisses = 0;
+    double profFdkaBuildKmers = 0.0, profFdkaSeenSet = 0.0, profFdkaMarkDup = 0.0;
 
     // Compute the base span of a journey interval [begin, end).
     auto intervalBaseSpan = [&](OrientedReadId oid, const auto& journey, uint32_t begin, uint32_t end) {
@@ -308,35 +319,107 @@ void Assembler::computeAnchorWindowsClean(
     // For each touched read, find first/last shared anchor with backbone
     // and claim all anchors in between.
     // ========================================================================
-    // Find k-mers that appear more than once in a journey interval.
-    auto findDuplicateKmers = [&](const auto& journey, uint32_t begin, uint32_t end) {
-        std::set<Kmer> seen;
-        std::set<Kmer> duplicateKmers;
-        for(uint32_t pos = begin; pos < end; pos++) {
-            const Kmer kmer = shasta2Anchors->anchorKmer(journey[pos]);
-            if(!seen.insert(kmer).second) {
-                duplicateKmers.insert(kmer);
+    // Kmer (ShortBaseSequence<Int>, Int = uint64_t or __uint128_t depending on
+    // DINARA_LONG_MARKERS) has no std::hash specialization, so the duplicate-kmer
+    // scan below used a std::set (tree, O(log n) comparisons of the underlying
+    // 2-word representation). Byte-level FNV-style hash over the same
+    // `array<Int, 2> data` the comparison operators already use, so an
+    // unordered_set can be used instead -- O(1) average instead of O(log n),
+    // with no change to which k-mers compare equal.
+    struct KmerHash {
+        size_t operator()(const Kmer& kmer) const {
+            size_t h = 14695981039346656037ULL;  // FNV-1a offset basis.
+            for(const auto& word : kmer.data) {
+                const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&word);
+                for(size_t i = 0; i < sizeof(word); i++) {
+                    h = (h ^ bytes[i]) * 1099511628211ULL;  // FNV-1a prime.
+                }
             }
+            return h;
         }
-        return duplicateKmers;
     };
 
     // Find anchor IDs in a journey interval whose k-mer appears more than once.
     // Anchors at the first and last positions of the interval are never marked
     // as duplicates, to avoid disconnecting chain endpoints.
+    //
+    // anchorKmer() reconstructs the k-mer base by base from the read sequence
+    // (O(k) per call) -- profiling showed this is the single largest cost in
+    // window creation, because it used to run TWICE per journey position (once
+    // to find which k-mers repeat, once to mark the repeated ones) every time
+    // this was called. Compute each position's k-mer exactly once into a local
+    // buffer and reuse it for both passes.
     auto findDuplicateKmerAnchors = [&](const auto& journey, uint32_t begin, uint32_t end) {
-        const auto duplicateKmers = findDuplicateKmers(journey, begin, end);
         std::unordered_set<uint64_t> duplicateAnchorIds;
+        if(end <= begin) {
+            return duplicateAnchorIds;
+        }
+        const auto profFdkaT0 = steady_clock::now();
+        vector<Kmer> kmers(end - begin);
+        for(uint32_t pos = begin; pos < end; pos++) {
+            kmers[pos - begin] = shasta2Anchors->anchorKmer(journey[pos]);
+        }
+        if(profileClaiming) profFdkaBuildKmers += seconds(steady_clock::now() - profFdkaT0);
+
+        const auto profFdkaT1 = steady_clock::now();
+        std::unordered_set<Kmer, KmerHash> seen;
+        std::unordered_set<Kmer, KmerHash> duplicateKmers;
+        seen.reserve(end - begin);
+        for(uint32_t pos = begin; pos < end; pos++) {
+            if(!seen.insert(kmers[pos - begin]).second) {
+                duplicateKmers.insert(kmers[pos - begin]);
+            }
+        }
+        if(profileClaiming) profFdkaSeenSet += seconds(steady_clock::now() - profFdkaT1);
+
+        const auto profFdkaT2 = steady_clock::now();
         if(!duplicateKmers.empty()) {
             for(uint32_t pos = begin; pos < end; pos++) {
                 if(pos == begin || pos == end - 1) continue;
-                const Kmer kmer = shasta2Anchors->anchorKmer(journey[pos]);
-                if(duplicateKmers.count(kmer)) {
+                if(duplicateKmers.count(kmers[pos - begin])) {
                     duplicateAnchorIds.insert(uint64_t(journey[pos]));
                 }
             }
         }
+        if(profileClaiming) profFdkaMarkDup += seconds(steady_clock::now() - profFdkaT2);
         return duplicateAnchorIds;
+    };
+
+    // Cache of findDuplicateKmerAnchors(journey, 0, journey.size()) for a read's
+    // FULL own journey, keyed by oidValue. This depends only on the read's own
+    // (fixed, read-only during window creation) journey, not on which window is
+    // asking, but the same oriented read can be "touched" by many different
+    // windows over the course of this sweep (a read stays touchable until every
+    // anchor it shares with some backbone is claimed) -- each touch previously
+    // recomputed this from scratch by rescanning the read's whole journey with a
+    // std::set. Sparse map: only reads actually touched pay for an entry, so
+    // memory stays bounded by the number of distinct reads ever touched (no
+    // worse than before), while repeat touches of the same read become O(1).
+    std::unordered_map<uint32_t, std::unordered_set<uint64_t>> readDuplicatesCache;
+    auto getFullJourneyDuplicateKmerAnchors = [&](OrientedReadId oid, const auto& journey)
+        -> const std::unordered_set<uint64_t>&
+    {
+        const uint32_t oidValue = uint32_t(oid.getValue());
+        if(profileClaiming) {
+            const auto profT0hit = steady_clock::now();
+            const auto existing = readDuplicatesCache.find(oidValue);
+            if(existing != readDuplicatesCache.end()) {
+                profDupCacheHitTime += seconds(steady_clock::now() - profT0hit);
+                ++profDupCacheHits;
+                return existing->second;
+            }
+            const auto& result = readDuplicatesCache.emplace(oidValue,
+                findDuplicateKmerAnchors(journey, 0, uint32_t(journey.size()))).first->second;
+            profDupCacheMissTime += seconds(steady_clock::now() - profT0hit);
+            ++profDupCacheMisses;
+            return result;
+        }
+        const auto existing = readDuplicatesCache.find(oidValue);
+        if(existing != readDuplicatesCache.end()) {
+            return existing->second;
+        }
+        return readDuplicatesCache.emplace(oidValue,
+            findDuplicateKmerAnchors(journey, 0, uint32_t(journey.size()))).first->second;
     };
 
     // Filter a backbone journey interval to keep the longest subsequence
@@ -431,6 +514,7 @@ void Assembler::computeAnchorWindowsClean(
             return; // Too few anchors.
         }
 
+        const auto profT0start = steady_clock::now();
         const auto fullJourney = (*shasta2Journeys)[backboneOid];
 
         vector<uint32_t> filteredPositions;
@@ -446,6 +530,7 @@ void Assembler::computeAnchorWindowsClean(
         window.backboneBegin = seedBegin;
         window.backboneEnd = seedEnd;
         window.filteredBackbonePositions = filteredPositions;
+        if(profileClaiming) profFilteredPosBuild += seconds(steady_clock::now() - profT0start);
 
         // Get backbone journey and build a lookup: anchorId -> position in backbone.
         // Only include anchors that survived filtering and don't have duplicate k-mers.
@@ -454,19 +539,19 @@ void Assembler::computeAnchorWindowsClean(
         backboneAnchorToPos.reserve(filteredPositions.size());
 
         // Find backbone anchors with duplicate k-mers and exclude them.
+        const auto profT0a = steady_clock::now();
         const auto backboneDuplicates = findDuplicateKmerAnchors(
             backboneJourney, window.backboneBegin, window.backboneEnd);
+        if(profileClaiming) profBackboneDup += seconds(steady_clock::now() - profT0a);
         // Build the lookup from filtered positions only.
-        std::unordered_set<uint64_t> filteredAnchorSet;
-        for(const uint32_t pos : filteredPositions) {
-            filteredAnchorSet.insert(uint64_t(backboneJourney[pos]));
-        }
+        const auto profT0map = steady_clock::now();
         for(const uint32_t pos : filteredPositions) {
             const uint64_t aid = uint64_t(backboneJourney[pos]);
             if(backboneDuplicates.count(aid) == 0) {
                 backboneAnchorToPos[aid] = pos;
             }
         }
+        if(profileClaiming) profBackboneMapBuild += seconds(steady_clock::now() - profT0map);
 
         // Add backbone read interval (covers the full filtered span).
         window.readIntervals.push_back(AnchorWindowReadInterval{
@@ -489,6 +574,7 @@ void Assembler::computeAnchorWindowsClean(
         readSpans.push_back(ReadSpan{backboneOid, seedBegin, seedEnd});
 
         // Find all other oriented reads that share anchors with the backbone.
+        const auto profT0b = steady_clock::now();
         ++epoch;
         touchedOrientedReads.clear();
         for(uint32_t pos = seedBegin; pos < seedEnd; pos++) {
@@ -504,9 +590,11 @@ void Assembler::computeAnchorWindowsClean(
                 }
             }
         }
+        if(profileClaiming) profTouchedDiscovery += seconds(steady_clock::now() - profT0b);
 
         // Build the set of direct cis overlap oriented read IDs for the backbone
         // using the read graph (which contains only cis overlaps).
+        const auto profT0c = steady_clock::now();
         std::unordered_set<uint32_t> directCisOverlapReads;
         {
             const auto backboneEdges = readGraph.connectivity[backboneOid.getValue()];
@@ -516,6 +604,7 @@ void Assembler::computeAnchorWindowsClean(
                 directCisOverlapReads.insert(partner.getValue());
             }
         }
+        if(profileClaiming) profDirectCis += seconds(steady_clock::now() - profT0c);
 
         // For each touched read:
         // 1. Find shared anchors (present in both the read's journey and the backbone).
@@ -532,12 +621,15 @@ void Assembler::computeAnchorWindowsClean(
             const bool isDirectCis = (directCisOverlapReads.find(oidValue) != directCisOverlapReads.end());
 
             // Find anchors with duplicate k-mers in this read's journey.
-            const auto readDuplicates = findDuplicateKmerAnchors(journey, 0, uint32_t(journey.size()));
+            const auto profT0dup = steady_clock::now();
+            const auto& readDuplicates = getFullJourneyDuplicateKmerAnchors(oid, journey);
+            if(profileClaiming) profDupCacheLookup += seconds(steady_clock::now() - profT0dup);
 
             // Step 1-2: Find shared anchors and their backbone positions.
             vector<uint32_t> sharedReadPositions;
             vector<uint32_t> sharedBackbonePositions;
 
+            const auto profT0d = steady_clock::now();
             for(uint32_t readPos = 0; readPos < uint32_t(journey.size()); readPos++) {
                 const uint64_t anchorId = uint64_t(journey[readPos]);
                 if(readDuplicates.count(anchorId)) continue;
@@ -549,6 +641,7 @@ void Assembler::computeAnchorWindowsClean(
                     }
                 }
             }
+            if(profileClaiming) profSharedScan += seconds(steady_clock::now() - profT0d);
 
             if(sharedReadPositions.empty()) continue;
 
@@ -587,6 +680,7 @@ void Assembler::computeAnchorWindowsClean(
             // subset via LIS over the backbone positions (read order is the
             // implicit increasing axis), discarding off-diagonal pins.
             {
+                const auto profT0e = steady_clock::now();
                 const vector<uint32_t> keep =
                     longestIncreasingSubsequence(sharedBackbonePositions);
                 vector<AnchorWindowSharedPin>& pins = readInterval.sharedPins;
@@ -598,6 +692,7 @@ void Assembler::computeAnchorWindowsClean(
                 // LIS over backbone positions (read order increasing) yields
                 // pins already sorted by backbone position with strictly
                 // increasing read positions, matching the consumer's asserts.
+                if(profileClaiming) profLis += seconds(steady_clock::now() - profT0e);
             }
 
             window.readIntervals.push_back(std::move(readInterval));
@@ -605,6 +700,7 @@ void Assembler::computeAnchorWindowsClean(
         }
 
         // Claim all anchors across all spans (backbone + touched reads) and their RC.
+        const auto profT0f = steady_clock::now();
         for(const ReadSpan& span : readSpans) {
             const auto journey = (*shasta2Journeys)[span.oid];
             // Forward orientation of this read relative to the strand-0 backbone:
@@ -629,13 +725,17 @@ void Assembler::computeAnchorWindowsClean(
             }
         }
 
+        if(profileClaiming) profClaim += seconds(steady_clock::now() - profT0f);
+
         // Now that claiming is done, bump generations and re-push unclaimed
         // intervals for all touched reads.
+        const auto profT0g = steady_clock::now();
         for(const uint32_t oidValue : touchedOrientedReads) {
             const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
             ++candidateGeneration[uint64_t(oid.getReadId())];
             pushCurrentUnclaimedIntervals(oid);
         }
+        if(profileClaiming) profRepush += seconds(steady_clock::now() - profT0g);
 
         claimedAnchors += window.claimedAnchorCount;
         totalReadIntervals += window.readIntervals.size();
@@ -643,16 +743,20 @@ void Assembler::computeAnchorWindowsClean(
     };
 
     // Initialize the heap: all strand-0 reads, ordered by length (longest first).
-    for(const ReadId readId : readIdsSortedByLength) {
-        const OrientedReadId backboneOid(readId, 0);
-        if(backboneOid.getValue() >= shasta2Journeys->size()) {
-            continue;
+    {
+        const auto profT0h = steady_clock::now();
+        for(const ReadId readId : readIdsSortedByLength) {
+            const OrientedReadId backboneOid(readId, 0);
+            if(backboneOid.getValue() >= shasta2Journeys->size()) {
+                continue;
+            }
+            const auto journey = (*shasta2Journeys)[backboneOid];
+            if(journey.empty()) {
+                continue;
+            }
+            pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
         }
-        const auto journey = (*shasta2Journeys)[backboneOid];
-        if(journey.empty()) {
-            continue;
-        }
-        pushCandidate(backboneOid, journey, 0, uint32_t(journey.size()));
+        if(profileClaiming) profInitSeed += seconds(steady_clock::now() - profT0h);
     }
 
     // Process the heap. For each candidate (longest base span first):
@@ -681,6 +785,7 @@ void Assembler::computeAnchorWindowsClean(
             // Find contiguous unclaimed intervals within the full journey.
             // We always scan the full journey regardless of candidate.begin/end,
             // since claimed regions may have appeared since this candidate was pushed.
+            const auto profT0i = steady_clock::now();
             vector<pair<uint32_t, uint32_t>> unclaimedIntervals;
             {
                 uint32_t pos = 0;
@@ -700,6 +805,7 @@ void Assembler::computeAnchorWindowsClean(
                     }
                 }
             }
+            if(profileClaiming) profUnclaimedScan += seconds(steady_clock::now() - profT0i);
 
             if(unclaimedIntervals.empty()) continue;
 
@@ -729,7 +835,9 @@ void Assembler::computeAnchorWindowsClean(
                     }
                 }
 
+                const auto profT0j = steady_clock::now();
                 createWindow(candidate.backboneOrientedReadId, intervalBegin, intervalEnd);
+                if(profileClaiming) profCreateWindowTotal += seconds(steady_clock::now() - profT0j);
 
                 if(isFullJourney) {
                     ++fullJourneyWindows;
@@ -767,6 +875,7 @@ void Assembler::computeAnchorWindowsClean(
         // behavior is unchanged.
         if(tileUnclaimedIntervals) {
             const uint64_t windowsBefore = anchorWindows.size();
+            const auto profT0k = steady_clock::now();
             for(const ReadId readId : readIdsSortedByLength) {
                 const OrientedReadId backboneOid(readId, 0);
                 if(backboneOid.getValue() >= shasta2Journeys->size()) continue;
@@ -775,6 +884,7 @@ void Assembler::computeAnchorWindowsClean(
                 ++candidateGeneration[uint64_t(readId)];  // invalidate stale.
                 pushCurrentUnclaimedIntervals(backboneOid);
             }
+            if(profileClaiming) profReseed += seconds(steady_clock::now() - profT0k);
             runPqPass(true);
             cout << timestamp << "Unclaimed-interval pass added "
                  << (anchorWindows.size() - windowsBefore)
@@ -803,6 +913,34 @@ void Assembler::computeAnchorWindowsClean(
          << " readIntervals=" << totalReadIntervals
          << " seconds=" << std::fixed << std::setprecision(2) << elapsedSeconds
          << std::defaultfloat << endl;
+
+    if(profileClaiming) {
+        cout << std::fixed << std::setprecision(2)
+             << "  [claim-profile] initSeed=" << profInitSeed
+             << "s unclaimedScan=" << profUnclaimedScan
+             << "s reseed=" << profReseed
+             << "s createWindowTotal=" << profCreateWindowTotal
+             << "s (of which filteredPosBuild=" << profFilteredPosBuild
+             << "s backboneMapBuild=" << profBackboneMapBuild
+             << "s backboneDup=" << profBackboneDup
+             << "s touchedDiscovery=" << profTouchedDiscovery
+             << "s directCis=" << profDirectCis
+             << "s dupCacheLookup=" << profDupCacheLookup
+             << "s [hits=" << profDupCacheHits << " hitTime=" << profDupCacheHitTime
+             << "s misses=" << profDupCacheMisses << " missTime=" << profDupCacheMissTime
+             << "s avgMissUs=" << (profDupCacheMisses ? (profDupCacheMissTime * 1e6 / double(profDupCacheMisses)) : 0.0)
+             << " buildKmers=" << profFdkaBuildKmers
+             << "s seenSet=" << profFdkaSeenSet
+             << "s markDup=" << profFdkaMarkDup
+             << "s]"
+             << "s sharedScan=" << profSharedScan
+             << "s lis=" << profLis
+             << "s claim=" << profClaim
+             << "s repush=" << profRepush << "s)"
+             << " sum=" << (profInitSeed + profUnclaimedScan + profReseed + profCreateWindowTotal)
+             << "s / total=" << elapsedSeconds << "s"
+             << std::defaultfloat << endl;
+    }
 }
 
 
