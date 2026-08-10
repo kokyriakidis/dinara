@@ -414,6 +414,13 @@ PrimaryMarkerSet buildPrimaryMarkerSet(const Shasta2Anchors& anchors)
     // Called before any het/hom append, so anchors.size() is the primary count
     // and every stored marker belongs to a primary anchor.
     PrimaryMarkerSet set;
+    // Without this, the set grows one insert at a time with no reserve --
+    // for ~21M markers that means dozens of full rehashes (each touching every
+    // element inserted so far), which profiling showed costing ~11s on a small
+    // test region. anchorMarkerInfos.totalSize() is the exact final element
+    // count (sum of every anchor's member count), available up front with no
+    // extra pass, so reserve once and insert without ever rehashing.
+    set.reserve(anchors.anchorMarkerInfos.totalSize());
     const uint64_t primaryCount = anchors.size();
     for(Shasta2AnchorId aid = 0; aid < primaryCount; aid++) {
         const Shasta2Anchor anchor = anchors[aid];
@@ -623,72 +630,81 @@ void planWindowHetBubbles(
 // root-cause representation fix, not an export-time drop.
 void mergeWindowCoincidentHoms(
     AnchorWindow& window,
-    const vector<Shasta2AnchorId>& bbAnchors,
     uint64_t& mergedHoms)
 {
-    // Group planned bubbles by interval, then within each interval look for
-    // adjacent pairs whose homs coincide.
-    vector<vector<AnchorWindow::HetBubble*>> byInterval(bbAnchors.size());
-    for(auto& b : window.hetBubbles) {
-        if(b.plannedInterval < 0) continue;
-        const size_t i = size_t(b.plannedInterval);
-        if(i + 1 < bbAnchors.size()) byInterval[i].push_back(&b);
+    if(window.hetBubbles.empty()) {
+        return;
     }
 
-    for(size_t i = 0; i + 1 < bbAnchors.size(); i++) {
-        auto& bubs = byInterval[i];
-        if(bubs.size() < 2) continue;
-        std::sort(bubs.begin(), bubs.end(),
-            [](const AnchorWindow::HetBubble* a, const AnchorWindow::HetBubble* b) {
-                return a->backboneOffset < b->backboneOffset;
-            });
+    // Group planned bubbles by interval, then within each interval look for
+    // adjacent pairs whose homs coincide. Previously this bucketed into
+    // vector<vector<...>>(bbAnchors.size()) -- one bucket per BACKBONE anchor,
+    // not per bubble -- so every window paid for an allocation and a scan
+    // sized by its full backbone length (thousands of positions for a
+    // full-journey window) even when it had zero or a handful of bubbles.
+    // Sorting the actual bubbles by (plannedInterval, backboneOffset) gets the
+    // same grouping and order, scaled by bubble count instead.
+    vector<AnchorWindow::HetBubble*> planned;
+    planned.reserve(window.hetBubbles.size());
+    for(auto& b : window.hetBubbles) {
+        if(b.plannedInterval >= 0) planned.push_back(&b);
+    }
+    if(planned.size() < 2) {
+        return;
+    }
+    std::sort(planned.begin(), planned.end(),
+        [](const AnchorWindow::HetBubble* a, const AnchorWindow::HetBubble* b) {
+            if(a->plannedInterval != b->plannedInterval)
+                return a->plannedInterval < b->plannedInterval;
+            return a->backboneOffset < b->backboneOffset;
+        });
 
-        for(size_t bj = 0; bj + 1 < bubs.size(); bj++) {
-            AnchorWindow::HetBubble& cur = *bubs[bj];
-            AnchorWindow::HetBubble& nxt = *bubs[bj + 1];
-            // Coincident iff the two homs sit on the same backbone column, which
-            // (nodeToBackboneOffset is a bijection) means the SAME POA node.
-            if(cur.succBackboneOffset != nxt.predBackboneOffset) continue;
+    for(size_t bj = 0; bj + 1 < planned.size(); bj++) {
+        AnchorWindow::HetBubble& cur = *planned[bj];
+        AnchorWindow::HetBubble& nxt = *planned[bj + 1];
+        if(cur.plannedInterval != nxt.plannedInterval) continue;
+        // Coincident iff the two homs sit on the same backbone column, which
+        // (nodeToBackboneOffset is a bijection) means the SAME POA node.
+        if(cur.succBackboneOffset != nxt.predBackboneOffset) continue;
 
-            // The two homs sit on one node but were built from DIFFERENT read
-            // sets: cur.hom from SNP N's spanning reads, nxt.leadHom from SNP
-            // N+1's spanning reads. A read spanning only one of the two SNPs is
-            // in only one list, so the lists are not equal (and their allele-
-            // grouped orderings differ). But because both lookups use the same
-            // node and the same per-read position map, a read present in BOTH is
-            // recovered at the SAME rawPosition. The physically correct shared
-            // anchor is therefore the UNION of the two member sets (every read
-            // through this backbone column belongs to this k=2 column); an
-            // intersection would needlessly weaken the anchor. Merge nxt.leadHom
-            // into cur.hom by OrientedReadId, deduplicating and asserting the
-            // position invariant on the overlap.
-            std::unordered_map<uint64_t, uint32_t> posByRead;
-            posByRead.reserve(cur.hom.members.size() + nxt.leadHom.members.size());
-            for(const auto& m : cur.hom.members)
+        // The two homs sit on one node but were built from DIFFERENT read
+        // sets: cur.hom from SNP N's spanning reads, nxt.leadHom from SNP
+        // N+1's spanning reads. A read spanning only one of the two SNPs is
+        // in only one list, so the lists are not equal (and their allele-
+        // grouped orderings differ). But because both lookups use the same
+        // node and the same per-read position map, a read present in BOTH is
+        // recovered at the SAME rawPosition. The physically correct shared
+        // anchor is therefore the UNION of the two member sets (every read
+        // through this backbone column belongs to this k=2 column); an
+        // intersection would needlessly weaken the anchor. Merge nxt.leadHom
+        // into cur.hom by OrientedReadId, deduplicating and asserting the
+        // position invariant on the overlap.
+        std::unordered_map<uint64_t, uint32_t> posByRead;
+        posByRead.reserve(cur.hom.members.size() + nxt.leadHom.members.size());
+        for(const auto& m : cur.hom.members)
+            posByRead.emplace(m.orientedReadId.getValue(), m.rawPosition);
+        for(const auto& m : nxt.leadHom.members) {
+            const auto [it, inserted] =
                 posByRead.emplace(m.orientedReadId.getValue(), m.rawPosition);
-            for(const auto& m : nxt.leadHom.members) {
-                const auto [it, inserted] =
-                    posByRead.emplace(m.orientedReadId.getValue(), m.rawPosition);
-                // Read in both sets: same node + same per-read map => same
-                // rawPosition. A mismatch would mean the coincidence assumption
-                // is broken, so assert.
-                if(!inserted) DINARA_ASSERT(it->second == m.rawPosition);
-                else cur.hom.members.push_back(m);   // union: add the extra read
-            }
-            // Fold: bubble N+1 reuses bubble N's (now unioned) trailing hom as
-            // its leading hom.
-            nxt.sharedLeadFromBubble = int64_t(bubs[bj] - window.hetBubbles.data());
-            if(getenv("DINARA_APPEND_HET_DEBUG") != nullptr) {
-                cout << "mergeDebug: window=" << window.windowId
-                     << " cur.backboneOffset=" << cur.backboneOffset
-                     << " cur.plannedInterval=" << cur.plannedInterval
-                     << " nxt.backboneOffset=" << nxt.backboneOffset
-                     << " nxt.plannedInterval=" << nxt.plannedInterval
-                     << " storedIndex=" << nxt.sharedLeadFromBubble
-                     << " window.hetBubbles.size()=" << window.hetBubbles.size() << endl;
-            }
-            ++mergedHoms;
+            // Read in both sets: same node + same per-read map => same
+            // rawPosition. A mismatch would mean the coincidence assumption
+            // is broken, so assert.
+            if(!inserted) DINARA_ASSERT(it->second == m.rawPosition);
+            else cur.hom.members.push_back(m);   // union: add the extra read
         }
+        // Fold: bubble N+1 reuses bubble N's (now unioned) trailing hom as
+        // its leading hom.
+        nxt.sharedLeadFromBubble = int64_t(planned[bj] - window.hetBubbles.data());
+        if(getenv("DINARA_APPEND_HET_DEBUG") != nullptr) {
+            cout << "mergeDebug: window=" << window.windowId
+                 << " cur.backboneOffset=" << cur.backboneOffset
+                 << " cur.plannedInterval=" << cur.plannedInterval
+                 << " nxt.backboneOffset=" << nxt.backboneOffset
+                 << " nxt.plannedInterval=" << nxt.plannedInterval
+                 << " storedIndex=" << nxt.sharedLeadFromBubble
+                 << " window.hetBubbles.size()=" << window.hetBubbles.size() << endl;
+        }
+        ++mergedHoms;
     }
 }
 
@@ -2442,8 +2458,11 @@ void dinara::main::assemble(
     // is safe -- nothing between window creation and Pass 3 changes a
     // window's backbone fields or moves an existing anchor's position).
     cout << timestamp << "Computing window backbones..." << endl;
+    const auto tBackboneCache0 = steady_clock::now();
     const WindowBackboneCache backboneCache(
         *shasta2Anchors, *shasta2Journeys, anchorWindows, hetKHalf, threadCount);
+    cout << timestamp << "Window backbones computed in "
+         << seconds(steady_clock::now() - tBackboneCache0) << "s." << endl;
 
     // Pass 1: plan. Assign each bubble to the backbone interval that strictly
     // contains its flank span; drop the rest (plannedInterval = -1). Also drop
@@ -2454,7 +2473,11 @@ void dinara::main::assemble(
     {
         // (read, position) markers owned by primary anchors, built once before
         // any het anchor is appended (so the store still holds only primaries).
+        const auto tPrimarySet0 = steady_clock::now();
         const PrimaryMarkerSet primarySet = buildPrimaryMarkerSet(*shasta2Anchors);
+        cout << timestamp << "buildPrimaryMarkerSet: " << primarySet.size()
+             << " markers in " << seconds(steady_clock::now() - tPrimarySet0) << "s." << endl;
+        const auto tPlanLoop0 = steady_clock::now();
         // Parallel over windows: planning is window-local (mutates only its own
         // window's bubbles) and reads shared state read-only (the store via
         // getPosition, the frozen primarySet, the frozen backboneCache).
@@ -2489,6 +2512,7 @@ void dinara::main::assemble(
         droppedUncontained = aUncontained.load();
         droppedPrimaryCollision = aPrimaryCollision.load();
         droppedBackwardMembers = aBackwardMembers.load();
+        cout << timestamp << "Planning loop: " << seconds(steady_clock::now() - tPlanLoop0) << "s." << endl;
         cout << timestamp << "Planned " << plannedBubbles
              << " contained het bubbles (" << droppedUncontained
              << " dropped, of which " << droppedPrimaryCollision
@@ -2506,6 +2530,7 @@ void dinara::main::assemble(
     // fold bubble N+1's leading hom onto bubble N's trailing hom so the chain
     // becomes ...arms_N -> sharedHom -> arms_{N+1}..., keeping BOTH SNPs.
     {
+        const auto tMergeLoop0 = steady_clock::now();
         // Parallel over windows: the merge is window-local (folds one window's
         // adjacent-bubble homs) and reads no mutable shared state (the
         // backboneCache is frozen after its construction above).
@@ -2516,9 +2541,10 @@ void dinara::main::assemble(
             }
             AnchorWindow& window = anchorWindows[wi];
             uint64_t merged = 0;
-            mergeWindowCoincidentHoms(window, backboneCache.bbAnchors(wi), merged);
+            mergeWindowCoincidentHoms(window, merged);
             aMergedHoms.fetch_add(merged, std::memory_order_relaxed);
         });
+        cout << timestamp << "Merge loop: " << seconds(steady_clock::now() - tMergeLoop0) << "s." << endl;
         cout << timestamp << "Merged " << aMergedHoms.load()
              << " coincident hom anchors (adjacent SNPs 3 bp apart)." << endl;
     }
