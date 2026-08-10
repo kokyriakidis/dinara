@@ -2062,6 +2062,21 @@ void dinara::main::assemble(
     // sub-k-mers of lengths 1, 2, 3). Thresholds: {4, 12, 24}. Removes ~4.5%.
     // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
 
+    // Remove vertices created by transitive-collapse false merges, detected via
+    // cross-read order agreement on consecutive journey vertices: if one read's
+    // journey visits vertex A then B, and some other read visits the same pair
+    // in the opposite order, that is a direct, cheap witness that A and/or B
+    // cannot both be single, correctly-placed genomic loci. Complementary to,
+    // not a subset of, the chain-consistency filter below: that filter only
+    // checks read pairs that are direct alignment candidates, so it can miss
+    // violations between reads that never became candidates -- on one test
+    // region every flagged vertex here was also caught below, on another
+    // ~30% were not. Low recall by design (a windowed sweep confirmed it's a
+    // narrower, cheaper signal, not a stand-in for the broader filter below).
+    // Runs first so the chain-consistency filter below sees a slightly
+    // smaller, cheaply-pre-cleaned vertex set.
+    assembler.filterMarkerGraphVerticesByJourneyOrderConsistency(threadCount);
+
     // Remove vertices where the transitive collapse grouped reads at k-mer
     // positions outside their direct chaining range. For each pair of reads
     // in a vertex, check that the vertex ordinal falls within the chain

@@ -10,6 +10,7 @@
 #include "timestamp.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -191,6 +192,18 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
     const uint64_t removedCount = vertexCount - kept.size();
     cout << timestamp << "Chain-consistency filter: removed "
          << removedCount << " / " << vertexCount << " marker graph vertices." << endl;
+
+    // Diagnostic (env DINARA_CHAIN_CONSISTENCY_DUMP=1): dump the flagged vertex
+    // ids, one per line, for comparison against other candidate filters that
+    // target the same class of transitive-collapse errors.
+    if(getenv("DINARA_CHAIN_CONSISTENCY_DUMP") != nullptr) {
+        ofstream out("ChainConsistencyFlaggedVertices.csv");
+        for(MarkerGraph::VertexId vertexId = 0; vertexId < vertexCount; ++vertexId) {
+            if(remove[vertexId]) {
+                out << vertexId << "\n";
+            }
+        }
+    }
 
     if(removedCount == 0) {
         return;
