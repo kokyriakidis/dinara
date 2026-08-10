@@ -364,14 +364,26 @@ void Assembler::computeAnchorWindowsClean(
         }
         if(profileClaiming) profFdkaBuildKmers += seconds(steady_clock::now() - profFdkaT0);
 
+        // Find which k-mers repeat by sorting a copy and scanning for adjacent
+        // equal runs, instead of inserting into a hash set. KmerId (Uint256) is
+        // a 256-bit type: each unordered_set insert pays for a full 256-bit
+        // hash plus a heap-allocated hash-table node, whereas sort+scan on a
+        // plain vector is allocation-free (besides the one copy) and
+        // cache-friendly. duplicateKmers ends up sorted, so membership below
+        // is a binary search instead of a hash lookup.
         const auto profFdkaT1 = steady_clock::now();
-        std::unordered_set<KmerId> seen;
-        std::unordered_set<KmerId> duplicateKmers;
-        seen.reserve(end - begin);
-        for(uint32_t pos = begin; pos < end; pos++) {
-            if(!seen.insert(kmers[pos - begin]).second) {
-                duplicateKmers.insert(kmers[pos - begin]);
+        vector<KmerId> sortedKmers(kmers);
+        std::sort(sortedKmers.begin(), sortedKmers.end());
+        vector<KmerId> duplicateKmers;
+        for(size_t i = 0; i < sortedKmers.size(); ) {
+            size_t j = i + 1;
+            while(j < sortedKmers.size() && sortedKmers[j] == sortedKmers[i]) {
+                ++j;
             }
+            if(j - i > 1) {
+                duplicateKmers.push_back(sortedKmers[i]);
+            }
+            i = j;
         }
         if(profileClaiming) profFdkaSeenSet += seconds(steady_clock::now() - profFdkaT1);
 
@@ -379,7 +391,7 @@ void Assembler::computeAnchorWindowsClean(
         if(!duplicateKmers.empty()) {
             for(uint32_t pos = begin; pos < end; pos++) {
                 if(pos == begin || pos == end - 1) continue;
-                if(duplicateKmers.count(kmers[pos - begin])) {
+                if(std::binary_search(duplicateKmers.begin(), duplicateKmers.end(), kmers[pos - begin])) {
                     duplicateAnchorIds.insert(uint64_t(journey[pos]));
                 }
             }
