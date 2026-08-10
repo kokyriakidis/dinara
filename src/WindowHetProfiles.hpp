@@ -20,6 +20,8 @@
 #include "invalid.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -27,6 +29,20 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace dinara {
+// Ad-hoc perf counters for emitHetBubblesFromProfiles's aggregation/gating
+// stage (everything after per-member profiles are already built), summed
+// across all windows/threads. Printed once by the caller via
+// dinaraPrintHetEmitTiming() when DINARA_HET_TIMING_DEBUG is set. Exists to
+// MEASURE whether the O(nMembers x nSites) scans in delSupportAt/insSupportAt/
+// the refCount loop are worth sweep-line-optimizing, rather than assuming.
+inline std::atomic<std::uint64_t> hetEmitTotalNs{0};
+inline std::atomic<std::uint64_t> hetEmitCalls{0};
+inline std::atomic<std::uint64_t> hetEmitPosListNs{0};   // refCount/delSupportAt scan over posList
+inline std::atomic<std::uint64_t> hetEmitPassingNs{0};   // flanksLinear + arm/hom emission over passingSites
+}
+
 
 namespace dinara {
 
@@ -157,6 +173,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
     using std::min;
     using std::sort;
 
+    const auto tEmit0 = std::chrono::steady_clock::now();
+
     const uint8_t* bbSeq = bbSeqVec.data();
     const uint32_t bbLen = uint32_t(bbSeqVec.size());
 
@@ -215,6 +233,110 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         }
     }
 
+    // Batch sweep-line replacement for the O(nMembers) refCount/delSupportAt
+    // scans the main posList loop below used to do PER SNP POSITION (measured
+    // as the dominant cost of this function: ~72% of its time on real data).
+    // For each profile, "clean coverage" is [bbCovBegin,bbCovEnd) minus its
+    // deletionRanges minus its noisyRanges -- exactly the positions memberCall
+    // would classify as either ref (-2) or an alt (a real KwSnp entry), never
+    // -1. Summing (+1 at range start, -1 at range end) events across ALL
+    // profiles' clean-coverage ranges and sweeping once, in position order,
+    // gives cleanCoverageAtPos[i] = count of profiles classified ref-or-alt at
+    // sortedSnpPositions[i] -- and since altTotal(pos) (from snpCounts, built
+    // above) already counts exactly the alt-classified subset of those same
+    // profiles, refCount-1 = cleanCoverageAtPos[i] - altTotal(pos) without
+    // ever inspecting an individual profile per query position.
+    //
+    // deletionRanges and noisyRanges must be MERGED per profile (not just
+    // added as two independent event pairs) before generating exclusion
+    // events: they can overlap for the same profile (a position can be both
+    // deleted-range and separately noisy-range), and two independent -1/+1
+    // pairs over the same sub-range would double-exclude it, undercounting
+    // clean coverage there. Merging first (both inputs already individually
+    // sorted+merged, so this is one sort + one linear coalesce per profile)
+    // avoids that.
+    //
+    // delSupportAtPos is a second, simpler sweep over deletionRanges alone
+    // (clipped to coverage), replacing the delSupportAt(pos) calls in the
+    // same loop (insSupportAt/delSupportAt calls inside flanksLinear are left
+    // as-is: measured at a much smaller ~16% of this function's time, over a
+    // far smaller position set -- passingSites x 8 flanks, not every profile
+    // x every SNP position -- so not worth the same treatment yet).
+    vector<uint32_t> cleanCoverageAtPos(sortedSnpPositions.size(), 0);
+    vector<uint32_t> delSupportAtPosVec(sortedSnpPositions.size(), 0);
+    {
+        vector<CovEvent> cleanEvents;
+        vector<CovEvent> delEvents;
+        cleanEvents.reserve(profiles.size() * 2);
+        delEvents.reserve(profiles.size() * 2);
+        vector<pair<uint32_t, uint32_t>> mergedExcl;
+        for (const auto& prof : profiles) {
+            if (prof.bbCovBegin >= prof.bbCovEnd) continue;
+            cleanEvents.push_back({prof.bbCovBegin, +1});
+            cleanEvents.push_back({prof.bbCovEnd, -1});
+
+            for (const auto& r : prof.deletionRanges) {
+                const uint32_t a = max(r.first, prof.bbCovBegin);
+                const uint32_t b = min(r.second, prof.bbCovEnd);
+                if (a < b) { delEvents.push_back({a, +1}); delEvents.push_back({b, -1}); }
+            }
+
+            mergedExcl.clear();
+            mergedExcl.reserve(prof.deletionRanges.size() + prof.noisyRanges.size());
+            for (const auto& r : prof.deletionRanges) mergedExcl.push_back(r);
+            // Noisy ranges are excluded from clean coverage only when the
+            // noise filter is actually in effect (matches snpCounts' own
+            // noise check above and memberCall's): DINARA_HET_NONOISE lets
+            // noisy alt votes count in altTotal, so clean coverage must
+            // count those same profiles too, or altTotal could exceed
+            // cleanCoverageAtPos and underflow the unsigned refCount subtraction.
+            if (!disableNoise)
+                for (const auto& r : prof.noisyRanges) mergedExcl.push_back(r);
+            if (!mergedExcl.empty()) {
+                sort(mergedExcl.begin(), mergedExcl.end());
+                size_t w = 0;
+                for (size_t ri = 0; ri < mergedExcl.size(); ri++) {
+                    const uint32_t a = max(mergedExcl[ri].first, prof.bbCovBegin);
+                    const uint32_t b = min(mergedExcl[ri].second, prof.bbCovEnd);
+                    if (a >= b) continue;
+                    if (w > 0 && a <= mergedExcl[w - 1].second) {
+                        mergedExcl[w - 1].second = max(mergedExcl[w - 1].second, b);
+                    } else {
+                        mergedExcl[w] = {a, b};
+                        w++;
+                    }
+                }
+                mergedExcl.resize(w);
+                for (const auto& r : mergedExcl) {
+                    cleanEvents.push_back({r.first, -1});
+                    cleanEvents.push_back({r.second, +1});
+                }
+            }
+        }
+        sort(cleanEvents.begin(), cleanEvents.end(),
+            [](const CovEvent& a, const CovEvent& b) { return a.pos < b.pos; });
+        sort(delEvents.begin(), delEvents.end(),
+            [](const CovEvent& a, const CovEvent& b) { return a.pos < b.pos; });
+
+        int cleanRunning = 0;
+        size_t cei = 0;
+        int delRunning = 0;
+        size_t dei = 0;
+        for (size_t pi = 0; pi < sortedSnpPositions.size(); pi++) {
+            const uint32_t pos = sortedSnpPositions[pi];
+            while (cei < cleanEvents.size() && cleanEvents[cei].pos <= pos) {
+                cleanRunning += cleanEvents[cei].delta;
+                cei++;
+            }
+            while (dei < delEvents.size() && delEvents[dei].pos <= pos) {
+                delRunning += delEvents[dei].delta;
+                dei++;
+            }
+            cleanCoverageAtPos[pi] = uint32_t(max(cleanRunning, 0));
+            delSupportAtPosVec[pi] = uint32_t(max(delRunning, 0));
+        }
+    }
+
     // Per-member allele call at a backbone position: -2 = ref (agrees with
     // backbone), a base 0-3 = that alt, or -1 if not covered / deleted / noisy.
     auto memberCall = [disableNoise](const KwMemberProfile& prof, uint32_t pos) -> int {
@@ -252,21 +374,35 @@ inline std::uint32_t emitHetBubblesFromProfiles(
     struct PassingSite { uint32_t pos; uint32_t spanning; uint32_t refCount; vector<PassingAlt> alts; };
     vector<PassingSite> passingSites;
 
-    vector<uint32_t> posList(snpPositions.begin(), snpPositions.end());
-    sort(posList.begin(), posList.end());
-
-    for (uint32_t pos : posList) {
-        uint32_t refCount = 1; // backbone is ref
-        for (const auto& prof : profiles)
-            if (memberCall(prof, pos) == -2) refCount++;
+    const auto tPosList0 = std::chrono::steady_clock::now();
+    for (size_t posIdx = 0; posIdx < sortedSnpPositions.size(); posIdx++) {
+        const uint32_t pos = sortedSnpPositions[posIdx];
 
         uint32_t altTotal = 0;
         for (uint8_t b = 0; b < 4; b++) {
             auto it = snpCounts.find(snpKey(pos, b));
             if (it != snpCounts.end()) altTotal += it->second.total;
         }
-        const uint32_t del = delSupportAt(pos);
+        // refCount-1 = (profiles classified ref-or-alt here) - (profiles
+        // classified alt here) = cleanCoverageAtPos[posIdx] - altTotal; see
+        // the design note on cleanCoverageAtPos above for the derivation.
+        const uint32_t refCount = 1 + cleanCoverageAtPos[posIdx] - altTotal;
+        const uint32_t del = delSupportAtPosVec[posIdx];
         const uint32_t spanning = refCount + altTotal + del;
+
+        if (std::getenv("DINARA_HET_VALIDATE_SWEEP") != nullptr) {
+            uint32_t refCountSlow = 1;
+            for (const auto& prof : profiles)
+                if (memberCall(prof, pos) == -2) refCountSlow++;
+            uint32_t delSlow = 0;
+            for (const auto& prof : profiles)
+                if (pos >= prof.bbCovBegin && pos < prof.bbCovEnd && prof.isDeleted(pos)) delSlow++;
+            if (refCountSlow != refCount || delSlow != del) {
+                std::cout << "SWEEP MISMATCH pos=" << pos
+                          << " refCount fast=" << refCount << " slow=" << refCountSlow
+                          << " del fast=" << del << " slow=" << delSlow << std::endl;
+            }
+        }
         if (spanning == 0) continue;
         if (refCount < uint32_t(minSupport)) continue; // ref allele must be present
 
@@ -295,6 +431,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         }
         if (!site.alts.empty()) passingSites.push_back(std::move(site));
     }
+    hetEmitPosListNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tPosList0).count()), std::memory_order_relaxed);
 
     // Flank-linearity gate (majority-based reconstruction of abPOA's degree-1
     // predPrev/commonPred and commonSucc/succNext test). A flank column breaks
@@ -375,6 +513,7 @@ inline std::uint32_t emitHetBubblesFromProfiles(
     };
 
     uint32_t emitted = 0;
+    const auto tPassing0 = std::chrono::steady_clock::now();
     for (const PassingSite& site : passingSites) {
         const uint32_t pos = site.pos;
         if (!flanksLinear(pos)) continue;
@@ -531,6 +670,8 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         window.hetBubbles.push_back(std::move(bubble));
         emitted++;
     }
+    hetEmitPassingNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tPassing0).count()), std::memory_order_relaxed);
 
     // NOTE: coincident-hom merging (sharedLeadFromBubble) is intentionally NOT
     // done here. It must run AFTER planning (main.cpp mergeWindowCoincidentHoms,
@@ -560,7 +701,24 @@ inline std::uint32_t emitHetBubblesFromProfiles(
         }
     }
 
+    hetEmitTotalNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tEmit0).count()), std::memory_order_relaxed);
+    hetEmitCalls.fetch_add(1, std::memory_order_relaxed);
+
     return emitted;
+}
+
+// Prints the summed emitHetBubblesFromProfiles aggregation/gating time across
+// all calls/threads so far, when DINARA_HET_TIMING_DEBUG is set. Call once
+// after all window processing completes.
+inline void dinaraPrintHetEmitTiming() {
+    if (std::getenv("DINARA_HET_TIMING_DEBUG") == nullptr) return;
+    std::cout << "emitHetBubblesFromProfiles timing: "
+              << hetEmitCalls.load() << " calls, "
+              << (double(hetEmitTotalNs.load()) / 1e6) << " ms total"
+              << " (posList loop=" << (double(hetEmitPosListNs.load()) / 1e6) << " ms, "
+              << "passingSites loop=" << (double(hetEmitPassingNs.load()) / 1e6) << " ms)."
+              << std::endl;
 }
 
 } // namespace dinara

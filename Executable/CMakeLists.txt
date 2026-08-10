@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(dinaraExecutable)
 
-# C++ dialect.
-add_definitions(-std=c++23)
+# C++ dialect. Scoped to CXX only (add_definitions would also apply it to the
+# project's one C source, ksw2_extd2_sse.c, which clang rejects -std=c++23 for).
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-std=c++23>)
 
 # Compilation warnings.
 # Keep actionable warnings enabled by default, but avoid conversion-noise flooding

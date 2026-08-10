@@ -100,13 +100,22 @@ void Assembler::computeAnchorWindowsClean(
     shared_ptr<Shasta2Journeys> shasta2Journeys,
     const vector<ReadId>& readIdsSortedByLength,
     vector<AnchorWindow>& anchorWindows,
-    uint64_t threadCount,
+    uint64_t /* threadCount */,
     uint64_t minCommonForBackbone,
     uint64_t maxSkipForBackbone,
     uint64_t minWindowBaseSpan,
     vector<uint32_t>* anchorDovetailWindow,
     bool tileUnclaimedIntervals)
 {
+    // threadCount is intentionally unused: window claiming is a single
+    // priority-queue sweep over shared, mutually-exclusive anchor ownership
+    // (anchorOwner), with lazy stale-candidate invalidation
+    // (candidateGeneration) driving a strict largest-first claim order.
+    // That's inherently serial, not just not-yet-parallelized -- two threads
+    // racing to claim overlapping journey spans would break both the
+    // disjoint-windows invariant and the deterministic tiebreak order the
+    // priority comparator (CleanWindowCandidateLess) is built around. Kept
+    // in the signature for parity with sibling mode3-pipeline calls.
     cout << timestamp << "computeAnchorWindowsClean begins." << endl;
     const auto t0 = steady_clock::now();
 
@@ -116,10 +125,6 @@ void Assembler::computeAnchorWindowsClean(
     DINARA_ASSERT(shasta2Journeys);
     DINARA_ASSERT(shasta2Journeys->isOpen());
     DINARA_ASSERT(reads->readCount() > 0);
-
-    if(threadCount == 0) {
-        threadCount = std::thread::hardware_concurrency();
-    }
 
     const uint64_t readCount = reads->readCount();
     const uint64_t orientedReadCount = 2 * readCount;

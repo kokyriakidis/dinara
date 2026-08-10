@@ -825,52 +825,53 @@ uint64_t Shasta2Anchors::countCommon(Shasta2AnchorId anchorId0, Shasta2AnchorId 
 
 
 
-uint32_t Shasta2Anchors::getPosition(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
-    const Shasta2Anchor anchor = (*this)[anchorId];
-    for(const auto& info: anchor) {
-        if(info.orientedReadId == orientedReadId) {
-            return info.position;
+namespace {
+    // Every anchor's member list is stored sorted ascending by OrientedReadId --
+    // primary anchors are explicitly sorted before storage (see the "Sort by
+    // OrientedReadId to ensure canonical order" block above), and appendHetAnchorPair
+    // sorts both the forward and RC member lists the same way before appending.
+    // So a lookup by OrientedReadId can binary search instead of scanning the
+    // whole anchor, turning an O(coverage) scan into O(log coverage). This is the
+    // single lookup primitive behind getPosition/getOrdinal/getPositionInJourney/
+    // getAnchorMarkerInfo/anchorContains, all called in per-anchor hot loops
+    // throughout window creation, window transitions, and anchor graph construction.
+    const Shasta2AnchorMarkerInfo* findMarkerInfo(
+        const Shasta2Anchor& anchor, OrientedReadId orientedReadId)
+    {
+        const auto it = std::lower_bound(anchor.begin(), anchor.end(), orientedReadId,
+            [](const Shasta2AnchorMarkerInfo& info, OrientedReadId oid) {
+                return info.orientedReadId < oid;
+            });
+        if(it != anchor.end() and it->orientedReadId == orientedReadId) {
+            return &(*it);
         }
+        return nullptr;
     }
-    return invalid<uint32_t>;
+}
+
+uint32_t Shasta2Anchors::getPosition(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
+    const Shasta2AnchorMarkerInfo* info = findMarkerInfo((*this)[anchorId], orientedReadId);
+    return info ? info->position : invalid<uint32_t>;
 }
 
 uint32_t Shasta2Anchors::getOrdinal(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
-    const Shasta2Anchor anchor = (*this)[anchorId];
-    for(const auto& info: anchor) {
-        if(info.orientedReadId == orientedReadId) {
-            return info.ordinal;
-        }
-    }
-    return invalid<uint32_t>;
+    const Shasta2AnchorMarkerInfo* info = findMarkerInfo((*this)[anchorId], orientedReadId);
+    return info ? info->ordinal : invalid<uint32_t>;
 }
 
 uint32_t Shasta2Anchors::getPositionInJourney(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
-    const Shasta2Anchor anchor = (*this)[anchorId];
-    for(const auto& info: anchor) {
-        if(info.orientedReadId == orientedReadId) {
-            return info.positionInJourney;
-        }
-    }
-    return invalid<uint32_t>;
+    const Shasta2AnchorMarkerInfo* info = findMarkerInfo((*this)[anchorId], orientedReadId);
+    return info ? info->positionInJourney : invalid<uint32_t>;
 }
 
 const Shasta2AnchorMarkerInfo& Shasta2Anchors::getAnchorMarkerInfo(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
-    const Shasta2Anchor anchor = (*this)[anchorId];
-    for(const auto& info: anchor) {
-        if(info.orientedReadId == orientedReadId) {
-            return info;
-        }
+    const Shasta2AnchorMarkerInfo* info = findMarkerInfo((*this)[anchorId], orientedReadId);
+    if(info == nullptr) {
+        throw runtime_error("Anchor marker info not found.");
     }
-    throw runtime_error("Anchor marker info not found.");
+    return *info;
 }
 
 bool Shasta2Anchors::anchorContains(Shasta2AnchorId anchorId, OrientedReadId orientedReadId) const {
-    const Shasta2Anchor anchor = (*this)[anchorId];
-    for(const auto& info: anchor) {
-        if(info.orientedReadId == orientedReadId) {
-            return true;
-        }
-    }
-    return false;
+    return findMarkerInfo((*this)[anchorId], orientedReadId) != nullptr;
 }

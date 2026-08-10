@@ -158,18 +158,17 @@ void Shasta2Journeys::threadFunction4(uint64_t /* threadId */)
             }
 
             // Store journey information for this oriented read in the marker interval.
+            // Anchor members are stored sorted ascending by OrientedReadId (see
+            // Shasta2Anchors), so binary search instead of scanning the whole anchor.
             for(uint64_t position=0; position<journey.size(); position++) {
                 const Shasta2AnchorId anchorId = journey[position];
                 span<Shasta2AnchorMarkerInfo> markerInfos = anchors.anchorMarkerInfos[anchorId];
-                bool found = false;
-                for(Shasta2AnchorMarkerInfo& markerInfo: markerInfos) {
-                    if(markerInfo.orientedReadId == orientedReadId) {
-                        markerInfo.positionInJourney = uint32_t(position);
-                        found = true;
-                        break;
-                    }
-                }
-                DINARA_ASSERT(found);
+                const auto it = std::lower_bound(markerInfos.begin(), markerInfos.end(), orientedReadId,
+                    [](const Shasta2AnchorMarkerInfo& info, OrientedReadId oid) {
+                        return info.orientedReadId < oid;
+                    });
+                DINARA_ASSERT(it != markerInfos.end() and it->orientedReadId == orientedReadId);
+                it->positionInJourney = uint32_t(position);
             }
         }
     }
@@ -343,11 +342,14 @@ void Shasta2Journeys::filterByAnchorChaining(
         for(uint64_t position = 0; position < journey.size(); position++) {
             const Shasta2AnchorId anchorId = journey[position];
             span<Shasta2AnchorMarkerInfo> markerInfos = anchors.anchorMarkerInfos[anchorId];
-            for(Shasta2AnchorMarkerInfo& markerInfo : markerInfos) {
-                if(markerInfo.orientedReadId == orientedReadId) {
-                    markerInfo.positionInJourney = uint32_t(position);
-                    break;
-                }
+            // Anchor members are stored sorted ascending by OrientedReadId (see
+            // Shasta2Anchors), so binary search instead of scanning the whole anchor.
+            const auto it = std::lower_bound(markerInfos.begin(), markerInfos.end(), orientedReadId,
+                [](const Shasta2AnchorMarkerInfo& info, OrientedReadId oid) {
+                    return info.orientedReadId < oid;
+                });
+            if(it != markerInfos.end() and it->orientedReadId == orientedReadId) {
+                it->positionInJourney = uint32_t(position);
             }
         }
     }

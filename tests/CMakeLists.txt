@@ -5,8 +5,9 @@ project(dinara_tests)
 # via `add_subdirectory(tests)` from the repo root).
 set(DINARA_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
-# C++ dialect
-add_definitions(-std=c++23)
+# C++ dialect. Scoped to CXX only (add_definitions would also apply it to the
+# project's one C source, ksw2_extd2_sse.c, which clang rejects -std=c++23 for).
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-std=c++23>)
 
 # Debug symbols for tests
 add_definitions(-ggdb3 -O0)

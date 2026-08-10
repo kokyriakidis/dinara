@@ -51,6 +51,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -419,6 +420,1183 @@ inline void runIpoaOnRows(
     std::vector<IpoaSpanMember>& spanMembers, const Reads& rds,
     IpoaAbHandle& ah, IpoaFragment& frag, bool timing,
     const IpoaClock::time_point& tSetup0, int minMembers);
+
+// ============================================================================
+// Leaf-snarl detection directly from the abpoa graph (substitution-only).
+// ============================================================================
+//
+// emitHetBubblesFromProfiles (WindowHetProfiles.hpp) scans the flattened MSA
+// column matrix (abc->msa_base[r][c]) one backbone column at a time, so a
+// genuine multi-base block shared identically by the same reads is never
+// recognized as one bubble -- it is only ever found (if at all) as several
+// unrelated single-column sites. This works directly on abpoa's own graph
+// instead, which additionally lets it tell apart "same value by coincidence"
+// from "genuinely the same aligned position" when nearby structural
+// complexity is involved.
+//
+// Per-read node membership is captured DIRECTLY from abpoa's own alignment
+// result (qpos_to_node_id, filled in by abpoa_add_subgraph_alignment /
+// abpoa_add_graph_alignment during construction) rather than reconstructed
+// afterward by walking read_ids bitmasks on graph edges. That reconstruction
+// was tried first and has a real bug for multi-segment members (a read added
+// piece by piece, one abpoa_add_subgraph_alignment call per inter-anchor
+// segment, matching AssemblerWindowAbpoaGraph.cpp): abpoa registers a read's
+// bit on the OUTGOING edge of a shared anchor node only when a further
+// segment continues past it (inc_both_ends=1 on the next segment's own first
+// step); a member whose own rightmost pin IS that anchor -- i.e. exactly its
+// own endpoint, which differs read by read -- has no such edge, even though
+// it genuinely matches there, so edge-based reconstruction misclassifies
+// every read as "diverged" exactly at its own endpoint. Reading
+// qpos_to_node_id directly avoids this: it is abpoa's own record of exactly
+// which node each of a read's bases aligned to, with no dependency on which
+// edge happened to get a bit registered.
+//
+// Grouping rule: consecutive backbone columns belong to the SAME leaf snarl
+// only while the exact SET of diverged (off-backbone) members is identical
+// from one column to the next -- not merely "some divergence exists". Two
+// reads that diverge independently at adjacent columns have DIFFERENT
+// diverged-row sets at those two columns (e.g. {R2} vs {R3}), so they are
+// kept as two separate single-column snarls; a genuine multi-base block
+// shared identically by the same reads keeps the same set across all its
+// columns and is correctly merged into one multi-base snarl. A column where
+// the diverged set changes at all -- growing, shrinking, or swapping
+// membership -- starts a new snarl there, ending the previous one at that
+// boundary.
+//
+// Scoped to substitutions only: an anchor needs a real base position for
+// every member, which a deletion or insertion doesn't have. A member with an
+// Invalid (non-substitution) divergence anywhere in a candidate span is
+// excluded from allele counting there -- same treatment as "not covered" --
+// rather than disqualifying the whole site for every other member. (An
+// earlier version disqualified the whole site, which in real noisy data --
+// almost every multi-row site has at least one indel-affected read mixed in
+// with otherwise-clean substitution support -- silently discarded
+// everything.)
+
+struct LeafSnarlAllele {
+    std::vector<OrientedReadId> members;
+    std::vector<std::uint8_t> bases;  // length == end - start - 1; one real base per column.
+};
+
+struct LeafSnarl {
+    std::uint32_t start;  // absolute backbone position: last full-agreement column before.
+    std::uint32_t end;    // absolute backbone position: first full-agreement column after.
+    std::vector<LeafSnarlAllele> alleles;  // >= 2; includes the backbone-matching (ref) allele.
+};
+
+// NotCovered is distinct from Invalid: Invalid means the member covers this
+// backbone position but has no substitution there (a deletion, or the
+// alignment simply doesn't reach it -- ambiguous either way, so scoped out).
+// NotCovered means this backbone position is outside the member's own
+// coverage range entirely -- it was never going to align here, which is the
+// common case for any window wider than a single read's overlap, and must
+// NOT be treated as divergence (see the design note on IpoaMemberInfo).
+enum class IpoaColState : std::uint8_t { OnBackbone, Substitution, Invalid, NotCovered };
+
+// Small per-member metadata: identity plus its coverage bound.
+// bbCovBegin/bbCovEnd (backbone position indices, half-open, same indexing as
+// backbonePath/bbBases below) bound where this member actually has coverage
+// -- normally its first and last shared anchor with the backbone. A window
+// is typically far wider than any single member's own overlap with the
+// backbone (a window chains together many reads, each covering only part of
+// it), so most members do not cover most positions. Without this bound,
+// "doesn't visit this node" is indistinguishable from "was never aligned
+// here at all", and every uncovered position gets misclassified as a
+// deletion for every member that simply isn't there -- in practice this
+// showed up as ~100% of positions in a window appearing to "diverge".
+struct IpoaMemberInfo {
+    OrientedReadId oid;
+    std::uint32_t bbCovBegin = 0;
+    std::uint32_t bbCovEnd = 0;
+};
+
+// Which members visited each graph node, captured directly from abpoa's own
+// alignment result (qpos_to_node_id, filled in by abpoa_add_subgraph_alignment
+// / abpoa_add_graph_alignment during construction) rather than reconstructed
+// afterward by walking read_ids bitmasks on graph edges. That reconstruction
+// was tried first and has a real bug for multi-segment members (a read added
+// piece by piece, one abpoa_add_subgraph_alignment call per inter-anchor
+// segment, matching AssemblerWindowAbpoaGraph.cpp): abpoa registers a read's
+// bit on the OUTGOING edge of a shared anchor node only when a further
+// segment continues past it (inc_both_ends=1 on the next segment's own first
+// step); a member whose own rightmost pin IS that anchor -- i.e. exactly its
+// own endpoint, which differs read by read -- has no such edge, even though
+// it genuinely matches there, so edge-based reconstruction misclassifies
+// every read as "diverged" exactly at its own endpoint. Reading
+// qpos_to_node_id directly avoids this: it is abpoa's own record of exactly
+// which node each of a read's bases aligned to, with no dependency on which
+// edge happened to get a bit registered.
+//
+// Stored as a CSR (offset + flat member-index array), built once from the
+// flat list of (nodeId, memberIndex) pairs collected during construction --
+// NOT as one vector<bool> per member sized to the whole graph. A member
+// typically visits only a small fraction of a window's nodes, so a per-member
+// bitset wastes memory proportional to graph size rather than actual
+// coverage, and turns classification into "ask every member a question"
+// instead of "look up who's already here".
+struct IpoaNodeVisitors {
+    std::vector<std::uint32_t> offset;  // size nodeCount + 1
+    std::vector<int> memberIdx;         // flat, size offset.back()
+
+    // Member indices that visited nodeId, as a raw (pointer, count) span.
+    std::pair<const int*, std::uint32_t> at(int nodeId) const {
+        if (nodeId < 0 || std::size_t(nodeId) + 1 >= offset.size()) return {nullptr, 0};
+        const std::uint32_t begin = offset[std::size_t(nodeId)];
+        const std::uint32_t end = offset[std::size_t(nodeId) + 1];
+        return {memberIdx.data() + begin, end - begin};
+    }
+
+    // Build the CSR from a flat (possibly unsorted) list of (nodeId, member)
+    // pairs via counting sort -- O(visits + nodeCount), no comparison sort.
+    static IpoaNodeVisitors build(
+        int nodeCount, const std::vector<std::pair<int, int>>& visits)
+    {
+        IpoaNodeVisitors nv;
+        nv.offset.assign(std::size_t(nodeCount) + 1, 0);
+        for (const auto& [nodeId, memberIdx] : visits) {
+            (void)memberIdx;
+            if (nodeId >= 0 && nodeId < nodeCount) nv.offset[std::size_t(nodeId) + 1]++;
+        }
+        for (std::size_t k = 1; k < nv.offset.size(); k++) nv.offset[k] += nv.offset[k - 1];
+        nv.memberIdx.resize(nv.offset.back());
+        std::vector<std::uint32_t> cursor(nv.offset.begin(), nv.offset.end() - 1);
+        for (const auto& [nodeId, memberIdx] : visits) {
+            if (nodeId >= 0 && nodeId < nodeCount) {
+                nv.memberIdx[cursor[std::size_t(nodeId)]++] = memberIdx;
+            }
+        }
+        return nv;
+    }
+};
+
+// backbonePath[i] = the graph node id of the backbone's own base at position
+// i, captured directly from qpos_to_node_id at seed time (not reconstructed
+// via edge traversal, for the same reason as IpoaNodeVisitors above).
+// bbBases/bbBeginAbs = the backbone's own base codes over the same span and
+// the absolute backbone position of bbBases[0]. minSupport/minVaf/
+// dropHomopolymer/dropRepeat mirror the identical-named gates in
+// emitHetBubblesFromProfiles (WindowHetProfiles.hpp).
+//
+// Performance note: state/altBase are one flat, contiguous, row-major array
+// each (index = i*nMembers+r), not vector<vector<T>> -- the latter is n
+// separate heap allocations, and walks between them on every position-major
+// access (which is the access pattern used throughout this function: outer
+// loop over position, inner loop over member). diverged is similarly one
+// flat CSR (offset + flat member-index array) instead of vector<vector<int>>,
+// for the same reason.
+// Shared classification+grouping core, independent of how state/altBase were
+// populated (from an abPOA graph, from independent pairwise alignments, or
+// any other source): given the fully-built per-position/per-member state,
+// group runs of identically-diverged columns into leaf snarls. See
+// findLeafSnarlsFromGraph and findLeafSnarlsFromPairwiseColumns for the two
+// current front-ends that build state/altBase and delegate here.
+inline std::vector<LeafSnarl> classifyLeafSnarls(
+    std::uint32_t n,
+    int nMembers,
+    const std::vector<IpoaColState>& state,
+    const std::vector<std::uint8_t>& altBase,
+    const std::vector<IpoaMemberInfo>& members,
+    OrientedReadId backboneOid,
+    const std::vector<std::uint8_t>& bbBases,
+    std::uint32_t bbBeginAbs,
+    std::uint64_t minSupport,
+    double minVaf,
+    bool dropHomopolymer,
+    bool dropRepeat)
+{
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::uint64_t;
+    using std::vector;
+
+    vector<LeafSnarl> result;
+    if (n == 0 || n != bbBases.size()) return result;
+
+    const size_t nMembersSz = size_t(nMembers);
+    auto idx = [nMembersSz](uint32_t i, int r) { return size_t(i) * nMembersSz + size_t(r); };
+
+    // Per-column set of diverged members, as one flat CSR (offset + flat
+    // member-index array) built in two passes over the now-known state array
+    // -- counting then filling -- rather than n separate vector<int> rows.
+    // Exact-equality comparison between consecutive columns' spans drives
+    // grouping (see the file-level design note above for why exact-set
+    // matching, not "any divergence", is required). NotCovered is excluded
+    // here alongside OnBackbone: a member never aligned at this position
+    // carries no information about it and must not count as divergence.
+    auto isDiverged = [](IpoaColState s) {
+        return s == IpoaColState::Substitution || s == IpoaColState::Invalid;
+    };
+    vector<uint32_t> divergedOffset(size_t(n) + 1, 0);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t cnt = 0;
+        for (int r = 0; r < nMembers; r++) if (isDiverged(state[idx(i, r)])) cnt++;
+        divergedOffset[i + 1] = divergedOffset[i] + cnt;
+    }
+    vector<int> divergedFlat(divergedOffset[n]);
+    {
+        vector<uint32_t> cursor(divergedOffset.begin(), divergedOffset.end() - 1);
+        for (uint32_t i = 0; i < n; i++) {
+            for (int r = 0; r < nMembers; r++) {
+                if (isDiverged(state[idx(i, r)])) divergedFlat[cursor[i]++] = r;
+            }
+        }
+    }
+    auto divergedSpan = [&](uint32_t i) {
+        return std::pair<const int*, uint32_t>(
+            divergedFlat.data() + divergedOffset[i], divergedOffset[i + 1] - divergedOffset[i]);
+    };
+    auto divergedEmpty = [&](uint32_t i) { return divergedOffset[i] == divergedOffset[i + 1]; };
+    auto divergedEqual = [&](uint32_t a, uint32_t b) {
+        const auto [pa, na] = divergedSpan(a);
+        const auto [pb, nb] = divergedSpan(b);
+        return na == nb && std::equal(pa, pa + na, pb);
+    };
+
+    // Flank-linearity gate, generalized from emitHetBubblesFromProfiles's
+    // single-column flanksLinear (WindowHetProfiles.hpp) to a [runStart,
+    // runEnd) span: requires >=4 clean columns on each side of the WHOLE
+    // span (not just around one position), where "clean" means no other
+    // divergence -- substitution or Invalid (deletion/insertion) -- reaches
+    // minSupport there. This is what keeps a real, isolated site from being
+    // called right next to a repeat/indel-prone region, same intent as the
+    // single-column version, just checked against the span's own two edges
+    // instead of a single position's immediate neighbors.
+    auto flanksLinear = [&](uint32_t spanStart, uint32_t spanEnd) -> bool {
+        if (spanStart < 4 || spanEnd + 4 > n) return false;
+        for (const uint32_t c : {spanStart - 4, spanStart - 3, spanStart - 2, spanStart - 1,
+                                  spanEnd,       spanEnd + 1,   spanEnd + 2,   spanEnd + 3}) {
+            uint64_t invalidCount = 0;
+            uint64_t altCounts[4] = {0, 0, 0, 0};
+            for (int r = 0; r < nMembers; r++) {
+                const size_t cell = idx(c, r);
+                if (state[cell] == IpoaColState::Invalid) {
+                    invalidCount++;
+                } else if (state[cell] == IpoaColState::Substitution) {
+                    const uint8_t b = altBase[cell];
+                    if (b < 4) altCounts[b]++;
+                }
+            }
+            if (invalidCount >= minSupport) return false;
+            for (uint64_t cnt : altCounts) if (cnt >= minSupport) return false;
+        }
+        return true;
+    };
+
+    uint32_t i = 0;
+    while (i < n) {
+        if (divergedEmpty(i)) { i++; continue; }
+        const uint32_t runStart = i;
+        uint32_t runEnd = i + 1;
+        while (runEnd < n && divergedEqual(runEnd, runStart)) runEnd++;
+
+        if (!flanksLinear(runStart, runEnd)) { i = runEnd; continue; }
+
+        {
+            // A member with an Invalid or NotCovered state anywhere in the
+            // span is excluded from allele counting for this span (see
+            // design notes on IpoaColState/IpoaMemberInfo): Invalid means
+            // real but non-substitution divergence there; NotCovered means
+            // this member has no information about part of the span at all,
+            // so it cannot contribute a full-span key either way.
+            vector<bool> rowExcluded(nMembersSz, false);
+            for (int r = 0; r < nMembers; r++) {
+                for (uint32_t c = runStart; c < runEnd; c++) {
+                    const IpoaColState s = state[idx(c, r)];
+                    if (s == IpoaColState::Invalid || s == IpoaColState::NotCovered) {
+                        rowExcluded[size_t(r)] = true;
+                        break;
+                    }
+                }
+            }
+
+            auto keyFor = [&](int r) {
+                vector<uint8_t> k;
+                k.reserve(runEnd - runStart);
+                for (uint32_t c = runStart; c < runEnd; c++) {
+                    const size_t cell = idx(c, r);
+                    k.push_back(state[cell] == IpoaColState::OnBackbone ? bbBases[c] : altBase[cell]);
+                }
+                return k;
+            };
+
+            // Seed with the ref allele (the backbone's own sequence over this
+            // span) so it always exists even if every member is excluded.
+            vector<vector<uint8_t>> alleleKeys;
+            vector<LeafSnarlAllele> alleles;
+            {
+                const vector<uint8_t> refKey(bbBases.begin() + runStart, bbBases.begin() + runEnd);
+                alleleKeys.push_back(refKey);
+                LeafSnarlAllele refAllele;
+                refAllele.members.push_back(backboneOid);
+                refAllele.bases = refKey;
+                alleles.push_back(std::move(refAllele));
+            }
+            const int refAlleleIndex = 0;
+
+            for (int r = 0; r < nMembers; r++) {
+                if (rowExcluded[size_t(r)]) continue;
+                vector<uint8_t> k = keyFor(r);
+                size_t ai = alleleKeys.size();
+                for (size_t j = 0; j < alleleKeys.size(); j++) {
+                    if (alleleKeys[j] == k) { ai = j; break; }
+                }
+                if (ai == alleleKeys.size()) {
+                    alleleKeys.push_back(k);
+                    LeafSnarlAllele allele;
+                    allele.bases = k;
+                    alleles.push_back(std::move(allele));
+                }
+                alleles[ai].members.push_back(members[size_t(r)].oid);
+            }
+
+            uint64_t totalMembers = 0;
+            for (const auto& a : alleles) totalMembers += a.members.size();
+
+            vector<LeafSnarlAllele> gated;
+            for (int ai = 0; ai < int(alleles.size()); ai++) {
+                LeafSnarlAllele& allele = alleles[size_t(ai)];
+                if (allele.members.size() < minSupport) continue;
+                if (ai != refAlleleIndex) {
+                    const double af = double(allele.members.size()) / double(totalMembers);
+                    if (af < minVaf) continue;
+                }
+                gated.push_back(std::move(allele));
+            }
+
+            bool passesRepeatGate = true;
+            if (dropHomopolymer || dropRepeat) {
+                KmVarKey vkey;
+                vkey.type = KmVarType::Snp;
+                vkey.refLen = 1; vkey.altLen = 1; vkey.altBase = 0;
+                // Check both ends of the span (matches the single-column gate,
+                // which checks the SNP's own single position via the same
+                // pos-1/pos+1 flank logic inside kmIsRepeatUnitRange).
+                for (uint32_t localPos : {runStart, runEnd - 1}) {
+                    vkey.pos = localPos;
+                    const bool inHomopolymer = kmIsRepeatUnitRange(
+                        bbBases.data(), uint32_t(bbBases.size()), vkey, 0, 1, 1);
+                    const bool inStr = kmIsRepeatUnitRange(
+                        bbBases.data(), uint32_t(bbBases.size()), vkey, 0, 2, 6);
+                    if (dropHomopolymer && inHomopolymer) passesRepeatGate = false;
+                    if (dropRepeat && inStr) passesRepeatGate = false;
+                }
+            }
+
+            if (passesRepeatGate && gated.size() >= 2) {
+                LeafSnarl snarl;
+                snarl.start = bbBeginAbs + runStart - 1;
+                snarl.end = bbBeginAbs + runEnd;
+                snarl.alleles = std::move(gated);
+                result.push_back(std::move(snarl));
+            }
+        }
+
+        i = runEnd;
+    }
+
+    return result;
+}
+
+// Populates state/altBase from an abPOA graph's own alignment record
+// (qpos_to_node_id / aligned_node_id), then delegates the classification and
+// grouping to classifyLeafSnarls. See the design note on IpoaNodeVisitors for
+// why membership is read from qpos_to_node_id rather than reconstructed from
+// read_ids edge bits.
+inline std::vector<LeafSnarl> findLeafSnarlsFromGraph(
+    const abpoa_graph_t* abg,
+    OrientedReadId backboneOid,
+    const std::vector<int>& backbonePath,
+    const std::vector<IpoaMemberInfo>& members,
+    const IpoaNodeVisitors& nodeVisitors,
+    const std::vector<std::uint8_t>& bbBases,
+    std::uint32_t bbBeginAbs,
+    std::uint64_t minSupport,
+    double minVaf,
+    bool dropHomopolymer,
+    bool dropRepeat)
+{
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::vector;
+
+    if (abg == nullptr) return {};
+
+    const uint32_t n = uint32_t(backbonePath.size());
+    if (n == 0 || n != bbBases.size()) return {};
+
+    const int nMembers = int(members.size());
+    const size_t nMembersSz = size_t(nMembers);
+
+    // Flat, contiguous, row-major (position-major) storage: cell (i, r) is
+    // state[size_t(i)*nMembersSz + r]. One allocation each, matching the
+    // position-major access pattern used everywhere below.
+    auto idx = [nMembersSz](uint32_t i, int r) { return size_t(i) * nMembersSz + size_t(r); };
+    vector<IpoaColState> state(size_t(n) * nMembersSz, IpoaColState::NotCovered);
+    vector<uint8_t> altBase(size_t(n) * nMembersSz, 0);
+
+    for (uint32_t i = 0; i < n; i++) {
+        const int bbNodeId = backbonePath[i];
+        const abpoa_node_t& node = abg->node[bbNodeId];
+
+        // Default per covered member: Invalid (pessimistic) unless upgraded
+        // below by direct membership in a visitor list. NotCovered members
+        // keep the array's global default and are never touched again.
+        for (int r = 0; r < nMembers; r++) {
+            if (i >= members[size_t(r)].bbCovBegin && i < members[size_t(r)].bbCovEnd) {
+                state[idx(i, r)] = IpoaColState::Invalid;
+            }
+        }
+
+        // Members actually at the backbone's own node: OnBackbone. Iterates
+        // only the (typically small) list of members truly there, not every
+        // member in the window.
+        {
+            const auto [ptr, cnt] = nodeVisitors.at(bbNodeId);
+            for (uint32_t k = 0; k < cnt; k++) {
+                const size_t cell = idx(i, ptr[k]);
+                if (state[cell] == IpoaColState::Invalid) state[cell] = IpoaColState::OnBackbone;
+            }
+        }
+
+        // Members at an aligned alternative (same column, different base):
+        // Substitution. aligned_node_n is small (a handful of alternate
+        // bases at most), so this stays cheap.
+        for (int a = 0; a < node.aligned_node_n; a++) {
+            const int altId = node.aligned_node_id[a];
+            if (altId < 0) continue;
+            const auto [ptr, cnt] = nodeVisitors.at(altId);
+            const uint8_t altBaseVal = abg->node[altId].base;
+            for (uint32_t k = 0; k < cnt; k++) {
+                const size_t cell = idx(i, ptr[k]);
+                if (state[cell] == IpoaColState::Invalid) {
+                    state[cell] = IpoaColState::Substitution;
+                    altBase[cell] = altBaseVal;
+                }
+            }
+        }
+    }
+
+    return classifyLeafSnarls(
+        n, nMembers, state, altBase, members, backboneOid, bbBases, bbBeginAbs,
+        minSupport, minVaf, dropHomopolymer, dropRepeat);
+}
+
+// Populates state/altBase from KwMemberProfile (WindowHetProfiles.hpp) --
+// the SAME engine-agnostic per-member representation emitHetBubblesFromProfiles
+// already consumes -- then delegates to classifyLeafSnarls. This means this
+// function plugs directly into whichever engine already built `profiles` for
+// a window (the production per-interval abPOA engine, or the ksw2 pairwise
+// engine) with ZERO new alignment work: both engines populate profiles by
+// aligning each member independently (one small bounded POA/DP per interval
+// or per member, no shared multi-sequence graph spanning the whole window),
+// so per-member cost here is bounded purely by that member's own overlap
+// span and is completely unaffected by how many other members were already
+// processed for this window -- see the design notes in
+// AssemblerWindowAbpoaGraph.cpp on the whole-window shared-graph blowup this
+// avoids by construction.
+//
+// A profile's aligned column whose readBase differs from the backbone's own
+// base there is a substitution, matching is OnBackbone. A position in
+// [bbCovBegin, bbCovEnd) with no corresponding column (a deletion), or one
+// flagged noisy (untrustworthy locally-dense mismatch/indel region -- same
+// exclusion emitHetBubblesFromProfiles's memberCall applies), is Invalid;
+// positions outside that range are NotCovered.
+inline std::vector<LeafSnarl> findLeafSnarlsFromProfiles(
+    OrientedReadId backboneOid,
+    const std::vector<KwMemberProfile>& profiles,
+    const std::vector<std::uint8_t>& bbBases,
+    std::uint32_t bbBeginAbs,
+    std::uint64_t minSupport,
+    double minVaf,
+    bool dropHomopolymer,
+    bool dropRepeat)
+{
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::vector;
+
+    const uint32_t n = uint32_t(bbBases.size());
+    if (n == 0) return {};
+
+    const int nMembers = int(profiles.size());
+    const size_t nMembersSz = size_t(nMembers);
+
+    vector<IpoaMemberInfo> members(nMembersSz);
+    for (int r = 0; r < nMembers; r++) {
+        members[size_t(r)].oid = profiles[size_t(r)].oid;
+        members[size_t(r)].bbCovBegin = profiles[size_t(r)].bbCovBegin;
+        members[size_t(r)].bbCovEnd = profiles[size_t(r)].bbCovEnd;
+    }
+
+    auto idx = [nMembersSz](uint32_t i, int r) { return size_t(i) * nMembersSz + size_t(r); };
+    vector<IpoaColState> state(size_t(n) * nMembersSz, IpoaColState::NotCovered);
+    vector<uint8_t> altBase(size_t(n) * nMembersSz, 0);
+
+    for (int r = 0; r < nMembers; r++) {
+        const KwMemberProfile& prof = profiles[size_t(r)];
+        const uint32_t covBegin = std::max(prof.bbCovBegin, bbBeginAbs);
+        const uint32_t covEnd = std::min(prof.bbCovEnd, bbBeginAbs + n);
+        for (uint32_t pos = covBegin; pos < covEnd; pos++) {
+            state[idx(pos - bbBeginAbs, r)] = IpoaColState::Invalid;
+        }
+        for (const KwAlignedCol& col : prof.alignedCols) {
+            if (col.bbPos < bbBeginAbs || col.bbPos >= bbBeginAbs + n) continue;
+            if (prof.isNoisy(col.bbPos)) continue; // untrustworthy: leave as Invalid.
+            const uint32_t i = col.bbPos - bbBeginAbs;
+            const size_t cell = idx(i, r);
+            if (col.readBase >= 4) continue; // N: leave as Invalid, not a substitution.
+            if (col.readBase == bbBases[i]) {
+                state[cell] = IpoaColState::OnBackbone;
+            } else {
+                state[cell] = IpoaColState::Substitution;
+                altBase[cell] = col.readBase;
+            }
+        }
+    }
+
+    return classifyLeafSnarls(
+        n, nMembers, state, altBase, members, backboneOid, bbBases, bbBeginAbs,
+        minSupport, minVaf, dropHomopolymer, dropRepeat);
+}
+
+// Sliding-window CIGAR-density noise tracker: shared by any per-member
+// pairwise alignment detector (ksw2, ProjectedAlignment, ...) that needs to
+// flag locally dense mismatch/indel clusters as untrustworthy -- a port of
+// pgphase's XidQueue, originally duplicated per-file in this codebase's
+// per-engine detectors to avoid unrelated naming collisions, consolidated
+// here once a second detector needed the identical logic. Each variant event
+// (mismatch=1, insertion=len, deletion=len) is pushed in backbone-coordinate
+// order; within a window of `win` backbone bases, if the summed event size
+// exceeds `maxS`, the spanned backbone interval is flagged noisy. Contiguous/
+// overlapping noisy spans are merged. Emitted ranges are half-open
+// [begin, end) backbone positions. Without this gate, independent per-member
+// alignment noise (dense local mismatch/indel clusters, each member solving
+// its own optimal but locally ambiguous gap placement) produces spurious
+// apparent divergence.
+struct IpoaNoiseTracker {
+    int win;
+    int maxS;
+    std::vector<std::uint32_t> pos;
+    std::vector<std::uint32_t> len;
+    std::vector<int> count;
+    std::size_t front = 0;
+    long total = 0;
+    long curStart = -1;
+    long curEnd = -1;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& out;
+
+    IpoaNoiseTracker(int win_, int maxS_, std::vector<std::pair<std::uint32_t, std::uint32_t>>& out_)
+        : win(win_), maxS(maxS_), out(out_) {}
+
+    void observe(std::uint32_t p, std::uint32_t l, int c) {
+        pos.push_back(p);
+        len.push_back(l);
+        count.push_back(c);
+        total += c;
+        const std::size_t rear = pos.size() - 1;
+
+        while (front <= rear &&
+               std::int64_t(pos[front]) + std::int64_t(len[front]) - 1 <= std::int64_t(p) - win) {
+            total -= count[front];
+            ++front;
+        }
+
+        if (c <= 0) return;
+        if (total <= maxS) return;
+
+        const long noisyStart = long(pos[front]);
+        const long noisyEnd = long(pos[rear]) + long(len[rear]);
+
+        if (curStart == -1) {
+            curStart = noisyStart;
+            curEnd = noisyEnd;
+            return;
+        }
+        if (noisyStart <= curEnd) {
+            curEnd = std::max(curEnd, noisyEnd);
+            return;
+        }
+        out.push_back({std::uint32_t(curStart), std::uint32_t(curEnd)});
+        curStart = noisyStart;
+        curEnd = noisyEnd;
+    }
+
+    void finish() {
+        if (curStart == -1) return;
+        out.push_back({std::uint32_t(curStart), std::uint32_t(curEnd)});
+        curStart = -1;
+        curEnd = -1;
+    }
+};
+
+// One sparse mismatch, with the member's exact read position at that
+// backbone column (not just the alt base) -- needed to PIN a het/hom anchor
+// (see sparseColAt/sparsePinnedKmerCol/sparsePinnedPointCol below), not just
+// to classify divergence.
+struct SparseSnp {
+    std::uint32_t bbPos;
+    std::uint8_t altBase;
+    std::uint32_t readPos;
+};
+
+// A member's SPARSE evidence against the backbone (e.g. from
+// ProjectedAlignment::sparseMismatches/sparseIndels): only the positions
+// where it DIFFERS from the backbone, not a dense per-column list. Distinct
+// from KwMemberProfile/findLeafSnarlsFromProfiles above, which requires a
+// real KwAlignedCol entry at EVERY covered position to tell "matches
+// backbone" apart from "not aligned here" -- appropriate for a dense
+// aligner's per-column walk, but wasteful for a sparse-diff aligner where
+// the vast majority of covered positions simply match and were never
+// explicitly recorded as such.
+struct SparseMemberEvidence {
+    OrientedReadId oid;
+    std::uint32_t bbCovBegin = 0;
+    std::uint32_t bbCovEnd = 0;
+    std::vector<SparseSnp> snps;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> deletionRanges; // [begin,end)
+    // Piecewise-constant (readPos - bbPos) offset, as a sorted list of
+    // (bbPos, deltaFromHere) breakpoints: "starting at this bbPos
+    // (inclusive), delta = deltaFromHere, until the next breakpoint". Built
+    // once from the FULL, exhaustive indel event list (every insertion/
+    // deletion the aligner recorded across the member's whole covered
+    // range) -- NOT from sparse shared-anchor pins. This matters: pins are
+    // only as dense as the anchor graph (can be many kb apart), so "nearest
+    // pin, reject if any indel lies between it and the target column" was
+    // rejecting almost every column whenever an unrelated indel happened to
+    // sit anywhere in that wide span, even though the aligner's own CIGAR
+    // already gives the EXACT delta at every position with no ambiguity.
+    // A deletion at bbPos=p, length L (backbone consumes L bases the member
+    // doesn't have) shifts delta by -L starting at p+L (positions in
+    // [p,p+L) are handled by deletionRanges instead, not by delta at all).
+    // An insertion at bbPos=p, length L (member has L extra bases the
+    // backbone doesn't) shifts delta by +L starting at p (no backbone
+    // position is skipped, so the very next backbone column already sees
+    // the new delta).
+    std::vector<std::pair<std::uint32_t, std::int64_t>> deltaBreakpoints;
+    std::int64_t deltaAtStart = 0; // delta for bbPos < first breakpoint (or all of bbCovBegin..bbCovEnd if none)
+    // Locally dense mismatch/indel clusters (IpoaNoiseTracker output): this
+    // member's votes inside these ranges are untrustworthy and excluded from
+    // both OnBackbone and Substitution classification, matching the same
+    // exclusion emitHetBubblesFromProfiles's memberCall applies to
+    // KwMemberProfile::isNoisy.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> noisyRanges;
+};
+
+// Populates state/altBase from SPARSE per-member evidence: every position in
+// [bbCovBegin, bbCovEnd) defaults to OnBackbone (the aligner didn't bother
+// recording a match explicitly), EXCEPT positions inside a deletionRange
+// (Invalid -- no base there) or listed in snps (Substitution). This is the
+// mirror image of findLeafSnarlsFromProfiles's default (Invalid unless an
+// explicit alignedCols entry says otherwise): correct here because a sparse
+// diff-only aligner recording NOTHING at a position specifically means "it
+// matched", not "unknown".
+inline std::vector<LeafSnarl> findLeafSnarlsFromSparseEvidence(
+    OrientedReadId backboneOid,
+    const std::vector<SparseMemberEvidence>& evidence,
+    const std::vector<std::uint8_t>& bbBases,
+    std::uint32_t bbBeginAbs,
+    std::uint64_t minSupport,
+    double minVaf,
+    bool dropHomopolymer,
+    bool dropRepeat)
+{
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::vector;
+
+    const uint32_t n = uint32_t(bbBases.size());
+    if (n == 0) return {};
+
+    const int nMembers = int(evidence.size());
+    const size_t nMembersSz = size_t(nMembers);
+
+    vector<IpoaMemberInfo> members(nMembersSz);
+    for (int r = 0; r < nMembers; r++) {
+        members[size_t(r)].oid = evidence[size_t(r)].oid;
+        members[size_t(r)].bbCovBegin = evidence[size_t(r)].bbCovBegin;
+        members[size_t(r)].bbCovEnd = evidence[size_t(r)].bbCovEnd;
+    }
+
+    auto idx = [nMembersSz](uint32_t i, int r) { return size_t(i) * nMembersSz + size_t(r); };
+    vector<IpoaColState> state(size_t(n) * nMembersSz, IpoaColState::NotCovered);
+    vector<uint8_t> altBase(size_t(n) * nMembersSz, 0);
+
+    for (int r = 0; r < nMembers; r++) {
+        const SparseMemberEvidence& ev = evidence[size_t(r)];
+        const uint32_t covBegin = std::max(ev.bbCovBegin, bbBeginAbs);
+        const uint32_t covEnd = std::min(ev.bbCovEnd, bbBeginAbs + n);
+        for (uint32_t pos = covBegin; pos < covEnd; pos++) {
+            state[idx(pos - bbBeginAbs, r)] = IpoaColState::OnBackbone;
+        }
+        for (const auto& del : ev.deletionRanges) {
+            const uint32_t a = std::max(del.first, covBegin);
+            const uint32_t b = std::min(del.second, covEnd);
+            for (uint32_t pos = a; pos < b; pos++) {
+                state[idx(pos - bbBeginAbs, r)] = IpoaColState::Invalid;
+            }
+        }
+        // Noisy ranges: untrustworthy regardless of what's underneath (a
+        // match default OR a deletion), matching memberCall's precedence
+        // (isNoisy checked unconditionally, before looking at snps).
+        for (const auto& noisy : ev.noisyRanges) {
+            const uint32_t a = std::max(noisy.first, covBegin);
+            const uint32_t b = std::min(noisy.second, covEnd);
+            for (uint32_t pos = a; pos < b; pos++) {
+                state[idx(pos - bbBeginAbs, r)] = IpoaColState::Invalid;
+            }
+        }
+        for (const SparseSnp& snp : ev.snps) {
+            if (snp.bbPos < covBegin || snp.bbPos >= covEnd) continue;
+            if (snp.altBase >= 4) continue; // N: leave whatever it was, not a substitution.
+            const size_t cell = idx(snp.bbPos - bbBeginAbs, r);
+            if (state[cell] == IpoaColState::Invalid) continue; // deleted or noisy: not a substitution.
+            state[cell] = IpoaColState::Substitution;
+            altBase[cell] = snp.altBase;
+        }
+    }
+
+    return classifyLeafSnarls(
+        n, nMembers, state, altBase, members, backboneOid, bbBases, bbBeginAbs,
+        minSupport, minVaf, dropHomopolymer, dropRepeat);
+}
+
+// Sparse-native equivalent of findLeafSnarlsFromSparseEvidence: produces the
+// IDENTICAL LeafSnarl list (validated by DINARA_SPARSE_CLASSIFY_VALIDATE=1,
+// which runs both and asserts agreement) WITHOUT ever materializing the dense
+// n*nMembers state/altBase array -- that array, and classifyLeafSnarls's own
+// per-column scan of it, are the "~26% of runtime" a sparse-diff aligner like
+// ProjectedAlignment doesn't actually need: the vast majority of positions in
+// a wide window are OnBackbone for every member (nothing was ever recorded
+// there), so walking every (position, member) pair to discover that is pure
+// waste when the sparse evidence already tells you directly where the real
+// divergence is.
+//
+// Key insight: NONE of the three things classifyLeafSnarls' dense state array
+// is used for actually needs a per-column scan when the source is sparse:
+//   1. Run boundaries (divergedSpan/divergedEqual) only depend on
+//      Substitution/Invalid -- i.e. exactly the recorded snps/deletionRanges/
+//      noisyRanges. A member's diverged-or-not status can only CHANGE at the
+//      start/end of one of these recorded spans, so sweeping just those
+//      breakpoints (not every column) finds the exact same maximal
+//      constant-diverged-set runs classifyLeafSnarls's column-by-column
+//      divergedEqual walk does.
+//   2. rowExcluded's NotCovered half is a pure bounds check
+//      ([runStart,runEnd) subset of [bbCovBegin,bbCovEnd)?), not a per-column
+//      state read. Its Invalid half is answered by checking the (typically
+//      tiny) deletionRanges/noisyRanges lists for overlap with the run --
+//      also not a per-column read.
+//   3. keyFor only needs a base per (run column, surviving member) -- and
+//      every surviving member (rowExcluded already dropped the rest) is
+//      either OnBackbone (no recorded snp at that column: use bbBases) or
+//      Substitution (a recorded snp: use its altBase), decided by a lookup
+//      against that member's own small snps list, not a dense array.
+// flanksLinear (checking 8 flank columns) is the one place this still reads
+// per-member per-column state, but only for the handful of runs actually
+// found -- not for the window's silent majority.
+inline std::vector<LeafSnarl> findLeafSnarlsFromSparseEvidenceFast(
+    OrientedReadId backboneOid,
+    const std::vector<SparseMemberEvidence>& evidence,
+    const std::vector<std::uint8_t>& bbBases,
+    std::uint32_t bbBeginAbs,
+    std::uint64_t minSupport,
+    double minVaf,
+    bool dropHomopolymer,
+    bool dropRepeat)
+{
+    using std::uint8_t;
+    using std::uint32_t;
+    using std::uint64_t;
+    using std::vector;
+
+    vector<LeafSnarl> result;
+    const uint32_t n = uint32_t(bbBases.size());
+    if (n == 0) return result;
+    const int nMembers = int(evidence.size());
+
+    // Sparse per-member state at an ABSOLUTE backbone position: only called
+    // for flanksLinear's 8 flank columns and for keyFor's run columns, never
+    // for the window's bulk. altBase is set only when the return is
+    // Substitution.
+    // Binary search, not linear scan: deletionRanges/noisyRanges/snps are
+    // each sorted (and disjoint, for the range lists) by construction, but
+    // are also now LONG for a CIGAR-reuse-sourced member (its wider
+    // per-member coverage means 50-190+ entries per list is common) --
+    // stateAt is called 8*nMembers times per candidate run inside
+    // flanksLinear alone, so a linear scan here was the actual dominant
+    // cost of the whole detector once CIGAR reuse widened coverage
+    // (measured: ~60% of runtime), NOT the diverged-set bookkeeping.
+    auto rangeContains = [](const vector<pair<uint32_t, uint32_t>>& ranges, uint32_t pos) {
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), pos,
+            [](uint32_t p, const pair<uint32_t, uint32_t>& r) { return p < r.first; });
+        if (it == ranges.begin()) return false;
+        --it;
+        return pos >= it->first && pos < it->second;
+    };
+    auto stateAt = [&](int r, uint32_t absPos, uint8_t& outAltBase) -> IpoaColState {
+        const SparseMemberEvidence& ev = evidence[size_t(r)];
+        if (absPos < ev.bbCovBegin || absPos >= ev.bbCovEnd) return IpoaColState::NotCovered;
+        if (rangeContains(ev.deletionRanges, absPos)) return IpoaColState::Invalid;
+        if (rangeContains(ev.noisyRanges, absPos)) return IpoaColState::Invalid;
+        auto sit = std::lower_bound(ev.snps.begin(), ev.snps.end(), absPos,
+            [](const SparseSnp& s, uint32_t p) { return s.bbPos < p; });
+        if (sit != ev.snps.end() && sit->bbPos == absPos && sit->altBase < 4) {
+            outAltBase = sit->altBase;
+            return IpoaColState::Substitution;
+        }
+        return IpoaColState::OnBackbone;
+    };
+
+    auto flanksLinear = [&](uint32_t spanStartAbs, uint32_t spanEndAbs) -> bool {
+        if (spanStartAbs < bbBeginAbs + 4 || spanEndAbs + 4 > bbBeginAbs + n) return false;
+        for (const uint32_t c : {spanStartAbs - 4, spanStartAbs - 3, spanStartAbs - 2, spanStartAbs - 1,
+                                  spanEndAbs,       spanEndAbs + 1,   spanEndAbs + 2,   spanEndAbs + 3}) {
+            uint64_t invalidCount = 0;
+            uint64_t altCounts[4] = {0, 0, 0, 0};
+            for (int r = 0; r < nMembers; r++) {
+                uint8_t ab = 0;
+                const IpoaColState s = stateAt(r, c, ab);
+                if (s == IpoaColState::Invalid) invalidCount++;
+                else if (s == IpoaColState::Substitution) altCounts[ab]++;
+            }
+            if (invalidCount >= minSupport) return false;
+            for (uint64_t cnt : altCounts) if (cnt >= minSupport) return false;
+        }
+        return true;
+    };
+
+    // Breakpoint events: (position, member, +1 at the start of a
+    // Substitution/Invalid span for that member, -1 one past its end).
+    // Absolute backbone coordinates, clipped to [bbBeginAbs, bbBeginAbs+n).
+    struct BEv { uint32_t pos; int member; int delta; };
+    vector<BEv> events;
+    events.reserve(nMembers * 2);
+    for (int r = 0; r < nMembers; r++) {
+        const SparseMemberEvidence& ev = evidence[size_t(r)];
+        for (const SparseSnp& s : ev.snps) {
+            if (s.altBase >= 4) continue;
+            if (s.bbPos < bbBeginAbs || s.bbPos >= bbBeginAbs + n) continue;
+            events.push_back({s.bbPos, r, +1});
+            events.push_back({s.bbPos + 1, r, -1});
+        }
+        for (const auto& d : ev.deletionRanges) {
+            const uint32_t a = std::max(d.first, bbBeginAbs);
+            const uint32_t b = std::min(d.second, bbBeginAbs + n);
+            if (a < b) { events.push_back({a, r, +1}); events.push_back({b, r, -1}); }
+        }
+        for (const auto& nr : ev.noisyRanges) {
+            const uint32_t a = std::max(nr.first, bbBeginAbs);
+            const uint32_t b = std::min(nr.second, bbBeginAbs + n);
+            if (a < b) { events.push_back({a, r, +1}); events.push_back({b, r, -1}); }
+        }
+    }
+    if (events.empty()) return result;
+    // Removals sort before additions at the SAME position (delta -1 < +1):
+    // a member whose divergence span ends exactly where another of its own
+    // spans begins (e.g. two adjacent single-column snps) must stay
+    // continuously in divergedSet with no one-position gap. Applying the add
+    // before the remove would incorrectly drop it for that one position
+    // (addMember is a no-op when already present, so remove-after-add still
+    // removes it), splitting or losing a run that should span both columns.
+    std::sort(events.begin(), events.end(),
+        [](const BEv& x, const BEv& y) {
+            if (x.pos != y.pos) return x.pos < y.pos;
+            return x.delta < y.delta;
+        });
+
+    // Live diverged-member set, updated as the sweep crosses each
+    // breakpoint. Represented as a fixed-width bitset (vector<uint64_t>,
+    // one bit per member) rather than a sorted vector<int>: with dense
+    // per-member evidence (e.g. CIGAR-reuse's wider coverage feeding many
+    // more events per member) and nMembers in the hundreds, the sorted
+    // vector's O(nMembers) insert/erase/compare per breakpoint measurably
+    // dominated runtime (findLeafSnarlsFromSparseEvidenceFast's classify
+    // phase went from ~10% to ~60% of this detector's time once CIGAR
+    // reuse widened per-member coverage). A bitset turns set/clear into
+    // O(1) (single word, single bit) and equality/emptiness into O(words)
+    // word-at-a-time comparisons -- no per-member work at all. Between two
+    // consecutive distinct event positions this set is constant by
+    // construction; a run (below) is a MAXIMAL span of such constant-set
+    // positions, possibly crossing several breakpoints that net out to the
+    // same set (see the note on runOpen).
+    const size_t nWords = (size_t(nMembers) + 63) / 64;
+    vector<uint64_t> divergedSet(nWords, 0);
+    auto addMember = [&](int r) { divergedSet[size_t(r) / 64] |= (uint64_t(1) << (size_t(r) % 64)); };
+    auto removeMember = [&](int r) { divergedSet[size_t(r) / 64] &= ~(uint64_t(1) << (size_t(r) % 64)); };
+    auto bitsetPopcount = [](const vector<uint64_t>& b) {
+        uint64_t c = 0;
+        for (uint64_t w : b) c += uint64_t(__builtin_popcountll(w));
+        return c;
+    };
+
+    // A run is [openRunStart, someLaterPos) with a FIXED diverged-member set
+    // (openRunSet, snapshotted when the run opened). Breakpoints only close
+    // the run when the resulting set actually DIFFERS from openRunSet -- two
+    // breakpoints in a row that net out to the same set (e.g. one member's
+    // divergence ends exactly where a DIFFERENT member's begins, touching
+    // but not changing the overall set) must NOT split what
+    // classifyLeafSnarls' column-by-column divergedEqual would see as one
+    // unbroken run. Splitting it would additionally make each half look
+    // divergent to the other's flanksLinear check, so both fragments would
+    // spuriously fail flank-linearity and the whole real run would vanish.
+    bool runOpen = false;
+    uint32_t openRunStart = 0;
+    vector<uint64_t> openRunSet;
+
+    auto processRun = [&](uint32_t runStartAbs, uint32_t runEndAbs) {
+        if (runStartAbs >= runEndAbs) return;
+        if (!flanksLinear(runStartAbs, runEndAbs)) return;
+
+        const uint32_t runStart = runStartAbs - bbBeginAbs; // local, for bbBases indexing
+        const uint32_t runEnd = runEndAbs - bbBeginAbs;
+
+        // rowExcluded: NotCovered is a pure coverage-bounds check; Invalid is
+        // a small-list overlap check -- neither needs a per-column scan.
+        vector<bool> rowExcluded(size_t(nMembers), false);
+        for (int r = 0; r < nMembers; r++) {
+            const SparseMemberEvidence& ev = evidence[size_t(r)];
+            if (ev.bbCovBegin > runStartAbs || ev.bbCovEnd < runEndAbs) {
+                rowExcluded[size_t(r)] = true;
+                continue;
+            }
+            for (const auto& d : ev.deletionRanges)
+                if (d.first < runEndAbs && d.second > runStartAbs) { rowExcluded[size_t(r)] = true; break; }
+            if (rowExcluded[size_t(r)]) continue;
+            for (const auto& nr : ev.noisyRanges)
+                if (nr.first < runEndAbs && nr.second > runStartAbs) { rowExcluded[size_t(r)] = true; break; }
+        }
+
+        auto keyFor = [&](int r) {
+            vector<uint8_t> k;
+            k.reserve(runEnd - runStart);
+            for (uint32_t c = runStart; c < runEnd; c++) {
+                uint8_t ab = 0;
+                const IpoaColState s = stateAt(r, bbBeginAbs + c, ab);
+                k.push_back(s == IpoaColState::Substitution ? ab : bbBases[c]);
+            }
+            return k;
+        };
+
+        vector<vector<uint8_t>> alleleKeys;
+        vector<LeafSnarlAllele> alleles;
+        {
+            const vector<uint8_t> refKey(bbBases.begin() + runStart, bbBases.begin() + runEnd);
+            alleleKeys.push_back(refKey);
+            LeafSnarlAllele refAllele;
+            refAllele.members.push_back(backboneOid);
+            refAllele.bases = refKey;
+            alleles.push_back(std::move(refAllele));
+        }
+        const int refAlleleIndex = 0;
+
+        for (int r = 0; r < nMembers; r++) {
+            if (rowExcluded[size_t(r)]) continue;
+            vector<uint8_t> k = keyFor(r);
+            size_t ai = alleleKeys.size();
+            for (size_t j = 0; j < alleleKeys.size(); j++) {
+                if (alleleKeys[j] == k) { ai = j; break; }
+            }
+            if (ai == alleleKeys.size()) {
+                alleleKeys.push_back(k);
+                LeafSnarlAllele allele;
+                allele.bases = k;
+                alleles.push_back(std::move(allele));
+            }
+            alleles[ai].members.push_back(evidence[size_t(r)].oid);
+        }
+
+        uint64_t totalMembers = 0;
+        for (const auto& a : alleles) totalMembers += a.members.size();
+
+        vector<LeafSnarlAllele> gated;
+        for (int ai = 0; ai < int(alleles.size()); ai++) {
+            LeafSnarlAllele& allele = alleles[size_t(ai)];
+            if (allele.members.size() < minSupport) continue;
+            if (ai != refAlleleIndex) {
+                const double af = double(allele.members.size()) / double(totalMembers);
+                if (af < minVaf) continue;
+            }
+            gated.push_back(std::move(allele));
+        }
+
+        bool passesRepeatGate = true;
+        if (dropHomopolymer || dropRepeat) {
+            KmVarKey vkey;
+            vkey.type = KmVarType::Snp;
+            vkey.refLen = 1; vkey.altLen = 1; vkey.altBase = 0;
+            for (uint32_t localPos : {runStart, runEnd - 1}) {
+                vkey.pos = localPos;
+                const bool inHomopolymer = kmIsRepeatUnitRange(
+                    bbBases.data(), uint32_t(bbBases.size()), vkey, 0, 1, 1);
+                const bool inStr = kmIsRepeatUnitRange(
+                    bbBases.data(), uint32_t(bbBases.size()), vkey, 0, 2, 6);
+                if (dropHomopolymer && inHomopolymer) passesRepeatGate = false;
+                if (dropRepeat && inStr) passesRepeatGate = false;
+            }
+        }
+
+        if (passesRepeatGate && gated.size() >= 2) {
+            LeafSnarl snarl;
+            snarl.start = runStartAbs - 1;
+            snarl.end = runEndAbs;
+            snarl.alleles = std::move(gated);
+            result.push_back(std::move(snarl));
+        }
+    };
+
+    size_t ei = 0;
+    while (ei < events.size()) {
+        const uint32_t pos = events[ei].pos;
+        size_t ej = ei;
+        while (ej < events.size() && events[ej].pos == pos) {
+            if (events[ej].delta > 0) addMember(events[ej].member);
+            else removeMember(events[ej].member);
+            ej++;
+        }
+        ei = ej;
+
+        if (runOpen && divergedSet == openRunSet) continue; // touching, unchanged set: keep the run open
+
+        // Every alt allele is built EXCLUSIVELY from divergedSet members (a
+        // recorded snp always differs from the backbone base, by
+        // construction -- see ProjectedAlignment's mismatch-only recording
+        // -- so a member outside divergedSet can only ever key into the ref
+        // allele). An alt allele's member count is therefore bounded by
+        // openRunSet.size(), so openRunSet.size() < minSupport makes gating
+        // (>=2 alleles, each >=minSupport) unreachable regardless of what
+        // flanksLinear/keyFor would say -- skip the whole run for free. This
+        // matters: real HiFi windows carry plenty of ordinary per-base
+        // sequencing noise (isolated single-member "divergence"), and
+        // without this check EVERY such blip still pays flanksLinear's
+        // 8*nMembers sparse lookups before minSupport ever gets to reject it.
+        if (runOpen) {
+            if (bitsetPopcount(openRunSet) >= minSupport) processRun(openRunStart, pos);
+            runOpen = false;
+        }
+        if (bitsetPopcount(divergedSet) >= minSupport) {
+            runOpen = true;
+            openRunStart = pos;
+            openRunSet = divergedSet;
+        }
+    }
+    if (runOpen && bitsetPopcount(openRunSet) >= minSupport) processRun(openRunStart, bbBeginAbs + n);
+
+    return result;
+}
+
+// Result of a sparse column lookup: the member's exact read position and
+// base at a given backbone column. Mirrors KwAlignedCol's role for the dense
+// aligners, but computed from sparse evidence instead of a stored list.
+struct SparseColResult {
+    std::uint32_t readPos;
+    std::uint8_t readBase;
+};
+
+// The sparse equivalent of KwMemberProfile::colAt, needed to PIN a het/hom
+// anchor (recover the member's exact read position at a specific backbone
+// column) from sparse evidence. Three cases:
+//   1. bbPos outside coverage, or inside a deletion: not resolvable (no base
+//      there) -- returns false, matching colAt's nullptr.
+//   2. bbPos is a recorded mismatch: exact, no interpolation needed.
+//   3. bbPos is an ordinary (unrecorded) match column: readPos = bbPos +
+//      delta, where delta is looked up from ev.deltaBreakpoints (the
+//      piecewise-constant offset built from the aligner's OWN exhaustive
+//      indel list -- see SparseMemberEvidence's comment for why this
+//      replaces nearest-pin interpolation). No adjacency/indel-in-between
+//      check is needed here: the breakpoints already encode the exact
+//      cumulative effect of every indel over the whole covered range, so
+//      the delta this returns is exact, not an approximation.
+// bbBaseAtPos is the backbone's own base at bbPos, used only to fill
+// out.readBase for the interpolated (match) case -- a match column's base is
+// the backbone's own base there BY DEFINITION under the sparse "unrecorded
+// = matches" model, so this keeps the function's contract identical to
+// colAt's (always a real base, never a sentinel).
+inline bool sparseColAt(
+    const SparseMemberEvidence& ev,
+    std::uint32_t bbPos,
+    std::uint8_t bbBaseAtPos,
+    SparseColResult& out)
+{
+    if (bbPos < ev.bbCovBegin || bbPos >= ev.bbCovEnd) return false;
+    // Binary search, not linear scan: both lists are sorted (and
+    // deletionRanges is disjoint) by construction, and can be long for a
+    // CIGAR-reuse-sourced member (wider per-member coverage means more
+    // recorded events) -- this is called once per member per anchor column
+    // in buildHetBubbleFromLeafSnarl, so a linear scan here was a real,
+    // measurable cost (same class of issue found and fixed in stateAt,
+    // WindowIntervalPoa.hpp's classify path).
+    {
+        auto dit = std::upper_bound(ev.deletionRanges.begin(), ev.deletionRanges.end(), bbPos,
+            [](std::uint32_t p, const std::pair<std::uint32_t, std::uint32_t>& r) { return p < r.first; });
+        if (dit != ev.deletionRanges.begin()) {
+            const auto& d = *std::prev(dit);
+            if (bbPos >= d.first && bbPos < d.second) return false;
+        }
+    }
+
+    {
+        auto sit = std::lower_bound(ev.snps.begin(), ev.snps.end(), bbPos,
+            [](const SparseSnp& s, std::uint32_t p) { return s.bbPos < p; });
+        if (sit != ev.snps.end() && sit->bbPos == bbPos) {
+            out.readPos = sit->readPos;
+            out.readBase = sit->altBase;
+            return true;
+        }
+    }
+
+    // Ordinary match column: delta = the last breakpoint at or before bbPos
+    // (or deltaAtStart if bbPos precedes every breakpoint).
+    std::int64_t delta = ev.deltaAtStart;
+    auto it = std::upper_bound(ev.deltaBreakpoints.begin(), ev.deltaBreakpoints.end(), bbPos,
+        [](std::uint32_t pos, const std::pair<std::uint32_t, std::int64_t>& bp) {
+            return pos < bp.first;
+        });
+    if (it != ev.deltaBreakpoints.begin()) delta = std::prev(it)->second;
+
+    const std::int64_t readPos = std::int64_t(bbPos) + delta;
+    if (readPos < 0) return false;
+    out.readPos = std::uint32_t(readPos);
+    out.readBase = bbBaseAtPos;
+    return true;
+}
+
+// Sparse equivalent of pinnedKmerCol (WindowHetProfiles.hpp): valid only if
+// the member spells the 2-mer [kmer0, kmer1] starting at predPos with no gap
+// between the two bases (readPos advances by exactly 1). bbBaseAtPredPos/
+// bbBaseAtPredPos1 are the backbone's own bases at predPos and predPos+1
+// (passed through to sparseColAt).
+inline bool sparsePinnedKmerCol(
+    const SparseMemberEvidence& ev,
+    std::uint32_t predPos, std::uint8_t kmer0, std::uint8_t kmer1,
+    std::uint8_t bbBaseAtPredPos, std::uint8_t bbBaseAtPredPos1,
+    std::uint32_t& outReadPos)
+{
+    SparseColResult c0;
+    if (!sparseColAt(ev, predPos, bbBaseAtPredPos, c0)) return false;
+    if (c0.readBase != kmer0) return false;
+
+    SparseColResult c1;
+    if (!sparseColAt(ev, predPos + 1, bbBaseAtPredPos1, c1)) return false;
+    if (c1.readPos != c0.readPos + 1) return false; // insertion between them
+    if (c1.readBase != kmer1) return false;
+
+    outReadPos = c0.readPos;
+    return true;
+}
+
+// Sparse equivalent of pinnedPointCol: valid only if the member carries
+// `base` at atPos. bbBaseAtPos is the backbone's own base at atPos (passed
+// through to sparseColAt).
+inline bool sparsePinnedPointCol(
+    const SparseMemberEvidence& ev,
+    std::uint32_t atPos, std::uint8_t base, std::uint8_t bbBaseAtPos,
+    std::uint32_t& outReadPos)
+{
+    SparseColResult c;
+    if (!sparseColAt(ev, atPos, bbBaseAtPos, c)) return false;
+    if (c.readBase != base) return false;
+    outReadPos = c.readPos;
+    return true;
+}
 
 // Shared MSA + emit for a backbone interval. Given `spanMembers` already placed
 // over [bbBegin, bbEnd), run ONE abPOA MSA with row 0 = backbone segment and
@@ -1058,6 +2236,68 @@ inline std::uint32_t mergeAndEmitIpoaWindow(
     vector<uint8_t> bbSeqVec(plan.bbLen);
     for (uint32_t i = 0; i < plan.bbLen; i++)
         bbSeqVec[i] = rds.getOrientedReadBase(plan.bbOid, i).value;
+
+    // Leaf-snarl detection (verification only; not fed into window.hetBubbles
+    // or anything else -- production het-site output above is unaffected).
+    // Reuses the SAME per-member profiles the interval-abPOA engine already
+    // built for emitHetBubblesFromProfiles: no new alignment work, and no
+    // shared-graph memory risk, since each profile came from an independent
+    // small per-interval abPOA MSA (see the design note on
+    // findLeafSnarlsFromProfiles for why this is architecturally safe for
+    // large/dense windows, unlike the one-shared-graph-per-window approach in
+    // AssemblerWindowAbpoaGraph.cpp).
+    if (std::getenv("DINARA_INTERVALPOA_LEAFSNARL_DEBUG") != nullptr) {
+        const std::vector<std::uint8_t> bbWindowBases(
+            bbSeqVec.begin() + plan.windowBbBegin, bbSeqVec.begin() + plan.windowBbEnd);
+        if (const char* probeEnv = std::getenv("DINARA_INTERVALPOA_LEAFSNARL_PROBE")) {
+            const std::uint32_t probePos = std::uint32_t(std::atol(probeEnv));
+            std::uint32_t nCov = 0, nAligned = 0, nMatch = 0, nMismatch = 0, nDeleted = 0;
+            for (const auto& prof : profiles) {
+                if (probePos < prof.bbCovBegin || probePos >= prof.bbCovEnd) continue;
+                nCov++;
+                const auto* c = prof.colAt(probePos);
+                if (c) {
+                    nAligned++;
+                    if (c->readBase == bbWindowBases[probePos - plan.windowBbBegin]) nMatch++;
+                    else nMismatch++;
+                } else if (prof.isDeleted(probePos)) {
+                    nDeleted++;
+                }
+            }
+            std::cout << "    intervalPoaLeafSnarlProbe window=" << window.windowId
+                 << " pos=" << probePos << " nProfilesTotal=" << profiles.size()
+                 << " covering=" << nCov << " aligned=" << nAligned
+                 << " match=" << nMatch << " mismatch=" << nMismatch
+                 << " deleted=" << nDeleted << " neitherAlignedNorDeleted="
+                 << (nCov - nAligned - nDeleted) << std::endl;
+        }
+        const auto snarls = findLeafSnarlsFromProfiles(
+            plan.bbOid, profiles, bbWindowBases, plan.windowBbBegin,
+            /*minSupport=*/6, /*minVaf=*/0.12,
+            /*dropHomopolymer=*/hetDropHomopolymer, /*dropRepeat=*/hetDropRepeat);
+        for (const LeafSnarl& s : snarls) {
+            const std::int64_t localStart = std::int64_t(s.start) - std::int64_t(plan.windowBbBegin);
+            const std::int64_t ctxBegin = std::max<std::int64_t>(0, localStart - 10);
+            const std::int64_t ctxEnd = std::min<std::int64_t>(
+                std::int64_t(bbWindowBases.size()), localStart + 12);
+            std::string ctx;
+            for (std::int64_t p = ctxBegin; p < ctxEnd; p++) {
+                const std::uint8_t b = bbWindowBases[size_t(p)];
+                ctx += "ACGTN"[b < 4 ? b : 4];
+            }
+            std::cout << "    intervalPoaLeafSnarl window=" << window.windowId
+                 << " bb=" << plan.bbOid
+                 << " [" << s.start << "," << s.end << ")"
+                 << " ctx=" << ctx
+                 << " alleles=" << s.alleles.size();
+            for (const LeafSnarlAllele& al : s.alleles) {
+                std::cout << " {n=" << al.members.size() << " bases=";
+                for (std::uint8_t b : al.bases) std::cout << "ACGTN"[b < 4 ? b : 4];
+                std::cout << "}";
+            }
+            std::cout << std::endl;
+        }
+    }
 
     return emitHetBubblesFromProfiles(
         window, profiles, bbSeqVec, plan.windowBbBegin, plan.windowBbEnd,

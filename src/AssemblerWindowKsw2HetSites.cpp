@@ -57,6 +57,14 @@ using namespace dinara;
 
 namespace {
 
+// Ad-hoc perf counter: total ksw_extd2_sse calls (one per member per
+// inter-anchor segment), to compare call-count against the interval-abPOA
+// engine's msaRuns (one shared abpoa_msa call per interval, covering ALL
+// members touching it). Printed via dinaraPrintKswCallCount() when
+// DINARA_HET_TIMING is set (reusing that engine's timing flag for an
+// apples-to-apples side-by-side).
+inline std::atomic<std::uint64_t> kswAlignCalls{0};
+
 // Minimum reads (incl. backbone) for a window to be considered.
 constexpr uint32_t kwMinReadCoverage = 6;
 constexpr uint32_t kwMinSnpAltSupport = 3;
@@ -311,6 +319,23 @@ static void printWindowHetSiteMatrix(const AnchorWindow& window) {
 
 } // anonymous namespace
 
+// Prints the total ksw_extd2_sse call count (one per member per inter-anchor
+// segment) accumulated so far, when DINARA_HET_TIMING is set -- a side-by-side
+// comparison point against the interval-abPOA engine's own [HetTiming]
+// msaRuns count (one shared abpoa_msa call per interval, covering ALL members
+// touching it, versus one independent ksw2 call per member per segment here).
+// Lives in dinara::main (matching where main.cpp's assemble() calls it,
+// since a local extern declaration there resolves within that same nested
+// namespace, not global scope) even though it only needs the anonymous-
+// namespace counter above it, visible here via normal enclosing-scope lookup.
+namespace dinara { namespace main {
+void dinaraPrintKswCallCount() {
+    if (std::getenv("DINARA_HET_TIMING") == nullptr) return;
+    std::cout << "[HetTiming] ksw2 alignSegment (ksw_extd2_sse) calls: "
+              << kswAlignCalls.load() << std::endl;
+}
+} }
+
 
 // Detect clean het SNPs in an anchor window using banded ksw2 2-piece affine
 // alignment of each member's inter-anchor segments against the backbone.
@@ -355,10 +380,19 @@ uint32_t Assembler::ksw2DetectSnpsInWindow(
     const uint8_t* bbSeq = bbSeqVec.data();
 
     // ksw2 scoring: 2-piece affine, reused from AlignOptions (minimap2 model).
-    // ksw2 takes positive penalties; AlignOptions stores match positive and
-    // mismatch negative, so negate mismatch into a positive penalty.
+    // The gap-open/extend parameters below genuinely are positive penalty
+    // magnitudes that ksw2 subtracts internally, but the substitution matrix
+    // (mat[], used for kswMatch/kswMismatch) is a SIGNED addend matrix: ksw2
+    // adds mat[a][b] directly into the DP score, so a mismatch entry must
+    // stay negative, matching how AlignmentInfo::dpScore already sums these
+    // same AlignOptions fields elsewhere. overlapDpMismatchScore is already
+    // stored negative (default -4, symmetric with the positive +2 match
+    // score) -- do NOT negate it again (confirmed empirically: an extra
+    // negation here turns a -4 penalty into a +4 reward for mismatches,
+    // producing a ~19% aggregate mismatch rate on real HiFi data instead of
+    // the expected ~0.5%).
     const int8_t kswMatch = int8_t(alignOptions.overlapDpMatchScore);
-    const int8_t kswMismatch = int8_t(-alignOptions.overlapDpMismatchScore);
+    const int8_t kswMismatch = int8_t(alignOptions.overlapDpMismatchScore);
     const int8_t kswGapO1 = int8_t(alignOptions.overlapDpGapOpen1);
     const int8_t kswGapE1 = int8_t(alignOptions.overlapDpGapExtend1);
     const int8_t kswGapO2 = int8_t(alignOptions.overlapDpGapOpen2);
@@ -821,8 +855,13 @@ uint32_t Assembler::ksw2DetectHetBubblesInWindow(
     const uint8_t* bbSeq = bbSeqVec.data();
 
     // ksw2 scoring: 2-piece affine, reused from AlignOptions (minimap2 model).
+    // mat[] is a signed addend matrix (ksw2 adds it directly into the DP
+    // score), so the mismatch entry must stay negative -- overlapDpMismatchScore
+    // is already stored that way (default -4, symmetric with the positive +2
+    // match score); do not negate it again (see the detailed note on the
+    // other kswMismatch above in ksw2DetectSnpsInWindow).
     const int8_t kswMatch = int8_t(alignOptions.overlapDpMatchScore);
-    const int8_t kswMismatch = int8_t(-alignOptions.overlapDpMismatchScore);
+    const int8_t kswMismatch = int8_t(alignOptions.overlapDpMismatchScore);
     const int8_t kswGapO1 = int8_t(alignOptions.overlapDpGapOpen1);
     const int8_t kswGapE1 = int8_t(alignOptions.overlapDpGapExtend1);
     const int8_t kswGapO2 = int8_t(alignOptions.overlapDpGapOpen2);
@@ -847,6 +886,7 @@ uint32_t Assembler::ksw2DetectHetBubblesInWindow(
         vector<pair<uint32_t, vector<uint8_t>>>* outIns = nullptr)
     {
         if (bbSegLen == 0 || cSegLen == 0) return;
+        kswAlignCalls.fetch_add(1, std::memory_order_relaxed);
 
         static thread_local vector<uint8_t> query;
         static thread_local vector<uint8_t> target;
@@ -1640,7 +1680,18 @@ uint32_t Assembler::ksw2DetectHetBubblesInWindow(
             homMemberReads.push_back(prof.oid);
             homMemberProf.push_back(&prof);
         }
-        bubble.alleles.push_back(std::move(refArm));
+        // The site gate above used raw observation counts (site.refCount),
+        // but the arm's real members are re-filtered by colAt (a member
+        // without a recoverable rawPosition at pos-1 is dropped), which can
+        // shrink the arm well below the count that passed the site gate --
+        // in the extreme, down to just the backbone (size 1), which
+        // appendHetAnchorPair asserts against (members.size() >= 2). Re-apply
+        // minSupport to the PINNED member count so an allele that fell below
+        // threshold after pinning does not reach the anchor graph at all
+        // (mirrors the equivalent re-check in emitHetBubblesFromProfiles,
+        // WindowHetProfiles.hpp, which this function does not otherwise call).
+        if (refArm.members.size() >= size_t(minSupport))
+            bubble.alleles.push_back(std::move(refArm));
 
         // Alternate arms.
         for (const PassingAlt& pa : site.alts) {
@@ -1657,7 +1708,11 @@ uint32_t Assembler::ksw2DetectHetBubblesInWindow(
                 homMemberReads.push_back(prof.oid);
                 homMemberProf.push_back(&prof);
             }
-            if (arm.members.empty()) continue;
+            // Same post-pinning re-check as the ref arm above: an empty-only
+            // guard lets an arm through with as few as 1 member (below what
+            // appendHetAnchorPair requires), if pinning dropped most of the
+            // site gate's raw altCov.
+            if (arm.members.size() < size_t(minSupport)) continue;
             bubble.alleles.push_back(std::move(arm));
         }
         if (bubble.alleles.size() < 2) continue;
@@ -1709,20 +1764,19 @@ uint32_t Assembler::ksw2DetectHetBubblesInWindow(
         emitted++;
     }
 
-    // Coincident-hom merge (mirrors the abPOA Pass 1.5 condition): when this
-    // bubble's leading hom sits on the SAME backbone column as the preceding
-    // bubble's trailing hom -- i.e. two accepted SNPs exactly 3 bp apart, so
-    // predBackboneOffset == the previous bubble's succBackboneOffset -- flag the
-    // shared node so the downstream passes reuse one anchor instead of two.
-    for (size_t i = 1; i < window.hetBubbles.size(); i++) {
-        const auto& prev = window.hetBubbles[i - 1];
-        auto& cur = window.hetBubbles[i];
-        if (cur.predBackboneOffset != 0 && prev.succBackboneOffset != 0 &&
-            cur.predBackboneOffset == prev.succBackboneOffset &&
-            !cur.leadHom.members.empty() && !prev.hom.members.empty()) {
-            cur.sharedLeadFromBubble = int64_t(i - 1);
-        }
-    }
+    // NOTE: coincident-hom merging (sharedLeadFromBubble) is intentionally NOT
+    // done here, for the same reason documented in emitHetBubblesFromProfiles
+    // (WindowHetProfiles.hpp): it must run AFTER planning (main.cpp's Pass 1.5,
+    // mergeWindowCoincidentHoms), because a bubble referenced here as "the
+    // preceding bubble" can still be dropped by planning (primary-anchor
+    // collision, a backward-drift hom member drop, or falling outside any
+    // backbone interval) -- and nothing re-validates sharedLeadFromBubble
+    // afterward. An earlier version of this function set it right here,
+    // before planning ran; confirmed as a real bug (not hypothetical): on
+    // real data it produced a bubble whose sharedLeadFromBubble pointed at a
+    // since-dropped bubble (plannedInterval == -1), which
+    // appendWindowHetAnchors (main.cpp) then asserted against. Leave
+    // sharedLeadFromBubble at its default (-1) and let Pass 1.5 set it.
 
     cout << "    ksw2DetectHetBubbles bb=" << bbOid
          << " window=[" << windowBbBegin << "," << windowBbEnd << ")"

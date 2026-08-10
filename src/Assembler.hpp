@@ -3893,6 +3893,10 @@ public:
     // tiles the leftover unclaimed intervals into fragment windows (longest
     // base span first). When false (default), only full-journey cores are
     // created and the seams between them are left unclaimed.
+    // threadCount is accepted but unused: the claiming sweep is a single
+    // priority queue over shared anchor ownership with a strict largest-first
+    // order, which is inherently serial (not just unparallelized) -- see the
+    // definition for why. Kept for parity with sibling mode3-pipeline calls.
     void computeAnchorWindowsClean(
         shared_ptr<Shasta2Anchors> shasta2Anchors,
         shared_ptr<Shasta2Journeys> shasta2Journeys,
@@ -3931,6 +3935,53 @@ public:
         const Shasta2Journeys& journeys,
         const string& outputPrefix,
         uint64_t threadCount) const;
+
+    // Leaf-snarl (multi-column MNP/het-block) detection per anchor window,
+    // from independent pairwise ksw2 alignments (no shared multi-sequence
+    // graph, no per-interval fragmentation): one banded ksw2 global alignment
+    // per inter-anchor segment per member, FULLSPAN (every column the member
+    // spans gets a real aligned entry). Verification only -- writes nothing
+    // to AnchorWindow::hetBubbles.
+    void computeWindowKsw2LeafSnarls(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions,
+        uint64_t threadCount) const;
+
+    // Leaf-snarl detection using ProjectedAlignment (the same fast pairwise
+    // aligner computeBaseAlignmentsAndStore uses for the whole-dataset
+    // overlap graph) instead of ksw2's per-segment banded DP: ONE
+    // ProjectedAlignment call per member (covering all its inter-anchor
+    // segments internally), not one per segment. Verification only.
+    void computeWindowProjectedAlignmentLeafSnarls(
+        const vector<AnchorWindow>& anchorWindows,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions,
+        uint64_t threadCount) const;
+
+    // PRODUCTION het-bubble detection using ProjectedAlignment: same sparse
+    // evidence/pinning machinery as computeWindowProjectedAlignmentLeafSnarls
+    // above, but emits real AnchorWindow::hetBubbles (window.hetBubbles is
+    // cleared and repopulated) instead of only logging -- a drop-in
+    // alternative engine, selected the same way as ksw2/abpoa/intervalpoa.
+    // Multi-column MNP snarls are skipped (HetAnchor::alleleBase is a single
+    // base and can't represent them without extending the anchor format).
+    // Returns total bubbles; also reports hetWindows and totalBubbles counts.
+    uint32_t projAlnDetectHetBubblesAllWindows(
+        vector<AnchorWindow>& windows,
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const AlignOptions& alignOptions,
+        double hetMinVaf,
+        uint64_t hetMinSupport,
+        bool hetDropHomopolymer,
+        bool hetDropRepeat,
+        uint64_t threadCount,
+        uint64_t& hetWindowsOut,
+        uint64_t& totalBubblesOut,
+        const vector<bool>* skipWindow = nullptr) const;
 
     // Detect clean het SNPs in an anchor window using Theseus MSA.
     // Returns the number of SNPs passing strand bias and repeat filtering.

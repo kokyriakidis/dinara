@@ -206,6 +206,10 @@ public:
 
     MemoryMapped::VectorOfVectors<Shasta2AnchorMarkerInfo, uint64_t> anchorMarkerInfos;
 
+    // Each anchor's members are stored sorted ascending by OrientedReadId (see
+    // the anchor-construction code and appendHetAnchorPair), so the four
+    // lookups below binary search -- O(log coverage) -- rather than scanning
+    // the whole anchor.
     uint32_t getPosition(Shasta2AnchorId, OrientedReadId) const;
     uint32_t getOrdinal(Shasta2AnchorId, OrientedReadId) const;
     uint32_t getPositionInJourney(Shasta2AnchorId, OrientedReadId) const;

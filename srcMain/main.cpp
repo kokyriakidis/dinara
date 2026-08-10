@@ -8,6 +8,7 @@
 #include "AnchorWindows.hpp"
 #include "InvertedIndexBuilder.hpp"
 #include "AssemblerOptions.hpp"
+#include "WindowHetProfiles.hpp"
 #include "buildId.hpp"
 #if DINARA_ENABLE_VARIANT_CLUSTERING
 #include "ClusterGraph.hpp"
@@ -318,6 +319,45 @@ bool computeWindowBackbone(
         bbOffset[i] = anchors.getPosition(bbAnchors[i], backboneOid) - backboneBeginPos;
     return true;
 }
+
+
+// Per-window backbone (bbAnchors/bbOffset), computed ONCE and shared by all
+// three het-anchor wiring passes below (plan, merge, stage). Nothing between
+// window creation and the stage pass mutates a window's own backbone fields
+// (filteredBackbonePositions/backboneBegin/backboneEnd) or moves an existing
+// anchor's position -- the intervening het-anchor append only ADDS new
+// anchors -- so the three passes would otherwise recompute byte-identical
+// results. computeWindowBackbone's cost is O(backbone anchors x anchor
+// coverage) per window (getPosition linearly scans an anchor's markers to
+// find one read), so computing it once instead of three times removes 2/3 of
+// that work across every window in the assembly.
+class WindowBackboneCache {
+public:
+    WindowBackboneCache(
+        const Shasta2Anchors& anchors,
+        const Shasta2Journeys& journeys,
+        const vector<AnchorWindow>& windows,
+        uint32_t kHalf,
+        uint64_t threadCount) :
+        bbAnchors_(windows.size()),
+        bbOffset_(windows.size())
+    {
+        parallelForEachWindow(windows.size(), threadCount, [&](uint64_t wi) {
+            computeWindowBackbone(anchors, journeys, windows[wi], kHalf,
+                bbAnchors_[wi], bbOffset_[wi]);
+        });
+    }
+
+    // False when the window has fewer than two backbone anchors (no interval
+    // to contain a bubble); bbAnchors(wi)/bbOffset(wi) are empty in that case.
+    bool hasBackbone(uint64_t wi) const { return !bbAnchors_[wi].empty(); }
+    const vector<Shasta2AnchorId>& bbAnchors(uint64_t wi) const { return bbAnchors_[wi]; }
+    const vector<uint32_t>& bbOffset(uint64_t wi) const { return bbOffset_[wi]; }
+
+private:
+    vector<vector<Shasta2AnchorId>> bbAnchors_;
+    vector<vector<uint32_t>> bbOffset_;
+};
 
 
 // Step 1 of the per-window het pipeline: the explicit "middle-2 backbone
@@ -638,6 +678,15 @@ void mergeWindowCoincidentHoms(
             // Fold: bubble N+1 reuses bubble N's (now unioned) trailing hom as
             // its leading hom.
             nxt.sharedLeadFromBubble = int64_t(bubs[bj] - window.hetBubbles.data());
+            if(getenv("DINARA_APPEND_HET_DEBUG") != nullptr) {
+                cout << "mergeDebug: window=" << window.windowId
+                     << " cur.backboneOffset=" << cur.backboneOffset
+                     << " cur.plannedInterval=" << cur.plannedInterval
+                     << " nxt.backboneOffset=" << nxt.backboneOffset
+                     << " nxt.plannedInterval=" << nxt.plannedInterval
+                     << " storedIndex=" << nxt.sharedLeadFromBubble
+                     << " window.hetBubbles.size()=" << window.hetBubbles.size() << endl;
+            }
             ++mergedHoms;
         }
     }
@@ -649,6 +698,13 @@ void mergeWindowCoincidentHoms(
 void appendHetAnchor(Shasta2Anchors& anchors, AnchorWindow::HetAnchor& a)
 {
     if(a.members.empty()) return;
+    if(a.members.size() < 2 && getenv("DINARA_APPEND_HET_DEBUG") != nullptr) {
+        cout << "appendHetAnchorDebug: size=" << a.members.size()
+             << " backboneOffset=" << a.backboneOffset
+             << " isRef=" << a.isRef
+             << " alleleBase=" << int(a.alleleBase)
+             << " predBase=" << int(a.predBase) << endl;
+    }
     vector<std::pair<OrientedReadId, uint32_t>> members;
     members.reserve(a.members.size());
     for(const auto& m : a.members)
@@ -677,6 +733,14 @@ void appendWindowHetAnchors(
         if(bubble.sharedLeadFromBubble >= 0) {
             const AnchorWindow::HetBubble& prev =
                 window.hetBubbles[size_t(bubble.sharedLeadFromBubble)];
+            if(prev.plannedInterval < 0 && getenv("DINARA_APPEND_HET_DEBUG") != nullptr) {
+                cout << "sharedLeadDebug: window=" << window.windowId
+                     << " bubbleOff=" << bubble.backboneOffset
+                     << " sharedLeadFromBubble=" << bubble.sharedLeadFromBubble
+                     << " prev.backboneOffset=" << prev.backboneOffset
+                     << " prev.plannedInterval=" << prev.plannedInterval
+                     << " bubble.plannedInterval=" << bubble.plannedInterval << endl;
+            }
             // Pass 1.5 only sets sharedLeadFromBubble for pairs where BOTH
             // bubbles are planned and coincident, so prev.hom was appended and
             // its anchorId is valid here.
@@ -2110,9 +2174,16 @@ void dinara::main::assemble(
     // In/out degree is derived from the same per-window transition map the
     // anchor-graph constructor consumes. computeWindowTransitions clears and
     // repopulates its output fields on entry, so calling it here (before het
-    // detection) and again later (before the graph build) is safe and idempotent
-    // for the same journeys/windows. It reads only anchors/journeys/windows.
+    // detection) and again later (before the graph build) is safe and
+    // idempotent for the same journeys/windows: it reads only backbone
+    // journeys and each window's own readIntervals/backboneBegin/End/
+    // filteredBackbonePositions, none of which the intervening het-bubble
+    // plan/append/stage passes touch (they mutate hetBubbles/intraWindowEdges
+    // only). So the two calls would produce byte-identical output -- windowTransitionsComputed
+    // tracks whether the gate already paid for it, so the graph-build call
+    // below can skip a second full recomputation.
     std::vector<bool> hetSkipWindow;
+    bool windowTransitionsComputed = false;
     {
         const uint64_t hetMaxInDeg =
             assemblerOptions.assemblyOptions.mode3Options.hetMaxWindowInDegree;
@@ -2121,6 +2192,7 @@ void dinara::main::assemble(
         // Gate is active only when BOTH thresholds are set (>0); either at 0
         // disables it (0 would otherwise match every window trivially).
         if(hetMaxInDeg > 0 && hetMaxOutDeg > 0) {
+            windowTransitionsComputed = true;
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys,
                 anchorWindows, &anchorDovetailWindow);
 
@@ -2168,16 +2240,20 @@ void dinara::main::assemble(
     //         per window, one window per thread). Capped by DINARA_MSA_MAX_WINDOWS
     //         (default 1, 0=all).
     //   "ksw2"    : star alignment against the backbone (no read-to-read POA).
+    //   "projaln" : per-member ProjectedAlignment (computeBaseAlignmentsAndStore's
+    //         own fast aligner) sparse-evidence pinning -- see
+    //         projAlnDetectHetBubblesAllWindows, AssemblerWindowProjectedAlignmentLeafSnarls.cpp.
     {
         const char* hetEngineEnv = getenv("DINARA_HET_ENGINE");
         const string hetEngine = (hetEngineEnv != nullptr) ? string(hetEngineEnv) : "";
         const bool useKsw2HetEngine = (hetEngine == "ksw2");
         const bool useAbpoaHetEngine = (hetEngine == "abpoa");
+        const bool useProjAlnHetEngine = (hetEngine == "projaln");
         // Default engine is per-interval POA: selected explicitly or when unset
         // and no other engine was requested.
         const bool useIntervalPoaHetEngine =
             (hetEngine == "intervalpoa") ||
-            (!useKsw2HetEngine && !useAbpoaHetEngine);
+            (!useKsw2HetEngine && !useAbpoaHetEngine && !useProjAlnHetEngine);
 
         if(useIntervalPoaHetEngine) {
             cout << timestamp << "Detecting het bubbles with the per-interval POA"
@@ -2203,6 +2279,39 @@ void dinara::main::assemble(
                 threadCount, hetWindows, totalBubbles,
                 hetSkipWindow.empty() ? nullptr : &hetSkipWindow);
             const double hetSecs = seconds(steady_clock::now() - tHet0);
+            dinaraPrintHetEmitTiming();
+            // Verification-only: run the whole-window abpoa graph (one graph
+            // per seed/backbone read, members added piece-by-piece via their
+            // own shared anchors) and its leaf-snarl detector alongside the
+            // live per-interval pipeline, logging results without feeding
+            // them into window.hetBubbles or anything else live. Off by
+            // default; opt in with DINARA_WINDOW_ABPOA_DEBUG=1.
+            if (getenv("DINARA_WINDOW_ABPOA_DEBUG") != nullptr) {
+                assembler.computeWindowAbpoaGraphs(
+                    anchorWindows, *shasta2Anchors, *shasta2Journeys,
+                    "windowAbpoaDebug.", threadCount);
+            }
+            // Verification-only: leaf-snarl detection from independent
+            // pairwise ksw2 alignments (no shared graph, no per-interval
+            // fragmentation) -- a comparison point against both the abPOA
+            // shared-graph version above and the interval-abPOA-profile
+            // version (DINARA_INTERVALPOA_LEAFSNARL_DEBUG=1, inside
+            // intervalPoaDetectHetBubblesAllWindows itself). Off by default;
+            // opt in with DINARA_KSW2_LEAFSNARL_DEBUG=1.
+            if (getenv("DINARA_KSW2_LEAFSNARL_DEBUG") != nullptr) {
+                assembler.computeWindowKsw2LeafSnarls(
+                    anchorWindows, *shasta2Anchors, *shasta2Journeys,
+                    assemblerOptions.alignOptions, threadCount);
+            }
+            // Verification-only: leaf-snarl detection using ProjectedAlignment
+            // (computeBaseAlignmentsAndStore's own fast aligner) instead of
+            // ksw2's per-segment banded DP. Off by default; opt in with
+            // DINARA_PROJALN_LEAFSNARL_DEBUG=1.
+            if (getenv("DINARA_PROJALN_LEAFSNARL_DEBUG") != nullptr) {
+                assembler.computeWindowProjectedAlignmentLeafSnarls(
+                    anchorWindows, *shasta2Anchors, *shasta2Journeys,
+                    assemblerOptions.alignOptions, threadCount);
+            }
             cout << timestamp << "per-interval POA het-bubble detection complete."
                  << " hetWindows=" << hetWindows
                  << " homWindows=" << (anchorWindows.size() - hetWindows)
@@ -2237,6 +2346,30 @@ void dinara::main::assemble(
                  << " totalHetBubbles=" << totalBubbles
                  << " seconds=" << std::fixed << std::setprecision(2) << hetSecs
                  << std::defaultfloat << endl;
+            dinaraPrintHetEmitTiming();
+            { extern void dinaraPrintKswCallCount(); dinaraPrintKswCallCount(); }
+        } else if(useProjAlnHetEngine) {
+            cout << timestamp << "Detecting het bubbles with the ProjectedAlignment"
+                    " engine on " << anchorWindows.size() << " windows on "
+                 << threadCount << " threads..." << endl;
+            const auto tHet0 = steady_clock::now();
+            uint64_t hetWindows = 0, totalBubbles = 0;
+            assembler.projAlnDetectHetBubblesAllWindows(
+                anchorWindows, *shasta2Anchors, *shasta2Journeys,
+                assemblerOptions.alignOptions,
+                assemblerOptions.assemblyOptions.mode3Options.hetMinVaf,
+                assemblerOptions.assemblyOptions.mode3Options.hetMinSupport,
+                assemblerOptions.assemblyOptions.mode3Options.hetDropHomopolymer,
+                assemblerOptions.assemblyOptions.mode3Options.hetDropRepeat,
+                threadCount, hetWindows, totalBubbles,
+                hetSkipWindow.empty() ? nullptr : &hetSkipWindow);
+            const double hetSecs = seconds(steady_clock::now() - tHet0);
+            cout << timestamp << "ProjectedAlignment het-bubble detection complete."
+                 << " hetWindows=" << hetWindows
+                 << " homWindows=" << (anchorWindows.size() - hetWindows)
+                 << " totalHetBubbles=" << totalBubbles
+                 << " seconds=" << std::fixed << std::setprecision(2) << hetSecs
+                 << std::defaultfloat << endl;
         } else {  // useAbpoaHetEngine (DINARA_HET_ENGINE=abpoa)
             const auto tAbpoa0 = steady_clock::now();
             assembler.testAbpoaMultiSegmentMSA(
@@ -2257,12 +2390,45 @@ void dinara::main::assemble(
         }
     }
 
+    // Verification-only timing comparison: cigarDetectSnpsInWindow reuses
+    // computeBaseAlignmentsAndStore's ALREADY-COMPUTED pairwise CIGARs
+    // (overlapCigarStore) instead of doing fresh per-window realignment (ksw2
+    // or interval-abPOA above) -- a comparison point for whether that
+    // already-paid alignment cost, reused directly, beats redoing alignment
+    // per window. Writes only window.cleanHetSnpCount/hetSnps (not
+    // hetBubbles), so it does not disturb whichever engine ran above. Off by
+    // default; opt in with DINARA_CIGAR_SNP_DEBUG=1.
+    if (getenv("DINARA_CIGAR_SNP_DEBUG") != nullptr) {
+        cout << timestamp << "Running CIGAR-reuse SNP detection on "
+             << anchorWindows.size() << " windows (comparison only)..." << endl;
+        const auto tCigar0 = steady_clock::now();
+        uint64_t totalCigarSnps = 0;
+        for(AnchorWindow& window : anchorWindows) {
+            window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
+                window, *shasta2Anchors, *shasta2Journeys);
+            totalCigarSnps += window.cleanHetSnpCount;
+        }
+        const double cigarSecs = seconds(steady_clock::now() - tCigar0);
+        cout << timestamp << "CIGAR-reuse SNP detection complete."
+             << " totalSnps=" << totalCigarSnps
+             << " seconds=" << std::fixed << std::setprecision(2) << cigarSecs
+             << std::defaultfloat << endl;
+    }
+
     // Turn the staged het bubbles into anchor-graph structure in three serial
     // passes (plan -> append -> stage edges). The passes are ordered so anchors
     // are created only for bubbles that will be wired: the planner marks which
     // bubbles are usable, the append pass creates exactly those anchors, and the
     // staging pass wires them. See the helpers in the anonymous namespace above.
     const uint32_t hetKHalf = uint32_t(shasta2Anchors->k / 2);
+
+    // Backbone cache: computed once per window here, then shared read-only by
+    // Pass 1, Pass 1.5, and Pass 3 below (see WindowBackboneCache for why this
+    // is safe -- nothing between window creation and Pass 3 changes a
+    // window's backbone fields or moves an existing anchor's position).
+    cout << timestamp << "Computing window backbones..." << endl;
+    const WindowBackboneCache backboneCache(
+        *shasta2Anchors, *shasta2Journeys, anchorWindows, hetKHalf, threadCount);
 
     // Pass 1: plan. Assign each bubble to the backbone interval that strictly
     // contains its flank span; drop the rest (plannedInterval = -1). Also drop
@@ -2276,16 +2442,12 @@ void dinara::main::assemble(
         const PrimaryMarkerSet primarySet = buildPrimaryMarkerSet(*shasta2Anchors);
         // Parallel over windows: planning is window-local (mutates only its own
         // window's bubbles) and reads shared state read-only (the store via
-        // getPosition, the frozen primarySet). Counters are atomic; the backbone
-        // scratch is thread-local.
+        // getPosition, the frozen primarySet, the frozen backboneCache).
         std::atomic<uint64_t> aPlanned{0}, aUncontained{0}, aPrimaryCollision{0};
         std::atomic<uint64_t> aBackwardMembers{0};
         parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
             AnchorWindow& window = anchorWindows[wi];
-            thread_local vector<Shasta2AnchorId> bbAnchors;
-            thread_local vector<uint32_t> bbOffset;
-            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
-                                      hetKHalf, bbAnchors, bbOffset)) {
+            if(!backboneCache.hasBackbone(wi)) {
                 // Fewer than two backbone anchors: no interval, drop all bubbles.
                 for(auto& b : window.hetBubbles) { b.plannedInterval = -1; }
                 aUncontained.fetch_add(window.hetBubbles.size(),
@@ -2298,7 +2460,8 @@ void dinara::main::assemble(
             // frame, so the backward-member comparison uses the same frame the
             // verifier sees.
             uint64_t planned = 0, uncontained = 0, primaryCollision = 0, backward = 0;
-            planWindowHetBubbles(window, *shasta2Anchors, bbAnchors, bbOffset,
+            planWindowHetBubbles(window, *shasta2Anchors,
+                                 backboneCache.bbAnchors(wi), backboneCache.bbOffset(wi),
                                  /*hetKHalf=*/hetAnchorKHalf(), primarySet,
                                  planned, uncontained,
                                  primaryCollision, backward);
@@ -2329,18 +2492,16 @@ void dinara::main::assemble(
     // becomes ...arms_N -> sharedHom -> arms_{N+1}..., keeping BOTH SNPs.
     {
         // Parallel over windows: the merge is window-local (folds one window's
-        // adjacent-bubble homs) and reads no mutable shared state.
+        // adjacent-bubble homs) and reads no mutable shared state (the
+        // backboneCache is frozen after its construction above).
         std::atomic<uint64_t> aMergedHoms{0};
         parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
-            AnchorWindow& window = anchorWindows[wi];
-            thread_local vector<Shasta2AnchorId> bbAnchors;
-            thread_local vector<uint32_t> bbOffset;
-            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
-                                      hetKHalf, bbAnchors, bbOffset)) {
+            if(!backboneCache.hasBackbone(wi)) {
                 return;
             }
+            AnchorWindow& window = anchorWindows[wi];
             uint64_t merged = 0;
-            mergeWindowCoincidentHoms(window, bbAnchors, merged);
+            mergeWindowCoincidentHoms(window, backboneCache.bbAnchors(wi), merged);
             aMergedHoms.fetch_add(merged, std::memory_order_relaxed);
         });
         cout << timestamp << "Merged " << aMergedHoms.load()
@@ -2514,17 +2675,17 @@ void dinara::main::assemble(
         const uint64_t anchorCount = shasta2Anchors->size();
         // Parallel over windows: staging is window-local (mutates only its own
         // window.intraWindowEdges) and reads the store read-only. anchorCount is
-        // fixed here (append is complete), so all endpoint ids are valid.
+        // fixed here (append is complete), so all endpoint ids are valid. The
+        // backboneCache is frozen and unaffected by the append (see its comment).
         std::atomic<uint64_t> aBackbone{0}, aHet{0}, aChained{0};
         parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
-            AnchorWindow& window = anchorWindows[wi];
-            thread_local vector<Shasta2AnchorId> bbAnchors;
-            thread_local vector<uint32_t> bbOffset;
-            thread_local vector<uint32_t> bbExportedOffset;
-            if(!computeWindowBackbone(*shasta2Anchors, *shasta2Journeys, window,
-                                      hetKHalf, bbAnchors, bbOffset)) {
+            if(!backboneCache.hasBackbone(wi)) {
                 return;
             }
+            AnchorWindow& window = anchorWindows[wi];
+            const vector<Shasta2AnchorId>& bbAnchors = backboneCache.bbAnchors(wi);
+            const vector<uint32_t>& bbOffset = backboneCache.bbOffset(wi);
+            thread_local vector<uint32_t> bbExportedOffset;
             // Step 1: middle-2 backbone shift. Materialize the exported (k=2)
             // frame the edges and monotonicity check operate in. The shift is a
             // uniform -1 per anchor, so it preserves the backbone's strict
@@ -2732,10 +2893,14 @@ void dinara::main::assemble(
     // constructor consumes; the constructor then wires backbone chains,
     // inter-window edges, and het bubbles. anchorDovetailWindow was populated
     // above (with the windows). This is the second end product alongside the
-    // exported anchors.
+    // exported anchors. Skip if the high-connectivity het gate already
+    // computed it above -- see the note there for why the result would be
+    // identical either way.
     {
-        computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
-            &anchorDovetailWindow);
+        if(!windowTransitionsComputed) {
+            computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
+                &anchorDovetailWindow);
+        }
 
         const uint64_t minInterWindowCoverage =
             assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
@@ -2856,2042 +3021,6 @@ void dinara::main::assemble(
         cout << timestamp << "Wrote Shasta2AssemblyGraph.gfa / -cleaned.gfa" << endl;
     }
 
-    return;
-
-    // ksw2-based het SNP detection per window. Aligns each member's
-    // inter-anchor segments against the backbone with banded 2-piece affine
-    // ksw2, using the persisted shared-anchor pins. Self-contained per window
-    // (handles transitive members, no global alignment table), and each DP is
-    // bounded by the small inter-anchor gap, so it is fast at window scale.
-    {
-        cout << timestamp << "Running ksw2-based SNP detection on "
-             << anchorWindows.size() << " windows..." << endl;
-        const auto tSnp0 = steady_clock::now();
-        uint64_t hetWindows = 0;
-        uint64_t totalSnps = 0;
-        // CIGAR-density noise filter window/threshold. HiFi defaults (100/5);
-        // for ONT use a tighter window (~25/5). Tune per read technology.
-        constexpr int noisyRegSlideWin = 100;
-        constexpr int noisyRegMaxXgaps = 5;
-        for(AnchorWindow& window : anchorWindows) {
-            window.cleanHetSnpCount = assembler.ksw2DetectSnpsInWindow(
-                window, *shasta2Anchors, *shasta2Journeys,
-                assemblerOptions.alignOptions,
-                noisyRegSlideWin, noisyRegMaxXgaps);
-            if(window.cleanHetSnpCount > 0) {
-                hetWindows++;
-                totalSnps += window.cleanHetSnpCount;
-            }
-        }
-        const auto tSnp1 = steady_clock::now();
-        const double snpSecs = seconds(tSnp1 - tSnp0);
-        cout << timestamp << "ksw2-based SNP detection complete."
-             << " hetWindows=" << hetWindows
-             << " homWindows=" << (anchorWindows.size() - hetWindows)
-             << " totalCleanHetSnps=" << totalSnps
-             << " seconds=" << std::fixed << std::setprecision(2) << snpSecs
-             << std::defaultfloat << endl;
-
-        // Persist all called het sites so detection quality can be inspected.
-        // One row per (window, site): backbone read, backbone position, ref/alt
-        // base, coverage, and the number of reads supporting each allele.
-        {
-            const string fileName = "window_het_sites.tsv";
-            ofstream hetOut(fileName);
-            hetOut << "windowId\tbackboneOrientedReadId\tbbPos"
-                      "\trefBase\taltBase\trefCov\taltCov\tspanning"
-                      "\tnRefReads\tnAltReads\n";
-            const char baseChars[5] = {'A', 'C', 'G', 'T', 'N'};
-            for(const AnchorWindow& window : anchorWindows) {
-                for(const auto& hs : window.hetSnps) {
-                    hetOut << window.windowId
-                           << '\t' << window.backboneOrientedReadId
-                           << '\t' << hs.bbPos
-                           << '\t' << baseChars[hs.refBase < 5 ? hs.refBase : 4]
-                           << '\t' << baseChars[hs.altBase < 5 ? hs.altBase : 4]
-                           << '\t' << hs.refCov
-                           << '\t' << hs.altCov
-                           << '\t' << hs.spanning
-                           << '\t' << hs.refReads.size()
-                           << '\t' << hs.altReads.size()
-                           << '\n';
-                }
-            }
-            cout << timestamp << "Wrote het sites to " << fileName << "." << endl;
-        }
-    }
-
-    // CIGAR-based het SNP detection (alternative). Reuses pairwise CIGARs from
-    // computeBaseAlignmentsAndStore. Superseded by ksw2DetectSnpsInWindow above;
-    // kept for comparison.
-    // {
-    //     cout << timestamp << "Running CIGAR-based SNP detection on "
-    //          << anchorWindows.size() << " windows..." << endl;
-    //     for(AnchorWindow& window : anchorWindows) {
-    //         window.cleanHetSnpCount = assembler.cigarDetectSnpsInWindow(
-    //             window, *shasta2Anchors, *shasta2Journeys);
-    //     }
-    // }
-
-    // // Write per-read haplotype assignments and het SNP info for the first window.
-    // if (!anchorWindows.empty()) {
-    //     const auto& w0 = anchorWindows[0];
-    //     const char* baseChar = "ACGT";
-
-    //     // Het SNP positions.
-    //     if (!w0.hetSnps.empty()) {
-    //         const string snpFileName = "WindowHetSnps.csv";
-    //         ofstream snpFile(snpFileName);
-    //         if (snpFile) {
-    //             snpFile << "BbPos,RefBase,AltBase,AltCov,RefCov,Spanning,AF,AltReads,RefReads\n";
-    //             for (const auto& s : w0.hetSnps) {
-    //                 snpFile << s.bbPos << ","
-    //                         << baseChar[s.refBase] << ","
-    //                         << baseChar[s.altBase] << ","
-    //                         << s.altCov << ","
-    //                         << s.refCov << ","
-    //                         << s.spanning << ","
-    //                         << std::fixed << std::setprecision(3)
-    //                         << (s.spanning > 0 ? double(s.altCov) / double(s.spanning) : 0.0)
-    //                         << std::defaultfloat << ",";
-    //                 for (size_t i = 0; i < s.altReads.size(); i++) {
-    //                     if (i > 0) snpFile << " ";
-    //                     snpFile << s.altReads[i];
-    //                 }
-    //                 snpFile << ",";
-    //                 for (size_t i = 0; i < s.refReads.size(); i++) {
-    //                     if (i > 0) snpFile << " ";
-    //                     snpFile << s.refReads[i];
-    //                 }
-    //                 snpFile << "\n";
-    //             }
-    //             cout << timestamp << "Wrote " << snpFileName
-    //                  << " (" << w0.hetSnps.size() << " het SNPs)" << endl;
-    //         }
-    //     }
-
-    //     // Per-read haplotype assignments.
-    //     if (!w0.readHaplotypes.empty()) {
-    //         const string hapFileName = "WindowHaplotypes.csv";
-    //         ofstream hapFile(hapFileName);
-    //         if (hapFile) {
-    //             hapFile << "OrientedReadId,Haplotype\n";
-    //             // Backbone read is hap 1 by convention.
-    //             hapFile << w0.backboneOrientedReadId << ",1\n";
-    //             for (const auto& rh : w0.readHaplotypes) {
-    //                 hapFile << rh.orientedReadId << "," << rh.hap << "\n";
-    //             }
-    //             cout << timestamp << "Wrote " << hapFileName
-    //                  << " (" << w0.readHaplotypes.size() << " reads, window bb="
-    //                  << w0.backboneOrientedReadId << ")" << endl;
-    //         }
-    //     }
-
-    //     // Read clusters from iterative refinement.
-    //     if (!w0.readClusters.empty()) {
-    //         const string clusterFileName = "WindowClusters.csv";
-    //         ofstream clusterFile(clusterFileName);
-    //         if (clusterFile) {
-    //             clusterFile << "Cluster,OrientedReadId\n";
-    //             // Backbone read is in cluster 0.
-    //             clusterFile << 0 << "," << w0.backboneOrientedReadId << "\n";
-    //             for (size_t ci = 0; ci < w0.readClusters.size(); ci++) {
-    //                 for (const auto& oid : w0.readClusters[ci]) {
-    //                     clusterFile << ci << "," << oid << "\n";
-    //                 }
-    //             }
-    //             uint64_t totalReads = 0;
-    //             for (const auto& c : w0.readClusters) totalReads += c.size();
-    //             cout << timestamp << "Wrote " << clusterFileName
-    //                  << " (" << w0.readClusters.size() << " clusters, "
-    //                  << totalReads << " reads)" << endl;
-    //         }
-    //     }
-    // }
-
-    // DISABLED: cluster-aware alternate paths — under development.
-    if(false)
-    // Build cluster-aware alternate paths by creating new anchor copies.
-    // For each het window with >=2 haplotype clusters, for each non-backbone
-    // cluster: find which backbone pillars contain reads from that cluster,
-    // create new copies of the interior pillars with only that cluster's reads
-    // (+ unclassified), and emit an alternate path sharing the first and last
-    // pillar with the backbone.
-    {
-        cout << timestamp << "Building cluster-aware alternate paths..." << endl;
-        auto& anchors = *shasta2Anchors;
-        const auto& journeys = *shasta2Journeys;
-        uint64_t totalAltPaths = 0;
-        uint64_t windowsWithAltPaths = 0;
-        uint64_t newAnchorsCopied = 0;
-
-        // Collect new anchors to append after processing all windows.
-        vector<vector<Shasta2AnchorMarkerInfo>> pendingAnchors;
-
-        // Collect unclassified read IDs per window for fast lookup.
-        // (Unclassified reads go into all anchor copies.)
-
-        for (auto& window : anchorWindows) {
-            window.alternatePaths.clear();
-
-            if (window.readClusters.size() <= 1) continue;
-
-            // Count non-unclassified clusters.
-            uint32_t hapClusterCount = 0;
-            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
-                if (!window.clusterIsUnclassified[ci])
-                    hapClusterCount++;
-            }
-            if (hapClusterCount < 2) continue;
-
-            // Build backbone pillar list (ordered anchor IDs in this window).
-            const auto bbJ = journeys[window.backboneOrientedReadId];
-            vector<Shasta2AnchorId> pillars;
-            for (uint32_t jp = window.backboneBegin; jp < window.backboneEnd; jp++) {
-                pillars.push_back(bbJ[jp]);
-            }
-            if (pillars.size() < 3) continue;  // Need at least 3 pillars for interior copies.
-
-            // (Unclassified reads are not included in new anchor copies
-            // to avoid polluting other windows' backbone journeys.)
-
-            bool windowHasAltPaths = false;
-
-            for (size_t ci = 0; ci < window.readClusters.size(); ci++) {
-                if (window.clusterIsUnclassified[ci]) continue;
-
-                // Skip backbone cluster.
-                bool isBackboneCluster = false;
-                for (const auto& oid : window.readClusters[ci]) {
-                    if (oid == window.backboneOrientedReadId) {
-                        isBackboneCluster = true;
-                        break;
-                    }
-                }
-                if (isBackboneCluster) continue;
-
-                // Build set of this cluster's read IDs.
-                std::set<uint32_t> clusterReadIds;
-                for (const auto& oid : window.readClusters[ci]) {
-                    clusterReadIds.insert(oid.getValue());
-                }
-
-                // Find which pillars contain reads from this cluster.
-                vector<uint32_t> clusterPillarIndices;  // indices into pillars[]
-                for (uint32_t pi = 0; pi < uint32_t(pillars.size()); pi++) {
-                    const auto anchor = anchors[pillars[pi]];
-                    for (const auto& ami : anchor) {
-                        if (clusterReadIds.count(ami.orientedReadId.getValue())) {
-                            clusterPillarIndices.push_back(pi);
-                            break;
-                        }
-                    }
-                }
-
-                // Need at least 2 pillars to form a path.
-                if (clusterPillarIndices.size() < 2) continue;
-
-                // First and last are shared with backbone (fork/join points).
-                // Interior pillars get new anchor copies.
-                const uint32_t firstIdx = clusterPillarIndices.front();
-                const uint32_t lastIdx = clusterPillarIndices.back();
-
-                // Create new anchor copies for interior pillars and track
-                // which reads each copy contains.
-                struct NewCopy {
-                    Shasta2AnchorId newId;
-                    Shasta2AnchorId originalPillar;
-                    std::set<uint32_t> readIds;  // oriented read IDs in this copy
-                };
-                vector<NewCopy> copies;
-
-                for (size_t k = 1; k + 1 < clusterPillarIndices.size(); k++) {
-                    const uint32_t pi = clusterPillarIndices[k];
-                    const auto anchor = anchors[pillars[pi]];
-
-                    vector<Shasta2AnchorMarkerInfo> newAnchor;
-                    std::set<uint32_t> copyReadIds;
-                    for (const auto& ami : anchor) {
-                        uint32_t rv = ami.orientedReadId.getValue();
-                        if (clusterReadIds.count(rv)) {
-                            newAnchor.push_back(ami);
-                            copyReadIds.insert(rv);
-                        }
-                    }
-
-                    if (newAnchor.empty()) continue;
-
-                    Shasta2AnchorId newId = Shasta2AnchorId(
-                        anchors.size() + pendingAnchors.size());
-                    sort(newAnchor.begin(), newAnchor.end());
-                    pendingAnchors.push_back(std::move(newAnchor));
-                    copies.push_back(NewCopy{newId, pillars[pi], std::move(copyReadIds)});
-                    newAnchorsCopied++;
-                }
-
-                if (copies.empty()) continue;
-
-                // Build alternate paths. Break into separate paths where
-                // consecutive copies don't share reads — each path must
-                // have connectivity through shared reads.
-                // A "run" is a maximal sequence of consecutive copies where
-                // each pair shares reads. Each run becomes one alternate path,
-                // with the original pillar before the first copy as anchorIdA
-                // and the original pillar after the last copy as anchorIdB.
-                size_t runStart = 0;
-                while (runStart < copies.size()) {
-                    size_t runEnd = runStart + 1;
-                    while (runEnd < copies.size()) {
-                        bool sharesReads = false;
-                        for (uint32_t rv : copies[runEnd].readIds) {
-                            if (copies[runEnd - 1].readIds.count(rv)) {
-                                sharesReads = true;
-                                break;
-                            }
-                        }
-                        if (!sharesReads) break;
-                        runEnd++;
-                    }
-
-                    // Build alternate path for this run.
-                    // anchorIdA: the original pillar just before the run's
-                    // first copy in clusterPillarIndices. For the first run,
-                    // this is pillars[firstIdx]. For subsequent runs, it's
-                    // the original pillar of the previous run's last copy.
-                    // anchorIdB: the original pillar just after the run's
-                    // last copy. For the last run, this is pillars[lastIdx].
-
-                    // The copies correspond to clusterPillarIndices[1..N-2]
-                    // (interior pillars). Copy index k corresponds to
-                    // clusterPillarIndices[k+1]. So:
-                    // - anchorIdA = pillar at clusterPillarIndices[runStart]
-                    //   (which is clusterPillarIndices[runStart+1 - 1])
-                    // - anchorIdB = pillar at clusterPillarIndices[runEnd+1]
-
-                    // copies[k] corresponds to clusterPillarIndices[k+1].
-                    // anchorIdA = pillar at clusterPillarIndices[runStart+1 - 1] = clusterPillarIndices[runStart]
-                    // anchorIdB = pillar at clusterPillarIndices[runEnd+1 - 1 + 1] = clusterPillarIndices[runEnd + 1]
-                    uint32_t aIdx = clusterPillarIndices[runStart];      // pillar before first copy in run
-                    uint32_t bIdx = clusterPillarIndices[runEnd + 1];    // pillar after last copy in run
-
-                    // Also check that anchorIdA shares reads with the first copy,
-                    // and anchorIdB shares reads with the last copy.
-                    bool aConnects = false;
-                    {
-                        const auto anchorA = anchors[pillars[aIdx]];
-                        for (const auto& ami : anchorA) {
-                            if (copies[runStart].readIds.count(ami.orientedReadId.getValue())) {
-                                aConnects = true;
-                                break;
-                            }
-                        }
-                    }
-                    bool bConnects = false;
-                    {
-                        const auto anchorB = anchors[pillars[bIdx]];
-                        for (const auto& ami : anchorB) {
-                            if (copies[runEnd - 1].readIds.count(ami.orientedReadId.getValue())) {
-                                bConnects = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (aConnects && bConnects) {
-                        AnchorWindowAlternatePath altPath;
-                        altPath.anchorIdA = pillars[aIdx];
-                        altPath.anchorIdB = pillars[bIdx];
-                        for (size_t k = runStart; k < runEnd; k++) {
-                            altPath.intermediateAnchorIds.push_back(copies[k].newId);
-                        }
-                        window.alternatePaths.push_back(std::move(altPath));
-                        totalAltPaths++;
-                        windowHasAltPaths = true;
-                    }
-
-                    runStart = runEnd;
-                }
-            }
-
-            if (windowHasAltPaths)
-                windowsWithAltPaths++;
-        }
-
-        cout << timestamp << "  cluster-aware alternate paths: "
-             << totalAltPaths << " paths in "
-             << windowsWithAltPaths << " windows, "
-             << newAnchorsCopied << " new anchor copies" << endl;
-
-        // Append new anchors.
-        if (!pendingAnchors.empty()) {
-            for (const auto& a : pendingAnchors) {
-                anchors.anchorMarkerInfos.appendVector(a);
-            }
-            cout << timestamp << "  anchors: " << (anchors.size() - pendingAnchors.size())
-                 << " -> " << anchors.size() << endl;
-
-            // Rebuild journeys.
-            cout << timestamp << "  rebuilding journeys..." << endl;
-            assembler.shasta2Journeys.reset();
-            assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
-                2 * assembler.getReads().readCount(),
-                shasta2Anchors,
-                threadCount,
-                shasta2Owner);
-            shasta2Journeys = assembler.shasta2Journeys;
-            cout << timestamp << "  journeys rebuilt." << endl;
-
-            // Validate alternate paths: drop any path where an edge has
-            // no shared reads with correct journey ordering.
-            uint64_t droppedPaths = 0;
-            for (auto& window : anchorWindows) {
-                vector<AnchorWindowAlternatePath> validPaths;
-                for (const auto& altPath : window.alternatePaths) {
-                    bool valid = true;
-                    Shasta2AnchorId prev = altPath.anchorIdA;
-                    for (const Shasta2AnchorId mid : altPath.intermediateAnchorIds) {
-                        Shasta2AnchorPair pair(anchors, prev, mid, false);
-                        if (pair.orientedReadIds.empty()) {
-                            valid = false;
-                            break;
-                        }
-                        prev = mid;
-                    }
-                    if (valid) {
-                        Shasta2AnchorPair pair(anchors, prev, altPath.anchorIdB, false);
-                        if (pair.orientedReadIds.empty())
-                            valid = false;
-                    }
-                    if (valid) {
-                        validPaths.push_back(altPath);
-                    } else {
-                        droppedPaths++;
-                    }
-                }
-                window.alternatePaths = std::move(validPaths);
-            }
-            if (droppedPaths > 0) {
-                cout << timestamp << "  dropped " << droppedPaths
-                     << " alternate paths with broken edges" << endl;
-            }
-        }
-    }
-
-    // ========================================================================
-    // PER-WINDOW PROCESSING HOOK.
-    // Runs after windows exist (Phase 1) but before any inter-window edges are
-    // derived (Phase 2). Each window is self-contained here (its readIntervals,
-    // backbone, etc.), so per-window work (consensus, phasing, splitting,
-    // filtering) belongs here and can be done independently per window.
-    // ========================================================================
-    // Per-window progressive abPOA: seed each window's graph with the backbone
-    // read, then add every member read aligned to the backbone subgraph
-    // spanning its shared-anchor interval. Writes one GFA per window; the
-    // graph/MSA is the substrate for later het-site detection.
-    {
-        // The per-segment abPOA path re-aligns sequences that
-        // computeBaseAlignmentsAndStore already aligned, and its per-segment
-        // graph rescans make it intractable at window scale. Het-site
-        // detection runs instead off the stored CIGARs via
-        // cigarDetectSnpsInWindow (see below). Keep the abPOA code for
-        // diagnostics but leave it off.
-        constexpr bool computeWindowAbpoa = false;
-        if(computeWindowAbpoa) {
-            assembler.computeWindowAbpoaGraphs(
-                anchorWindows,
-                *shasta2Anchors,
-                *shasta2Journeys,
-                "window_abpoa_",
-                threadCount);
-        }
-    }
-
-    // ========================================================================
-    // PHASE 2: Edge derivation.
-    // Derives inter-window adjacency from journeys and records it on the
-    // windows (transitionReads, per-read previous/next window,
-    // backbonePreviousWindow/backboneNextWindow). Produces edges-as-data only;
-    // does not build the graph. Phase 3 (the Shasta2AnchorGraph constructor)
-    // consumes these fields directly instead of recomputing them.
-    // ========================================================================
-    computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
-        &anchorDovetailWindow);
-
-    const uint64_t minInterWindowCoverage =
-        assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage;
-    const uint64_t minInterWindowEdgeCoverage =
-        assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
-
-    // ========================================================================
-    // PHASE 3: Graph assembly.
-    // Builds Shasta2AnchorGraph from windows (Phase 1) + transitions (Phase 2).
-    // ========================================================================
-    // Single-pass anchor graph construction (no detour suppression).
-    cout << timestamp << "Creating Shasta2AnchorGraph from " << anchorWindows.size()
-         << " anchor windows..." << endl;
-    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        anchorWindows,
-        minInterWindowCoverage,
-        minInterWindowEdgeCoverage,
-        threadCount,
-        &assembler.getReads(),
-        nullptr, // bypassEdges
-        nullptr, // detourWindowPairs
-        &anchorDovetailWindow);
-    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
-
-    // Trim excess backbone sequence dangling beyond the outermost inter-window
-    // connections. trimBackbones deletes backbone anchors before the first and
-    // after the last anchor that carries an inter-window edge.
-    //
-    // Enabled. With all-to-all inter-window connection (connectAllWindows) a
-    // window typically connects near both ends, so only the small unsupported
-    // overhangs past the outermost links are shaved rather than the interior.
-    // (The earlier concern about head-trim walking through the whole window
-    // applied to the sparse strict 1-to-1 model, where a window could connect at
-    // only one end.)
-    constexpr bool trimBackbonesEnabled = true;
-    if(trimBackbonesEnabled) {
-        shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
-    }
-
-    // Save the anchor graph.
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
-    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
-    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
-
-    // Export in shasta2-native format for --external-anchor-graph-name.
-    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph", *shasta2Anchors);
-
-    // Create the AssemblyGraph with window info.
-    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        *shasta2AnchorGraph,
-        anchorWindows,
-        shasta2AssemblyGraphOptions);
-    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
-
-    // Iterative tip removal + superbubble popping.
-    {
-        const uint32_t maxTipWindows = 3;
-        const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
-        for(uint64_t cleanRound = 0; ; cleanRound++) {
-            uint64_t changeCount = 0;
-            changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
-            shasta2AssemblyGraph->compress();
-            if(changeCount == 0) break;
-        }
-    }
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
-
-    // Diagnostic (read-only): report candidate bridges between maximal 1-1
-    // linear segments, using read window-paths. Adds no edges.
-    shasta2AssemblyGraph->reportSegmentBridges(
-        shasta2AnchorGraph->windowReads, shasta2AnchorGraph->readWindows);
-
-    // Stage B.2: add confident bridge edges (mutually-best, non-ambiguous,
-    // support >= 2) between maximal 1-1 segments, plus RC mirrors. Then write
-    // a GFA so the bridged graph can be truth-mapped.
-    //
-    // Disabled: addConfidentBridges adds edges computed independently from the
-    // anchor graph and does not enforce the both-strand contact rule, so it
-    // can re-introduce a window -> X / window -> X^1 contact that edge creation
-    // forbade. Kept here (not deleted) for easy restoration.
-    // shasta2AssemblyGraph->addConfidentBridges(shasta2AnchorGraph->readWindows);
-    // shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-bridged.gfa");
-
-    // Directed-graph filter pipeline (disabled — using bidirected pipeline instead).
-#if 0
-    // Remove isolated windows (no inter-window edges).
-    shasta2AnchorGraph->removeIsolatedWindows(anchorWindows, *shasta2Journeys);
-
-    // G-test based detangling.
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-pre-detangle.gfa", &anchorWindows);
-    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph-pre-detangle.csv");
-
-    const bool enableDetangling = false;
-    std::vector<DetangleBypassEdge> bypassEdges;
-    if(enableDetangling) {
-        const uint64_t detangledCount = detangleWindowsGTest(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            anchorWindows,
-            bypassEdges);
-
-        if(detangledCount > 0) {
-            cout << timestamp << "Rebuilding anchor graph after detangling..." << endl;
-
-            assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-                *shasta2Anchors,
-                *shasta2Journeys,
-                anchorWindows,
-                minInterWindowCoverage,
-                minInterWindowEdgeCoverage,
-                threadCount,
-                &assembler.getReads(),
-                &bypassEdges,
-                nullptr, // detourWindowPairs
-                &anchorDovetailWindow);
-            shasta2AnchorGraph = assembler.shasta2AnchorGraph;
-        }
-    }
-
-    // Write external anchors.
-    cout << timestamp << "Writing Shasta2 external anchors to "
-         << externalAnchorsName << "..." << endl;
-    const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
-    cout << timestamp << "Wrote " << exportedExternalAnchorCount
-         << " external anchors for Shasta2. Use --external-anchors-name "
-         << externalAnchorsName << endl;
-
-    // Dump detailed stats for the largest window's connections.
-    shasta2AnchorGraph->writeWindowConnectionStats(*shasta2Anchors, anchorWindows, *shasta2Journeys);
-
-    // Clean the anchor graph.
-    shasta2AnchorGraph->removeRcWindowConnections();
-    shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
-    shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
-
-    // Run detangling again after internal connection removal.
-    if(enableDetangling) {
-        std::vector<DetangleBypassEdge> bypassEdges2;
-        const uint64_t detangledCount2 = detangleWindowsGTest(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            anchorWindows,
-            bypassEdges2);
-
-        if(detangledCount2 > 0) {
-            cout << timestamp << "Rebuilding anchor graph after second detangling..." << endl;
-
-            assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-                *shasta2Anchors,
-                *shasta2Journeys,
-                anchorWindows,
-                minInterWindowCoverage,
-                minInterWindowEdgeCoverage,
-                threadCount,
-                &assembler.getReads(),
-                &bypassEdges2,
-                nullptr, // detourWindowPairs
-                &anchorDovetailWindow);
-            shasta2AnchorGraph = assembler.shasta2AnchorGraph;
-
-            // Clean again after detangling.
-            shasta2AnchorGraph->removeRcWindowConnections();
-            shasta2AnchorGraph->removeInternalConnections(*shasta2Anchors, anchorWindows, *shasta2Journeys);
-            shasta2AnchorGraph->trimBackbones(anchorWindows, *shasta2Journeys);
-        }
-    }
-
-    // Save the cleaned anchor graph.
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
-    shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
-    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
-
-    // Export in shasta2-native format for --external-anchor-graph-name.
-    shasta2AnchorGraph->saveForShasta2("Shasta2ExternalAnchorGraph", *shasta2Anchors);
-
-    // Create the AssemblyGraph with window info.
-    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        *shasta2AnchorGraph,
-        anchorWindows,
-        shasta2AssemblyGraphOptions);
-    auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
-    shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
-
-    // Iterative tip removal + superbubble popping.
-    const uint32_t maxTipWindows = 3;
-    const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
-    for(uint64_t cleanRound = 0; ; cleanRound++) {
-        uint64_t changeCount = 0;
-
-        changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
-        shasta2AssemblyGraph->compress();
-    }
-#endif
-
-    // Convert the cleaned assembly graph to bidirected.
-    auto bidirectedGraph = shasta2AssemblyGraph->toBidirected(anchorWindows, *shasta2Journeys);
-    bidirectedGraph.writeGfa("Shasta2AnchorGraph-bidirected.gfa");
-    bidirectedGraph.writeCsv("Shasta2AnchorGraph-bidirected.csv", shasta2AnchorGraph->windowCount);
-    bidirectedGraph.writeCsvByRead("Shasta2AnchorGraph-bidirected-byread.csv",
-        uint32_t(assembler.getReads().readCount()));
-
-    // // Unitigify the bidirected graph and write unitig GFA/CSV.
-    // const auto unitigs = bidirectedGraph.unitigify();
-    // bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs.gfa", unitigs, shasta2AnchorGraph->windowCount);
-    // bidirectedGraph.writeUnitigCsv("Shasta2AnchorGraph-unitigs.csv", unitigs, shasta2AnchorGraph->windowCount);
-    // bidirectedGraph.writeUnitigCsvByRead("Shasta2AnchorGraph-unitigs-byread.csv",
-    //     unitigs, uint32_t(assembler.getReads().readCount()));
-
-    // // Remove short dangling unitigs and write cleaned unitig GFA.
-    // bidirectedGraph.removeTips(unitigs);
-    // const auto cleanedUnitigs = bidirectedGraph.unitigify();
-    // bidirectedGraph.writeUnitigGfa("Shasta2AnchorGraph-unitigs-cleaned.gfa",
-    //     cleanedUnitigs, shasta2AnchorGraph->windowCount);
-
-    //     changeCount += shasta2AssemblyGraph->removeParallelEdges();
-    //     shasta2AssemblyGraph->compress();
-
-    //     changeCount += shasta2AssemblyGraph->popSuperbubbles();
-    //     shasta2AssemblyGraph->compress();
-
-    //     shasta2AssemblyGraph->writeGfa(
-    //         "Shasta2AssemblyGraph-clean-" + to_string(cleanRound) + ".gfa");
-
-    //     cout << timestamp << "Clean round " << cleanRound
-    //          << ": " << changeCount << " changes." << endl;
-    //     if(changeCount == 0) break;
-    // }
-
-    // // Export the cleaned assembly graph as a shasta2-compatible anchor graph.
-    // shasta2AssemblyGraph->saveForShasta2("Shasta2ExternalAnchorGraph");
-
-    return;
-
-
-
-
-
-
-
-
-
-
-    
-
-
-    // // // Declare anchors pointer here to avoid scope issues
-    // shared_ptr<mode3::Anchors> anchors;
-    // anchors = make_shared<mode3::Anchors>(
-    //     MappedMemoryOwner(assembler),
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     *assembler.markers,
-    //     assembler.markerGraph,
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     true); // createFromVertices
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
-
-
-    
-
-    
-    
-    
-
-    
-
-    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
-    // shasta2AssemblyGraph->simplifyAndAssemble();
-
-    // return;
-
-    // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
-
-    // // Step 3: MBG-style cleaning phase
-    // cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
-    // const uint64_t maxResolveLength = 500000;
-    // const bool doRoundCleaning = true;
-    // const bool doGuessworkCleaning = true;
-    // const uint64_t maxUnconditionalResolveLength = 0;
-    // const bool copycountFilterHeuristic = false;
-    // const uint64_t maxLocalResolve = 0;
-    // const bool resolvePalindromesGlobal = false;
-
-    // // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
-    // auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
-    // if(tipStats1.nodesRemoved > 0) {
-    //     cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
-    //          << tipStats1.edgesRemoved << " edges." << endl;
-    //     dag.unitigifyAll();
-    //     cout << "  After tip removal: "
-    //          << dag.nodeCount() << " nodes, "
-    //          << dag.edgeCount() << " edges." << endl;
-    // }
-
-    // // Step 3b: Remove low-coverage crosslinks
-    // auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
-    // if(crosslinkStats.edgesRemoved > 0) {
-    //     cout << "  Removed " << crosslinkStats.edgesRemoved
-    //          << " crosslink edges." << endl;
-    //     dag.unitigifyAll();
-    //     cout << "  After crosslink removal: "
-    //          << dag.nodeCount() << " nodes, "
-    //          << dag.edgeCount() << " edges." << endl;
-    // }
-
-    // // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
-    // if(doGuessworkCleaning) {
-    //     double totalCov = 0.0;
-    //     uint64_t count = 0;
-    //     for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
-    //         if(!dag.nodeExists(segId)) continue;
-    //         totalCov += dag.getPathCoverage(segId);
-    //         count++;
-    //     }
-    //     const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
-    //     auto copyStats = dag.cleanComponentsByCopynumber(
-    //         avgCov,
-    //         50000,
-    //         0,
-    //         max(maxResolveLength, maxLocalResolve),
-    //         {},
-    //         0);
-    //     if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
-    //         cout << "  Copy-number cleaning removed "
-    //              << copyStats.nodesRemoved << " nodes, "
-    //              << copyStats.edgesRemoved << " edges." << endl;
-    //         dag.unitigifyAll();
-    //         cout << "  After copy-number cleaning: "
-    //              << dag.nodeCount() << " nodes, "
-    //              << dag.edgeCount() << " edges." << endl;
-    //     }
-    // }
-
-    // cout << timestamp << "Cleaning phase complete." << endl;
-    // dag.writeSummary(cout);
-    // dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
-
-    
-
-    // // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
-    // const uint64_t initialMinEdgeSupport = 20;
-
-    // // Step 4a: Resolve with minEdgeSupport = initial pass.
-    // cout << timestamp
-    //      << "Resolution step with minEdgeSupport="
-    //      << initialMinEdgeSupport << endl;
-    // dag.resolveRound(
-    //     initialMinEdgeSupport,
-    //     maxResolveLength,
-    //     doRoundCleaning,
-    //     doGuessworkCleaning,
-    //     maxUnconditionalResolveLength,
-    //     copycountFilterHeuristic,
-    //     maxLocalResolve,
-    //     resolvePalindromesGlobal);
-    // dag.unitigifyAll();
-    // cout << "  After resolution step " << initialMinEdgeSupport << ": "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-
-    // // Step 4b: MBG-style second pass with minimal support.
-    // cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
-    // dag.resolveRound(
-    //     1,
-    //     maxResolveLength,
-    //     doRoundCleaning,
-    //     doGuessworkCleaning,
-    //     maxUnconditionalResolveLength,
-    //     copycountFilterHeuristic,
-    //     maxLocalResolve,
-    //     resolvePalindromesGlobal);
-    // dag.unitigifyAll();
-    // cout << "  After final low-support pass: "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-
-    // // Step 5: Write final graph
-    // dag.verifyEdgeConsistency();
-    // dag.writeSummary(cout);
-    // dag.writeGfa("DirectedAnchorGraph.gfa");
-    // dag.writePaths("DirectedAnchorGraph.paths.gaf");
-
-    // return;
-
-
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     /*enableColinearityPeeling*/ false,
-    //     /*minDominantFractionToPeel*/ 0.9);
-
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
-    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
-    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
-    // assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
-    //
-    //
-    // std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
-    // for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
-    //     if (!keepForMarkerGraph[i]) continue;
-    //
-    //     const auto& ad = assembler.alignmentData[i];
-    //
-    //     // Strict rule: only keep if both sides still keep it after your extra filtering.
-    //     if (!ad.keptByBothSides()) continue;
-    //
-    //     keepForReadGraph[i] = true;
-    // }
-    //
-    // // Rebuild the read graph using the tightened keep-set.
-    // assembler.rebuildReadGraphUsingSelectedAlignments(
-    //     std::move(keepForReadGraph),
-    //     /*rebuildDirectedReadGraph*/false);
-
-
-
-
-
-
-
-
-
-
-
-    return;
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-    // The marker graph vertex builder iterates readGraph edges. For this
-    // diagnostic prototype, keep all chained alignments and let marker-graph
-    // coverage/repeat/complexity filters do the pruning.
-    assembler.createReadGraphAllAlignments();
-
-    // // Delete overlaps where one read is contained in the other.
-    // assembler.deleteContainmentOverlaps(threadCount);
-
-    // // // Delete internal overlaps (excessive overhangs or too short).
-    // // assembler.deleteInternalOverlaps(500, 0.8, 50, threadCount);
-
-    
-
-    // assembler.debugDumpSnpSitesForRead(0, 3);
-    // return;
-
-
-    // coverageHet already defined above (line ~979).
-    const uint64_t minFreq = 8;
-    const uint64_t maxFreq = 5 * coverageHet;
-
-
-    // Build marker graph vertices needed by performHifiasmECParityWithMarkerGraph.
-    assembler.createMarkerGraphVertices(
-        minFreq,                                              // minVertexCoverage
-        maxFreq,                                              // maxVertexCoverage
-        0,                                              // minVertexCoveragePerStrand
-        false,                                          // allowDuplicateMarkers
-        std::numeric_limits<double>::signaling_NaN(),   // unused (minVertexCoverage != 0)
-        invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
-        threadCount);
-    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-
-    {
-    // Same Shasta2 anchor/journey coverage as the main assembly path (see shasta2 block
-    // later in this file): reuse these objects when wiring Theseus to Shasta2.
-    const uint64_t minPrimaryCoverage = 8;
-    const uint64_t maxPrimaryCoverage = 5 * coverageHet;
-    const MappedMemoryOwner shasta2OwnerEarly = assembler.shasta2MappedMemoryOwner();
-    cout << timestamp << "Creating Shasta2Anchors for Theseus read-window prototype..." << endl;
-    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
-        shasta2OwnerEarly,
-        assembler.getReads(),
-        assembler.assemblerInfo->k,
-        *assembler.markers,
-        assembler.markerGraph,
-        threadCount,
-        minPrimaryCoverage,
-        maxPrimaryCoverage);
-
-    
-    cout << timestamp << "Creating Shasta2Journeys for Theseus read-window prototype..." << endl;
-    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
-        2 * assembler.getReads().readCount(),
-        assembler.shasta2Anchors,
-        threadCount,
-        shasta2OwnerEarly);
-
-    // Structural scaffold before het detection / phasing: journey co-read CSR (marker graph).
-    assembler.computeStrand0JourneyCoReadsTable();
-
-    // Sort reads by length (longest first) for backbone priority.
-    const uint64_t readCount = assembler.getReads().readCount();
-    vector<ReadId> readIdsSortedByLength(readCount);
-    std::iota(readIdsSortedByLength.begin(), readIdsSortedByLength.end(), ReadId(0));
-    std::sort(readIdsSortedByLength.begin(), readIdsSortedByLength.end(),
-        [&](ReadId a, ReadId b) {
-            return assembler.getReads().getRead(a).baseCount
-                 > assembler.getReads().getRead(b).baseCount;
-        });
-
-    // Partition anchor journeys into disjoint windows.
-    vector<AnchorWindow> anchorWindows;
-    assembler.computeAnchorWindows(
-        assembler.shasta2Anchors,
-        assembler.shasta2Journeys,
-        readIdsSortedByLength,
-        anchorWindows,
-        threadCount);
-
-    // Test computeAnchorWindowsClean on the longest read and build a restricted
-    // anchor graph from the kept anchors.
-    assembler.testAnchorWindowsCleanLongestRead(threadCount,
-        assemblerOptions.assemblyOptions.mode3Options.minInterWindowCoverage);
-
-    // (testAbpoaMultiSegmentMSA is invoked earlier, right after anchor windows
-    // are built, since this code path returns before reaching here.)
-    // assembler.computeTheseusReadWindowMSAPrototype(
-    //     assembler.shasta2Anchors,
-    //     assembler.shasta2Journeys,
-    //     threadCount);
-    // assembler.computeTheseusMarkerGraphMSAPrototype(
-    //     std::numeric_limits<uint64_t>::max(),    // maxAnchorPairs
-    //     std::numeric_limits<uint64_t>::max(),    // maxReadsPerPair
-    //     threadCount);
-    // assembler.computeTheseusTargetBackboneMSAPrototype(
-    //     12800,    // maxReads
-    //     threadCount);
-    return;
-    }
-
-    // Run marker-graph-projected EC parity (updates delete flags on alignments).
-    assembler.performHifiasmECParityWithMarkerGraph(threadCount);
-
-    // Print het sites for read 0-0 using the surviving (non-deleted) candidates.
-    assembler.debugPrintHetSitesForRead(0);
-
-    return;
-
-
-
-
-
-
-    // // =========================================================================
-    // // Overlap Filtering + Clean ReadGraph
-    // // =========================================================================
-    // // Build global mismatch-site clusters before EC parity paths.
-    // // This guarantees global-site construction runs first for both parity modes.
-    // cout << timestamp << "Precomputing global mismatch-site clusters before EC parity..." << endl;
-    // const auto preEcGlobalHetClusters = assembler.clusterMismatchingPositionsIntoGlobalHetSites(
-    //     assemblerOptions.alignOptions,
-    //     threadCount,
-    //     false,  // includeDeletedAlignments
-    //     false   // readGraphOnly
-    // );
-    // cout << timestamp << "Precomputed global mismatch-site clusters: clusters="
-    //      << preEcGlobalHetClusters.clusterRepresentatives.size()
-    //      << " nodes=" << preEcGlobalHetClusters.nodes.size()
-    //      << endl;
-
-    // Default path: Hifiasm-style overlap filtering/parity (ha_ec + ha_ec_ff semantics).
-    // Optional path: experimental global-site phasing/parity.
-    // const bool useGlobalSiteEcParity = (::getenv("DINARA_USE_GLOBAL_SITE_EC") != nullptr);
-    const bool useGlobalSiteEcParity = false;
-    if (useGlobalSiteEcParity) {
-        cout << timestamp << "Using experimental global-site EC parity path." << endl;
-        assembler.performGlobalSiteECParity(threadCount);
-    } else {
-        assembler.performHifiasmECParity(threadCount);
-    }
-
-    // return;
-
-
-
-    // =========================================================================
-    // Read graph construction — two alternatives:
-    //   (A) All alignments: skip EC parity filtering entirely; defer to
-    //       marker graph vertex coverage thresholds (minCoverage / maxCoverage).
-    //   (B) Phased alignments: keep only overlaps where BOTH sides passed the
-    //       phasing step of performHifiasmECParity (DeleteReasonPhase not set
-    //       on either side).
-    // =========================================================================
-    // assembler.createReadGraphAllAlignments();       // (A)
-    assembler.createReadGraphFromEcParityCisOverlaps(); // (B)
-
-    
-
-    // // Create the bidirectional read graph.
-    // // This is built from the same alignments that are in the ReadGraph
-    // // (isInReadGraph == 1), but stores one vertex per physical read and
-    // // one edge per alignment (no strand doubling).
-    // assembler.createBidirectionalReadGraph();
-
-    // return;
-
-    // // Clean the BRG using string-graph-style operations:
-    // // Step 10: transitive reduction + Step 11: tip cutting.
-    // // This removes redundant edges while operating on the undirected BRG
-    // // via a temporary directed-arc view derived from alignment coordinates.
-    // assembler.cleanBidirectionalReadGraphInitial(
-    //     /*gapFuzz*/1000,
-    //     /*maxShortTipReads*/3);
-
-    // // Global mismatch-site diagnostics and export are expensive and intended for debugging.
-    // // Keep them off by default in production runs to preserve assembly throughput.
-    // const bool runGlobalHetDiagnostics = true;
-    // if (runGlobalHetDiagnostics) {
-    // // Global mismatch sites + full per-allele member lists using only readGraph overlaps.
-    // // This is the fastest way to approximate "pileup across all reads" without a reference.
-    // {
-    //     const OrientedReadId focalOrientedReadId(ReadId(24347), 1);
-    //     const ReadId focalReadId = focalOrientedReadId.getReadId();
-    //     const Strand focalReadStrand = focalOrientedReadId.getStrand();
-    //     const string focalReadLabel =
-    //         to_string(uint64_t(focalReadId)) + "-" + to_string(uint64_t(focalReadStrand));
-    //     const Reads& reads = assembler.getReads();
-    //     const uint32_t focalReadLength = uint32_t(reads.getRead(focalReadId).baseCount);
-
-    //     const auto clusters = assembler.clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
-    //         focalReadId,
-    //         assemblerOptions.alignOptions,
-    //         threadCount,
-    //         0,      // maxReadsToProcess
-    //         0,      // maxAlignmentsToProcess
-    //         false,  // includeDeletedAlignments
-    //         true    // readGraphOnly
-    //     );
-    //     const uint32_t clusterSiteCount = uint32_t(
-    //         clusters.clusterMemberOffsets.empty() ? 0 : (clusters.clusterMemberOffsets.size() - 1));
-
-    //     static const char baseToAscii[] = {'A', 'C', 'G', 'T'};
-
-    //     // Collect mismatch-defined sites that explicitly involve focalReadId (it has a mismatch at that site).
-    //     struct FocalMismatchSite {
-    //         uint32_t focalPos = 0;
-    //         uint32_t siteId = 0;
-    //     };
-    //     vector<FocalMismatchSite> focalMismatchSites;
-    //     focalMismatchSites.reserve(clusterSiteCount);
-    //     for (size_t siteId = 0; siteId + 1 < clusters.clusterMemberOffsets.size(); siteId++) {
-    //         const uint64_t begin = clusters.clusterMemberOffsets[siteId];
-    //         const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
-    //         uint32_t bestPos = std::numeric_limits<uint32_t>::max();
-    //         for (uint64_t i = begin; i < end; i++) {
-    //             const auto& node = clusters.nodes[clusters.clusterMembers[i]];
-    //             if (node.first == focalReadId) {
-    //                 bestPos = std::min(bestPos, node.second);
-    //             }
-    //         }
-    //         if (bestPos != std::numeric_limits<uint32_t>::max()) {
-    //             if (focalReadStrand == 1 && focalReadLength > 0 && bestPos < focalReadLength) {
-    //                 bestPos = (focalReadLength - 1U) - bestPos;
-    //             }
-    //             focalMismatchSites.push_back(FocalMismatchSite{bestPos, uint32_t(siteId)});
-    //         }
-    //     }
-    //     sort(focalMismatchSites.begin(), focalMismatchSites.end(),
-    //         [](const FocalMismatchSite& a, const FocalMismatchSite& b) {
-    //             if (a.focalPos != b.focalPos) {
-    //                 return a.focalPos < b.focalPos;
-    //             }
-    //             return a.siteId < b.siteId;
-    //         });
-    //     cout << timestamp << "Read" << focalReadLabel
-    //          << " mismatch sites (readGraph clusters): " << focalMismatchSites.size() << endl;
-
-    //     const auto propagationStart = std::chrono::steady_clock::now();
-    //     cout << timestamp << "GlobalHetSite member propagation (readGraph): starting..." << endl;
-    //     const auto members = assembler.computeGlobalHetSiteAlleleMembersUsingReadGraph(
-    //         clusters,
-    //         assemblerOptions.alignOptions,
-    //         0,      // maxPendingTasks
-    //         false,  // includeDeletedAlignments
-    //         focalReadId
-    //     );
-    //     const auto propagationSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-    //         std::chrono::steady_clock::now() - propagationStart).count();
-
-    //     cout << timestamp << "GlobalHetSite member propagation (readGraph): sites=" << clusterSiteCount
-    //          << " propagatedAssignments=" << members.propagatedAssignments
-    //          << " mappingHoles=" << members.mappingHoles
-    //          << " mappingConflicts=" << members.mappingConflicts
-    //          << " elapsedSec=" << propagationSeconds
-    //          << endl;
-
-    //     // Compute a consistent strand assignment for reads reachable from the focal read in the read graph.
-    //     // This lets us export member positions (and alleles) in a single, focal-oriented coordinate frame.
-    //     uint64_t strandConflicts = 0;
-    //     vector<int8_t> strandByRead = assembler.computeReadGraphStrandsFromSeed(
-    //         focalReadId,
-    //         strandConflicts,
-    //         false // includeDeletedAlignments
-    //     );
-    //     if (focalReadStrand == 1) {
-    //         for (int8_t& v : strandByRead) {
-    //             if (v != -1) {
-    //                 v = int8_t(v ^ 1);
-    //             }
-    //         }
-    //     }
-    //     {
-    //         uint64_t assigned = 0;
-    //         for (const int8_t v : strandByRead) {
-    //             if (v != -1) {
-    //                 assigned++;
-    //             }
-    //         }
-    //         cout << timestamp << "ReadGraph strand assignment: assigned=" << assigned
-    //              << " conflicts=" << strandConflicts << endl;
-    //     }
-
-    //     static const uint8_t complementBase[4] = {3, 2, 1, 0};
-    //     const auto orientedMembers = assembler.orientGlobalHetSiteAlleleMembers(members, strandByRead);
-
-    //     // Spot-check: verify that a few sites involving the focal read have self-consistent positions
-    //     // under a readGraph-only multi-source traversal seeded from the mismatch members.
-    //     {
-    //         const size_t checkCount = std::min<size_t>(3, focalMismatchSites.size());
-    //         for (size_t i = 0; i < checkCount; i++) {
-    //             const uint32_t siteId = focalMismatchSites[i].siteId;
-    //             const auto stats = assembler.debugVerifyGlobalHetSitePositionsUsingReadGraph(
-    //                 clusters,
-    //                 members,
-    //                 siteId,
-    //                 assemblerOptions.alignOptions,
-    //                 20000,   // maxNodesToVisit
-    //                 200000,  // maxAlignmentsToScan
-    //                 false    // includeDeletedAlignments
-    //             );
-    //             cout << timestamp << "GlobalHetSite verify: siteId=" << siteId
-    //                  << " expected=" << stats.expectedMembers
-    //                  << " reached=" << stats.reachedMembers
-    //                  << " checked=" << stats.checkedMappings
-    //                  << " mismatched=" << stats.mismatchedPositions
-    //                  << " holes=" << stats.mappingHoles
-    //                  << " fails=" << stats.mappingFailures
-    //                  << " hitNodeLimit=" << stats.hitNodeLimit
-    //                  << " hitAlignmentLimit=" << stats.hitAlignmentLimit
-    //                  << endl;
-    //         }
-    //     }
-
-    //     const uint32_t siteCount = uint32_t(members.offsets.size());
-
-    //     // Precompute mismatch-member counts and per-allele mismatch counts once per site.
-    //     vector<array<uint32_t, 4> > mismatchCountsForward(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
-    //     vector<array<uint32_t, 4> > mismatchCountsOriented(siteCount, array<uint32_t, 4>{0, 0, 0, 0});
-    //     vector<uint64_t> mismatchMembersBySite(siteCount, 0);
-    //     for (uint32_t siteId = 0; siteId < siteCount && (siteId + 1) < clusters.clusterMemberOffsets.size(); siteId++) {
-    //         const uint64_t begin = clusters.clusterMemberOffsets[siteId];
-    //         const uint64_t end = clusters.clusterMemberOffsets[siteId + 1];
-    //         mismatchMembersBySite[siteId] = end - begin;
-    //         for (uint64_t j = begin; j < end; j++) {
-    //             const auto& node = clusters.nodes[clusters.clusterMembers[j]];
-    //             uint8_t b = reads.getOrientedReadBase(OrientedReadId(node.first, 0), node.second).value;
-    //             if (b >= 4) {
-    //                 continue;
-    //             }
-    //             mismatchCountsForward[siteId][b]++;
-    //             const int8_t s = (uint64_t(node.first) < strandByRead.size()) ? strandByRead[uint64_t(node.first)] : int8_t(-1);
-    //             if (s == 1) {
-    //                 b = complementBase[b];
-    //             }
-    //             mismatchCountsOriented[siteId][b]++;
-    //         }
-    //     }
-
-    //     // Precompute oriented support counts and total members per site once.
-    //     // These are reused in filtering, printing, and export.
-    //     vector<array<uint64_t, 4> > orientedSiteCounts(siteCount, array<uint64_t, 4>{0, 0, 0, 0});
-    //     vector<uint64_t> orientedSiteMembers(siteCount, 0);
-    //     const uint32_t orientedCount = uint32_t(orientedMembers.offsets.size());
-    //     for (uint32_t siteId = 0; siteId < siteCount && siteId < orientedCount; siteId++) {
-    //         const auto& off = orientedMembers.offsets[siteId];
-    //         for (int allele = 0; allele < 4; allele++) {
-    //             orientedSiteCounts[siteId][allele] = off[allele + 1] - off[allele];
-    //             orientedSiteMembers[siteId] += orientedSiteCounts[siteId][allele];
-    //         }
-    //     }
-
-    //     // Keep only robust multiallelic sites: at least 2 alleles with support >= 3.
-    //     static constexpr uint32_t minAlleleSupportForExport = 3;
-    //     static constexpr uint32_t minAlleleCountForExport = 2;
-    //     vector<uint8_t> sitePassesMultiallelic(siteCount, 0);
-    //     for (uint32_t siteId = 0; siteId < siteCount; siteId++) {
-    //         uint32_t supportedAlleles = 0;
-    //         for (int allele = 0; allele < 4; allele++) {
-    //             if (orientedSiteCounts[siteId][allele] >= minAlleleSupportForExport) {
-    //                 supportedAlleles++;
-    //             }
-    //         }
-    //         sitePassesMultiallelic[siteId] = uint8_t(supportedAlleles >= minAlleleCountForExport);
-    //     }
-
-    //     const auto readIndex = assembler.buildFilteredGlobalHetSiteReadIndex(
-    //         members,
-    //         minAlleleSupportForExport,
-    //         minAlleleCountForExport
-    //     );
-    //     const uint32_t invalidPos = std::numeric_limits<uint32_t>::max();
-    //     const vector<Assembler::GlobalHetSiteReadIndex::ReadSite> emptyFocalReadSites;
-    //     const auto& focalReadSites =
-    //         (uint64_t(focalReadId) < readIndex.sitesByRead.size()) ?
-    //         readIndex.sitesByRead[uint64_t(focalReadId)] :
-    //         emptyFocalReadSites;
-    //     vector<uint32_t> focalReadPosBySite(siteCount, invalidPos);
-    //     vector<char> focalReadAlleleBySite(siteCount, '?');
-    //     for (const auto& s : focalReadSites) {
-    //         if (s.siteId < siteCount) {
-    //             uint32_t pos = s.readPosition;
-    //             uint8_t allele = s.allele;
-    //             if (focalReadStrand == 1 && focalReadLength > 0 && pos < focalReadLength) {
-    //                 pos = (focalReadLength - 1U) - pos;
-    //                 allele = complementBase[allele];
-    //             }
-    //             focalReadPosBySite[s.siteId] = pos;
-    //             focalReadAlleleBySite[s.siteId] = baseToAscii[allele];
-    //         }
-    //     }
-
-    //     vector<Assembler::GlobalHetSiteReadIndex::ReadSite> filteredFocalReadSites;
-    //     filteredFocalReadSites.reserve(focalReadSites.size());
-    //     for (const auto& s : focalReadSites) {
-    //         if (s.siteId < sitePassesMultiallelic.size() && sitePassesMultiallelic[s.siteId]) {
-    //             filteredFocalReadSites.push_back(s);
-    //         }
-    //     }
-
-    //     cout << timestamp << "Read" << focalReadLabel
-    //          << " projected global het sites after multiallelic filter: "
-    //          << filteredFocalReadSites.size() << " / " << focalReadSites.size()
-    //          << " (need >= " << minAlleleCountForExport << " alleles with support >= "
-    //          << minAlleleSupportForExport << ")" << endl;
-
-    //     // Print 10 sites involving focalReadId.
-    //     const size_t toPrint = std::min<size_t>(10, filteredFocalReadSites.size());
-    //     for (size_t i = 0; i < toPrint; i++) {
-    //         const uint32_t siteId = filteredFocalReadSites[i].siteId;
-    //         const uint32_t focalPos =
-    //             (siteId < focalReadPosBySite.size()) ? focalReadPosBySite[siteId] : invalidPos;
-    //         const char focalAllele =
-    //             (siteId < focalReadAlleleBySite.size()) ? focalReadAlleleBySite[siteId] : '?';
-    //         const uint64_t mismatchMembers =
-    //             (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
-    //         const auto mismatchCounts =
-    //             (siteId < mismatchCountsForward.size()) ?
-    //             mismatchCountsForward[siteId] :
-    //             std::array<uint32_t, 4>{0, 0, 0, 0};
-    //         const auto siteCounts =
-    //             (siteId < orientedSiteCounts.size()) ?
-    //             orientedSiteCounts[siteId] :
-    //             std::array<uint64_t, 4>{0, 0, 0, 0};
-    //         const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
-
-    //         cout << timestamp
-    //              << "GlobalHetSite[" << i << "]"
-    //              << " read" << focalReadLabel << "Pos=" << focalPos
-    //              << " read" << focalReadLabel << "Allele=" << focalAllele
-    //              << " mismatchMembers=" << mismatchMembers
-    //              << " mismatchCounts(A,C,G,T)=(" << mismatchCounts[0] << "," << mismatchCounts[1] << "," << mismatchCounts[2] << "," << mismatchCounts[3] << ")"
-    //              << " siteMembers=" << siteMembers
-    //              << " siteCounts(A,C,G,T)=(" << siteCounts[0] << "," << siteCounts[1] << "," << siteCounts[2] << "," << siteCounts[3] << ")"
-    //              << " members={";
-
-    //         // Show up to 8 members per allele.
-    //         for (int allele = 0; allele < 4; allele++) {
-    //             const uint64_t b0 = orientedMembers.offsets[siteId][allele];
-    //             const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
-    //             const uint64_t show = std::min<uint64_t>(b1 - b0, 8);
-    //             if (show == 0) {
-    //                 continue;
-    //             }
-    //             cout << baseToAscii[allele] << ":{";
-    //             for (uint64_t k = 0; k < show; k++) {
-    //                 const auto& m = orientedMembers.members[b0 + k];
-    //                 cout << m.orientedReadId.getReadId()
-    //                      << (m.orientedReadId.getStrand() == 1 ? "rc" : "fw")
-    //                      << "-" << m.position;
-    //                 if (k + 1 < show) {
-    //                     cout << ",";
-    //                 }
-    //             }
-    //             if ((b1 - b0) > show) {
-    //                 cout << ",...";
-    //             }
-    //             cout << "}";
-    //         }
-    //         cout << "}" << endl;
-    //     }
-
-    //     // Export all SNP sites involving read 0 (summary + full per-allele member list).
-    //     {
-    //         const string summaryFileName = "Read" + focalReadLabel + "GlobalHetSitesSummary.tsv";
-    //         const string membersFileName = "Read" + focalReadLabel + "GlobalHetSitesMembers.tsv";
-    //         std::ofstream summary(summaryFileName);
-    //         std::ofstream membersOut(membersFileName);
-    //         if (!summary || !membersOut) {
-    //             cout << timestamp << "Failed to open export files for read " << focalReadLabel << "." << endl;
-    //         } else {
-    //             summary << "siteId\treadPos\tmismatchMembers\tmismatchA\tmismatchC\tmismatchG\tmismatchT"
-    //                     << "\tsiteMembers\tsiteA\tsiteC\tsiteG\tsiteT\treadAllele\n";
-    //             membersOut << "siteId\treadPos0\treadAllele\treadId\treadStrand\tposition0\tpositionForward0\treadLength\n";
-
-    //             // Prefer the mismatch-defined sites for "SNP sites of read0".
-    //             // If there are none, fall back to the propagated membership list.
-    //             const bool useMismatchSites = !focalMismatchSites.empty();
-    //             const size_t exportCount = useMismatchSites ? focalMismatchSites.size() : filteredFocalReadSites.size();
-    //             vector<uint32_t> readLengths(reads.readCount(), 0);
-    //             for (uint64_t iRead = 0; iRead < reads.readCount(); iRead++) {
-    //                 const ReadId rid = ReadId(iRead);
-    //                 readLengths[iRead] = uint32_t(reads.getRead(rid).baseCount);
-    //             }
-    //             size_t exportedCount = 0;
-    //             size_t filteredOutCount = 0;
-    //             for (size_t idx = 0; idx < exportCount; idx++) {
-    //                 const uint32_t siteId = useMismatchSites ? focalMismatchSites[idx].siteId : filteredFocalReadSites[idx].siteId;
-    //                 if (siteId >= readIndex.sitePassesFilter.size() || readIndex.sitePassesFilter[siteId] == 0) {
-    //                     filteredOutCount++;
-    //                     continue;
-    //                 }
-    //                 if (siteId >= sitePassesMultiallelic.size() || sitePassesMultiallelic[siteId] == 0) {
-    //                     filteredOutCount++;
-    //                     continue;
-    //                 }
-    //                 if (siteId >= focalReadPosBySite.size() || focalReadPosBySite[siteId] == invalidPos) {
-    //                     // Keep per-read-consistency filtering strict for DP-ready exports.
-    //                     filteredOutCount++;
-    //                     continue;
-    //                 }
-    //                 const uint32_t readPos = focalReadPosBySite[siteId];
-    //                 const char readAllele = focalReadAlleleBySite[siteId];
-
-    //                 const uint64_t mismatchMembers =
-    //                     (siteId < mismatchMembersBySite.size()) ? mismatchMembersBySite[siteId] : 0;
-    //                 const auto mismatchCounts =
-    //                     (siteId < mismatchCountsOriented.size()) ?
-    //                     mismatchCountsOriented[siteId] :
-    //                     std::array<uint32_t, 4>{0, 0, 0, 0};
-    //                 const auto siteCounts =
-    //                     (siteId < orientedSiteCounts.size()) ?
-    //                     orientedSiteCounts[siteId] :
-    //                     std::array<uint64_t, 4>{0, 0, 0, 0};
-
-    //                 // Export members using the focal-oriented coordinate frame (strandByRead),
-    //                 // plus the original forward coordinates for debugging.
-    //                 const uint32_t readPos0 = readPos;
-    //                 // Export members in oriented coordinates (position0/1) consistent with readStrand,
-    //                 // plus forward positions for debugging.
-    //                 for (int allele = 0; allele < 4; allele++) {
-    //                     const uint64_t b0 = orientedMembers.offsets[siteId][allele];
-    //                     const uint64_t b1 = orientedMembers.offsets[siteId][allele + 1];
-    //                     for (uint64_t k = b0; k < b1; k++) {
-    //                         const auto& om = orientedMembers.members[k];
-    //                         const ReadId rid = om.orientedReadId.getReadId();
-    //                         const Strand strand = om.orientedReadId.getStrand();
-    //                         const uint32_t posOriented0 = om.position;
-    //                         const uint32_t len = (uint64_t(rid) < readLengths.size()) ? readLengths[uint64_t(rid)] : 0;
-    //                         if (len == 0 || posOriented0 >= len) {
-    //                             continue;
-    //                         }
-    //                         const uint32_t posFwd0 = (strand == 1) ? ((len - 1U) - posOriented0) : posOriented0;
-
-    //                         // Allele char is already in oriented frame by construction (bucketed by allele).
-    //                         const char alleleChar = baseToAscii[allele];
-
-    //                         membersOut << siteId << "\t" << readPos0
-    //                                    << "\t" << alleleChar
-    //                                    << "\t" << rid
-    //                                    << "\t" << int(strand)
-    //                                    << "\t" << posOriented0
-    //                                    << "\t" << posFwd0
-    //                                    << "\t" << len
-    //                                    << "\n";
-    //                     }
-    //                 }
-
-    //                 const uint64_t siteMembers = (siteId < orientedSiteMembers.size()) ? orientedSiteMembers[siteId] : 0;
-    //                 summary << siteId << "\t" << readPos
-    //                         << "\t" << mismatchMembers
-    //                         << "\t" << mismatchCounts[0] << "\t" << mismatchCounts[1] << "\t" << mismatchCounts[2] << "\t" << mismatchCounts[3]
-    //                         << "\t" << siteMembers
-    //                         << "\t" << siteCounts[0] << "\t" << siteCounts[1] << "\t" << siteCounts[2] << "\t" << siteCounts[3]
-    //                         << "\t" << readAllele
-    //                         << "\n";
-    //                 exportedCount++;
-    //             }
-
-    //             cout << timestamp << "Wrote read" << focalReadLabel << " global het sites to " << summaryFileName
-    //                  << " and " << membersFileName
-    //                  << " (sites=" << exportedCount
-    //                  << ", filteredOut=" << filteredOutCount
-    //                  << ", criteria: >= " << minAlleleCountForExport
-    //                  << " alleles with support >= " << minAlleleSupportForExport
-    //                  << ")." << endl;
-    //         }
-    //     }
-    // }
-    // } else {
-    //     cout << timestamp << "Skipping global-het diagnostics/export. "
-    //          << "Set DINARA_ENABLE_GLOBAL_HET_DEBUG=1 to enable." << endl;
-    // }
-
-    // return;
-
-
-    // vector<uint32_t> ids;
-    //
-    // // After performHifiasmECParity(...) (it sets DeleteReasonPhase + informative counts/scores).
-    // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids);
-    //
-    // // Print the 10 first sorted alignmentId and the informative sites they share
-    // const size_t n = std::min<size_t>(10, ids.size());
-    // for(size_t i = 0; i < n; ++i) {
-    //     const uint32_t alignmentId = ids[i];
-    //     const auto& ad = assembler.alignmentData[alignmentId];
-    //
-    //     // NOTE: we do NOT currently compute the exact "shared" informative-site intersection.
-    //     // We have per-side counts and an overlap score:
-    //     //   ad.informativeHetSiteCount0, ad.informativeHetSiteCount1
-    //     //   ad.informativeHetSiteScore = max(count0,count1)
-    //     const uint32_t sharedLowerBound = std::min(ad.informativeHetSiteCount0, ad.informativeHetSiteCount1);
-    //
-    //     cout << "rank=" << i
-    //          << " alignmentId=" << alignmentId
-    //          << " reads=(" << ad.readIds[0] << "," << ad.readIds[1] << ")"
-    //          << " informative0=" << ad.informativeHetSiteCount0
-    //          << " informative1=" << ad.informativeHetSiteCount1
-    //          << " score=" << ad.informativeHetSiteScore
-    //          << " sharedLB=" << sharedLowerBound
-    //          << "\n";
-    // }
-    //
-    //
-    //
-    //
-    // // If you also want to exclude anything with other delete reasons:
-    // // assembler.getAllCisAlignmentIdsSortedByInformativeSites(ids, /*keptByBothSidesOnly=*/true);
-    //
-    // // `ids` is now: CIS in both views (no DeleteReasonPhase on either side),
-    // // sorted by `alignmentData[id].informativeHetSiteScore` descending.
-    //
-    // // assembler.createReadGraphFromEcParityCisOverlaps(threadCount, /*rebuildDirectedReadGraph*/ false);
-    // assembler.createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(threadCount,  false);
-
-    // // Snapshot the broad keep-set used for marker-graph collapse.
-    // std::vector<bool> keepForMarkerGraph(assembler.alignmentData.size(), false);
-    // for (uint64_t i = 0; i < keepForMarkerGraph.size(); ++i) {
-    //     keepForMarkerGraph[i] = (assembler.alignmentData[i].info.isInReadGraph != 0);
-    // }
-
-    // Mode 3 assembly requires reads in raw representation (not RLE).
-    DINARA_ASSERT(assemblerOptions.readsOptions.representation == 0);
-
-    // The marker length must be even.
-    DINARA_ASSERT((assembler.assemblerInfo->k %2) == 0);
-
-
-    assembler.createMarkerGraphVertices(
-        2,                                              // minVertexCoverage
-        std::numeric_limits<uint64_t>::max(),           // maxVertexCoverage
-        0,                                              // minVertexCoveragePerStrand
-        false,                                           // allowDuplicateMarkers
-        std::numeric_limits<double>::signaling_NaN(),   // For peak finder, unused because minVertexCoverage is not 0.
-        invalid<uint64_t>,                              // For peak finder, unused because minVertexCoverage is not 0.
-        threadCount);
-
-    // Filter marker graph vertices whose marker k-mers are short-period repeats (including homopolymers).
-    // This reduces unreliable anchors and artifacts in repetitive regions.
-    assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-
-    // Filter marker graph vertices whose marker k-mers have low sequence complexity
-    // (too few distinct sub-k-mers of lengths 1, 2, 3, ...).
-    assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
-
-    // Find the reverse complement of each marker graph vertex.
-    // We need the reverse complement vertices to be populated for Mode 3 anchor generation.
-    assembler.findMarkerGraphReverseComplementVertices(threadCount);
-
-    // // Create edges of the marker graph.
-    // assembler.createMarkerGraphEdges(threadCount);
-    // assembler.findMarkerGraphReverseComplementEdges(threadCount);
-
-    if(assemblerOptions.markerGraphOptions.writeVertexCoverageHistogram) {
-        cout << timestamp << "Writing marker graph vertex coverage histogram to " <<
-            assemblerOptions.markerGraphOptions.vertexCoverageHistogramFileName << "." << endl;
-        assembler.markerGraph.writeVertexCoverageHistogram(
-            assemblerOptions.markerGraphOptions.vertexCoverageHistogramFileName,
-            assemblerOptions.markerGraphOptions.vertexCoverageHistogramCanonicalOnly);
-    }
-
-    {
-    const uint64_t minPrimaryCoverage = 2;
-    const uint64_t maxPrimaryCoverage = std::numeric_limits<uint64_t>::max();
-    // const uint64_t minPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;;
-    // const uint64_t maxPrimaryCoverage = assemblerOptions.assemblyOptions.mode3Options.maxAnchorCoverage;;
-    cout << "Using: minAnchorCoverage = " << minPrimaryCoverage <<
-        ", maxAnchorCoverage = " << maxPrimaryCoverage << endl;
-
-    // // // Declare anchors pointer here to avoid scope issues
-    // shared_ptr<mode3::Anchors> anchors;
-    // anchors = make_shared<mode3::Anchors>(
-    //     MappedMemoryOwner(assembler),
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     *assembler.markers,
-    //     assembler.markerGraph,
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     true); // createFromVertices
-
-    // // Compute oriented read journeys.
-    // anchors->computeJourneys(threadCount);
-
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
-
-    
-
-
-
-    const MappedMemoryOwner shasta2Owner = assembler.shasta2MappedMemoryOwner();
-    
-    // Create Shasta2Anchors
-    // We use the markerGraph structure to define anchors.
-    assembler.shasta2Anchors = make_shared<Shasta2Anchors>(
-            shasta2Owner,
-            assembler.getReads(),
-            assembler.assemblerInfo->k,
-            *assembler.markers,
-            assembler.markerGraph,
-            threadCount,
-            minPrimaryCoverage,
-            maxPrimaryCoverage);
-    auto& shasta2Anchors = assembler.shasta2Anchors;
-
-    const string externalAnchorsName =
-        std::filesystem::absolute("Shasta2ExternalAnchors").string();
-    cout << timestamp << "Writing Shasta2 external anchors to "
-         << externalAnchorsName << "..." << endl;
-    const uint64_t exportedExternalAnchorCount =
-        shasta2Anchors->writeExternalAnchors(externalAnchorsName);
-    cout << timestamp << "Wrote " << exportedExternalAnchorCount
-         << " external anchors for Shasta2. Use --external-anchors-name "
-         << externalAnchorsName << endl;
-
-    // Compute journeys.
-    cout << timestamp << "Creating Shasta2Journeys..." << endl;
-    assembler.shasta2Journeys = make_shared<Shasta2Journeys>(
-        2 * assembler.getReads().readCount(),
-        shasta2Anchors,
-        threadCount,
-        shasta2Owner);
-    auto& shasta2Journeys = assembler.shasta2Journeys;
-
-    // // --- Remove overlapping anchors from journeys ---
-    // // Two consecutive anchors on the same oriented read overlap when the base
-    // // position of anchor i+1 is less than position(anchor_i) + k, i.e. the
-    // // k-mers share bases. We greedily keep the first anchor of any overlapping
-    // // pair (anchors are already in ordinal order so the first has the smaller
-    // // position). The result is stored as a plain vector so the memory-mapped
-    // // journeys are not modified.
-    // cout << timestamp << "Removing overlapping anchors from journeys..." << endl;
-    // {
-    //     const uint64_t k = assembler.assemblerInfo->k;
-    //     const auto& mkrs = *assembler.markers;
-    //     const uint64_t orientedReadCount = 2 * assembler.getReads().readCount();
-
-    //     assembler.shasta2LinearJourneys.resize(orientedReadCount);
-    //     uint64_t totalRemoved = 0;
-
-    //     for (uint64_t i = 0; i < orientedReadCount; i++) {
-    //         const OrientedReadId oid = OrientedReadId::fromValue(ReadId(i));
-    //         const Shasta2Journey journey = (*shasta2Journeys)[oid];
-    //         std::vector<Shasta2AnchorId>& linear = assembler.shasta2LinearJourneys[i];
-    //         linear.clear();
-    //         linear.reserve(journey.size());
-
-    //         uint32_t prevEnd = 0; // end base position of the last kept anchor
-    //         for (const Shasta2AnchorId anchorId : journey) {
-    //             const uint32_t ordinal = shasta2Anchors->getOrdinal(anchorId, oid);
-    //             const uint32_t pos = uint32_t(mkrs[i][ordinal].position);
-    //             if (linear.empty() || pos >= prevEnd) {
-    //                 linear.push_back(anchorId);
-    //                 prevEnd = pos + uint32_t(k);
-    //             } else {
-    //                 ++totalRemoved;
-    //             }
-    //         }
-    //     }
-    //     cout << timestamp << "  Removed " << totalRemoved << " overlapping anchors." << endl;
-    // }
-
-    // Create the Shasta2AnchorGraph.
-    const uint64_t minEdgeCoverage = 2;
-    cout << timestamp << "Creating Shasta2AnchorGraph..." << endl;
-    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        minEdgeCoverage,
-        threadCount);
-    auto& shasta2AnchorGraph = assembler.shasta2AnchorGraph;
-
-    // Save the pre-transitive-reduction Shasta2 anchor graph so the HTTP server
-    // can load and visualize it even when we return before later assembly stages.
-    // With paired anchor IDs (2*i = canonical, 2*i+1 = RC), the anchor graph
-    // IDs directly match shasta2's scheme from readExternalAnchors.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2-Shasta2AnchorGraph");
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa");
-    shasta2AnchorGraph->writeBubbleFinderGraph("Shasta2AnchorGraph.graph", true);
-
-
-    // Transitive reduction.
-    // Shared parameters for local path-based simplification steps.
-    const uint64_t transitiveReductionMaxEdgeCoverage = 10;
-    const uint64_t transitiveReductionMaxDistance = 10;
-
-    shasta2AnchorGraph->transitiveReduction(
-        transitiveReductionMaxEdgeCoverage,
-        transitiveReductionMaxDistance);
-
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction.gfa");
-
-    // Post-transitive-reduction cleanup:
-    // cut low-read linear stalks that start at a tip and reach a branch point
-    // before involving more than 3 distinct oriented reads across all anchors
-    // in the traversed chain.
-    const uint64_t maxWeakTipReadCount = 3;
-    shasta2AnchorGraph->cutWeakStalksLeadingToBranch(
-        *shasta2Anchors,
-        maxWeakTipReadCount);
-
-
-    // Save the final assembly-enabled state used by the HTTP server.
-    shasta2AnchorGraph->saveAnchorGraph("Shasta2AnchorGraph");
-    shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph-transitive-reduction-weak-stalk-cut.gfa");
-
-    // Next Shasta2 stage: create the AssemblyGraph, then simplify/assemble.
-    cout << timestamp << "Creating Shasta2AssemblyGraph..." << endl;
-    Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-    shasta2AssemblyGraphOptions.simplifyMaxIterationCount = 3;
-    shasta2AssemblyGraphOptions.threadCount = threadCount;
-    shasta2AssemblyGraphOptions.writeIntermediateAssemblyStages = true;
-    assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-        *shasta2Anchors,
-        *shasta2Journeys,
-        *shasta2AnchorGraph,
-        shasta2AssemblyGraphOptions);
-    (void)assembler.shasta2AssemblyGraph;
-
-
-    return;
-    } // end of second assembly path block scope
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-    // // // Declare anchors pointer here to avoid scope issues
-    // shared_ptr<mode3::Anchors> anchors;
-    // anchors = make_shared<mode3::Anchors>(
-    //     MappedMemoryOwner(assembler),
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     *assembler.markers,
-    //     assembler.markerGraph,
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     true); // createFromVertices
-    // assembler.mode3Assembly(threadCount, anchors, assemblerOptions.assemblyOptions.mode3Options, false);
-
-
-    
-
-    
-    
-    
-
-    
-
-    // cout << timestamp << "Simplifying and assembling Shasta2AssemblyGraph..." << endl;
-    // shasta2AssemblyGraph->simplifyAndAssemble();
-
-    // return;
-
-    // dag.writeGfa("DirectedAnchorGraph-initial.gfa", true);
-
-    // // Step 3: MBG-style cleaning phase
-    // cout << timestamp << "Starting MBG-style cleaning phase..." << endl;
-    // const uint64_t maxResolveLength = 500000;
-    // const bool doRoundCleaning = true;
-    // const bool doGuessworkCleaning = true;
-    // const uint64_t maxUnconditionalResolveLength = 0;
-    // const bool copycountFilterHeuristic = false;
-    // const uint64_t maxLocalResolve = 0;
-    // const bool resolvePalindromesGlobal = false;
-
-    // // Step 3a: Remove low-coverage tips (MBG pre-resolve pass)
-    // auto tipStats1 = dag.removeLowCoverageTips(3.0, 10.0, 10000);
-    // if(tipStats1.nodesRemoved > 0) {
-    //     cout << "  Removed " << tipStats1.nodesRemoved << " tip nodes, "
-    //          << tipStats1.edgesRemoved << " edges." << endl;
-    //     dag.unitigifyAll();
-    //     cout << "  After tip removal: "
-    //          << dag.nodeCount() << " nodes, "
-    //          << dag.edgeCount() << " edges." << endl;
-    // }
-
-    // // Step 3b: Remove low-coverage crosslinks
-    // auto crosslinkStats = dag.removeLowCoverageCrosslinks(2.0, 10);
-    // if(crosslinkStats.edgesRemoved > 0) {
-    //     cout << "  Removed " << crosslinkStats.edgesRemoved
-    //          << " crosslink edges." << endl;
-    //     dag.unitigifyAll();
-    //     cout << "  After crosslink removal: "
-    //          << dag.nodeCount() << " nodes, "
-    //          << dag.edgeCount() << " edges." << endl;
-    // }
-
-    // // Step 3c: Copy-number cleaning (MBG pre-resolve, guesswork mode)
-    // if(doGuessworkCleaning) {
-    //     double totalCov = 0.0;
-    //     uint64_t count = 0;
-    //     for(uint64_t segId = 0; segId < dag.totalNodeCount(); ++segId) {
-    //         if(!dag.nodeExists(segId)) continue;
-    //         totalCov += dag.getPathCoverage(segId);
-    //         count++;
-    //     }
-    //     const double avgCov = count > 0 ? totalCov / double(count) : 1.0;
-    //     auto copyStats = dag.cleanComponentsByCopynumber(
-    //         avgCov,
-    //         50000,
-    //         0,
-    //         max(maxResolveLength, maxLocalResolve),
-    //         {},
-    //         0);
-    //     if(copyStats.nodesRemoved > 0 || copyStats.edgesRemoved > 0) {
-    //         cout << "  Copy-number cleaning removed "
-    //              << copyStats.nodesRemoved << " nodes, "
-    //              << copyStats.edgesRemoved << " edges." << endl;
-    //         dag.unitigifyAll();
-    //         cout << "  After copy-number cleaning: "
-    //              << dag.nodeCount() << " nodes, "
-    //              << dag.edgeCount() << " edges." << endl;
-    //     }
-    // }
-
-    // cout << timestamp << "Cleaning phase complete." << endl;
-    // dag.writeSummary(cout);
-    // dag.writeGfa("DirectedAnchorGraph-After-Cleaning.gfa", true);
-
-    
-
-    // // Step 4: Resolution rounds (MBG two-pass: minCoverage, then 1)
-    // const uint64_t initialMinEdgeSupport = 20;
-
-    // // Step 4a: Resolve with minEdgeSupport = initial pass.
-    // cout << timestamp
-    //      << "Resolution step with minEdgeSupport="
-    //      << initialMinEdgeSupport << endl;
-    // dag.resolveRound(
-    //     initialMinEdgeSupport,
-    //     maxResolveLength,
-    //     doRoundCleaning,
-    //     doGuessworkCleaning,
-    //     maxUnconditionalResolveLength,
-    //     copycountFilterHeuristic,
-    //     maxLocalResolve,
-    //     resolvePalindromesGlobal);
-    // dag.unitigifyAll();
-    // cout << "  After resolution step " << initialMinEdgeSupport << ": "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-
-    // // Step 4b: MBG-style second pass with minimal support.
-    // cout << timestamp << "Resolution final low-support pass (minEdgeSupport=1)" << endl;
-    // dag.resolveRound(
-    //     1,
-    //     maxResolveLength,
-    //     doRoundCleaning,
-    //     doGuessworkCleaning,
-    //     maxUnconditionalResolveLength,
-    //     copycountFilterHeuristic,
-    //     maxLocalResolve,
-    //     resolvePalindromesGlobal);
-    // dag.unitigifyAll();
-    // cout << "  After final low-support pass: "
-    //      << dag.nodeCount() << " nodes, "
-    //      << dag.edgeCount() << " edges, "
-    //      << dag.pathCount() << " paths." << endl;
-
-    // // Step 5: Write final graph
-    // dag.verifyEdgeConsistency();
-    // dag.writeSummary(cout);
-    // dag.writeGfa("DirectedAnchorGraph.gfa");
-    // dag.writePaths("DirectedAnchorGraph.paths.gaf");
-
-    // return;
-
-
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     /*enableColinearityPeeling*/ false,
-    //     /*minDominantFractionToPeel*/ 0.9);
-
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
-    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // // Step 6c: For each contained read, keep only one best overlap (by dpScore) and prune all others.
-    // // This is a diagnostic/experimental alternative to removing contained reads entirely.
-    // assembler.pruneContainedReadsToOneBestOverlapByDpScore(threadCount);
-    //
-    //
-    // std::vector<bool> keepForReadGraph(assembler.alignmentData.size(), false);
-    // for (uint64_t i = 0; i < keepForReadGraph.size(); ++i) {
-    //     if (!keepForMarkerGraph[i]) continue;
-    //
-    //     const auto& ad = assembler.alignmentData[i];
-    //
-    //     // Strict rule: only keep if both sides still keep it after your extra filtering.
-    //     if (!ad.keptByBothSides()) continue;
-    //
-    //     keepForReadGraph[i] = true;
-    // }
-    //
-    // // Rebuild the read graph using the tightened keep-set.
-    // assembler.rebuildReadGraphUsingSelectedAlignments(
-    //     std::move(keepForReadGraph),
-    //     /*rebuildDirectedReadGraph*/false);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // // Alternatives (disabled):
-    // anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
-    //     minPrimaryCoverage, maxPrimaryCoverage, threadCount);
-    // anchors = make_shared<mode3::Anchors>(
-    //     MappedMemoryOwner(assembler),
-    //     assembler.getReads(),
-    //     assembler.assemblerInfo->k,
-    //     *assembler.markers,
-    //     assembler.markerGraph,
-    //     minPrimaryCoverage,
-    //     maxPrimaryCoverage,
-    //     threadCount,
-    //     true); // createFromVertices
-
-
-    // // Construct the mode3::Anchors (for HTTP server visualization).
-    // // This must be done BEFORE createShasta2Anchors.
-    // if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-    //     "FromMarkerGraphVerticesAtOverlapEvents") {
-    //     anchors = assembler.createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
-    //         minPrimaryCoverage,
-    //         maxPrimaryCoverage,
-    //         threadCount);
-    // } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-    //     "FromMarkerGraphVerticesBestPerOverlapInterval") {
-    //     anchors = assembler.createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-    //         minPrimaryCoverage,
-    //         maxPrimaryCoverage,
-    //         threadCount);
-    // } else if(assemblerOptions.assemblyOptions.mode3Options.anchorCreationMethod ==
-    //     "FromOverlapsBestPerOverlapInterval") {
-    //     anchors = assembler.createAnchorsFromOverlapsBestPerOverlapInterval(
-    //         minPrimaryCoverage,
-    //         maxPrimaryCoverage,
-    //         threadCount);
-    // } else {
-    //     anchors =
-    //         make_shared<mode3::Anchors>(
-    //             MappedMemoryOwner(assembler),
-    //             assembler.getReads(),
-    //             assembler.assemblerInfo->k,
-    //             *assembler.markers,
-    //             assembler.markerGraph,
-    //             minPrimaryCoverage,
-    //             maxPrimaryCoverage,
-    //             threadCount,
-    //             true); // createFromVertices
-    // }
-    
-
-    
-
     // Store elapsed time for assembly.
     const auto steadyClock1 = std::chrono::steady_clock::now();
     const auto userClock1 = boost::chrono::process_user_cpu_clock::now();
@@ -4907,7 +3036,7 @@ void dinara::main::assemble(
     assembler.storeAssemblyTime(elapsedTime, averageCpuUtilization);
 
     // Store peak memory usage.
-    uint64_t peakMemoryUsage = getPeakMemoryUsage();
+    const uint64_t peakMemoryUsage = getPeakMemoryUsage();
     assembler.storePeakMemoryUsage(peakMemoryUsage);
 
     // Store other performance information.
@@ -4926,8 +3055,6 @@ void dinara::main::assemble(
     ofstream htmlIndex("index.html");
     assembler.writeAssemblyIndex(htmlIndex);
 
-    // If --saveBinaryData was requested and Mode assembly is 3,
-    // wait for save binary data threads to finish.
     if(not assembler.saveBinaryDataDirectory.empty()) {
         assembler.waitForSaveBinaryDataThreads();
     }
@@ -4941,11 +3068,7 @@ void dinara::main::assemble(
     performanceLog << "Peak Memory usage: " << peakMemoryUsage << " bytes = " <<
         int(std::round(double(peakMemoryUsage) / (1024. * 1024. * 1024.)) ) << " GiB" << endl;
 
-
-    // // Create shasta2 anchors equivalent to the marker graph vertices.
-    // // This allows downstream processing using shasta2 tools.
-    // createShasta2Anchors(assembler, assemblerOptions, threadCount, anchors);
-
+    return;
 }
 
 
