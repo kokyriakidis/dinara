@@ -16,7 +16,6 @@
 #include "Assembler.hpp"
 #include "InvertedIndexBuilder.hpp"
 #include "hifiasmCoordinateTransforms.hpp"
-#include "MyloasmChainKernel.hpp"
 #include "performanceLog.hpp"
 #include "OrientedReadPair.hpp"
 #include "ProjectedAlignment.hpp"
@@ -1644,44 +1643,10 @@ static inline void hifiasm_lchain_qdp_mcopy_fast(
     int chainingMode = 0,
     int32_t minimap2Bw = 100,
     int32_t minimap2MaxGap = 100,
-    int32_t minimap2MinChainScore = 25,
-    const MyloasmChainParams& myloasmParams = MyloasmChainParams{})
+    int32_t minimap2MinChainScore = 25)
 {
     const int64_t a_n = static_cast<int64_t>(a.size());
     if (a_n <= 0) return;
-
-    // myloasm chaining mode: a self-contained port (MyloasmChainKernel.hpp) with
-    // its own required anchor sort order and its own multi-chain extraction
-    // strategy, structurally independent from run_main_dp_loop below -- so it
-    // runs entirely on its own and returns, rather than sharing any of the
-    // hifiasm/minimap2-mode DP state.
-    if(chainingMode == 2) {
-        MyloasmAnchorInput anchors;
-        anchors.selfOffset.resize(size_t(a_n));
-        anchors.offset.resize(size_t(a_n));
-        anchors.strand.resize(size_t(a_n));
-        for(int64_t i = 0; i < a_n; ++i) {
-            anchors.selfOffset[size_t(i)] = a[size_t(i)].self_offset;
-            anchors.offset[size_t(i)] = a[size_t(i)].offset;
-            anchors.strand[size_t(i)] = a[size_t(i)].strand;
-        }
-
-        const vector<MyloasmChain> chains = myloasmChainAnchors(anchors, myloasmParams);
-        for(const MyloasmChain& chain : chains) {
-            HifiasmOverlapRegion z{};
-            hifiasm_push_ovlp_chain_qgen(
-                z, xid, xl, yl, int64_t(chain.score),
-                &a[size_t(chain.originalIndices.front())],
-                &a[size_t(chain.originalIndices.back())]);
-            z.align_length = uint32_t(chain.originalIndices.size());
-            z.non_homopolymer_errors = uint32_t(chainHitIndexFlat.size());
-            for(const int64_t idx : chain.originalIndices) {
-                chainHitIndexFlat.push_back(a[size_t(idx)].globalIndex);
-            }
-            res.push_back(z);
-        }
-        return;
-    }
 
     dp.resize(static_cast<size_t>(a_n));
     int64_t* p  = dp.pre.data();
@@ -2081,13 +2046,6 @@ static inline void configureInvertedIndexDataForChaining(
     data.minimap2Bw = overlapCandidatesOptions.minimap2Bw;
     data.minimap2MaxGap = overlapCandidatesOptions.minimap2MaxGap;
     data.minimap2MinChainScore = overlapCandidatesOptions.minimap2MinChainScore;
-    data.myloasmMatchScore = overlapCandidatesOptions.myloasmMatchScore;
-    data.myloasmGapCost = overlapCandidatesOptions.myloasmGapCost;
-    data.myloasmMaxGap = overlapCandidatesOptions.myloasmMaxGap;
-    data.myloasmDoubleGap = overlapCandidatesOptions.myloasmDoubleGap;
-    data.myloasmMaxSkip = overlapCandidatesOptions.myloasmMaxSkip;
-    data.myloasmMaxIter = overlapCandidatesOptions.myloasmMaxIter;
-    data.myloasmMinChainLength = overlapCandidatesOptions.myloasmMinChainLength;
     data.referenceReadCount = overlapCandidatesOptions.referenceReadCount;
 }
 
@@ -2298,14 +2256,6 @@ private:
         const int32_t minimap2MinChainScore = invertedIndexData.minimap2MinChainScore;
         const uint64_t referenceReadCount = invertedIndexData.referenceReadCount;
         const uint32_t maxChainingFreq = invertedIndexData.maxChainingFreq;
-        MyloasmChainParams myloasmParams;
-        myloasmParams.matchScore = invertedIndexData.myloasmMatchScore;
-        myloasmParams.gapCost = invertedIndexData.myloasmGapCost;
-        myloasmParams.maxGap = invertedIndexData.myloasmMaxGap;
-        myloasmParams.doubleGap = invertedIndexData.myloasmDoubleGap;
-        myloasmParams.maxSkip = invertedIndexData.myloasmMaxSkip;
-        myloasmParams.maxIter = invertedIndexData.myloasmMaxIter;
-        myloasmParams.minChainLength = invertedIndexData.myloasmMinChainLength;
 
         uint64_t startBatch, endBatch;
         while(getNextBatch(startBatch, endBatch)) {
@@ -2642,8 +2592,7 @@ private:
                             chainingMode,
                             minimap2Bw,
                             minimap2MaxGap,
-                            minimap2MinChainScore,
-                            myloasmParams);
+                            minimap2MinChainScore);
                     }
 
                     if (isOverlapDebugRead) {

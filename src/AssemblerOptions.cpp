@@ -582,9 +582,7 @@ void AssemblerOptions::addConfigurableOptions()
         value<int>(&overlapCandidatesOptions.chainingMode)->
         default_value(0),
         "Chaining scoring mode: 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty), "
-        "1 = minimap2-sr (fixed bandwidth, log gap penalty), "
-        "2 = myloasm (ported from https://github.com/bluenote-1577/myloasm, for A/B testing). "
-        "Mode 1 is used by --command svanchors.")
+        "1 = minimap2-sr (fixed bandwidth, log gap penalty). Mode 1 is used by --command svanchors.")
 
         ("OverlapCandidates.minimap2Bw",
         value<int32_t>(&overlapCandidatesOptions.minimap2Bw)->
@@ -600,41 +598,6 @@ void AssemblerOptions::addConfigurableOptions()
         value<int32_t>(&overlapCandidatesOptions.minimap2MinChainScore)->
         default_value(25),
         "Min chain score for minimap2-sr chaining mode (minimap2 -m). Only used when chainingMode=1.")
-
-        ("OverlapCandidates.myloasmMatchScore",
-        value<int32_t>(&overlapCandidatesOptions.myloasmMatchScore)->
-        default_value(11),
-        "myloasm chaining: anchor match score. Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmGapCost",
-        value<int32_t>(&overlapCandidatesOptions.myloasmGapCost)->
-        default_value(1),
-        "myloasm chaining: linear gap penalty coefficient. Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmMaxGap",
-        value<int32_t>(&overlapCandidatesOptions.myloasmMaxGap)->
-        default_value(200),
-        "myloasm chaining: max tolerated |dist1-dist2| gap imbalance. Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmDoubleGap",
-        value<int32_t>(&overlapCandidatesOptions.myloasmDoubleGap)->
-        default_value(10000),
-        "myloasm chaining: max target-side distance window between chained anchors. Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmMaxSkip",
-        value<int32_t>(&overlapCandidatesOptions.myloasmMaxSkip)->
-        default_value(10),
-        "myloasm chaining: max consecutive non-improving predecessors before pruning. Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmMaxIter",
-        value<int32_t>(&overlapCandidatesOptions.myloasmMaxIter)->
-        default_value(50),
-        "myloasm chaining: predecessor search band width (myloasm's \"band\"). Only used when chainingMode=2.")
-
-        ("OverlapCandidates.myloasmMinChainLength",
-        value<int32_t>(&overlapCandidatesOptions.myloasmMinChainLength)->
-        default_value(3),
-        "myloasm chaining: minimum anchor count for a chain to be kept. Only used when chainingMode=2.")
 
         ("OverlapCandidates.invertedIndexLchainIsAccurate",
         value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
@@ -1823,13 +1786,6 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minimap2Bw = " << minimap2Bw << "\n";
     s << "minimap2MaxGap = " << minimap2MaxGap << "\n";
     s << "minimap2MinChainScore = " << minimap2MinChainScore << "\n";
-    s << "myloasmMatchScore = " << myloasmMatchScore << "\n";
-    s << "myloasmGapCost = " << myloasmGapCost << "\n";
-    s << "myloasmMaxGap = " << myloasmMaxGap << "\n";
-    s << "myloasmDoubleGap = " << myloasmDoubleGap << "\n";
-    s << "myloasmMaxSkip = " << myloasmMaxSkip << "\n";
-    s << "myloasmMaxIter = " << myloasmMaxIter << "\n";
-    s << "myloasmMinChainLength = " << myloasmMinChainLength << "\n";
     s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
     s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";
     s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";

@@ -248,22 +248,10 @@ public:
     // --- Chaining scoring mode ---
     // 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty)
     // 1 = minimap2-sr (fixed bandwidth, log gap penalty)
-    // 2 = myloasm (ported from https://github.com/bluenote-1577/myloasm src/mapping.rs, for A/B testing)
     int chainingMode = 0;
     int32_t minimap2Bw = 100;       // Fixed bandwidth for minimap2-sr mode (minimap2 -r100).
     int32_t minimap2MaxGap = 100;   // Max gap for minimap2-sr mode (minimap2 -g100).
     int32_t minimap2MinChainScore = 25; // Min chain score (minimap2 -m25).
-
-    // --- myloasm chaining mode (chainingMode=2) ---
-    // Ported literally from myloasm's dp_anchors_v2/dp_inner (src/mapping.rs).
-    // Defaults are myloasm's own defaults, not tuned for Dinara.
-    int32_t myloasmMatchScore = 11;      // myloasm: match_score (mapping.rs:939-945, default k=11).
-    int32_t myloasmGapCost = 1;          // myloasm: gap_cost.
-    int32_t myloasmMaxGap = 200;         // myloasm: MAX_GAP_CHAINING (constants.rs:6).
-    int32_t myloasmDoubleGap = 10000;    // myloasm: CompareTwinReadOptions::default().double_gap.
-    int32_t myloasmMaxSkip = 10;         // myloasm: CompareTwinReadOptions::default().max_skip.
-    int32_t myloasmMaxIter = 50;         // myloasm: chaining "band" default (mapping.rs:823-827).
-    int32_t myloasmMinChainLength = 3;   // myloasm: CompareTwinReadOptions::default().min_chain_length.
 
     // When > 0, only chain pairs where at least one read has
     // readId < referenceReadCount. Skips read-vs-read pairs.
