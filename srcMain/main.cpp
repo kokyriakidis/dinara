@@ -2009,17 +2009,20 @@ void dinara::main::assemble(
     // Delete internal overlaps — overlaps where both reads extend
     // significantly beyond the aligned region on the same side.
     //
-    // ad.qs/qe/ts/te are already extended to read tips by
-    // hifiasm_push_ovlp_chain_qgen (the port of push_ovlp_chain_qgen /
-    // append_inexact_overlap_region_alloc), matching the coordinates
-    // hifiasm stores in ma_hit_t and feeds to ma_hit2arc.
+    // NOTE (corrected): ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment
+    // span (computeBaseAlignmentsAndStoreThreadFunction), not extended to
+    // read tips. AlignmentData::extendedQs/extendedQe/extendedTs/extendedTe
+    // are the hifiasm ma_hit_t-convention coordinates (diagonally
+    // extrapolated to read boundaries via extendOverlapToReadBoundaries,
+    // overlapClassification.hpp) that ma_hit2arc actually needs.
     //
     // Two variants:
-    //   deleteInternalOverlaps:         feeds the already-extended coords
-    //                                   straight to ma_hit2arc (hifiasm parity).
-    //   deleteInternalOverlapsExtended: extends a SECOND time on top of the
-    //                                   already-extended coords (more aggressive,
-    //                                   diverges from hifiasm).
+    //   deleteInternalOverlaps:         feeds the TIGHT ad.qs/qe/ts/te
+    //                                   straight to ma_hit2arc -- NOT hifiasm
+    //                                   parity despite the name/old comment here.
+    //   deleteInternalOverlapsExtended: correctly uses
+    //                                   ad.extendedQs/extendedQe/extendedTs/extendedTe.
+    //                                   This is the hifiasm-parity one.
     // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
     // assembler.deleteInternalOverlapsExtended(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 

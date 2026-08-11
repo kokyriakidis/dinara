@@ -2,6 +2,7 @@
 #define DINARA_OVERLAP_CLASSIFICATION_HPP
 
 #include "cstdint.hpp"
+#include "hifiasmCoordinateTransforms.hpp"
 
 namespace dinara {
 
@@ -71,6 +72,54 @@ inline int ma_hit2arc(
     if (qe - qs + ext5 + ext3 < min_ovlp || te - ts + ext5 + ext3 < min_ovlp) return MA_HT_SHORT_OVLP; // short overlap
 
     return (int)l;
+}
+
+
+/*
+Extend a TIGHT overlap span (e.g. the real CIGAR-matched boundary) out to
+read boundaries the same way hifiasm's push_ovlp_chain_qgen /
+append_inexact_overlap_region_alloc do: on each side independently,
+whichever read has the smaller overhang gets snapped to exactly 0 (left) or
+its own length (right), and the same amount is added to the other read's
+coordinate. This is NOT a fixed-size or threshold-gated extension -- it is
+an unconditional diagonal extrapolation, relative between the two reads.
+
+hifiasm's ma_hit_t.qs/qe/ts/te (and therefore its ma_hit2arc/containment
+classification) are ALWAYS these extended coordinates, never a tight span --
+callers doing hifiasm-parity containment/dovetail classification must feed
+ma_hit2arc coordinates produced by this function (or already stored in that
+form), not a tight/real-alignment span.
+
+qs/qe/ts/te are modified in place. ts/te are given and returned in
+forward-strand orientation on the target read; internally this flips them to
+oriented (RC) coordinates when !isSameStrand so the overhang comparison is
+in a consistent frame with qs/qe, then flips back.
+*/
+inline void extendOverlapToReadBoundaries(
+    uint32_t queryLen, uint32_t targetLen, bool isSameStrand,
+    uint32_t& qs, uint32_t& qe, uint32_t& ts, uint32_t& te)
+{
+    if(!isSameStrand) {
+        auto p = rcIntervalToForward(targetLen, ts, te);
+        ts = p.first;
+        te = p.second;
+    }
+
+    // Extend start: shorter overhang goes to 0.
+    if(qs <= ts) { ts -= qs; qs = 0; }
+    else         { qs -= ts; ts = 0; }
+
+    // Extend end: shorter remaining goes to read length.
+    const int64_t qr = int64_t(queryLen) - int64_t(qe);
+    const int64_t tr = int64_t(targetLen) - int64_t(te);
+    if(qr <= tr) { qe = queryLen; te += uint32_t(qr); }
+    else         { te = targetLen; qe += uint32_t(tr); }
+
+    if(!isSameStrand) {
+        auto p = rcIntervalToForward(targetLen, ts, te);
+        ts = p.first;
+        te = p.second;
+    }
 }
 
 

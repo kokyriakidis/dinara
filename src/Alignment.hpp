@@ -700,6 +700,20 @@ public:
     uint32_t ts = 0; // Target Start (forward)
     uint32_t te = 0; // Target End (forward)
 
+    // Hifiasm-parity EXTENDED coordinates: the qs/qe/ts/te above, diagonally
+    // extrapolated to read boundaries via extendOverlapToReadBoundaries
+    // (overlapClassification.hpp) -- whichever read has the smaller overhang
+    // on each side gets snapped to exactly 0 or its own length. This, not
+    // the tight span above, is what hifiasm's ma_hit_t always stores and
+    // feeds to ma_hit2arc. Use these fields for any containment/dovetail-type
+    // classification (ma_hit2arc, ha_ov_type-style logic); use the tight
+    // qs/qe/ts/te above when the real aligned span itself is what's needed
+    // (coverage sweeps, CIGAR walking, evidence bounds, etc.).
+    uint32_t extendedQs = 0;
+    uint32_t extendedQe = 0;
+    uint32_t extendedTs = 0;
+    uint32_t extendedTe = 0;
+
     AlignmentData() {}
     AlignmentData(
         const array<ReadId, 2>& readIds,

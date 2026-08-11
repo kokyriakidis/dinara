@@ -13,6 +13,7 @@
 #include "AlignedEvidenceStore.hpp"
 #include "Reads.hpp"
 #include "hifiasmCoordinateTransforms.hpp"
+#include "overlapClassification.hpp"
 #include "span.hpp"
 #include "timestamp.hpp"
 
@@ -501,7 +502,23 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 thisAlignmentData.ts = tLen - projectedAlignment.cigarRead1End;
                 thisAlignmentData.te = tLen - projectedAlignment.cigarRead1Start;
             }
-            
+
+            // Hifiasm-parity EXTENDED coordinates (see AlignmentData::extendedQs
+            // doc comment): diagonally extrapolate the tight span above out to
+            // read boundaries, matching hifiasm's ma_hit_t convention. Used by
+            // any containment/dovetail-type classification (e.g. flagContainedReads),
+            // never by consumers that want the real/tight aligned span.
+            thisAlignmentData.extendedQs = thisAlignmentData.qs;
+            thisAlignmentData.extendedQe = thisAlignmentData.qe;
+            thisAlignmentData.extendedTs = thisAlignmentData.ts;
+            thisAlignmentData.extendedTe = thisAlignmentData.te;
+            extendOverlapToReadBoundaries(
+                uint32_t(sequenceViews[0].baseCount),
+                uint32_t(sequenceViews[1].baseCount),
+                candidate.isSameStrand,
+                thisAlignmentData.extendedQs, thisAlignmentData.extendedQe,
+                thisAlignmentData.extendedTs, thisAlignmentData.extendedTe);
+
             thisAlignmentData.hasLargeIndel = projectedAlignment.hasLargeIndel;
             thisAlignmentData.informativeHetSiteCount0 = 0;
             thisAlignmentData.informativeHetSiteCount1 = 0;

@@ -767,7 +767,11 @@ without removing the contained reads themselves. Uses ma_hit2arc to detect
 QCONT (query contained in target) or TCONT (target contained in query), and marks
 those overlaps with DeleteReasonContained.
 
-Uses extended coordinates (ad.qs/qe/ts/te) from chaining.
+NOTE: ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment span, not extended --
+ma_hit2arc needs hifiasm's ma_hit_t convention (diagonally extrapolated to read
+boundaries). Use ad.extendedQs/extendedQe/extendedTs/extendedTe instead (see
+AlignmentData::extendedQs doc comment) if/when this function is wired back in --
+it is currently not called anywhere in the live pipeline.
 */
 void Assembler::deleteContainmentOverlaps(uint64_t threadCount)
 {
@@ -866,10 +870,15 @@ validReadIntervals are [0, readLen) for all reads.  This makes ma_hit_cut a
 no-op (no coordinate clipping) and ma_hit_flt uses raw read lengths.  We
 therefore use raw read lengths directly, skipping the clipping step.
 
-ad.qs/qe/ts/te store extended coordinates (matching hifiasm's
-append_inexact_overlap_region_alloc), where chain anchor positions are
-extended toward read tips.  These are the same coordinates hifiasm stores
-in ma_hit_t and passes to ma_hit2arc.
+NOTE: ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment span, not extended --
+this function (deleteInternalOverlapsThreadFunction, below) feeds them to
+ma_hit2arc as-is, which is NOT hifiasm parity: ma_hit2arc needs hifiasm's
+ma_hit_t convention (diagonally extrapolated to read boundaries). Use
+ad.extendedQs/extendedQe/extendedTs/extendedTe instead (see
+AlignmentData::extendedQs doc comment) if/when this function is wired back in --
+it is currently not called anywhere in the live pipeline
+(deleteInternalOverlapsExtendedThreadFunction, further below, already does this
+correctly).
 
 Parameters (hifiasm defaults):
   maxHang          = 1000  (asm_opt.max_hang_Len)
@@ -933,10 +942,11 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
             const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
             const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
 
-            // ad.qs/qe/ts/te are extended coordinates (matching hifiasm's
-            // append_inexact_overlap_region_alloc), where chain anchor
-            // positions are extended toward read tips.  These are the same
-            // coordinates hifiasm stores in ma_hit_t and passes to ma_hit2arc.
+            // NOTE: ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment span,
+            // not extended -- see the header comment above. This does not
+            // match hifiasm's ma_hit_t convention; prefer
+            // deleteInternalOverlapsExtendedThreadFunction (below), which
+            // uses ad.extendedQs/extendedQe/extendedTs/extendedTe.
             const uint32_t queryStart  = ad.qs;
             const uint32_t queryEnd    = ad.qe;
             const uint32_t targetStart = ad.ts;
@@ -1030,37 +1040,14 @@ void Assembler::deleteInternalOverlapsExtendedThreadFunction(size_t threadId)
             const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
             const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
 
-            // Start from stored CIGAR boundary positions.
-            uint32_t qs = ad.qs;
-            uint32_t qe = ad.qe;
-            uint32_t ts = ad.ts;
-            uint32_t te = ad.te;
-
-            // For RC overlaps, convert target forward coords to oriented
-            // (RC) coords before extension, then convert back after.
-            if (!ad.isSameStrand) {
-                auto p = dinara::rcIntervalToForward(targetLen, ts, te);
-                ts = p.first;
-                te = p.second;
-            }
-
-            // Extend toward read tips (hifiasm's append_inexact_overlap_region_alloc).
-            // Extend start: shorter overhang goes to 0.
-            if(qs <= ts) { ts -= qs; qs = 0; }
-            else         { qs -= ts; ts = 0; }
-
-            // Extend end: shorter remaining goes to read length.
-            const int64_t qr = int64_t(queryLen) - int64_t(qe);
-            const int64_t tr = int64_t(targetLen) - int64_t(te);
-            if(qr <= tr) { qe = queryLen; te += uint32_t(qr); }
-            else         { te = targetLen; qe += uint32_t(tr); }
-
-            // Convert target back to forward coords if RC.
-            if (!ad.isSameStrand) {
-                auto p = dinara::rcIntervalToForward(targetLen, ts, te);
-                ts = p.first;
-                te = p.second;
-            }
+            // Use the stored EXTENDED coordinates (hifiasm ma_hit_t convention;
+            // see AlignmentData::extendedQs doc comment) directly -- no need to
+            // re-derive the extension here, computeBaseAlignmentsAndStoreThreadFunction
+            // already did it.
+            const uint32_t qs = ad.extendedQs;
+            const uint32_t qe = ad.extendedQe;
+            const uint32_t ts = ad.extendedTs;
+            const uint32_t te = ad.extendedTe;
 
             if (qe <= qs || te <= ts) continue;
 
@@ -2462,18 +2449,22 @@ void Assembler::flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_
             const int32_t targetLen = int32_t(reads->getReadRawSequenceLength(targetId));
             if(targetLen <= 0) continue;
 
-            // Project overlap coordinates onto queryId's axis.
+            // Project overlap coordinates onto queryId's axis. Use the
+            // EXTENDED (hifiasm ma_hit_t convention) coordinates, not the
+            // tight qs/qe/ts/te -- ma_hit2arc's containment test assumes
+            // coordinates diagonally extrapolated to read boundaries (see
+            // AlignmentData::extendedQs doc comment).
             int32_t queryStart, queryEnd, targetStart, targetEnd;
             if(ad.readIds[0] == queryId) {
-                queryStart  = int32_t(ad.qs);
-                queryEnd    = int32_t(ad.qe);
-                targetStart = int32_t(ad.ts);
-                targetEnd   = int32_t(ad.te);
+                queryStart  = int32_t(ad.extendedQs);
+                queryEnd    = int32_t(ad.extendedQe);
+                targetStart = int32_t(ad.extendedTs);
+                targetEnd   = int32_t(ad.extendedTe);
             } else {
-                queryStart  = int32_t(ad.ts);
-                queryEnd    = int32_t(ad.te);
-                targetStart = int32_t(ad.qs);
-                targetEnd   = int32_t(ad.qe);
+                queryStart  = int32_t(ad.extendedTs);
+                queryEnd    = int32_t(ad.extendedTe);
+                targetStart = int32_t(ad.extendedQs);
+                targetEnd   = int32_t(ad.extendedQe);
             }
             if(queryStart >= queryEnd || targetStart >= targetEnd) continue;
 
