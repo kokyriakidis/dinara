@@ -88,6 +88,7 @@ add_executable(test_integration
     test_overlap_cigar_store.cpp
     test_phasing_coordinates.cpp
     test_msa_het_kernel.cpp
+    test_myloasm_chaining.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )

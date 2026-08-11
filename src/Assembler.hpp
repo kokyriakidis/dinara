@@ -2868,7 +2868,7 @@ public:
 		             bool lchainIsAccurate = true;
 		             bool useEcScoring = true;
 	             bool enableMcopyFast = true;
-             // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr.
+             // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr, 2 = myloasm.
              int chainingMode = 0;
              // When > 0, only chain pairs where at least one read is a
              // reference (readId < referenceReadCount). Skips read-vs-read.
@@ -2876,6 +2876,14 @@ public:
              int32_t minimap2Bw = 100;
              int32_t minimap2MaxGap = 100;
              int32_t minimap2MinChainScore = 25;
+             // myloasm chaining mode (chainingMode=2) parameters.
+             int32_t myloasmMatchScore = 11;
+             int32_t myloasmGapCost = 1;
+             int32_t myloasmMaxGap = 200;
+             int32_t myloasmDoubleGap = 10000;
+             int32_t myloasmMaxSkip = 10;
+             int32_t myloasmMaxIter = 50;
+             int32_t myloasmMinChainLength = 3;
              uint32_t mcopyNum = 3;
              double mcopyRate = 0.70;
              uint32_t mcopyKhitCutoff = 32;
