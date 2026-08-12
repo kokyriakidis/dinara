@@ -3112,8 +3112,53 @@ void Assembler::chainPafCandidates(
                     const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
                     const uint64_t readLenB = reads->getReadRawSequenceLength(readIdB);
 
+                    // PAF interval for this pair. Every PAF candidate has one (no
+                    // transitive expansion is performed). Restrict marker generation on
+                    // read A to the q-window, and keep only partner hits inside the
+                    // t-window, so we only build markers for k-mers shared inside the
+                    // interval the PAF agreed on rather than scanning the whole read.
+                    const uint64_t pafKey = (uint64_t(readIdA) << 32) | uint64_t(readIdB);
+                    const auto pafIt = pafCandidateIntervals.find(pafKey);
+                    const bool haveInterval = (pafIt != pafCandidateIntervals.end());
+                    const uint32_t kLen = uint32_t(kmerLen);
+                    uint32_t winQStart = 0, winQEnd = 0, winTStart = 0, winTEnd = 0;
+                    if(haveInterval) {
+                        winQStart = pafIt->second.qStart;
+                        winQEnd   = pafIt->second.qEnd;
+                        winTStart = pafIt->second.tStart;
+                        winTEnd   = pafIt->second.tEnd;
+                    }
+
+                    // Marker index range on read A whose k-mer spans [p, p+k) intersect
+                    // the q-window [winQStart, winQEnd). Markers are position-sorted and
+                    // indexed by ordinal, so a binary search gives the range directly.
+                    size_t iLo = 0;
+                    size_t iHi = numMarkersA;
+                    if(haveInterval) {
+                        // iLo: first ordinal with position + kLen > winQStart.
+                        size_t lo = 0, hi = numMarkersA;
+                        while(lo < hi) {
+                            const size_t mid = (lo + hi) >> 1;
+                            if(uint64_t(markersA[mid].position) + kLen > winQStart) hi = mid;
+                            else lo = mid + 1;
+                        }
+                        iLo = lo;
+                        // iHi: first ordinal with position >= winQEnd.
+                        lo = iLo; hi = numMarkersA;
+                        while(lo < hi) {
+                            const size_t mid = (lo + hi) >> 1;
+                            if(markersA[mid].position >= winQEnd) hi = mid;
+                            else lo = mid + 1;
+                        }
+                        iHi = lo;
+                        if(iLo >= iHi) {
+                            // No read-A markers inside the interval; nothing to chain.
+                            continue;
+                        }
+                    }
+
                     scratch.clear();
-                    scratch.flatHits.reserve(numMarkersA);
+                    scratch.flatHits.reserve(iHi - iLo);
                     highFrequencyStreak.clear();
                     int64_t lastNonHighBoundaryPos = -1;
 
@@ -3124,13 +3169,20 @@ void Assembler::chainPafCandidates(
                             invertedIndexData.weightLut, invertedIndexData.weightExponent);
                     };
 
-                    // PAF path: emit only hits matching the specific partner readIdB.
+                    // PAF path: emit only hits matching the specific partner readIdB,
+                    // and (when we have the interval) only those whose read-B k-mer span
+                    // intersects the t-window. This keeps the shared minimizers to the
+                    // overlap interval on both reads.
                     auto appendMarkerHits = [&](const PendingHighFrequencyMarker& markerInfo) {
                         const auto* compactOccs = &invertedIndexData.compactOccurrences[markerInfo.startIdx];
                         for (uint32_t j = 0; j < markerInfo.count; ++j) {
                             if (compactOccs[j].readId == readIdB) {
                                 const uint32_t posBEncoded = compactOccs[j].position;
                                 const uint32_t posB = posBEncoded & 0x7fffffffU;
+                                if (haveInterval &&
+                                    (posB + kLen <= winTStart || posB >= winTEnd)) {
+                                    continue;   // Outside the PAF t-window.
+                                }
                                 const uint8_t isRcB = uint8_t(posBEncoded >> 31);
                                 scratch.flatHits.push_back(
                                     {readIdB, markerInfo.posA, posB, markerInfo.ordinalA,
@@ -3150,7 +3202,7 @@ void Assembler::chainPafCandidates(
                             });
                     };
 
-                    for(size_t i = 0; i < numMarkersA; i++) {
+                    for(size_t i = iLo; i < iHi; i++) {
                         KmerId canonicalKId;
                         uint8_t isRcA = 0;
                         if(canonicalIdsA) {
@@ -3201,9 +3253,13 @@ void Assembler::chainPafCandidates(
                         lastNonHighBoundaryPos = posA;
                     }
                     if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
-                        const uint32_t readLenABoundary = uint32_t(std::min<uint64_t>(
-                            readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
-                        doFlushStreak(readLenABoundary);
+                        // Right boundary for the final streak: the end of the scanned
+                        // window (q-window end when we have the interval, else read end).
+                        const uint32_t rightBoundary = haveInterval ?
+                            winQEnd :
+                            uint32_t(std::min<uint64_t>(
+                                readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
+                        doFlushStreak(rightBoundary);
                     }
 
                     if(scratch.flatHits.empty()) {
@@ -3243,25 +3299,20 @@ void Assembler::chainPafCandidates(
                     // PAF INTERVAL PATH
                     // ============================================================
                     // Instead of re-running DP over the whole read, use the shared
-                    // minimizers (common markers) that fall inside the overlap interval
-                    // the PAF already agreed on. The chain is the longest subsequence of
-                    // those anchors that is strictly monotone in both reads' marker
-                    // ordinals (increasing on B for same-strand overlaps, decreasing on
-                    // B for reverse-complement overlaps). Alignment coordinates come
-                    // straight from the PAF interval and the score is the PAF block length.
-                    // readIdA < readIdB is guaranteed (canonical pair ordering), so the
-                    // key and the q/t interval assignment match importAlignmentCandidatesFromPaf.
+                    // minimizers (common markers) inside the overlap interval the PAF
+                    // agreed on. Hit collection above already restricted markers to that
+                    // window on both reads (via iLo/iHi on A and the t-window filter on
+                    // B), so here we only drop hits whose strand disagrees with the PAF
+                    // record or whose B ordinal did not resolve. The chain is the longest
+                    // subsequence of the remaining anchors that is strictly monotone in
+                    // both reads' marker ordinals (increasing on B for same-strand,
+                    // decreasing for reverse-complement). Alignment coordinates come from
+                    // the PAF interval and the score is the PAF block length.
                     {
-                        const uint64_t pafKey = (uint64_t(readIdA) << 32) | uint64_t(readIdB);
-                        const auto pafIt = pafCandidateIntervals.find(pafKey);
-                        if(pafIt != pafCandidateIntervals.end()) {
+                        if(haveInterval) {
                             const PafCandidateInterval& iv = pafIt->second;
                             const bool sameStrandWanted = pafSameStrand;
-                            const uint32_t kLen = uint32_t(kmerLen);
 
-                            // Collect shared minimizers inside the PAF window that match
-                            // the overlap orientation. A k-mer hit at base position p spans
-                            // [p, p+k); keep it if that span intersects the interval.
                             scratch.intervalAnchors.clear();
                             for(size_t k = 0; k < numHits; ++k) {
                                 const auto& h = scratch.flatHits[k];
@@ -3272,14 +3323,9 @@ void Assembler::chainPafCandidates(
                                 const uint32_t oB = scratch.hitOrdinalB[k];
                                 if(oB == std::numeric_limits<uint32_t>::max()) continue;
 
-                                const uint32_t pA = scratch.hitPosA[k];
-                                const uint32_t pB = scratch.hitPosB[k];
-                                // Half-open [start, end) window on each read, with k-mer span.
-                                if(pA + kLen <= iv.qStart || pA >= iv.qEnd) continue;
-                                if(pB + kLen <= iv.tStart || pB >= iv.tEnd) continue;
-
                                 scratch.intervalAnchors.push_back(
-                                    {pA, pB, scratch.hitOrdinalA[k], oB});
+                                    {scratch.hitPosA[k], scratch.hitPosB[k],
+                                     scratch.hitOrdinalA[k], oB});
                             }
 
                             const size_t na = scratch.intervalAnchors.size();
