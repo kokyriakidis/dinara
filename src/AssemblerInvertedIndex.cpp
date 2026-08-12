@@ -3255,7 +3255,7 @@ void Assembler::chainPafCandidates(
                         const uint64_t pafKey = (uint64_t(readIdA) << 32) | uint64_t(readIdB);
                         const auto pafIt = pafCandidateIntervals.find(pafKey);
                         if(pafIt != pafCandidateIntervals.end()) {
-                            const Assembler::PafCandidateInterval& iv = pafIt->second;
+                            const PafCandidateInterval& iv = pafIt->second;
                             const bool sameStrandWanted = pafSameStrand;
                             const uint32_t kLen = uint32_t(kmerLen);
 

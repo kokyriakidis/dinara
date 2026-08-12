@@ -32,6 +32,7 @@
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
 #include "mode3-Anchor.hpp"
+#include "PafImport.hpp"
 
 // Standard library.
 #include "memory.hpp"
@@ -1243,18 +1244,10 @@ private:
     // PAF-imported overlap intervals, keyed by canonical read pair (readId0<readId1).
     // Populated by importAlignmentCandidatesFromPaf and consumed by chainPafCandidates
     // to constrain shared-minimizer collection to the interval hifiasm already agreed on.
-    // Coordinates are half-open base positions on each read; target coordinates are
-    // forward-strand (matching Alignment::ts/te convention).
-public:
-    struct PafCandidateInterval {
-        uint32_t qStart = 0;   // Start on readId0 (query).
-        uint32_t qEnd = 0;     // End on readId0 (query).
-        uint32_t tStart = 0;   // Start on readId1 (target), forward strand.
-        uint32_t tEnd = 0;     // End on readId1 (target), forward strand.
-        uint32_t blockLen = 0; // PAF alignment block length (used as chain score).
-        bool isSameStrand = true;
-    };
+    // PafCandidateInterval is defined in PafImport.hpp; coordinates are half-open base
+    // positions on each read, target coordinates forward-strand (Alignment::ts/te).
     // Key packs (readId0<<32 | readId1) with readId0<readId1.
+public:
     std::unordered_map<uint64_t, PafCandidateInterval> pafCandidateIntervals;
 private:
 

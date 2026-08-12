@@ -158,10 +158,29 @@ add_custom_command(TARGET test_long_markers POST_BUILD
     VERBATIM
 )
 
+# ============================================================================
+# PAF IMPORT UNIT TEST
+# ============================================================================
+# Validates the pure PAF import helpers in src/PafImport.hpp (line parsing,
+# line-aligned chunk splitting, canonical keying and longest-overlap dedup) in
+# isolation. Focused unit target: PafImport.hpp only depends on ReadId.hpp and
+# span.hpp, so only DINARA_ASSERT.cpp is needed for the assert symbol.
+add_executable(test_paf_import
+    test_paf_import.cpp
+    ${DINARA_ROOT}/src/DINARA_ASSERT.cpp
+    $<TARGET_OBJECTS:catch_main>
+)
+target_link_libraries(test_paf_import pthread)
+add_custom_command(TARGET test_paf_import POST_BUILD
+    COMMAND chmod +x $<TARGET_FILE:test_paf_import>
+    VERBATIM
+)
+
 # Enable CTest
 enable_testing()
 add_test(NAME IntegrationTests COMMAND test_integration)
 add_test(NAME LongMarkersTests COMMAND test_long_markers)
+add_test(NAME PafImportTests COMMAND test_paf_import)
 
 # CI/dev environments can have LD_LIBRARY_PATH pointing at /usr/local/lib first.
 # Force our curated dependency builds (in ${DINARA_BUILD_DIR}/lib) to take precedence.

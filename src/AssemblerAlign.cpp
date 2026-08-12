@@ -29,6 +29,13 @@ using namespace dinara;
 #include <algorithm>
 #include <thread>
 
+// Linux, for the memory-mapped parallel PAF reader.
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 
 
 // Compute a marker alignment of two oriented reads.
@@ -244,103 +251,167 @@ void Assembler::alignOverlappingOrientedReads(
 
 
 
+// Minimum PAF alignment block length (column 11) for an overlap to be kept.
+static constexpr uint64_t pafMinAlignmentBlockLength = 200;
+
 void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
 {
+    // Memory-map the PAF file and parse it in parallel. The file is split into
+    // line-aligned byte ranges (one per thread); each thread parses its range
+    // with a locale-free, allocation-free scanner (see PafImport.hpp) into a
+    // thread-local vector of PafEntry. The per-thread vectors are concatenated
+    // and then sorted/deduplicated once, keeping the longest overlap per read
+    // pair. The result is deterministic and independent of thread count.
+    //
+    // Only overlaps actually present in the PAF are chained: no transitive
+    // expansion is performed. The interval each record agreed on is retained in
+    // pafCandidateIntervals for chainPafCandidates.
+
     if (!std::filesystem::exists(pafFilePath)) {
         throw runtime_error("PAF file not found: " + pafFilePath);
     }
 
     cout << timestamp << "Loading alignment candidates from " << pafFilePath << "..." << endl;
-    alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
+    const auto tBegin = steady_clock::now();
 
-    // Keep the interval each PAF record agreed on so chainPafCandidates can build the
-    // chain directly from the shared minimizers inside it, instead of re-chaining the
-    // whole read. Transitive expansion is intentionally not performed: only overlaps
-    // actually present in the PAF are chained.
+    alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
     pafCandidateIntervals.clear();
 
-    std::ifstream pafFile(pafFilePath);
-    string line;
-    uint64_t lineCount = 0;
-    uint64_t duplicateCount = 0;
-
-    while (std::getline(pafFile, line)) {
-        std::stringstream ss(line);
-        string qName, tName, strandStr;
-        uint64_t qLen, qStart, qEnd, tLen, tStart, tEnd, mapQ, alignLen;
-
-        // PAF columns:
-        // 1: Query name        2: Query length     3: Query start      4: Query end
-        // 5: Strand (+/-)      6: Target name      7: Target length    8: Target start
-        // 9: Target end        10: Residue matches 11: Alignment block length
-        // (12+: optional tags such as cg:Z: CIGAR, ignored here)
-
-        if (!(ss >> qName >> qLen >> qStart >> qEnd >> strandStr >> tName >> tLen >> tStart >> tEnd >> mapQ >> alignLen)) {
-            continue;
-        }
-
-        if (alignLen < 200) {
-            continue;
-        }
-
-        try {
-            ReadId readId0 = reads->getReadId(qName);
-            ReadId readId1 = reads->getReadId(tName);
-
-            if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) continue;
-            // Ignore palindromic for now
-            if (reads->getFlags(readId0).isPalindromic || reads->getFlags(readId1).isPalindromic) continue;
-            if (readId0 == readId1) continue;
-
-            const bool isSameStrand = (strandStr == "+");
-
-            // PAF query/target coordinates are both forward-strand on their respective
-            // reads (minimap2/hifiasm convention), regardless of overlap orientation.
-            // Canonicalize so readIds[0] < readIds[1]; swap the intervals with the ids
-            // so q* always refers to the smaller id and t* to the larger id. This matches
-            // the forward-coordinate convention used by Alignment::ts/te.
-            PafCandidateInterval interval;
-            interval.isSameStrand = isSameStrand;
-            interval.blockLen = uint32_t(alignLen);
-            if (readId0 < readId1) {
-                interval.qStart = uint32_t(qStart);
-                interval.qEnd   = uint32_t(qEnd);
-                interval.tStart = uint32_t(tStart);
-                interval.tEnd   = uint32_t(tEnd);
-            } else {
-                swap(readId0, readId1);
-                interval.qStart = uint32_t(tStart);
-                interval.qEnd   = uint32_t(tEnd);
-                interval.tStart = uint32_t(qStart);
-                interval.tEnd   = uint32_t(qEnd);
-            }
-
-            const uint64_t key = (uint64_t(readId0) << 32) | uint64_t(readId1);
-            auto [it, inserted] = pafCandidateIntervals.try_emplace(key, interval);
-            if (inserted) {
-                alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
-            } else {
-                // Multiple records for the same read pair collapse to one candidate.
-                // This covers reciprocal A->B / B->A records as well as several
-                // A->B lines (e.g. repeat-induced multi-mappings or split overlaps).
-                // Keep the record with the largest alignment block length (PAF col 11),
-                // i.e. the longest overlap.
-                ++duplicateCount;
-                if (interval.blockLen > it->second.blockLen) {
-                    it->second = interval;
-                }
-            }
-
-            lineCount++;
-
-        } catch (...) {
-            continue;
-        }
+    // ---- Memory-map the file. ----
+    const int fd = ::open(pafFilePath.c_str(), O_RDONLY);
+    if (fd == -1) {
+        throw runtime_error("Error opening PAF file: " + pafFilePath);
     }
-    cout << timestamp << "Parsed " << lineCount << " PAF overlap records ("
-         << duplicateCount << " duplicate pairs merged)." << endl;
+    struct stat st{};
+    if (::fstat(fd, &st) == -1) {
+        ::close(fd);
+        throw runtime_error("Error stat-ing PAF file: " + pafFilePath);
+    }
+    const size_t fileSize = size_t(st.st_size);
+
+    const char* data = nullptr;
+    void* mapping = MAP_FAILED;
+    if (fileSize > 0) {
+        mapping = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED) {
+            ::close(fd);
+            throw runtime_error("Error memory-mapping PAF file: " + pafFilePath);
+        }
+        // Sequential access hint improves read-ahead behavior.
+        ::madvise(mapping, fileSize, MADV_SEQUENTIAL);
+        data = reinterpret_cast<const char*>(mapping);
+    }
+    ::close(fd);
+
+    // ---- Split into line-aligned chunks and parse in parallel. ----
+    uint64_t threadCount = std::thread::hardware_concurrency();
+    if (threadCount == 0) threadCount = 1;
+
+    const auto ranges = computePafChunkRanges(data, fileSize, threadCount);
+    const size_t nRanges = ranges.size();
+
+    vector<vector<PafEntry>> threadEntries(nRanges);
+    vector<uint64_t> threadParsed(nRanges, 0);   // Lines that produced a kept overlap.
+    vector<uint64_t> threadMalformed(nRanges, 0);
+
+    vector<std::thread> threads;
+    threads.reserve(nRanges);
+    for (size_t ti = 0; ti < nRanges; ti++) {
+        threads.emplace_back([&, ti]() {
+            const size_t rBegin = ranges[ti].first;
+            const size_t rEnd = ranges[ti].second;
+            auto& entries = threadEntries[ti];
+            uint64_t parsed = 0;
+            uint64_t malformed = 0;
+
+            const char* p = data + rBegin;
+            const char* const chunkEnd = data + rEnd;
+            while (p < chunkEnd) {
+                // Find end of this line within the chunk.
+                const char* lineEnd = p;
+                while (lineEnd < chunkEnd && *lineEnd != '\n') ++lineEnd;
+
+                PafRecord rec;
+                if (parsePafLine(p, lineEnd, rec)) {
+                    if (rec.alignLen >= pafMinAlignmentBlockLength) {
+                        const ReadId readId0 = reads->getReadId(rec.qName);
+                        const ReadId readId1 = reads->getReadId(rec.tName);
+                        const bool valid =
+                            readId0 != invalidReadId &&
+                            readId1 != invalidReadId &&
+                            readId0 != readId1 &&
+                            !reads->getFlags(readId0).isPalindromic &&
+                            !reads->getFlags(readId1).isPalindromic;
+                        if (valid) {
+                            entries.push_back(makePafEntry(
+                                readId0, readId1,
+                                uint32_t(rec.qStart), uint32_t(rec.qEnd),
+                                uint32_t(rec.tStart), uint32_t(rec.tEnd),
+                                uint32_t(rec.alignLen), rec.isSameStrand));
+                            ++parsed;
+                        }
+                    }
+                } else if (lineEnd != p) {
+                    // Non-empty line that failed to parse (ignore blank lines).
+                    ++malformed;
+                }
+
+                // Advance past the newline (if any).
+                p = (lineEnd < chunkEnd) ? lineEnd + 1 : chunkEnd;
+            }
+
+            threadParsed[ti] = parsed;
+            threadMalformed[ti] = malformed;
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    // ---- Merge thread-local entries into one vector. ----
+    size_t totalEntries = 0;
+    uint64_t parsedTotal = 0;
+    uint64_t malformedTotal = 0;
+    for (size_t ti = 0; ti < nRanges; ti++) {
+        totalEntries += threadEntries[ti].size();
+        parsedTotal += threadParsed[ti];
+        malformedTotal += threadMalformed[ti];
+    }
+    vector<PafEntry> entries;
+    entries.reserve(totalEntries);
+    for (size_t ti = 0; ti < nRanges; ti++) {
+        auto& te = threadEntries[ti];
+        entries.insert(entries.end(), te.begin(), te.end());
+        vector<PafEntry>().swap(te);   // Free thread-local memory eagerly.
+    }
+
+    if (fileSize > 0 && mapping != MAP_FAILED) {
+        ::munmap(mapping, fileSize);
+    }
+
+    // ---- Deduplicate: one entry per read pair, keeping the longest overlap. ----
+    const size_t rawCount = entries.size();
+    dedupPafEntriesKeepLongest(entries);
+    const uint64_t duplicateCount = uint64_t(rawCount - entries.size());
+
+    // ---- Publish results (deterministic: entries are in ascending key order). ----
+    pafCandidateIntervals.reserve(entries.size());
+    for (const PafEntry& e : entries) {
+        pafCandidateIntervals.emplace(e.key, e.iv);
+        const ReadId readId0 = ReadId(e.key >> 32);
+        const ReadId readId1 = ReadId(e.key & 0xffffffffULL);
+        alignmentCandidates.candidates.push_back(
+            OrientedReadPair(readId0, readId1, e.iv.isSameStrand));
+    }
 
     alignmentCandidates.unreserve();
+
+    const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        steady_clock::now() - tBegin).count());
+    cout << timestamp << "Parsed " << parsedTotal << " PAF overlap records ("
+         << duplicateCount << " duplicate pairs merged";
+    if (malformedTotal > 0) {
+        cout << ", " << malformedTotal << " malformed lines skipped";
+    }
+    cout << ") in " << seconds << " s using " << nRanges << " threads." << endl;
     cout << timestamp << "Total PAF candidates: " << alignmentCandidates.candidates.size() << endl;
 }
 
