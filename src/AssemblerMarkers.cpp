@@ -320,6 +320,7 @@ static size_t getMinimizerMarkersForRead(
     int w,
     bool useHifiasm,
     SimdSketcher* sketcher,
+    hifiasm_sketch_ctx_t* hifiasmCtx,
     const shared_ptr<KmerChecker>& kmerChecker,
     string& readSequence,
     std::vector<uint32_t>& positionBuffer,
@@ -341,13 +342,17 @@ static size_t getMinimizerMarkersForRead(
     }
 
     if(useHifiasm) {
-        // hifiasm sketcher (no-HPC). Returns START positions already; we take
-        // only the positions and let the shared tail below re-extract the real
-        // canonical KmerId, so the marker/index representation is unchanged.
-        hifiasm_minimizer_t* mz = nullptr;
+        // hifiasm sketcher (no-HPC) via a reusable per-thread context, so
+        // steady-state sketching does no per-read heap allocation. The context
+        // returns START positions already sorted and deduplicated, so the
+        // std::sort/std::unique below is skipped on this path. We take only the
+        // positions and let the shared tail re-extract the real canonical
+        // KmerId, so the marker/index representation is unchanged.
+        const hifiasm_minimizer_t* mz = nullptr;
         int n = 0;
-        const int rc = hifiasm_sketch_minimizers(
-            readSequence.c_str(), int(baseCount), w, k, /*is_hpc*/ 0, &mz, &n);
+        const int rc = hifiasm_sketch_minimizers_ctx(
+            hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
+            /*is_hpc*/ 0, &mz, &n);
         if(rc != 0) {
             // Treat a sketch failure as "no markers" rather than aborting the
             // whole run; the read simply contributes nothing.
@@ -357,24 +362,23 @@ static size_t getMinimizerMarkersForRead(
             for(int i = 0; i < n; i++) {
                 positionBuffer[size_t(i)] = mz[i].pos;
             }
-            free(mz);
         }
     } else {
-        // simd-minimizers library (default). Compute canonical minimizer
-        // positions (START offsets).
+        // simd-minimizers library. Compute canonical minimizer positions
+        // (START offsets), then sort + deduplicate to guarantee monotonic
+        // ordering (the library does not guarantee sorted, unique output).
         MinimizerList minimizerList = canonical_minimizer_positions(
             sketcher,
             readSequence.c_str(),
             readSequence.size());
         positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
         free_minimizer_list(minimizerList);
-    }
 
-    // Sort and deduplicate positions to guarantee monotonic ordering.
-    std::sort(positionBuffer.begin(), positionBuffer.end());
-    positionBuffer.erase(
-        std::unique(positionBuffer.begin(), positionBuffer.end()),
-        positionBuffer.end());
+        std::sort(positionBuffer.begin(), positionBuffer.end());
+        positionBuffer.erase(
+            std::unique(positionBuffer.begin(), positionBuffer.end()),
+            positionBuffer.end());
+    }
 
     const size_t uniqueCandidateCount = positionBuffer.size();
 
@@ -467,10 +471,11 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
     const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
-    // The simd sketcher is unused on the hifiasm path but cheap to allocate;
-    // keep one per thread either way to keep the call sites uniform.
-    SimdSketcher* sketcher = simd_sketcher_new(
+    // Allocate only the backend actually used on this path: the hifiasm sketch
+    // context or the simd sketcher (each is per-thread; neither is thread-safe).
+    SimdSketcher* sketcher = useHifiasm ? nullptr : simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
+    hifiasm_sketch_ctx_t* hifiasmCtx = useHifiasm ? hifiasm_sketch_ctx_init() : nullptr;
     string readSequence;
     std::vector<uint32_t> positionBuffer;
 
@@ -478,7 +483,7 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const size_t count = getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, kmerChecker, readSequence, positionBuffer, nullptr);
+                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx, kmerChecker, readSequence, positionBuffer, nullptr);
 
             const uint64_t count64 = count;
             this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
@@ -487,7 +492,8 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
             markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
         }
     }
-    simd_sketcher_free(sketcher);
+    if(sketcher) simd_sketcher_free(sketcher);
+    if(hifiasmCtx) hifiasm_sketch_ctx_destroy(hifiasmCtx);
 }
 
 void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
@@ -495,8 +501,9 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
     const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
-    SimdSketcher* sketcher = simd_sketcher_new(
+    SimdSketcher* sketcher = useHifiasm ? nullptr : simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
+    hifiasm_sketch_ctx_t* hifiasmCtx = useHifiasm ? hifiasm_sketch_ctx_init() : nullptr;
     string readSequence;
     std::vector<uint32_t> positionBuffer;
     std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
@@ -506,7 +513,7 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId);
             getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, kmerChecker, readSequence, positionBuffer, &markerBuffer);
+                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx, kmerChecker, readSequence, positionBuffer, &markerBuffer);
 
             if(markerBuffer.empty()) continue;
 
@@ -532,7 +539,8 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
             }
         }
     }
-    simd_sketcher_free(sketcher);
+    if(sketcher) simd_sketcher_free(sketcher);
+    if(hifiasmCtx) hifiasm_sketch_ctx_destroy(hifiasmCtx);
 }
 
 

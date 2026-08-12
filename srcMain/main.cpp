@@ -3399,7 +3399,9 @@ void dinara::main::svanchors(
     cout << timestamp << "Finding minimizer markers (k=" << k << ", w=" << w << ")." << endl;
     {
         const auto tMark0 = steady_clock::now();
-        assembler.findMarkersSimdMinimizers(threadCount, k, w);
+        // svanchors uses simd-minimizers explicitly (its own minimizerW-based
+        // density model); the hifiasm default applies only to the overlap path.
+        assembler.findMarkersSimdMinimizers(threadCount, k, w, /*useHifiasm*/ false);
         const auto tMark1 = steady_clock::now();
         cout << "    findMarkersSimdMinimizers completed in "
              << seconds(tMark1 - tMark0) << " s." << endl;

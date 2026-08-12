@@ -291,7 +291,7 @@ public:
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
     void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
-    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm = false);
+    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm = true);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 

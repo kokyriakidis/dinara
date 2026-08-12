@@ -416,11 +416,12 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Kmers.useHifiasmMinimizers",
         value<bool>(&kmersOptions.useHifiasmMinimizers)->
-        default_value(false),
-        "If set to true, use hifiasm's sketcher (no-HPC) as the minimizer position source "
+        default_value(true),
+        "If true (default), use hifiasm's sketcher (no-HPC) as the minimizer position source "
         "instead of the simd-minimizers library. Only affects the SIMD minimizer path "
         "(when Kmers.useSimdClosedSyncmers is false). Positions are still resolved to canonical "
-        "KmerIds by dinara, so the inverted index is unchanged. Intended for benchmarking.")
+        "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
+        "simd-minimizers instead.")
 
         ("Kmers.minMarkerSpanFraction",
         value<double>(&kmersOptions.minMarkerSpanFraction)->
