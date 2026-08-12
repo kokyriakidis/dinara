@@ -24,6 +24,7 @@ include_directories(${DINARA_ROOT}/external/catch2)
 include_directories(${DINARA_ROOT}/src/edlib/include)
 include_directories(${DINARA_ROOT}/src/ksw2)
 include_directories(${DINARA_ROOT}/external/snarls/vendored ${DINARA_ROOT}/external/snarls/libhandlegraph/src/include ${DINARA_ROOT}/external/snarls/structures/src/include)
+include_directories(${DINARA_ROOT}/external/hifiasmCandidates)
 
 # Figure out if we are on Intel (as opposed to ARM).
 set(X86_64 OFF)
@@ -105,7 +106,7 @@ add_custom_command(TARGET test_integration POST_BUILD
 # Link all required libraries
 if(APPLE)
     target_link_libraries(test_integration
-        dinara_snarls
+        dinara_snarls hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
         ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
@@ -115,7 +116,7 @@ else()
     # Most of our dependencies are static .a libraries, so we need either strict
     # ordering or a link group to resolve transitive symbols.
     target_link_libraries(test_integration
-        dinara_snarls
+        dinara_snarls hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
         -Wl,--start-group

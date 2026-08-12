@@ -414,6 +414,14 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(11),
         "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
 
+        ("Kmers.useHifiasmMinimizers",
+        value<bool>(&kmersOptions.useHifiasmMinimizers)->
+        default_value(false),
+        "If set to true, use hifiasm's sketcher (no-HPC) as the minimizer position source "
+        "instead of the simd-minimizers library. Only affects the SIMD minimizer path "
+        "(when Kmers.useSimdClosedSyncmers is false). Positions are still resolved to canonical "
+        "KmerIds by dinara, so the inverted index is unchanged. Intended for benchmarking.")
+
         ("Kmers.minMarkerSpanFraction",
         value<double>(&kmersOptions.minMarkerSpanFraction)->
         default_value(0.5),
@@ -1749,6 +1757,7 @@ void KmersOptions::write(ostream& s) const
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
     s << "syncmerS = " << syncmerS << "\n";
+    s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
     s << "minimizerW = " << minimizerW << "\n";
 }

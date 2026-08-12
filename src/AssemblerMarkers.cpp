@@ -15,10 +15,15 @@ using namespace dinara;
 // SIMD minimizers library.
 #include <simd-minimizers/simd_minimizers.h>
 
+// hifiasm minimizer bridge (no-HPC position source, benchmarking alternative
+// to simd-minimizers). Positions are still resolved to canonical KmerIds here.
+#include "hifiasm_overlaps.h"
+
 // Standard library.
 #include "fstream.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 
@@ -312,6 +317,8 @@ static size_t getMinimizerMarkersForRead(
     ReadId readId,
     const Reads& reads,
     int k,
+    int w,
+    bool useHifiasm,
     SimdSketcher* sketcher,
     const shared_ptr<KmerChecker>& kmerChecker,
     string& readSequence,
@@ -326,19 +333,42 @@ static size_t getMinimizerMarkersForRead(
         return 0;
     }
 
-    // Convert read to string for simd-minimizers.
+    // Convert read to string. Both minimizer backends read raw ASCII bases
+    // (no HPC); positions are k-mer START offsets on the forward strand.
     readSequence.resize(baseCount);
     for(uint64_t i = 0; i < baseCount; i++) {
         readSequence[i] = read[i].character();
     }
 
-    // Compute canonical minimizer positions.
-    MinimizerList minimizerList = canonical_minimizer_positions(
-        sketcher,
-        readSequence.c_str(),
-        readSequence.size());
-    positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
-    free_minimizer_list(minimizerList);
+    if(useHifiasm) {
+        // hifiasm sketcher (no-HPC). Returns START positions already; we take
+        // only the positions and let the shared tail below re-extract the real
+        // canonical KmerId, so the marker/index representation is unchanged.
+        hifiasm_minimizer_t* mz = nullptr;
+        int n = 0;
+        const int rc = hifiasm_sketch_minimizers(
+            readSequence.c_str(), int(baseCount), w, k, /*is_hpc*/ 0, &mz, &n);
+        if(rc != 0) {
+            // Treat a sketch failure as "no markers" rather than aborting the
+            // whole run; the read simply contributes nothing.
+            positionBuffer.clear();
+        } else {
+            positionBuffer.resize(size_t(n));
+            for(int i = 0; i < n; i++) {
+                positionBuffer[size_t(i)] = mz[i].pos;
+            }
+            free(mz);
+        }
+    } else {
+        // simd-minimizers library (default). Compute canonical minimizer
+        // positions (START offsets).
+        MinimizerList minimizerList = canonical_minimizer_positions(
+            sketcher,
+            readSequence.c_str(),
+            readSequence.size());
+        positionBuffer.assign(minimizerList.data, minimizerList.data + minimizerList.len);
+        free_minimizer_list(minimizerList);
+    }
 
     // Sort and deduplicate positions to guarantee monotonic ordering.
     std::sort(positionBuffer.begin(), positionBuffer.end());
@@ -381,18 +411,20 @@ static size_t getMinimizerMarkersForRead(
     return validCount;
 }
 
-void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
+void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm)
 {
     reads->checkReadsAreOpen();
 
-    performanceLog << timestamp << "Finding markers using SIMD minimizers (k=" << k << ", w=" << w << ") in "
-        << reads->readCount() << " reads." << endl;
+    performanceLog << timestamp << "Finding markers using "
+        << (useHifiasm ? "hifiasm (no-HPC)" : "SIMD") << " minimizers (k=" << k
+        << ", w=" << w << ") in " << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
     // Store parameters.
     assemblerInfo->k = k;
     findMarkersSimdMinimizersData.k = k;
     findMarkersSimdMinimizersData.w = w;
+    findMarkersSimdMinimizersData.useHifiasm = useHifiasm;
 
     // Create the markers and markerKmerIds data structures.
     markers->createNew(largeDataName("Markers"), largeDataPageSize);
@@ -422,14 +454,21 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w)
 
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
-    performanceLog << timestamp << "Finding markers using SIMD minimizers completed in " << tTotal << " s." << endl;
-    cout << "Created " << markers->totalSize() << " markers using SIMD minimizers." << endl;
+    const char* backend = findMarkersSimdMinimizersData.useHifiasm ?
+        "hifiasm (no-HPC)" : "SIMD";
+    performanceLog << timestamp << "Finding markers using " << backend
+        << " minimizers completed in " << tTotal << " s." << endl;
+    cout << "Created " << markers->totalSize() << " markers using " << backend
+        << " minimizers." << endl;
 }
 
 void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
 {
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
+    const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
+    // The simd sketcher is unused on the hifiasm path but cheap to allocate;
+    // keep one per thread either way to keep the call sites uniform.
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
     string readSequence;
@@ -439,7 +478,7 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const size_t count = getMinimizerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, nullptr);
+                readId, *reads, k, w, useHifiasm, sketcher, kmerChecker, readSequence, positionBuffer, nullptr);
 
             const uint64_t count64 = count;
             this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
@@ -455,6 +494,7 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
 {
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
+    const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
     SimdSketcher* sketcher = simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
     string readSequence;
@@ -466,7 +506,7 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId);
             getMinimizerMarkersForRead(
-                readId, *reads, k, sketcher, kmerChecker, readSequence, positionBuffer, &markerBuffer);
+                readId, *reads, k, w, useHifiasm, sketcher, kmerChecker, readSequence, positionBuffer, &markerBuffer);
 
             if(markerBuffer.empty()) continue;
 

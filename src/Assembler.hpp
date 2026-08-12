@@ -291,7 +291,7 @@ public:
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
     void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
-    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w);
+    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm = false);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -2589,6 +2589,7 @@ private:
     public:
          int k;
          int w; // window size for minimizers
+         bool useHifiasm = false; // use hifiasm's no-HPC sketcher as position source
     };
     FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
 

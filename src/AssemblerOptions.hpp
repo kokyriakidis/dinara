@@ -169,6 +169,13 @@ public:
     bool useSimdClosedSyncmers;
     int syncmerS;
 
+    // Use hifiasm's sketcher (no-HPC) as the minimizer position source instead
+    // of the simd-minimizers library. Only affects the SIMD minimizer path
+    // (useSimdClosedSyncmers == false); positions are still resolved to real
+    // canonical KmerIds by dinara, so the downstream index is unchanged. Exists
+    // to benchmark hifiasm's seed selection against simd-minimizers.
+    bool useHifiasmMinimizers;
+
     // Minimum fraction of read length that must be covered by the marker span
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.

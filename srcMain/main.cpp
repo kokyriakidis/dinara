@@ -1791,7 +1791,8 @@ void dinara::main::assemble(
         assembler.findMarkersSimdMinimizers(
             threadCount,
             assemblerOptions.kmersOptions.k,
-            assemblerOptions.kmersOptions.k);  // Using kmer length as window size w
+            assemblerOptions.kmersOptions.k,  // Using kmer length as window size w
+            assemblerOptions.kmersOptions.useHifiasmMinimizers);
 
         // Compute histogram using the pre-calculated KmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
